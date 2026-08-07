@@ -142,7 +142,10 @@ use fastmcp_core::{
     McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
-use fastmcp_protocol::protocol_policy::ProtocolPolicy;
+use fastmcp_protocol::protocol_policy::{
+    LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION, ModernVersionSupport, ProtocolEra,
+    ProtocolPolicy, StdioEraClassifier, StdioEraDecision, StdioOpeningFrame,
+};
 use fastmcp_protocol::{
     CallToolParams, CancelledParams, CorrelationKey, DiscoveryCacheHints, GetPromptParams,
     InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
@@ -229,6 +232,86 @@ fn measure_dispatch_request(request: &JsonRpcRequest) -> Option<usize> {
     serde_json::to_writer(&mut counter, request)
         .ok()
         .map(|()| counter.bytes)
+}
+
+const MODERN_PROTOCOL_VERSION_METADATA_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+fn modern_protocol_version(request: &JsonRpcRequest) -> Option<&str> {
+    request
+        .params
+        .as_ref()?
+        .get("_meta")?
+        .get(MODERN_PROTOCOL_VERSION_METADATA_KEY)?
+        .as_str()
+}
+
+fn is_exact_legacy_initialize(request: &JsonRpcRequest) -> bool {
+    request.method == "initialize"
+        && request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("protocolVersion"))
+            .and_then(serde_json::Value::as_str)
+            == Some(LEGACY_PROTOCOL_VERSION)
+}
+
+fn stdio_opening_frame(request: &JsonRpcRequest) -> StdioOpeningFrame {
+    if let Some(protocol_version) = modern_protocol_version(request) {
+        return if request.method == "initialize" {
+            StdioOpeningFrame::MixedInitializeAndModernMetadata {
+                protocol_version: protocol_version.to_owned(),
+            }
+        } else {
+            StdioOpeningFrame::ModernRequest {
+                protocol_version: protocol_version.to_owned(),
+            }
+        };
+    }
+
+    if request.id.is_none() {
+        return StdioOpeningFrame::Notification;
+    }
+
+    if is_exact_legacy_initialize(request) {
+        StdioOpeningFrame::LegacyInitialize
+    } else {
+        StdioOpeningFrame::RequestWithoutModernMetadata
+    }
+}
+
+fn remove_modern_protocol_metadata(request: &mut JsonRpcRequest) {
+    let Some(params) = request.params.as_mut() else {
+        return;
+    };
+    let Some(params) = params.as_object_mut() else {
+        return;
+    };
+    let remove_meta = params
+        .get_mut("_meta")
+        .and_then(serde_json::Value::as_object_mut)
+        .is_some_and(|metadata| {
+            metadata.remove(MODERN_PROTOCOL_VERSION_METADATA_KEY);
+            metadata.is_empty()
+        });
+    if remove_meta {
+        params.remove("_meta");
+    }
+}
+
+fn protocol_era_refusal(request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    request.id.clone().map(|id| {
+        JsonRpcResponse::error(
+            Some(id),
+            JsonRpcError {
+                code: McpErrorCode::InvalidRequest.into(),
+                message: "Request does not match the connection's negotiated MCP protocol era"
+                    .to_owned(),
+                data: Some(serde_json::json!({
+                    "supported": [MODERN_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION],
+                })),
+            },
+        )
+    })
 }
 
 fn is_quarantined_task_rpc(method: &str) -> bool {
@@ -318,6 +401,7 @@ struct DispatchQueueStateInner {
 
 struct QueuedDispatchRequest {
     request: JsonRpcRequest,
+    era: ProtocolEra,
     serialized_bytes: usize,
 }
 
@@ -1671,10 +1755,11 @@ impl Server {
         {
             let receive_fatal_output = Arc::clone(&fatal_notification_output);
             let send_fatal_output = Arc::clone(&fatal_notification_output);
-            self.run_loop_legacy(
+            self.run_loop(
                 cx,
-                move |cx| {
+                move |cx, worker_failed| {
                     if receive_fatal_output.load(Ordering::Acquire) {
+                        worker_failed.store(true, Ordering::Release);
                         return Err(TransportError::Io(std::io::Error::other(
                             "notification output failed",
                         )));
@@ -1684,6 +1769,7 @@ impl Server {
                         // Generic non-Unix reads cannot be interrupted once
                         // blocked, but the fatal latch must still dominate a
                         // concurrently completed frame or clean EOF.
+                        worker_failed.store(true, Ordering::Release);
                         Err(TransportError::Io(std::io::Error::other(
                             "notification output failed",
                         )))
@@ -1704,7 +1790,7 @@ impl Server {
                     Ok(())
                 },
                 notification_sender,
-                Some(Arc::clone(&fatal_notification_output)),
+                Arc::clone(&fatal_notification_output),
                 "stdio",
             )
         }
@@ -2367,8 +2453,8 @@ impl Server {
         }
     }
 
-    /// Runs a continuous receive pump while one bounded worker serializes
-    /// request dispatch against the connection session.
+    /// Runs a continuous receive pump while one bounded worker dispatches
+    /// against the connection's immutable negotiated protocol era.
     fn run_loop<R, S>(
         self,
         cx: &Cx,
@@ -2390,6 +2476,7 @@ impl Server {
             transport_label,
             true,
             Some(connection_failure),
+            true,
         );
         std::process::exit(exit_code)
     }
@@ -2399,9 +2486,8 @@ impl Server {
     /// Clean closure or cancellation returns `Ok(())`; any failing pump status
     /// is preserved as a local server-loop error. A receive implementation
     /// that can block must include the supplied worker-failure flag in its
-    /// readiness/stop predicate. The legacy session currently shares the
-    /// ambient `Cx` with request work, so shutdown cancellation is not isolated
-    /// from that caller context.
+    /// readiness/stop predicate. Modern requests establish a fresh stateless
+    /// request scope; exact legacy traffic retains its isolated session path.
     /// Unlike the process-exiting stdio entry point, this returning helper
     /// never detaches a non-quiescent handler: after logging the bounded
     /// shutdown deadline it continues waiting before running lifecycle hooks.
@@ -2411,6 +2497,7 @@ impl Server {
         mut recv: R,
         send: S,
         notification_sender: NotificationSender,
+        connection_failure: Option<Arc<AtomicBool>>,
         transport_label: &'static str,
     ) -> McpResult<()>
     where
@@ -2424,7 +2511,8 @@ impl Server {
             notification_sender,
             transport_label,
             false,
-            None,
+            connection_failure,
+            true,
         ) {
             0 => Ok(()),
             _ => Err(server_run_error(
@@ -2456,6 +2544,7 @@ impl Server {
             transport_label,
             true,
             None,
+            false,
         )
     }
 
@@ -2469,6 +2558,7 @@ impl Server {
         transport_label: &'static str,
         detach_on_worker_timeout: bool,
         connection_failure: Option<Arc<AtomicBool>>,
+        enforce_runtime_era: bool,
     ) -> i32
     where
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
@@ -2551,6 +2641,7 @@ impl Server {
                     }
                 };
                 worker_queue_state.release_queued_bytes(queued_request.serialized_bytes);
+                let era = queued_request.era;
                 let request = queued_request.request;
 
                 if worker_queue_state.is_stopping() {
@@ -2567,6 +2658,35 @@ impl Server {
                 }
 
                 let request_id = request.id.clone();
+                if matches!(era, ProtocolEra::Modern2026) {
+                    let inbound = InboundRequestContext::new(
+                        worker_cx.clone(),
+                        request_id_to_u64(request.id.as_ref()),
+                        InboundRequestTransport::Stdio,
+                    );
+                    let response = worker_server.dispatch_with_protocol_policy(
+                        ProtocolPolicy::ModernOnly,
+                        &inbound,
+                        &request,
+                    );
+                    let send_result = response.map_or(Ok(()), |response| {
+                        let mut send_guard = worker_send
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        send_guard(&worker_cx, &JsonRpcMessage::Response(response))
+                    });
+                    if let Some(id) = request_id.as_ref() {
+                        worker_queue_state.discard(id);
+                    }
+                    if let Err(send_error) = &send_result {
+                        if send_error.is_cancelled() {
+                            worker_queue_state.stop();
+                            clean_exit = true;
+                        }
+                        break;
+                    }
+                    continue;
+                }
                 let handled = worker_server.handle_request_from_dispatch_queue(
                     &worker_cx,
                     &mut session,
@@ -2624,8 +2744,10 @@ impl Server {
             }
         });
 
+        let mut era_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let mut negotiated_era = None;
         let mut exit_code = 0;
-        loop {
+        'receive: loop {
             if worker_failed.load(Ordering::Acquire)
                 || connection_failure
                     .as_ref()
@@ -2727,13 +2849,97 @@ impl Server {
                         }
                     }
                 }
-                JsonRpcMessage::Request(request) => {
+                JsonRpcMessage::Request(mut request) => {
                     if request.validate().is_err() {
                         if send_invalid_request(&send, cx, request.id).is_err() {
                             exit_code = 1;
-                            break;
+                            break 'receive;
                         }
                         continue;
+                    }
+                    let era = if !enforce_runtime_era {
+                        ProtocolEra::Legacy2024
+                    } else {
+                        match negotiated_era {
+                            Some(ProtocolEra::Modern2026) => {
+                                if modern_protocol_version(&request)
+                                    == Some(MODERN_PROTOCOL_VERSION)
+                                {
+                                    ProtocolEra::Modern2026
+                                } else {
+                                    if let Some(response) = protocol_era_refusal(&request)
+                                        && send
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                            cx,
+                                            &JsonRpcMessage::Response(response),
+                                        )
+                                        .is_err()
+                                    {
+                                        exit_code = 1;
+                                    }
+                                    exit_code = 1;
+                                    break 'receive;
+                                }
+                            }
+                            Some(ProtocolEra::Legacy2024) => {
+                                if modern_protocol_version(&request).is_some()
+                                    || (request.method == "initialize"
+                                        && !is_exact_legacy_initialize(&request))
+                                {
+                                    if let Some(response) = protocol_era_refusal(&request)
+                                        && send
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                            cx,
+                                            &JsonRpcMessage::Response(response),
+                                        )
+                                        .is_err()
+                                    {
+                                        exit_code = 1;
+                                    }
+                                    exit_code = 1;
+                                    break 'receive;
+                                }
+                                ProtocolEra::Legacy2024
+                            }
+                            None => match era_classifier
+                                .classify_opening(stdio_opening_frame(&request))
+                            {
+                                StdioEraDecision::Selected {
+                                    era: ProtocolEra::Modern2026,
+                                    modern_version: Some(ModernVersionSupport::Supported),
+                                } => {
+                                    negotiated_era = Some(ProtocolEra::Modern2026);
+                                    ProtocolEra::Modern2026
+                                }
+                                StdioEraDecision::Selected {
+                                    era: ProtocolEra::Legacy2024,
+                                    modern_version: None,
+                                } => {
+                                    negotiated_era = Some(ProtocolEra::Legacy2024);
+                                    ProtocolEra::Legacy2024
+                                }
+                                _ => {
+                                    if let Some(response) = protocol_era_refusal(&request)
+                                        && send
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                            cx,
+                                            &JsonRpcMessage::Response(response),
+                                        )
+                                        .is_err()
+                                    {
+                                        exit_code = 1;
+                                    }
+                                    exit_code = 1;
+                                    break 'receive;
+                                }
+                            },
+                        }
+                    };
+                    if matches!(era, ProtocolEra::Modern2026) {
+                        remove_modern_protocol_metadata(&mut request);
                     }
                     let request_id = request.id.clone();
                     if let Some(id) = request_id.as_ref()
@@ -2793,6 +2999,7 @@ impl Server {
 
                     match dispatch_sender.try_send(QueuedDispatchRequest {
                         request,
+                        era,
                         serialized_bytes,
                     }) {
                         Ok(()) => {}
@@ -2922,6 +3129,8 @@ impl Server {
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let mut session = Session::new(self.info.clone(), self.capabilities.clone());
+        let era_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let mut negotiated_era = None;
 
         // Wrap send in Arc<Mutex> for shared access from bidirectional requests
         let send = Arc::new(Mutex::new(send));
@@ -3021,7 +3230,7 @@ impl Server {
 
             // Handle the message
             let response_opt = match message {
-                JsonRpcMessage::Request(request) => {
+                JsonRpcMessage::Request(mut request) => {
                     if request.validate().is_err() {
                         if send_invalid_request(&send, cx, request.id).is_err() {
                             self.graceful_shutdown(1);
@@ -3036,15 +3245,95 @@ impl Server {
                             stats.add_bytes_received(json.len() as u64 + 1); // +1 for newline
                         }
                     }
-                    self.handle_request_internal(
-                        cx,
-                        &mut session,
-                        request,
-                        &notification_sender,
-                        &request_sender,
-                        None,
-                        None,
-                    )
+                    let era = match negotiated_era {
+                        Some(ProtocolEra::Modern2026)
+                            if modern_protocol_version(&request)
+                                == Some(MODERN_PROTOCOL_VERSION) =>
+                        {
+                            ProtocolEra::Modern2026
+                        }
+                        Some(ProtocolEra::Legacy2024)
+                            if modern_protocol_version(&request).is_none()
+                                && (request.method != "initialize"
+                                    || is_exact_legacy_initialize(&request)) =>
+                        {
+                            ProtocolEra::Legacy2024
+                        }
+                        Some(_) => {
+                            if let Some(response) = protocol_era_refusal(&request)
+                                && let Err(send_error) = send
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                    cx,
+                                    &JsonRpcMessage::Response(response),
+                                )
+                            {
+                                error!(
+                                    target: targets::TRANSPORT,
+                                    "Failed to send protocol-era refusal; terminating transport: {send_error}"
+                                );
+                            }
+                            self.graceful_shutdown(1);
+                        }
+                        None => {
+                            match era_classifier.classify_opening(stdio_opening_frame(&request)) {
+                                StdioEraDecision::Selected {
+                                    era: ProtocolEra::Modern2026,
+                                    modern_version: Some(ModernVersionSupport::Supported),
+                                } => {
+                                    negotiated_era = Some(ProtocolEra::Modern2026);
+                                    ProtocolEra::Modern2026
+                                }
+                                StdioEraDecision::Selected {
+                                    era: ProtocolEra::Legacy2024,
+                                    modern_version: None,
+                                } => {
+                                    negotiated_era = Some(ProtocolEra::Legacy2024);
+                                    ProtocolEra::Legacy2024
+                                }
+                                _ => {
+                                    if let Some(response) = protocol_era_refusal(&request)
+                                        && let Err(send_error) = send
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                            cx,
+                                            &JsonRpcMessage::Response(response),
+                                        )
+                                    {
+                                        error!(
+                                            target: targets::TRANSPORT,
+                                            "Failed to send protocol-era refusal; terminating transport: {send_error}"
+                                        );
+                                    }
+                                    self.graceful_shutdown(1);
+                                }
+                            }
+                        }
+                    };
+
+                    if matches!(era, ProtocolEra::Modern2026) {
+                        remove_modern_protocol_metadata(&mut request);
+                        let inbound = InboundRequestContext::new(
+                            cx.clone(),
+                            request_id_to_u64(request.id.as_ref()),
+                            InboundRequestTransport::Stdio,
+                        );
+                        self.dispatch_with_protocol_policy(
+                            ProtocolPolicy::ModernOnly,
+                            &inbound,
+                            &request,
+                        )
+                    } else {
+                        self.handle_request_internal(
+                            cx,
+                            &mut session,
+                            request,
+                            &notification_sender,
+                            &request_sender,
+                            None,
+                            None,
+                        )
+                    }
                 }
                 JsonRpcMessage::Response(response) => {
                     if response.validate().is_err() {
@@ -3129,6 +3418,8 @@ impl Server {
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let mut session = Session::new(self.info.clone(), self.capabilities.clone());
+        let era_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let mut negotiated_era = None;
 
         // Wrap send in Arc<Mutex> for shared access from bidirectional requests
         let send = Arc::new(Mutex::new(send));
@@ -3252,7 +3543,7 @@ impl Server {
 
             // Handle the message
             let response_opt = match message {
-                JsonRpcMessage::Request(request) => {
+                JsonRpcMessage::Request(mut request) => {
                     if request.validate().is_err() {
                         if let Err(send_error) = send_invalid_request(&send, cx, request.id) {
                             self.graceful_shutdown_returning();
@@ -3271,15 +3562,107 @@ impl Server {
                             stats.add_bytes_received(json.len() as u64 + 1); // +1 for newline
                         }
                     }
-                    self.handle_request_internal(
-                        cx,
-                        &mut session,
-                        request,
-                        &notification_sender,
-                        &request_sender,
-                        None,
-                        None,
-                    )
+                    let era = match negotiated_era {
+                        Some(ProtocolEra::Modern2026)
+                            if modern_protocol_version(&request)
+                                == Some(MODERN_PROTOCOL_VERSION) =>
+                        {
+                            ProtocolEra::Modern2026
+                        }
+                        Some(ProtocolEra::Legacy2024)
+                            if modern_protocol_version(&request).is_none()
+                                && (request.method != "initialize"
+                                    || is_exact_legacy_initialize(&request)) =>
+                        {
+                            ProtocolEra::Legacy2024
+                        }
+                        Some(_) => {
+                            if let Some(response) = protocol_era_refusal(&request)
+                                && let Err(send_error) = send
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                    cx,
+                                    &JsonRpcMessage::Response(response),
+                                )
+                            {
+                                self.graceful_shutdown_returning();
+                                return returning_send_result_with_connection_failure(
+                                    &send_error,
+                                    &connection_failure,
+                                );
+                            }
+                            self.graceful_shutdown_returning();
+                            return Err(server_run_error(
+                                "protocol",
+                                "era_admission",
+                                "Request does not match the negotiated MCP protocol era",
+                            ));
+                        }
+                        None => {
+                            match era_classifier.classify_opening(stdio_opening_frame(&request)) {
+                                StdioEraDecision::Selected {
+                                    era: ProtocolEra::Modern2026,
+                                    modern_version: Some(ModernVersionSupport::Supported),
+                                } => {
+                                    negotiated_era = Some(ProtocolEra::Modern2026);
+                                    ProtocolEra::Modern2026
+                                }
+                                StdioEraDecision::Selected {
+                                    era: ProtocolEra::Legacy2024,
+                                    modern_version: None,
+                                } => {
+                                    negotiated_era = Some(ProtocolEra::Legacy2024);
+                                    ProtocolEra::Legacy2024
+                                }
+                                _ => {
+                                    if let Some(response) = protocol_era_refusal(&request)
+                                        && let Err(send_error) = send
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                            cx,
+                                            &JsonRpcMessage::Response(response),
+                                        )
+                                    {
+                                        self.graceful_shutdown_returning();
+                                        return returning_send_result_with_connection_failure(
+                                            &send_error,
+                                            &connection_failure,
+                                        );
+                                    }
+                                    self.graceful_shutdown_returning();
+                                    return Err(server_run_error(
+                                        "protocol",
+                                        "era_admission",
+                                        "Request does not match the negotiated MCP protocol era",
+                                    ));
+                                }
+                            }
+                        }
+                    };
+
+                    if matches!(era, ProtocolEra::Modern2026) {
+                        remove_modern_protocol_metadata(&mut request);
+                        let inbound = InboundRequestContext::new(
+                            cx.clone(),
+                            request_id_to_u64(request.id.as_ref()),
+                            InboundRequestTransport::Stdio,
+                        );
+                        self.dispatch_with_protocol_policy(
+                            ProtocolPolicy::ModernOnly,
+                            &inbound,
+                            &request,
+                        )
+                    } else {
+                        self.handle_request_internal(
+                            cx,
+                            &mut session,
+                            request,
+                            &notification_sender,
+                            &request_sender,
+                            None,
+                            None,
+                        )
+                    }
                 }
                 JsonRpcMessage::Response(response) => {
                     if response.validate().is_err() {
@@ -7914,6 +8297,7 @@ mod lib_unit_tests {
                     )))
                 },
                 Arc::new(|_| {}),
+                None,
                 "test",
             );
 
@@ -7960,6 +8344,7 @@ mod lib_unit_tests {
                     )))
                 },
                 Arc::new(|_| {}),
+                None,
                 "test",
             );
 
@@ -7991,6 +8376,7 @@ mod lib_unit_tests {
                     panic!("dispatch worker send callback panic")
                 },
                 Arc::new(|_| {}),
+                None,
                 "test",
             );
 
@@ -8045,6 +8431,7 @@ mod lib_unit_tests {
                     Ok(())
                 },
                 Arc::new(|_| {}),
+                None,
                 "test",
             );
 
@@ -8096,6 +8483,7 @@ mod lib_unit_tests {
                 "stdio-test",
                 true,
                 Some(Arc::clone(&notification_failure)),
+                false,
             );
 
         assert!(notification_failure.load(Ordering::Acquire));
@@ -8533,6 +8921,7 @@ mod lib_unit_tests {
                     Ok(())
                 },
                 Arc::new(|_| {}),
+                None,
                 "test",
             )
             .expect("clean transport closure after a recoverable codec error must succeed");
@@ -8587,6 +8976,7 @@ mod lib_unit_tests {
                     Ok(())
                 },
                 Arc::new(|_| {}),
+                None,
                 "test",
             )
             .expect("clean transport closure after an invalid-request reply must succeed");
@@ -8629,6 +9019,7 @@ mod lib_unit_tests {
                     Ok(())
                 },
                 Arc::new(|_| {}),
+                None,
                 "test",
             )
             .expect_err("fatal framing failure must propagate from the returning loop");
