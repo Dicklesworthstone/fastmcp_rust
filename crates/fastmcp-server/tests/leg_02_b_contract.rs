@@ -3,17 +3,17 @@
 use std::collections::BTreeMap;
 
 use fastmcp_protocol::methods::{
-    Legacy2024Direction, Legacy2024ListChangedCapability, Legacy2024ResourcesCapability,
-    Legacy2024ServerCapabilities, LOGGING_SET_LEVEL, NOTIFICATIONS_CANCELLED,
+    LOGGING_SET_LEVEL, Legacy2024Direction, Legacy2024ListChangedCapability,
+    Legacy2024ResourcesCapability, Legacy2024ServerCapabilities, NOTIFICATIONS_CANCELLED,
     NOTIFICATIONS_INITIALIZED, NOTIFICATIONS_PROGRESS, PING, RESOURCES_SUBSCRIBE,
     RESOURCES_UNSUBSCRIBE, ROOTS_LIST, SAMPLING_CREATE_MESSAGE,
 };
 use fastmcp_server::legacy_2024::{
-    legacy_2024_b_digest_preimage, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Lifecycle,
-    Legacy2024Outbound, Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo,
-    Legacy2024StateSnapshot, LegacyAuthenticatedPeerPartition, LegacyPeerBinding,
+    Legacy2024Handler, Legacy2024HandlerError, Legacy2024Lifecycle, Legacy2024Outbound,
+    Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo, Legacy2024StateSnapshot,
+    LegacyAuthenticatedPeerPartition, LegacyPeerBinding, legacy_2024_b_digest_preimage,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const LEFT_OWNER: [u8; 32] = [0x41; 32];
 const RIGHT_OWNER: [u8; 32] = [0x42; 32];
@@ -417,10 +417,12 @@ fn leg_02_b_positive() {
     assert_eq!(left_rows.len(), 8);
     assert_eq!(right_rows.len(), 8);
     assert_eq!(left_rows.iter().chain(&right_rows).count(), 16);
-    assert!(left_rows
-        .iter()
-        .zip(&right_rows)
-        .all(|(left, right)| left != right));
+    assert!(
+        left_rows
+            .iter()
+            .zip(&right_rows)
+            .all(|(left, right)| left != right)
+    );
     assert_eq!(left.lifecycle(), Legacy2024Lifecycle::Closed);
     assert_eq!(right.lifecycle(), Legacy2024Lifecycle::Closed);
     assert_eq!(left.snapshot().close_release_count, 1);
