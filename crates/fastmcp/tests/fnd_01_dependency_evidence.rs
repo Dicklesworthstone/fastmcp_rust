@@ -16,8 +16,7 @@ const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
 #[cfg(test)]
 fn fresh_test_root(namespace: &str) -> std::path::PathBuf {
-    static NEXT_ROOT: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for _ in 0..1_024 {
         let sequence = NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::path::PathBuf::from("/tmp").join(format!(
