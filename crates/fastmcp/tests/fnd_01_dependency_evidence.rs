@@ -93059,17 +93059,16 @@ fn fallible(value: Option<u8>) {
         if !public_harness.is_absolute() {
             return Err(pending!("public harness path must be absolute"));
         }
-        let public_relative = public_harness
-            .strip_prefix(&source_root)
-            .map_err(|_| pending!("public harness must be inside the repository"))?
-            .to_str()
-            .ok_or_else(|| pending!("public harness path must be UTF-8"))?;
+        let expected = source_root.join("target/debug/examples/fnd_01_evidence_harness");
+        if public_harness != expected {
+            return Err(pending!("public harness must be the Cargo example artifact"));
+        }
         let (_, public_binding) = ordinary_checked_file_binding(
             &source_root,
-            public_relative,
+            "target/debug/examples/fnd_01_evidence_harness",
             MAX_GATE_EXECUTABLE_BYTES,
             None,
-            "public harness source",
+            "Cargo-built public harness",
         )?;
         ordinary_fixture_install_executable(&public_harness, &selected_executable)?;
         let (_, installed_binding) = ordinary_checked_file_binding(
