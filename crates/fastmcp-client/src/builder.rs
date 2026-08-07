@@ -37,10 +37,19 @@ use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::{StdioTransport, Transport};
 
 use crate::{
-    ChildGuard, ChildOwnership, Client, ClientSession, ProcessGroupAnchor, RequestTimeoutPolicy,
-    combine_cleanup_results, combine_operation_with_cleanup, is_cleanup_unverified,
-    resolve_stdio_command, transport_error_to_mcp,
+    ChildGuard, ChildOwnership, Client, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
+    ProcessGroupAnchor, RequestTimeoutPolicy, combine_cleanup_results,
+    combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
+    transport_error_to_mcp,
 };
+
+fn protocol_plan_error_to_mcp(error: ClientProtocolPlanError) -> McpError {
+    match error {
+        ClientProtocolPlanError::LegacyAdapterUnavailable { policy } => McpError::invalid_params(
+            format!("{policy:?} requires the installed exact 2024-11-05 client adapter"),
+        ),
+    }
+}
 
 /// Builder for configuring an MCP client.
 ///
@@ -68,6 +77,7 @@ pub struct ClientBuilder {
     auto_initialize: bool,
     /// Whether the subprocess must be isolated in an owned Unix process group.
     owned_process_group: bool,
+    protocol_plan: ClientProtocolPlan,
 }
 
 impl std::fmt::Debug for ClientBuilder {
@@ -120,6 +130,9 @@ impl ClientBuilder {
             capabilities: ClientCapabilities::default(),
             auto_initialize: false,
             owned_process_group: false,
+            protocol_plan: ClientProtocolPlan::stdio(
+                fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+            ),
         }
     }
 
@@ -276,6 +289,19 @@ impl ClientBuilder {
         self
     }
 
+    /// Selects an immutable protocol and endpoint plan before process creation.
+    #[must_use]
+    pub fn protocol_plan(mut self, protocol_plan: ClientProtocolPlan) -> Self {
+        self.protocol_plan = protocol_plan;
+        self
+    }
+
+    /// Returns the immutable protocol plan that will be validated before connect.
+    #[must_use]
+    pub const fn selected_protocol_plan(&self) -> &ClientProtocolPlan {
+        &self.protocol_plan
+    }
+
     /// Connects to a server via stdio subprocess.
     ///
     /// Spawns the specified command as a subprocess and communicates via
@@ -310,6 +336,9 @@ impl ClientBuilder {
         // auto-initialize must never return a live client that cannot issue its
         // first protocol request.
         self.timeout_policy.validate()?;
+        self.protocol_plan
+            .validate_for_stdio()
+            .map_err(protocol_plan_error_to_mcp)?;
         let mut last_error = None;
         // Compute attempts in u64 to avoid overflow when max_retries == u32::MAX.
         let attempts = u64::from(self.max_retries) + 1;
@@ -477,7 +506,8 @@ impl ClientBuilder {
             },
             fastmcp_protocol::ServerCapabilities::default(),
             String::new(),
-        );
+        )
+        .with_protocol_plan(self.protocol_plan.clone());
 
         Client::from_parts_uninitialized_with_ownership(
             child,
@@ -531,7 +561,8 @@ impl ClientBuilder {
             init_result.server_info,
             init_result.capabilities,
             init_result.protocol_version,
-        );
+        )
+        .with_protocol_plan(self.protocol_plan.clone());
 
         // Create client - disarm guard since Client now owns the subprocess
         let (child, group_anchor) = child_guard.disarm_all();

@@ -50,8 +50,12 @@ pub use execution::{
     ExecutionTerminalState, OpaquePagination, PaginationBounds, PendingRequestRecord, Request,
     RequestExecution, RequestExecutor, clt_01_a_manifest_digest, clt_01_b_manifest_digest,
 };
+pub use fastmcp_core::CanonicalHttpUrl;
+pub use fastmcp_protocol::protocol_policy::{
+    HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
+};
 pub use mcp_config::claude_desktop_config_path;
-pub use session::ClientSession;
+pub use session::{ClientProtocolPlan, ClientProtocolPlanError, ClientSession};
 
 use std::any::Any;
 use std::cell::Cell;
@@ -2712,6 +2716,7 @@ impl Client {
             }
         };
 
+        let protocol_plan = client.session.protocol_plan().clone();
         // Update session with server response
         client.session = ClientSession::new(
             client.session.client_info().clone(),
@@ -2719,7 +2724,8 @@ impl Client {
             init_result.server_info,
             init_result.capabilities,
             init_result.protocol_version,
-        );
+        )
+        .with_protocol_plan(protocol_plan);
 
         // Send the spec-correct `notifications/initialized` lifecycle notification.
         if let Err(error) = client.send_initialized_notification() {
@@ -2868,6 +2874,7 @@ impl Client {
             Err(error) => return Err(self.record_initialization_failure(error)),
         };
 
+        let protocol_plan = self.session.protocol_plan().clone();
         // Update session with server response
         self.session = ClientSession::new(
             self.session.client_info().clone(),
@@ -2875,7 +2882,8 @@ impl Client {
             init_result.server_info,
             init_result.capabilities,
             init_result.protocol_version,
-        );
+        )
+        .with_protocol_plan(protocol_plan);
 
         // Send the spec-correct `notifications/initialized` lifecycle notification.
         if let Err(error) = self.send_initialized_notification() {

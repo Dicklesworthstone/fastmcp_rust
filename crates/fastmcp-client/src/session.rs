@@ -1,6 +1,79 @@
 //! Client session state.
 
+use fastmcp_core::CanonicalHttpUrl;
+use fastmcp_protocol::protocol_policy::{
+    HttpEndpointBundle, HttpEndpointBundleError, ProtocolPolicy,
+};
 use fastmcp_protocol::{ClientCapabilities, ClientInfo, ServerCapabilities, ServerInfo};
+
+/// Immutable transport policy and trusted endpoint configuration for one client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientProtocolPlan {
+    policy: ProtocolPolicy,
+    http_endpoints: Option<HttpEndpointBundle>,
+}
+
+impl ClientProtocolPlan {
+    #[must_use]
+    pub const fn stdio(policy: ProtocolPolicy) -> Self {
+        Self {
+            policy,
+            http_endpoints: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn http(
+        policy: ProtocolPolicy,
+        modern_post: Option<CanonicalHttpUrl>,
+        legacy_sse: Option<CanonicalHttpUrl>,
+        legacy_message_post: Option<CanonicalHttpUrl>,
+        credential_partition: String,
+        transport_profile: String,
+        configuration_generation: u64,
+        legacy_receipt_generation: u64,
+    ) -> Result<Self, HttpEndpointBundleError> {
+        Ok(Self {
+            policy,
+            http_endpoints: Some(HttpEndpointBundle::new(
+                policy,
+                modern_post,
+                legacy_sse,
+                legacy_message_post,
+                credential_partition,
+                transport_profile,
+                configuration_generation,
+                legacy_receipt_generation,
+            )?),
+        })
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> ProtocolPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn http_endpoints(&self) -> Option<&HttpEndpointBundle> {
+        self.http_endpoints.as_ref()
+    }
+
+    pub(crate) fn validate_for_stdio(&self) -> Result<(), ClientProtocolPlanError> {
+        if self.policy.requires_legacy_adapter() {
+            return Err(ClientProtocolPlanError::LegacyAdapterUnavailable {
+                policy: self.policy,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Typed refusal raised before a client process can be spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientProtocolPlanError {
+    /// Auto and legacy-only require the exact installed LEG-03 adapter.
+    LegacyAdapterUnavailable { policy: ProtocolPolicy },
+}
 
 /// Client-side session state.
 #[derive(Debug)]
@@ -15,6 +88,8 @@ pub struct ClientSession {
     server_capabilities: ServerCapabilities,
     /// Negotiated protocol version.
     protocol_version: String,
+    /// Immutable policy and configured endpoint bundle for this client.
+    protocol_plan: ClientProtocolPlan,
 }
 
 impl ClientSession {
@@ -33,7 +108,14 @@ impl ClientSession {
             server_info,
             server_capabilities,
             protocol_version,
+            protocol_plan: ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
         }
+    }
+
+    #[must_use]
+    pub fn with_protocol_plan(mut self, protocol_plan: ClientProtocolPlan) -> Self {
+        self.protocol_plan = protocol_plan;
+        self
     }
 
     /// Returns the client info.
@@ -64,6 +146,11 @@ impl ClientSession {
     #[must_use]
     pub fn protocol_version(&self) -> &str {
         &self.protocol_version
+    }
+
+    #[must_use]
+    pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
+        &self.protocol_plan
     }
 }
 
