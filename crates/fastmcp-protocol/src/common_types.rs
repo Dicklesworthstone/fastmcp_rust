@@ -33,6 +33,13 @@ impl std::error::Error for CommonTypeError {}
 
 /// Maximum encoded bytes admitted for ordinary URI wire fields.
 pub const MAX_ABSOLUTE_URI_BYTES: usize = 64 * 1024;
+/// Maximum bytes in a `data:` icon media-type and parameter prefix, through the comma.
+pub const MAX_ICON_DATA_URI_PREFIX_BYTES: usize = 1024;
+/// Maximum decoded bytes represented by a raw icon `data:` URI.
+pub const MAX_ICON_DATA_URI_DECODED_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum encoded bytes in a raw icon `data:` URI, including its prefix.
+pub const MAX_ICON_DATA_URI_ENCODED_BYTES: usize =
+    4 * MAX_ICON_DATA_URI_DECODED_BYTES.div_ceil(3) + MAX_ICON_DATA_URI_PREFIX_BYTES;
 /// Maximum UTF-8 bytes admitted for a peer cancellation reason.
 pub const MAX_CANCELLATION_REASON_BYTES: usize = 4 * 1024;
 /// Maximum number of retained open metadata entries.
@@ -117,6 +124,112 @@ impl<'de> Deserialize<'de> for AbsoluteUri {
         String::deserialize(deserializer)
             .and_then(|value| Self::parse(value).map_err(serde::de::Error::custom))
     }
+}
+
+/// A raw icon source URI with a dedicated data-image budget.
+///
+/// This is a wire-admission type only: it preserves a schema-valid source exactly and does not
+/// fetch, render, or otherwise grant authority over it.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct RawIconSourceUri(String);
+
+impl RawIconSourceUri {
+    /// Parses a raw icon source without normalizing its wire spelling.
+    pub fn parse(value: impl Into<String>) -> Result<Self, CommonTypeError> {
+        let value = value.into();
+        let Some(colon) = value.find(':') else {
+            return Err(CommonTypeError::Invalid("URI scheme"));
+        };
+        let scheme = &value[..colon];
+        let limit = if scheme.eq_ignore_ascii_case("data") {
+            MAX_ICON_DATA_URI_ENCODED_BYTES
+        } else {
+            MAX_ABSOLUTE_URI_BYTES
+        };
+        if value.is_empty() || value.len() > limit {
+            return Err(if value.len() > limit {
+                CommonTypeError::TooLong("icon source URI")
+            } else {
+                CommonTypeError::Invalid("absolute URI")
+            });
+        }
+        if !value.is_ascii()
+            || value.bytes().any(|byte| byte <= 0x20 || byte == 0x7f)
+            || scheme.is_empty()
+            || !scheme.as_bytes()[0].is_ascii_alphabetic()
+            || !scheme
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+            || !valid_uri_remainder(&value[colon + 1..])
+        {
+            return Err(CommonTypeError::Invalid("absolute URI"));
+        }
+        if scheme.eq_ignore_ascii_case("data") {
+            let before_fragment = value
+                .split_once('#')
+                .map_or(value.as_str(), |(before_fragment, _)| before_fragment);
+            let structural_data_uri = before_fragment
+                .split_once('?')
+                .map_or(before_fragment, |(before_query, _)| before_query);
+            validate_icon_data_uri(structural_data_uri)?;
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the exact schema-valid source spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RawIconSourceUri {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)
+            .and_then(|value| Self::parse(value).map_err(serde::de::Error::custom))
+    }
+}
+
+fn validate_icon_data_uri(value: &str) -> Result<(), CommonTypeError> {
+    let data = &value["data:".len()..];
+    let Some((prefix, payload)) = data.split_once(',') else {
+        return Err(CommonTypeError::Invalid("icon data URI"));
+    };
+    if prefix.len() + 1 > MAX_ICON_DATA_URI_PREFIX_BYTES {
+        return Err(CommonTypeError::TooLong("icon data URI prefix"));
+    }
+    let Some(media_type) = prefix.strip_suffix(";base64") else {
+        return Err(CommonTypeError::Invalid("icon data URI"));
+    };
+    if !media_type
+        .split_once('/')
+        .is_some_and(|(kind, _)| kind.eq_ignore_ascii_case("image"))
+        || !valid_mime_type(media_type)
+    {
+        return Err(CommonTypeError::Invalid("icon data MIME type"));
+    }
+    let decoded_upper_bound = base64_decoded_upper_bound(payload)?;
+    if decoded_upper_bound > MAX_ICON_DATA_URI_DECODED_BYTES {
+        return Err(CommonTypeError::TooLong("icon data URI"));
+    }
+    validate_standard_base64(payload)
+}
+
+fn base64_decoded_upper_bound(value: &str) -> Result<usize, CommonTypeError> {
+    let unpadded = value.trim_end_matches('=');
+    if unpadded.len() % 4 == 1 || value[..unpadded.len()].contains('=') {
+        return Err(CommonTypeError::Invalid("base64 content"));
+    }
+    let groups = unpadded.len() / 4;
+    let remainder = unpadded.len() % 4;
+    groups
+        .checked_mul(3)
+        .and_then(|size| size.checked_add(if remainder == 0 { 0 } else { remainder - 1 }))
+        .ok_or(CommonTypeError::TooLong("base64 content"))
 }
 
 fn valid_uri_remainder(value: &str) -> bool {
@@ -269,9 +382,12 @@ impl Serialize for OpaqueCursor {
         S: serde::Serializer,
     {
         match self {
-            // A standalone value cannot represent an absent object member. `null` is therefore
-            // reserved for the helper's direct serde form; enclosing wire objects omit the field.
-            Self::Absent => serializer.serialize_none(),
+            // A standalone value cannot represent an absent object member. Enclosing wire
+            // objects must omit an absent cursor; serializing it as `null` would conflate two
+            // distinct wire states.
+            Self::Absent => Err(serde::ser::Error::custom(
+                "an absent cursor must be omitted from its enclosing object",
+            )),
             Self::Present(value) => serializer.serialize_str(value),
         }
     }
@@ -282,8 +398,9 @@ impl<'de> Deserialize<'de> for OpaqueCursor {
     where
         D: serde::Deserializer<'de>,
     {
-        Option::<String>::deserialize(deserializer)
-            .and_then(|value| Self::try_from_presence(value).map_err(serde::de::Error::custom))
+        String::deserialize(deserializer).and_then(|value| {
+            Self::try_from_presence(Some(value)).map_err(serde::de::Error::custom)
+        })
     }
 }
 
@@ -408,6 +525,18 @@ impl<'de> Deserialize<'de> for Implementation {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
+        reject_unknown_fields(
+            &value,
+            &[
+                "name",
+                "version",
+                "title",
+                "description",
+                "websiteUrl",
+                "icons",
+            ],
+        )
+        .map_err(serde::de::Error::custom)?;
         reject_explicit_null_fields(&value, &["title", "description", "websiteUrl", "icons"])
             .map_err(serde::de::Error::custom)?;
         let wire: ImplementationWire =
@@ -590,6 +719,19 @@ fn reject_explicit_null_fields(value: &Value, fields: &[&str]) -> Result<(), Com
     Ok(())
 }
 
+fn reject_unknown_fields(value: &Value, allowed: &[&str]) -> Result<(), CommonTypeError> {
+    let object = value
+        .as_object()
+        .ok_or(CommonTypeError::Invalid("wire object"))?;
+    if object
+        .keys()
+        .any(|field| !allowed.iter().any(|known| field == known))
+    {
+        return Err(CommonTypeError::Invalid("unknown wire field"));
+    }
+    Ok(())
+}
+
 fn valid_reverse_dns_prefix(prefix: &str) -> bool {
     let labels = prefix.split('.').collect::<Vec<_>>();
     labels.len() >= 2
@@ -735,7 +877,7 @@ pub enum IconTheme {
 #[serde(rename_all = "camelCase")]
 pub struct RawIcon {
     /// Required schema URI source.
-    pub src: AbsoluteUri,
+    pub src: RawIconSourceUri,
     /// Optional peer MIME declaration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
@@ -751,7 +893,7 @@ impl RawIcon {
     /// Constructs a raw icon with a required absolute source.
     pub fn try_new(src: impl Into<String>) -> Result<Self, CommonTypeError> {
         Ok(Self {
-            src: AbsoluteUri::parse(src)?,
+            src: RawIconSourceUri::parse(src)?,
             mime_type: None,
             sizes: None,
             theme: None,
@@ -772,7 +914,7 @@ impl RawIcon {
             return Err(CommonTypeError::TooLong("icon sizes"));
         }
         Ok(Self {
-            src: AbsoluteUri::parse(src)?,
+            src: RawIconSourceUri::parse(src)?,
             mime_type,
             sizes,
             theme,
@@ -789,7 +931,7 @@ impl RawIcon {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawIconWire {
-    src: AbsoluteUri,
+    src: RawIconSourceUri,
     #[serde(default)]
     mime_type: Option<String>,
     #[serde(default)]
@@ -804,6 +946,8 @@ impl<'de> Deserialize<'de> for RawIcon {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
+        reject_unknown_fields(&value, &["src", "mimeType", "sizes", "theme"])
+            .map_err(serde::de::Error::custom)?;
         reject_explicit_null_fields(&value, &["mimeType", "sizes", "theme"])
             .map_err(serde::de::Error::custom)?;
         let wire: RawIconWire = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
@@ -867,6 +1011,8 @@ impl<'de> Deserialize<'de> for Annotations {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
+        reject_unknown_fields(&value, &["audience", "priority", "lastModified"])
+            .map_err(serde::de::Error::custom)?;
         reject_explicit_null_fields(&value, &["audience", "priority", "lastModified"])
             .map_err(serde::de::Error::custom)?;
         let wire: AnnotationsWire =
@@ -915,6 +1061,8 @@ impl<'de> Deserialize<'de> for ResourceLink {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
+        reject_unknown_fields(&value, &["uri", "name", "annotations", "_meta"])
+            .map_err(serde::de::Error::custom)?;
         reject_explicit_null_fields(&value, &["annotations", "_meta"])
             .map_err(serde::de::Error::custom)?;
         let wire: ResourceLinkWire =
@@ -973,6 +1121,25 @@ impl<'de> Deserialize<'de> for EmbeddedResourceContents {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("embedded resource must be an object"))?;
+        let has_text = object.contains_key("text");
+        let has_blob = object.contains_key("blob");
+        if has_text == has_blob {
+            return Err(serde::de::Error::custom(
+                "embedded resource requires exactly one of text or blob",
+            ));
+        }
+        reject_unknown_fields(
+            &value,
+            if has_text {
+                &["uri", "text", "mimeType"]
+            } else {
+                &["uri", "blob", "mimeType"]
+            },
+        )
+        .map_err(serde::de::Error::custom)?;
         reject_explicit_null_fields(&value, &["mimeType"]).map_err(serde::de::Error::custom)?;
         let wire: EmbeddedResourceContentsWire =
             serde_json::from_value(value).map_err(serde::de::Error::custom)?;
@@ -1103,13 +1270,25 @@ impl<'de> Deserialize<'de> for ContentBlock {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("missing content discriminator"))?;
+        let allowed = match kind {
+            "text" => &["type", "text", "annotations", "_meta"][..],
+            "image" | "audio" => &["type", "data", "mimeType", "annotations", "_meta"][..],
+            "resource_link" => &["type", "uri", "name", "annotations", "_meta"][..],
+            "resource" => &["type", "resource", "annotations", "_meta"][..],
+            _ => return Err(serde::de::Error::custom("content discriminator")),
+        };
+        reject_unknown_fields(&value, allowed).map_err(serde::de::Error::custom)?;
         reject_explicit_null_fields(&value, &["annotations", "_meta"])
             .map_err(serde::de::Error::custom)?;
-        if value.get("type").and_then(Value::as_str) == Some("resource") {
+        if kind == "resource" {
             let resource = value
                 .get("resource")
                 .ok_or_else(|| serde::de::Error::custom("missing embedded resource"))?;
-            reject_explicit_null_fields(resource, &["mimeType"])
+            let _ = serde_json::from_value::<EmbeddedResourceContents>(resource.clone())
                 .map_err(serde::de::Error::custom)?;
         }
         let wire: ContentBlockWire =

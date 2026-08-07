@@ -6,11 +6,13 @@
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, CancellationNotification, CancellationRequestId, CommonTypeError,
     CommonWireDirection, ContentBlock, EmbeddedResourceContents, FinalCommonTypesSchema,
-    Implementation, OpaqueCursor, OpenMetadata, RawIcon, TraceContext, MAX_ABSOLUTE_URI_BYTES,
-    MAX_CANCELLATION_REASON_BYTES, MAX_CONTENT_ENCODED_BYTES, MAX_CURSOR_BYTES,
-    MAX_ICON_SIZE_BYTES, MAX_ICON_SIZE_ENTRIES, MAX_METADATA_ENTRIES, MAX_TRACE_FIELD_BYTES,
+    Implementation, MAX_ABSOLUTE_URI_BYTES, MAX_CANCELLATION_REASON_BYTES,
+    MAX_CONTENT_ENCODED_BYTES, MAX_CURSOR_BYTES, MAX_ICON_DATA_URI_DECODED_BYTES,
+    MAX_ICON_DATA_URI_ENCODED_BYTES, MAX_ICON_DATA_URI_PREFIX_BYTES, MAX_ICON_SIZE_BYTES,
+    MAX_ICON_SIZE_ENTRIES, MAX_METADATA_ENTRIES, MAX_TRACE_FIELD_BYTES, OpaqueCursor, OpenMetadata,
+    RawIcon, TraceContext,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn request_metadata() -> OpenMetadata {
     OpenMetadata::try_from_entries([
@@ -75,18 +77,24 @@ fn prt_02_a_positive() {
         OpaqueCursor::from_presence(Some("next".to_owned())).as_present(),
         Some("next")
     );
-    assert!(!CancellationNotification::try_new(
-        CancellationRequestId::String("req".to_owned()),
-        None
-    )
-    .expect("cancellation without reason")
-    .has_untrusted_reason());
-    assert!(CancellationNotification::try_new(
-        CancellationRequestId::Integer(7),
-        Some(String::new())
-    )
-    .expect("cancellation with empty reason")
-    .has_untrusted_reason());
+    let present_cursor = OpaqueCursor::try_from_presence(Some(String::new())).expect("cursor");
+    assert_eq!(
+        serde_json::from_value::<OpaqueCursor>(
+            serde_json::to_value(&present_cursor).expect("present cursor wire")
+        )
+        .expect("present cursor round trip"),
+        present_cursor
+    );
+    assert!(
+        !CancellationNotification::try_new(CancellationRequestId::String("req".to_owned()), None)
+            .expect("cancellation without reason")
+            .has_untrusted_reason()
+    );
+    assert!(
+        CancellationNotification::try_new(CancellationRequestId::Integer(7), Some(String::new()))
+            .expect("cancellation with empty reason")
+            .has_untrusted_reason()
+    );
 
     let icon = RawIcon::try_with_details(
         "https://example.test/icon.svg?variant=1#exact",
@@ -99,6 +107,22 @@ fn prt_02_a_positive() {
     assert_eq!(
         serde_json::from_value::<RawIcon>(icon_wire).expect("icon round trip"),
         icon
+    );
+    let data_icon = RawIcon::try_new("DATA:image/png;base64,aGVsbG8=?cache=opaque#fragment")
+        .expect("raw data icon with preserved query and fragment");
+    assert_eq!(
+        data_icon.src.as_str(),
+        "DATA:image/png;base64,aGVsbG8=?cache=opaque#fragment"
+    );
+    let over_ordinary_uri_limit = format!(
+        "data:image/png;base64,{}",
+        "A".repeat(MAX_ABSOLUTE_URI_BYTES)
+    );
+    RawIcon::try_new(over_ordinary_uri_limit)
+        .expect("data icon uses its dedicated bound rather than the ordinary URI bound");
+    assert_eq!(
+        MAX_ICON_DATA_URI_ENCODED_BYTES,
+        4 * MAX_ICON_DATA_URI_DECODED_BYTES.div_ceil(3) + MAX_ICON_DATA_URI_PREFIX_BYTES
     );
 
     let content_rows = [
@@ -152,6 +176,61 @@ fn prt_02_a_planted_negative() {
         accepted_metadata, metadata_baseline,
         "rejected key cannot mutate metadata"
     );
+
+    let cursor = OpaqueCursor::from_presence(None);
+    assert!(
+        serde_json::to_value(&cursor).is_err(),
+        "a standalone absent cursor must not serialize as explicit null"
+    );
+    assert!(
+        serde_json::from_value::<OpaqueCursor>(Value::Null).is_err(),
+        "explicit null is distinct from an omitted nextCursor member"
+    );
+
+    let accepted_resource = json!({
+        "type": "resource",
+        "resource": {
+            "uri": "https://example.test/embedded",
+            "text": "baseline"
+        }
+    });
+    let resource_baseline = accepted_resource.clone();
+    let mut conflicting_resource = accepted_resource.clone();
+    conflicting_resource["resource"]["blob"] = json!("aGVsbG8=");
+    assert!(
+        serde_json::from_value::<ContentBlock>(conflicting_resource).is_err(),
+        "only the conflicting content member changes"
+    );
+    assert_eq!(
+        accepted_resource, resource_baseline,
+        "a rejected conflicting member cannot mutate accepted wire"
+    );
+
+    let accepted_content = json!({"type": "text", "text": "baseline"});
+    let content_baseline = accepted_content.clone();
+    let mut unknown_member = accepted_content.clone();
+    unknown_member["unrecognized"] = json!(true);
+    assert!(
+        serde_json::from_value::<ContentBlock>(unknown_member).is_err(),
+        "only one unknown content member changes"
+    );
+    assert_eq!(
+        accepted_content, content_baseline,
+        "a rejected unknown member cannot mutate accepted wire"
+    );
+
+    let accepted_data_icon = RawIcon::try_new("data:image/png;base64,aGVsbG8=")
+        .expect("accepted image data icon baseline");
+    let data_icon_baseline = accepted_data_icon.clone();
+    assert_eq!(
+        RawIcon::try_new("data:text/plain;base64,aGVsbG8="),
+        Err(CommonTypeError::Invalid("icon data MIME type")),
+        "only the data URI media type changes from image to text"
+    );
+    assert_eq!(
+        accepted_data_icon, data_icon_baseline,
+        "a rejected data MIME cannot mutate accepted icon state"
+    );
 }
 
 #[test]
@@ -190,9 +269,11 @@ fn prt_02_b_positive() {
     );
 
     let icon = json!({"src": "HTTPS://example.test/icon.svg", "sizes": [], "theme": "dark"});
-    assert!(!FinalCommonTypesSchema::validate_icon(&icon)
-        .expect("icon schema")
-        .effective_any_size());
+    assert!(
+        !FinalCommonTypesSchema::validate_icon(&icon)
+            .expect("icon schema")
+            .effective_any_size()
+    );
     let cancellation = json!({
         "method": "notifications/cancelled",
         "params": {"requestId": "request-7", "reason": "bounded"}
@@ -229,12 +310,14 @@ fn prt_02_b_positive() {
         MAX_CANCELLATION_REASON_BYTES - 1,
         MAX_CANCELLATION_REASON_BYTES,
     ] {
-        assert!(CancellationNotification::try_new(
-            CancellationRequestId::Integer(1),
-            Some("x".repeat(length))
-        )
-        .expect("cancellation reason at bound")
-        .has_untrusted_reason());
+        assert!(
+            CancellationNotification::try_new(
+                CancellationRequestId::Integer(1),
+                Some("x".repeat(length))
+            )
+            .expect("cancellation reason at bound")
+            .has_untrusted_reason()
+        );
     }
     let sizes = vec!["x".repeat(MAX_ICON_SIZE_BYTES); MAX_ICON_SIZE_ENTRIES];
     RawIcon::try_with_details("https://example.test/icon", None, Some(sizes), None)
