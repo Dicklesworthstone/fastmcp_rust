@@ -2425,12 +2425,14 @@ mod tests {
         let policy = CanonicalResourceIdPolicy::DEFAULT.with_resource_significant_query();
         let endpoint =
             CanonicalHttpUrl::parse("https://public.example.test/mcp?tenant=one").unwrap();
-        assert!(CanonicalResourceId::parse_for_endpoint(
-            "https://public.example.test/mcp?tenant=one",
-            &endpoint,
-            policy,
-        )
-        .is_ok());
+        assert!(
+            CanonicalResourceId::parse_for_endpoint(
+                "https://public.example.test/mcp?tenant=one",
+                &endpoint,
+                policy,
+            )
+            .is_ok()
+        );
         assert_eq!(
             CanonicalResourceId::parse_for_endpoint(
                 "https://public.example.test/mcp?tenant=two",
@@ -2449,12 +2451,14 @@ mod tests {
         );
 
         let empty_endpoint = CanonicalHttpUrl::parse("https://public.example.test/mcp?").unwrap();
-        assert!(CanonicalResourceId::parse_for_endpoint(
-            "https://public.example.test/mcp?",
-            &empty_endpoint,
-            policy,
-        )
-        .is_ok());
+        assert!(
+            CanonicalResourceId::parse_for_endpoint(
+                "https://public.example.test/mcp?",
+                &empty_endpoint,
+                policy,
+            )
+            .is_ok()
+        );
         assert_eq!(
             CanonicalResourceId::parse_for_endpoint(
                 "https://public.example.test/mcp",
@@ -2583,7 +2587,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            CanonicalResourceId::parse_for_configured_endpoints("https://example.test/mcp", &[],),
+            CanonicalResourceId::parse_for_configured_endpoints("https://example.test/mcp", &[]),
             Err(CanonicalResourceIdError::ConfiguredEndpointSetEmpty)
         );
     }

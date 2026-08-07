@@ -9,8 +9,8 @@ use std::fmt::Debug;
 
 use fastmcp_core::uri::ConfiguredResourceEndpoint;
 use fastmcp_core::{
-    sha256_bounded, AbsoluteUri, AbsoluteUriError, CanonicalHttpUrl, CanonicalHttpUrlError,
-    CanonicalResourceId, CanonicalResourceIdError, CanonicalResourceIdPolicy, UriComponentState,
+    AbsoluteUri, AbsoluteUriError, CanonicalHttpUrl, CanonicalHttpUrlError, CanonicalResourceId,
+    CanonicalResourceIdError, CanonicalResourceIdPolicy, UriComponentState, sha256_bounded,
 };
 
 const TRACE_HASH_MAX_BYTES: usize = 4 * 1024;
@@ -42,7 +42,7 @@ fn trace_case(
 ) {
     eprintln!(
         concat!(
-            "{\"event\":\"fnd01_uri\",\"test_id\":{},\"case_id\":{},",
+            "{{\"event\":\"fnd01_uri\",\"test_id\":{},\"case_id\":{},",
             "\"public_api\":{},\"baseline_sha256\":{},\"planted_field\":{},",
             "\"result\":{},\"canonical_output\":{},\"input_pre_sha256\":{},",
             "\"input_post_sha256\":{},\"configuration_pre_sha256\":{},",
