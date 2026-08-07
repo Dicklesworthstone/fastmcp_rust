@@ -1,9 +1,9 @@
 use asupersync::Cx;
 use fastmcp_client::{
-    CanonicalHttpUrl, ClientBuilder, ClientInfo, ClientProtocolPlan, ClientSession, ProtocolEra,
-    ProtocolPolicy, ServerCapabilities, ServerInfo,
+    CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ClientSession, ProtocolEra, ProtocolPolicy,
 };
 use fastmcp_core::McpErrorCode;
+use fastmcp_protocol::{ClientInfo, ServerCapabilities, ServerInfo};
 
 const ABSENT_STDIO_COMMAND: &str = "./clt-02-intentionally-absent-server";
 
