@@ -172,6 +172,8 @@ impl std::error::Error for Legacy2024AdapterError {}
 pub struct Legacy2024StateSnapshot {
     /// Current lifecycle state.
     pub lifecycle: Legacy2024Lifecycle,
+    /// Number of successful transitions into `Operating` for this binding.
+    pub operating_transition_count: u64,
     /// Frozen exact client capability bytes, if initialization committed.
     pub client_capabilities_bytes: Vec<u8>,
     /// Count of retained resource subscriptions.
@@ -186,6 +188,7 @@ pub struct Legacy2024StateSnapshot {
 pub struct Legacy2024ServerAdapter<H> {
     binding: LegacyPeerBinding,
     lifecycle: Legacy2024Lifecycle,
+    operating_transition_count: u64,
     config: Legacy2024ServerConfig,
     handler: H,
     client_capabilities: Option<Legacy2024ClientCapabilities>,
@@ -207,6 +210,7 @@ where
         Self {
             binding,
             lifecycle: Legacy2024Lifecycle::AwaitInitialize,
+            operating_transition_count: 0,
             config,
             handler,
             client_capabilities: None,
@@ -236,6 +240,7 @@ where
     pub fn snapshot(&self) -> Legacy2024StateSnapshot {
         Legacy2024StateSnapshot {
             lifecycle: self.lifecycle,
+            operating_transition_count: self.operating_transition_count,
             client_capabilities_bytes: self.client_capabilities_bytes.clone(),
             subscription_count: self.subscriptions.len(),
             control_notification_count: self.control_notification_count,
@@ -381,6 +386,7 @@ where
             )),
             Legacy2024Lifecycle::AwaitInitialized if method == NOTIFICATIONS_INITIALIZED => {
                 self.lifecycle = Legacy2024Lifecycle::Operating;
+                self.operating_transition_count = self.operating_transition_count.saturating_add(1);
                 Ok(())
             }
             Legacy2024Lifecycle::AwaitInitialized => Err(Legacy2024AdapterError::invalid_request(
@@ -823,9 +829,73 @@ mod tests {
         lifecycle_rows.push(adapter.receive(binding, json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progressToken": 1, "progress": 1}})).unwrap());
 
         assert_eq!(lifecycle_rows.len(), 12);
+        assert_eq!(
+            lifecycle_rows[0],
+            Legacy2024Outbound::Response(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "logging": {},
+                        "prompts": {},
+                        "resources": {"subscribe": true},
+                        "tools": {},
+                    },
+                    "serverInfo": {"name": "legacy-server", "version": "1.0.0"},
+                    "instructions": "exact legacy profile",
+                },
+            }))
+        );
+        assert_eq!(lifecycle_rows[1], Legacy2024Outbound::NoResponse);
+        for (row, id, method) in [
+            (2, 2, TOOLS_LIST),
+            (3, 3, RESOURCES_LIST),
+            (4, 4, PROMPTS_LIST),
+            (5, 5, COMPLETION_COMPLETE),
+        ] {
+            assert_eq!(
+                lifecycle_rows[row],
+                Legacy2024Outbound::Response(json!({
+                    "jsonrpc": "2.0", "id": id, "result": {"handled": method},
+                }))
+            );
+        }
+        assert_eq!(
+            lifecycle_rows[6],
+            Legacy2024Outbound::Response(json!({"jsonrpc": "2.0", "id": 6, "result": {}}))
+        );
+        assert_eq!(
+            lifecycle_rows[7],
+            Legacy2024Outbound::ReverseRequest(
+                json!({"jsonrpc": "2.0", "id": 1, "method": ROOTS_LIST, "params": {}})
+            )
+        );
+        assert_eq!(
+            lifecycle_rows[8],
+            Legacy2024Outbound::ReverseRequest(json!({
+                "jsonrpc": "2.0", "id": 2,
+                "method": SAMPLING_CREATE_MESSAGE, "params": {"messages": []},
+            }))
+        );
+        assert_eq!(
+            lifecycle_rows[9],
+            Legacy2024Outbound::Response(json!({"jsonrpc": "2.0", "id": 7, "result": {}}))
+        );
+        assert_eq!(lifecycle_rows[10], Legacy2024Outbound::NoResponse);
+        assert_eq!(lifecycle_rows[11], Legacy2024Outbound::NoResponse);
         assert_eq!(adapter.lifecycle(), Legacy2024Lifecycle::Operating);
+        assert_eq!(adapter.snapshot().operating_transition_count, 1);
         assert_eq!(adapter.snapshot().control_notification_count, 2);
         assert_eq!(adapter.snapshot().subscription_count, 1);
+        assert_eq!(
+            adapter.handler.methods,
+            vec![
+                TOOLS_LIST,
+                RESOURCES_LIST,
+                PROMPTS_LIST,
+                COMPLETION_COMPLETE
+            ]
+        );
     }
 
     #[test]
