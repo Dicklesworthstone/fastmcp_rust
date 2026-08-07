@@ -7460,7 +7460,7 @@ mod helper_function_tests {
                 .as_ref()
                 .and_then(|result| result.pointer("/content/0/text"))
                 .and_then(serde_json::Value::as_str),
-            Some("Hello, stateless client")
+            Some("Hello, stateless client!")
         );
         assert_eq!(inbound.request_id(), 71);
         assert_eq!(inbound.transport(), InboundRequestTransport::Memory);
