@@ -7898,7 +7898,7 @@ mod tests {
             progress: 0.5,
             total: Some(1.0),
             message: Some("half".into()),
-            _meta: None,
+            meta: None,
         };
         let debug = format!("{:?}", params);
         assert!(debug.contains("progress"));
