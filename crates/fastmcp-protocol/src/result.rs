@@ -1029,8 +1029,8 @@ mod tests {
             .expect("pristine input is unchanged by the rejection");
         let (DecodedResult::Complete(before), DecodedResult::Complete(after)) = (baseline, reaccepted) else { panic!("complete baseline"); };
         assert_eq!(before.extras, after.extras);
-        assert_eq!(encode_result(&DecodedResult::Complete(before)), accepted);
         assert_eq!(before.extras.members().first().map(|member| &member.value), Some(&ExactJsonValue::Object(ExactJsonObject { members: vec![ExactJsonMember { name: "count".to_owned(), value: ExactJsonValue::Number("1.20e+4".to_owned()) }] })));
+        assert_eq!(encode_result(&DecodedResult::Complete(before)), accepted);
     }
 
     #[derive(Debug, PartialEq, Eq)]
