@@ -38,8 +38,11 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+pub mod common_types;
 mod jsonrpc;
 mod messages;
+pub mod protocol_policy;
+pub mod protocol_version;
 mod result;
 pub mod methods;
 pub mod schema;

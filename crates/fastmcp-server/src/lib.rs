@@ -67,6 +67,7 @@ pub mod caching;
 // FND-01: Docket/Redis is not part of the FND-01 production surface. Source bytes
 // remain on disk (no-deletion) and are package-excluded; do not re-export.
 mod handler;
+pub mod legacy_2024;
 mod middleware;
 pub mod oauth;
 pub mod oidc;
