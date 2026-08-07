@@ -40,14 +40,22 @@
 
 mod jsonrpc;
 mod messages;
+mod result;
 pub mod methods;
 pub mod schema;
 mod types;
 
 pub use jsonrpc::{
-    JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    MAX_JSONRPC_STRING_ID_ENCODED_BYTES, RequestId,
+    JSONRPC_VERSION, ClientIngressFailureScope, CorrelationKey, JsonRpcAdmissionError,
+    JsonRpcEndpointRole,
+    JsonRpcError, JsonRpcMessage, JsonRpcMessageDirection, JsonRpcRequest, JsonRpcResponse,
+    RawJsonAdmissionError, RawJsonRpcDisposition, RequestId, UncorrelatedJsonRpcErrorResponse,
+    MAX_JSONRPC_STRING_ID_ENCODED_BYTES, MAX_RAW_JSON_AGGREGATE_NUMBER_BYTES,
+    MAX_RAW_JSON_CONTAINER_ENTRIES, MAX_RAW_JSON_EXPONENT, MAX_RAW_JSON_NESTING_DEPTH,
+    MAX_RAW_JSON_NUMBER_BYTES, admit_raw_jsonrpc_document, decode_strict_jsonrpc_message,
+    dispose_raw_jsonrpc_failure,
 };
 pub use messages::*;
+pub use result::*;
 pub use schema::{ValidationError, ValidationResult, validate, validate_strict};
 pub use types::*;

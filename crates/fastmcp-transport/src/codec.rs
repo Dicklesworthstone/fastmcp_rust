@@ -3,7 +3,8 @@
 //! MCP uses newline-delimited JSON (NDJSON) for message framing.
 
 use fastmcp_protocol::{
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, MAX_JSONRPC_STRING_ID_ENCODED_BYTES, RequestId,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
+    MAX_JSONRPC_STRING_ID_ENCODED_BYTES, admit_raw_jsonrpc_document,
 };
 use std::collections::BTreeSet;
 
@@ -817,6 +818,17 @@ impl Codec {
                 "expected a JSON-RPC request, received a response envelope",
             ));
         }
+
+        // Keep the protocol-owned raw admission primitive in the production
+        // decode path. The local scanner above retains envelope classification
+        // for direction-safe codec diagnostics; this call makes the shared
+        // strict UTF-8/BOM/duplicate/limit contract authoritative before any
+        // `serde_json` typed envelope is constructed.
+        admit_raw_jsonrpc_document(frame, self.max_message_size).map_err(|error| {
+            CodecError::Json(<serde_json::Error as serde::de::Error>::custom(
+                error.to_string(),
+            ))
+        })?;
 
         Ok(EnvelopeAdmission { kind, request_id })
     }

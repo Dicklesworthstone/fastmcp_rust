@@ -1,8 +1,9 @@
 //! JSON-RPC 2.0 message types.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
-use serde::de::{Error as _, Visitor};
+use serde::de::Error as _;
 use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -12,6 +13,371 @@ pub const JSONRPC_VERSION: &str = "2.0";
 
 /// Maximum encoded bytes in one JSON-RPC string ID, including quotes.
 pub const MAX_JSONRPC_STRING_ID_ENCODED_BYTES: usize = 256;
+
+/// Default maximum nesting depth for raw JSON admission.
+pub const MAX_RAW_JSON_NESTING_DEPTH: usize = 64;
+/// Default maximum aggregate object members and array elements for raw JSON admission.
+pub const MAX_RAW_JSON_CONTAINER_ENTRIES: usize = 100_000;
+/// Maximum encoded bytes in one JSON number token before typed decoding.
+pub const MAX_RAW_JSON_NUMBER_BYTES: usize = 4 * 1024;
+/// Maximum aggregate encoded number bytes in one admitted JSON document.
+pub const MAX_RAW_JSON_AGGREGATE_NUMBER_BYTES: usize = 256 * 1024;
+/// Maximum absolute decimal exponent accepted by raw JSON admission.
+pub const MAX_RAW_JSON_EXPONENT: usize = 10_000;
+
+/// A stable reason why raw JSON was rejected before typed decoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawJsonAdmissionError {
+    DocumentTooLarge,
+    InvalidUtf8,
+    ByteOrderMark,
+    InvalidSyntax,
+    TopLevelBatch,
+    TopLevelNotObject,
+    DuplicateObjectMember,
+    NestingTooDeep,
+    TooManyContainerEntries,
+    NumberTooLong,
+    TooManyNumberBytes,
+    ExponentTooLarge,
+    TooManyDecodedStringBytes,
+}
+
+impl std::fmt::Display for RawJsonAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::DocumentTooLarge => "JSON document exceeds the configured byte limit",
+            Self::InvalidUtf8 => "JSON document is not strict UTF-8",
+            Self::ByteOrderMark => "JSON document contains a UTF-8 byte-order mark",
+            Self::InvalidSyntax => "invalid JSON syntax during raw admission",
+            Self::TopLevelBatch => "JSON-RPC batch arrays are not supported",
+            Self::TopLevelNotObject => "JSON-RPC top-level value must be an object",
+            Self::DuplicateObjectMember => "duplicate JSON object member",
+            Self::NestingTooDeep => "JSON nesting limit exceeded",
+            Self::TooManyContainerEntries => "JSON container-entry limit exceeded",
+            Self::NumberTooLong => "JSON number-token limit exceeded",
+            Self::TooManyNumberBytes => "aggregate JSON number-byte limit exceeded",
+            Self::ExponentTooLarge => "JSON exponent limit exceeded",
+            Self::TooManyDecodedStringBytes => "decoded JSON string-byte limit exceeded",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for RawJsonAdmissionError {}
+
+/// Admission failure for a complete strict JSON-RPC document.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsonRpcAdmissionError {
+    /// The raw JSON boundary rejected the document before typed decoding.
+    Raw(RawJsonAdmissionError),
+    /// The raw document was valid JSON but not a valid JSON-RPC envelope.
+    InvalidEnvelope,
+}
+
+impl std::fmt::Display for JsonRpcAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Raw(error) => error.fmt(formatter),
+            Self::InvalidEnvelope => formatter.write_str("invalid JSON-RPC envelope"),
+        }
+    }
+}
+
+impl std::error::Error for JsonRpcAdmissionError {}
+
+/// Admit one complete raw JSON-RPC document before any typed decoding.
+///
+/// The caller chooses the document/body byte bound. The fixed structural
+/// limits prevent duplicate-member ambiguity and bound recursive parsing,
+/// decoded string bytes, and numeric lexemes before `serde_json` receives the
+/// document. Only one top-level object is admitted; JSON-RPC batch arrays are
+/// rejected deliberately.
+pub fn admit_raw_jsonrpc_document(
+    bytes: &[u8],
+    document_byte_limit: usize,
+) -> Result<(), RawJsonAdmissionError> {
+    if bytes.len() > document_byte_limit {
+        return Err(RawJsonAdmissionError::DocumentTooLarge);
+    }
+    if bytes.windows(3).any(|window| window == [0xef, 0xbb, 0xbf]) {
+        return Err(RawJsonAdmissionError::ByteOrderMark);
+    }
+    let input = std::str::from_utf8(bytes).map_err(|_| RawJsonAdmissionError::InvalidUtf8)?;
+    let mut scanner = RawJsonScanner::new(input, document_byte_limit);
+    scanner.skip_whitespace();
+    match scanner.peek() {
+        Some(b'{') => scanner.parse_object(0)?,
+        Some(b'[') => return Err(RawJsonAdmissionError::TopLevelBatch),
+        _ => return Err(RawJsonAdmissionError::TopLevelNotObject),
+    }
+    scanner.skip_whitespace();
+    if scanner.position != scanner.bytes.len() {
+        return Err(RawJsonAdmissionError::InvalidSyntax);
+    }
+    Ok(())
+}
+
+/// Decode a complete JSON-RPC message only after raw-document admission.
+pub fn decode_strict_jsonrpc_message(
+    bytes: &[u8],
+    document_byte_limit: usize,
+) -> Result<JsonRpcMessage, JsonRpcAdmissionError> {
+    admit_raw_jsonrpc_document(bytes, document_byte_limit).map_err(JsonRpcAdmissionError::Raw)?;
+    serde_json::from_slice(bytes).map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)
+}
+
+struct RawJsonScanner<'a> {
+    input: &'a str,
+    bytes: &'a [u8],
+    position: usize,
+    container_entries: usize,
+    number_bytes: usize,
+    decoded_string_bytes: usize,
+    decoded_string_byte_limit: usize,
+}
+
+impl<'a> RawJsonScanner<'a> {
+    fn new(input: &'a str, decoded_string_byte_limit: usize) -> Self {
+        Self {
+            input,
+            bytes: input.as_bytes(),
+            position: 0,
+            container_entries: 0,
+            number_bytes: 0,
+            decoded_string_bytes: 0,
+            decoded_string_byte_limit,
+        }
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<(), RawJsonAdmissionError> {
+        match self.peek() {
+            Some(b'{') => self.parse_object(depth),
+            Some(b'[') => self.parse_array(depth),
+            Some(b'"') => self.parse_string(false).map(|_| ()),
+            Some(b't') => self.parse_literal(b"true"),
+            Some(b'f') => self.parse_literal(b"false"),
+            Some(b'n') => self.parse_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            _ => Err(RawJsonAdmissionError::InvalidSyntax),
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Result<(), RawJsonAdmissionError> {
+        let nested_depth = self.enter_container(depth)?;
+        self.position += 1;
+        self.skip_whitespace();
+        if self.consume(b'}') {
+            return Ok(());
+        }
+
+        let mut names = BTreeSet::new();
+        loop {
+            self.charge_container_entry()?;
+            let name = self.parse_string(true)?.ok_or(RawJsonAdmissionError::InvalidSyntax)?;
+            if !names.insert(name) {
+                return Err(RawJsonAdmissionError::DuplicateObjectMember);
+            }
+            self.skip_whitespace();
+            if !self.consume(b':') {
+                return Err(RawJsonAdmissionError::InvalidSyntax);
+            }
+            self.skip_whitespace();
+            self.parse_value(nested_depth)?;
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                return Ok(());
+            }
+            if !self.consume(b',') {
+                return Err(RawJsonAdmissionError::InvalidSyntax);
+            }
+            self.skip_whitespace();
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Result<(), RawJsonAdmissionError> {
+        let nested_depth = self.enter_container(depth)?;
+        self.position += 1;
+        self.skip_whitespace();
+        if self.consume(b']') {
+            return Ok(());
+        }
+        loop {
+            self.charge_container_entry()?;
+            self.parse_value(nested_depth)?;
+            self.skip_whitespace();
+            if self.consume(b']') {
+                return Ok(());
+            }
+            if !self.consume(b',') {
+                return Err(RawJsonAdmissionError::InvalidSyntax);
+            }
+            self.skip_whitespace();
+        }
+    }
+
+    fn enter_container(&self, depth: usize) -> Result<usize, RawJsonAdmissionError> {
+        let nested_depth = depth.checked_add(1).ok_or(RawJsonAdmissionError::NestingTooDeep)?;
+        if nested_depth > MAX_RAW_JSON_NESTING_DEPTH {
+            Err(RawJsonAdmissionError::NestingTooDeep)
+        } else {
+            Ok(nested_depth)
+        }
+    }
+
+    fn charge_container_entry(&mut self) -> Result<(), RawJsonAdmissionError> {
+        self.container_entries = self
+            .container_entries
+            .checked_add(1)
+            .ok_or(RawJsonAdmissionError::TooManyContainerEntries)?;
+        if self.container_entries > MAX_RAW_JSON_CONTAINER_ENTRIES {
+            Err(RawJsonAdmissionError::TooManyContainerEntries)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn parse_string(&mut self, capture: bool) -> Result<Option<String>, RawJsonAdmissionError> {
+        if !self.consume(b'"') {
+            return Err(RawJsonAdmissionError::InvalidSyntax);
+        }
+        let mut decoded = capture.then(String::new);
+        loop {
+            let byte = self.peek().ok_or(RawJsonAdmissionError::InvalidSyntax)?;
+            match byte {
+                b'"' => {
+                    self.position += 1;
+                    return Ok(decoded);
+                }
+                b'\\' => {
+                    self.position += 1;
+                    let character = self.parse_escape()?;
+                    self.charge_string_bytes(character.len_utf8())?;
+                    if let Some(value) = decoded.as_mut() {
+                        value.push(character);
+                    }
+                }
+                0x00..=0x1f => return Err(RawJsonAdmissionError::InvalidSyntax),
+                0x20..=0x7f => {
+                    self.position += 1;
+                    self.charge_string_bytes(1)?;
+                    if let Some(value) = decoded.as_mut() {
+                        value.push(char::from(byte));
+                    }
+                }
+                _ => {
+                    let character = self.input[self.position..]
+                        .chars()
+                        .next()
+                        .ok_or(RawJsonAdmissionError::InvalidSyntax)?;
+                    self.position += character.len_utf8();
+                    self.charge_string_bytes(character.len_utf8())?;
+                    if let Some(value) = decoded.as_mut() {
+                        value.push(character);
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_escape(&mut self) -> Result<char, RawJsonAdmissionError> {
+        let escape = self.peek().ok_or(RawJsonAdmissionError::InvalidSyntax)?;
+        self.position += 1;
+        match escape {
+            b'"' => Ok('"'), b'\\' => Ok('\\'), b'/' => Ok('/'), b'b' => Ok('\u{0008}'),
+            b'f' => Ok('\u{000c}'), b'n' => Ok('\n'), b'r' => Ok('\r'), b't' => Ok('\t'),
+            b'u' => self.parse_unicode_escape(),
+            _ => Err(RawJsonAdmissionError::InvalidSyntax),
+        }
+    }
+
+    fn parse_unicode_escape(&mut self) -> Result<char, RawJsonAdmissionError> {
+        let first = self.parse_hex_quad()?;
+        let scalar = if (0xd800..=0xdbff).contains(&first) {
+            if !self.consume(b'\\') || !self.consume(b'u') {
+                return Err(RawJsonAdmissionError::InvalidSyntax);
+            }
+            let second = self.parse_hex_quad()?;
+            if !(0xdc00..=0xdfff).contains(&second) {
+                return Err(RawJsonAdmissionError::InvalidSyntax);
+            }
+            0x1_0000 + ((u32::from(first) - 0xd800) << 10) + u32::from(second) - 0xdc00
+        } else if (0xdc00..=0xdfff).contains(&first) {
+            return Err(RawJsonAdmissionError::InvalidSyntax);
+        } else {
+            u32::from(first)
+        };
+        char::from_u32(scalar).ok_or(RawJsonAdmissionError::InvalidSyntax)
+    }
+
+    fn parse_hex_quad(&mut self) -> Result<u16, RawJsonAdmissionError> {
+        let end = self.position.checked_add(4).ok_or(RawJsonAdmissionError::InvalidSyntax)?;
+        let digits = self.bytes.get(self.position..end).ok_or(RawJsonAdmissionError::InvalidSyntax)?;
+        let mut value = 0_u16;
+        for digit in digits {
+            let nibble = match digit {
+                b'0'..=b'9' => u16::from(*digit - b'0'), b'a'..=b'f' => u16::from(*digit - b'a' + 10),
+                b'A'..=b'F' => u16::from(*digit - b'A' + 10), _ => return Err(RawJsonAdmissionError::InvalidSyntax),
+            };
+            value = (value << 4) | nibble;
+        }
+        self.position = end;
+        Ok(value)
+    }
+
+    fn parse_literal(&mut self, literal: &[u8]) -> Result<(), RawJsonAdmissionError> {
+        let end = self.position.checked_add(literal.len()).ok_or(RawJsonAdmissionError::InvalidSyntax)?;
+        if self.bytes.get(self.position..end) == Some(literal) {
+            self.position = end;
+            Ok(())
+        } else {
+            Err(RawJsonAdmissionError::InvalidSyntax)
+        }
+    }
+
+    fn parse_number(&mut self) -> Result<(), RawJsonAdmissionError> {
+        let start = self.position;
+        self.consume(b'-');
+        match self.peek() {
+            Some(b'0') => { self.position += 1; if matches!(self.peek(), Some(b'0'..=b'9')) { return Err(RawJsonAdmissionError::InvalidSyntax); } }
+            Some(b'1'..=b'9') => { self.position += 1; self.consume_digits(); }
+            _ => return Err(RawJsonAdmissionError::InvalidSyntax),
+        }
+        if self.consume(b'.') {
+            if !matches!(self.peek(), Some(b'0'..=b'9')) { return Err(RawJsonAdmissionError::InvalidSyntax); }
+            self.consume_digits();
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.position += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.position += 1;
+            }
+            let exponent_start = self.position;
+            if !matches!(self.peek(), Some(b'0'..=b'9')) { return Err(RawJsonAdmissionError::InvalidSyntax); }
+            self.consume_digits();
+            if exponent_exceeds_raw_limit(&self.bytes[exponent_start..self.position]) { return Err(RawJsonAdmissionError::ExponentTooLarge); }
+        }
+        let length = self.position - start;
+        if length > MAX_RAW_JSON_NUMBER_BYTES { return Err(RawJsonAdmissionError::NumberTooLong); }
+        self.number_bytes = self.number_bytes.checked_add(length).ok_or(RawJsonAdmissionError::TooManyNumberBytes)?;
+        if self.number_bytes > MAX_RAW_JSON_AGGREGATE_NUMBER_BYTES { Err(RawJsonAdmissionError::TooManyNumberBytes) } else { Ok(()) }
+    }
+
+    fn consume_digits(&mut self) { while matches!(self.peek(), Some(b'0'..=b'9')) { self.position += 1; } }
+    fn charge_string_bytes(&mut self, bytes: usize) -> Result<(), RawJsonAdmissionError> {
+        self.decoded_string_bytes = self.decoded_string_bytes.checked_add(bytes).ok_or(RawJsonAdmissionError::TooManyDecodedStringBytes)?;
+        if self.decoded_string_bytes > self.decoded_string_byte_limit { Err(RawJsonAdmissionError::TooManyDecodedStringBytes) } else { Ok(()) }
+    }
+    fn skip_whitespace(&mut self) { while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) { self.position += 1; } }
+    fn consume(&mut self, expected: u8) -> bool { if self.peek() == Some(expected) { self.position += 1; true } else { false } }
+    fn peek(&self) -> Option<u8> { self.bytes.get(self.position).copied() }
+}
+
+fn exponent_exceeds_raw_limit(digits: &[u8]) -> bool {
+    let first_significant = digits.iter().position(|digit| *digit != b'0').unwrap_or(digits.len());
+    let significant = &digits[first_significant..];
+    significant.len() > 5 || significant.iter().fold(0_usize, |value, digit| value * 10 + usize::from(*digit - b'0')) > MAX_RAW_JSON_EXPONENT
+}
 
 /// Serializes the jsonrpc version field.
 fn serialize_jsonrpc_version<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
@@ -44,8 +410,23 @@ where
 pub enum RequestId {
     /// Integer ID.
     Number(i64),
+    /// An arbitrary-precision mathematical-integer ID preserving its admitted
+    /// JSON number lexeme for an exact response echo.
+    Integer(String),
     /// String ID.
     String(String),
+}
+
+/// Canonical map/registry key for a JSON-RPC request ID.
+///
+/// Numeric spellings are normalized by exact mathematical value; string IDs
+/// remain byte-for-byte distinct from numeric IDs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CorrelationKey {
+    /// A string request ID, retained byte-for-byte.
+    String(String),
+    /// A canonical decimal mathematical-integer value.
+    Integer(String),
 }
 
 impl RequestId {
@@ -58,12 +439,26 @@ impl RequestId {
     /// [`MAX_JSONRPC_STRING_ID_ENCODED_BYTES`]. Raw decoders must additionally
     /// enforce the byte length of the received token before escape decoding.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if let Self::String(value) = self
-            && encoded_json_string_len(value) > MAX_JSONRPC_STRING_ID_ENCODED_BYTES
-        {
-            return Err("JSON-RPC string id exceeds byte limit");
+        match self {
+            Self::String(value) if encoded_json_string_len(value) > MAX_JSONRPC_STRING_ID_ENCODED_BYTES => {
+                return Err("JSON-RPC string id exceeds byte limit");
+            }
+            Self::Integer(lexeme) if !is_mathematical_integer(lexeme) => {
+                return Err("JSON-RPC numeric id must be a mathematical integer");
+            }
+            _ => {}
         }
         Ok(())
+    }
+
+    /// Produces the canonical key used by request registries and correlation.
+    #[must_use]
+    pub fn correlation_key(&self) -> CorrelationKey {
+        match self {
+            Self::Number(value) => CorrelationKey::Integer(value.to_string()),
+            Self::Integer(lexeme) => CorrelationKey::Integer(canonical_integer_lexeme(lexeme)),
+            Self::String(value) => CorrelationKey::String(value.clone()),
+        }
     }
 }
 
@@ -75,6 +470,9 @@ impl Serialize for RequestId {
         self.validate().map_err(S::Error::custom)?;
         match self {
             Self::Number(number) => serializer.serialize_i64(*number),
+            Self::Integer(lexeme) => serde_json::from_str::<serde_json::Number>(lexeme)
+                .map_err(S::Error::custom)?
+                .serialize(serializer),
             Self::String(value) => serializer.serialize_str(value),
         }
     }
@@ -85,58 +483,111 @@ impl<'de> Deserialize<'de> for RequestId {
     where
         D: Deserializer<'de>,
     {
-        struct RequestIdVisitor;
-
-        impl Visitor<'_> for RequestIdVisitor {
-            type Value = RequestId;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a bounded JSON-RPC string id or signed 64-bit integer id")
-            }
-
-            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(RequestId::Number(value))
-            }
-
-            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                i64::try_from(value)
-                    .map(RequestId::Number)
-                    .map_err(|_| E::custom("JSON-RPC integer id exceeds signed 64-bit range"))
-            }
-
-            fn visit_borrowed_str<E>(self, value: &'_ str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                self.visit_str(value)
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if encoded_json_string_len(value) > MAX_JSONRPC_STRING_ID_ENCODED_BYTES {
-                    return Err(E::custom("JSON-RPC string id exceeds byte limit"));
+        match Value::deserialize(deserializer)? {
+            Value::Number(number) => {
+                let lexeme = number.to_string();
+                if !lexeme.contains(['.', 'e', 'E']) && lexeme != "-0"
+                    && let Ok(value) = lexeme.parse::<i64>()
+                {
+                    Ok(RequestId::Number(value))
+                } else if is_mathematical_integer(&lexeme) {
+                    Ok(RequestId::Integer(lexeme))
+                } else {
+                    Err(D::Error::custom("JSON-RPC numeric id must be a mathematical integer"))
                 }
-                Ok(RequestId::String(value.to_owned()))
             }
-
-            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
+            Value::String(value) => {
                 if encoded_json_string_len(&value) > MAX_JSONRPC_STRING_ID_ENCODED_BYTES {
-                    return Err(E::custom("JSON-RPC string id exceeds byte limit"));
+                    return Err(D::Error::custom("JSON-RPC string id exceeds byte limit"));
                 }
                 Ok(RequestId::String(value))
             }
+            _ => Err(D::Error::custom("JSON-RPC id must be a string or mathematical integer")),
         }
-
-        deserializer.deserialize_any(RequestIdVisitor)
     }
+}
+
+fn is_mathematical_integer(lexeme: &str) -> bool {
+    if lexeme.len() > MAX_RAW_JSON_NUMBER_BYTES {
+        return false;
+    }
+    let bytes = lexeme.as_bytes();
+    let mut index = usize::from(matches!(bytes.first(), Some(b'-')));
+    if index == bytes.len() {
+        return false;
+    }
+    let integer_start = index;
+    if bytes.get(index) == Some(&b'0') {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'0'..=b'9')) {
+            return false;
+        }
+    } else if matches!(bytes.get(index), Some(b'1'..=b'9')) {
+        index += 1;
+        while matches!(bytes.get(index), Some(b'0'..=b'9')) { index += 1; }
+    } else {
+        return false;
+    }
+    let mut fraction_digits = 0_usize;
+    let mut trailing_zeroes = 0_usize;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let fraction_start = index;
+        while matches!(bytes.get(index), Some(b'0'..=b'9')) { index += 1; }
+        fraction_digits = index - fraction_start;
+        if fraction_digits == 0 { return false; }
+    }
+    let coefficient_end = index;
+    let coefficient = &bytes[integer_start..coefficient_end];
+    for digit in coefficient.iter().rev() {
+        if *digit == b'0' { trailing_zeroes += 1; } else if *digit != b'.' { break; }
+    }
+    let exponent = if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        let negative = if bytes.get(index) == Some(&b'-') { index += 1; true } else { if bytes.get(index) == Some(&b'+') { index += 1; } false };
+        let exponent_start = index;
+        while matches!(bytes.get(index), Some(b'0'..=b'9')) { index += 1; }
+        if index == exponent_start || index != bytes.len() { return false; }
+        let magnitude = std::str::from_utf8(&bytes[exponent_start..index]).ok().and_then(|value| value.parse::<i64>().ok());
+        match magnitude {
+            Some(value) if value <= MAX_RAW_JSON_EXPONENT as i64 && negative => -value,
+            Some(value) if value <= MAX_RAW_JSON_EXPONENT as i64 => value,
+            _ => return false,
+        }
+    } else {
+        if index != bytes.len() { return false; }
+        0
+    };
+    let scale = i64::try_from(fraction_digits).unwrap_or(i64::MAX) - exponent;
+    scale <= 0 || usize::try_from(scale).is_ok_and(|required_zeroes| trailing_zeroes >= required_zeroes)
+}
+
+fn canonical_integer_lexeme(lexeme: &str) -> String {
+    debug_assert!(is_mathematical_integer(lexeme));
+    let bytes = lexeme.as_bytes();
+    let negative = bytes.first() == Some(&b'-');
+    let unsigned = if negative { &lexeme[1..] } else { lexeme };
+    let (coefficient, exponent) = match unsigned.find(['e', 'E']) {
+        Some(index) => (&unsigned[..index], unsigned[index + 1..].parse::<i64>().unwrap_or(0)),
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = coefficient.split_once('.').unwrap_or((coefficient, ""));
+    let mut digits = format!("{whole}{fraction}");
+    let leading = digits.bytes().take_while(|digit| *digit == b'0').count();
+    digits.drain(..leading);
+    if digits.is_empty() {
+        return "0".to_owned();
+    }
+    let scale = i64::try_from(fraction.len()).unwrap_or(i64::MAX) - exponent;
+    if scale > 0 {
+        let removable = usize::try_from(scale).unwrap_or(usize::MAX);
+        let retained = digits.len().saturating_sub(removable);
+        digits.truncate(retained);
+    } else {
+        let zeroes = usize::try_from(scale.unsigned_abs()).unwrap_or(usize::MAX);
+        digits.extend(std::iter::repeat_n('0', zeroes));
+    }
+    if negative { format!("-{digits}") } else { digits }
 }
 
 fn encoded_json_string_len(value: &str) -> usize {
@@ -179,6 +630,7 @@ impl std::fmt::Display for RequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RequestId::Number(n) => write!(f, "{n}"),
+            RequestId::Integer(lexeme) => f.write_str(lexeme),
             RequestId::String(s) => write!(f, "{s}"),
         }
     }
@@ -268,7 +720,7 @@ impl JsonRpcRequest {
 }
 
 /// JSON-RPC 2.0 error object.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JsonRpcError {
     /// Error code.
     pub code: i32,
@@ -277,6 +729,126 @@ pub struct JsonRpcError {
     /// Additional error data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+/// Immutable local endpoint role for raw JSON-RPC ingress disposition.
+///
+/// The role is chosen by local transport construction. It is deliberately a
+/// closed value rather than a peer-provided header/body setting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsonRpcEndpointRole {
+    /// This endpoint receives client-to-server JSON-RPC traffic.
+    ServerIngress,
+    /// This endpoint receives server-to-client JSON-RPC traffic.
+    ClientIngress,
+}
+
+/// The direction attached by the local transport to a decoded message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsonRpcMessageDirection {
+    /// Client-to-server traffic.
+    ClientToServer,
+    /// Server-to-client traffic.
+    ServerToClient,
+}
+
+/// Transport ownership for a client-ingress raw protocol failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientIngressFailureScope {
+    /// The malformed body belongs to one request/response exchange.
+    OwningExchange,
+    /// The malformed body arrived on a multiplexed/shared channel.
+    SharedChannel,
+}
+
+/// An error response that is deliberately uncorrelated and omits `id`.
+///
+/// It is distinct from [`JsonRpcResponse`], so safe code cannot accidentally
+/// use an absent ID as an ordinary response correlation key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UncorrelatedJsonRpcErrorResponse {
+    #[serde(
+        serialize_with = "serialize_jsonrpc_version",
+        deserialize_with = "deserialize_jsonrpc_version"
+    )]
+    jsonrpc: Cow<'static, str>,
+    error: JsonRpcError,
+}
+
+impl UncorrelatedJsonRpcErrorResponse {
+    fn parse_or_invalid_request(message: impl Into<String>, code: i32) -> Self {
+        Self {
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
+            error: JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            },
+        }
+    }
+
+    /// Returns the error payload without exposing an ID-bearing response.
+    #[must_use]
+    pub fn error(&self) -> &JsonRpcError {
+        &self.error
+    }
+}
+
+/// Role-aware disposition of a raw malformed JSON-RPC document.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawJsonRpcDisposition {
+    /// Server ingress can emit an error correlated to the one readable ID.
+    CorrelatedError(JsonRpcResponse),
+    /// Server ingress can emit an explicitly uncorrelated parse/invalid error.
+    UncorrelatedError(UncorrelatedJsonRpcErrorResponse),
+    /// Client ingress emits no JSON-RPC response and fails only its owning exchange.
+    ClientOwningFailure,
+    /// Client ingress emits no JSON-RPC response and reports a shared-channel failure.
+    ClientSharedChannelFailure,
+    /// The direction is not an ingress path for this endpoint and emits nothing.
+    NoAction,
+}
+
+/// Convert a raw admission failure into an endpoint-safe disposition.
+///
+/// A valid request ID is echoed only at server ingress for client-to-server
+/// traffic. Client ingress never obtains a response-emitting branch.
+#[must_use]
+pub fn dispose_raw_jsonrpc_failure(
+    role: JsonRpcEndpointRole,
+    direction: JsonRpcMessageDirection,
+    readable_id: Option<RequestId>,
+    failure_scope: ClientIngressFailureScope,
+) -> RawJsonRpcDisposition {
+    match (role, direction) {
+        (JsonRpcEndpointRole::ServerIngress, JsonRpcMessageDirection::ClientToServer) => {
+            if let Some(id) = readable_id {
+                RawJsonRpcDisposition::CorrelatedError(JsonRpcResponse::error(
+                    Some(id),
+                    JsonRpcError {
+                        code: -32600,
+                        message: "Invalid Request".to_owned(),
+                        data: None,
+                    },
+                ))
+            } else {
+                RawJsonRpcDisposition::UncorrelatedError(
+                    UncorrelatedJsonRpcErrorResponse::parse_or_invalid_request(
+                        "Parse error",
+                        -32700,
+                    ),
+                )
+            }
+        }
+        (JsonRpcEndpointRole::ClientIngress, JsonRpcMessageDirection::ServerToClient) => {
+            match failure_scope {
+                ClientIngressFailureScope::OwningExchange => RawJsonRpcDisposition::ClientOwningFailure,
+                ClientIngressFailureScope::SharedChannel => RawJsonRpcDisposition::ClientSharedChannelFailure,
+            }
+        }
+        _ => RawJsonRpcDisposition::NoAction,
+    }
 }
 
 impl From<fastmcp_core::McpError> for JsonRpcError {
@@ -333,7 +905,7 @@ struct JsonRpcResponseWire {
 }
 
 /// JSON-RPC 2.0 response.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JsonRpcResponse {
     /// Protocol version (always "2.0").
     pub jsonrpc: Cow<'static, str>,
@@ -464,6 +1036,235 @@ impl JsonRpcMessage {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct AdmittedFrames {
+        bytes: Vec<Vec<u8>>,
+    }
+
+    fn admit_frame(
+        state: &mut AdmittedFrames,
+        frame: &[u8],
+    ) -> Result<JsonRpcMessage, JsonRpcAdmissionError> {
+        let message = decode_strict_jsonrpc_message(frame, 4 * 1024)?;
+        state.bytes.push(frame.to_vec());
+        Ok(message)
+    }
+
+    #[test]
+    fn prt_01_envelopes_positive() {
+        let request = br#"{"jsonrpc":"2.0","method":"tools/list","id":42}"#;
+        let notification = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let success = br#"{"jsonrpc":"2.0","result":null,"id":"request-42"}"#;
+        let error = br#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"missing"},"id":42}"#;
+
+        assert!(matches!(
+            decode_strict_jsonrpc_message(request, 4 * 1024),
+            Ok(JsonRpcMessage::Request(JsonRpcRequest { id: Some(RequestId::Number(42)), .. }))
+        ));
+        assert!(matches!(
+            decode_strict_jsonrpc_message(notification, 4 * 1024),
+            Ok(JsonRpcMessage::Request(JsonRpcRequest { id: None, .. }))
+        ));
+        assert!(matches!(
+            decode_strict_jsonrpc_message(success, 4 * 1024),
+            Ok(JsonRpcMessage::Response(JsonRpcResponse { result: Some(Value::Null), error: None, .. }))
+        ));
+        assert!(matches!(
+            decode_strict_jsonrpc_message(error, 4 * 1024),
+            Ok(JsonRpcMessage::Response(JsonRpcResponse { result: None, error: Some(_), .. }))
+        ));
+
+        assert!(matches!(
+            dispose_raw_jsonrpc_failure(
+                JsonRpcEndpointRole::ServerIngress,
+                JsonRpcMessageDirection::ClientToServer,
+                Some(RequestId::String("known".to_owned())),
+                ClientIngressFailureScope::OwningExchange,
+            ),
+            RawJsonRpcDisposition::CorrelatedError(JsonRpcResponse { id: Some(RequestId::String(_)), .. })
+        ));
+        assert!(matches!(
+            dispose_raw_jsonrpc_failure(
+                JsonRpcEndpointRole::ClientIngress,
+                JsonRpcMessageDirection::ServerToClient,
+                None,
+                ClientIngressFailureScope::SharedChannel,
+            ),
+            RawJsonRpcDisposition::ClientSharedChannelFailure
+        ));
+    }
+
+    #[test]
+    fn prt_01_a_positive() {
+        let frame = br#"{"jsonrpc":"2.0","method":"tools/list","id":"public-request"}"#;
+        let mut state = AdmittedFrames::default();
+        let admitted = admit_frame(&mut state, frame)
+            .expect("the protocol-owned raw gate admits a strict public request envelope");
+        assert!(matches!(admitted, JsonRpcMessage::Request(_)));
+        assert_eq!(state.bytes, vec![frame.to_vec()]);
+        assert!(matches!(
+            dispose_raw_jsonrpc_failure(
+                JsonRpcEndpointRole::ClientIngress,
+                JsonRpcMessageDirection::ServerToClient,
+                None,
+                ClientIngressFailureScope::OwningExchange,
+            ),
+            RawJsonRpcDisposition::ClientOwningFailure
+        ));
+    }
+
+    #[test]
+    fn prt_01_envelopes_planted_negative() {
+        let baseline = br#"{"jsonrpc":"2.0","method":"tools/list","id":42}"#;
+        let planted = br#"{"jsonrpc":"2.0","method":"tools/list","id":42,"id":42}"#;
+        let mut state = AdmittedFrames::default();
+        admit_frame(&mut state, baseline).expect("the unmodified envelope is admitted");
+        let state_before = state.clone();
+
+        assert!(
+            matches!(
+                admit_frame(&mut state, planted),
+                Err(JsonRpcAdmissionError::Raw(
+                    RawJsonAdmissionError::DuplicateObjectMember
+                ))
+            ),
+            "changing only the second id member must reach production raw admission"
+        );
+        assert_eq!(state, state_before, "rejected raw JSON cannot mutate admitted state");
+    }
+
+    #[test]
+    fn prt_01_a_planted_negative() {
+        let baseline = br#"{"jsonrpc":"2.0","method":"tools/list","id":"public-request"}"#;
+        let mut planted = baseline.to_vec();
+        planted.splice(0..0, [0xef, 0xbb, 0xbf]);
+        let mut state = AdmittedFrames::default();
+        admit_frame(&mut state, baseline).expect("the baseline is admitted");
+        let state_before = state.clone();
+
+        assert!(
+            matches!(
+                admit_frame(&mut state, &planted),
+                Err(JsonRpcAdmissionError::Raw(RawJsonAdmissionError::ByteOrderMark))
+            ),
+            "inserting only a UTF-8 BOM must reach the typed raw-admission refusal"
+        );
+        assert_eq!(state, state_before, "rejected raw bytes leave admitted state unchanged");
+    }
+
+    #[test]
+    fn prt_01_id_correlation_positive() {
+        let numeric = RequestId::Number(1);
+        let string = RequestId::String("1".to_owned());
+        assert_ne!(numeric, string, "string and numeric request IDs are disjoint");
+        assert_eq!(
+            numeric.correlation_key(),
+            RequestId::Integer("1.0".to_owned()).correlation_key(),
+            "numeric aliases share one exact mathematical correlation key"
+        );
+        assert_eq!(
+            numeric.correlation_key(),
+            RequestId::Integer("1e0".to_owned()).correlation_key(),
+            "exponent-form integer aliases share one exact mathematical correlation key"
+        );
+        assert_ne!(
+            numeric.correlation_key(),
+            string.correlation_key(),
+            "a string ID never aliases its numeric spelling"
+        );
+        assert_eq!(
+            JsonRpcResponse::success(numeric.clone(), Value::Null).id,
+            Some(numeric),
+            "a correlated success preserves its accepted request ID"
+        );
+        let large = "922337203685477580812345678901234567890";
+        let raw = format!(r#"{{"jsonrpc":"2.0","method":"tools/list","id":{large}}}"#);
+        let decoded = decode_strict_jsonrpc_message(raw.as_bytes(), 4 * 1024)
+            .expect("an arbitrary-precision mathematical integer is admitted");
+        let JsonRpcMessage::Request(request) = decoded else {
+            panic!("the admitted envelope remains a request");
+        };
+        assert_eq!(request.id, Some(RequestId::Integer(large.to_owned())));
+        let echoed = JsonRpcResponse::success(
+            request.id.expect("admitted request keeps its original ID lexeme"),
+            Value::Null,
+        );
+        assert!(
+            serde_json::to_string(&echoed)
+                .expect("the exact admitted ID can be echoed")
+                .contains(large),
+            "response serialization preserves the accepted arbitrary-precision ID lexeme"
+        );
+        assert!(matches!(
+            dispose_raw_jsonrpc_failure(
+                JsonRpcEndpointRole::ServerIngress,
+                JsonRpcMessageDirection::ClientToServer,
+                Some(RequestId::Number(9)),
+                ClientIngressFailureScope::OwningExchange,
+            ),
+            RawJsonRpcDisposition::CorrelatedError(JsonRpcResponse { id: Some(RequestId::Number(9)), .. })
+        ));
+    }
+
+    #[test]
+    fn prt_01_id_correlation_planted_negative() {
+        let baseline = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let planted = br#"{"jsonrpc":"2.0","method":"tools/list","id":1.5}"#;
+        let mut state = AdmittedFrames::default();
+        admit_frame(&mut state, baseline).expect("integer request ID is admitted");
+        let state_before = state.clone();
+
+        assert!(
+            matches!(
+                admit_frame(&mut state, planted),
+                Err(JsonRpcAdmissionError::InvalidEnvelope)
+            ),
+            "changing only the ID to a fractional number must be rejected"
+        );
+        assert_eq!(state, state_before, "a rejected fractional ID cannot claim a correlation slot");
+    }
+
+    #[test]
+    fn prt_01_duplicate_member_planted_negative() {
+        let baseline = br#"{"jsonrpc":"2.0","method":"tools/list","params":{"cursor":"a"}}"#;
+        let planted = br#"{"jsonrpc":"2.0","method":"tools/list","params":{"cursor":"a","cursor":"b"}}"#;
+        let mut state = AdmittedFrames::default();
+        admit_frame(&mut state, baseline).expect("baseline nested object is admitted");
+        let state_before = state.clone();
+
+        assert!(
+            matches!(
+                admit_frame(&mut state, planted),
+                Err(JsonRpcAdmissionError::Raw(
+                    RawJsonAdmissionError::DuplicateObjectMember
+                ))
+            ),
+            "a one-member duplicate must fail before typed params decoding"
+        );
+        assert_eq!(state, state_before, "duplicate raw members cannot mutate admitted state");
+    }
+
+    #[test]
+    fn prt_01_top_level_batch_array_planted_negative() {
+        let baseline = br#"{"jsonrpc":"2.0","method":"tools/list"}"#;
+        let array_of_one = br#"[{"jsonrpc":"2.0","method":"tools/list"}]"#;
+        let mixed_array = br#"[{"jsonrpc":"2.0","method":"tools/list"},{"jsonrpc":"2.0","method":"notifications/initialized"}]"#;
+        let mut state = AdmittedFrames::default();
+        admit_frame(&mut state, baseline).expect("one top-level request object is admitted");
+        let state_before = state.clone();
+
+        for planted in [array_of_one.as_slice(), mixed_array.as_slice()] {
+            assert!(
+                matches!(
+                    admit_frame(&mut state, planted),
+                    Err(JsonRpcAdmissionError::Raw(RawJsonAdmissionError::TopLevelBatch))
+                ),
+                "a top-level batch fails before envelope construction"
+            );
+            assert_eq!(state, state_before, "rejected batch traffic has no admitted state effect");
+        }
+    }
 
     // ========================================================================
     // RequestId Tests

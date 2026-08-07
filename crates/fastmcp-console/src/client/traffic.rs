@@ -467,6 +467,7 @@ impl RequestResponseRenderer {
     fn format_present_id(&self, id: &RequestId) -> String {
         match id {
             RequestId::Number(n) => n.to_string(),
+            RequestId::Integer(lexeme) => peer_metadata_preview(lexeme, PEER_ID_MAX_CHARS),
             RequestId::String(s) => peer_metadata_preview(s, PEER_ID_MAX_CHARS),
         }
     }
