@@ -108,7 +108,10 @@ fn std_01_a_positive() {
         requests,
         vec![
             ("notifications/progress".to_owned(), None),
-            ("tools/list".to_owned(), Some(serde_json::json!("request-8"))),
+            (
+                "tools/list".to_owned(),
+                Some(serde_json::json!("request-8"))
+            ),
         ],
         "request and notification frames retain order while responses multiplex separately"
     );
@@ -139,16 +142,20 @@ fn std_01_a_planted_negative() {
     let mut request_count = 0;
     let mut response_count = 0;
     let error = transport
-        .dispatch_next(
-            &cx,
-            &mut |_| request_count += 1,
-            &mut |_| response_count += 1,
-        )
+        .dispatch_next(&cx, &mut |_| request_count += 1, &mut |_| {
+            response_count += 1
+        })
         .expect_err("an embedded newline must reject before either direction dispatches");
 
     assert!(matches!(error, TransportError::Codec(_)));
-    assert_eq!(request_count, 0, "rejected framing cannot dispatch a request");
-    assert_eq!(response_count, 0, "rejected framing cannot dispatch a response");
+    assert_eq!(
+        request_count, 0,
+        "rejected framing cannot dispatch a request"
+    );
+    assert_eq!(
+        response_count, 0,
+        "rejected framing cannot dispatch a response"
+    );
     assert!(
         writer.recorded().is_empty(),
         "a rejected inbound frame never emits a reverse parse or invalid-request response"
@@ -160,7 +167,10 @@ fn std_01_a_planted_negative() {
 fn std_01_b_positive() {
     let mut child = ChildGuard::new(
         Command::new("sh")
-            .args(["-c", "IFS= read -r line; test -n \"$line\"; cat >/dev/null; exit 0"])
+            .args([
+                "-c",
+                "IFS= read -r line; test -n \"$line\"; cat >/dev/null; exit 0",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -186,11 +196,21 @@ fn std_01_b_positive() {
         )
         .expect("closing stdin lets the exact child exit and reap");
 
-    assert!(status.success(), "the child observed the committed control frame");
-    assert!(!forced, "EOF-driven child exit must not require escalation");
-    assert!(transport.is_closed(), "lifecycle close rejects later application writes");
     assert!(
-        child.child_mut().try_wait().expect("inspect reaped child").is_some(),
+        status.success(),
+        "the child observed the committed control frame"
+    );
+    assert!(!forced, "EOF-driven child exit must not require escalation");
+    assert!(
+        transport.is_closed(),
+        "lifecycle close rejects later application writes"
+    );
+    assert!(
+        child
+            .child_mut()
+            .try_wait()
+            .expect("inspect reaped child")
+            .is_some(),
         "a returned lifecycle outcome is reaped, not merely signalled"
     );
 }
@@ -200,7 +220,10 @@ fn std_01_b_positive() {
 fn std_01_b_planted_negative() {
     let mut child = ChildGuard::new(
         Command::new("sh")
-            .args(["-c", "IFS= read -r line; test -n \"$line\"; cat >/dev/null; exit 0"])
+            .args([
+                "-c",
+                "IFS= read -r line; test -n \"$line\"; cat >/dev/null; exit 0",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -230,7 +253,11 @@ fn std_01_b_planted_negative() {
         "pre-close cancellation leaves the transport write side unchanged"
     );
     assert!(
-        child.child_mut().try_wait().expect("inspect live child").is_none(),
+        child
+            .child_mut()
+            .try_wait()
+            .expect("inspect live child")
+            .is_none(),
         "pre-close cancellation cannot reap or terminate the unrelated child"
     );
 

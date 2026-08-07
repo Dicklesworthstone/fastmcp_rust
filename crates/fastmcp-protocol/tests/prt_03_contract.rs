@@ -4,11 +4,10 @@
 //! unqualified frozen `--exact` selectors name executable harness entries.
 
 use fastmcp_protocol::protocol_version::{
-    FINAL_PROTOCOL_VERSION, HEADER_MISMATCH_ERROR_CODE,
-    MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MCP_PROTOCOL_VERSION_HEADER,
-    FinalHttpRequestMetadata, HeaderMismatchReason, MissingRequiredClientCapabilityError,
-    RequestAdmissionError, RequestVersionMetadata, admit_final_http_request,
-    admit_final_request,
+    FINAL_PROTOCOL_VERSION, FinalHttpRequestMetadata, HEADER_MISMATCH_ERROR_CODE,
+    HeaderMismatchReason, MCP_PROTOCOL_VERSION_HEADER,
+    MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MissingRequiredClientCapabilityError,
+    RequestAdmissionError, RequestVersionMetadata, admit_final_http_request, admit_final_request,
 };
 use serde_json::json;
 
@@ -27,7 +26,10 @@ fn prt_03_a_positive() {
     .expect("matching final protocol, method, and name mirrors must be admitted");
 
     assert_eq!(MCP_PROTOCOL_VERSION_HEADER, "MCP-Protocol-Version");
-    assert_eq!(admission.protocol_version().as_str(), FINAL_PROTOCOL_VERSION);
+    assert_eq!(
+        admission.protocol_version().as_str(),
+        FINAL_PROTOCOL_VERSION
+    );
 }
 
 #[test]
@@ -72,7 +74,10 @@ fn prt_03_b_positive() {
     let missing_capability = MissingRequiredClientCapabilityError::new(required_capabilities)
         .expect("a bounded required-capabilities object must remain typed peer data");
 
-    assert_eq!(admission.protocol_version().as_str(), FINAL_PROTOCOL_VERSION);
+    assert_eq!(
+        admission.protocol_version().as_str(),
+        FINAL_PROTOCOL_VERSION
+    );
     assert_eq!(missing_capability.http_status(), 400);
     assert_eq!(
         missing_capability.jsonrpc_error_code(),

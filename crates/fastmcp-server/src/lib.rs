@@ -143,10 +143,10 @@ use fastmcp_core::{
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
 use fastmcp_protocol::{
-    CallToolParams, CancelledParams, GetPromptParams, InitializeParams, JsonRpcError,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
+    CallToolParams, CancelledParams, CorrelationKey, GetPromptParams, InitializeParams,
+    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
     ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
-    CorrelationKey, Prompt, ReadResourceParams, RequestId, Resource, ResourceTemplate, ServerCapabilities,
+    Prompt, ReadResourceParams, RequestId, Resource, ResourceTemplate, ServerCapabilities,
     ServerInfo, SetLogLevelParams, SubscribeResourceParams, Tool, UnsubscribeResourceParams,
 };
 

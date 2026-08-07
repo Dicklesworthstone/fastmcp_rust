@@ -155,7 +155,7 @@ impl Sha256Digest {
 /// canonical input.
 pub fn sha256_bounded(
     input: &[u8],
-    max_input_bytes: usize
+    max_input_bytes: usize,
 ) -> Result<Sha256Digest, CryptoInputTooLongError> {
     sha256_bounded_with(input, max_input_bytes, sha256_exact)
 }
@@ -230,7 +230,7 @@ impl HmacSha256Key {
     pub fn authenticate_bounded(
         &self,
         input: &[u8],
-        max_input_bytes: usize
+        max_input_bytes: usize,
     ) -> Result<HmacSha256Tag, CryptoInputTooLongError> {
         enforce_input_limit(input, max_input_bytes)?;
 
@@ -253,7 +253,7 @@ impl HmacSha256Key {
         &self,
         input: &[u8],
         max_input_bytes: usize,
-        tag: &HmacSha256Tag
+        tag: &HmacSha256Tag,
     ) -> Result<(), HmacVerificationError> {
         enforce_input_limit(input, max_input_bytes)?;
 
@@ -2470,7 +2470,7 @@ mod tests {
         assert_random_draw_denial(
             &arbitrary_free_function,
             RandomDrawApiDenyError::UnexpectedTopLevelPublicFunction(
-                "pub fn arbitrary_random_bytes() -> [u8; 32]".to_owned()
+                "pub fn arbitrary_random_bytes() -> [u8; 32]".to_owned(),
             ),
             "random draw API denial: unexpected top-level public function `pub fn arbitrary_random_bytes() -> [u8; 32]`",
         );
@@ -2754,11 +2754,15 @@ mod tests {
                 "extern crate getrandom",
             ),
             (
-                format!("extern crate getrandom;\nuse self::getrandom as self_rng;\n{production}\nfn self_realias(destination: &mut [u8]) -> Result<(), getrandom::Error> {{ self_rng::fill(destination) }}\n"),
+                format!(
+                    "extern crate getrandom;\nuse self::getrandom as self_rng;\n{production}\nfn self_realias(destination: &mut [u8]) -> Result<(), getrandom::Error> {{ self_rng::fill(destination) }}\n"
+                ),
                 "extern crate getrandom",
             ),
             (
-                format!("extern crate getrandom;\nuse crate::getrandom as crate_rng;\n{production}\nfn crate_realias(destination: &mut [u8]) -> Result<(), getrandom::Error> {{ crate_rng::fill(destination) }}\n"),
+                format!(
+                    "extern crate getrandom;\nuse crate::getrandom as crate_rng;\n{production}\nfn crate_realias(destination: &mut [u8]) -> Result<(), getrandom::Error> {{ crate_rng::fill(destination) }}\n"
+                ),
                 "extern crate getrandom",
             ),
         ] {

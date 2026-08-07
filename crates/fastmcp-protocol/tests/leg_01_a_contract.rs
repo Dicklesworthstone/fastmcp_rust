@@ -2,13 +2,13 @@
 
 use fastmcp_core::sha256_bounded;
 use fastmcp_protocol::methods::{
+    INITIALIZE, LEGACY_2024_11_05_METHODS, LEGACY_2024_11_05_PROTOCOL_VERSION,
+    LEGACY_2024_11_05_SCHEMA_SHA256, Legacy2024Capability, Legacy2024Direction, Legacy2024Envelope,
+    Legacy2024EnvelopeKind, NOTIFICATIONS_INITIALIZED, SAMPLING_CREATE_MESSAGE, TOOLS_CALL,
     decode_legacy_2024_11_05_envelope, legacy_2024_11_05_method, legacy_2024_11_05_schema,
-    translate_legacy_2024_result, Legacy2024Capability, Legacy2024Direction, Legacy2024Envelope,
-    Legacy2024EnvelopeKind, INITIALIZE, LEGACY_2024_11_05_METHODS,
-    LEGACY_2024_11_05_PROTOCOL_VERSION, LEGACY_2024_11_05_SCHEMA_SHA256, NOTIFICATIONS_INITIALIZED,
-    SAMPLING_CREATE_MESSAGE, TOOLS_CALL,
+    translate_legacy_2024_result,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn exact_initialize() -> Value {
     json!({

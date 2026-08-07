@@ -5,17 +5,17 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use fastmcp_protocol::methods::{
-    Legacy2024Direction, Legacy2024ListChangedCapability, Legacy2024ResourcesCapability,
-    Legacy2024ServerCapabilities, COMPLETION_COMPLETE, NOTIFICATIONS_CANCELLED,
+    COMPLETION_COMPLETE, Legacy2024Direction, Legacy2024ListChangedCapability,
+    Legacy2024ResourcesCapability, Legacy2024ServerCapabilities, NOTIFICATIONS_CANCELLED,
     NOTIFICATIONS_INITIALIZED, NOTIFICATIONS_PROGRESS, RESOURCES_SUBSCRIBE,
     RESOURCES_TEMPLATES_LIST, ROOTS_LIST, SAMPLING_CREATE_MESSAGE, TOOLS_LIST,
 };
 use fastmcp_server::legacy_2024::{
-    legacy_2024_a_digest_preimage, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Lifecycle,
-    Legacy2024Outbound, Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo,
-    LegacyAuthenticatedPeerPartition, LegacyPeerBinding,
+    Legacy2024Handler, Legacy2024HandlerError, Legacy2024Lifecycle, Legacy2024Outbound,
+    Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo,
+    LegacyAuthenticatedPeerPartition, LegacyPeerBinding, legacy_2024_a_digest_preimage,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const OWNER_PARTITION: LegacyAuthenticatedPeerPartition =
     LegacyAuthenticatedPeerPartition::from_authenticated_transport([0xA5; 32]);

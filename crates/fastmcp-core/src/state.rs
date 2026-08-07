@@ -73,7 +73,7 @@ impl SessionState {
 
     fn from_map_with_partition_draw<F, E>(
         values: HashMap<String, serde_json::Value>,
-        draw: F
+        draw: F,
     ) -> Self
     where
         F: FnOnce() -> Result<[u8; CACHE_PARTITION_BYTES], E>,
@@ -536,24 +536,30 @@ mod tests {
         }
 
         let typed = SessionState::new();
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = typed.set(PanickingKey, true);
-        }))
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = typed.set(PanickingKey, true);
+            }))
+            .is_err()
+        );
         assert!(typed.set("after-typed-panic", true));
 
         let raw = SessionState::new();
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = raw.set_raw(PanickingKey, serde_json::Value::Null);
-        }))
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = raw.set_raw(PanickingKey, serde_json::Value::Null);
+            }))
+            .is_err()
+        );
         assert!(raw.set_raw("after-raw-panic", serde_json::Value::Null));
 
         let layered = SessionState::new().with_local_overrides();
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = layered.set_local_raw(PanickingKey, serde_json::Value::Null);
-        }))
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = layered.set_local_raw(PanickingKey, serde_json::Value::Null);
+            }))
+            .is_err()
+        );
         assert!(layered.set_local_raw("after-local-panic", serde_json::Value::Null));
     }
 

@@ -3,8 +3,8 @@
 //! MCP uses newline-delimited JSON (NDJSON) for message framing.
 
 use fastmcp_protocol::{
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
-    MAX_JSONRPC_STRING_ID_ENCODED_BYTES, admit_raw_jsonrpc_document,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, MAX_JSONRPC_STRING_ID_ENCODED_BYTES,
+    RequestId, admit_raw_jsonrpc_document,
 };
 use std::collections::BTreeSet;
 

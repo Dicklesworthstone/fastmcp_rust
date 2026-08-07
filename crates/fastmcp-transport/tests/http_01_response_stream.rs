@@ -1,9 +1,6 @@
 use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcResponse, RequestId};
-use fastmcp_transport::{
-    TransportError,
-    http::{StreamableHttpTransport},
-};
+use fastmcp_transport::{TransportError, http::StreamableHttpTransport};
 
 #[test]
 fn http_01_a_positive() {
@@ -70,8 +67,8 @@ fn http_01_a_planted_negative() {
 
 #[test]
 fn http_01_b_positive() {
-    let mut transport = StreamableHttpTransport::with_capacity(1)
-        .expect("a one-entry bounded transport is valid");
+    let mut transport =
+        StreamableHttpTransport::with_capacity(1).expect("a one-entry bounded transport is valid");
     let responses = transport
         .response_stream()
         .expect("the public HTTP response stream can be externalized once");
@@ -139,8 +136,8 @@ fn http_01_b_positive() {
 
 #[test]
 fn http_01_b_planted_negative() {
-    let mut transport = StreamableHttpTransport::with_capacity(1)
-        .expect("a one-entry bounded transport is valid");
+    let mut transport =
+        StreamableHttpTransport::with_capacity(1).expect("a one-entry bounded transport is valid");
     let responses = transport
         .response_stream()
         .expect("the public HTTP response stream can be externalized once");

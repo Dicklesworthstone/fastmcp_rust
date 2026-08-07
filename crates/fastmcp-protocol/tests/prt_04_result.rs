@@ -1,7 +1,7 @@
 use fastmcp_protocol::{
     CompleteResultPayload, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonObject,
-    ExactJsonValue, ResultDecodeError, ResultDecodeErrorKind, ResultPeerEra,
-    TypedCompleteMembers, decode_peer_result, decode_typed_complete, encode_result,
+    ExactJsonValue, ResultDecodeError, ResultDecodeErrorKind, ResultPeerEra, TypedCompleteMembers,
+    decode_peer_result, decode_typed_complete, encode_result,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,7 +40,11 @@ fn prt_04_a_positive() {
         panic!("complete result");
     };
     assert_eq!(
-        complete.meta.server_info.as_ref().map(|info| info.name.as_str()),
+        complete
+            .meta
+            .server_info
+            .as_ref()
+            .map(|info| info.name.as_str()),
         Some("FastMCP")
     );
     assert!(matches!(
@@ -93,8 +97,7 @@ fn prt_04_a_planted_negative() {
         &CoreResultDiscriminatorPolicy,
     )
     .expect("rejection cannot mutate the stateless codec");
-    let (DecodedResult::Complete(before), DecodedResult::Complete(after)) =
-        (baseline, reaccepted)
+    let (DecodedResult::Complete(before), DecodedResult::Complete(after)) = (baseline, reaccepted)
     else {
         panic!("complete baseline");
     };
@@ -105,8 +108,9 @@ fn prt_04_a_planted_negative() {
 #[test]
 fn prt_04_b_positive() {
     let source = r#"{"resultType":"complete","status":"ready","record":{"id":123456789012345678901234567890},"opaque":{"null":null,"decimal":1.20e+4}}"#;
-    let (decoded, diagnostic) = decode_typed_complete::<LookupResult>(source, ResultPeerEra::Modern)
-        .expect("public typed result codec consumes only selected known members");
+    let (decoded, diagnostic) =
+        decode_typed_complete::<LookupResult>(source, ResultPeerEra::Modern)
+            .expect("public typed result codec consumes only selected known members");
     assert_eq!(diagnostic, None);
     assert_eq!(decoded.payload.status, "ready");
     assert_eq!(
@@ -116,11 +120,8 @@ fn prt_04_b_positive() {
         ))
     );
     assert_eq!(decoded.extras.members().len(), 1);
-    let Some(ExactJsonValue::Object(opaque)) = decoded
-        .extras
-        .members()
-        .first()
-        .map(|member| &member.value)
+    let Some(ExactJsonValue::Object(opaque)) =
+        decoded.extras.members().first().map(|member| &member.value)
     else {
         panic!("unknown member is retained");
     };

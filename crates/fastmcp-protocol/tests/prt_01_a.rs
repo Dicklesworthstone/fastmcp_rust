@@ -48,9 +48,15 @@ fn prt_01_envelopes_planted_negative() {
 
     assert!(matches!(
         decode_strict_jsonrpc_message(planted, 4 * 1024),
-        Err(JsonRpcAdmissionError::Raw(RawJsonAdmissionError::DuplicateObjectMember))
+        Err(JsonRpcAdmissionError::Raw(
+            RawJsonAdmissionError::DuplicateObjectMember
+        ))
     ));
-    assert_eq!(accepted.len(), state_before, "rejection occurs before accepted state mutates");
+    assert_eq!(
+        accepted.len(),
+        state_before,
+        "rejection occurs before accepted state mutates"
+    );
 }
 
 #[test]
@@ -85,7 +91,11 @@ fn prt_01_id_correlation_positive() {
         request.id.expect("the request remains correlated"),
         Value::Null,
     );
-    assert!(serde_json::to_string(&response).expect("response serializes").contains(large));
+    assert!(
+        serde_json::to_string(&response)
+            .expect("response serializes")
+            .contains(large)
+    );
 }
 
 #[test]
@@ -112,7 +122,8 @@ fn prt_01_id_correlation_planted_negative() {
 #[test]
 fn prt_01_duplicate_member_planted_negative() {
     let baseline = br#"{"jsonrpc":"2.0","method":"tools/list","params":{"cursor":"a"}}"#;
-    let planted = br#"{"jsonrpc":"2.0","method":"tools/list","params":{"cursor":"a","cursor":"b"}}"#;
+    let planted =
+        br#"{"jsonrpc":"2.0","method":"tools/list","params":{"cursor":"a","cursor":"b"}}"#;
     let mut accepted = Vec::new();
     accepted.push(
         decode_strict_jsonrpc_message(baseline, 4 * 1024)
@@ -122,9 +133,15 @@ fn prt_01_duplicate_member_planted_negative() {
 
     assert!(matches!(
         decode_strict_jsonrpc_message(planted, 4 * 1024),
-        Err(JsonRpcAdmissionError::Raw(RawJsonAdmissionError::DuplicateObjectMember))
+        Err(JsonRpcAdmissionError::Raw(
+            RawJsonAdmissionError::DuplicateObjectMember
+        ))
     ));
-    assert_eq!(accepted.len(), state_before, "duplicate parameters reach no typed state");
+    assert_eq!(
+        accepted.len(),
+        state_before,
+        "duplicate parameters reach no typed state"
+    );
 }
 
 #[test]
@@ -159,14 +176,19 @@ fn prt_01_a_planted_negative() {
     planted.splice(0..0, [0xef, 0xbb, 0xbf]);
     let mut accepted = Vec::new();
     accepted.push(
-        decode_strict_jsonrpc_message(baseline, 4 * 1024)
-            .expect("the public baseline is admitted"),
+        decode_strict_jsonrpc_message(baseline, 4 * 1024).expect("the public baseline is admitted"),
     );
     let state_before = accepted.len();
 
     assert!(matches!(
         decode_strict_jsonrpc_message(&planted, 4 * 1024),
-        Err(JsonRpcAdmissionError::Raw(RawJsonAdmissionError::ByteOrderMark))
+        Err(JsonRpcAdmissionError::Raw(
+            RawJsonAdmissionError::ByteOrderMark
+        ))
     ));
-    assert_eq!(accepted.len(), state_before, "the planted raw rejection leaves state unchanged");
+    assert_eq!(
+        accepted.len(),
+        state_before,
+        "the planted raw rejection leaves state unchanged"
+    );
 }
