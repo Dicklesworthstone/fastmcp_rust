@@ -70,6 +70,23 @@ const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = concat!(
     "examples, redact secrets and peer-controlled terminal text, and preserve nonzero ",
     "failures rather than fabricating an empty catalog or selection."
 );
+/// Independently authored normalized root-help frame. Root help is a public
+/// documentation boundary: support claims may appear only in the exact
+/// provisional status stanza, never in a free-form prefix.
+const EXPECTED_CLI_ROOT_HELP_PREFIX: &str = concat!(
+    "FastMCP CLI - Run, inspect, and install MCP servers. ",
+    "Usage: fastmcp <COMMAND> ",
+    "Commands: ",
+    "run Run an MCP server binary ",
+    "inspect Inspect an MCP server's capabilities ",
+    "install Install server configuration into Claude Desktop or other clients ",
+    "list List configured MCP servers ",
+    "test Test MCP server connectivity ",
+    "dev Run server in development mode with hot reloading ",
+    "tasks Inspect legacy background-task RPCs (quarantined by FastMCP servers) ",
+    "help Print this message or the help of the given subcommand(s) ",
+    "Options: -h, --help Print help -V, --version Print version "
+);
 
 /// Typed refusal emitted when the public Clap help pipeline cannot produce an
 /// exactly provisional documentation contract.
@@ -85,7 +102,7 @@ enum CliDocumentationRefusal {
     AggregateClaimTreatedAsEvidence,
     MissingStatusStanza,
     StatusStanzaMismatch,
-    StatusClaimOutsideStanza,
+    RootHelpFrameMismatch,
     UnsafeRootHelpContent,
     NoAcceptedHelp,
     HelpEmissionFailed,
@@ -120,8 +137,8 @@ impl CliDocumentationRefusal {
             Self::StatusStanzaMismatch => {
                 "DOC-01 CLI help has an altered provisional protocol-status stanza"
             }
-            Self::StatusClaimOutsideStanza => {
-                "DOC-01 CLI help places a protocol-status claim outside its provisional stanza"
+            Self::RootHelpFrameMismatch => {
+                "DOC-01 CLI help has an unexpected root documentation frame"
             }
             Self::UnsafeRootHelpContent => {
                 "DOC-01 CLI help contains unsafe credential or terminal content"
@@ -232,28 +249,14 @@ fn validate_public_cli_help(candidate: &CliHelpCandidate) -> Result<(), CliDocum
         return Err(CliDocumentationRefusal::StatusStanzaMismatch);
     }
 
-    let status_terms = [
-        "MCP 2026-07-28",
-        "PROTOCOL_VERSION",
-        "ModernOnly",
-        "Auto",
-        "LegacyOnly",
-        "MCP 2025-11-25",
-        "conformance",
-        "runtime-readiness",
-        "maturity",
-        "release evidence",
-        "production-ready",
-        "production ready",
-    ];
-    if status_terms.iter().any(|term| root_help.contains(term)) {
-        return Err(CliDocumentationRefusal::StatusClaimOutsideStanza);
-    }
     if ["Bearer ", "token=", "\u{1b}"]
         .iter()
         .any(|term| root_help.contains(term))
     {
         return Err(CliDocumentationRefusal::UnsafeRootHelpContent);
+    }
+    if root_help != EXPECTED_CLI_ROOT_HELP_PREFIX {
+        return Err(CliDocumentationRefusal::RootHelpFrameMismatch);
     }
 
     Ok(())
@@ -443,6 +446,7 @@ fn doc_01_b_planted_negative() {
         "Auto is runnable.",
         "MCP 2025-11-25 is supported.",
         "FastMCP is production ready.",
+        "FastMCP is fully supported for production use.",
     ] {
         let planted_candidate = CliHelpCandidate {
             contract: baseline.contract,
@@ -450,7 +454,7 @@ fn doc_01_b_planted_negative() {
         };
         assert_eq!(
             admit_public_cli_help(&mut state, planted_candidate),
-            Err(CliDocumentationRefusal::StatusClaimOutsideStanza),
+            Err(CliDocumentationRefusal::RootHelpFrameMismatch),
             "the raw-help claim {claim:?} must be rejected"
         );
         assert_eq!(

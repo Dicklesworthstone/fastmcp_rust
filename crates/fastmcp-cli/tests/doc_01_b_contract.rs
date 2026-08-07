@@ -40,6 +40,24 @@ const PROVISIONAL_PUBLIC_STATUS_STANZA: &str = concat!(
     "failures rather than fabricating an empty catalog or selection."
 );
 
+/// Independently authored normalized root frame for the public binary. This
+/// positive contract rejects any free-form prefix claim instead of attempting
+/// to enumerate paraphrases of unsupported aggregate support.
+const PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX: &str = concat!(
+    "FastMCP CLI - Run, inspect, and install MCP servers. ",
+    "Usage: fastmcp <COMMAND> ",
+    "Commands: ",
+    "run Run an MCP server binary ",
+    "inspect Inspect an MCP server's capabilities ",
+    "install Install server configuration into Claude Desktop or other clients ",
+    "list List configured MCP servers ",
+    "test Test MCP server connectivity ",
+    "dev Run server in development mode with hot reloading ",
+    "tasks Inspect legacy background-task RPCs (quarantined by FastMCP servers) ",
+    "help Print this message or the help of the given subcommand(s) ",
+    "Options: -h, --help Print help -V, --version Print version "
+);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublicHelpRefusal {
     InvalidOutputEnvelope,
@@ -53,7 +71,7 @@ enum PublicHelpRefusal {
     MissingBaseFrame,
     MissingStatusStanza,
     AlteredStatusStanza,
-    StatusClaimOutsideStanza,
+    RootHelpFrameMismatch,
     UnsafeRootHelpContent,
 }
 
@@ -141,28 +159,14 @@ fn validate_public_root_help_bytes(bytes: &[u8]) -> Result<(), PublicHelpRefusal
         return Err(PublicHelpRefusal::AlteredStatusStanza);
     }
 
-    let status_terms = [
-        "MCP 2026-07-28",
-        "PROTOCOL_VERSION",
-        "ModernOnly",
-        "Auto",
-        "LegacyOnly",
-        "MCP 2025-11-25",
-        "conformance",
-        "runtime-readiness",
-        "maturity",
-        "release evidence",
-        "production-ready",
-        "production ready",
-    ];
-    if status_terms.iter().any(|term| root_help.contains(term)) {
-        return Err(PublicHelpRefusal::StatusClaimOutsideStanza);
-    }
     if ["Bearer ", "token=", "\u{1b}"]
         .iter()
         .any(|term| root_help.contains(term))
     {
         return Err(PublicHelpRefusal::UnsafeRootHelpContent);
+    }
+    if root_help != PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX {
+        return Err(PublicHelpRefusal::RootHelpFrameMismatch);
     }
 
     Ok(())
@@ -270,6 +274,7 @@ fn doc_01_b_public_binary_planted_negative() {
         "Auto is runnable.",
         "MCP 2025-11-25 is supported.",
         "FastMCP is production ready.",
+        "FastMCP is fully supported for production use.",
     ] {
         let planted_candidate = PublicHelpCandidate {
             oracle: baseline.oracle,
@@ -277,7 +282,7 @@ fn doc_01_b_public_binary_planted_negative() {
         };
         assert_eq!(
             admit_public_root_help(&mut state, planted_candidate),
-            Err(PublicHelpRefusal::StatusClaimOutsideStanza),
+            Err(PublicHelpRefusal::RootHelpFrameMismatch),
             "the raw-help claim {claim:?} must be rejected"
         );
         assert_eq!(
