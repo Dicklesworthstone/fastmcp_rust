@@ -1145,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn clt_01_a_positive() {
+    fn unit_clt_01_a_positive() {
         assert_eq!(
             clt_01_a_manifest_digest().as_bytes(),
             &[
@@ -1294,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn clt_01_a_planted_negative() {
+    fn unit_clt_01_a_planted_negative() {
         let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
         let cx = Cx::for_testing();
         let _first = executor
@@ -1312,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn clt_01_b_positive() {
+    fn unit_clt_01_b_positive() {
         assert_eq!(
             clt_01_b_manifest_digest().as_bytes(),
             &[
@@ -1480,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn clt_01_b_planted_negative() {
+    fn unit_clt_01_b_planted_negative() {
         let cx = Cx::for_testing();
         let executor = RequestExecutor::new(ScriptedTransport::new([Ok(JsonRpcMessage::Request(
             JsonRpcRequest::notification(
