@@ -3120,7 +3120,7 @@ impl Server {
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let mut session = Session::new(self.info.clone(), self.capabilities.clone());
-        let era_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let mut era_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
         let mut negotiated_era = None;
 
         // Wrap send in Arc<Mutex> for shared access from bidirectional requests
@@ -3410,7 +3410,7 @@ impl Server {
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let mut session = Session::new(self.info.clone(), self.capabilities.clone());
-        let era_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let mut era_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
         let mut negotiated_era = None;
 
         // Wrap send in Arc<Mutex> for shared access from bidirectional requests
