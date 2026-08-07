@@ -274,6 +274,10 @@ pub struct Legacy2024StateSnapshot {
     pub subscriptions: Vec<String>,
     /// Current client logging level, if one was admitted.
     pub logging_level: Option<String>,
+    /// Exact pending server-to-client request IDs in stable order.
+    pub pending_reverse_request_ids: Vec<i64>,
+    /// Number of live adapter-owned quota reservations.
+    pub reservation_count: u64,
     /// Count of admitted cancellation/progress control notifications.
     pub control_notification_count: u64,
     /// Count of accepted client root-list-change notifications.
@@ -303,6 +307,14 @@ impl Legacy2024StateSnapshot {
             &mut bytes,
             self.logging_level.as_deref().unwrap_or_default().as_bytes(),
         );
+        append_length_prefixed(
+            &mut bytes,
+            &(self.pending_reverse_request_ids.len() as u32).to_be_bytes(),
+        );
+        for request_id in &self.pending_reverse_request_ids {
+            append_length_prefixed(&mut bytes, &request_id.to_be_bytes());
+        }
+        append_length_prefixed(&mut bytes, &self.reservation_count.to_be_bytes());
         append_length_prefixed(&mut bytes, &self.control_notification_count.to_be_bytes());
         append_length_prefixed(&mut bytes, &self.roots_list_changed_count.to_be_bytes());
         append_length_prefixed(&mut bytes, &self.close_release_count.to_be_bytes());
@@ -323,6 +335,8 @@ pub struct Legacy2024ServerAdapter<H> {
     client_capabilities_bytes: Vec<u8>,
     subscriptions: BTreeSet<String>,
     logging_level: Option<String>,
+    pending_reverse_request_ids: BTreeSet<i64>,
+    reservation_count: u64,
     control_notification_count: u64,
     roots_list_changed_count: u64,
     close_release_count: u64,
@@ -357,6 +371,8 @@ where
             client_capabilities_bytes: Vec::new(),
             subscriptions: BTreeSet::new(),
             logging_level: None,
+            pending_reverse_request_ids: BTreeSet::new(),
+            reservation_count: 0,
             control_notification_count: 0,
             roots_list_changed_count: 0,
             close_release_count: 0,
@@ -391,6 +407,8 @@ where
             client_capabilities_bytes: self.client_capabilities_bytes.clone(),
             subscriptions: self.subscriptions.iter().cloned().collect(),
             logging_level: self.logging_level.clone(),
+            pending_reverse_request_ids: self.pending_reverse_request_ids.iter().copied().collect(),
+            reservation_count: self.reservation_count,
             control_notification_count: self.control_notification_count,
             roots_list_changed_count: self.roots_list_changed_count,
             close_release_count: self.close_release_count,
@@ -433,10 +451,9 @@ where
                 self.receive_notification(method.name, params.as_ref())?;
                 Ok(Legacy2024Outbound::NoResponse)
             }
-            Legacy2024Envelope::Response { .. } | Legacy2024Envelope::Error { .. } => {
-                Err(Legacy2024AdapterError::invalid_request(
-                    "server adapter accepts only client request or notification envelopes",
-                ))
+            Legacy2024Envelope::Response { id, .. } | Legacy2024Envelope::Error { id, .. } => {
+                self.complete_reverse_request(id)?;
+                Ok(Legacy2024Outbound::NoResponse)
             }
         }
     }
@@ -556,14 +573,19 @@ where
     /// Transitions to terminal Closed and releases all adapter-owned state once.
     pub fn close(&mut self, binding: LegacyPeerBinding) -> Result<(), Legacy2024AdapterError> {
         self.require_binding(binding)?;
-        if self.lifecycle != Legacy2024Lifecycle::Closed {
-            self.lifecycle = Legacy2024Lifecycle::Closed;
-            self.client_capabilities = None;
-            self.client_capabilities_bytes.clear();
-            self.subscriptions.clear();
-            self.logging_level = None;
-            self.close_release_count = self.close_release_count.saturating_add(1);
+        if self.lifecycle == Legacy2024Lifecycle::Closed {
+            return Err(Legacy2024AdapterError::invalid_request(
+                "legacy adapter lifecycle is already closed",
+            ));
         }
+        self.lifecycle = Legacy2024Lifecycle::Closed;
+        self.client_capabilities = None;
+        self.client_capabilities_bytes.clear();
+        self.subscriptions.clear();
+        self.logging_level = None;
+        self.pending_reverse_request_ids.clear();
+        self.reservation_count = 0;
+        self.close_release_count = self.close_release_count.saturating_add(1);
         Ok(())
     }
 
@@ -777,7 +799,10 @@ where
             ));
         }
         let uri = uri_param(params)?;
-        self.subscriptions.insert(uri.to_owned());
+        if !self.subscriptions.contains(uri) {
+            self.reserve_state()?;
+            self.subscriptions.insert(uri.to_owned());
+        }
         Ok(json!({}))
     }
 
@@ -794,7 +819,9 @@ where
             ));
         }
         let uri = uri_param(params)?;
-        self.subscriptions.remove(uri);
+        if self.subscriptions.remove(uri) {
+            self.release_state()?;
+        }
         Ok(json!({}))
     }
 
@@ -852,12 +879,52 @@ where
         params: Value,
     ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
         let id = self.next_reverse_request_id;
-        self.next_reverse_request_id = self.next_reverse_request_id.checked_add(1).ok_or(
+        let next_reverse_request_id = self.next_reverse_request_id.checked_add(1).ok_or(
             Legacy2024AdapterError::invalid_request("legacy reverse request ID space is exhausted"),
         )?;
+        self.reserve_state()?;
+        self.next_reverse_request_id = next_reverse_request_id;
+        self.pending_reverse_request_ids.insert(id);
         Ok(Legacy2024Outbound::ReverseRequest(json!({
             "jsonrpc": "2.0", "id": id, "method": method, "params": params,
         })))
+    }
+
+    fn complete_reverse_request(&mut self, id: Value) -> Result<(), Legacy2024AdapterError> {
+        if self.lifecycle != Legacy2024Lifecycle::Operating {
+            return Err(Legacy2024AdapterError::invalid_request(
+                "reverse response requires Operating lifecycle",
+            ));
+        }
+        let id = id.as_i64().ok_or(Legacy2024AdapterError::invalid_request(
+            "reverse response ID is not an adapter-owned integer",
+        ))?;
+        if !self.pending_reverse_request_ids.contains(&id) {
+            return Err(Legacy2024AdapterError::invalid_request(
+                "reverse response does not own an adapter request correlation",
+            ));
+        }
+        self.release_state()?;
+        self.pending_reverse_request_ids.remove(&id);
+        Ok(())
+    }
+
+    fn reserve_state(&mut self) -> Result<(), Legacy2024AdapterError> {
+        self.reservation_count = self.reservation_count.checked_add(1).ok_or(
+            Legacy2024AdapterError::invalid_request(
+                "legacy adapter reservation count is exhausted",
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn release_state(&mut self) -> Result<(), Legacy2024AdapterError> {
+        self.reservation_count = self.reservation_count.checked_sub(1).ok_or(
+            Legacy2024AdapterError::invalid_request(
+                "legacy adapter reservation accounting is inconsistent",
+            ),
+        )?;
+        Ok(())
     }
 }
 
@@ -940,6 +1007,41 @@ pub fn legacy_2024_a_digest_preimage(
         direction_bytes(direction).to_vec(),
         lifecycle_bytes(output_lifecycle).to_vec(),
         state_digest.to_vec(),
+    ] {
+        append_length_prefixed(&mut bytes, &field);
+    }
+    bytes
+}
+
+/// Encodes the canonical LEG-02 B operating-isolation and teardown digest
+/// preimage without hashing it.
+#[must_use]
+pub fn legacy_2024_b_digest_preimage(
+    partition_ordinal: u32,
+    operation_ordinal: u32,
+    method: &[u8],
+    direction: Legacy2024Direction,
+    owner_partition: &[u8],
+    connection_identity: &[u8],
+    before_state_digest: &[u8],
+    after_state_digest: &[u8],
+    lifecycle: Legacy2024Lifecycle,
+    reservation_count: u64,
+    release_counter: u64,
+) -> Vec<u8> {
+    let mut bytes = b"fastmcp-leg-02-b-v1\0".to_vec();
+    for field in [
+        partition_ordinal.to_be_bytes().to_vec(),
+        operation_ordinal.to_be_bytes().to_vec(),
+        method.to_vec(),
+        direction_bytes(direction).to_vec(),
+        owner_partition.to_vec(),
+        connection_identity.to_vec(),
+        before_state_digest.to_vec(),
+        after_state_digest.to_vec(),
+        lifecycle_bytes(lifecycle).to_vec(),
+        reservation_count.to_be_bytes().to_vec(),
+        release_counter.to_be_bytes().to_vec(),
     ] {
         append_length_prefixed(&mut bytes, &field);
     }
