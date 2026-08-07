@@ -5,6 +5,8 @@
 //! `io.modelcontextprotocol/protocolVersion` value. Transport code owns HTTP
 //! header parsing and supplies the already-decoded field value here.
 
+use serde_json::{json, Map, Value};
+
 /// The final protocol version implemented by this narrow modern surface.
 pub const FINAL_PROTOCOL_VERSION: &str = "2026-07-28";
 
@@ -17,8 +19,14 @@ pub const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 /// The final MCP JSON-RPC code for malformed, missing, or mismatched headers.
 pub const HEADER_MISMATCH_ERROR_CODE: i32 = -32020;
 
+/// The final MCP JSON-RPC code for a missing required client capability.
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE: i32 = -32021;
+
 /// The final MCP JSON-RPC code for a version the server does not support.
 pub const UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE: i32 = -32022;
+
+/// The maximum encoded size accepted for typed required-capabilities error data.
+pub const MAX_REQUIRED_CAPABILITIES_ERROR_DATA_BYTES: usize = 64 * 1024;
 
 /// A validated final protocol version.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +63,21 @@ impl FinalRequestAdmission {
     }
 }
 
+/// HTTP metadata mirrored from the final JSON-RPC request body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FinalHttpRequestMetadata<'a> {
+    /// The final protocol-version header/body mirror.
+    pub version: RequestVersionMetadata<'a>,
+    /// The `Mcp-Method` header value.
+    pub header_method: Option<&'a str>,
+    /// The JSON-RPC request method.
+    pub body_method: Option<&'a str>,
+    /// The conditional `Mcp-Name` header value.
+    pub header_name: Option<&'a str>,
+    /// The conditional name or URI value from the request body.
+    pub body_name: Option<&'a str>,
+}
+
 /// The exact header/body condition that failed final request admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HeaderMismatchReason {
@@ -68,6 +91,26 @@ pub enum HeaderMismatchReason {
     EmptyBodyVersion,
     /// The supplied header and body values were different.
     HeaderBodyVersionMismatch,
+    /// The required `Mcp-Method` header was absent.
+    MissingMethodHeader,
+    /// The JSON-RPC request method was absent.
+    MissingBodyMethod,
+    /// The `Mcp-Method` header was empty.
+    EmptyMethodHeader,
+    /// The JSON-RPC request method was empty.
+    EmptyBodyMethod,
+    /// The supplied `Mcp-Method` header and JSON-RPC method differed.
+    HeaderBodyMethodMismatch,
+    /// A method that requires `Mcp-Name` omitted that header.
+    MissingNameHeader,
+    /// A method that requires `Mcp-Name` omitted the matching body value.
+    MissingBodyName,
+    /// The required `Mcp-Name` header was empty.
+    EmptyNameHeader,
+    /// The matching body name or URI was empty.
+    EmptyBodyName,
+    /// The supplied `Mcp-Name` header and matching body value differed.
+    HeaderBodyNameMismatch,
 }
 
 /// Typed local detail for a final `HeaderMismatchError`.
@@ -96,6 +139,12 @@ impl HeaderMismatchError {
     #[must_use]
     pub const fn http_status(self) -> u16 {
         400
+    }
+
+    /// Returns no canonical peer error data for a header mismatch.
+    #[must_use]
+    pub fn canonical_error_data(self) -> Option<Value> {
+        None
     }
 }
 
@@ -128,6 +177,77 @@ impl UnsupportedProtocolVersionError {
     #[must_use]
     pub const fn http_status(&self) -> u16 {
         400
+    }
+
+    /// Returns the exact final peer error-data object.
+    #[must_use]
+    pub fn canonical_error_data(&self) -> Value {
+        json!({
+            "supported": self.supported_versions(),
+            "requested": self.requested(),
+        })
+    }
+}
+
+/// Why a caller could not construct required-capabilities error data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequiredCapabilitiesError {
+    /// The protocol requires an object, not another JSON value kind.
+    NotAnObject,
+    /// The exact JSON encoding exceeded the bounded peer-data allowance.
+    TooLarge,
+    /// The JSON object could not be encoded for the peer-facing error shape.
+    Encoding,
+}
+
+/// Typed final error data for a missing required client capability.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MissingRequiredClientCapabilityError {
+    required_capabilities: Map<String, Value>,
+}
+
+impl MissingRequiredClientCapabilityError {
+    /// Constructs the error from the exact required-capabilities object.
+    ///
+    /// Flattened diagnostic paths deliberately do not enter peer-facing data;
+    /// the exact object is retained for the final error shape instead.
+    pub fn new(required_capabilities: Value) -> Result<Self, RequiredCapabilitiesError> {
+        let Value::Object(required_capabilities) = required_capabilities else {
+            return Err(RequiredCapabilitiesError::NotAnObject);
+        };
+        let encoded_len = serde_json::to_vec(&required_capabilities)
+            .map_err(|_| RequiredCapabilitiesError::Encoding)?
+            .len();
+        if encoded_len > MAX_REQUIRED_CAPABILITIES_ERROR_DATA_BYTES {
+            return Err(RequiredCapabilitiesError::TooLarge);
+        }
+        Ok(Self {
+            required_capabilities,
+        })
+    }
+
+    /// Returns the exact required-capabilities object.
+    #[must_use]
+    pub const fn required_capabilities(&self) -> &Map<String, Value> {
+        &self.required_capabilities
+    }
+
+    /// Returns the final MCP JSON-RPC missing-capability code.
+    #[must_use]
+    pub const fn jsonrpc_error_code(&self) -> i32 {
+        MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE
+    }
+
+    /// Returns the final HTTP status for a missing client capability.
+    #[must_use]
+    pub const fn http_status(&self) -> u16 {
+        400
+    }
+
+    /// Returns the exact final peer error-data object.
+    #[must_use]
+    pub fn canonical_error_data(&self) -> Value {
+        json!({"requiredCapabilities": self.required_capabilities})
     }
 }
 
@@ -265,34 +385,126 @@ pub fn admit_final_request(
     })
 }
 
+/// Admits the standard final HTTP header mirrors for a request.
+///
+/// Protocol-version admission occurs first. Once that mirror selects the
+/// final protocol, `Mcp-Method` must exactly match the JSON-RPC method. The
+/// `Mcp-Name` mirror is then required only for `tools/call`, `resources/read`,
+/// and `prompts/get`; no extra header is inferred for other methods.
+pub fn admit_final_http_request(
+    metadata: FinalHttpRequestMetadata<'_>,
+) -> Result<FinalRequestAdmission, RequestAdmissionError> {
+    let admission = admit_final_request(metadata.version)?;
+    let method = exact_nonempty_mirror(
+        metadata.header_method,
+        metadata.body_method,
+        HeaderMismatchReason::MissingMethodHeader,
+        HeaderMismatchReason::MissingBodyMethod,
+        HeaderMismatchReason::EmptyMethodHeader,
+        HeaderMismatchReason::EmptyBodyMethod,
+        HeaderMismatchReason::HeaderBodyMethodMismatch,
+    )?;
+    if requires_mcp_name(method) {
+        let _ = exact_nonempty_mirror(
+            metadata.header_name,
+            metadata.body_name,
+            HeaderMismatchReason::MissingNameHeader,
+            HeaderMismatchReason::MissingBodyName,
+            HeaderMismatchReason::EmptyNameHeader,
+            HeaderMismatchReason::EmptyBodyName,
+            HeaderMismatchReason::HeaderBodyNameMismatch,
+        )?;
+    }
+    Ok(admission)
+}
+
+fn exact_nonempty_mirror<'a>(
+    header: Option<&'a str>,
+    body: Option<&'a str>,
+    missing_header: HeaderMismatchReason,
+    missing_body: HeaderMismatchReason,
+    empty_header: HeaderMismatchReason,
+    empty_body: HeaderMismatchReason,
+    mismatch: HeaderMismatchReason,
+) -> Result<&'a str, RequestAdmissionError> {
+    let header = header.ok_or(RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
+        reason: missing_header,
+    }))?;
+    let body = body.ok_or(RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
+        reason: missing_body,
+    }))?;
+    if header.is_empty() {
+        return Err(RequestAdmissionError::HeaderMismatch(
+            HeaderMismatchError {
+                reason: empty_header,
+            },
+        ));
+    }
+    if body.is_empty() {
+        return Err(RequestAdmissionError::HeaderMismatch(
+            HeaderMismatchError {
+                reason: empty_body,
+            },
+        ));
+    }
+    if header != body {
+        return Err(RequestAdmissionError::HeaderMismatch(
+            HeaderMismatchError { reason: mismatch },
+        ));
+    }
+    Ok(header)
+}
+
+fn requires_mcp_name(method: &str) -> bool {
+    matches!(method, "tools/call" | "resources/read" | "prompts/get")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn prt_03_a_positive() {
-        let header = Some(FINAL_PROTOCOL_VERSION);
-        let body = Some(FINAL_PROTOCOL_VERSION);
+        let admission = admit_final_http_request(FinalHttpRequestMetadata {
+            version: RequestVersionMetadata {
+                header_version: Some(FINAL_PROTOCOL_VERSION),
+                body_version: Some(FINAL_PROTOCOL_VERSION),
+            },
+            header_method: Some("tools/call"),
+            body_method: Some("tools/call"),
+            header_name: Some("weather"),
+            body_name: Some("weather"),
+        })
+        .expect("matching final standard headers and body values must be admitted");
 
-        let version = validate_final_protocol_version(header, body)
-            .expect("matching final header and body version must be admitted");
-
-        assert_eq!(version.as_str(), FINAL_PROTOCOL_VERSION);
+        assert_eq!(admission.protocol_version().as_str(), FINAL_PROTOCOL_VERSION);
         assert_eq!(MCP_PROTOCOL_VERSION_HEADER, "MCP-Protocol-Version");
     }
 
     #[test]
     fn prt_03_a_planted_negative() {
-        let header = Some("2025-11-25");
-        let body = Some(FINAL_PROTOCOL_VERSION);
+        let body_name = Some("weather");
+        let error = admit_final_http_request(FinalHttpRequestMetadata {
+            version: RequestVersionMetadata {
+                header_version: Some(FINAL_PROTOCOL_VERSION),
+                body_version: Some(FINAL_PROTOCOL_VERSION),
+            },
+            header_method: Some("tools/call"),
+            body_method: Some("tools/call"),
+            header_name: Some("other-weather"),
+            body_name,
+        })
+        .expect_err("changing only the name header must reject the request");
 
-        let error = validate_final_protocol_version(header, body)
-            .expect_err("changing only the header version must reject the request");
-
-        assert_eq!(error, ProtocolVersionError::HeaderMismatch);
+        assert_eq!(
+            error,
+            RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
+                reason: HeaderMismatchReason::HeaderBodyNameMismatch,
+            })
+        );
         assert_eq!(error.http_status(), 400);
         assert_eq!(error.jsonrpc_error_code(), HEADER_MISMATCH_ERROR_CODE);
-        assert_eq!(body, Some(FINAL_PROTOCOL_VERSION));
+        assert_eq!(body_name, Some("weather"));
     }
 
     #[test]
@@ -377,5 +589,41 @@ mod tests {
         assert_eq!(error.supported_versions(), [FINAL_PROTOCOL_VERSION]);
         assert_eq!(error.jsonrpc_error_code(), UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE);
         assert_eq!(error.http_status(), 400);
+    }
+
+    #[test]
+    fn typed_errors_preserve_only_their_final_peer_data_shapes() {
+        let mismatch = HeaderMismatchError {
+            reason: HeaderMismatchReason::MissingHeader,
+        };
+        assert_eq!(mismatch.canonical_error_data(), None);
+
+        let unsupported = UnsupportedProtocolVersionError {
+            requested: "2025-11-25".to_owned(),
+        };
+        assert_eq!(
+            unsupported.canonical_error_data(),
+            json!({"supported": [FINAL_PROTOCOL_VERSION], "requested": "2025-11-25"})
+        );
+
+        let missing = MissingRequiredClientCapabilityError::new(json!({
+            "roots": {"listChanged": true},
+            "sampling": {"context": {}}
+        }))
+        .expect("bounded capability object is valid typed peer data");
+        assert_eq!(missing.http_status(), 400);
+        assert_eq!(
+            missing.jsonrpc_error_code(),
+            MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE
+        );
+        assert_eq!(
+            missing.canonical_error_data(),
+            json!({
+                "requiredCapabilities": {
+                    "roots": {"listChanged": true},
+                    "sampling": {"context": {}}
+                }
+            })
+        );
     }
 }
