@@ -7,7 +7,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use fastmcp_client::Client;
-use fastmcp_core::{McpContext, McpError, McpResult};
+use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpResult};
+use fastmcp_protocol::protocol_policy::{
+    HttpEndpointBundle, HttpEndpointBundleKey, HttpEraCache, HttpEraDecision, HttpModernProbe,
+    ModernVersionSupport, ProtocolEra, ProtocolPolicy, StdioEraClassifier, StdioEraDecision,
+    StdioOpeningFrame,
+};
 use fastmcp_protocol::{
     Content, Prompt, PromptMessage, Resource, ResourceContent, ResourceTemplate, Tool,
 };
@@ -144,7 +149,251 @@ pub struct ProxyClient {
     inner: Arc<Mutex<dyn ProxyBackend>>,
 }
 
+/// Immutable adapter selected for one independently configured upstream leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyUpstreamAdapter {
+    /// MCP 2026-07-28 over the upstream stdio adapter.
+    ModernStdio,
+    /// Exact MCP 2024-11-05 over the upstream stdio adapter.
+    LegacyStdio,
+    /// MCP 2026-07-28 Streamable HTTP request/response transport.
+    ModernHttp,
+    /// Exact MCP 2024-11-05 advertised-POST plus SSE transport.
+    LegacyHttpSse,
+}
+
+/// Immutable route-local selection made before upstream lifecycle traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyUpstreamBinding {
+    era: ProtocolEra,
+    adapter: ProxyUpstreamAdapter,
+    policy: ProtocolPolicy,
+    configuration_generation: u64,
+}
+
+impl ProxyUpstreamBinding {
+    /// Returns the exact era selected for this upstream only.
+    #[must_use]
+    pub const fn era(self) -> ProtocolEra {
+        self.era
+    }
+
+    /// Returns the immutable transport adapter selected for this upstream.
+    #[must_use]
+    pub const fn adapter(self) -> ProxyUpstreamAdapter {
+        self.adapter
+    }
+
+    /// Returns whether this immutable binding selected the exact-2024 adapter.
+    #[must_use]
+    pub const fn uses_legacy_adapter(self) -> bool {
+        matches!(
+            self.adapter,
+            ProxyUpstreamAdapter::LegacyStdio | ProxyUpstreamAdapter::LegacyHttpSse
+        )
+    }
+
+    /// Returns whether this immutable binding selected an HTTP adapter.
+    #[must_use]
+    pub const fn uses_http_transport(self) -> bool {
+        matches!(
+            self.adapter,
+            ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::LegacyHttpSse
+        )
+    }
+
+    /// Returns the policy fixed before this upstream was classified.
+    #[must_use]
+    pub const fn policy(self) -> ProtocolPolicy {
+        self.policy
+    }
+
+    /// Returns the configuration generation included in this binding identity.
+    #[must_use]
+    pub const fn configuration_generation(self) -> u64 {
+        self.configuration_generation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StdioBindingKey {
+    route_identity: String,
+    transport_identity: String,
+    adapter_receipt_identity: String,
+    policy: ProtocolPolicy,
+    configuration_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HttpBindingKey {
+    route_identity: String,
+    transport_identity: String,
+    adapter_receipt_identity: String,
+    configuration_generation: u64,
+    bundle: HttpEndpointBundleKey,
+}
+
+/// Cache of immutable selections for independently configured proxy upstreams.
+///
+/// A cache entry is never keyed by an origin alone. Route, complete transport
+/// identity, policy (inside the HTTP bundle), adapter receipt identity, and
+/// configuration generation all participate in its identity.
+#[derive(Debug, Default)]
+pub struct ProxyUpstreamBindingRegistry {
+    stdio: HashMap<StdioBindingKey, ProxyUpstreamBinding>,
+    http: HashMap<HttpBindingKey, ProxyUpstreamBinding>,
+    http_eras: HttpEraCache,
+}
+
+impl ProxyUpstreamBindingRegistry {
+    /// Binds one stdio upstream using the exact two-era opening classifier.
+    ///
+    /// `adapter_receipt_identity` is an opaque identity supplied by the
+    /// installed upstream adapter. It is part of the cache key and must be
+    /// non-empty; this method neither fabricates a legacy receipt nor retries
+    /// selection under another policy.
+    pub fn bind_stdio(
+        &mut self,
+        route_identity: &str,
+        transport_identity: &str,
+        adapter_receipt_identity: &str,
+        configuration_generation: u64,
+        policy: ProtocolPolicy,
+        opening: StdioOpeningFrame,
+    ) -> McpResult<ProxyUpstreamBinding> {
+        let key = StdioBindingKey {
+            route_identity: route_identity.to_owned(),
+            transport_identity: transport_identity.to_owned(),
+            adapter_receipt_identity: adapter_receipt_identity.to_owned(),
+            policy,
+            configuration_generation,
+        };
+        validate_binding_key(
+            &key.route_identity,
+            &key.transport_identity,
+            &key.adapter_receipt_identity,
+        )?;
+        if let Some(binding) = self.stdio.get(&key) {
+            return Ok(*binding);
+        }
+
+        let mut classifier = StdioEraClassifier::new(policy);
+        let binding = match classifier.classify_opening(opening) {
+            StdioEraDecision::Selected {
+                era: ProtocolEra::Modern2026,
+                modern_version: Some(ModernVersionSupport::Supported),
+            } => ProxyUpstreamBinding {
+                era: ProtocolEra::Modern2026,
+                adapter: ProxyUpstreamAdapter::ModernStdio,
+                policy,
+                configuration_generation,
+            },
+            StdioEraDecision::Selected {
+                era: ProtocolEra::Legacy2024,
+                modern_version: None,
+            } => ProxyUpstreamBinding {
+                era: ProtocolEra::Legacy2024,
+                adapter: ProxyUpstreamAdapter::LegacyStdio,
+                policy,
+                configuration_generation,
+            },
+            _ => {
+                return Err(McpError::invalid_request(
+                    "Upstream stdio opening does not select an exact permitted MCP era",
+                ));
+            }
+        };
+        self.stdio.insert(key, binding);
+        Ok(binding)
+    }
+
+    /// Binds one HTTP upstream through its configured modern or legacy routes.
+    ///
+    /// Modern bindings use only the modern request/response route; legacy
+    /// bindings use only the exact-2024 SSE plus advertised-POST route chosen
+    /// by the immutable endpoint bundle.
+    pub fn bind_http(
+        &mut self,
+        route_identity: &str,
+        transport_identity: &str,
+        adapter_receipt_identity: &str,
+        configuration_generation: u64,
+        policy: ProtocolPolicy,
+        modern_post: Option<CanonicalHttpUrl>,
+        legacy_sse: Option<CanonicalHttpUrl>,
+        legacy_message_post: Option<CanonicalHttpUrl>,
+        credential_partition: String,
+        transport_profile: String,
+        legacy_receipt_generation: u64,
+        probe: HttpModernProbe,
+    ) -> McpResult<ProxyUpstreamBinding> {
+        validate_binding_key(route_identity, transport_identity, adapter_receipt_identity)?;
+        let bundle = HttpEndpointBundle::new(
+            policy,
+            modern_post,
+            legacy_sse,
+            legacy_message_post,
+            credential_partition,
+            transport_profile,
+            configuration_generation,
+            legacy_receipt_generation,
+        )
+        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        let key = HttpBindingKey {
+            route_identity: route_identity.to_owned(),
+            transport_identity: transport_identity.to_owned(),
+            adapter_receipt_identity: adapter_receipt_identity.to_owned(),
+            configuration_generation,
+            bundle: bundle.key(),
+        };
+        if let Some(binding) = self.http.get(&key) {
+            return Ok(*binding);
+        }
+        let era = match self.http_eras.classify_or_cached(&bundle, probe) {
+            HttpEraDecision::Selected(era) => era,
+            HttpEraDecision::RejectedWithoutLegacyFallback => {
+                return Err(McpError::invalid_request(
+                    "Upstream HTTP probe cannot select an exact permitted MCP era",
+                ));
+            }
+        };
+        let adapter = match era {
+            ProtocolEra::Modern2026 => ProxyUpstreamAdapter::ModernHttp,
+            ProtocolEra::Legacy2024 => ProxyUpstreamAdapter::LegacyHttpSse,
+        };
+        let binding = ProxyUpstreamBinding {
+            era,
+            adapter,
+            policy,
+            configuration_generation,
+        };
+        self.http.insert(key, binding);
+        Ok(binding)
+    }
+}
+
+fn validate_binding_key(
+    route_identity: &str,
+    transport_identity: &str,
+    adapter_receipt_identity: &str,
+) -> McpResult<()> {
+    if route_identity.is_empty()
+        || transport_identity.is_empty()
+        || adapter_receipt_identity.is_empty()
+    {
+        return Err(McpError::invalid_params(
+            "Upstream route, transport, and adapter receipt identities must be non-empty",
+        ));
+    }
+    Ok(())
+}
+
 impl ProxyClient {
+    /// Creates an independent cache for immutable upstream era selections.
+    #[must_use]
+    pub fn upstream_binding_registry() -> ProxyUpstreamBindingRegistry {
+        ProxyUpstreamBindingRegistry::default()
+    }
     /// Creates a proxy client from an MCP client.
     #[must_use]
     pub fn from_client(client: Client) -> Self {
