@@ -12,9 +12,8 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_client::{
-    clt_01_a_manifest_digest, clt_01_b_manifest_digest, ExecutionTerminalReason,
-    ExecutionTerminalState, OpaquePagination, PaginationBounds, Request, RequestExecutor,
-    RequestTimeoutPolicy,
+    ExecutionTerminalReason, ExecutionTerminalState, OpaquePagination, PaginationBounds, Request,
+    RequestExecutor, RequestTimeoutPolicy, clt_01_a_manifest_digest, clt_01_b_manifest_digest,
 };
 use fastmcp_core::McpErrorCode;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
@@ -399,15 +398,21 @@ fn clt_01_b_positive() {
     );
 
     let mut pagination = OpaquePagination::new(PaginationBounds::default(), Instant::now());
-    assert!(pagination
-        .accept_page(Some(String::new()), 0, 0, Instant::now())
-        .expect("empty cursor"));
-    assert!(pagination
-        .accept_page(Some(String::new()), 0, 0, Instant::now())
-        .expect("repeat cursor"));
-    assert!(!pagination
-        .accept_page(None, 0, 0, Instant::now())
-        .expect("absent cursor"));
+    assert!(
+        pagination
+            .accept_page(Some(String::new()), 0, 0, Instant::now())
+            .expect("empty cursor")
+    );
+    assert!(
+        pagination
+            .accept_page(Some(String::new()), 0, 0, Instant::now())
+            .expect("repeat cursor")
+    );
+    assert!(
+        !pagination
+            .accept_page(None, 0, 0, Instant::now())
+            .expect("absent cursor")
+    );
 
     let (shutdown_transport, shutdown_probe) = ScriptedTransport::new(std::iter::empty());
     let shutdown = RequestExecutor::new(shutdown_transport);
@@ -443,10 +448,12 @@ fn clt_01_b_planted_negative() {
         .drive(&cx)
         .expect("unrelated progress is peer activity");
     assert_eq!(executor.pending_records(), before);
-    assert!(owner
-        .take_stream_notifications()
-        .expect("stream remains empty")
-        .is_empty());
+    assert!(
+        owner
+            .take_stream_notifications()
+            .expect("stream remains empty")
+            .is_empty()
+    );
     assert_eq!(executor.take_notifications().len(), 1);
     assert!(executor.take_cancellation_events().is_empty());
     assert_eq!(probe.sent_len(), 1);
