@@ -142,6 +142,10 @@ fn prt_02_a_positive() {
     ];
     for content in content_rows {
         let wire = serde_json::to_value(&content).expect("content wire");
+        if matches!(&content, ContentBlock::Resource { .. }) {
+            assert_eq!(wire["resource"]["mimeType"], json!("text/plain"));
+            assert!(wire["resource"].get("mime_type").is_none());
+        }
         FinalCommonTypesSchema::validate(CommonWireDirection::Result, &wire)
             .expect("content schema");
         assert_eq!(
@@ -204,6 +208,17 @@ fn prt_02_a_planted_negative() {
     assert_eq!(
         accepted_resource, resource_baseline,
         "a rejected conflicting member cannot mutate accepted wire"
+    );
+
+    let mut snake_case_resource = accepted_resource.clone();
+    snake_case_resource["resource"]["mime_type"] = json!("text/plain");
+    assert!(
+        serde_json::from_value::<ContentBlock>(snake_case_resource).is_err(),
+        "only the unrecognized snake_case MIME member changes"
+    );
+    assert_eq!(
+        accepted_resource, resource_baseline,
+        "a rejected snake_case MIME member cannot mutate accepted wire"
     );
 
     let accepted_content = json!({"type": "text", "text": "baseline"});

@@ -1085,14 +1085,14 @@ pub enum EmbeddedResourceContents {
     Text {
         uri: AbsoluteUri,
         text: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
     },
     /// Blob resource contents.
     Blob {
         uri: AbsoluteUri,
         blob: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
     },
 }
@@ -1104,13 +1104,13 @@ enum EmbeddedResourceContentsWire {
     Text {
         uri: AbsoluteUri,
         text: String,
-        #[serde(default)]
+        #[serde(rename = "mimeType", default)]
         mime_type: Option<String>,
     },
     Blob {
         uri: AbsoluteUri,
         blob: String,
-        #[serde(default)]
+        #[serde(rename = "mimeType", default)]
         mime_type: Option<String>,
     },
 }
