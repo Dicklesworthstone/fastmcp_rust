@@ -249,6 +249,8 @@ def provider_statuses(value: Any) -> list[tuple[str, str]]:
         status = value.get("status")
         if isinstance(provider, str) and isinstance(status, str):
             found.append((provider, status.lower()))
+        elif isinstance(provider, str) and isinstance(value.get("passed"), bool):
+            found.append((provider, "pass" if value["passed"] else "fail"))
         for child in value.values():
             found.extend(provider_statuses(child))
     elif isinstance(value, list):
