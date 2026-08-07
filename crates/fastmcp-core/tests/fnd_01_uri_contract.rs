@@ -16,8 +16,8 @@ use fastmcp_core::uri::ConfiguredResourceEndpoint;
 
 const TRACE_HASH_MAX_BYTES: usize = 4 * 1024;
 
-fn digest_hex(value: &str) -> String {
-    let digest = sha256_bounded(value.as_bytes(), TRACE_HASH_MAX_BYTES)
+fn digest_hex(value: impl AsRef<[u8]>) -> String {
+    let digest = sha256_bounded(value.as_ref(), TRACE_HASH_MAX_BYTES)
         .expect("URI contract trace values stay within their fixed bound");
     digest
         .as_bytes()
@@ -30,14 +30,14 @@ fn trace_case(
     test_id: &str,
     case_id: &str,
     public_api: &str,
-    baseline: &str,
+    baseline: impl AsRef<[u8]>,
     planted_field: &str,
-    input_before: &str,
-    input_after: &str,
-    configuration_before: &str,
-    configuration_after: &str,
-    registry_before: &str,
-    registry_after: &str,
+    input_before: impl AsRef<[u8]>,
+    input_after: impl AsRef<[u8]>,
+    configuration_before: impl AsRef<[u8]>,
+    configuration_after: impl AsRef<[u8]>,
+    registry_before: impl AsRef<[u8]>,
+    registry_after: impl AsRef<[u8]>,
     result: &str,
 ) {
     eprintln!(
@@ -55,15 +55,25 @@ fn trace_case(
     );
 }
 
-fn assert_typed_refusal<T: Debug, E: Debug + PartialEq>(
+fn snapshot(value: &impl Debug) -> String {
+    format!("{value:?}")
+}
+
+#[derive(Debug)]
+struct NoConfiguration;
+
+#[derive(Debug)]
+struct NoEndpointRegistry;
+
+fn assert_typed_refusal<T: Debug, E: Debug + PartialEq, C: Debug, R: Debug>(
     test_id: &str,
     case_id: &str,
     public_api: &str,
     baseline: &str,
     planted_field: &str,
     planted_input: &str,
-    configuration: &str,
-    registry: &str,
+    configuration: &C,
+    registry: &R,
     expected: E,
     baseline_operation: impl FnOnce(&str) -> Result<T, E>,
     planted_operation: impl FnOnce(&str) -> Result<T, E>,
@@ -73,25 +83,29 @@ fn assert_typed_refusal<T: Debug, E: Debug + PartialEq>(
         "{test_id}:{case_id}: baseline must be accepted"
     );
     let input_before = planted_input.to_owned();
-    let configuration_before = configuration.to_owned();
-    let registry_before = registry.to_owned();
+    let input_before_bytes = input_before.as_bytes().to_vec();
+    let configuration_before = snapshot(configuration);
+    let registry_before = snapshot(registry);
     let actual = planted_operation(&input_before).expect_err("planted input must be refused");
+    let input_after = input_before.as_bytes().to_vec();
+    let configuration_after = snapshot(configuration);
+    let registry_after = snapshot(registry);
     assert_eq!(actual, expected, "{test_id}:{case_id}");
-    assert_eq!(input_before, planted_input, "input changed during refusal");
-    assert_eq!(configuration_before, configuration, "configuration changed during refusal");
-    assert_eq!(registry_before, registry, "registry state changed during refusal");
+    assert_eq!(input_after, input_before_bytes, "input changed during refusal");
+    assert_eq!(configuration_after, configuration_before, "configuration changed during refusal");
+    assert_eq!(registry_after, registry_before, "registry state changed during refusal");
     trace_case(
         test_id,
         case_id,
         public_api,
         baseline,
         planted_field,
-        &input_before,
-        planted_input,
+        &input_before_bytes,
+        &input_after,
         &configuration_before,
-        configuration,
+        &configuration_after,
         &registry_before,
-        registry,
+        &registry_after,
         &format!("{actual:?}"),
     );
 }
@@ -102,12 +116,6 @@ fn expected_state(component: Option<&str>) -> UriComponentState<'_> {
         Some("") => UriComponentState::Empty,
         Some(value) => UriComponentState::NonEmpty(value),
     }
-}
-
-fn parse_default_resource(input: &str) -> Result<CanonicalResourceId, CanonicalResourceIdError> {
-    let endpoint = CanonicalHttpUrl::parse(input)
-        .expect("resource test input must be accepted by the lower URL layer");
-    CanonicalResourceId::parse_for_endpoint(input, &endpoint, CanonicalResourceIdPolicy::DEFAULT)
 }
 
 #[test]
@@ -282,8 +290,8 @@ fn canonical_resource_can_bind_the_most_specific_configured_endpoint() {
         input,
         "candidate_path_percent_encoded_separator",
         "https://api.example.test/tenant/mcp%2Ftool",
-        "CanonicalResourceIdPolicy::DEFAULT",
-        "tenant-base,tenant",
+        &CanonicalResourceIdPolicy::DEFAULT,
+        &endpoints,
         CanonicalResourceIdError::NoMatchingConfiguredEndpoint,
         |candidate| CanonicalResourceId::parse_for_configured_endpoints(candidate, &endpoints),
         |candidate| CanonicalResourceId::parse_for_configured_endpoints(candidate, &endpoints),
@@ -307,34 +315,45 @@ fn canonical_resource_can_bind_the_most_specific_configured_endpoint() {
 #[test]
 fn absolute_uri_rejects_missing_and_invalid_schemes() {
     let cases = [
-        ("empty", "scheme:path", "", AbsoluteUriError::Empty),
+        (
+            "empty",
+            "x:",
+            "entire_absolute_uri",
+            "",
+            AbsoluteUriError::Empty,
+        ),
         (
             "relative-path",
-            "scheme:path",
+            "relative:path",
+            "scheme_delimiter",
             "relative/path",
             AbsoluteUriError::MissingScheme,
         ),
         (
             "slash-relative-path",
-            "scheme:path",
+            "x:/relative",
+            "scheme_prefix",
             "/relative",
             AbsoluteUriError::MissingScheme,
         ),
         (
             "authority-relative-path",
-            "scheme:path",
+            "x://authority/path",
+            "scheme_prefix",
             "//authority/path",
             AbsoluteUriError::MissingScheme,
         ),
         (
             "empty-scheme",
-            "scheme:path",
+            "x:path",
+            "scheme_name",
             ":path",
             AbsoluteUriError::EmptyScheme,
         ),
         (
             "numeric-leading-scheme",
-            "scheme:path",
+            "xscheme:path",
+            "scheme_first_byte",
             "1scheme:path",
             AbsoluteUriError::InvalidCharacter {
                 component: fastmcp_core::AbsoluteUriComponent::Scheme,
@@ -344,7 +363,8 @@ fn absolute_uri_rejects_missing_and_invalid_schemes() {
         ),
         (
             "plus-leading-scheme",
-            "scheme:path",
+            "xscheme:path",
+            "scheme_first_byte",
             "+scheme:path",
             AbsoluteUriError::InvalidCharacter {
                 component: fastmcp_core::AbsoluteUriComponent::Scheme,
@@ -354,7 +374,8 @@ fn absolute_uri_rejects_missing_and_invalid_schemes() {
         ),
         (
             "underscore-in-scheme",
-            "scheme:path",
+            "scheme-name:path",
+            "scheme_byte_6",
             "scheme_name:path",
             AbsoluteUriError::InvalidCharacter {
                 component: fastmcp_core::AbsoluteUriComponent::Scheme,
@@ -364,7 +385,8 @@ fn absolute_uri_rejects_missing_and_invalid_schemes() {
         ),
         (
             "slash-in-scheme",
-            "scheme:path",
+            "schemeXpath:later",
+            "scheme_byte_6",
             "scheme/path:later",
             AbsoluteUriError::InvalidCharacter {
                 component: fastmcp_core::AbsoluteUriComponent::Scheme,
@@ -374,7 +396,8 @@ fn absolute_uri_rejects_missing_and_invalid_schemes() {
         ),
         (
             "query-leading-scheme",
-            "scheme:path",
+            "xquery:later",
+            "scheme_first_byte",
             "?query:later",
             AbsoluteUriError::InvalidCharacter {
                 component: fastmcp_core::AbsoluteUriComponent::Scheme,
@@ -383,16 +406,18 @@ fn absolute_uri_rejects_missing_and_invalid_schemes() {
             },
         ),
     ];
-    for (case_id, baseline, planted, expected) in cases {
+    let configuration = NoConfiguration;
+    let registry = NoEndpointRegistry;
+    for (case_id, baseline, planted_field, planted, expected) in cases {
         assert_typed_refusal(
             "absolute_uri_rejects_missing_and_invalid_schemes",
             case_id,
             "AbsoluteUri::parse",
             baseline,
-            "scheme",
+            planted_field,
             planted,
-            "required_scheme_rfc3986",
-            "no_configured_endpoint",
+            &configuration,
+            &registry,
             expected,
             AbsoluteUri::parse,
             AbsoluteUri::parse,
@@ -403,25 +428,47 @@ fn absolute_uri_rejects_missing_and_invalid_schemes() {
 #[test]
 fn absolute_uri_rejects_invalid_percent_triplets_everywhere() {
     let cases = [
-        ("path-empty", "scheme:path", "scheme:%"),
-        ("path-short", "scheme:path", "scheme:%0"),
-        ("path-non-hex", "scheme:path", "scheme:%GG"),
-        ("userinfo", "scheme://user@host/path", "scheme://user%@host/path"),
-        ("host", "scheme://host/path", "scheme://host%2/path"),
-        ("query", "scheme:path?x=1", "scheme:path?%"),
-        ("query-short", "scheme:path?x=1", "scheme:path?x=%0"),
-        ("fragment", "scheme:path#fragment", "scheme:path#%xz"),
+        ("path-empty", "scheme:path", "path_percent_triplet", "scheme:%"),
+        ("path-short", "scheme:path", "path_percent_triplet", "scheme:%0"),
+        ("path-non-hex", "scheme:path", "path_percent_triplet", "scheme:%GG"),
+        (
+            "userinfo",
+            "scheme://user@host/path",
+            "userinfo_percent_triplet",
+            "scheme://user%@host/path",
+        ),
+        (
+            "host",
+            "scheme://host/path",
+            "host_percent_triplet",
+            "scheme://host%2/path",
+        ),
+        ("query", "scheme:path?x=1", "query_percent_triplet", "scheme:path?%"),
+        (
+            "query-short",
+            "scheme:path?x=1",
+            "query_percent_triplet",
+            "scheme:path?x=%0",
+        ),
+        (
+            "fragment",
+            "scheme:path#fragment",
+            "fragment_percent_triplet",
+            "scheme:path#%xz",
+        ),
     ];
-    for (case_id, baseline, planted) in cases {
+    let configuration = NoConfiguration;
+    let registry = NoEndpointRegistry;
+    for (case_id, baseline, planted_field, planted) in cases {
         assert_typed_refusal(
             "absolute_uri_rejects_invalid_percent_triplets_everywhere",
             case_id,
             "AbsoluteUri::parse",
             baseline,
-            "percent_triplet",
+            planted_field,
             planted,
-            "required_scheme_rfc3986",
-            "no_configured_endpoint",
+            &configuration,
+            &registry,
             AbsoluteUriError::InvalidPercentEncoding {
                 index: planted.find('%').unwrap(),
             },
@@ -437,50 +484,58 @@ fn canonical_http_rejects_non_http_relative_missing_host_and_bad_port() {
         (
             "non-http-scheme",
             "https://example.test/mcp",
+            "scheme",
             "ftp://example.test/mcp",
             CanonicalHttpUrlError::SchemeNotHttp,
         ),
         (
             "opaque-non-http-scheme",
             "https://example.test/mcp",
+            "url_form",
             "urn:example:x",
             CanonicalHttpUrlError::SchemeNotHttp,
         ),
         (
             "relative-input",
             "https://example.test/mcp",
+            "url_form",
             "/relative",
             CanonicalHttpUrlError::Parse(url::ParseError::RelativeUrlWithoutBase),
         ),
         (
             "missing-host",
             "https://example.test/mcp",
+            "authority_host",
             "https:///mcp",
             CanonicalHttpUrlError::MissingHost,
         ),
         (
             "empty-authority",
             "https://example.test/mcp",
+            "authority_host",
             "https://",
-            CanonicalHttpUrlError::MissingHost,
+            CanonicalHttpUrlError::Parse(url::ParseError::EmptyHost),
         ),
         (
             "bad-port",
             "https://example.test/mcp",
+            "authority_port",
             "https://example.test:99999/mcp",
             CanonicalHttpUrlError::Parse(url::ParseError::InvalidPort),
         ),
     ];
-    for (case_id, baseline, planted, expected) in cases {
+    let configuration = NoConfiguration;
+    let registry = NoEndpointRegistry;
+    for (case_id, baseline, planted_field, planted, expected) in cases {
         assert_typed_refusal(
             "canonical_http_rejects_non_http_relative_missing_host_and_bad_port",
             case_id,
             "CanonicalHttpUrl::parse",
             baseline,
-            "http_url_form",
+            planted_field,
             planted,
-            "http_or_https_required",
-            "no_configured_endpoint",
+            &configuration,
+            &registry,
             expected,
             CanonicalHttpUrl::parse,
             CanonicalHttpUrl::parse,
@@ -497,18 +552,26 @@ fn canonical_resource_rejects_every_http_form_including_loopback() {
         ("ipv6-loopback-http", "https://[::1]/mcp", "http://[::1]/mcp"),
     ];
     for (case_id, baseline, planted) in cases {
+        let endpoint = CanonicalHttpUrl::parse(baseline)
+            .expect("each resource refusal baseline must provide an accepted HTTPS endpoint");
+        let policy = CanonicalResourceIdPolicy::DEFAULT;
+        let registry = [ConfiguredResourceEndpoint::new(
+            "fixed-https-endpoint",
+            &endpoint,
+            policy,
+        )];
         assert_typed_refusal(
             "canonical_resource_rejects_every_http_form_including_loopback",
             case_id,
             "CanonicalResourceId::parse_for_endpoint",
             baseline,
-            "scheme",
+            "resource_scheme",
             planted,
-            "CanonicalResourceIdPolicy::DEFAULT",
-            "single-configured-endpoint",
+            &(&endpoint, policy),
+            &registry,
             CanonicalResourceIdError::HttpsRequired,
-            parse_default_resource,
-            parse_default_resource,
+            |candidate| CanonicalResourceId::parse_for_endpoint(candidate, &endpoint, policy),
+            |candidate| CanonicalResourceId::parse_for_endpoint(candidate, &endpoint, policy),
         );
     }
 }

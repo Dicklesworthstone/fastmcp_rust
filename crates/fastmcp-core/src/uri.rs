@@ -1149,8 +1149,7 @@ fn has_empty_http_authority(input: &str) -> bool {
     let Some(authority) = after_scheme.strip_prefix("//") else {
         return false;
     };
-    authority.is_empty()
-        || authority.starts_with('/')
+    authority.starts_with('/')
         || authority.starts_with('?')
         || authority.starts_with('#')
 }
