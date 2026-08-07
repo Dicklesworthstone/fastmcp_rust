@@ -23,6 +23,14 @@ use fastmcp_protocol::methods::{
 };
 use serde_json::{Value, json};
 
+/// Maximum combined subscriptions and pending reverse requests retained by
+/// one exact-2024 adapter binding.
+///
+/// The adapter shares the server's bounded bidirectional-request ceiling so a
+/// legacy connection cannot accumulate an independent unbounded state set.
+pub const LEGACY_2024_MAX_ADAPTER_RESERVATIONS: usize =
+    crate::bidirectional::DEFAULT_MAX_IN_FLIGHT_REQUESTS;
+
 /// Opaque, authenticated transport-owner partition for legacy peer state.
 ///
 /// The transport creates this value only after it has authenticated its peer.
@@ -910,6 +918,11 @@ where
     }
 
     fn reserve_state(&mut self) -> Result<(), Legacy2024AdapterError> {
+        if self.reservation_count >= LEGACY_2024_MAX_ADAPTER_RESERVATIONS as u64 {
+            return Err(Legacy2024AdapterError::invalid_request(
+                "legacy adapter reservation limit reached",
+            ));
+        }
         self.reservation_count = self.reservation_count.checked_add(1).ok_or(
             Legacy2024AdapterError::invalid_request(
                 "legacy adapter reservation count is exhausted",

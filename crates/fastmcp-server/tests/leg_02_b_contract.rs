@@ -9,9 +9,10 @@ use fastmcp_protocol::methods::{
     RESOURCES_UNSUBSCRIBE, ROOTS_LIST, SAMPLING_CREATE_MESSAGE,
 };
 use fastmcp_server::legacy_2024::{
-    Legacy2024Handler, Legacy2024HandlerError, Legacy2024Lifecycle, Legacy2024Outbound,
-    Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo, Legacy2024StateSnapshot,
-    LegacyAuthenticatedPeerPartition, LegacyPeerBinding, legacy_2024_b_digest_preimage,
+    LEGACY_2024_MAX_ADAPTER_RESERVATIONS, Legacy2024Handler, Legacy2024HandlerError,
+    Legacy2024Lifecycle, Legacy2024Outbound, Legacy2024ServerAdapter, Legacy2024ServerConfig,
+    Legacy2024ServerInfo, Legacy2024StateSnapshot, LegacyAuthenticatedPeerPartition,
+    LegacyPeerBinding, legacy_2024_b_digest_preimage,
 };
 use serde_json::{Value, json};
 
@@ -203,6 +204,50 @@ fn assert_row(
     expected
 }
 
+fn complete_reverse_request(
+    adapter: &mut Legacy2024ServerAdapter<NoopHandler>,
+    binding: LegacyPeerBinding,
+    request_id: i64,
+) {
+    assert_eq!(
+        adapter.snapshot().pending_reverse_request_ids,
+        vec![request_id]
+    );
+    assert_eq!(adapter.snapshot().reservation_count, 1);
+    assert_eq!(
+        adapter.receive(
+            binding,
+            json!({"jsonrpc": "2.0", "id": request_id, "result": {}}),
+        ),
+        Ok(Legacy2024Outbound::NoResponse)
+    );
+    assert!(adapter.snapshot().pending_reverse_request_ids.is_empty());
+    assert_eq!(adapter.snapshot().reservation_count, 0);
+}
+
+fn assert_reservation_limit(binding: LegacyPeerBinding) {
+    let mut adapter = operating_adapter(binding);
+    for _ in 0..LEGACY_2024_MAX_ADAPTER_RESERVATIONS {
+        assert!(matches!(
+            adapter.make_reverse_request(binding, PING, json!({})),
+            Ok(Legacy2024Outbound::ReverseRequest(_))
+        ));
+    }
+
+    let full_state = adapter.snapshot();
+    let error = adapter
+        .make_reverse_request(binding, PING, json!({}))
+        .expect_err("the adapter must reject the next reservation at its fixed bound");
+    assert_eq!(error.code(), -32600);
+    assert_eq!(error.message(), "legacy adapter reservation limit reached");
+    assert_eq!(adapter.snapshot(), full_state);
+    assert_eq!(
+        adapter.snapshot().reservation_count,
+        LEGACY_2024_MAX_ADAPTER_RESERVATIONS as u64
+    );
+    assert_eq!(adapter.close(binding), Ok(()));
+}
+
 fn exercise_partition(
     partition: u32,
     owner: [u8; 32],
@@ -223,6 +268,7 @@ fn exercise_partition(
             json!({"jsonrpc": "2.0", "id": 1, "method": PING, "params": {}})
         ))
     );
+    complete_reverse_request(&mut adapter, binding, 1);
     rows.push(assert_row(
         &adapter,
         binding,
@@ -247,6 +293,7 @@ fn exercise_partition(
             "params": {"messages": [], "maxTokens": 16},
         })))
     );
+    complete_reverse_request(&mut adapter, binding, 2);
     rows.push(assert_row(
         &adapter,
         binding,
@@ -266,6 +313,7 @@ fn exercise_partition(
             json!({"jsonrpc": "2.0", "id": 3, "method": ROOTS_LIST, "params": {}})
         ))
     );
+    complete_reverse_request(&mut adapter, binding, 3);
     rows.push(assert_row(
         &adapter,
         binding,
@@ -429,6 +477,7 @@ fn leg_02_b_positive() {
     assert_eq!(right.snapshot().close_release_count, 1);
     assert_eq!(left.snapshot().reservation_count, 0);
     assert_eq!(right.snapshot().reservation_count, 0);
+    assert_reservation_limit(binding(LEFT_OWNER, LEFT_CONNECTION + 1));
 }
 
 #[test]
