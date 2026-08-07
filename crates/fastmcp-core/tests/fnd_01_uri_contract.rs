@@ -7,12 +7,11 @@
 
 use std::fmt::Debug;
 
-use fastmcp_core::{
-    sha256_bounded, AbsoluteUri, AbsoluteUriError, CanonicalHttpUrl,
-    CanonicalHttpUrlError, CanonicalResourceId, CanonicalResourceIdError,
-    CanonicalResourceIdPolicy, UriComponentState,
-};
 use fastmcp_core::uri::ConfiguredResourceEndpoint;
+use fastmcp_core::{
+    sha256_bounded, AbsoluteUri, AbsoluteUriError, CanonicalHttpUrl, CanonicalHttpUrlError,
+    CanonicalResourceId, CanonicalResourceIdError, CanonicalResourceIdPolicy, UriComponentState,
+};
 
 const TRACE_HASH_MAX_BYTES: usize = 4 * 1024;
 
@@ -39,20 +38,35 @@ fn trace_case(
     registry_before: impl AsRef<[u8]>,
     registry_after: impl AsRef<[u8]>,
     result: &str,
+    canonical_output: Option<&str>,
 ) {
     eprintln!(
-        "fnd01_uri test_id={test_id} case_id={case_id} api={public_api} \\
-         baseline_sha256={} planted_field={planted_field} result={result} \\
-         input_pre_sha256={} input_post_sha256={} configuration_pre_sha256={} \\
-         configuration_post_sha256={} registry_pre_sha256={} registry_post_sha256={}",
-        digest_hex(baseline),
-        digest_hex(input_before),
-        digest_hex(input_after),
-        digest_hex(configuration_before),
-        digest_hex(configuration_after),
-        digest_hex(registry_before),
-        digest_hex(registry_after),
+        concat!(
+            "{\"event\":\"fnd01_uri\",\"test_id\":{},\"case_id\":{},",
+            "\"public_api\":{},\"baseline_sha256\":{},\"planted_field\":{},",
+            "\"result\":{},\"canonical_output\":{},\"input_pre_sha256\":{},",
+            "\"input_post_sha256\":{},\"configuration_pre_sha256\":{},",
+            "\"configuration_post_sha256\":{},\"registry_pre_sha256\":{},",
+            "\"registry_post_sha256\":{}}}"
+        ),
+        json_string(test_id),
+        json_string(case_id),
+        json_string(public_api),
+        json_string(&digest_hex(baseline)),
+        json_string(planted_field),
+        json_string(result),
+        canonical_output.map_or_else(|| "null".to_owned(), json_string),
+        json_string(&digest_hex(input_before)),
+        json_string(&digest_hex(input_after)),
+        json_string(&digest_hex(configuration_before)),
+        json_string(&digest_hex(configuration_after)),
+        json_string(&digest_hex(registry_before)),
+        json_string(&digest_hex(registry_after)),
     );
+}
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).expect("URI contract trace values serialize as JSON strings")
 }
 
 fn snapshot(value: &impl Debug) -> String {
@@ -91,9 +105,18 @@ fn assert_typed_refusal<T: Debug, E: Debug + PartialEq, C: Debug, R: Debug>(
     let configuration_after = snapshot(configuration);
     let registry_after = snapshot(registry);
     assert_eq!(actual, expected, "{test_id}:{case_id}");
-    assert_eq!(input_after, input_before_bytes, "input changed during refusal");
-    assert_eq!(configuration_after, configuration_before, "configuration changed during refusal");
-    assert_eq!(registry_after, registry_before, "registry state changed during refusal");
+    assert_eq!(
+        input_after, input_before_bytes,
+        "input changed during refusal"
+    );
+    assert_eq!(
+        configuration_after, configuration_before,
+        "configuration changed during refusal"
+    );
+    assert_eq!(
+        registry_after, registry_before,
+        "registry state changed during refusal"
+    );
     trace_case(
         test_id,
         case_id,
@@ -107,6 +130,7 @@ fn assert_typed_refusal<T: Debug, E: Debug + PartialEq, C: Debug, R: Debug>(
         &registry_before,
         &registry_after,
         &format!("{actual:?}"),
+        None,
     );
 }
 
@@ -154,11 +178,12 @@ fn absolute_uri_accepts_rfc3986_hierarchical_and_opaque_goldens() {
             "none",
             input,
             input,
-            "required_scheme_rfc3986",
-            "required_scheme_rfc3986",
-            "no_configured_endpoint",
-            "no_configured_endpoint",
+            &snapshot(&NoConfiguration),
+            &snapshot(&NoConfiguration),
+            &snapshot(&NoEndpointRegistry),
+            &snapshot(&NoEndpointRegistry),
             "Ok(AbsoluteUri)",
+            Some(uri.as_str()),
         );
     }
 }
@@ -194,11 +219,12 @@ fn absolute_uri_preserves_query_fragment_cartesian_product() {
                 "query_and_fragment_presence",
                 &input,
                 &input,
-                "preserve_absent_empty_nonempty",
-                "preserve_absent_empty_nonempty",
-                "no_configured_endpoint",
-                "no_configured_endpoint",
+                &snapshot(&NoConfiguration),
+                &snapshot(&NoConfiguration),
+                &snapshot(&NoEndpointRegistry),
+                &snapshot(&NoEndpointRegistry),
                 "Ok(AbsoluteUri)",
+                Some(uri.as_str()),
             );
         }
     }
@@ -225,25 +251,23 @@ fn canonical_http_uses_exact_url_crate_canonicalization() {
         "url_crate_canonicalization",
         input,
         value.as_str(),
-        "url=2.5.8,std",
-        "url=2.5.8,std",
-        "no_configured_endpoint",
-        "no_configured_endpoint",
+        &snapshot(&NoConfiguration),
+        &snapshot(&NoConfiguration),
+        &snapshot(&NoEndpointRegistry),
+        &snapshot(&NoEndpointRegistry),
         "Ok(CanonicalHttpUrl)",
+        Some(value.as_str()),
     );
 }
 
 #[test]
 fn canonical_resource_can_bind_the_most_specific_configured_endpoint() {
+    let policy = CanonicalResourceIdPolicy::DEFAULT;
     let tenant_base = CanonicalHttpUrl::parse("https://api.example.test/tenant").unwrap();
     let tenant = CanonicalHttpUrl::parse("https://api.example.test/tenant/mcp").unwrap();
     let endpoints = [
-        ConfiguredResourceEndpoint::new(
-            "tenant-base",
-            &tenant_base,
-            CanonicalResourceIdPolicy::DEFAULT,
-        ),
-        ConfiguredResourceEndpoint::new("tenant", &tenant, CanonicalResourceIdPolicy::DEFAULT),
+        ConfiguredResourceEndpoint::new("tenant-base", &tenant_base, policy),
+        ConfiguredResourceEndpoint::new("tenant", &tenant, policy),
     ];
 
     let input = "https://api.example.test/tenant/mcp/tool";
@@ -257,7 +281,7 @@ fn canonical_resource_can_bind_the_most_specific_configured_endpoint() {
         &[ConfiguredResourceEndpoint::new(
             "first-identity",
             &tenant,
-            CanonicalResourceIdPolicy::DEFAULT,
+            policy,
         )],
     )
     .unwrap();
@@ -266,7 +290,7 @@ fn canonical_resource_can_bind_the_most_specific_configured_endpoint() {
         &[ConfiguredResourceEndpoint::new(
             "second-identity",
             &tenant,
-            CanonicalResourceIdPolicy::DEFAULT,
+            policy,
         )],
     )
     .unwrap();
@@ -275,11 +299,7 @@ fn canonical_resource_can_bind_the_most_specific_configured_endpoint() {
     let ipv6 = CanonicalHttpUrl::parse("https://[2001:db8::1]/mcp").unwrap();
     let ipv6_resource = CanonicalResourceId::parse_for_configured_endpoints(
         "https://[2001:db8::1]/mcp/tool",
-        &[ConfiguredResourceEndpoint::new(
-            "ipv6",
-            &ipv6,
-            CanonicalResourceIdPolicy::DEFAULT,
-        )],
+        &[ConfiguredResourceEndpoint::new("ipv6", &ipv6, policy)],
     )
     .unwrap();
     assert_eq!(ipv6_resource.configured_endpoint_identity(), "ipv6");
@@ -290,7 +310,7 @@ fn canonical_resource_can_bind_the_most_specific_configured_endpoint() {
         input,
         "candidate_path_percent_encoded_separator",
         "https://api.example.test/tenant/mcp%2Ftool",
-        &CanonicalResourceIdPolicy::DEFAULT,
+        &policy,
         &endpoints,
         CanonicalResourceIdError::NoMatchingConfiguredEndpoint,
         |candidate| CanonicalResourceId::parse_for_configured_endpoints(candidate, &endpoints),
@@ -304,11 +324,12 @@ fn canonical_resource_can_bind_the_most_specific_configured_endpoint() {
         "configured_endpoint_path_specificity",
         input,
         resource.as_str(),
-        "CanonicalResourceIdPolicy::DEFAULT",
-        "CanonicalResourceIdPolicy::DEFAULT",
-        "tenant-base,tenant",
-        "tenant-base,tenant",
+        &snapshot(&policy),
+        &snapshot(&policy),
+        &snapshot(&endpoints),
+        &snapshot(&endpoints),
         "Ok(CanonicalResourceId { identity: tenant })",
+        Some(resource.as_str()),
     );
 }
 
@@ -428,31 +449,51 @@ fn absolute_uri_rejects_missing_and_invalid_schemes() {
 #[test]
 fn absolute_uri_rejects_invalid_percent_triplets_everywhere() {
     let cases = [
-        ("path-empty", "scheme:path", "path_percent_triplet", "scheme:%"),
-        ("path-short", "scheme:path", "path_percent_triplet", "scheme:%0"),
-        ("path-non-hex", "scheme:path", "path_percent_triplet", "scheme:%GG"),
+        (
+            "path-empty",
+            "scheme:%00",
+            "path_percent_triplet",
+            "scheme:%",
+        ),
+        (
+            "path-short",
+            "scheme:%00",
+            "path_percent_triplet",
+            "scheme:%0",
+        ),
+        (
+            "path-non-hex",
+            "scheme:%00",
+            "path_percent_triplet",
+            "scheme:%GG",
+        ),
         (
             "userinfo",
-            "scheme://user@host/path",
+            "scheme://user%20@host/path",
             "userinfo_percent_triplet",
             "scheme://user%@host/path",
         ),
         (
             "host",
-            "scheme://host/path",
+            "scheme://host%20/path",
             "host_percent_triplet",
             "scheme://host%2/path",
         ),
-        ("query", "scheme:path?x=1", "query_percent_triplet", "scheme:path?%"),
+        (
+            "query",
+            "scheme:path?x=%00",
+            "query_percent_triplet",
+            "scheme:path?%",
+        ),
         (
             "query-short",
-            "scheme:path?x=1",
+            "scheme:path?x=%00",
             "query_percent_triplet",
             "scheme:path?x=%0",
         ),
         (
             "fragment",
-            "scheme:path#fragment",
+            "scheme:path#%00",
             "fragment_percent_triplet",
             "scheme:path#%xz",
         ),
@@ -490,35 +531,35 @@ fn canonical_http_rejects_non_http_relative_missing_host_and_bad_port() {
         ),
         (
             "opaque-non-http-scheme",
-            "https://example.test/mcp",
-            "url_form",
+            "https:example:x",
+            "scheme",
             "urn:example:x",
             CanonicalHttpUrlError::SchemeNotHttp,
         ),
         (
             "relative-input",
-            "https://example.test/mcp",
-            "url_form",
+            "https:/relative",
+            "scheme_prefix",
             "/relative",
             CanonicalHttpUrlError::Parse(url::ParseError::RelativeUrlWithoutBase),
         ),
         (
             "missing-host",
-            "https://example.test/mcp",
+            "https://host/mcp",
             "authority_host",
             "https:///mcp",
             CanonicalHttpUrlError::MissingHost,
         ),
         (
             "empty-authority",
-            "https://example.test/mcp",
+            "https://host",
             "authority_host",
             "https://",
-            CanonicalHttpUrlError::Parse(url::ParseError::EmptyHost),
+            CanonicalHttpUrlError::MissingHost,
         ),
         (
             "bad-port",
-            "https://example.test/mcp",
+            "https://example.test:443/mcp",
             "authority_port",
             "https://example.test:99999/mcp",
             CanonicalHttpUrlError::Parse(url::ParseError::InvalidPort),
@@ -546,10 +587,26 @@ fn canonical_http_rejects_non_http_relative_missing_host_and_bad_port() {
 #[test]
 fn canonical_resource_rejects_every_http_form_including_loopback() {
     let cases = [
-        ("public-http", "https://example.test/mcp", "http://example.test/mcp"),
-        ("localhost-http", "https://localhost/mcp", "http://localhost/mcp"),
-        ("ipv4-loopback-http", "https://127.0.0.1/mcp", "http://127.0.0.1/mcp"),
-        ("ipv6-loopback-http", "https://[::1]/mcp", "http://[::1]/mcp"),
+        (
+            "public-http",
+            "https://example.test/mcp",
+            "http://example.test/mcp",
+        ),
+        (
+            "localhost-http",
+            "https://localhost/mcp",
+            "http://localhost/mcp",
+        ),
+        (
+            "ipv4-loopback-http",
+            "https://127.0.0.1/mcp",
+            "http://127.0.0.1/mcp",
+        ),
+        (
+            "ipv6-loopback-http",
+            "https://[::1]/mcp",
+            "http://[::1]/mcp",
+        ),
     ];
     for (case_id, baseline, planted) in cases {
         let endpoint = CanonicalHttpUrl::parse(baseline)
