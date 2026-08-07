@@ -72,10 +72,10 @@ jobs:
 
       - name: Compile renamed facade-only macro consumer
         if: matrix.os == 'ubuntu-latest'
-        run: >-
-          cargo test --locked -p fastmcp-rust --test trybuild_tests
-          renamed_facade_only_consumer_compiles_every_macro_family
-          -- --exact --ignored
+        run: |
+          cargo test --locked -p fastmcp-rust --test trybuild_tests \
+            renamed_facade_only_consumer_compiles_every_macro_family \
+            -- --exact --ignored
 
       - name: Run default-feature doc tests
         run: cargo test --locked --workspace --doc
