@@ -1,10 +1,10 @@
 //! Frozen top-level LEG-01 B translation and disposition acceptance entries.
 
 use fastmcp_protocol::methods::{
-    classify_legacy_2024_result, translate_legacy_2024_result, Legacy2024ResultDisposition,
-    Legacy2024ResultKind, PING, PROMPTS_GET, RESOURCES_READ, TOOLS_CALL,
+    Legacy2024ResultDisposition, Legacy2024ResultKind, PING, PROMPTS_GET, RESOURCES_READ,
+    TOOLS_CALL, classify_legacy_2024_result, translate_legacy_2024_result,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn exact_tool_result() -> Value {
     json!({
