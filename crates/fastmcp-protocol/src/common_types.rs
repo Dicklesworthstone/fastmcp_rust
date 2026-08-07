@@ -823,7 +823,9 @@ impl FinalCommonTypesSchema {
             (CommonWireDirection::Request, None) => {
                 return Err(CommonTypeError::Invalid("request metadata"));
             }
-            (_, Some(meta)) => Self::validate_open_metadata(meta)?,
+            (_, Some(meta)) => {
+                let _ = Self::validate_open_metadata(meta)?;
+            }
             (_, None) => {}
         }
         if let Some(kind) = object.get("type") {
