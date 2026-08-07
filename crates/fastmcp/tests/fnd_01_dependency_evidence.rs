@@ -8,9 +8,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 903_485;
+const FROZEN_POLICY_BYTES: usize = 903_486;
 const FROZEN_POLICY_SHA256: &str =
-    "b3803b7b7119bbcbb86d0587ff70ae92778c6669bd37f75ada20bfcfd75544a3";
+    "dd8228505be3679e097c8f717454eec1dc3f37a9b9d01f10faf526f0a3166c10";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -50900,8 +50900,8 @@ activate = 1\n";
         reference: &str,
         subject: &str,
     ) -> VResult<&'static [&'static str]> {
-        let allowed: &'static [&'static str] = match reference {
-            ACTION_CHECKOUT => &[],
+        let allowed = match reference {
+            ACTION_CHECKOUT => &["persist-credentials"],
             ACTION_RUST_TOOLCHAIN => &["toolchain", "targets", "components"],
             ACTION_RUST_CACHE => &["key"],
             ACTION_UPLOAD_ARTIFACT => &["name", "path", "if-no-files-found"],
