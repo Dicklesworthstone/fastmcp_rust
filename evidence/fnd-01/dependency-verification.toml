@@ -9406,7 +9406,7 @@ selector = "/peers/id=typescript"
 rule = "missing_tier1_peer"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "ce053101f8061c2828d070d5537bbfde40bfa4247f97710b85c07d5a38a3e8d6"
+baseline_observation_sha256 = "16d3ef06251a9c29a82f24f837bb5618f2ab6b6dd8d87156315e13bb1c8d2008"
 violation_mode = "exact_observation_sha256"
 violating_observation_sha256 = "5647354d590ba4c9b949ee90eb20bc274f2ec957328bcbf5ab195761f2fce024"
 expected_trigger_count = 1

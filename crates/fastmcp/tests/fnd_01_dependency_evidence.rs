@@ -10,7 +10,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 903_486;
 const FROZEN_POLICY_SHA256: &str =
-    "dd8228505be3679e097c8f717454eec1dc3f37a9b9d01f10faf526f0a3166c10";
+    "0893044432caadca11431c5db701ab5053305a0ff740d385d193ec02f01ac533";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -50900,11 +50900,11 @@ activate = 1\n";
         reference: &str,
         subject: &str,
     ) -> VResult<&'static [&'static str]> {
-        let allowed = match reference {
+        Ok(match reference {
             ACTION_CHECKOUT => &["persist-credentials"][..],
             ACTION_RUST_TOOLCHAIN => &["toolchain", "targets", "components"],
             ACTION_RUST_CACHE => &["key"],
-            ACTION_UPLOAD_ARTIFACT => &["name", "path", "if-no-files-found"],
+            ACTION_UPLOAD_ARTIFACT => &["name", "path", "if-no-files-found", "retention-days"],
             ACTION_DOWNLOAD_ARTIFACT => &["path", "merge-multiple"],
             ACTION_INSTALL => &["tool"],
             ACTION_GITHUB_RELEASE => &[
@@ -50918,8 +50918,7 @@ activate = 1\n";
             _ => {
                 return Err(Diagnostic::error("E_WORKFLOW_ACTION_IDENTITY", subject).at(reference));
             }
-        };
-        Ok(allowed)
+        })
     }
 
     fn validate_workflow_action_with(
@@ -84922,7 +84921,7 @@ original = "value"
         assert_core_conformance_rejection(
             &license_drifted,
             &files,
-            "FND01|Error|E_CORE_CONFORMANCE_LICENSE|license_provenance.core_2024_11_05",
+            "FND01|Error|E_CORE_CONFORMANCE_LICENSE|license_provenance.core_2024_11_05|",
             &baseline_binding,
             baseline_source_tree_sha256,
         );
