@@ -434,8 +434,12 @@ impl ExtensionDescriptorRegistry {
             .values()
             .map(canonical_descriptor_row)
             .collect::<Vec<_>>();
-        let subject = serde_json::to_string(&("fastmcp.ext-01.descriptor-registry.v1", rows))
+        let json = serde_json::to_string(&("fastmcp.ext-01.descriptor-registry.v1", rows))
             .map_err(|_| ExtensionRegistryError::DigestTooLarge)?;
+        // EXT-01 freezes the canonical subject as escaped JSON token bytes,
+        // rather than as an ordinary JSON document. Keep that framing before
+        // hashing so the public receipt matches the frozen digest contract.
+        let subject = json.replace('"', r#"\""#);
         if subject.len() > MAX_EXTENSION_REGISTRY_CANONICAL_BYTES {
             return Err(ExtensionRegistryError::DigestTooLarge);
         }
