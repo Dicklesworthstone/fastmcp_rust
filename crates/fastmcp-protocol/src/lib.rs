@@ -50,6 +50,14 @@ pub mod schema;
 mod server_discovery;
 mod types;
 
+pub use extensions::{
+    ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionDirection,
+    ExtensionDiscovery, ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId,
+    ExtensionMethodDescriptor, ExtensionNegotiationResolver, ExtensionNotificationDescriptor,
+    ExtensionRegistryError, ExtensionRegistryReceipt, ExtensionRoutingHeaderDescriptor,
+    ExtensionSettings, ExtensionSettingsSchema, MAX_EXTENSION_DESCRIPTORS, MAX_EXTENSION_ID_BYTES,
+    MAX_EXTENSION_REGISTRY_CANONICAL_BYTES, ServerExtensionDiscovery, StdioCorrelationDescriptor,
+};
 pub use jsonrpc::{
     ClientIngressFailureScope, CorrelationKey, JSONRPC_VERSION, JsonRpcAdmissionError,
     JsonRpcEndpointRole, JsonRpcError, JsonRpcMessage, JsonRpcMessageDirection, JsonRpcRequest,
