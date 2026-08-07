@@ -6,9 +6,11 @@
 //! surface can remain independent of transport classification and lifecycle
 //! state.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
+use fastmcp_core::CanonicalHttpUrl;
 use serde::{Deserialize, Serialize};
 
 /// The exact modern MCP protocol revision supported by this policy surface.
@@ -403,6 +405,525 @@ pub trait LegacyAdapterReceiptIssuer: sealed::ReceiptIssuerSealed {
     }
 }
 
+/// The state of one server-side stdio process's immutable era selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdioEraState {
+    /// Auto policy has not yet received a structurally valid opening request.
+    Unclassified,
+    /// The process selected this era and cannot select again.
+    Selected(ProtocolEra),
+    /// An invalid opening closed the process without selecting an era.
+    TerminalWithoutEra,
+}
+
+/// The opening frame relevant to stdio era selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdioOpeningFrame {
+    /// A complete modern request carrying a protocol-version field.
+    ModernRequest {
+        /// The exact protocol-version spelling supplied by the peer.
+        protocol_version: String,
+    },
+    /// Exact legacy `initialize` with no modern marker.
+    LegacyInitialize,
+    /// An otherwise modern request that also contains an initialize marker.
+    MixedInitializeAndModernMetadata {
+        /// The exact protocol-version spelling supplied by the peer.
+        protocol_version: String,
+    },
+    /// A request that provides no complete modern metadata.
+    RequestWithoutModernMetadata,
+    /// A notification, for which no JSON-RPC response may be emitted.
+    Notification,
+    /// A JSON-RPC response received where an opening request is required.
+    Response,
+    /// A malformed opening frame.
+    Malformed,
+}
+
+/// Modern-version support result after era selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModernVersionSupport {
+    /// The modern metadata contained exact MCP 2026-07-28.
+    Supported,
+    /// The metadata was structurally valid but its version is unsupported.
+    Unsupported {
+        /// The unnormalized version spelling supplied by the peer.
+        received: String,
+    },
+}
+
+/// Deterministic result of considering one stdio frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdioEraDecision {
+    /// The process selected an era exactly once.
+    Selected {
+        /// The immutable selected era.
+        era: ProtocolEra,
+        /// Present only for modern request metadata.
+        modern_version: Option<ModernVersionSupport>,
+    },
+    /// A frame was rejected under an already selected fixed policy or era.
+    RejectedUnderSelectedEra {
+        /// The fixed or previously selected era.
+        era: ProtocolEra,
+        /// The exact rejection class.
+        reason: StdioEraRejection,
+    },
+    /// The first frame was rejected and the process closed without an era.
+    RejectedAndClosed {
+        /// The exact rejection class.
+        reason: StdioEraRejection,
+    },
+    /// A terminal process ignores any attempt to retry classification.
+    AlreadyTerminal,
+}
+
+/// Typed refusal classes for invalid stdio era-selection traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdioEraRejection {
+    /// Legacy initialize and modern metadata were mixed in one opening frame.
+    MixedEraMarkers,
+    /// A request omitted complete modern metadata where it was required.
+    MissingModernMetadata,
+    /// A notification arrived where an opening request is required.
+    NotificationCannotClassify,
+    /// A response arrived where an opening request is required.
+    ResponseCannotClassify,
+    /// The opening bytes were malformed.
+    MalformedOpeningFrame,
+    /// Legacy-only policy requires exact legacy initialize as the first frame.
+    LegacyInitializeRequired,
+    /// Traffic from the opposite era arrived after selection.
+    CrossEraTraffic,
+}
+
+/// One-shot era classifier owned by a single server-side stdio process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StdioEraClassifier {
+    policy: ProtocolPolicy,
+    state: StdioEraState,
+}
+
+impl StdioEraClassifier {
+    /// Creates a classifier with its policy fixed before the first frame.
+    #[must_use]
+    pub const fn new(policy: ProtocolPolicy) -> Self {
+        let state = match policy {
+            ProtocolPolicy::Auto => StdioEraState::Unclassified,
+            ProtocolPolicy::ModernOnly => StdioEraState::Selected(ProtocolEra::Modern2026),
+            ProtocolPolicy::LegacyOnly => StdioEraState::Selected(ProtocolEra::Legacy2024),
+        };
+        Self { policy, state }
+    }
+
+    /// Returns the policy fixed for this process.
+    #[must_use]
+    pub const fn policy(&self) -> ProtocolPolicy {
+        self.policy
+    }
+
+    /// Returns the process's current one-shot selection state.
+    #[must_use]
+    pub const fn state(&self) -> &StdioEraState {
+        &self.state
+    }
+
+    /// Considers the opening frame without allowing same-process retry.
+    pub fn classify_opening(&mut self, frame: StdioOpeningFrame) -> StdioEraDecision {
+        match self.state {
+            StdioEraState::TerminalWithoutEra => StdioEraDecision::AlreadyTerminal,
+            StdioEraState::Unclassified => self.classify_auto(frame),
+            StdioEraState::Selected(era) => self.classify_fixed(era, frame),
+        }
+    }
+
+    fn classify_auto(&mut self, frame: StdioOpeningFrame) -> StdioEraDecision {
+        match frame {
+            StdioOpeningFrame::ModernRequest { protocol_version } => {
+                self.select_modern(protocol_version)
+            }
+            StdioOpeningFrame::LegacyInitialize => {
+                self.state = StdioEraState::Selected(ProtocolEra::Legacy2024);
+                StdioEraDecision::Selected {
+                    era: ProtocolEra::Legacy2024,
+                    modern_version: None,
+                }
+            }
+            StdioOpeningFrame::MixedInitializeAndModernMetadata { .. } => {
+                self.reject_and_close(StdioEraRejection::MixedEraMarkers)
+            }
+            StdioOpeningFrame::RequestWithoutModernMetadata => {
+                self.reject_and_close(StdioEraRejection::MissingModernMetadata)
+            }
+            StdioOpeningFrame::Notification => {
+                self.reject_and_close(StdioEraRejection::NotificationCannotClassify)
+            }
+            StdioOpeningFrame::Response => {
+                self.reject_and_close(StdioEraRejection::ResponseCannotClassify)
+            }
+            StdioOpeningFrame::Malformed => {
+                self.reject_and_close(StdioEraRejection::MalformedOpeningFrame)
+            }
+        }
+    }
+
+    fn classify_fixed(&mut self, era: ProtocolEra, frame: StdioOpeningFrame) -> StdioEraDecision {
+        match (era, frame) {
+            (ProtocolEra::Modern2026, StdioOpeningFrame::ModernRequest { protocol_version }) => {
+                Self::modern_decision(protocol_version)
+            }
+            (ProtocolEra::Modern2026, StdioOpeningFrame::LegacyInitialize) => {
+                StdioEraDecision::RejectedUnderSelectedEra {
+                    era,
+                    reason: StdioEraRejection::CrossEraTraffic,
+                }
+            }
+            (
+                ProtocolEra::Modern2026,
+                StdioOpeningFrame::MixedInitializeAndModernMetadata { .. },
+            ) => StdioEraDecision::RejectedUnderSelectedEra {
+                era,
+                reason: StdioEraRejection::MixedEraMarkers,
+            },
+            (ProtocolEra::Modern2026, StdioOpeningFrame::RequestWithoutModernMetadata) => {
+                StdioEraDecision::RejectedUnderSelectedEra {
+                    era,
+                    reason: StdioEraRejection::MissingModernMetadata,
+                }
+            }
+            (ProtocolEra::Modern2026, StdioOpeningFrame::Notification) => {
+                StdioEraDecision::RejectedUnderSelectedEra {
+                    era,
+                    reason: StdioEraRejection::NotificationCannotClassify,
+                }
+            }
+            (ProtocolEra::Modern2026, StdioOpeningFrame::Response) => {
+                StdioEraDecision::RejectedUnderSelectedEra {
+                    era,
+                    reason: StdioEraRejection::ResponseCannotClassify,
+                }
+            }
+            (ProtocolEra::Modern2026, StdioOpeningFrame::Malformed) => {
+                StdioEraDecision::RejectedUnderSelectedEra {
+                    era,
+                    reason: StdioEraRejection::MalformedOpeningFrame,
+                }
+            }
+            (ProtocolEra::Legacy2024, StdioOpeningFrame::LegacyInitialize) => {
+                StdioEraDecision::Selected {
+                    era,
+                    modern_version: None,
+                }
+            }
+            (ProtocolEra::Legacy2024, StdioOpeningFrame::ModernRequest { .. })
+            | (
+                ProtocolEra::Legacy2024,
+                StdioOpeningFrame::MixedInitializeAndModernMetadata { .. },
+            ) => StdioEraDecision::RejectedUnderSelectedEra {
+                era,
+                reason: StdioEraRejection::CrossEraTraffic,
+            },
+            (ProtocolEra::Legacy2024, _) => StdioEraDecision::RejectedUnderSelectedEra {
+                era,
+                reason: StdioEraRejection::LegacyInitializeRequired,
+            },
+        }
+    }
+
+    fn select_modern(&mut self, protocol_version: String) -> StdioEraDecision {
+        self.state = StdioEraState::Selected(ProtocolEra::Modern2026);
+        Self::modern_decision(protocol_version)
+    }
+
+    fn modern_decision(protocol_version: String) -> StdioEraDecision {
+        let modern_version = match ProtocolVersion::parse(&protocol_version) {
+            Ok(ProtocolVersion::MODERN_2026) => ModernVersionSupport::Supported,
+            Ok(ProtocolVersion::LEGACY_2024)
+            | Err(ProtocolVersionError::UnsupportedVersion { .. }) => {
+                ModernVersionSupport::Unsupported {
+                    received: protocol_version,
+                }
+            }
+        };
+        StdioEraDecision::Selected {
+            era: ProtocolEra::Modern2026,
+            modern_version: Some(modern_version),
+        }
+    }
+
+    fn reject_and_close(&mut self, reason: StdioEraRejection) -> StdioEraDecision {
+        self.state = StdioEraState::TerminalWithoutEra;
+        StdioEraDecision::RejectedAndClosed { reason }
+    }
+}
+
+/// One explicit configured HTTP route before protocol parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HttpRouteKind {
+    /// Modern Streamable HTTP MCP POST route.
+    ModernMcpPost,
+    /// Exact legacy SSE GET route.
+    LegacySseGet,
+    /// Exact legacy message POST route.
+    LegacyMessagePost,
+}
+
+impl HttpRouteKind {
+    const fn method(self) -> &'static str {
+        match self {
+            Self::ModernMcpPost | Self::LegacyMessagePost => "POST",
+            Self::LegacySseGet => "GET",
+        }
+    }
+}
+
+/// Immutable, configured HTTP endpoint bundle for one policy selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpEndpointBundle {
+    key: HttpEndpointBundleKey,
+}
+
+/// Opaque key for HTTP era negotiation and cached classification state.
+///
+/// Equality includes complete canonical targets, including path and query, as
+/// well as the opaque partition/profile/generation values. Origin equality by
+/// itself is never bundle identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HttpEndpointBundleKey {
+    modern_post_target: Option<String>,
+    legacy_sse_target: Option<String>,
+    legacy_message_post_target: Option<String>,
+    credential_partition: String,
+    transport_profile: String,
+    policy: ProtocolPolicy,
+    configuration_generation: u64,
+    legacy_receipt_generation: u64,
+}
+
+/// Typed refusal while constructing a configured HTTP endpoint bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpEndpointBundleError {
+    /// A policy requiring modern HTTP lacked its explicit configured POST target.
+    MissingModernPostTarget {
+        /// The rejected policy.
+        policy: ProtocolPolicy,
+    },
+    /// A policy requiring legacy HTTP lacked its configured SSE GET target.
+    MissingLegacySseTarget {
+        /// The rejected policy.
+        policy: ProtocolPolicy,
+    },
+    /// A policy requiring legacy HTTP lacked its configured message POST target.
+    MissingLegacyMessagePostTarget {
+        /// The rejected policy.
+        policy: ProtocolPolicy,
+    },
+    /// A configured endpoint contained a fragment, which is never sent in HTTP.
+    FragmentNotAllowed {
+        /// The route that supplied the invalid target.
+        route: HttpRouteKind,
+    },
+    /// Two configured routes have the same method and exact canonical target.
+    RouteCollision {
+        /// The first colliding route.
+        first: HttpRouteKind,
+        /// The second colliding route.
+        second: HttpRouteKind,
+        /// The colliding full canonical target.
+        target: String,
+    },
+}
+
+impl HttpEndpointBundle {
+    /// Builds a trusted bundle exclusively from configured canonical targets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        policy: ProtocolPolicy,
+        modern_post: Option<CanonicalHttpUrl>,
+        legacy_sse: Option<CanonicalHttpUrl>,
+        legacy_message_post: Option<CanonicalHttpUrl>,
+        credential_partition: String,
+        transport_profile: String,
+        configuration_generation: u64,
+        legacy_receipt_generation: u64,
+    ) -> Result<Self, HttpEndpointBundleError> {
+        let requires_modern = !matches!(policy, ProtocolPolicy::LegacyOnly);
+        let requires_legacy = !matches!(policy, ProtocolPolicy::ModernOnly);
+
+        if requires_modern && modern_post.is_none() {
+            return Err(HttpEndpointBundleError::MissingModernPostTarget { policy });
+        }
+        if requires_legacy && legacy_sse.is_none() {
+            return Err(HttpEndpointBundleError::MissingLegacySseTarget { policy });
+        }
+        if requires_legacy && legacy_message_post.is_none() {
+            return Err(HttpEndpointBundleError::MissingLegacyMessagePostTarget { policy });
+        }
+
+        Self::reject_fragment(modern_post.as_ref(), HttpRouteKind::ModernMcpPost)?;
+        Self::reject_fragment(legacy_sse.as_ref(), HttpRouteKind::LegacySseGet)?;
+        Self::reject_fragment(
+            legacy_message_post.as_ref(),
+            HttpRouteKind::LegacyMessagePost,
+        )?;
+
+        let key = HttpEndpointBundleKey {
+            modern_post_target: modern_post.map(|target| target.as_str().to_owned()),
+            legacy_sse_target: legacy_sse.map(|target| target.as_str().to_owned()),
+            legacy_message_post_target: legacy_message_post
+                .map(|target| target.as_str().to_owned()),
+            credential_partition,
+            transport_profile,
+            policy,
+            configuration_generation,
+            legacy_receipt_generation,
+        };
+        Self::reject_route_collisions(&key)?;
+        Ok(Self { key })
+    }
+
+    /// Returns the immutable opaque cache key for this configured bundle.
+    #[must_use]
+    pub fn key(&self) -> HttpEndpointBundleKey {
+        self.key.clone()
+    }
+
+    fn reject_fragment(
+        target: Option<&CanonicalHttpUrl>,
+        route: HttpRouteKind,
+    ) -> Result<(), HttpEndpointBundleError> {
+        if target.is_some_and(|target| target.fragment().is_some()) {
+            return Err(HttpEndpointBundleError::FragmentNotAllowed { route });
+        }
+        Ok(())
+    }
+
+    fn reject_route_collisions(key: &HttpEndpointBundleKey) -> Result<(), HttpEndpointBundleError> {
+        let routes = [
+            (
+                HttpRouteKind::ModernMcpPost,
+                key.modern_post_target.as_deref(),
+            ),
+            (
+                HttpRouteKind::LegacySseGet,
+                key.legacy_sse_target.as_deref(),
+            ),
+            (
+                HttpRouteKind::LegacyMessagePost,
+                key.legacy_message_post_target.as_deref(),
+            ),
+        ];
+        for (index, (first_kind, first_target)) in routes.iter().enumerate() {
+            let Some(first_target) = first_target else {
+                continue;
+            };
+            for (second_kind, second_target) in routes.iter().skip(index + 1) {
+                if first_kind.method() == second_kind.method()
+                    && second_target.is_some_and(|second_target| second_target == *first_target)
+                {
+                    return Err(HttpEndpointBundleError::RouteCollision {
+                        first: *first_kind,
+                        second: *second_kind,
+                        target: (*first_target).to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The body category returned by one isolated modern HTTP probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpProbeBody {
+    /// A recognized modern JSON-RPC result or error object.
+    RecognizedModernJsonRpc,
+    /// An empty response body.
+    Empty,
+    /// A body that is not a recognized modern JSON-RPC result or error.
+    Unrecognized,
+    /// No response was received because of a transport failure.
+    TransportFailure,
+}
+
+/// One isolated response to the configured modern HTTP probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpModernProbe {
+    /// The received HTTP status, when a response was received.
+    pub status: u16,
+    /// The classified body form.
+    pub body: HttpProbeBody,
+}
+
+/// Era classification result for a configured HTTP bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpEraDecision {
+    /// The bundle selected this era and may cache it under its exact key.
+    Selected(ProtocolEra),
+    /// The response cannot signal downgrade and must not trigger legacy GET.
+    RejectedWithoutLegacyFallback,
+}
+
+/// Per-bundle era cache that cannot be contaminated by origin-only matches.
+#[derive(Debug, Default)]
+pub struct HttpEraCache {
+    selected_eras: HashMap<HttpEndpointBundleKey, ProtocolEra>,
+}
+
+impl HttpEraCache {
+    /// Classifies one configured bundle once or returns its immutable cached era.
+    pub fn classify_or_cached(
+        &mut self,
+        bundle: &HttpEndpointBundle,
+        probe: HttpModernProbe,
+    ) -> HttpEraDecision {
+        let key = bundle.key();
+        if let Some(era) = self.selected_eras.get(&key) {
+            return HttpEraDecision::Selected(*era);
+        }
+
+        let decision = Self::classify_probe(bundle.key.policy, probe);
+        if let HttpEraDecision::Selected(era) = decision {
+            self.selected_eras.insert(key, era);
+        }
+        decision
+    }
+
+    /// Explicit trusted invalidation removes only one exact bundle key.
+    pub fn invalidate(&mut self, key: &HttpEndpointBundleKey) -> Option<ProtocolEra> {
+        self.selected_eras.remove(key)
+    }
+
+    /// Returns an era only for the exact full bundle key.
+    #[must_use]
+    pub fn selected_era(&self, key: &HttpEndpointBundleKey) -> Option<ProtocolEra> {
+        self.selected_eras.get(key).copied()
+    }
+
+    fn classify_probe(policy: ProtocolPolicy, probe: HttpModernProbe) -> HttpEraDecision {
+        match policy {
+            ProtocolPolicy::ModernOnly => HttpEraDecision::Selected(ProtocolEra::Modern2026),
+            ProtocolPolicy::LegacyOnly => HttpEraDecision::Selected(ProtocolEra::Legacy2024),
+            ProtocolPolicy::Auto
+                if matches!(probe.body, HttpProbeBody::RecognizedModernJsonRpc) =>
+            {
+                HttpEraDecision::Selected(ProtocolEra::Modern2026)
+            }
+            ProtocolPolicy::Auto
+                if matches!(probe.status, 400 | 404 | 405)
+                    && matches!(
+                        probe.body,
+                        HttpProbeBody::Empty | HttpProbeBody::Unrecognized
+                    ) =>
+            {
+                HttpEraDecision::Selected(ProtocolEra::Legacy2024)
+            }
+            ProtocolPolicy::Auto => HttpEraDecision::RejectedWithoutLegacyFallback,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +993,132 @@ mod tests {
             Err(ProtocolVersionError::UnsupportedVersion {
                 received: "2025-11-25".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn fnd_03_era_classification_positive() {
+        let mut stdio = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        assert_eq!(stdio.state(), &StdioEraState::Unclassified);
+        assert_eq!(
+            stdio.classify_opening(StdioOpeningFrame::ModernRequest {
+                protocol_version: "2025-11-25".to_owned(),
+            }),
+            StdioEraDecision::Selected {
+                era: ProtocolEra::Modern2026,
+                modern_version: Some(ModernVersionSupport::Unsupported {
+                    received: "2025-11-25".to_owned(),
+                }),
+            }
+        );
+        assert_eq!(
+            stdio.state(),
+            &StdioEraState::Selected(ProtocolEra::Modern2026)
+        );
+        assert_eq!(
+            stdio.classify_opening(StdioOpeningFrame::LegacyInitialize),
+            StdioEraDecision::RejectedUnderSelectedEra {
+                era: ProtocolEra::Modern2026,
+                reason: StdioEraRejection::CrossEraTraffic,
+            }
+        );
+
+        let first_bundle = HttpEndpointBundle::new(
+            ProtocolPolicy::Auto,
+            Some(CanonicalHttpUrl::parse("https://api.example.test/mcp").unwrap()),
+            Some(CanonicalHttpUrl::parse("https://api.example.test/sse").unwrap()),
+            Some(CanonicalHttpUrl::parse("https://api.example.test/messages").unwrap()),
+            "partition-a".to_owned(),
+            "http-sse-v2".to_owned(),
+            1,
+            1,
+        )
+        .unwrap();
+        let second_bundle = HttpEndpointBundle::new(
+            ProtocolPolicy::Auto,
+            Some(CanonicalHttpUrl::parse("https://api.example.test/other-mcp").unwrap()),
+            Some(CanonicalHttpUrl::parse("https://api.example.test/other-sse").unwrap()),
+            Some(CanonicalHttpUrl::parse("https://api.example.test/other-messages").unwrap()),
+            "partition-a".to_owned(),
+            "http-sse-v2".to_owned(),
+            1,
+            1,
+        )
+        .unwrap();
+        assert_ne!(first_bundle.key(), second_bundle.key());
+
+        let mut cache = HttpEraCache::default();
+        assert_eq!(
+            cache.classify_or_cached(
+                &first_bundle,
+                HttpModernProbe {
+                    status: 500,
+                    body: HttpProbeBody::RecognizedModernJsonRpc,
+                },
+            ),
+            HttpEraDecision::Selected(ProtocolEra::Modern2026)
+        );
+        assert_eq!(
+            cache.classify_or_cached(
+                &second_bundle,
+                HttpModernProbe {
+                    status: 404,
+                    body: HttpProbeBody::Empty,
+                },
+            ),
+            HttpEraDecision::Selected(ProtocolEra::Legacy2024)
+        );
+        assert_eq!(
+            cache.selected_era(&first_bundle.key()),
+            Some(ProtocolEra::Modern2026)
+        );
+        assert_eq!(
+            cache.selected_era(&second_bundle.key()),
+            Some(ProtocolEra::Legacy2024)
+        );
+    }
+
+    #[test]
+    fn fnd_03_era_classification_planted_negative() {
+        let baseline_frame = StdioOpeningFrame::ModernRequest {
+            protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
+        };
+        let mut accepted_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        assert_eq!(
+            accepted_classifier.classify_opening(baseline_frame.clone()),
+            StdioEraDecision::Selected {
+                era: ProtocolEra::Modern2026,
+                modern_version: Some(ModernVersionSupport::Supported),
+            }
+        );
+        let accepted_state = accepted_classifier.state().clone();
+
+        // The initialize marker is the sole planted opening-frame dimension;
+        // policy, request shape, and protocol version remain unchanged.
+        let mut planted_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let refusal = planted_classifier.classify_opening(
+            StdioOpeningFrame::MixedInitializeAndModernMetadata {
+                protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
+            },
+        );
+        assert_eq!(
+            refusal,
+            StdioEraDecision::RejectedAndClosed {
+                reason: StdioEraRejection::MixedEraMarkers,
+            }
+        );
+        assert_eq!(
+            planted_classifier.state(),
+            &StdioEraState::TerminalWithoutEra
+        );
+        assert_eq!(accepted_classifier.state(), &accepted_state);
+        assert_eq!(
+            planted_classifier.classify_opening(baseline_frame),
+            StdioEraDecision::AlreadyTerminal
+        );
+        assert_eq!(
+            planted_classifier.state(),
+            &StdioEraState::TerminalWithoutEra
         );
     }
 }
