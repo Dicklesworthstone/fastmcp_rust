@@ -6079,7 +6079,7 @@ mod tests {
         });
         let first =
             parse_valid_client_progress(&valid, None).expect("first finite update is valid");
-        assert_eq!(first.progress, -1.5);
+        assert_eq!(first.progress.to_bits(), (-1.5_f64).to_bits());
         assert_eq!(
             first.meta.as_ref().and_then(|meta| meta.get("trace")),
             Some(&serde_json::json!("accepted"))
