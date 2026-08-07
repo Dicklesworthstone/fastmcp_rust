@@ -63,10 +63,10 @@ pub use messages::*;
 pub use result::*;
 pub use schema::{ValidationError, ValidationResult, validate, validate_strict};
 pub use server_discovery::{
-    DiscoveryCacheHintError, DiscoveryCacheHints, MAX_SERVER_INSTRUCTIONS_BYTES,
-    SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior,
-    ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
-    ServerDiscoverResult, ServerDiscoveryError, ServerInstructionError, ServerInstructions,
+    DiscoveryCacheHints, MAX_SERVER_INSTRUCTIONS_BYTES, SERVER_DISCOVER_METHOD,
+    SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior, ServerBehaviorRegistry,
+    ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult, ServerDiscoveryError,
+    ServerInstructionError, ServerInstructions,
 };
 pub use types::*;
 
