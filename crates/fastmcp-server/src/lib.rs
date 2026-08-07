@@ -95,7 +95,10 @@ pub use handler::{
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 pub use proxy::{ProxyBackend, ProxyCatalog, ProxyClient};
-pub use router::{MountResult, NotificationSender, Router, TagFilters};
+pub use router::{
+    InboundRequestContext, InboundRequestTransport, MountResult, NotificationSender, Router,
+    TagFilters,
+};
 use router::{RouterResourceReader, RouterToolCaller};
 pub use session::Session;
 use session::{
@@ -1167,6 +1170,165 @@ impl Server {
             self.console
                 .print_plain("Note: Rich logging not initialized (logger already set)");
         }
+    }
+
+    /// Processes one modern request without connection-local session state.
+    ///
+    /// The transport owns raw headers and credentials. It must authenticate and
+    /// validate those private inputs before constructing an
+    /// [`InboundRequestContext`]; this public boundary receives only immutable,
+    /// allowlisted request facts. Each call creates a fresh request authority,
+    /// commits anonymous auth before extension middleware, and delegates only to
+    /// the router's stateless dispatch surface. It neither reads nor mutates a
+    /// [`Session`].
+    ///
+    /// Requests that require connection-local lifecycle state remain available
+    /// exclusively through the legacy adapter. In particular, modern list
+    /// results come from the immutable router catalog and never depend on a
+    /// connection's previous requests.
+    #[must_use]
+    pub fn dispatch_stateless(
+        &self,
+        inbound: &InboundRequestContext,
+        request: &JsonRpcRequest,
+    ) -> Option<JsonRpcResponse> {
+        let method = request.method.clone();
+        let response_id = request.id.clone();
+        let is_notification = response_id.is_none();
+        let started_at = Instant::now();
+
+        let response_for_error = |error: McpError| {
+            response_id.clone().map(|id| {
+                let masked = mask_peer_error(error, self.mask_error_details);
+                JsonRpcResponse::error(
+                    Some(id),
+                    JsonRpcError {
+                        code: masked.code.into(),
+                        message: masked.message,
+                        data: masked.data,
+                    },
+                )
+            })
+        };
+
+        if request.validate().is_err() {
+            if let Some(stats) = &self.stats {
+                stats.record_request(&method, started_at.elapsed(), false);
+            }
+            return response_for_error(McpError::invalid_request("Invalid JSON-RPC request"));
+        }
+        if !is_notification && is_notification_only_method(&method) {
+            if let Some(stats) = &self.stats {
+                stats.record_request(&method, started_at.elapsed(), false);
+            }
+            return response_for_error(McpError::invalid_request(
+                "MCP notification method must not carry a request id",
+            ));
+        }
+        if is_notification && is_request_only_method(&method) {
+            if let Some(stats) = &self.stats {
+                stats.record_request(&method, started_at.elapsed(), false);
+            }
+            return None;
+        }
+        if inbound.request_id() != request_id_to_u64(response_id.as_ref()) {
+            if let Some(stats) = &self.stats {
+                stats.record_request(&method, started_at.elapsed(), false);
+            }
+            return response_for_error(McpError::invalid_request(
+                "Inbound request identity does not match the JSON-RPC request id",
+            ));
+        }
+
+        let request_ctx = inbound.request_context();
+        let budget = self.create_request_budget(request_ctx.cx());
+        if let Some(error) = Self::request_budget_error(request_ctx.cx(), budget) {
+            if let Some(stats) = &self.stats {
+                stats.record_request(&method, started_at.elapsed(), false);
+            }
+            return response_for_error(error);
+        }
+        let Some((request_ctx, _request_lease_guard)) = request_ctx
+            .with_budget_ceiling(budget)
+            .begin_request_scope()
+        else {
+            if let Some(stats) = &self.stats {
+                stats.record_request(&method, started_at.elapsed(), false);
+            }
+            return response_for_error(McpError::internal_error(
+                "request scope could not be established",
+            ));
+        };
+
+        // This modern path deliberately has no server authentication hook yet.
+        // Commit the anonymous admission before middleware so extension code
+        // cannot forge a principal on a context that has no raw credentials.
+        if !request_ctx.commit_anonymous_auth() {
+            if let Some(stats) = &self.stats {
+                stats.record_request(&method, started_at.elapsed(), false);
+            }
+            return response_for_error(McpError::internal_error(
+                "anonymous request admission could not be committed",
+            ));
+        }
+
+        let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
+        let result: McpResult<serde_json::Value> = (|| {
+            for middleware in self.middleware.iter() {
+                Self::enforce_request_context(&request_ctx)?;
+                entered_middleware.push(middleware.as_ref());
+                match catch_extension_unwind(|| middleware.on_request(&request_ctx, request)) {
+                    Ok(Ok(MiddlewareDecision::Continue)) => {}
+                    Ok(Ok(MiddlewareDecision::Respond(value))) => return Ok(value),
+                    Ok(Err(error)) => return Err(error),
+                    Err(_payload) => return Err(extension_panic_error("middleware_on_request")),
+                }
+            }
+            self.router.dispatch_stateless(&request_ctx, request)
+        })();
+        let result = match result {
+            Ok(value) => self
+                .apply_middleware_response(&entered_middleware, &request_ctx, request, value)
+                .map_err(|error| {
+                    self.apply_middleware_error(&entered_middleware, &request_ctx, request, error)
+                }),
+            Err(error) => {
+                Err(self.apply_middleware_error(&entered_middleware, &request_ctx, request, error))
+            }
+        };
+        let result = Self::request_context_error(&request_ctx).map_or(result, Err);
+
+        let succeeded = result.is_ok();
+        if let Some(stats) = &self.stats {
+            stats.record_request(&method, started_at.elapsed(), succeeded);
+        }
+        if is_notification {
+            if let Err(error) = result {
+                error!(
+                    target: targets::HANDLER,
+                    "Stateless notification failed; method_key={:016x}; code={:?}",
+                    stable_hash_request_id(&method),
+                    error.code
+                );
+            }
+            return None;
+        }
+
+        let response_id = response_id.expect("non-notification requests have an id");
+        Some(match result {
+            Ok(value) => JsonRpcResponse::success(response_id, value),
+            Err(error) => {
+                let masked = mask_peer_error(error, self.mask_error_details);
+                JsonRpcResponse::error(
+                    Some(response_id),
+                    JsonRpcError {
+                        code: masked.code.into(),
+                        message: masked.message,
+                        data: masked.data,
+                    },
+                )
+            }
+        })
     }
 
     /// Processes a single JSON-RPC request through the full server dispatch
@@ -5238,11 +5400,12 @@ fn parse_params_or_default<T: serde::de::DeserializeOwned + Default>(
 
 /// Converts a JSON-RPC RequestId to a u64 for internal tracking.
 ///
-/// If the ID is a number, uses that number. If it's a string or absent,
-/// uses a stable hash (string) or 0 (absent) as a fallback.
+/// If the ID is representable as an `i64`, uses that number. Arbitrary-
+/// precision integer and string IDs use a stable hash; absent IDs use zero.
 fn request_id_to_u64(id: Option<&RequestId>) -> u64 {
     match id {
         Some(RequestId::Number(n)) => *n as u64,
+        Some(RequestId::Integer(integer)) => stable_hash_request_id(integer),
         Some(RequestId::String(s)) => stable_hash_request_id(s),
         None => 0,
     }

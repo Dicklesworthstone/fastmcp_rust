@@ -40,10 +40,16 @@
 #![allow(dead_code)]
 
 mod builder;
+mod execution;
 pub mod mcp_config;
 mod session;
 
 pub use builder::ClientBuilder;
+pub use execution::{
+    CancellationRequested, ExecutionTerminalReason, ExecutionTerminalRecord,
+    ExecutionTerminalState, OpaquePagination, PaginationBounds, PendingRequestRecord, Request,
+    RequestExecution, RequestExecutor, clt_01_a_manifest_digest, clt_01_b_manifest_digest,
+};
 pub use mcp_config::claude_desktop_config_path;
 pub use session::ClientSession;
 

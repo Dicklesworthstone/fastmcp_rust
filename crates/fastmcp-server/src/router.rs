@@ -46,6 +46,68 @@ use crate::handler::{
 /// during request handling. The callback receives a JSON-RPC request (notification format).
 pub type NotificationSender = Arc<dyn Fn(JsonRpcRequest) + Send + Sync>;
 
+/// Allowlisted transport provenance attached to a sanitized inbound request.
+///
+/// This deliberately contains no peer address, headers, cookies, or
+/// credentials. Transport implementations retain those raw values inside their
+/// authentication boundary and pass only one of these validated facts to the
+/// server dispatch layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundRequestTransport {
+    /// Standard input/output framing.
+    Stdio,
+    /// Streamable HTTP request handling.
+    Http,
+    /// Server-sent events transport.
+    Sse,
+    /// WebSocket transport.
+    WebSocket,
+    /// In-process transport used by embeddings and tests.
+    Memory,
+}
+
+/// Sanitized, immutable ingress facts for one server dispatch.
+///
+/// The type intentionally has no `Clone`, `Serialize`, or `Debug`
+/// implementation. In particular, it offers no channel for raw headers or
+/// credentials: a transport must authenticate privately and construct this
+/// context from its allowlisted provenance only. The server creates a fresh
+/// request-scoped [`McpContext`] from these facts for every dispatch.
+pub struct InboundRequestContext {
+    cx: Cx,
+    request_id: u64,
+    transport: InboundRequestTransport,
+}
+
+impl InboundRequestContext {
+    /// Creates sanitized facts after transport-owned authentication and request
+    /// metadata validation have completed.
+    #[must_use]
+    pub fn new(cx: Cx, request_id: u64, transport: InboundRequestTransport) -> Self {
+        Self {
+            cx,
+            request_id,
+            transport,
+        }
+    }
+
+    /// Returns the transport's allowlisted provenance fact.
+    #[must_use]
+    pub const fn transport(&self) -> InboundRequestTransport {
+        self.transport
+    }
+
+    /// Returns the request identity selected by the transport.
+    #[must_use]
+    pub const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    pub(crate) fn request_context(&self) -> McpContext {
+        McpContext::new(self.cx.clone(), self.request_id)
+    }
+}
+
 /// Tag filtering parameters for list operations.
 #[derive(Debug, Clone, Default)]
 pub struct TagFilters<'a> {
@@ -118,6 +180,31 @@ fn decode_cursor_offset(cursor: Option<&str>) -> McpResult<usize> {
 
     usize::try_from(offset)
         .map_err(|_| McpError::invalid_params("Invalid cursor (offset too large)".to_string()))
+}
+
+fn parse_stateless_params<T: serde::de::DeserializeOwned>(
+    params: Option<serde_json::Value>,
+) -> McpResult<T> {
+    let value = params.ok_or_else(|| McpError::invalid_params("Missing required parameters"))?;
+    serde_json::from_value(value).map_err(|error| McpError::invalid_params(error.to_string()))
+}
+
+fn parse_stateless_params_or_default<T: serde::de::DeserializeOwned + Default>(
+    params: Option<serde_json::Value>,
+) -> McpResult<T> {
+    match params {
+        Some(value) => serde_json::from_value(value)
+            .map_err(|error| McpError::invalid_params(error.to_string())),
+        None => Ok(T::default()),
+    }
+}
+
+/// Converts a completed handler result to its JSON-RPC value while preserving
+/// the original typed [`McpError`] on refusal.
+fn encode_stateless_handler_result<T: serde::Serialize>(
+    result: McpResult<T>,
+) -> McpResult<serde_json::Value> {
+    serde_json::to_value(result?).map_err(McpError::from)
 }
 
 fn encode_cursor_offset(offset: usize) -> String {
@@ -992,6 +1079,88 @@ impl Router {
             server_info: session.server_info().clone(),
             instructions: instructions.map(String::from),
         })
+    }
+
+    /// Dispatches a request without connection or session state.
+    ///
+    /// This is the modern server-side routing seam. It deliberately has no
+    /// `Session` argument: list results come from the immutable router catalog,
+    /// and handler invocations receive a fresh state bag that cannot be shared
+    /// with another request or connection. State-bearing lifecycle methods stay
+    /// on the legacy adapter rather than acquiring accidental modern semantics.
+    pub(crate) fn dispatch_stateless(
+        &self,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<serde_json::Value> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
+        let params = request.params.clone();
+        let result = match request.method.as_str() {
+            "ping" => serde_json::json!({}),
+            "tools/list" => {
+                let params = parse_stateless_params_or_default(params)?;
+                serde_json::to_value(self.handle_tools_list(request_ctx, params, None)?)
+                    .map_err(McpError::from)?
+            }
+            "tools/call" => {
+                let params = parse_stateless_params(params)?;
+                encode_stateless_handler_result(self.handle_tools_call(
+                    request_ctx,
+                    params,
+                    SessionState::new(),
+                    None,
+                    None,
+                ))?
+            }
+            "resources/list" => {
+                let params = parse_stateless_params_or_default(params)?;
+                serde_json::to_value(self.handle_resources_list(request_ctx, params, None)?)
+                    .map_err(McpError::from)?
+            }
+            "resources/templates/list" => {
+                let params = parse_stateless_params_or_default(params)?;
+                serde_json::to_value(self.handle_resource_templates_list(
+                    request_ctx,
+                    params,
+                    None,
+                )?)
+                .map_err(McpError::from)?
+            }
+            "resources/read" => {
+                let params = parse_stateless_params(params)?;
+                encode_stateless_handler_result(self.handle_resources_read(
+                    request_ctx,
+                    &params,
+                    SessionState::new(),
+                    None,
+                    None,
+                ))?
+            }
+            "prompts/list" => {
+                let params = parse_stateless_params_or_default(params)?;
+                serde_json::to_value(self.handle_prompts_list(request_ctx, params, None)?)
+                    .map_err(McpError::from)?
+            }
+            "prompts/get" => {
+                let params = parse_stateless_params(params)?;
+                encode_stateless_handler_result(self.handle_prompts_get(
+                    request_ctx,
+                    params,
+                    SessionState::new(),
+                    None,
+                    None,
+                ))?
+            }
+            _ => return Err(McpError::method_not_found(&request.method)),
+        };
+
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        Ok(result)
     }
 
     /// Handles the tools/list request.
