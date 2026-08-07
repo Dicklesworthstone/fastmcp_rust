@@ -6,7 +6,7 @@
 //! perform authentication and authorization.  Those concerns are explicit
 //! integration responsibilities.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fastmcp_protocol::methods::{
     decode_legacy_2024_11_05_client_capabilities, decode_legacy_2024_11_05_envelope,
@@ -736,14 +736,14 @@ mod tests {
             LegacyPeerBinding::new(7),
             Legacy2024ServerConfig {
                 capabilities: Legacy2024ServerCapabilities {
-                    logging: Some(Default::default()),
+                    logging: Some(BTreeMap::default()),
                     tools: Some(Legacy2024ListChangedCapability::default()),
                     resources: Some(Legacy2024ResourcesCapability {
                         subscribe: true,
-                        ..Default::default()
+                        ..Legacy2024ResourcesCapability::default()
                     }),
                     prompts: Some(Legacy2024ListChangedCapability::default()),
-                    ..Default::default()
+                    ..Legacy2024ServerCapabilities::default()
                 },
                 server_info: Legacy2024ServerInfo {
                     name: "legacy-server".to_owned(),
