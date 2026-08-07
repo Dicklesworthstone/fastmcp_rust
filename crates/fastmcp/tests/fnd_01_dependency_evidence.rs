@@ -98866,14 +98866,6 @@ fn fallible(value: Option<u8>) {
 pub use bootstrap::harness_main;
 #[cfg(all(not(fnd01_bootstrap), not(test)))]
 pub use ordinary::harness_main;
-#[cfg(not(fnd01_bootstrap))]
-pub(crate) use ordinary::{
-    SdkBatchPlan, SdkBatchReceiptBody, SdkExecutableBinding, SdkExecutionObservation,
-    SdkExecutionProcessBinding, SdkNetworkProbeBinding, SdkTranscriptBinding,
-    ValidatedSdkStaticPeer, sdk_admit_batch, sdk_batch_failure_json, sdk_composite_binding,
-    sdk_environment_sha256, sdk_prepare_batch, sdk_process_sha256, sdk_sequence_sha256,
-};
-
 #[cfg(all(fnd01_bootstrap, not(test)))]
 fn main() {
     std::process::exit(harness_main(std::env::args_os()));
