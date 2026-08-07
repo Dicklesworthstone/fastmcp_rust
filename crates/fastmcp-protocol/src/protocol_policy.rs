@@ -714,8 +714,10 @@ pub struct HttpEndpointBundleKey {
     legacy_sse_target: Option<String>,
     legacy_message_post_target: Option<String>,
     credential_partition: String,
+    security_partition: String,
     transport_profile: String,
     policy: ProtocolPolicy,
+    policy_generation: u64,
     configuration_generation: u64,
     legacy_receipt_generation: u64,
 }
@@ -763,7 +765,9 @@ impl HttpEndpointBundle {
         legacy_sse: Option<CanonicalHttpUrl>,
         legacy_message_post: Option<CanonicalHttpUrl>,
         credential_partition: String,
+        security_partition: String,
         transport_profile: String,
+        policy_generation: u64,
         configuration_generation: u64,
         legacy_receipt_generation: u64,
     ) -> Result<Self, HttpEndpointBundleError> {
@@ -793,8 +797,10 @@ impl HttpEndpointBundle {
             legacy_message_post_target: legacy_message_post
                 .map(|target| target.as_str().to_owned()),
             credential_partition,
+            security_partition,
             transport_profile,
             policy,
+            policy_generation,
             configuration_generation,
             legacy_receipt_generation,
         };
@@ -969,9 +975,11 @@ pub(crate) mod tests {
             policy.modern_discovery_versions(),
             [ProtocolVersion::MODERN_2026]
         );
-        assert!(ProtocolPolicy::LegacyOnly
-            .modern_discovery_versions()
-            .is_empty());
+        assert!(
+            ProtocolPolicy::LegacyOnly
+                .modern_discovery_versions()
+                .is_empty()
+        );
         assert_eq!(policy.preferred_versions(), policy.supported_versions());
         assert!(policy.permits(ProtocolVersion::MODERN_2026));
         assert!(policy.permits(ProtocolVersion::LEGACY_2024));
@@ -1052,7 +1060,9 @@ pub(crate) mod tests {
             Some(CanonicalHttpUrl::parse("https://api.example.test/sse").unwrap()),
             Some(CanonicalHttpUrl::parse("https://api.example.test/messages").unwrap()),
             "partition-a".to_owned(),
+            "security-a".to_owned(),
             "http-sse-v2".to_owned(),
+            1,
             1,
             1,
         )
@@ -1063,7 +1073,9 @@ pub(crate) mod tests {
             Some(CanonicalHttpUrl::parse("https://api.example.test/other-sse").unwrap()),
             Some(CanonicalHttpUrl::parse("https://api.example.test/other-messages").unwrap()),
             "partition-a".to_owned(),
+            "security-a".to_owned(),
             "http-sse-v2".to_owned(),
+            1,
             1,
             1,
         )
