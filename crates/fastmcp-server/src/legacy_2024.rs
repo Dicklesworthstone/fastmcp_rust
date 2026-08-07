@@ -6,7 +6,7 @@
 //! perform authentication and authorization.  Those concerns are explicit
 //! integration responsibilities.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use fastmcp_protocol::methods::{
     decode_legacy_2024_11_05_client_capabilities, decode_legacy_2024_11_05_envelope,
@@ -875,6 +875,8 @@ const fn direction_bytes(direction: Legacy2024Direction) -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use fastmcp_protocol::methods::{
         Legacy2024ListChangedCapability, Legacy2024ResourcesCapability,
     };
