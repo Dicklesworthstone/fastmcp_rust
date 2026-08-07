@@ -258,10 +258,10 @@ pub fn validate_response_head(
         return Err(ModernHttpExecutorError::Redirect { status });
     }
     let kind = if (200..300).contains(&status) {
-        match single_header(headers, "content-type")
+        let content_type = single_header(headers, "content-type")?
             .map(normalize_success_content_type)
-            .transpose()?
-        {
+            .transpose()?;
+        match content_type {
             Some(content_type) if content_type.eq_ignore_ascii_case("application/json") => {
                 ModernHttpResponseKind::Json
             }
