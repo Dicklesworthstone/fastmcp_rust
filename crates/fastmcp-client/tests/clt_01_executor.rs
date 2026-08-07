@@ -19,13 +19,14 @@ use fastmcp_core::McpErrorCode;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 use fastmcp_transport::{Transport, TransportError};
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ProbeState {
     received: VecDeque<Result<JsonRpcMessage, TransportError>>,
     sent: Vec<JsonRpcMessage>,
     closed: bool,
 }
 
+#[derive(Debug)]
 struct ScriptedTransport {
     state: Rc<RefCell<ProbeState>>,
 }
