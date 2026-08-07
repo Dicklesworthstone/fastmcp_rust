@@ -616,10 +616,10 @@ impl StdioEraClassifier {
                     modern_version: None,
                 }
             }
-            (ProtocolEra::Legacy2024, StdioOpeningFrame::ModernRequest { .. })
-            | (
+            (
                 ProtocolEra::Legacy2024,
-                StdioOpeningFrame::MixedInitializeAndModernMetadata { .. },
+                StdioOpeningFrame::ModernRequest { .. }
+                | StdioOpeningFrame::MixedInitializeAndModernMetadata { .. },
             ) => StdioEraDecision::RejectedUnderSelectedEra {
                 era,
                 reason: StdioEraRejection::CrossEraTraffic,
