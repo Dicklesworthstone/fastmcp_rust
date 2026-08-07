@@ -42,6 +42,7 @@
 mod builder;
 mod execution;
 pub mod mcp_config;
+mod negotiation;
 mod session;
 
 pub use builder::ClientBuilder;
@@ -52,9 +53,14 @@ pub use execution::{
 };
 pub use fastmcp_core::CanonicalHttpUrl;
 pub use fastmcp_protocol::protocol_policy::{
-    HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
+    HttpEndpointBundle, HttpEndpointBundleError, HttpModernProbe, HttpProbeBody, ProtocolEra,
+    ProtocolPolicy, ProtocolVersion,
 };
 pub use mcp_config::claude_desktop_config_path;
+pub use negotiation::{
+    ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
+    ClientHttpNegotiationState,
+};
 pub use session::{ClientProtocolPlan, ClientProtocolPlanError, ClientSession};
 
 use std::any::Any;

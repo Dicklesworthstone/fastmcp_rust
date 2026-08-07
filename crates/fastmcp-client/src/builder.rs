@@ -37,10 +37,10 @@ use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::{StdioTransport, Transport};
 
 use crate::{
-    ChildGuard, ChildOwnership, Client, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-    ProcessGroupAnchor, RequestTimeoutPolicy, combine_cleanup_results,
-    combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
-    transport_error_to_mcp,
+    ChildGuard, ChildOwnership, Client, ClientHttpNegotiation, ClientHttpNegotiationError,
+    ClientProtocolPlan, ClientProtocolPlanError, ClientSession, ProcessGroupAnchor,
+    RequestTimeoutPolicy, combine_cleanup_results, combine_operation_with_cleanup,
+    is_cleanup_unverified, resolve_stdio_command, transport_error_to_mcp,
 };
 
 fn protocol_plan_error_to_mcp(error: ClientProtocolPlanError) -> McpError {
@@ -301,6 +301,15 @@ impl ClientBuilder {
     #[must_use]
     pub const fn selected_protocol_plan(&self) -> &ClientProtocolPlan {
         &self.protocol_plan
+    }
+
+    /// Starts a modern-first HTTP negotiation from this immutable builder plan.
+    ///
+    /// This is a side-effect-free admission boundary. The returned attempt
+    /// permits at most one modern probe and binds its cache to the complete
+    /// configured endpoint bundle rather than to an HTTP origin.
+    pub fn http_negotiation(&self) -> Result<ClientHttpNegotiation, ClientHttpNegotiationError> {
+        ClientHttpNegotiation::from_protocol_plan(&self.protocol_plan)
     }
 
     /// Connects to a server via stdio subprocess.
