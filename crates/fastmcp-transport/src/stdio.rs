@@ -151,6 +151,36 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
         self.recv_with_readiness(cx, |_, _| Ok(()))
     }
 
+    /// Receives one complete NDJSON frame and dispatches it by JSON-RPC
+    /// direction without emitting a reverse frame.
+    ///
+    /// The caller retains the request and response handlers across calls, so
+    /// it can correlate interleaved responses while independently handling
+    /// inbound requests or notifications. Exactly one handler runs for an
+    /// admitted frame. A framing or codec error runs neither handler and this
+    /// transport never fabricates a parse or invalid-request response.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same cancellation, closure, I/O, and codec errors as
+    /// [`Self::recv_with_completion`].
+    pub fn dispatch_next<RequestHandler, ResponseHandler>(
+        &mut self,
+        cx: &Cx,
+        on_request: &mut RequestHandler,
+        on_response: &mut ResponseHandler,
+    ) -> Result<(), TransportError>
+    where
+        RequestHandler: FnMut(JsonRpcRequest),
+        ResponseHandler: FnMut(JsonRpcResponse),
+    {
+        match self.recv_with_completion(cx)?.0 {
+            JsonRpcMessage::Request(request) => on_request(request),
+            JsonRpcMessage::Response(response) => on_response(response),
+        }
+        Ok(())
+    }
+
     /// Encodes and sends a message, appending newline.
     fn write_message(&mut self, message: &JsonRpcMessage) -> Result<(), TransportError> {
         if self.closed {
@@ -1915,6 +1945,89 @@ mod tests {
         // Fourth recv should return EOF (Closed)
         let result = transport.recv(&cx);
         assert!(matches!(result, Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn std_01_a_positive() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":\"request-7\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":1}}\n{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"request-8\"}\n";
+        assert_eq!(input.iter().filter(|byte| **byte == b'\n').count(), 3);
+        let mut transport = StdioTransport::new(Cursor::new(input.to_vec()), Vec::new());
+        let cx = Cx::for_testing();
+        let mut requests = Vec::new();
+        let mut responses = Vec::new();
+        let mut on_request = |request: JsonRpcRequest| {
+            requests.push((
+                request.method,
+                request
+                    .id
+                    .map(|id| serde_json::to_value(id).expect("request ID is serializable")),
+            ));
+        };
+        let mut on_response = |response: JsonRpcResponse| {
+            responses.push(
+                serde_json::to_value(response.id).expect("response ID is serializable"),
+            );
+        };
+
+        for _ in 0..3 {
+            transport
+                .dispatch_next(&cx, &mut on_request, &mut on_response)
+                .expect("each complete newline frame dispatches exactly once");
+        }
+
+        assert_eq!(
+            responses,
+            vec![serde_json::json!("request-7")],
+            "the response remains correlated with its exact wire ID"
+        );
+        assert_eq!(
+            requests,
+            vec![
+                ("notifications/progress".to_owned(), None),
+                ("tools/list".to_owned(), Some(serde_json::json!("request-8"))),
+            ],
+            "request and notification frames retain order while responses multiplex separately"
+        );
+        assert!(
+            transport.writer.as_ref().expect("open writer").is_empty(),
+            "bidirectional dispatch never invents a reverse response"
+        );
+    }
+
+    #[test]
+    fn std_01_a_planted_negative() {
+        let valid = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"request-8\"}\n";
+        let forbidden = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools\n/list\",\"id\":\"request-8\"}\n";
+        let mut restored = forbidden.to_vec();
+        let embedded_newline = restored
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("the planted frame contains an embedded newline");
+        restored.remove(embedded_newline);
+        assert_eq!(
+            restored, valid,
+            "the planted negative differs only by one forbidden embedded newline byte"
+        );
+
+        let mut transport = StdioTransport::new(Cursor::new(forbidden.to_vec()), Vec::new());
+        let cx = Cx::for_testing();
+        let mut request_count = 0;
+        let mut response_count = 0;
+        let error = transport
+            .dispatch_next(
+                &cx,
+                &mut |_| request_count += 1,
+                &mut |_| response_count += 1,
+            )
+            .expect_err("an embedded newline must reject before either direction dispatches");
+
+        assert!(matches!(error, TransportError::Codec(_)));
+        assert_eq!(request_count, 0, "rejected framing cannot dispatch a request");
+        assert_eq!(response_count, 0, "rejected framing cannot dispatch a response");
+        assert!(
+            transport.writer.as_ref().expect("open writer").is_empty(),
+            "a rejected inbound frame never emits a reverse parse or invalid-request response"
+        );
     }
 
     #[test]
