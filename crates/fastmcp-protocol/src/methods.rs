@@ -545,6 +545,327 @@ impl std::fmt::Display for Legacy2024WireError {
 
 impl std::error::Error for Legacy2024WireError {}
 
+/// Classifies a server result after exact-2024 lossless admission.
+///
+/// Only the three ordinary server results that can cross this boundary are
+/// represented here. Modern task, structured-content, Apps, and elicitation
+/// surfaces have no exact 2024 wire equivalent and are refused instead of
+/// being silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Legacy2024ResultKind {
+    /// A `tools/call` result with a `content` array.
+    Tool,
+    /// A `resources/read` result with a `contents` array.
+    Resource,
+    /// A `prompts/get` result with a `messages` array.
+    Prompt,
+}
+
+/// Returns an ordinary complete result unchanged only when it has an exact
+/// 2024 representation for `method`.
+pub fn translate_legacy_2024_result(
+    method: &str,
+    result: Value,
+) -> Result<Value, Legacy2024WireError> {
+    let (kind, required_member) = match method {
+        TOOLS_CALL => (Legacy2024ResultKind::Tool, "content"),
+        RESOURCES_READ => (Legacy2024ResultKind::Resource, "contents"),
+        PROMPTS_GET => (Legacy2024ResultKind::Prompt, "messages"),
+        _ => {
+            return Err(Legacy2024WireError(
+                "method does not have an ordinary exact MCP 2024-11-05 result mapping",
+            ));
+        }
+    };
+    let object = result.as_object().ok_or(Legacy2024WireError(
+        "ordinary MCP 2024-11-05 results must be objects",
+    ))?;
+    if ["structuredContent", "task", "tasks", "apps", "elicitation"]
+        .iter()
+        .any(|member| object.contains_key(*member))
+    {
+        return Err(Legacy2024WireError(
+            "modern-only result member cannot be represented by exact MCP 2024-11-05",
+        ));
+    }
+    if !object.get(required_member).is_some_and(Value::is_array) {
+        return Err(match kind {
+            Legacy2024ResultKind::Tool => {
+                Legacy2024WireError("tools/call result requires a content array")
+            }
+            Legacy2024ResultKind::Resource => {
+                Legacy2024WireError("resources/read result requires a contents array")
+            }
+            Legacy2024ResultKind::Prompt => {
+                Legacy2024WireError("prompts/get result requires a messages array")
+            }
+        });
+    }
+    Ok(result)
+}
+
+/// Validates the required exact-2024 parameter members for the methods used by
+/// the server adapter. JSON-RPC itself already guarantees an object whenever
+/// parameters are present; this function adds the pinned method-level shape.
+pub fn validate_legacy_2024_11_05_method_params(
+    method: &str,
+    params: Option<&Value>,
+) -> Result<(), Legacy2024WireError> {
+    match method {
+        TOOLS_CALL => {
+            let params = required_params_object(method, params)?;
+            required_string(params, "name", "tools/call")?;
+            optional_object(params, "arguments", "tools/call")
+        }
+        RESOURCES_READ | RESOURCES_SUBSCRIBE | RESOURCES_UNSUBSCRIBE => {
+            let params = required_params_object(method, params)?;
+            required_string(params, "uri", method)
+        }
+        PROMPTS_GET => {
+            let params = required_params_object(method, params)?;
+            required_string(params, "name", "prompts/get")?;
+            let Some(arguments) = params.get("arguments") else {
+                return Ok(());
+            };
+            let arguments = arguments.as_object().ok_or(Legacy2024WireError(
+                "prompts/get arguments must be an object",
+            ))?;
+            if arguments.values().all(Value::is_string) {
+                Ok(())
+            } else {
+                Err(Legacy2024WireError(
+                    "prompts/get arguments must map names to strings",
+                ))
+            }
+        }
+        COMPLETION_COMPLETE => {
+            let params = required_params_object(method, params)?;
+            let argument =
+                params
+                    .get("argument")
+                    .and_then(Value::as_object)
+                    .ok_or(Legacy2024WireError(
+                        "completion/complete requires an argument object",
+                    ))?;
+            required_string(argument, "name", "completion/complete argument")?;
+            required_string(argument, "value", "completion/complete argument")?;
+            let reference =
+                params
+                    .get("ref")
+                    .and_then(Value::as_object)
+                    .ok_or(Legacy2024WireError(
+                        "completion/complete requires a reference object",
+                    ))?;
+            match reference.get("type").and_then(Value::as_str) {
+                Some("ref/prompt") => required_string(reference, "name", "prompt reference"),
+                Some("ref/resource") => required_string(reference, "uri", "resource reference"),
+                _ => Err(Legacy2024WireError(
+                    "completion/complete reference must be an exact prompt or resource reference",
+                )),
+            }
+        }
+        LOGGING_SET_LEVEL => {
+            let params = required_params_object(method, params)?;
+            let level = params
+                .get("level")
+                .and_then(Value::as_str)
+                .ok_or(Legacy2024WireError(
+                    "logging/setLevel requires a string level",
+                ))?;
+            if matches!(
+                level,
+                "alert"
+                    | "critical"
+                    | "debug"
+                    | "emergency"
+                    | "error"
+                    | "info"
+                    | "notice"
+                    | "warning"
+            ) {
+                Ok(())
+            } else {
+                Err(Legacy2024WireError(
+                    "logging/setLevel requires an exact MCP 2024-11-05 level",
+                ))
+            }
+        }
+        NOTIFICATIONS_CANCELLED => {
+            let params = required_params_object(method, params)?;
+            if !params.get("requestId").is_some_and(legacy_2024_request_id) {
+                return Err(Legacy2024WireError(
+                    "notifications/cancelled requires a non-null string or signed integer requestId",
+                ));
+            }
+            if params.get("reason").is_none_or(Value::is_string) {
+                Ok(())
+            } else {
+                Err(Legacy2024WireError(
+                    "notifications/cancelled reason must be a string",
+                ))
+            }
+        }
+        NOTIFICATIONS_PROGRESS => {
+            let params = required_params_object(method, params)?;
+            let token = params.get("progressToken");
+            if !token.is_some_and(legacy_2024_request_id)
+                || !params.get("progress").is_some_and(Value::is_number)
+                || !params.get("total").is_none_or(Value::is_number)
+            {
+                return Err(Legacy2024WireError(
+                    "notifications/progress requires exact token, progress, and optional total members",
+                ));
+            }
+            Ok(())
+        }
+        SAMPLING_CREATE_MESSAGE => {
+            let params = required_params_object(method, params)?;
+            if params.get("messages").is_some_and(Value::is_array)
+                && params
+                    .get("maxTokens")
+                    .is_some_and(|value| value.is_i64() || value.is_u64())
+            {
+                Ok(())
+            } else {
+                Err(Legacy2024WireError(
+                    "sampling/createMessage requires messages array and integer maxTokens",
+                ))
+            }
+        }
+        NOTIFICATIONS_MESSAGE => {
+            let params = required_params_object(method, params)?;
+            if !params.contains_key("data") {
+                return Err(Legacy2024WireError(
+                    "notifications/message requires a data member",
+                ));
+            }
+            let level = params
+                .get("level")
+                .and_then(Value::as_str)
+                .ok_or(Legacy2024WireError(
+                    "notifications/message requires a string level",
+                ))?;
+            if !matches!(
+                level,
+                "alert"
+                    | "critical"
+                    | "debug"
+                    | "emergency"
+                    | "error"
+                    | "info"
+                    | "notice"
+                    | "warning"
+            ) || !params.get("logger").is_none_or(Value::is_string)
+            {
+                return Err(Legacy2024WireError(
+                    "notifications/message requires exact level and optional string logger",
+                ));
+            }
+            Ok(())
+        }
+        NOTIFICATIONS_RESOURCES_UPDATED => {
+            let params = required_params_object(method, params)?;
+            required_string(params, "uri", "notifications/resources/updated")
+        }
+        NOTIFICATIONS_ROOTS_LIST_CHANGED
+        | NOTIFICATIONS_INITIALIZED
+        | PING
+        | ROOTS_LIST
+        | TOOLS_LIST
+        | RESOURCES_LIST
+        | RESOURCES_TEMPLATES_LIST
+        | PROMPTS_LIST => optional_params_object(params, method),
+        NOTIFICATIONS_PROMPTS_LIST_CHANGED
+        | NOTIFICATIONS_RESOURCES_LIST_CHANGED
+        | NOTIFICATIONS_TOOLS_LIST_CHANGED => optional_params_object(params, method),
+        INITIALIZE => validate_legacy_2024_initialize(method, params),
+        _ => Err(Legacy2024WireError(
+            "method is not part of exact MCP 2024-11-05",
+        )),
+    }
+}
+
+fn required_params_object<'a>(
+    method: &str,
+    params: Option<&'a Value>,
+) -> Result<&'a serde_json::Map<String, Value>, Legacy2024WireError> {
+    params.and_then(Value::as_object).ok_or_else(|| {
+        Legacy2024WireError(match method {
+            TOOLS_CALL => "tools/call requires object params",
+            RESOURCES_READ => "resources/read requires object params",
+            RESOURCES_SUBSCRIBE => "resources/subscribe requires object params",
+            RESOURCES_UNSUBSCRIBE => "resources/unsubscribe requires object params",
+            PROMPTS_GET => "prompts/get requires object params",
+            COMPLETION_COMPLETE => "completion/complete requires object params",
+            LOGGING_SET_LEVEL => "logging/setLevel requires object params",
+            NOTIFICATIONS_CANCELLED => "notifications/cancelled requires object params",
+            NOTIFICATIONS_PROGRESS => "notifications/progress requires object params",
+            SAMPLING_CREATE_MESSAGE => "sampling/createMessage requires object params",
+            NOTIFICATIONS_MESSAGE => "notifications/message requires object params",
+            NOTIFICATIONS_RESOURCES_UPDATED => {
+                "notifications/resources/updated requires object params"
+            }
+            _ => "exact MCP 2024-11-05 method requires object params",
+        })
+    })
+}
+
+fn optional_params_object(params: Option<&Value>, method: &str) -> Result<(), Legacy2024WireError> {
+    if params.is_none_or(Value::is_object) {
+        Ok(())
+    } else {
+        Err(Legacy2024WireError(match method {
+            PING => "ping params must be an object when present",
+            _ => "exact MCP 2024-11-05 params must be an object when present",
+        }))
+    }
+}
+
+fn required_string(
+    object: &serde_json::Map<String, Value>,
+    member: &str,
+    subject: &str,
+) -> Result<(), Legacy2024WireError> {
+    if object.get(member).is_some_and(Value::is_string) {
+        Ok(())
+    } else {
+        Err(Legacy2024WireError(match (subject, member) {
+            ("tools/call", "name") => "tools/call requires a string name",
+            ("prompts/get", "name") => "prompts/get requires a string name",
+            ("completion/complete argument", "name") => {
+                "completion/complete argument requires a string name"
+            }
+            ("completion/complete argument", "value") => {
+                "completion/complete argument requires a string value"
+            }
+            ("prompt reference", "name") => "prompt reference requires a string name",
+            ("resource reference", "uri") => "resource reference requires a string uri",
+            ("resources/read", "uri") => "resources/read requires a string uri",
+            ("resources/subscribe", "uri") => "resources/subscribe requires a string uri",
+            ("resources/unsubscribe", "uri") => "resources/unsubscribe requires a string uri",
+            ("notifications/resources/updated", "uri") => {
+                "notifications/resources/updated requires a string uri"
+            }
+            _ => "exact MCP 2024-11-05 method requires a string member",
+        }))
+    }
+}
+
+fn optional_object(
+    object: &serde_json::Map<String, Value>,
+    member: &str,
+    subject: &str,
+) -> Result<(), Legacy2024WireError> {
+    if object.get(member).is_none_or(Value::is_object) {
+        Ok(())
+    } else {
+        Err(Legacy2024WireError(match subject {
+            "tools/call" => "tools/call arguments must be an object",
+            _ => "exact MCP 2024-11-05 optional member must be an object",
+        }))
+    }
+}
+
 /// Decodes one exact MCP 2024-11-05 JSON-RPC envelope before any lifecycle or
 /// dispatch work.  Top-level batches, modern method literals, invalid IDs, and
 /// 2025-11-25 initialization are rejected at this pure raw-admission boundary.
@@ -571,7 +892,7 @@ pub fn decode_legacy_2024_11_05_envelope(
                 "JSON-RPC params must be an object when present",
             ));
         }
-        validate_legacy_2024_initialize(method.name, params.as_ref())?;
+        validate_legacy_2024_11_05_method_params(method.name, params.as_ref())?;
 
         return match method.envelope {
             Legacy2024EnvelopeKind::Request => {
@@ -700,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn method_constants_match_mcp_spec() {
+    fn lifecycle_and_tool_constants_match_mcp_spec() {
         // Lifecycle: the initialized notification is `notifications/initialized`,
         // NOT bare `initialized`. https://modelcontextprotocol.io/specification
         assert_eq!(INITIALIZE, "initialize");

@@ -10,13 +10,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fastmcp_protocol::methods::{
     decode_legacy_2024_11_05_client_capabilities, decode_legacy_2024_11_05_envelope,
-    validate_legacy_2024_11_05_initialize_result, Legacy2024Capability,
-    Legacy2024ClientCapabilities, Legacy2024Direction, Legacy2024Envelope,
-    Legacy2024ServerCapabilities, COMPLETION_COMPLETE, INITIALIZE,
-    LEGACY_2024_11_05_PROTOCOL_VERSION, LOGGING_SET_LEVEL, NOTIFICATIONS_CANCELLED,
-    NOTIFICATIONS_INITIALIZED, NOTIFICATIONS_PROGRESS, PING, PROMPTS_GET, PROMPTS_LIST,
-    RESOURCES_LIST, RESOURCES_READ, RESOURCES_SUBSCRIBE, RESOURCES_TEMPLATES_LIST,
-    RESOURCES_UNSUBSCRIBE, ROOTS_LIST, SAMPLING_CREATE_MESSAGE, TOOLS_CALL, TOOLS_LIST,
+    translate_legacy_2024_result, validate_legacy_2024_11_05_initialize_result,
+    validate_legacy_2024_11_05_method_params, Legacy2024Capability, Legacy2024ClientCapabilities,
+    Legacy2024Direction, Legacy2024Envelope, Legacy2024ServerCapabilities, COMPLETION_COMPLETE,
+    INITIALIZE, LEGACY_2024_11_05_PROTOCOL_VERSION, LOGGING_SET_LEVEL, NOTIFICATIONS_CANCELLED,
+    NOTIFICATIONS_INITIALIZED, NOTIFICATIONS_MESSAGE, NOTIFICATIONS_PROGRESS,
+    NOTIFICATIONS_PROMPTS_LIST_CHANGED, NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+    NOTIFICATIONS_RESOURCES_UPDATED, NOTIFICATIONS_ROOTS_LIST_CHANGED,
+    NOTIFICATIONS_TOOLS_LIST_CHANGED, PING, PROMPTS_GET, PROMPTS_LIST, RESOURCES_LIST,
+    RESOURCES_READ, RESOURCES_SUBSCRIBE, RESOURCES_TEMPLATES_LIST, RESOURCES_UNSUBSCRIBE,
+    ROOTS_LIST, SAMPLING_CREATE_MESSAGE, TOOLS_CALL, TOOLS_LIST,
 };
 use serde_json::{json, Value};
 
@@ -73,6 +76,41 @@ pub struct Legacy2024ServerConfig {
     pub instructions: Option<String>,
 }
 
+/// Opaque proof that this adapter was installed for one exact legacy binding.
+///
+/// Its fields intentionally remain private: consumers may retain or compare
+/// the receipt, but cannot mint one from protocol facts or a boolean claim.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LegacyServerAdapterInstalledReceipt {
+    binding: LegacyPeerBinding,
+    protocol_version: &'static str,
+}
+
+impl LegacyServerAdapterInstalledReceipt {
+    /// Returns the exact protocol era bound by the real installation.
+    #[must_use]
+    pub const fn protocol_version(&self) -> &'static str {
+        self.protocol_version
+    }
+
+    /// Returns canonical, receipt-bound bytes for a downstream verifier.
+    ///
+    /// This is an observation surface only; there is no public constructor for
+    /// a receipt from these bytes or their constituent facts.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = b"fastmcp-legacy-server-install-v1\0".to_vec();
+        for field in [
+            self.protocol_version.as_bytes(),
+            &self.binding.generation().to_be_bytes(),
+        ] {
+            bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(field);
+        }
+        bytes
+    }
+}
+
 /// A transport-neutral operation delegated after lifecycle and capability admission.
 pub trait Legacy2024Handler {
     /// Handles one admitted client-to-server request and returns its exact result object.
@@ -113,6 +151,8 @@ pub enum Legacy2024Outbound {
     Response(Value),
     /// A server-to-client JSON-RPC request constructed from negotiated capabilities.
     ReverseRequest(Value),
+    /// A server-to-client JSON-RPC notification constructed from advertised capabilities.
+    ReverseNotification(Value),
     /// A valid notification produces no JSON-RPC response.
     NoResponse,
 }
@@ -180,6 +220,8 @@ pub struct Legacy2024StateSnapshot {
     pub subscription_count: usize,
     /// Count of admitted cancellation/progress control notifications.
     pub control_notification_count: u64,
+    /// Count of accepted client root-list-change notifications.
+    pub roots_list_changed_count: u64,
     /// Count of completed terminal close releases.
     pub close_release_count: u64,
 }
@@ -187,6 +229,7 @@ pub struct Legacy2024StateSnapshot {
 /// Exact MCP 2024-11-05 server adapter for one transport-selected binding.
 pub struct Legacy2024ServerAdapter<H> {
     binding: LegacyPeerBinding,
+    installed_receipt: LegacyServerAdapterInstalledReceipt,
     lifecycle: Legacy2024Lifecycle,
     operating_transition_count: u64,
     config: Legacy2024ServerConfig,
@@ -196,6 +239,7 @@ pub struct Legacy2024ServerAdapter<H> {
     subscriptions: BTreeSet<String>,
     logging_level: Option<String>,
     control_notification_count: u64,
+    roots_list_changed_count: u64,
     close_release_count: u64,
     next_reverse_request_id: i64,
 }
@@ -204,11 +248,22 @@ impl<H> Legacy2024ServerAdapter<H>
 where
     H: Legacy2024Handler,
 {
-    /// Constructs an uninitialized adapter for exactly one selected peer binding.
-    #[must_use]
-    pub fn new(binding: LegacyPeerBinding, config: Legacy2024ServerConfig, handler: H) -> Self {
-        Self {
+    /// Installs an uninitialized adapter for exactly one selected peer binding.
+    ///
+    /// Installation validates the eventual exact initialize result before an
+    /// adapter or its opaque receipt can exist.
+    pub fn install(
+        binding: LegacyPeerBinding,
+        config: Legacy2024ServerConfig,
+        handler: H,
+    ) -> Result<Self, Legacy2024AdapterError> {
+        initialize_result(&config)?;
+        Ok(Self {
             binding,
+            installed_receipt: LegacyServerAdapterInstalledReceipt {
+                binding,
+                protocol_version: LEGACY_2024_11_05_PROTOCOL_VERSION,
+            },
             lifecycle: Legacy2024Lifecycle::AwaitInitialize,
             operating_transition_count: 0,
             config,
@@ -218,15 +273,22 @@ where
             subscriptions: BTreeSet::new(),
             logging_level: None,
             control_notification_count: 0,
+            roots_list_changed_count: 0,
             close_release_count: 0,
             next_reverse_request_id: 1,
-        }
+        })
     }
 
     /// Returns the binding that exclusively owns this lifecycle state.
     #[must_use]
     pub const fn binding(&self) -> LegacyPeerBinding {
         self.binding
+    }
+
+    /// Returns the opaque receipt produced by this real installation.
+    #[must_use]
+    pub const fn installed_receipt(&self) -> &LegacyServerAdapterInstalledReceipt {
+        &self.installed_receipt
     }
 
     /// Returns the current lifecycle state.
@@ -244,6 +306,7 @@ where
             client_capabilities_bytes: self.client_capabilities_bytes.clone(),
             subscription_count: self.subscriptions.len(),
             control_notification_count: self.control_notification_count,
+            roots_list_changed_count: self.roots_list_changed_count,
             close_release_count: self.close_release_count,
         }
     }
@@ -309,6 +372,11 @@ where
                 "reverse request params must be an object",
             ));
         }
+        validate_legacy_2024_11_05_method_params(method, Some(&params)).map_err(|_| {
+            Legacy2024AdapterError::invalid_params(
+                "reverse request params are not exact MCP 2024-11-05",
+            )
+        })?;
         let capability = match method {
             ROOTS_LIST => Legacy2024Capability::ClientRoots,
             SAMPLING_CREATE_MESSAGE => Legacy2024Capability::ClientSampling,
@@ -325,6 +393,77 @@ where
             ));
         }
         self.emit_reverse_request(method, params)
+    }
+
+    /// Builds a capability-gated exact server-to-client notification without
+    /// framing it for a transport.
+    pub fn make_notification(
+        &self,
+        binding: LegacyPeerBinding,
+        method: &'static str,
+        params: Option<Value>,
+    ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
+        self.require_binding(binding)?;
+        if self.lifecycle != Legacy2024Lifecycle::Operating {
+            return Err(Legacy2024AdapterError::invalid_request(
+                "reverse notifications require Operating lifecycle",
+            ));
+        }
+        validate_legacy_2024_11_05_method_params(method, params.as_ref()).map_err(|_| {
+            Legacy2024AdapterError::invalid_params(
+                "notification params are not exact MCP 2024-11-05",
+            )
+        })?;
+        let capability_permitted = match method {
+            NOTIFICATIONS_CANCELLED | NOTIFICATIONS_PROGRESS => true,
+            NOTIFICATIONS_MESSAGE => self.config.capabilities.logging.is_some(),
+            NOTIFICATIONS_PROMPTS_LIST_CHANGED => self
+                .config
+                .capabilities
+                .prompts
+                .as_ref()
+                .is_some_and(|prompts| prompts.list_changed),
+            NOTIFICATIONS_RESOURCES_LIST_CHANGED => self
+                .config
+                .capabilities
+                .resources
+                .as_ref()
+                .is_some_and(|resources| resources.list_changed),
+            NOTIFICATIONS_RESOURCES_UPDATED => params
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|params| params.get("uri"))
+                .and_then(Value::as_str)
+                .is_some_and(|_| {
+                    self.config
+                        .capabilities
+                        .resources
+                        .as_ref()
+                        .is_some_and(|resources| resources.subscribe)
+                        && !self.subscriptions.is_empty()
+                }),
+            NOTIFICATIONS_TOOLS_LIST_CHANGED => self
+                .config
+                .capabilities
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.list_changed),
+            _ => {
+                return Err(Legacy2024AdapterError::method_not_found(
+                    "method is not an exact MCP 2024-11-05 server-to-client notification",
+                ));
+            }
+        };
+        if !capability_permitted {
+            return Err(Legacy2024AdapterError::invalid_request(
+                "advertised exact MCP 2024-11-05 capability does not permit notification",
+            ));
+        }
+        let mut notification = json!({"jsonrpc": "2.0", "method": method});
+        if let Some(params) = params {
+            notification["params"] = params;
+        }
+        Ok(Legacy2024Outbound::ReverseNotification(notification))
     }
 
     /// Transitions to terminal Closed and releases all adapter-owned state once.
@@ -403,6 +542,15 @@ where
                         self.control_notification_count.saturating_add(1);
                     Ok(())
                 }
+                NOTIFICATIONS_ROOTS_LIST_CHANGED => {
+                    if !self.client_supports(Legacy2024Capability::ClientRootsListChanged) {
+                        return Err(Legacy2024AdapterError::invalid_request(
+                            "client roots.listChanged capability is required",
+                        ));
+                    }
+                    self.roots_list_changed_count = self.roots_list_changed_count.saturating_add(1);
+                    Ok(())
+                }
                 NOTIFICATIONS_INITIALIZED => Err(Legacy2024AdapterError::invalid_request(
                     "notifications/initialized may be sent exactly once",
                 )),
@@ -460,22 +608,7 @@ where
             ));
         }
 
-        let mut result = json!({
-            "protocolVersion": LEGACY_2024_11_05_PROTOCOL_VERSION,
-            "capabilities": self.config.capabilities.clone(),
-            "serverInfo": {
-                "name": self.config.server_info.name.clone(),
-                "version": self.config.server_info.version.clone(),
-            },
-        });
-        if let Some(instructions) = &self.config.instructions {
-            result["instructions"] = Value::String(instructions.clone());
-        }
-        validate_legacy_2024_11_05_initialize_result(&result).map_err(|_| {
-            Legacy2024AdapterError::invalid_params(
-                "configured server result is not exact MCP 2024-11-05",
-            )
-        })?;
+        let result = initialize_result(&self.config)?;
         self.client_capabilities = Some(client_capabilities);
         self.client_capabilities_bytes = client_capabilities_bytes;
         self.lifecycle = Legacy2024Lifecycle::AwaitInitialized;
@@ -501,12 +634,23 @@ where
             | PROMPTS_GET
             | COMPLETION_COMPLETE => {
                 self.require_server_capability(method)?;
-                self.handler
+                let result = self
+                    .handler
                     .handle_legacy_2024(method, params)
                     .map_err(|_| Legacy2024AdapterError {
                         code: -32603,
                         message: "legacy handler failed",
-                    })
+                    })?;
+                match method {
+                    TOOLS_CALL | RESOURCES_READ | PROMPTS_GET => {
+                        translate_legacy_2024_result(method, result).map_err(|_| {
+                            Legacy2024AdapterError::invalid_params(
+                                "handler result is not losslessly representable in exact MCP 2024-11-05",
+                            )
+                        })
+                    }
+                    _ => Ok(result),
+                }
             }
             _ => Err(Legacy2024AdapterError::method_not_found(
                 "method direction or lifecycle is not admitted by exact MCP 2024-11-05",
@@ -630,6 +774,26 @@ where
     }
 }
 
+fn initialize_result(config: &Legacy2024ServerConfig) -> Result<Value, Legacy2024AdapterError> {
+    let mut result = json!({
+        "protocolVersion": LEGACY_2024_11_05_PROTOCOL_VERSION,
+        "capabilities": config.capabilities.clone(),
+        "serverInfo": {
+            "name": config.server_info.name.clone(),
+            "version": config.server_info.version.clone(),
+        },
+    });
+    if let Some(instructions) = &config.instructions {
+        result["instructions"] = Value::String(instructions.clone());
+    }
+    validate_legacy_2024_11_05_initialize_result(&result).map_err(|_| {
+        Legacy2024AdapterError::invalid_params(
+            "configured server result is not exact MCP 2024-11-05",
+        )
+    })?;
+    Ok(result)
+}
+
 fn uri_param(params: Option<&Value>) -> Result<&str, Legacy2024AdapterError> {
     params
         .and_then(Value::as_object)
@@ -732,7 +896,7 @@ mod tests {
     }
 
     fn adapter() -> Legacy2024ServerAdapter<RecordingHandler> {
-        Legacy2024ServerAdapter::new(
+        Legacy2024ServerAdapter::install(
             LegacyPeerBinding::new(7),
             Legacy2024ServerConfig {
                 capabilities: Legacy2024ServerCapabilities {
@@ -753,6 +917,7 @@ mod tests {
             },
             RecordingHandler::default(),
         )
+        .expect("exact test configuration must install")
     }
 
     fn initialize() -> Value {
@@ -809,7 +974,13 @@ mod tests {
             adapter
                 .receive(
                     binding,
-                    json!({"jsonrpc": "2.0", "id": 5, "method": "completion/complete"}),
+                    json!({
+                        "jsonrpc": "2.0", "id": 5, "method": "completion/complete",
+                        "params": {
+                            "ref": {"type": "ref/prompt", "name": "legacy-prompt"},
+                            "argument": {"name": "topic", "value": "leg"},
+                        },
+                    }),
                 )
                 .unwrap(),
         );
@@ -821,7 +992,11 @@ mod tests {
         );
         lifecycle_rows.push(
             adapter
-                .make_reverse_request(binding, SAMPLING_CREATE_MESSAGE, json!({"messages": []}))
+                .make_reverse_request(
+                    binding,
+                    SAMPLING_CREATE_MESSAGE,
+                    json!({"messages": [], "maxTokens": 16}),
+                )
                 .unwrap(),
         );
         lifecycle_rows.push(adapter.receive(binding, json!({"jsonrpc": "2.0", "id": 7, "method": "logging/setLevel", "params": {"level": "info"}})).unwrap());
@@ -874,7 +1049,8 @@ mod tests {
             lifecycle_rows[8],
             Legacy2024Outbound::ReverseRequest(json!({
                 "jsonrpc": "2.0", "id": 2,
-                "method": SAMPLING_CREATE_MESSAGE, "params": {"messages": []},
+                "method": SAMPLING_CREATE_MESSAGE,
+                "params": {"messages": [], "maxTokens": 16},
             }))
         );
         assert_eq!(
