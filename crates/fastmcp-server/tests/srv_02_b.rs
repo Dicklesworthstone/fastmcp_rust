@@ -118,7 +118,7 @@ fn srv_02_b_positive() {
             .expect("ModernOnly HTTP response is JSON-RPC")
             .error
             .expect("ModernOnly HTTP initialize is rejected");
-    assert_eq!(stdio_error.code, (-32601).into());
+    assert_eq!(stdio_error.code, -32601_i32);
     assert_eq!(
         stdio_error.message,
         "Initialization-based MCP is not enabled"
@@ -155,7 +155,7 @@ fn srv_02_b_planted_negative() {
     let planted_error = planted_response
         .error
         .expect("ModernOnly initialize reaches the typed refusal boundary");
-    assert_eq!(planted_error.code, (-32601).into());
+    assert_eq!(planted_error.code, -32601_i32);
     assert_eq!(
         planted_error.message,
         "Initialization-based MCP is not enabled"
