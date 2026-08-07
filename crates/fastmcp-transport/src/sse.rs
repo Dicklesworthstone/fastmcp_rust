@@ -798,6 +798,240 @@ impl<R: Read> SseReader<R> {
 }
 
 // =============================================================================
+// Exact MCP 2024-11-05 SSE transport
+// =============================================================================
+
+/// One client-to-server HTTP POST selected by an exact-2024 SSE endpoint event.
+///
+/// The endpoint is opaque to this transport: the caller's HTTP adapter owns
+/// connection establishment and any origin, credential, redirect, or TLS
+/// policy. The adapter receives the exact advertised URI and already-framed
+/// JSON-RPC bytes, so it cannot silently substitute a derived modern route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacySseMessagePost {
+    endpoint: String,
+    body: Vec<u8>,
+}
+
+impl LegacySseMessagePost {
+    fn new(endpoint: String, body: Vec<u8>) -> Self {
+        Self { endpoint, body }
+    }
+
+    /// Returns the exact URI advertised by the first SSE endpoint event.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Returns the newline-delimited JSON-RPC body for the advertised POST.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+/// Caller-owned HTTP POST adapter for exact MCP 2024-11-05 SSE clients.
+///
+/// A legacy SSE connection has two directions: server messages remain on the
+/// SSE reader, while every client JSON-RPC message is delivered to this sink
+/// using the one URI advertised by the first endpoint event.
+pub trait LegacySsePostSink {
+    /// Delivers one JSON-RPC message to the advertised endpoint.
+    fn post(&mut self, cx: &Cx, post: LegacySseMessagePost) -> Result<(), TransportError>;
+}
+
+/// Exact MCP 2024-11-05 client-side SSE adapter.
+///
+/// This adapter is deliberately separate from [`SseClientTransport`]. It
+/// requires the first valid event to be `endpoint`, latches the advertised
+/// POST URI once, and rejects any send before that handshake. Modern
+/// streamable-HTTP routing never constructs this type.
+pub struct LegacySseClientTransport<R, P> {
+    reader: SseReader<R>,
+    post_sink: P,
+    codec: Codec,
+    advertised_endpoint: Option<String>,
+    closed: bool,
+}
+
+impl<R: Read, P: LegacySsePostSink> LegacySseClientTransport<R, P> {
+    /// Creates a legacy SSE adapter over an already-opened SSE GET body.
+    #[must_use]
+    pub fn new(reader: R, post_sink: P) -> Self {
+        Self {
+            reader: SseReader::new(reader),
+            post_sink,
+            codec: Codec::new(),
+            advertised_endpoint: None,
+            closed: false,
+        }
+    }
+
+    /// Consumes and latches the required first `endpoint` event.
+    ///
+    /// A `message` event, end of stream, or an empty endpoint is a terminal
+    /// legacy-adapter denial. The reader intentionally does not search ahead
+    /// for a later endpoint because that would allow endpoint replacement.
+    pub fn establish(&mut self, cx: &Cx) -> Result<&str, TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        if self.advertised_endpoint.is_some() {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "legacy SSE endpoint has already been established",
+            )));
+        }
+
+        let event = match self.reader.read_event(cx) {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                self.closed = true;
+                return Err(TransportError::Closed);
+            }
+            Err(error) => {
+                self.closed = true;
+                return Err(error);
+            }
+        };
+        if event.event_type != SseEventType::Endpoint || event.data.is_empty() {
+            self.closed = true;
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy SSE stream must begin with one nonempty endpoint event",
+            )));
+        }
+        self.advertised_endpoint = Some(event.data);
+        if let Some(endpoint) = self.advertised_endpoint.as_deref() {
+            Ok(endpoint)
+        } else {
+            self.closed = true;
+            Err(TransportError::Closed)
+        }
+    }
+
+    /// Returns the endpoint fixed by [`Self::establish`].
+    #[must_use]
+    pub fn advertised_endpoint(&self) -> Option<&str> {
+        self.advertised_endpoint.as_deref()
+    }
+
+    fn encode_client_message(&self, message: &JsonRpcMessage) -> Result<Vec<u8>, TransportError> {
+        match message {
+            JsonRpcMessage::Request(request) => self
+                .codec
+                .encode_request(request)
+                .map_err(TransportError::Codec),
+            JsonRpcMessage::Response(response) => self
+                .codec
+                .encode_response(response)
+                .map_err(TransportError::Codec),
+        }
+    }
+}
+
+impl<R: Read, P: LegacySsePostSink> Transport for LegacySseClientTransport<R, P> {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+        let endpoint = self.advertised_endpoint.clone().ok_or_else(|| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "legacy SSE endpoint event must be established before POSTing messages",
+            ))
+        })?;
+        let post = LegacySseMessagePost::new(endpoint, self.encode_client_message(message)?);
+        match self.post_sink.post(cx, post) {
+            Ok(()) => Ok(()),
+            Err(TransportError::Cancelled) => Err(TransportError::Cancelled),
+            Err(error) => {
+                self.closed = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        match self.reader.read_message(cx) {
+            Ok(Some(message)) => Ok(message),
+            Ok(None) => {
+                self.closed = true;
+                Err(TransportError::Closed)
+            }
+            Err(error @ TransportError::Codec(_)) => Err(error),
+            Err(error @ TransportError::Cancelled) => {
+                if self.reader.terminal {
+                    self.closed = true;
+                }
+                Err(error)
+            }
+            Err(error) => {
+                self.closed = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.closed = true;
+        Ok(())
+    }
+}
+
+/// Exact MCP 2024-11-05 server-side SSE adapter.
+///
+/// The HTTP GET handler calls [`Self::open`] immediately after establishing
+/// its SSE response body, guaranteeing that the endpoint event precedes every
+/// server-to-client JSON-RPC message. Existing [`SseServerTransport`] callers
+/// retain their current lazy endpoint behavior.
+pub struct LegacySseServerTransport<W, R> {
+    inner: SseServerTransport<W, R>,
+}
+
+impl<W: Write, R: Iterator<Item = JsonRpcRequest>> LegacySseServerTransport<W, R> {
+    /// Creates the exact-2024 server adapter with one advertised POST URI.
+    #[must_use]
+    pub fn new(writer: W, request_source: R, endpoint_url: impl Into<String>) -> Self {
+        Self {
+            inner: SseServerTransport::new(writer, request_source, endpoint_url),
+        }
+    }
+
+    /// Opens the SSE body by sending its mandatory first endpoint event.
+    pub fn open(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        if self.inner.closed || self.inner.writer.closed {
+            self.inner.closed = true;
+            return Err(TransportError::Closed);
+        }
+        self.inner.ensure_endpoint_sent(cx)
+    }
+}
+
+impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for LegacySseServerTransport<W, R> {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.open(cx)?;
+        self.inner.send(cx, message)
+    }
+
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        self.open(cx)?;
+        self.inner.recv(cx)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.inner.close()
+    }
+}
+
+// =============================================================================
 // SSE Transport (Server-Side)
 // =============================================================================
 

@@ -50,6 +50,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::sync::{
     Arc, Mutex, TryLockError,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -232,6 +233,78 @@ impl HttpRequest {
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_slice(&self.body)
     }
+}
+
+/// Concrete HTTP POST sink for the exact MCP 2024-11-05 SSE endpoint event.
+///
+/// This narrow adapter opens one plain-HTTP connection to the URI advertised
+/// by the legacy SSE stream and writes one JSON-RPC message POST. It never
+/// derives a `/sse` or `/messages` route and never adds modern session headers.
+/// TLS, credential, redirect, and origin policy are intentionally owned by the
+/// corresponding security and adapter layers rather than this transport slice.
+#[derive(Debug, Default)]
+pub struct LegacySseHttpPostSink;
+
+impl LegacySseHttpPostSink {
+    /// Creates a concrete legacy SSE message-POST sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::sse::LegacySsePostSink for LegacySseHttpPostSink {
+    fn post(
+        &mut self,
+        cx: &Cx,
+        post: crate::sse::LegacySseMessagePost,
+    ) -> Result<(), TransportError> {
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+        let (authority, target) = legacy_sse_http_post_target(post.endpoint())?;
+        let mut stream = TcpStream::connect(authority).map_err(TransportError::Io)?;
+        let request = format!(
+            "POST {target} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            post.body().len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(TransportError::Io)?;
+        stream.write_all(post.body()).map_err(TransportError::Io)?;
+        stream.flush().map_err(TransportError::Io)?;
+        stream.shutdown(Shutdown::Write).map_err(TransportError::Io)
+    }
+}
+
+fn legacy_sse_http_post_target(endpoint: &str) -> Result<(&str, &str), TransportError> {
+    let authority_and_target = endpoint.strip_prefix("http://").ok_or_else(|| {
+        TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "legacy SSE advertised endpoint must be an absolute HTTP URI",
+        ))
+    })?;
+    if authority_and_target
+        .bytes()
+        .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+    {
+        return Err(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "legacy SSE advertised endpoint contains an invalid control byte",
+        )));
+    }
+    let (authority, target) = authority_and_target
+        .split_once('/')
+        .map_or((authority_and_target, "/"), |(authority, target)| {
+            (authority, &authority_and_target[authority.len()..])
+        });
+    if authority.is_empty() {
+        return Err(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "legacy SSE advertised endpoint omits its authority",
+        )));
+    }
+    Ok((authority, target))
 }
 
 /// Outgoing HTTP response.
