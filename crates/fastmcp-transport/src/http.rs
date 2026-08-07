@@ -295,7 +295,7 @@ fn legacy_sse_http_post_target(endpoint: &str) -> Result<(&str, &str), Transport
     }
     let (authority, target) = authority_and_target
         .split_once('/')
-        .map_or((authority_and_target, "/"), |(authority, target)| {
+        .map_or((authority_and_target, "/"), |(authority, _target)| {
             (authority, &authority_and_target[authority.len()..])
         });
     if authority.is_empty() {
