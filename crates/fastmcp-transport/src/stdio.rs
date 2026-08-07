@@ -1602,7 +1602,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn std_01_b_positive() {
+    fn internal_stdio_b_lifecycle_positive() {
         let mut child = TestChildGuard::new(
             Command::new("sh")
                 .args(["-c", "IFS= read -r line; test -n \"$line\"; cat >/dev/null; exit 0"])
@@ -1642,7 +1642,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn std_01_b_planted_negative() {
+    fn internal_stdio_b_lifecycle_planted_negative() {
         let mut child = TestChildGuard::new(
             Command::new("sh")
                 .args(["-c", "IFS= read -r line; test -n \"$line\"; cat >/dev/null; exit 0"])
@@ -2085,7 +2085,7 @@ mod tests {
     }
 
     #[test]
-    fn std_01_a_positive() {
+    fn internal_stdio_a_dispatch_positive() {
         let input = b"{\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":\"request-7\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":1}}\n{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"request-8\"}\n";
         assert_eq!(input.split(|byte| *byte == b'\n').count(), 4);
         assert!(input.ends_with(b"\n"));
@@ -2133,7 +2133,7 @@ mod tests {
     }
 
     #[test]
-    fn std_01_a_planted_negative() {
+    fn internal_stdio_a_dispatch_planted_negative() {
         let valid = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"request-8\"}\n";
         let forbidden = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools\n/list\",\"id\":\"request-8\"}\n";
         let mut restored = forbidden.to_vec();
