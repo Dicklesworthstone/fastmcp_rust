@@ -549,6 +549,53 @@ impl StdioTransport<std::io::Stdin, std::io::Stdout> {
     }
 }
 
+impl<R: Read> StdioTransport<R, std::process::ChildStdin> {
+    /// Closes the child stdin and reaps the exact child within a bounded grace
+    /// period, escalating once when voluntary exit does not occur.
+    ///
+    /// The caller context is checked before stdin close, so cancellation before
+    /// that write-side commit leaves both the transport and child untouched.
+    /// Once stdin has been closed, cleanup deliberately no longer observes the
+    /// request context: the connection owns reaping and must not leave a child
+    /// running because its original request was cancelled. This transport does
+    /// not select, probe, or change a protocol era from child output.
+    ///
+    /// The returned flag is `true` exactly when forced termination was needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns cancellation before close, I/O failure, or a close failure after
+    /// the child has still been reaped.
+    pub fn close_and_reap_child(
+        &mut self,
+        cx: &Cx,
+        child: &mut std::process::Child,
+        grace: std::time::Duration,
+    ) -> Result<(std::process::ExitStatus, bool), TransportError> {
+        stdio_checkpoint(cx)?;
+        let close_error = Transport::close(self).err();
+        let deadline = Instant::now().checked_add(grace).unwrap_or_else(Instant::now);
+        let mut forced = false;
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(TransportError::Io)? {
+                break status;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                forced = true;
+                child.kill().map_err(TransportError::Io)?;
+                break child.wait().map_err(TransportError::Io)?;
+            }
+            std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(10)));
+        };
+        if let Some(error) = close_error {
+            Err(error)
+        } else {
+            Ok((status, forced))
+        }
+    }
+}
+
 #[cfg(unix)]
 impl<R, W: AsFd> StdioTransport<R, W> {
     fn try_write_atomic_control(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
@@ -1551,6 +1598,96 @@ mod tests {
             panic!("expected request");
         };
         assert_eq!(request.method, "slow");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn std_01_b_positive() {
+        let mut child = TestChildGuard::new(
+            Command::new("sh")
+                .args(["-c", "IFS= read -r line; test -n \"$line\"; cat >/dev/null; exit 0"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn stdio lifecycle child"),
+        );
+        let writer = child.child_mut().stdin.take().expect("child stdin");
+        let reader = child.child_mut().stdout.take().expect("child stdout");
+        let mut transport = StdioTransport::new(reader, writer);
+        let control = JsonRpcMessage::Request(JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({"requestId": "request-8"})),
+        ));
+        transport
+            .try_send_control_message(&control)
+            .expect("reserved control capacity commits one complete cancellation frame");
+
+        let (status, forced) = transport
+            .close_and_reap_child(
+                &Cx::for_testing(),
+                child.child_mut(),
+                Duration::from_secs(2),
+            )
+            .expect("closing stdin lets the exact child exit and reap");
+
+        assert!(status.success(), "the child observed the committed control frame");
+        assert!(!forced, "EOF-driven child exit must not require escalation");
+        assert!(transport.is_closed(), "lifecycle close rejects later application writes");
+        assert!(
+            child.child_mut().try_wait().expect("inspect reaped child").is_some(),
+            "a returned lifecycle outcome is reaped, not merely signalled"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn std_01_b_planted_negative() {
+        let mut child = TestChildGuard::new(
+            Command::new("sh")
+                .args(["-c", "IFS= read -r line; test -n \"$line\"; cat >/dev/null; exit 0"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn stdio lifecycle child"),
+        );
+        let writer = child.child_mut().stdin.take().expect("child stdin");
+        let reader = child.child_mut().stdout.take().expect("child stdout");
+        let mut transport = StdioTransport::new(reader, writer);
+        let control = JsonRpcMessage::Request(JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({"requestId": "request-8"})),
+        ));
+        transport
+            .try_send_control_message(&control)
+            .expect("the same reserved control frame commits before the plant");
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+
+        let error = transport
+            .close_and_reap_child(&cancelled, child.child_mut(), Duration::from_secs(2))
+            .expect_err("one changed cancellation bit refuses before stdin close");
+
+        assert!(matches!(error, TransportError::Cancelled));
+        assert!(
+            !transport.is_closed(),
+            "pre-close cancellation leaves the transport write side unchanged"
+        );
+        assert!(
+            child.child_mut().try_wait().expect("inspect live child").is_none(),
+            "pre-close cancellation cannot reap or terminate the unrelated child"
+        );
+
+        let (status, forced) = transport
+            .close_and_reap_child(
+                &Cx::for_testing(),
+                child.child_mut(),
+                Duration::from_secs(2),
+            )
+            .expect("fresh connection cleanup reaps the still-live child");
+        assert!(status.success());
+        assert!(!forced);
     }
 
     #[cfg(unix)]
