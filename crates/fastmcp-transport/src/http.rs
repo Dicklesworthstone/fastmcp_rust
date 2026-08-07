@@ -1659,6 +1659,175 @@ impl StreamableHttpResponseStream {
     pub fn is_closed(&self) -> bool {
         !self.owner_open.load(Ordering::Acquire) || !self.admissions_open.load(Ordering::Acquire)
     }
+
+    /// Binds a response consumer to one request's final response.
+    ///
+    /// The returned stream carries the request ID internally, so an HTTP
+    /// response body cannot accidentally consume another in-flight request's
+    /// response. Dropping it requests cancellation through the paired guard;
+    /// request handlers retain that guard and checkpoint it before committing
+    /// further work or writes.
+    #[must_use]
+    pub fn for_request(&self, request_id: RequestId) -> StreamableHttpRequestResponseStream {
+        StreamableHttpRequestResponseStream {
+            responses: self.clone(),
+            request_id,
+            cancellation: StreamableHttpRequestCancellation {
+                state: Arc::new(StreamableHttpRequestCancellationState {
+                    request_id: request_id.clone(),
+                    cancelled: AtomicBool::new(false),
+                    response_commit_gate: Mutex::new(()),
+                }),
+            },
+            finished: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Request-owned cancellation guard paired with a response stream.
+///
+/// A handler keeps a clone of this guard while it performs request work. A
+/// peer disconnect drops the response body, which marks the guard cancelled;
+/// the handler then observes [`TransportError::Cancelled`] at its next
+/// explicit checkpoint before it can commit another response-side effect.
+#[derive(Clone, Debug)]
+pub struct StreamableHttpRequestCancellation {
+    state: Arc<StreamableHttpRequestCancellationState>,
+}
+
+#[derive(Debug)]
+struct StreamableHttpRequestCancellationState {
+    request_id: RequestId,
+    cancelled: AtomicBool,
+    response_commit_gate: Mutex<()>,
+}
+
+impl StreamableHttpRequestCancellation {
+    fn cancel(&self) {
+        let _commit_gate = self
+            .state
+            .response_commit_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.state.cancelled.store(true, Ordering::Release);
+    }
+
+    fn with_response_commit<T>(
+        &self,
+        cx: &Cx,
+        commit: impl FnOnce() -> Result<T, TransportError>,
+    ) -> Result<T, TransportError> {
+        self.checkpoint(cx)?;
+        let _commit_gate = match self.state.response_commit_gate.try_lock() {
+            Ok(commit_gate) => commit_gate,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err(streamable_queue_full_error(
+                    "streamable request response commit is busy",
+                ));
+            }
+        };
+        self.checkpoint(cx)?;
+        commit()
+    }
+
+    /// Returns whether the request response body has been dropped or finished.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Returns the only JSON-RPC response ID this request guard may commit.
+    #[must_use]
+    pub fn request_id(&self) -> &RequestId {
+        &self.state.request_id
+    }
+
+    /// Observes caller cancellation and the request response body's lifetime.
+    ///
+    /// Callers must checkpoint again after any independently cancellable work
+    /// and immediately before committing a response-side effect.
+    pub fn checkpoint(&self, cx: &Cx) -> Result<(), TransportError> {
+        http_checkpoint(cx)?;
+        if self.is_cancelled() {
+            return Err(TransportError::Cancelled);
+        }
+        Ok(())
+    }
+}
+
+/// Per-request consumer for one Streamable HTTP response body.
+///
+/// This abstraction owns the response's correlation ID and its cancellation
+/// guard. It intentionally has no `Clone` implementation: one dropped HTTP
+/// response body has one cancellation decision for its request, while handlers
+/// can clone only the accompanying [`StreamableHttpRequestCancellation`] guard.
+pub struct StreamableHttpRequestResponseStream {
+    responses: StreamableHttpResponseStream,
+    request_id: RequestId,
+    cancellation: StreamableHttpRequestCancellation,
+    finished: AtomicBool,
+}
+
+impl Drop for StreamableHttpRequestResponseStream {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+impl StreamableHttpRequestResponseStream {
+    /// Returns a cancellation guard for the request handler that owns this
+    /// response body.
+    #[must_use]
+    pub fn cancellation(&self) -> StreamableHttpRequestCancellation {
+        self.cancellation.clone()
+    }
+
+    /// Returns the request ID bound to this response body.
+    #[must_use]
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    /// Returns whether this response body has reached its terminal state.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    /// Pops the bound request's final response without blocking.
+    ///
+    /// A completed response is terminal for this body. Subsequent calls fail
+    /// closed rather than allowing a second final response for the request.
+    pub fn pop_response(&self) -> Result<Option<JsonRpcResponse>, TransportError> {
+        if self.is_finished() {
+            return Err(TransportError::Closed);
+        }
+        if self.cancellation.is_cancelled() {
+            return Err(TransportError::Cancelled);
+        }
+
+        let response = self.responses.pop_response(Some(&self.request_id))?;
+        if response.is_some() {
+            self.finished.store(true, Ordering::Release);
+            self.cancellation.cancel();
+        }
+        Ok(response)
+    }
+
+    /// Waits for the bound request's final response while observing both the
+    /// caller context and response-body cancellation.
+    pub fn recv_response(&self, cx: &Cx) -> Result<JsonRpcResponse, TransportError> {
+        if self.is_finished() {
+            return Err(TransportError::Closed);
+        }
+        self.cancellation.checkpoint(cx)?;
+
+        let response = self.responses.recv_response(cx, Some(&self.request_id))?;
+        self.finished.store(true, Ordering::Release);
+        self.cancellation.cancel();
+        Ok(response)
+    }
 }
 
 fn try_pop_streamable_response(
@@ -2088,6 +2257,96 @@ impl StreamableHttpTransport {
         self.capacity
     }
 
+    /// Commits a final response for one live request response body.
+    ///
+    /// The guard binds the response ID to its request and closes the request's
+    /// response-commit gate before a dropped body returns. This prevents a
+    /// disconnected request from committing a late response while retaining
+    /// the transport's existing count and byte backpressure limits.
+    pub fn send_response_for_request(
+        &mut self,
+        cx: &Cx,
+        cancellation: &StreamableHttpRequestCancellation,
+        response: JsonRpcResponse,
+    ) -> Result<(), TransportError> {
+        if response.id.as_ref() != Some(cancellation.request_id()) {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP response ID does not match its request response body",
+            )));
+        }
+        cancellation.with_response_commit(cx, || {
+            self.enqueue_response(cx, &response, Some(cancellation))
+        })
+    }
+
+    fn enqueue_response(
+        &mut self,
+        cx: &Cx,
+        response: &JsonRpcResponse,
+        request_cancellation: Option<&StreamableHttpRequestCancellation>,
+    ) -> Result<(), TransportError> {
+        if !self.owner_open.load(Ordering::Acquire)
+            || !self.response_admissions_open.load(Ordering::Acquire)
+        {
+            return Err(TransportError::Closed);
+        }
+        http_checkpoint(cx)?;
+        if let Some(cancellation) = request_cancellation {
+            cancellation.checkpoint(cx)?;
+        }
+        // Validate before retaining a clone in the bounded queue. The codec
+        // bounds each message's serialized size, while the retained-byte
+        // counter bounds the aggregate queue footprint.
+        let _admission = begin_streamable_admission(
+            &self.response_admissions_open,
+            &self.response_active_admissions,
+        )?;
+        let serialized_bytes = self.codec.encode_response(response)?.len();
+        // Do not commit a response after cancellation or a deadline that
+        // became observable during bounded serialization.
+        http_checkpoint(cx)?;
+        if let Some(cancellation) = request_cancellation {
+            cancellation.checkpoint(cx)?;
+        }
+        let mut mailbox = match self.response_mailbox.try_lock() {
+            Ok(mailbox) => mailbox,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err(streamable_queue_full_error(
+                    "streamable response mailbox is busy",
+                ));
+            }
+        };
+        if !self.owner_open.load(Ordering::Acquire)
+            || !self.response_admissions_open.load(Ordering::Acquire)
+        {
+            return Err(TransportError::Closed);
+        }
+        if let Some(cancellation) = request_cancellation {
+            cancellation.checkpoint(cx)?;
+        }
+        if mailbox.queue.len() >= self.capacity {
+            return Err(streamable_queue_full_error(
+                "streamable response queue is full",
+            ));
+        }
+        let prospective = mailbox
+            .retained_bytes
+            .checked_add(serialized_bytes)
+            .filter(|bytes| *bytes <= self.max_queued_bytes_per_direction)
+            .ok_or_else(|| {
+                streamable_queue_full_error("streamable response byte budget is full")
+            })?;
+        mailbox.queue.push_back(QueuedResponse {
+            message: response.clone(),
+            serialized_bytes,
+        });
+        mailbox.retained_bytes = prospective;
+        self.response_pending_count.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
     fn release_request_bytes(&self, serialized_bytes: usize) {
         release_streamable_bytes(&self.request_retained_bytes, serialized_bytes);
     }
@@ -2136,49 +2395,7 @@ impl Transport for StreamableHttpTransport {
 
         match message {
             JsonRpcMessage::Response(response) => {
-                // Validate before retaining a clone in the bounded queue. The
-                // codec bounds each message's serialized size, while the
-                // retained-byte counter bounds the aggregate queue footprint.
-                let _admission = begin_streamable_admission(
-                    &self.response_admissions_open,
-                    &self.response_active_admissions,
-                )?;
-                let serialized_bytes = self.codec.encode_response(response)?.len();
-                // Do not commit a response after cancellation or a deadline
-                // that became observable during bounded serialization.
-                http_checkpoint(cx)?;
-                let mut mailbox = match self.response_mailbox.try_lock() {
-                    Ok(mailbox) => mailbox,
-                    Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                    Err(TryLockError::WouldBlock) => {
-                        return Err(streamable_queue_full_error(
-                            "streamable response mailbox is busy",
-                        ));
-                    }
-                };
-                if !self.owner_open.load(Ordering::Acquire)
-                    || !self.response_admissions_open.load(Ordering::Acquire)
-                {
-                    return Err(TransportError::Closed);
-                }
-                if mailbox.queue.len() >= self.capacity {
-                    return Err(streamable_queue_full_error(
-                        "streamable response queue is full",
-                    ));
-                }
-                let prospective = mailbox
-                    .retained_bytes
-                    .checked_add(serialized_bytes)
-                    .filter(|bytes| *bytes <= self.max_queued_bytes_per_direction)
-                    .ok_or_else(|| {
-                        streamable_queue_full_error("streamable response byte budget is full")
-                    })?;
-                mailbox.queue.push_back(QueuedResponse {
-                    message: response.clone(),
-                    serialized_bytes,
-                });
-                mailbox.retained_bytes = prospective;
-                self.response_pending_count.fetch_add(1, Ordering::Release);
+                self.enqueue_response(cx, response, None)?;
             }
             JsonRpcMessage::Request(_) => {
                 // This transport currently streams only JSON-RPC responses.
@@ -3982,6 +4199,214 @@ X-Checksum: abc123\r\n\
         assert!(transport.has_responses());
         let resp = transport.pop_response().unwrap().unwrap();
         assert_eq!(resp.id, Some(RequestId::Number(2)));
+    }
+
+    #[test]
+    fn http_01_a_positive() {
+        let mut transport = StreamableHttpTransport::new();
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let request_id = RequestId::Number(701);
+        let request_response = response_stream.for_request(request_id.clone());
+        let other_request_id = RequestId::Number(703);
+        let other_request_response = response_stream.for_request(other_request_id.clone());
+        let request_cancellation = request_response.cancellation();
+        let cx = Cx::for_testing();
+
+        request_cancellation
+            .checkpoint(&cx)
+            .expect("a live response body admits request work");
+        transport
+            .send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    other_request_id.clone(),
+                    serde_json::json!({"response": "other"}),
+                )),
+            )
+            .expect("an independent request response remains queued for its own body");
+        transport
+            .send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    request_id.clone(),
+                    serde_json::json!({"response": "bound"}),
+                )),
+            )
+            .expect("a live request response body accepts its final response");
+
+        let response = request_response
+            .recv_response(&cx)
+            .expect("the request response body receives only its bound response");
+        assert_eq!(response.id, Some(request_id));
+        assert!(request_response.is_finished());
+        assert!(request_cancellation.is_cancelled());
+        assert_eq!(response_stream.pending_responses(), 1);
+        assert!(matches!(
+            request_response.pop_response(),
+            Err(TransportError::Closed)
+        ));
+        let other_response = other_request_response
+            .recv_response(&cx)
+            .expect("the second body receives the response retained for its request ID");
+        assert_eq!(other_response.id, Some(other_request_id));
+        assert_eq!(response_stream.pending_responses(), 0);
+    }
+
+    #[test]
+    fn http_01_a_planted_negative() {
+        let mut transport = StreamableHttpTransport::new();
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let request_response = response_stream.for_request(RequestId::Number(702));
+        let request_cancellation = request_response.cancellation();
+        let cx = Cx::for_testing();
+        let pending_before = response_stream.pending_responses();
+
+        // Planted forbidden dimension: the otherwise live request response
+        // body is dropped, modeling peer disconnect before handler commit.
+        drop(request_response);
+
+        assert!(request_cancellation.is_cancelled());
+        assert!(matches!(
+            request_cancellation.checkpoint(&cx),
+            Err(TransportError::Cancelled)
+        ));
+        assert_eq!(
+            response_stream.pending_responses(),
+            pending_before,
+            "disconnect cancellation must not enqueue or consume another request's response"
+        );
+        assert!(
+            !response_stream.is_closed(),
+            "one request-body disconnect must not close independent response bodies"
+        );
+    }
+
+    #[test]
+    fn http_01_b_positive() {
+        let mut transport =
+            StreamableHttpTransport::with_capacity(1).expect("capacity one is valid");
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let first_id = RequestId::Number(801);
+        let first_body = response_stream.for_request(first_id.clone());
+        let first_cancellation = first_body.cancellation();
+        let second_id = RequestId::Number(802);
+        let second_body = response_stream.for_request(second_id.clone());
+        let second_cancellation = second_body.cancellation();
+        let cx = Cx::for_testing();
+
+        transport
+            .send_response_for_request(
+                &cx,
+                &first_cancellation,
+                JsonRpcResponse::success(first_id.clone(), serde_json::json!({"sequence": 1})),
+            )
+            .expect("the first bounded response is admitted");
+        let retained_before_backpressure = transport
+            .response_mailbox
+            .lock()
+            .expect("response mailbox is available")
+            .retained_bytes;
+        assert!(matches!(
+            transport.send_response_for_request(
+                &cx,
+                &second_cancellation,
+                JsonRpcResponse::success(second_id.clone(), serde_json::json!({"sequence": 2})),
+            ),
+            Err(TransportError::Io(ref error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(response_stream.pending_responses(), 1);
+        assert_eq!(
+            transport
+                .response_mailbox
+                .lock()
+                .expect("response mailbox is available")
+                .retained_bytes,
+            retained_before_backpressure,
+            "a slow consumer must not grow the bounded response mailbox"
+        );
+
+        assert_eq!(
+            first_body
+                .recv_response(&cx)
+                .expect("the first body drains its final response")
+                .id,
+            Some(first_id.clone())
+        );
+        assert!(first_body.is_finished());
+        assert!(first_cancellation.is_cancelled());
+        assert!(matches!(
+            transport.send_response_for_request(
+                &cx,
+                &first_cancellation,
+                JsonRpcResponse::success(first_id, serde_json::json!({"late": true})),
+            ),
+            Err(TransportError::Cancelled)
+        ));
+        assert_eq!(response_stream.pending_responses(), 0);
+
+        transport
+            .send_response_for_request(
+                &cx,
+                &second_cancellation,
+                JsonRpcResponse::success(second_id.clone(), serde_json::json!({"sequence": 2})),
+            )
+            .expect("draining the first body releases exactly one response slot");
+        assert_eq!(
+            second_body
+                .recv_response(&cx)
+                .expect("the second body receives the response admitted after backpressure")
+                .id,
+            Some(second_id)
+        );
+        assert_eq!(response_stream.pending_responses(), 0);
+    }
+
+    #[test]
+    fn http_01_b_planted_negative() {
+        let mut transport = StreamableHttpTransport::new();
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let request_id = RequestId::Number(803);
+        let request_body = response_stream.for_request(request_id.clone());
+        let request_cancellation = request_body.cancellation();
+        let cx = Cx::for_testing();
+        let pending_before = response_stream.pending_responses();
+        let retained_before = transport
+            .response_mailbox
+            .lock()
+            .expect("response mailbox is available")
+            .retained_bytes;
+
+        // Planted forbidden dimension: only the request body is dropped before
+        // the handler attempts its otherwise identical response commit.
+        drop(request_body);
+
+        assert!(matches!(
+            transport.send_response_for_request(
+                &cx,
+                &request_cancellation,
+                JsonRpcResponse::success(request_id, serde_json::json!({"late": true})),
+            ),
+            Err(TransportError::Cancelled)
+        ));
+        assert_eq!(response_stream.pending_responses(), pending_before);
+        assert_eq!(
+            transport
+                .response_mailbox
+                .lock()
+                .expect("response mailbox is available")
+                .retained_bytes,
+            retained_before,
+            "a cancelled request must leave queued-response accounting unchanged"
+        );
+        assert!(!response_stream.is_closed());
     }
 
     #[test]
