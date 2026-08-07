@@ -286,8 +286,8 @@ fn valid_authority(value: &str) -> bool {
     }
     let (host, port) = host_and_port
         .rsplit_once(':')
-        .map_or((host_and_port, ""), |(host, port)| (host, port));
-    valid_reg_name(host) && valid_port(port)
+        .map_or((host_and_port, None), |(host, port)| (host, Some(port)));
+    valid_reg_name(host) && port.is_none_or(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn valid_ip_literal(value: &str) -> bool {
