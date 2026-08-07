@@ -2,7 +2,7 @@
 
 use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::protocol_policy::{
-    HttpEndpointBundle, HttpEndpointBundleError, ProtocolPolicy,
+    HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
 };
 use fastmcp_protocol::{ClientCapabilities, ClientInfo, ServerCapabilities, ServerInfo};
 
@@ -63,7 +63,7 @@ impl ClientProtocolPlan {
     }
 
     pub(crate) fn validate_for_stdio(&self) -> Result<(), ClientProtocolPlanError> {
-        if self.policy.requires_legacy_adapter() {
+        if matches!(self.policy, ProtocolPolicy::LegacyOnly) {
             return Err(ClientProtocolPlanError::LegacyAdapterUnavailable {
                 policy: self.policy,
             });
@@ -75,7 +75,7 @@ impl ClientProtocolPlan {
 /// Typed refusal raised before a client process can be spawned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientProtocolPlanError {
-    /// Auto and legacy-only require the exact installed LEG-03 adapter.
+    /// Legacy-only requires the exact installed LEG-03 adapter.
     LegacyAdapterUnavailable { policy: ProtocolPolicy },
 }
 
@@ -92,6 +92,8 @@ pub struct ClientSession {
     server_capabilities: ServerCapabilities,
     /// Negotiated protocol version.
     protocol_version: String,
+    /// Immutable era selected from the successful handshake.
+    selected_era: Option<ProtocolEra>,
     /// Immutable policy and configured endpoint bundle for this client.
     protocol_plan: ClientProtocolPlan,
 }
@@ -111,6 +113,9 @@ impl ClientSession {
             client_capabilities,
             server_info,
             server_capabilities,
+            selected_era: ProtocolVersion::parse(&protocol_version)
+                .ok()
+                .map(ProtocolVersion::era),
             protocol_version,
             protocol_plan: ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
         }
@@ -150,6 +155,15 @@ impl ClientSession {
     #[must_use]
     pub fn protocol_version(&self) -> &str {
         &self.protocol_version
+    }
+
+    /// Returns the immutable era selected by the successful handshake.
+    ///
+    /// Placeholder sessions used before initialization, and sessions built
+    /// from an unsupported wire spelling, have no selected era.
+    #[must_use]
+    pub const fn selected_era(&self) -> Option<ProtocolEra> {
+        self.selected_era
     }
 
     #[must_use]
