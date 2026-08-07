@@ -561,47 +561,208 @@ pub enum Legacy2024ResultKind {
     Prompt,
 }
 
-/// Returns an ordinary complete result unchanged only when it has an exact
-/// 2024 representation for `method`.
-pub fn translate_legacy_2024_result(
+/// Exact disposition of a result at the 2024-11-05 shared-result boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Legacy2024ResultDisposition {
+    /// The shared result has a complete, field-preserving legacy representation.
+    Lossless(Legacy2024ResultKind),
+    /// The method belongs to the exact legacy adapter and has no shared result mapping.
+    LegacyOwned,
+}
+
+/// Classifies a result before it can cross from shared handling to exact 2024.
+///
+/// A successful [`Legacy2024ResultDisposition::Lossless`] classification proves
+/// that the result uses only the exact 2024 fields and recursively valid
+/// legacy values. A recognized legacy method without an ordinary shared result
+/// is [`Legacy2024ResultDisposition::LegacyOwned`]; unknown methods and every
+/// modern or malformed result are rejected.
+pub fn classify_legacy_2024_result(
     method: &str,
-    result: Value,
-) -> Result<Value, Legacy2024WireError> {
-    let (kind, required_member) = match method {
-        TOOLS_CALL => (Legacy2024ResultKind::Tool, "content"),
-        RESOURCES_READ => (Legacy2024ResultKind::Resource, "contents"),
-        PROMPTS_GET => (Legacy2024ResultKind::Prompt, "messages"),
+    result: &Value,
+) -> Result<Legacy2024ResultDisposition, Legacy2024WireError> {
+    let kind = match method {
+        TOOLS_CALL => Legacy2024ResultKind::Tool,
+        RESOURCES_READ => Legacy2024ResultKind::Resource,
+        PROMPTS_GET => Legacy2024ResultKind::Prompt,
+        _ if legacy_2024_11_05_method(method).is_some() => {
+            return Ok(Legacy2024ResultDisposition::LegacyOwned);
+        }
         _ => {
             return Err(Legacy2024WireError(
-                "method does not have an ordinary exact MCP 2024-11-05 result mapping",
+                "method is not part of exact MCP 2024-11-05",
             ));
         }
     };
     let object = result.as_object().ok_or(Legacy2024WireError(
         "ordinary MCP 2024-11-05 results must be objects",
     ))?;
-    if ["structuredContent", "task", "tasks", "apps", "elicitation"]
-        .iter()
-        .any(|member| object.contains_key(*member))
+    validate_legacy_2024_result_members(kind, object)?;
+    Ok(Legacy2024ResultDisposition::Lossless(kind))
+}
+
+/// Returns an ordinary complete result unchanged only when it has an exact
+/// 2024 representation for `method`.
+pub fn translate_legacy_2024_result(
+    method: &str,
+    result: Value,
+) -> Result<Value, Legacy2024WireError> {
+    match classify_legacy_2024_result(method, &result)? {
+        Legacy2024ResultDisposition::Lossless(_) => Ok(result),
+        Legacy2024ResultDisposition::LegacyOwned => Err(Legacy2024WireError(
+            "method result is owned by the exact MCP 2024-11-05 adapter",
+        )),
+    }
+}
+
+fn validate_legacy_2024_result_members(
+    kind: Legacy2024ResultKind,
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), Legacy2024WireError> {
+    let allowed: &[&str] = match kind {
+        Legacy2024ResultKind::Tool => &["content", "isError", "_meta"],
+        Legacy2024ResultKind::Resource => &["contents", "_meta"],
+        Legacy2024ResultKind::Prompt => &["messages", "description", "_meta"],
+    };
+    if [
+        "structuredContent",
+        "task",
+        "tasks",
+        "apps",
+        "elicitation",
+        "extensions",
+        "meta",
+    ]
+    .iter()
+    .any(|member| object.contains_key(*member))
     {
         return Err(Legacy2024WireError(
             "modern-only result member cannot be represented by exact MCP 2024-11-05",
         ));
     }
-    if !object.get(required_member).is_some_and(Value::is_array) {
-        return Err(match kind {
-            Legacy2024ResultKind::Tool => {
-                Legacy2024WireError("tools/call result requires a content array")
-            }
-            Legacy2024ResultKind::Resource => {
-                Legacy2024WireError("resources/read result requires a contents array")
-            }
-            Legacy2024ResultKind::Prompt => {
-                Legacy2024WireError("prompts/get result requires a messages array")
-            }
-        });
+    if object
+        .keys()
+        .any(|member| !allowed.contains(&member.as_str()))
+    {
+        return Err(Legacy2024WireError(
+            "unclassified result member cannot be represented by exact MCP 2024-11-05",
+        ));
     }
-    Ok(result)
+    if !object.get("_meta").is_none_or(Value::is_object) {
+        return Err(Legacy2024WireError(
+            "exact MCP 2024-11-05 result _meta must be an object",
+        ));
+    }
+    match kind {
+        Legacy2024ResultKind::Tool => {
+            if !object.get("isError").is_none_or(Value::is_boolean) {
+                return Err(Legacy2024WireError(
+                    "tools/call result isError must be a boolean",
+                ));
+            }
+            let content =
+                object
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .ok_or(Legacy2024WireError(
+                        "tools/call result requires a content array",
+                    ))?;
+            for item in content {
+                validate_legacy_2024_content(item)?;
+            }
+        }
+        Legacy2024ResultKind::Resource => {
+            let contents =
+                object
+                    .get("contents")
+                    .and_then(Value::as_array)
+                    .ok_or(Legacy2024WireError(
+                        "resources/read result requires a contents array",
+                    ))?;
+            for resource in contents {
+                validate_legacy_2024_resource_contents(resource)?;
+            }
+        }
+        Legacy2024ResultKind::Prompt => {
+            if !object.get("description").is_none_or(Value::is_string) {
+                return Err(Legacy2024WireError(
+                    "prompts/get result description must be a string",
+                ));
+            }
+            let messages =
+                object
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .ok_or(Legacy2024WireError(
+                        "prompts/get result requires a messages array",
+                    ))?;
+            for message in messages {
+                validate_legacy_2024_prompt_message(message)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_legacy_2024_prompt_message(value: &Value) -> Result<(), Legacy2024WireError> {
+    let message = value.as_object().ok_or(Legacy2024WireError(
+        "prompts/get result messages must contain objects",
+    ))?;
+    if !matches!(
+        message.get("role").and_then(Value::as_str),
+        Some("user" | "assistant")
+    ) {
+        return Err(Legacy2024WireError(
+            "prompts/get result messages require an exact user or assistant role",
+        ));
+    }
+    let content = message.get("content").ok_or(Legacy2024WireError(
+        "prompts/get result messages require content",
+    ))?;
+    validate_legacy_2024_content(content)
+}
+
+fn validate_legacy_2024_content(value: &Value) -> Result<(), Legacy2024WireError> {
+    let content = value.as_object().ok_or(Legacy2024WireError(
+        "exact MCP 2024-11-05 content entries must be objects",
+    ))?;
+    match content.get("type").and_then(Value::as_str) {
+        Some("text") if content.get("text").is_some_and(Value::is_string) => {}
+        Some("image")
+            if content.get("data").is_some_and(Value::is_string)
+                && content.get("mimeType").is_some_and(Value::is_string) => {}
+        Some("resource") => {
+            let resource = content.get("resource").ok_or(Legacy2024WireError(
+                "embedded resource content requires resource data",
+            ))?;
+            validate_legacy_2024_resource_contents(resource)?;
+        }
+        _ => {
+            return Err(Legacy2024WireError(
+                "exact MCP 2024-11-05 content must be text, image, or resource",
+            ));
+        }
+    }
+    if let Some(annotations) = content.get("annotations") {
+        validate_legacy_2024_annotations(annotations)?;
+    }
+    Ok(())
+}
+
+fn validate_legacy_2024_resource_contents(value: &Value) -> Result<(), Legacy2024WireError> {
+    let resource = value.as_object().ok_or(Legacy2024WireError(
+        "exact MCP 2024-11-05 resource contents must be objects",
+    ))?;
+    if !resource.get("uri").is_some_and(Value::is_string)
+        || !resource.get("mimeType").is_none_or(Value::is_string)
+        || !(resource.get("text").is_some_and(Value::is_string)
+            || resource.get("blob").is_some_and(Value::is_string))
+    {
+        return Err(Legacy2024WireError(
+            "exact MCP 2024-11-05 resource contents require string uri and text or blob data",
+        ));
+    }
+    Ok(())
 }
 
 /// Validates the required exact-2024 parameter members for the methods used by
@@ -877,12 +1038,12 @@ fn validate_legacy_2024_sampling_message(value: &Value) -> Result<(), Legacy2024
         }
     }
     if let Some(annotations) = content.get("annotations") {
-        validate_legacy_2024_sampling_annotations(annotations)?;
+        validate_legacy_2024_annotations(annotations)?;
     }
     Ok(())
 }
 
-fn validate_legacy_2024_sampling_annotations(value: &Value) -> Result<(), Legacy2024WireError> {
+fn validate_legacy_2024_annotations(value: &Value) -> Result<(), Legacy2024WireError> {
     let annotations = value.as_object().ok_or(Legacy2024WireError(
         "sampling content annotations must be an object",
     ))?;
