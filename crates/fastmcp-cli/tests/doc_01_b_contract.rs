@@ -50,8 +50,9 @@ enum PublicHelpRefusal {
     LegacyOnlyIsExecutable,
     Mcp2025IsNotUnsupported,
     AggregateClaimTreatedAsEvidence,
+    MissingBaseFrame,
     MissingStatusStanza,
-    StatusStanzaMismatch,
+    AlteredStatusStanza,
     StatusClaimOutsideStanza,
     UnsafeRootHelpContent,
 }
@@ -133,10 +134,11 @@ fn validate_public_root_help_bytes(bytes: &[u8]) -> Result<(), PublicHelpRefusal
         return Err(PublicHelpRefusal::MissingStatusStanza);
     };
     let (root_help, status_stanza) = stdout.split_at(status_start);
-    if !root_help.contains("FastMCP CLI - Run, inspect, and install MCP servers.")
-        || status_stanza != PROVISIONAL_PUBLIC_STATUS_STANZA
-    {
-        return Err(PublicHelpRefusal::StatusStanzaMismatch);
+    if !root_help.contains("FastMCP CLI - Run, inspect, and install MCP servers.") {
+        return Err(PublicHelpRefusal::MissingBaseFrame);
+    }
+    if status_stanza != PROVISIONAL_PUBLIC_STATUS_STANZA {
+        return Err(PublicHelpRefusal::AlteredStatusStanza);
     }
 
     let status_terms = [
@@ -150,6 +152,8 @@ fn validate_public_root_help_bytes(bytes: &[u8]) -> Result<(), PublicHelpRefusal
         "runtime-readiness",
         "maturity",
         "release evidence",
+        "production-ready",
+        "production ready",
     ];
     if status_terms.iter().any(|term| root_help.contains(term)) {
         return Err(PublicHelpRefusal::StatusClaimOutsideStanza);
@@ -162,6 +166,20 @@ fn validate_public_root_help_bytes(bytes: &[u8]) -> Result<(), PublicHelpRefusal
     }
 
     Ok(())
+}
+
+fn raw_help_with_root_claim(bytes: &[u8], claim: &str) -> Vec<u8> {
+    let marker = b"Protocol status:";
+    let status_start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("public root help must contain its status stanza");
+    let mut forged = Vec::with_capacity(bytes.len() + claim.len() + 1);
+    forged.extend_from_slice(&bytes[..status_start]);
+    forged.extend_from_slice(claim.as_bytes());
+    forged.push(b' ');
+    forged.extend_from_slice(&bytes[status_start..]);
+    forged
 }
 
 fn admit_public_root_help(
@@ -189,6 +207,18 @@ fn doc_01_b_public_binary_positive() {
     assert_eq!(
         normalized_stdout(&long_help),
         normalized_stdout(&short_help)
+    );
+    assert_eq!(
+        validate_public_root_help_bytes(
+            format!("Usage: fastmcp {PROVISIONAL_PUBLIC_STATUS_STANZA}").as_bytes()
+        ),
+        Err(PublicHelpRefusal::MissingBaseFrame)
+    );
+    assert_eq!(
+        validate_public_root_help_bytes(
+            b"FastMCP CLI - Run, inspect, and install MCP servers. Protocol status: altered"
+        ),
+        Err(PublicHelpRefusal::AlteredStatusStanza)
     );
 
     let mut long_state = AcceptedPublicHelp::default();
@@ -235,16 +265,26 @@ fn doc_01_b_public_binary_planted_negative() {
         .expect("baseline public help must satisfy the independent oracle");
     let accepted_before = state.clone();
 
-    let mut planted_candidate = baseline;
-    planted_candidate.oracle.modern_only_executable = true;
-    assert_eq!(
-        admit_public_root_help(&mut state, planted_candidate),
-        Err(PublicHelpRefusal::ModernOnlyIsExecutable)
-    );
-    assert_eq!(
-        state, accepted_before,
-        "a rejected one-field oracle mutation must not alter accepted evaluator/output state"
-    );
+    for claim in [
+        "FastMCP supports MCP 2026-07-28.",
+        "Auto is runnable.",
+        "MCP 2025-11-25 is supported.",
+        "FastMCP is production ready.",
+    ] {
+        let planted_candidate = PublicHelpCandidate {
+            oracle: baseline.oracle,
+            stdout: raw_help_with_root_claim(&baseline.stdout, claim),
+        };
+        assert_eq!(
+            admit_public_root_help(&mut state, planted_candidate),
+            Err(PublicHelpRefusal::StatusClaimOutsideStanza),
+            "the raw-help claim {claim:?} must be rejected"
+        );
+        assert_eq!(
+            state, accepted_before,
+            "a rejected one-field raw-help mutation must not alter accepted evaluator/output state"
+        );
+    }
     let long_help_after_rejection = fastmcp_output("--help");
     assert_eq!(
         long_help_after_rejection.stdout.as_slice(),

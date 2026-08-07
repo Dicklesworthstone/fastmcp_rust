@@ -57,6 +57,19 @@ const CLI_PROTOCOL_STATUS_HELP: &str = concat!(
     "examples, redact secrets and peer-controlled terminal text, and preserve nonzero ",
     "failures rather than fabricating an empty catalog or selection."
 );
+/// Independently authored consumer contract for the normalized rendered
+/// status stanza. This is intentionally not derived from `after_help`: a
+/// change to producer text must fail admission until this contract is reviewed.
+const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = concat!(
+    "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
+    "Public PROTOCOL_VERSION remains 2024-11-05; ModernOnly, Auto, and LegacyOnly are ",
+    "planned/unverified policy modes, not executable CLI profiles. MCP 2025-11-25 is ",
+    "unsupported: it has no alias, compatibility profile, route, or diagnostic selection. ",
+    "Help, inspect output, and examples are not conformance, runtime-readiness, maturity, ",
+    "or release evidence. Machine-readable diagnostics are separate from human-facing ",
+    "examples, redact secrets and peer-controlled terminal text, and preserve nonzero ",
+    "failures rather than fabricating an empty catalog or selection."
+);
 
 /// Typed refusal emitted when the public Clap help pipeline cannot produce an
 /// exactly provisional documentation contract.
@@ -215,7 +228,7 @@ fn validate_public_cli_help(candidate: &CliHelpCandidate) -> Result<(), CliDocum
         return Err(CliDocumentationRefusal::MissingStatusStanza);
     };
     let (root_help, status_stanza) = rendered.split_at(status_start);
-    if status_stanza != normalize_cli_help_whitespace(CLI_PROTOCOL_STATUS_HELP.as_bytes()) {
+    if status_stanza != EXPECTED_CLI_PROTOCOL_STATUS_STANZA {
         return Err(CliDocumentationRefusal::StatusStanzaMismatch);
     }
 
@@ -230,6 +243,8 @@ fn validate_public_cli_help(candidate: &CliHelpCandidate) -> Result<(), CliDocum
         "runtime-readiness",
         "maturity",
         "release evidence",
+        "production-ready",
+        "production ready",
     ];
     if status_terms.iter().any(|term| root_help.contains(term)) {
         return Err(CliDocumentationRefusal::StatusClaimOutsideStanza);
@@ -322,6 +337,21 @@ fn is_exact_root_help_request(args: &[std::ffi::OsString]) -> bool {
     )
 }
 
+#[cfg(test)]
+fn raw_help_with_root_claim(bytes: &[u8], claim: &str) -> Vec<u8> {
+    let marker = b"Protocol status:";
+    let status_start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("public root help must contain its status stanza");
+    let mut forged = Vec::with_capacity(bytes.len() + claim.len() + 1);
+    forged.extend_from_slice(&bytes[..status_start]);
+    forged.extend_from_slice(claim.as_bytes());
+    forged.push(b' ');
+    forged.extend_from_slice(&bytes[status_start..]);
+    forged
+}
+
 #[test]
 fn doc_01_b_positive() {
     let independently_authored_contract = CliDocumentationContract {
@@ -407,16 +437,27 @@ fn doc_01_b_planted_negative() {
     admit_public_cli_help(&mut state, baseline.clone())
         .expect("baseline public help must be admitted");
     let accepted_before = state.clone();
-    let mut planted_candidate = baseline;
-    planted_candidate.contract.modern_only_executable = true;
-    assert_eq!(
-        admit_public_cli_help(&mut state, planted_candidate),
-        Err(CliDocumentationRefusal::ModernOnlyIsExecutable)
-    );
-    assert_eq!(
-        state, accepted_before,
-        "a rejected one-field support mutation must leave evaluator and consumer-visible state unchanged"
-    );
+
+    for claim in [
+        "FastMCP supports MCP 2026-07-28.",
+        "Auto is runnable.",
+        "MCP 2025-11-25 is supported.",
+        "FastMCP is production ready.",
+    ] {
+        let planted_candidate = CliHelpCandidate {
+            contract: baseline.contract,
+            bytes: raw_help_with_root_claim(&baseline.bytes, claim),
+        };
+        assert_eq!(
+            admit_public_cli_help(&mut state, planted_candidate),
+            Err(CliDocumentationRefusal::StatusClaimOutsideStanza),
+            "the raw-help claim {claim:?} must be rejected"
+        );
+        assert_eq!(
+            state, accepted_before,
+            "a rejected one-field raw-help mutation must leave evaluator and consumer-visible state unchanged"
+        );
+    }
     let mut emitted_after_rejection = Vec::new();
     assert_eq!(
         emit_admitted_cli_help_to(&state, &mut emitted_after_rejection),
