@@ -55,6 +55,11 @@ fn srv_02_a_positive() {
         json!(true)
     );
     assert_eq!(wire["cacheHints"]["maxAgeSeconds"], json!(60));
+    assert_eq!(
+        DiscoveryCacheHints::with_max_age_seconds(u32::MAX).max_age_seconds(),
+        u32::MAX,
+        "the typed cache-hint field admits its complete nonnegative wire domain"
+    );
 }
 
 #[test]
