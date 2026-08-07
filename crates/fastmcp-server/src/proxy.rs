@@ -323,7 +323,9 @@ impl ProxyUpstreamBindingRegistry {
         legacy_sse: Option<CanonicalHttpUrl>,
         legacy_message_post: Option<CanonicalHttpUrl>,
         credential_partition: String,
+        security_partition: String,
         transport_profile: String,
+        policy_generation: u64,
         legacy_receipt_generation: u64,
         probe: HttpModernProbe,
     ) -> McpResult<ProxyUpstreamBinding> {
@@ -334,7 +336,9 @@ impl ProxyUpstreamBindingRegistry {
             legacy_sse,
             legacy_message_post,
             credential_partition,
+            security_partition,
             transport_profile,
+            policy_generation,
             configuration_generation,
             legacy_receipt_generation,
         )

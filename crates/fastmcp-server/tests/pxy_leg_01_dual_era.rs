@@ -70,7 +70,9 @@ fn pxy_leg_01_a_positive() {
             Some(url("https://legacy.example.test/sse")),
             Some(url("https://legacy.example.test/messages")),
             "partition-c".to_owned(),
+            "security-partition-c".to_owned(),
             "http-profile-c".to_owned(),
+            3,
             11,
             HttpModernProbe {
                 status: 404,
@@ -94,7 +96,9 @@ fn pxy_leg_01_a_positive() {
             None,
             None,
             "partition-d".to_owned(),
+            "security-partition-d".to_owned(),
             "http-profile-d".to_owned(),
+            4,
             12,
             HttpModernProbe {
                 status: 200,
