@@ -15,7 +15,7 @@ authoring_bead = "bd-mcp-2026-07-28-support-ahet.1.14"
 integration_producer_bead = "bd-mcp-2026-07-28-support-ahet.1.1"
 final_attester_bead = "bd-mcp-2026-07-28-support-ahet.1.15"
 source_input_count = 68
-source_input_total_bytes = 3012794
+source_input_total_bytes = 3017187
 negative_case_count = 188
 derived_output_count = 14
 derived_toml_count = 10
@@ -152,8 +152,8 @@ ordering = "ascending raw path bytes"
 record_encoding = "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
 domain_prefix = "none"
 file_count = 68
-total_bytes = 3012794
-sha256 = "878c77d6d704b04e438da1e392bc598ca3d352b989aaa8c04df3b8984d2cf760"
+total_bytes = 3017187
+sha256 = "258eb69efbed9dee6201430b389b24801b71f0d625d8dd17921f2a52b97bbac3"
 excluded_exact_paths = [
   "evidence/fnd-01/dependency-verification.toml",
   "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
@@ -5649,8 +5649,8 @@ tree_sha256 = "8362bb3ce7b9fbb3c2013609a84d98e4c1895962d40fddd9b93a27b0d10e98c7"
 id = "sdk"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.5"
 file_count = 14
-total_bytes = 96975
-tree_sha256 = "41f9e921c87a02c24c00767c66b76bae1af5d3b37815a83b3b6de0795caa2bbd"
+total_bytes = 101368
+tree_sha256 = "d7294a8444f0892df030fdb94ea68437c18eed317354717bffc8b7e62c441816"
 
 [[source_family]]
 id = "toolchain"
@@ -6764,8 +6764,8 @@ id = "s30"
 family = "sdk"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.5"
 path = "evidence/fnd-01/sdk-matrix.toml"
-byte_length = 61216
-sha256 = "2230da0c1e40fb38e2dc7731a7c4f4b355dab4ed86f360c5c868883f393796b6"
+byte_length = 65609
+sha256 = "786de067f0ec9a999448a38ae13fe4052e9871164e4b37e616a1b3fd24b4bfdf"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true

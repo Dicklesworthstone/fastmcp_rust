@@ -34278,7 +34278,7 @@ mod ordinary {
     const BOOTSTRAP_MANIFEST_SHA256: &str =
         "46e94fe446043694b7b7305e2c1d29260cfeac1d7d8982e4e07bf7837a3a72b2";
     const SOURCE_TREE_SHA256: &str =
-        "878c77d6d704b04e438da1e392bc598ca3d352b989aaa8c04df3b8984d2cf760";
+        "258eb69efbed9dee6201430b389b24801b71f0d625d8dd17921f2a52b97bbac3";
     const NEGATIVE_INVENTORY_SHA256: &str =
         "294b4285f5fd3f0c36a3cb7dd8fccfb967dde29405805f3e1609858c75c973d5";
     const INTEGRATION_PRODUCER: &str = "bd-mcp-2026-07-28-support-ahet.1.1";
@@ -35209,8 +35209,8 @@ activate = 1\n";
             "sdk",
             "bd-mcp-2026-07-28-support-ahet.1.5",
             14,
-            96_975,
-            "41f9e921c87a02c24c00767c66b76bae1af5d3b37815a83b3b6de0795caa2bbd",
+            101_368,
+            "d7294a8444f0892df030fdb94ea68437c18eed317354717bffc8b7e62c441816",
         ),
         (
             "toolchain",
@@ -40783,7 +40783,7 @@ activate = 1\n";
             || policy.integration_producer_bead != INTEGRATION_PRODUCER
             || policy.final_attester_bead != FINAL_ATTESTER
             || policy.source_input_count != EXPECTED_SOURCE_FILES
-            || policy.source_input_total_bytes != 3_012_794
+            || policy.source_input_total_bytes != 3_017_187
             || policy.negative_case_count != EXPECTED_NEGATIVES
             || policy.derived_output_count != EXPECTED_RECEIPTS
             || policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS
