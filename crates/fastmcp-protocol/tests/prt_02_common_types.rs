@@ -67,6 +67,13 @@ fn prt_02_a_positive() {
         let parsed = AbsoluteUri::parse(uri).expect("final URI row");
         assert_eq!(parsed.as_str(), uri, "wire URI must remain byte-preserving");
     }
+    let authority_with_port = "HTTPS://user@example.test:8443/a%2Fb?x=%FF#fragment";
+    assert_eq!(
+        AbsoluteUri::parse(authority_with_port)
+            .expect("authority port is a valid byte-preserving URI")
+            .as_str(),
+        authority_with_port
+    );
 
     assert_eq!(OpaqueCursor::from_presence(None).as_present(), None);
     assert_eq!(
@@ -245,6 +252,19 @@ fn prt_02_a_planted_negative() {
     assert_eq!(
         accepted_data_icon, data_icon_baseline,
         "a rejected data MIME cannot mutate accepted icon state"
+    );
+
+    let accepted_authority =
+        AbsoluteUri::parse("https://user@example.test:8443/resource").expect("authority port");
+    let authority_baseline = accepted_authority.clone();
+    assert_eq!(
+        AbsoluteUri::parse("https://user@example.test:not-a-port/resource"),
+        Err(CommonTypeError::Invalid("absolute URI")),
+        "only the authority port changes from decimal digits to invalid characters"
+    );
+    assert_eq!(
+        accepted_authority, authority_baseline,
+        "a rejected authority port cannot mutate the accepted URI"
     );
 }
 
