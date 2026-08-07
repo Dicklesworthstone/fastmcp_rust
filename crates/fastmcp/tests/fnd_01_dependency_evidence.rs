@@ -76260,14 +76260,22 @@ activate = 1\n";
     }
 
     #[derive(Clone, Debug, PartialEq)]
+    struct CoreConformanceAdmittedArtifact {
+        manifest: CoreConformanceRecord,
+        path: String,
+        bytes: Vec<u8>,
+        digest: [u8; 32],
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
     struct CoreConformanceAcceptedBinding {
-        manifest_sha256: [u8; 32],
         authority: Vec<CoreConformanceRecord>,
-        artifacts: Vec<CoreConformanceRecord>,
+        artifacts: Vec<CoreConformanceAdmittedArtifact>,
         tree_chain: Vec<CoreConformanceTreeEdge>,
         licenses: Vec<CoreConformanceRecord>,
         no_claim: CoreConformanceRecord,
         registries: Vec<CoreConformanceRecord>,
+        group_digests: [(&'static str, [u8; 32]); 6],
     }
 
     fn core_conformance_root(
@@ -77058,7 +77066,8 @@ activate = 1\n";
         }
         let tree_chain = validate_core_conformance_tree_chain(document)?;
         let registries = validate_core_conformance_registries(document)?;
-        let _ = core_conformance_exact_group(
+        let group_digests = [
+        ("authority", core_conformance_exact_group(
             document,
             &[
                 "/manifest_format",
@@ -77079,33 +77088,28 @@ activate = 1\n";
                 "/manual_update",
             ],
             CORE_AUTHORITY_SHA256,
-            "authority",
-        )?;
-        let _ = core_conformance_exact_group(
+            "authority")?),
+        ("artifacts", core_conformance_exact_group(
             document,
             &["/artifacts"],
             CORE_ARTIFACTS_SHA256,
-            "artifacts",
-        )?;
-        let _ = core_conformance_exact_group(
+            "artifacts")?),
+        ("tree", core_conformance_exact_group(
             document,
             &["/immutable_tree_chain"],
             CORE_TREE_CHAIN_SHA256,
-            "immutable_tree_chain",
-        )?;
-        let _ = core_conformance_exact_group(
+            "immutable_tree_chain")?),
+        ("license", core_conformance_exact_group(
             document,
             &["/license_provenance"],
             CORE_LICENSE_SHA256,
-            "license_provenance",
-        )?;
-        let _ = core_conformance_exact_group(
+            "license_provenance")?),
+        ("no_claim", core_conformance_exact_group(
             document,
             &["/conformance"],
             CORE_NO_CLAIM_SHA256,
-            "conformance",
-        )?;
-        let _ = core_conformance_exact_group(
+            "conformance")?),
+        ("registries", core_conformance_exact_group(
             document,
             &[
                 "/final_error_codes",
@@ -77116,59 +77120,30 @@ activate = 1\n";
                 "/ambiguities",
             ],
             CORE_REGISTRIES_SHA256,
-            "registries",
-        )?;
+            "registries")?),
+        ];
         validate_core_conformance_manifest_binding(document, admitted_files)?;
         let root = core_conformance_root(document)?;
-        let authority = [
-            "core",
-            "core_2024_11_05",
-            "verification",
-            "derived_negative_policy",
-            "fixture_provenance",
-            "manual_update",
-        ]
-        .into_iter()
-        .map(|label| {
-            record_table(root, label, "core-conformance")
-                .map(|fields| CoreConformanceRecord {
-                    label,
-                    fields: fields.clone(),
-                })
-        })
-        .collect::<VResult<Vec<_>>>()?;
-        let artifacts = core_conformance_records(artifacts, "artifacts")?;
+        let mut authority = vec![CoreConformanceRecord { label: "manifest_root", fields: root.clone() }];
+        authority.extend(["core", "core_2024_11_05", "verification", "derived_negative_policy", "fixture_provenance", "manual_update"].into_iter().map(|label| record_table(root, label, "core-conformance").map(|fields| CoreConformanceRecord { label, fields: fields.clone() })).collect::<VResult<Vec<_>>>()?);
+        let domains = record_table(root, "authority_domains", "core-conformance")?;
+        authority.extend(["wire_contract", "behavioral_contract", "migration_and_context", "cross_domain_conflict"].into_iter().map(|label| record_table(domains, label, "authority_domains").map(|fields| CoreConformanceRecord { label, fields: fields.clone() })).collect::<VResult<Vec<_>>>()?);
+        authority.push(CoreConformanceRecord { label: "unsupported_third_era_negative", fields: record_table(root, "unsupported_third_era_negative", "core-conformance")?.clone() });
+        let artifacts = core_conformance_records(artifacts, "artifacts")?.into_iter().zip(admitted_artifacts).map(|(manifest, file)| CoreConformanceAdmittedArtifact { manifest, path: file.contract.path.clone(), bytes: file.bytes.clone(), digest: file.digest }).collect();
         let license_provenance = record_table(root, "license_provenance", "core-conformance")?;
-        let licenses = [
-            "core_2024_11_05",
-            "core_2026_07_28",
-            "conformance_2026_07_28_baseline",
-        ]
-        .into_iter()
-        .map(|label| {
-            record_table(license_provenance, label, "license_provenance")
-                .map(|fields| CoreConformanceRecord {
-                    label,
-                    fields: fields.clone(),
-                })
-        })
-        .collect::<VResult<Vec<_>>>()?;
+        let licenses = ["core_2024_11_05", "core_2026_07_28", "conformance_2026_07_28_baseline"].into_iter().map(|label| record_table(license_provenance, label, "license_provenance").map(|fields| CoreConformanceRecord { label, fields: fields.clone() })).collect::<VResult<Vec<_>>>()?;
         let no_claim = CoreConformanceRecord {
             label: "conformance",
             fields: record_table(root, "conformance", "core-conformance")?.clone(),
         };
         Ok(CoreConformanceAcceptedBinding {
-            manifest_sha256: source_lookup(
-                admitted_files,
-                "evidence/fnd-01/core-conformance.toml",
-            )?
-            .digest,
             authority,
             artifacts,
             tree_chain,
             licenses,
             no_claim,
             registries,
+            group_digests,
         })
     }
 
@@ -78206,7 +78181,13 @@ activate = 1\n";
     ) -> VResult<()> {
         let core = parse_source_toml(files, "evidence/fnd-01/core-conformance.toml")?;
         let accepted_core = validate_core_conformance_sources(&core, files)?;
-        if (accepted_core.authority.len(), accepted_core.artifacts.len(), accepted_core.tree_chain.len(), accepted_core.licenses.len(), accepted_core.registries.len(), accepted_core.tree_chain[1].parent_edge) != (6, 8, 14, 3, 85, Some(0)) {
+        let artifact = &accepted_core.artifacts[0];
+        if (accepted_core.authority.len(), accepted_core.artifacts.len(), accepted_core.tree_chain.len(), accepted_core.licenses.len(), accepted_core.registries.len(), accepted_core.tree_chain[1].parent_edge) != (12, 8, 14, 3, 85, Some(0))
+            || accepted_core.authority[0].fields.get("bead").and_then(toml::Value::as_str) != Some("bd-mcp-2026-07-28-support-ahet.1.2")
+            || accepted_core.authority[11].fields.get("protocol_version").and_then(toml::Value::as_str) != Some("2025-11-25")
+            || artifact.path != "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.ts" || artifact.digest != sha256(&artifact.bytes)
+            || accepted_core.group_digests[0].0 != "authority" || lower_hex(&accepted_core.group_digests[0].1) != CORE_AUTHORITY_SHA256
+        {
             return Err(Diagnostic::error("E_CORE_CONFORMANCE_ADMISSION", "accepted records"));
         }
 
@@ -84848,16 +84829,12 @@ original = "value"
         baseline_source_tree_sha256: [u8; 32],
     ) {
         let (files, source_tree_sha256) = admitted_core_conformance_test_inputs();
-        assert_eq!(
-            source_tree_sha256, baseline_source_tree_sha256,
-            "fresh normal admission retains the complete source-tree digest"
-        );
+        assert_eq!(source_tree_sha256, baseline_source_tree_sha256);
         let document = core_conformance_test_document(&files);
         assert_eq!(
             &validate_core_conformance_sources(&document, &files)
                 .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable())),
             baseline_binding,
-            "fresh normal admission retains the accepted core binding"
         );
     }
 
@@ -84867,22 +84844,13 @@ original = "value"
         let document = core_conformance_test_document(&files);
         let accepted = validate_core_conformance_sources(&document, &files)
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let manifest = source_lookup(&files, "evidence/fnd-01/core-conformance.toml")
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        assert_eq!(
-            accepted.manifest_sha256,
-            sha256(&manifest.bytes),
-            "accepted manifest binding is the admitted manifest bytes"
-        );
-        assert_eq!((accepted.authority.len(), accepted.artifacts.len()), (6, 8), "accepted records retain every authority and artifact row");
-        assert_eq!(
-            (accepted.artifacts[0].fields.get("vendored_path").and_then(toml::Value::as_str), accepted.artifacts[0].fields.get("sha256").and_then(toml::Value::as_str)),
-            (Some("evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.ts"), Some("742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd")),
-            "accepted artifact records retain exact provenance fields"
-        );
-        assert_eq!((accepted.tree_chain.len(), accepted.tree_chain[1].parent_edge, accepted.tree_chain[4].parent_edge, accepted.tree_chain[1].fields.get("parent_object").and_then(toml::Value::as_str), accepted.tree_chain[4].fields.get("child_path").and_then(toml::Value::as_str)), (14, Some(0), Some(0), Some("8957e31e8ecd6fd7f52df82d44b3827cb44cecb1"), Some("schema")), "retained tree edges bind exact immediate parents, including the branch");
-        assert_eq!((accepted.licenses.len(), accepted.no_claim.label, accepted.registries.len()), (3, "conformance", 85), "accepted binding retains complete field-labelled registries");
-        assert_eq!(accepted.registries[..3].iter().map(|record| record.fields.get("code").and_then(toml::Value::as_integer)).collect::<Vec<_>>(), [Some(-32_020), Some(-32_021), Some(-32_022)], "accepted registry records retain exact final error codes");
+        assert_eq!((accepted.authority.len(), accepted.artifacts.len(), accepted.group_digests[0].0), (12, 8, "authority"));
+        assert_eq!((accepted.authority[0].label, accepted.authority[0].fields.get("manifest_format").and_then(toml::Value::as_str), accepted.authority[11].fields.get("protocol_version").and_then(toml::Value::as_str)), ("manifest_root", Some("fastmcp-fnd-01-core-conformance-v1"), Some("2025-11-25")));
+        let artifact = &accepted.artifacts[0];
+        assert_eq!((artifact.manifest.fields.get("vendored_path").and_then(toml::Value::as_str), artifact.path.as_str(), artifact.bytes.len(), artifact.digest), (Some("evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.ts"), "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.ts", 98_426, sha256(&artifact.bytes)));
+        assert_eq!((accepted.tree_chain.len(), accepted.tree_chain[1].parent_edge, accepted.tree_chain[4].parent_edge, accepted.tree_chain[1].fields.get("parent_object").and_then(toml::Value::as_str), accepted.tree_chain[4].fields.get("child_path").and_then(toml::Value::as_str)), (14, Some(0), Some(0), Some("8957e31e8ecd6fd7f52df82d44b3827cb44cecb1"), Some("schema")));
+        assert_eq!((accepted.licenses.len(), accepted.no_claim.label, accepted.registries.len()), (3, "conformance", 85));
+        assert_eq!(accepted.registries[..3].iter().map(|record| record.fields.get("code").and_then(toml::Value::as_integer)).collect::<Vec<_>>(), [Some(-32_020), Some(-32_021), Some(-32_022)]);
     }
 
     fn assert_core_conformance_restores(
