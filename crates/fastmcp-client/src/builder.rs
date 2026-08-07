@@ -114,6 +114,7 @@ impl ClientBuilder {
     /// - Retry delay: 1 second
     /// - Inherit environment: true
     /// - Auto-initialize: false (initialize immediately on connect)
+    /// - Protocol policy: Auto
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -131,7 +132,7 @@ impl ClientBuilder {
             auto_initialize: false,
             owned_process_group: false,
             protocol_plan: ClientProtocolPlan::stdio(
-                fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+                fastmcp_protocol::protocol_policy::ProtocolPolicy::Auto,
             ),
         }
     }
