@@ -83,6 +83,7 @@ impl ExactJsonObject {
 pub struct ResultDecodeError {
     kind: ResultDecodeErrorKind,
     path: String,
+    raw_envelope: Option<RawResultEnvelope>,
 }
 
 /// Stable result-decoding failure categories.
@@ -115,6 +116,15 @@ impl ResultDecodeError {
         Self {
             kind,
             path: path.into(),
+            raw_envelope: None,
+        }
+    }
+
+    fn rejected_extension(raw_envelope: RawResultEnvelope) -> Self {
+        Self {
+            kind: ResultDecodeErrorKind::RejectedExtension,
+            path: "$.resultType".to_owned(),
+            raw_envelope: Some(raw_envelope),
         }
     }
 
@@ -134,6 +144,13 @@ impl ResultDecodeError {
     #[must_use]
     pub fn invalid_known_member(path: impl Into<String>) -> Self {
         Self::new(ResultDecodeErrorKind::InvalidKnownMember, path)
+    }
+
+    /// Returns the bounded raw envelope retained when a discriminator policy
+    /// rejected an otherwise structurally admitted extension result.
+    #[must_use]
+    pub fn raw_envelope(&self) -> Option<&RawResultEnvelope> {
+        self.raw_envelope.as_ref()
     }
 }
 
@@ -255,8 +272,13 @@ impl UnknownResultMembers {
         members: Vec<ExactJsonMember>,
         known_names: &[&str],
     ) -> Result<Self, ResultDecodeError> {
+        if members.len() > MAX_RESULT_CONTAINER_MEMBERS {
+            return Err(ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"));
+        }
         for (index, member) in members.iter().enumerate() {
-            if known_names.contains(&member.name.as_str()) {
+            if COMMON_RESULT_MEMBER_NAMES.contains(&member.name.as_str())
+                || known_names.contains(&member.name.as_str())
+            {
                 return Err(ResultDecodeError::new(
                     ResultDecodeErrorKind::KnownMemberCollision,
                     member.name.clone(),
@@ -272,6 +294,7 @@ impl UnknownResultMembers {
                 ));
             }
         }
+        validate_local_result_members(&members)?;
         Ok(Self { members })
     }
 
@@ -280,6 +303,120 @@ impl UnknownResultMembers {
     pub fn members(&self) -> &[ExactJsonMember] {
         &self.members
     }
+}
+
+const COMMON_RESULT_MEMBER_NAMES: [&str; 3] = ["resultType", "_meta", "serverInfo"];
+
+fn validate_local_result_members(members: &[ExactJsonMember]) -> Result<(), ResultDecodeError> {
+    let encoded_bytes = exact_json_members_len(members, 0)?;
+    if encoded_bytes > MAX_RESULT_ENCODED_BYTES {
+        return Err(ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"));
+    }
+    Ok(())
+}
+
+fn exact_json_members_len(
+    members: &[ExactJsonMember],
+    depth: usize,
+) -> Result<usize, ResultDecodeError> {
+    if depth > MAX_RESULT_DEPTH || members.len() > MAX_RESULT_CONTAINER_MEMBERS {
+        return Err(ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"));
+    }
+    let mut encoded_bytes = 2_usize;
+    for (index, member) in members.iter().enumerate() {
+        if member.name.len() > MAX_RESULT_STRING_BYTES {
+            return Err(ResultDecodeError::new(
+                ResultDecodeErrorKind::BoundExceeded,
+                "$.<extra-name>",
+            ));
+        }
+        if members[..index]
+            .iter()
+            .any(|preceding| preceding.name == member.name)
+        {
+            return Err(ResultDecodeError::new(
+                ResultDecodeErrorKind::DuplicateMember,
+                member.name.clone(),
+            ));
+        }
+        let value_bytes = exact_json_value_len(&member.value, depth + 1)?;
+        let member_bytes = encoded_json_string_len(&member.name)?
+            .checked_add(1)
+            .and_then(|size| size.checked_add(value_bytes))
+            .ok_or_else(|| ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"))?;
+        encoded_bytes = encoded_bytes
+            .checked_add(usize::from(index != 0))
+            .and_then(|size| size.checked_add(member_bytes))
+            .ok_or_else(|| ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"))?;
+        if encoded_bytes > MAX_RESULT_ENCODED_BYTES {
+            return Err(ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"));
+        }
+    }
+    Ok(encoded_bytes)
+}
+
+fn exact_json_value_len(value: &ExactJsonValue, depth: usize) -> Result<usize, ResultDecodeError> {
+    if depth > MAX_RESULT_DEPTH {
+        return Err(ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"));
+    }
+    match value {
+        ExactJsonValue::Null => Ok(4),
+        ExactJsonValue::Bool(true) => Ok(4),
+        ExactJsonValue::Bool(false) => Ok(5),
+        ExactJsonValue::String(value) => {
+            if value.len() > MAX_RESULT_STRING_BYTES {
+                return Err(ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"));
+            }
+            encoded_json_string_len(value)
+        }
+        ExactJsonValue::Number(value) => {
+            if value.len() > MAX_RESULT_NUMBER_BYTES {
+                return Err(ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"));
+            }
+            match parse_exact_json(value)? {
+                ExactJsonValue::Number(parsed) if parsed == *value => Ok(value.len()),
+                _ => Err(ResultDecodeError::new(ResultDecodeErrorKind::InvalidJson, "$")),
+            }
+        }
+        ExactJsonValue::Array(values) => {
+            if values.len() > MAX_RESULT_CONTAINER_MEMBERS {
+                return Err(ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"));
+            }
+            let mut encoded_bytes = 2_usize;
+            for (index, value) in values.iter().enumerate() {
+                let separator_bytes = usize::from(index != 0);
+                let value_bytes = exact_json_value_len(value, depth + 1)?;
+                encoded_bytes = encoded_bytes
+                    .checked_add(separator_bytes)
+                    .and_then(|size| size.checked_add(value_bytes))
+                    .ok_or_else(|| {
+                        ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$")
+                    })?;
+                if encoded_bytes > MAX_RESULT_ENCODED_BYTES {
+                    return Err(ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"));
+                }
+            }
+            Ok(encoded_bytes)
+        }
+        ExactJsonValue::Object(object) => {
+            exact_json_members_len(&object.members, depth + 1)
+        }
+    }
+}
+
+fn encoded_json_string_len(value: &str) -> Result<usize, ResultDecodeError> {
+    let mut encoded_bytes = 2_usize;
+    for character in value.chars() {
+        let bytes = match character {
+            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        };
+        encoded_bytes = encoded_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"))?;
+    }
+    Ok(encoded_bytes)
 }
 
 /// A typed core `complete` result with inert open siblings.
@@ -525,10 +662,10 @@ pub fn decode_peer_result(
     };
     match policy.decide(&result_type.0) {
         ResultDiscriminatorDecision::Rejected => {
-            return Err(ResultDecodeError::new(
-                ResultDecodeErrorKind::RejectedExtension,
-                "$.resultType",
-            ));
+            return Err(ResultDecodeError::rejected_extension(RawResultEnvelope {
+                discriminator: result_type.0,
+                members,
+            }));
         }
         ResultDiscriminatorDecision::DeferredExtension => {
             return Ok((
@@ -624,9 +761,8 @@ pub fn decode_typed_complete<T: CompleteResultPayload>(
 }
 
 fn validate_complete_payload_names<T: CompleteResultPayload>() -> Result<(), ResultDecodeError> {
-    const COMMON_NAMES: [&str; 3] = ["resultType", "_meta", "serverInfo"];
     for (index, name) in T::KNOWN_MEMBER_NAMES.iter().enumerate() {
-        if COMMON_NAMES.contains(name)
+        if COMMON_RESULT_MEMBER_NAMES.contains(name)
             || T::KNOWN_MEMBER_NAMES[..index]
                 .iter()
                 .any(|previous| previous == name)
@@ -995,7 +1131,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prt_04_a_positive() {
+    fn result_unit_a_positive_round_trip() {
         let source = r#"{"resultType":"complete","_meta":{"trace":true},"serverInfo":{"name":"FastMCP","version":"0.1"},"first":{"integer":123456789012345678901234567890,"decimal":1.20e+4,"nil":null,"array":[false,"text"]},"second":{"nested":{"ok":true}}}"#;
         let (decoded, diagnostic) = decode_peer_result(
             source,
@@ -1016,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_04_a_planted_negative() {
+    fn result_unit_a_rejects_null_discriminator() {
         let accepted = r#"{"resultType":"complete","extension":{"count":1.20e+4}}"#;
         let (baseline, _) = decode_peer_result(accepted, ResultPeerEra::Legacy, &CoreResultDiscriminatorPolicy)
             .expect("baseline");
@@ -1031,6 +1167,52 @@ mod tests {
         assert_eq!(before.extras, after.extras);
         assert_eq!(before.extras.members().first().map(|member| &member.value), Some(&ExactJsonValue::Object(ExactJsonObject { members: vec![ExactJsonMember { name: "count".to_owned(), value: ExactJsonValue::Number("1.20e+4".to_owned()) }] })));
         assert_eq!(encode_result(&DecodedResult::Complete(before)), accepted);
+    }
+
+    #[test]
+    fn rejected_extension_retains_its_raw_envelope() {
+        let source = r#"{"before":true,"resultType":"example/extension","after":1.20e+4}"#;
+        let error = decode_peer_result(source, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
+            .expect_err("the default policy must not activate an unclaimed extension");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::RejectedExtension);
+        assert_eq!(error.path(), "$.resultType");
+        let envelope = error.raw_envelope().expect("rejected envelope is diagnostic data");
+        assert_eq!(envelope.discriminator(), "example/extension");
+        assert_eq!(envelope.members().iter().map(|member| member.name.as_str()).collect::<Vec<_>>(), ["before", "resultType", "after"]);
+        assert_eq!(envelope.members()[2].value, ExactJsonValue::Number("1.20e+4".to_owned()));
+    }
+
+    #[test]
+    fn locally_authored_extras_use_the_bounded_exact_value_boundary() {
+        let valid = UnknownResultMembers::try_new(
+            vec![ExactJsonMember {
+                name: "extension".to_owned(),
+                value: ExactJsonValue::Number("123456789012345678901234567890".to_owned()),
+            }],
+            &["resultType", "_meta", "serverInfo"],
+        )
+        .expect("a bounded exact numeric lexeme is retained");
+        assert_eq!(valid.members()[0].value, ExactJsonValue::Number("123456789012345678901234567890".to_owned()));
+
+        let invalid = UnknownResultMembers::try_new(
+            vec![ExactJsonMember {
+                name: "extension".to_owned(),
+                value: ExactJsonValue::Number("1.".to_owned()),
+            }],
+            &["resultType", "_meta", "serverInfo"],
+        )
+        .expect_err("an invalid numeric lexeme never enters an open-member result");
+        assert_eq!(invalid.kind(), ResultDecodeErrorKind::InvalidJson);
+
+        let collision = UnknownResultMembers::try_new(
+            vec![ExactJsonMember {
+                name: "resultType".to_owned(),
+                value: ExactJsonValue::String("complete".to_owned()),
+            }],
+            &[],
+        )
+        .expect_err("a common discriminator can never be locally authored as an extra");
+        assert_eq!(collision.kind(), ResultDecodeErrorKind::KnownMemberCollision);
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1056,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_04_b_positive() {
+    fn result_unit_b_typed_decode_preserves_open_members() {
         let source = r#"{"resultType":"complete","status":"ready","record":{"id":123456789012345678901234567890},"opaque":{"null":null,"bool":true,"decimal":1.20e+4,"array":["kept"]}}"#;
         let (decoded, diagnostic) = decode_typed_complete::<LookupResult>(source, ResultPeerEra::Modern)
             .expect("selected complete members decode through the public result codec");
@@ -1068,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_04_b_planted_negative() {
+    fn result_unit_b_typed_decode_rejects_wrong_known_kind() {
         let accepted = r#"{"resultType":"complete","status":"ready","record":{"id":123456789012345678901234567890},"opaque":{"decimal":1.20e+4}}"#;
         let (baseline, _) = decode_typed_complete::<LookupResult>(accepted, ResultPeerEra::Modern)
             .expect("baseline selected complete result");
