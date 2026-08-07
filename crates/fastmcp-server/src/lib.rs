@@ -118,7 +118,7 @@ pub use bidirectional::{
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -142,12 +142,16 @@ use fastmcp_core::{
     McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
+use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{
-    CallToolParams, CancelledParams, CorrelationKey, GetPromptParams, InitializeParams,
-    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
-    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
-    Prompt, ReadResourceParams, RequestId, Resource, ResourceTemplate, ServerCapabilities,
-    ServerInfo, SetLogLevelParams, SubscribeResourceParams, Tool, UnsubscribeResourceParams,
+    CallToolParams, CancelledParams, CorrelationKey, DiscoveryCacheHints, GetPromptParams,
+    InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel,
+    LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES, Prompt, ReadResourceParams, RequestId,
+    Resource, ResourceTemplate, SERVER_DISCOVER_METHOD, ServerCapabilities,
+    ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult, ServerInfo,
+    ServerInstructions, SetLogLevelParams, SubscribeResourceParams, Tool,
+    UnsubscribeResourceParams,
 };
 
 const REDACTED_EXTENSION_PANIC_INCIDENT: &[u8] =
@@ -160,6 +164,8 @@ const RESOURCE_SUBSCRIPTION_CAPACITY_MESSAGE: &str = "Resource subscription capa
 const MAX_DISPATCH_QUEUE_DEPTH: usize = 64;
 const MAX_DISPATCH_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const DISPATCH_QUEUE_CAPACITY_MESSAGE: &str = "Server request queue capacity exhausted";
+const DISCOVERY_CACHE_MAX_AGE_SECONDS: u32 = 60;
+const MODERN_ONLY_INITIALIZE_MESSAGE: &str = "Initialization-based MCP is not enabled";
 const STDIO_OUTPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(not(test))]
 const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -239,7 +245,8 @@ fn is_notification_only_method(method: &str) -> bool {
 fn is_request_only_method(method: &str) -> bool {
     matches!(
         method,
-        "initialize"
+        "server/discover"
+            | "initialize"
             | "ping"
             | "logging/setLevel"
             | "tools/list"
@@ -1021,6 +1028,40 @@ impl Server {
         &self.capabilities
     }
 
+    /// Returns the final discovery result for this constructed server.
+    ///
+    /// Discovery is explicitly unauthenticated at this server boundary, just
+    /// like the rest of the modern stateless surface: transports authenticate
+    /// raw credentials before constructing [`InboundRequestContext`], while
+    /// this method receives only already-sanitized request facts. The result
+    /// derives from the immutable router catalog and cannot grant access to a
+    /// method or notification path that is not installed.
+    pub fn server_discovery(&self) -> McpResult<ServerDiscoverResult> {
+        let instructions = match self.instructions.as_deref() {
+            Some(value) if value.len() > MAX_SERVER_INSTRUCTIONS_BYTES => {
+                return Err(McpError::internal_error(
+                    "Server discovery instructions exceed the configured limit",
+                ));
+            }
+            Some(value) => Some(ServerInstructions::new(value.to_owned()).map_err(|_| {
+                McpError::internal_error("Server discovery instructions are invalid")
+            })?),
+            None => None,
+        };
+        let registry = self.router.server_discovery_behavior_registry();
+        let capabilities = ServerDiscoverCapabilities::from_registry(&registry, BTreeMap::new())
+            .map_err(|_| McpError::internal_error("Server discovery capabilities are invalid"))?;
+
+        Ok(ServerDiscoverResult::new(
+            capabilities,
+            self.info.clone(),
+            instructions,
+            Some(DiscoveryCacheHints::with_max_age_seconds(
+                DISCOVERY_CACHE_MAX_AGE_SECONDS,
+            )),
+        ))
+    }
+
     /// Lists all registered tools.
     #[must_use]
     pub fn tools(&self) -> Vec<Tool> {
@@ -1297,7 +1338,17 @@ impl Server {
                     Err(_payload) => return Err(extension_panic_error("middleware_on_request")),
                 }
             }
-            self.router.dispatch_stateless(&request_ctx, request)
+            if request.method == SERVER_DISCOVER_METHOD {
+                let params = request
+                    .params
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                serde_json::from_value::<ServerDiscoverRequest>(params)
+                    .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                serde_json::to_value(self.server_discovery()?).map_err(McpError::from)
+            } else {
+                self.router.dispatch_stateless(&request_ctx, request)
+            }
         })();
         let result = match result {
             Ok(value) => self
@@ -1342,6 +1393,65 @@ impl Server {
                 )
             }
         })
+    }
+
+    /// Processes a modern request under an explicit protocol policy.
+    ///
+    /// `ModernOnly` declines legacy `initialize` before parameter decoding or
+    /// any legacy session lookup. Other requests retain the stateless public
+    /// dispatch behavior, including final `server/discover` as the first
+    /// request.
+    #[must_use]
+    pub fn dispatch_with_protocol_policy(
+        &self,
+        policy: ProtocolPolicy,
+        inbound: &InboundRequestContext,
+        request: &JsonRpcRequest,
+    ) -> Option<JsonRpcResponse> {
+        if matches!(policy, ProtocolPolicy::ModernOnly)
+            && request.method == "initialize"
+            && request.validate().is_ok()
+            && inbound.request_id() == request_id_to_u64(request.id.as_ref())
+        {
+            return request.id.clone().map(|id| {
+                JsonRpcResponse::error(
+                    Some(id),
+                    JsonRpcError {
+                        code: (-32601).into(),
+                        message: MODERN_ONLY_INITIALIZE_MESSAGE.to_owned(),
+                        data: Some(serde_json::json!({ "supported": ["2026-07-28"] })),
+                    },
+                )
+            });
+        }
+        self.dispatch_stateless(inbound, request)
+    }
+
+    /// Maps an explicit-policy modern dispatch result onto the HTTP response
+    /// status required for a legacy initialize refusal.
+    ///
+    /// The transport still owns raw HTTP parsing, origin checks, and
+    /// authentication before it constructs [`InboundRequestContext`]. This
+    /// helper owns only the transport-neutral JSON-RPC result and its final
+    /// HTTP status mapping.
+    #[must_use]
+    pub fn dispatch_http_with_protocol_policy(
+        &self,
+        policy: ProtocolPolicy,
+        inbound: &InboundRequestContext,
+        request: &JsonRpcRequest,
+    ) -> HttpResponse {
+        let is_modern_only_initialize = matches!(policy, ProtocolPolicy::ModernOnly)
+            && request.method == "initialize"
+            && request.validate().is_ok()
+            && inbound.request_id() == request_id_to_u64(request.id.as_ref());
+        match self.dispatch_with_protocol_policy(policy, inbound, request) {
+            Some(response) if is_modern_only_initialize => {
+                HttpResponse::new(HttpStatus::BAD_REQUEST).with_json(&response)
+            }
+            Some(response) => HttpResponse::ok().with_json(&response),
+            None => HttpResponse::new(HttpStatus::ACCEPTED),
+        }
     }
 
     /// Processes a single JSON-RPC request through the full server dispatch

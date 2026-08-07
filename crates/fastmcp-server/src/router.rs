@@ -21,8 +21,8 @@ use fastmcp_protocol::{
     InitializeResult, JsonRpcRequest, ListPromptsParams, ListPromptsResult,
     ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
     ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker,
-    Prompt, ReadResourceParams, ReadResourceResult, Resource, ResourceTemplate, Tool, validate,
-    validate_strict,
+    Prompt, ReadResourceParams, ReadResourceResult, Resource, ResourceTemplate, ServerBehavior,
+    ServerBehaviorRegistry, Tool, validate, validate_strict,
 };
 #[cfg(test)]
 use fastmcp_protocol::{
@@ -988,6 +988,28 @@ impl Router {
     #[must_use]
     pub fn prompts_count(&self) -> usize {
         self.prompts.len()
+    }
+
+    /// Returns the immutable behavior registry for final server discovery.
+    ///
+    /// This records only APIs backed by this router's installed catalog. The
+    /// modern stateless dispatcher has no logging-request emitter,
+    /// completion handler, list-change producer, subscription listener, or
+    /// resource-update delivery path, so none of those behaviors can be
+    /// advertised merely because adjacent legacy code compiled.
+    #[must_use]
+    pub(crate) fn server_discovery_behavior_registry(&self) -> ServerBehaviorRegistry {
+        let mut behaviors = Vec::with_capacity(3);
+        if !self.tool_order.is_empty() {
+            behaviors.push(ServerBehavior::ToolsList);
+        }
+        if !self.resource_order.is_empty() || !self.resource_template_order.is_empty() {
+            behaviors.push(ServerBehavior::ResourcesList);
+        }
+        if !self.prompt_order.is_empty() {
+            behaviors.push(ServerBehavior::PromptsList);
+        }
+        ServerBehaviorRegistry::from_behaviors(behaviors)
     }
 
     /// Gets a tool handler by name.
