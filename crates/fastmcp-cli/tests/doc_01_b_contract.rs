@@ -5,25 +5,66 @@
 
 use std::process::{Command, Output};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ModeExpectation {
-    PlannedUnverifiedNotExecutable,
-    Supported,
-}
-
+/// This oracle is deliberately authored in the public-binary target instead
+/// of importing production validation code. It models each support assertion
+/// independently, so a one-field mutation has a stable, specific refusal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PublicHelpOracle {
-    modern_only: ModeExpectation,
+    protocol_2026_under_implementation: bool,
+    public_protocol_version: &'static str,
+    modern_only_executable: bool,
+    auto_executable: bool,
+    legacy_only_executable: bool,
+    mcp_2025_unsupported: bool,
+    aggregate_claims_are_evidence: bool,
 }
 
 const PROVISIONAL_PUBLIC_HELP_ORACLE: PublicHelpOracle = PublicHelpOracle {
-    modern_only: ModeExpectation::PlannedUnverifiedNotExecutable,
+    protocol_2026_under_implementation: true,
+    public_protocol_version: "2024-11-05",
+    modern_only_executable: false,
+    auto_executable: false,
+    legacy_only_executable: false,
+    mcp_2025_unsupported: true,
+    aggregate_claims_are_evidence: false,
 };
+
+const PROVISIONAL_PUBLIC_STATUS_STANZA: &str = concat!(
+    "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
+    "Public PROTOCOL_VERSION remains 2024-11-05; ModernOnly, Auto, and LegacyOnly are ",
+    "planned/unverified policy modes, not executable CLI profiles. MCP 2025-11-25 is ",
+    "unsupported: it has no alias, compatibility profile, route, or diagnostic selection. ",
+    "Help, inspect output, and examples are not conformance, runtime-readiness, maturity, ",
+    "or release evidence. Machine-readable diagnostics are separate from human-facing ",
+    "examples, redact secrets and peer-controlled terminal text, and preserve nonzero ",
+    "failures rather than fabricating an empty catalog or selection."
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublicHelpRefusal {
-    MissingRequiredClause,
-    UnexpectedAffirmativeClaim,
+    InvalidOutputEnvelope,
+    ProtocolStatusIsNotProvisional,
+    UnexpectedPublicProtocolVersion,
+    ModernOnlyIsExecutable,
+    AutoIsExecutable,
+    LegacyOnlyIsExecutable,
+    Mcp2025IsNotUnsupported,
+    AggregateClaimTreatedAsEvidence,
+    MissingStatusStanza,
+    StatusStanzaMismatch,
+    StatusClaimOutsideStanza,
+    UnsafeRootHelpContent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublicHelpCandidate {
+    oracle: PublicHelpOracle,
+    stdout: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AcceptedPublicHelp {
+    candidate: Option<PublicHelpCandidate>,
 }
 
 fn fastmcp_output(argument: &str) -> Output {
@@ -41,6 +82,32 @@ fn normalized_stdout(output: &Output) -> String {
         .join(" ")
 }
 
+fn validate_public_help_oracle(oracle: PublicHelpOracle) -> Result<(), PublicHelpRefusal> {
+    if !oracle.protocol_2026_under_implementation {
+        return Err(PublicHelpRefusal::ProtocolStatusIsNotProvisional);
+    }
+    if oracle.public_protocol_version != "2024-11-05" {
+        return Err(PublicHelpRefusal::UnexpectedPublicProtocolVersion);
+    }
+    if oracle.modern_only_executable {
+        return Err(PublicHelpRefusal::ModernOnlyIsExecutable);
+    }
+    if oracle.auto_executable {
+        return Err(PublicHelpRefusal::AutoIsExecutable);
+    }
+    if oracle.legacy_only_executable {
+        return Err(PublicHelpRefusal::LegacyOnlyIsExecutable);
+    }
+    if !oracle.mcp_2025_unsupported {
+        return Err(PublicHelpRefusal::Mcp2025IsNotUnsupported);
+    }
+    if oracle.aggregate_claims_are_evidence {
+        return Err(PublicHelpRefusal::AggregateClaimTreatedAsEvidence);
+    }
+
+    Ok(())
+}
+
 fn evaluate_public_root_help(
     output: &Output,
     oracle: PublicHelpOracle,
@@ -50,54 +117,60 @@ fn evaluate_public_root_help(
         || output.stdout.len() > 32 * 1024
         || output.stdout.contains(&0x1b)
     {
-        return Err(PublicHelpRefusal::MissingRequiredClause);
+        return Err(PublicHelpRefusal::InvalidOutputEnvelope);
     }
+    validate_public_help_oracle(oracle)?;
 
-    let stdout = normalized_stdout(output);
-    let required_clauses = [
-        "FastMCP CLI - Run, inspect, and install MCP servers.",
-        "Protocol status: MCP 2026-07-28 support is under implementation and unverified.",
-        "Public PROTOCOL_VERSION remains 2024-11-05;",
-        "ModernOnly, Auto, and LegacyOnly are planned/unverified policy modes, not executable CLI profiles.",
-        "MCP 2025-11-25 is unsupported: it has no alias, compatibility profile, route, or diagnostic selection.",
-        "Help, inspect output, and examples are not conformance, runtime-readiness, maturity, or release evidence.",
-        "Machine-readable diagnostics are separate from human-facing examples, redact secrets and peer-controlled terminal text, and preserve nonzero failures rather than fabricating an empty catalog or selection.",
-    ];
-    if required_clauses
-        .iter()
-        .any(|clause| !stdout.contains(clause))
+    validate_public_root_help_bytes(&output.stdout)
+}
+
+fn validate_public_root_help_bytes(bytes: &[u8]) -> Result<(), PublicHelpRefusal> {
+    let stdout = String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let Some(status_start) = stdout.find("Protocol status:") else {
+        return Err(PublicHelpRefusal::MissingStatusStanza);
+    };
+    let (root_help, status_stanza) = stdout.split_at(status_start);
+    if !root_help.contains("FastMCP CLI - Run, inspect, and install MCP servers.")
+        || status_stanza != PROVISIONAL_PUBLIC_STATUS_STANZA
     {
-        return Err(PublicHelpRefusal::MissingRequiredClause);
+        return Err(PublicHelpRefusal::StatusStanzaMismatch);
     }
 
-    let forbidden_claims = [
-        "MCP 2026-07-28 is supported",
-        "Auto is available",
-        "LegacyOnly is production ready",
-        "MCP 2025-11-25 has an alias",
-        "aggregate MCP support",
-        "MCP conformance",
-        "release ready",
-        "Bearer ",
-        "token=",
+    let status_terms = [
+        "MCP 2026-07-28",
+        "PROTOCOL_VERSION",
+        "ModernOnly",
+        "Auto",
+        "LegacyOnly",
+        "MCP 2025-11-25",
+        "conformance",
+        "runtime-readiness",
+        "maturity",
+        "release evidence",
     ];
-    if forbidden_claims.iter().any(|claim| stdout.contains(claim)) {
-        return Err(PublicHelpRefusal::UnexpectedAffirmativeClaim);
+    if status_terms.iter().any(|term| root_help.contains(term)) {
+        return Err(PublicHelpRefusal::StatusClaimOutsideStanza);
+    }
+    if ["Bearer ", "token=", "\u{1b}"]
+        .iter()
+        .any(|term| root_help.contains(term))
+    {
+        return Err(PublicHelpRefusal::UnsafeRootHelpContent);
     }
 
-    match oracle.modern_only {
-        ModeExpectation::PlannedUnverifiedNotExecutable => {
-            if stdout.contains("ModernOnly is supported") || stdout.contains("ModernOnly is runnable") {
-                return Err(PublicHelpRefusal::UnexpectedAffirmativeClaim);
-            }
-        }
-        ModeExpectation::Supported => {
-            if !stdout.contains("ModernOnly is supported") {
-                return Err(PublicHelpRefusal::MissingRequiredClause);
-            }
-        }
-    }
+    Ok(())
+}
 
+fn admit_public_root_help(
+    state: &mut AcceptedPublicHelp,
+    candidate: PublicHelpCandidate,
+) -> Result<(), PublicHelpRefusal> {
+    validate_public_help_oracle(candidate.oracle)?;
+    validate_public_root_help_bytes(&candidate.stdout)?;
+    state.candidate = Some(candidate);
     Ok(())
 }
 
@@ -113,7 +186,31 @@ fn doc_01_b_public_binary_positive() {
         evaluate_public_root_help(&short_help, PROVISIONAL_PUBLIC_HELP_ORACLE),
         Ok(())
     );
-    assert_eq!(normalized_stdout(&long_help), normalized_stdout(&short_help));
+    assert_eq!(
+        normalized_stdout(&long_help),
+        normalized_stdout(&short_help)
+    );
+
+    let mut long_state = AcceptedPublicHelp::default();
+    assert_eq!(
+        admit_public_root_help(
+            &mut long_state,
+            PublicHelpCandidate {
+                oracle: PROVISIONAL_PUBLIC_HELP_ORACLE,
+                stdout: long_help.stdout.clone(),
+            },
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        long_state
+            .candidate
+            .as_ref()
+            .expect("accepted public help must retain emitted bytes")
+            .stdout
+            .as_slice(),
+        long_help.stdout.as_slice()
+    );
 
     let subcommand_help = Command::new(env!("CARGO_BIN_EXE_fastmcp"))
         .args(["run", "--help"])
@@ -129,26 +226,34 @@ fn doc_01_b_public_binary_positive() {
 #[test]
 fn doc_01_b_public_binary_planted_negative() {
     let long_help = fastmcp_output("--help");
-    let short_help = fastmcp_output("-h");
-    let long_help_before = long_help.stdout.clone();
-    let short_help_before = short_help.stdout.clone();
+    let baseline = PublicHelpCandidate {
+        oracle: PROVISIONAL_PUBLIC_HELP_ORACLE,
+        stdout: long_help.stdout.clone(),
+    };
+    let mut state = AcceptedPublicHelp::default();
+    admit_public_root_help(&mut state, baseline.clone())
+        .expect("baseline public help must satisfy the independent oracle");
+    let accepted_before = state.clone();
 
-    let mut planted_oracle = PROVISIONAL_PUBLIC_HELP_ORACLE;
-    planted_oracle.modern_only = ModeExpectation::Supported;
+    let mut planted_candidate = baseline;
+    planted_candidate.oracle.modern_only_executable = true;
     assert_eq!(
-        evaluate_public_root_help(&long_help, planted_oracle),
-        Err(PublicHelpRefusal::MissingRequiredClause)
+        admit_public_root_help(&mut state, planted_candidate),
+        Err(PublicHelpRefusal::ModernOnlyIsExecutable)
     );
     assert_eq!(
-        long_help.stdout, long_help_before,
-        "one-field oracle mutation must not alter long-help output"
+        state, accepted_before,
+        "a rejected one-field oracle mutation must not alter accepted evaluator/output state"
     );
+    let long_help_after_rejection = fastmcp_output("--help");
     assert_eq!(
-        short_help.stdout, short_help_before,
-        "one-field oracle mutation must not alter short-help output"
-    );
-    assert_eq!(
-        evaluate_public_root_help(&short_help, PROVISIONAL_PUBLIC_HELP_ORACLE),
-        Ok(())
+        long_help_after_rejection.stdout.as_slice(),
+        accepted_before
+            .candidate
+            .as_ref()
+            .expect("baseline accepted state must retain public bytes")
+            .stdout
+            .as_slice(),
+        "a rejected oracle mutation must not alter the real binary's consumer-visible output"
     );
 }

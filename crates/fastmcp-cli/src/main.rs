@@ -63,9 +63,18 @@ const CLI_PROTOCOL_STATUS_HELP: &str = concat!(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CliDocumentationRefusal {
     ExpectedDisplayHelp,
-    MissingRequiredClause,
-    ContradictorySupportState,
-    ContradictoryAffirmativeClaim,
+    ProtocolStatusIsNotProvisional,
+    UnexpectedPublicProtocolVersion,
+    ModernOnlyIsExecutable,
+    AutoIsExecutable,
+    LegacyOnlyIsExecutable,
+    Mcp2025IsNotUnsupported,
+    AggregateClaimTreatedAsEvidence,
+    MissingStatusStanza,
+    StatusStanzaMismatch,
+    StatusClaimOutsideStanza,
+    UnsafeRootHelpContent,
+    NoAcceptedHelp,
     HelpEmissionFailed,
 }
 
@@ -73,35 +82,53 @@ impl CliDocumentationRefusal {
     const fn diagnostic(self) -> &'static str {
         match self {
             Self::ExpectedDisplayHelp => "DOC-01 CLI help request must reach Clap DisplayHelp",
-            Self::MissingRequiredClause => {
-                "DOC-01 CLI help is missing a required provisional-status clause"
+            Self::ProtocolStatusIsNotProvisional => {
+                "DOC-01 CLI contract must keep MCP 2026-07-28 provisional"
             }
-            Self::ContradictorySupportState => {
-                "DOC-01 CLI documentation contract contains a contradictory support state"
+            Self::UnexpectedPublicProtocolVersion => {
+                "DOC-01 CLI contract has an unexpected public protocol version"
             }
-            Self::ContradictoryAffirmativeClaim => {
-                "DOC-01 CLI help contains a forbidden affirmative support claim"
+            Self::ModernOnlyIsExecutable => {
+                "DOC-01 CLI contract must not make ModernOnly executable"
             }
+            Self::AutoIsExecutable => "DOC-01 CLI contract must not make Auto executable",
+            Self::LegacyOnlyIsExecutable => {
+                "DOC-01 CLI contract must not make LegacyOnly executable"
+            }
+            Self::Mcp2025IsNotUnsupported => {
+                "DOC-01 CLI contract must keep MCP 2025-11-25 unsupported"
+            }
+            Self::AggregateClaimTreatedAsEvidence => {
+                "DOC-01 CLI contract must not treat aggregate claims as evidence"
+            }
+            Self::MissingStatusStanza => {
+                "DOC-01 CLI help is missing its provisional protocol-status stanza"
+            }
+            Self::StatusStanzaMismatch => {
+                "DOC-01 CLI help has an altered provisional protocol-status stanza"
+            }
+            Self::StatusClaimOutsideStanza => {
+                "DOC-01 CLI help places a protocol-status claim outside its provisional stanza"
+            }
+            Self::UnsafeRootHelpContent => {
+                "DOC-01 CLI help contains unsafe credential or terminal content"
+            }
+            Self::NoAcceptedHelp => "DOC-01 CLI cannot emit help before a public frame is accepted",
             Self::HelpEmissionFailed => "DOC-01 CLI help emission failed",
         }
     }
 }
 
-/// Semantic support state for one policy profile. This independently authored
-/// contract is the validator input; it is never derived from Clap help bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CliPolicyModeStatus {
-    PlannedUnverifiedNotExecutable,
-    Runnable,
-}
-
+/// This independently authored semantic contract is validator input; it is
+/// never derived from Clap help bytes. Each executable flag is explicit so a
+/// one-field mutation receives a distinct typed refusal in shipped code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CliDocumentationContract {
     protocol_2026_under_implementation: bool,
     public_protocol_version: &'static str,
-    modern_only: CliPolicyModeStatus,
-    auto: CliPolicyModeStatus,
-    legacy_only: CliPolicyModeStatus,
+    modern_only_executable: bool,
+    auto_executable: bool,
+    legacy_only_executable: bool,
     mcp_2025_unsupported: bool,
     aggregate_claims_are_evidence: bool,
 }
@@ -109,16 +136,22 @@ struct CliDocumentationContract {
 const CLI_DOCUMENTATION_CONTRACT: CliDocumentationContract = CliDocumentationContract {
     protocol_2026_under_implementation: true,
     public_protocol_version: "2024-11-05",
-    modern_only: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
-    auto: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
-    legacy_only: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
+    modern_only_executable: false,
+    auto_executable: false,
+    legacy_only_executable: false,
     mcp_2025_unsupported: true,
     aggregate_claims_are_evidence: false,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CliHelpCandidate {
+    contract: CliDocumentationContract,
+    bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ConsumerVisibleCliHelp {
-    bytes: Vec<u8>,
+    accepted: Option<CliHelpCandidate>,
 }
 
 /// FastMCP CLI - Run, inspect, and install MCP servers.
@@ -144,57 +177,68 @@ fn normalize_cli_help_whitespace(bytes: &[u8]) -> String {
 fn validate_cli_documentation_contract(
     contract: CliDocumentationContract,
 ) -> Result<(), CliDocumentationRefusal> {
-    if !contract.protocol_2026_under_implementation
-        || contract.public_protocol_version != "2024-11-05"
-        || contract.modern_only != CliPolicyModeStatus::PlannedUnverifiedNotExecutable
-        || contract.auto != CliPolicyModeStatus::PlannedUnverifiedNotExecutable
-        || contract.legacy_only != CliPolicyModeStatus::PlannedUnverifiedNotExecutable
-        || !contract.mcp_2025_unsupported
-        || contract.aggregate_claims_are_evidence
-    {
-        return Err(CliDocumentationRefusal::ContradictorySupportState);
+    if !contract.protocol_2026_under_implementation {
+        return Err(CliDocumentationRefusal::ProtocolStatusIsNotProvisional);
+    }
+    if contract.public_protocol_version != "2024-11-05" {
+        return Err(CliDocumentationRefusal::UnexpectedPublicProtocolVersion);
+    }
+    if contract.modern_only_executable {
+        return Err(CliDocumentationRefusal::ModernOnlyIsExecutable);
+    }
+    if contract.auto_executable {
+        return Err(CliDocumentationRefusal::AutoIsExecutable);
+    }
+    if contract.legacy_only_executable {
+        return Err(CliDocumentationRefusal::LegacyOnlyIsExecutable);
+    }
+    if !contract.mcp_2025_unsupported {
+        return Err(CliDocumentationRefusal::Mcp2025IsNotUnsupported);
+    }
+    if contract.aggregate_claims_are_evidence {
+        return Err(CliDocumentationRefusal::AggregateClaimTreatedAsEvidence);
     }
 
     Ok(())
 }
 
 /// Validate the rendered public help against the independent semantic contract.
-/// Whitespace normalization makes wrapping width an output-only concern.
-fn validate_public_cli_help(bytes: &[u8]) -> Result<(), CliDocumentationRefusal> {
-    validate_cli_documentation_contract(CLI_DOCUMENTATION_CONTRACT)?;
+/// Whitespace normalization makes wrapping width an output-only concern. The
+/// complete status stanza must be the final normalized root-help section, so
+/// appending or altering any support claim fails instead of slipping past a
+/// substring blacklist.
+fn validate_public_cli_help(candidate: &CliHelpCandidate) -> Result<(), CliDocumentationRefusal> {
+    validate_cli_documentation_contract(candidate.contract)?;
 
-    let candidate = normalize_cli_help_whitespace(bytes);
-    let required_clauses = [
-        "Protocol status: MCP 2026-07-28 support is under implementation and unverified.",
-        "Public PROTOCOL_VERSION remains 2024-11-05;",
-        "ModernOnly, Auto, and LegacyOnly are planned/unverified policy modes, not executable CLI profiles.",
-        "MCP 2025-11-25 is unsupported: it has no alias, compatibility profile, route, or diagnostic selection.",
-        "Help, inspect output, and examples are not conformance, runtime-readiness, maturity, or release evidence.",
-        "Machine-readable diagnostics are separate from human-facing examples, redact secrets and peer-controlled terminal text, and preserve nonzero failures rather than fabricating an empty catalog or selection.",
-    ];
-    if required_clauses
-        .iter()
-        .any(|clause| !candidate.contains(clause))
-    {
-        return Err(CliDocumentationRefusal::MissingRequiredClause);
+    let rendered = normalize_cli_help_whitespace(&candidate.bytes);
+    let Some(status_start) = rendered.find("Protocol status:") else {
+        return Err(CliDocumentationRefusal::MissingStatusStanza);
+    };
+    let (root_help, status_stanza) = rendered.split_at(status_start);
+    if status_stanza != normalize_cli_help_whitespace(CLI_PROTOCOL_STATUS_HELP.as_bytes()) {
+        return Err(CliDocumentationRefusal::StatusStanzaMismatch);
     }
 
-    let forbidden_affirmative_claims = [
-        "MCP 2026-07-28 is supported",
-        "ModernOnly is supported",
-        "ModernOnly is runnable",
-        "Auto is available",
-        "LegacyOnly is production ready",
-        "MCP 2025-11-25 has an alias",
-        "aggregate MCP support",
-        "MCP conformance",
-        "release ready",
+    let status_terms = [
+        "MCP 2026-07-28",
+        "PROTOCOL_VERSION",
+        "ModernOnly",
+        "Auto",
+        "LegacyOnly",
+        "MCP 2025-11-25",
+        "conformance",
+        "runtime-readiness",
+        "maturity",
+        "release evidence",
     ];
-    if forbidden_affirmative_claims
+    if status_terms.iter().any(|term| root_help.contains(term)) {
+        return Err(CliDocumentationRefusal::StatusClaimOutsideStanza);
+    }
+    if ["Bearer ", "token=", "\u{1b}"]
         .iter()
-        .any(|claim| candidate.contains(claim))
+        .any(|term| root_help.contains(term))
     {
-        return Err(CliDocumentationRefusal::ContradictoryAffirmativeClaim);
+        return Err(CliDocumentationRefusal::UnsafeRootHelpContent);
     }
 
     Ok(())
@@ -209,10 +253,14 @@ fn display_help_bytes(error: clap::Error) -> Result<Vec<u8>, CliDocumentationRef
 
 /// Invoke the same `--help` parse path a CLI consumer receives. Clap returns
 /// the public help frame as `DisplayHelp` rather than parsing a command.
-fn public_cli_help_bytes() -> Result<Vec<u8>, CliDocumentationRefusal> {
+#[cfg(test)]
+fn public_cli_help_candidate() -> Result<CliHelpCandidate, CliDocumentationRefusal> {
     match Cli::try_parse_from(["fastmcp", "--help"]) {
         Ok(_) => Err(CliDocumentationRefusal::ExpectedDisplayHelp),
-        Err(error) => display_help_bytes(error),
+        Err(error) => Ok(CliHelpCandidate {
+            contract: CLI_DOCUMENTATION_CONTRACT,
+            bytes: display_help_bytes(error)?,
+        }),
     }
 }
 
@@ -221,10 +269,10 @@ fn public_cli_help_bytes() -> Result<Vec<u8>, CliDocumentationRefusal> {
 /// untouched.
 fn admit_public_cli_help(
     state: &mut ConsumerVisibleCliHelp,
-    candidate: Vec<u8>,
+    candidate: CliHelpCandidate,
 ) -> Result<(), CliDocumentationRefusal> {
     validate_public_cli_help(&candidate)?;
-    state.bytes = candidate;
+    state.accepted = Some(candidate);
     Ok(())
 }
 
@@ -232,7 +280,13 @@ fn admit_display_help(
     state: &mut ConsumerVisibleCliHelp,
     error: clap::Error,
 ) -> Result<(), CliDocumentationRefusal> {
-    admit_public_cli_help(state, display_help_bytes(error)?)
+    admit_public_cli_help(
+        state,
+        CliHelpCandidate {
+            contract: CLI_DOCUMENTATION_CONTRACT,
+            bytes: display_help_bytes(error)?,
+        },
+    )
 }
 
 /// Emit precisely the previously admitted public bytes. The caller never
@@ -241,8 +295,12 @@ fn emit_admitted_cli_help_to<W: Write>(
     state: &ConsumerVisibleCliHelp,
     writer: &mut W,
 ) -> Result<(), CliDocumentationRefusal> {
+    let accepted = state
+        .accepted
+        .as_ref()
+        .ok_or(CliDocumentationRefusal::NoAcceptedHelp)?;
     writer
-        .write_all(&state.bytes)
+        .write_all(&accepted.bytes)
         .and_then(|()| writer.flush())
         .map_err(|_| CliDocumentationRefusal::HelpEmissionFailed)
 }
@@ -269,9 +327,9 @@ fn doc_01_b_positive() {
     let independently_authored_contract = CliDocumentationContract {
         protocol_2026_under_implementation: true,
         public_protocol_version: "2024-11-05",
-        modern_only: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
-        auto: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
-        legacy_only: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
+        modern_only_executable: false,
+        auto_executable: false,
+        legacy_only_executable: false,
         mcp_2025_unsupported: true,
         aggregate_claims_are_evidence: false,
     };
@@ -292,21 +350,32 @@ fn doc_01_b_positive() {
             .collect::<Vec<_>>()
     ));
 
-    let public_help = public_cli_help_bytes().expect("--help must reach Clap DisplayHelp");
+    let public_help = public_cli_help_candidate().expect("--help must reach Clap DisplayHelp");
     let mut state = ConsumerVisibleCliHelp::default();
 
     assert_eq!(
         admit_public_cli_help(&mut state, public_help.clone()),
         Ok(())
     );
-    assert_eq!(state.bytes, public_help);
+    assert_eq!(state.accepted, Some(public_help));
 
     let mut emitted = Vec::new();
     assert_eq!(emit_admitted_cli_help_to(&state, &mut emitted), Ok(()));
-    assert_eq!(emitted, state.bytes);
+    assert_eq!(
+        emitted.as_slice(),
+        state
+            .accepted
+            .as_ref()
+            .expect("admitted state must retain public bytes")
+            .bytes
+            .as_slice()
+    );
 
     let short_help = match Cli::try_parse_from(["fastmcp", "-h"]) {
-        Err(error) => display_help_bytes(error).expect("root -h must reach Clap DisplayHelp"),
+        Err(error) => CliHelpCandidate {
+            contract: CLI_DOCUMENTATION_CONTRACT,
+            bytes: display_help_bytes(error).expect("root -h must reach Clap DisplayHelp"),
+        },
         Ok(_) => panic!("root -h must not parse a command"),
     };
     let mut short_state = ConsumerVisibleCliHelp::default();
@@ -333,33 +402,35 @@ fn doc_01_b_positive() {
 #[test]
 fn doc_01_b_planted_negative() {
     let mut state = ConsumerVisibleCliHelp::default();
-    admit_public_cli_help(
-        &mut state,
-        public_cli_help_bytes().expect("baseline public help must reach Clap DisplayHelp"),
-    )
-    .expect("baseline public help must be admitted");
-    let accepted_before = state.bytes.clone();
-    let accepted_contract = CLI_DOCUMENTATION_CONTRACT;
-    let mut planted_contract = accepted_contract;
-    planted_contract.modern_only = CliPolicyModeStatus::Runnable;
+    let baseline =
+        public_cli_help_candidate().expect("baseline public help must reach Clap DisplayHelp");
+    admit_public_cli_help(&mut state, baseline.clone())
+        .expect("baseline public help must be admitted");
+    let accepted_before = state.clone();
+    let mut planted_candidate = baseline;
+    planted_candidate.contract.modern_only_executable = true;
     assert_eq!(
-        validate_cli_documentation_contract(planted_contract),
-        Err(CliDocumentationRefusal::ContradictorySupportState)
+        admit_public_cli_help(&mut state, planted_candidate),
+        Err(CliDocumentationRefusal::ModernOnlyIsExecutable)
     );
     assert_eq!(
-        CLI_DOCUMENTATION_CONTRACT, accepted_contract,
-        "rejected contract mutation must not mutate the accepted evaluator state"
-    );
-    assert_eq!(
-        state.bytes, accepted_before,
-        "rejected public help must not mutate consumer-visible accepted bytes"
+        state, accepted_before,
+        "a rejected one-field support mutation must leave evaluator and consumer-visible state unchanged"
     );
     let mut emitted_after_rejection = Vec::new();
     assert_eq!(
         emit_admitted_cli_help_to(&state, &mut emitted_after_rejection),
         Ok(())
     );
-    assert_eq!(emitted_after_rejection, accepted_before);
+    assert_eq!(
+        emitted_after_rejection.as_slice(),
+        accepted_before
+            .accepted
+            .as_ref()
+            .expect("baseline accepted state must retain public bytes")
+            .bytes
+            .as_slice()
+    );
 }
 
 #[derive(Subcommand)]
