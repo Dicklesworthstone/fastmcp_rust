@@ -385,6 +385,27 @@ if sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/curl -
 fi
 '''
 
+[peers.lock.last_execution]
+executed_at_utc = "2026-07-29T21:42:53Z"
+online_exit = 0
+offline_exit = 0
+closure_compare_exit = 0
+network_denial_probe_exit = 6
+network_denial_probe_stderr = "curl: (6) Could not resolve host: registry.npmjs.org"
+online_closure_sha256 = "4d98599cb296425e2ae6cfeca26396d1d7d4f858f96b2c78b30c52d7852ee9a6"
+offline_closure_sha256 = "4d98599cb296425e2ae6cfeca26396d1d7d4f858f96b2c78b30c52d7852ee9a6"
+checked_in_lock_sha256 = "0a068c8f409b9c09e57a16280a7bc56859d6810cf91b98317176bc7a1a87c70a"
+result = "pass"
+
+[peers.lock.last_revalidation]
+executed_at_utc = "2026-07-29T21:59:09Z"
+reproduction_script_sha256 = "e74789371421f203c4b83f43a56acb7b71045ae4792d63cee5fbfeb2d2ef6ba9"
+script_exit = 0
+native_package_filenames_staged = true
+online_offline_closure_equal = true
+network_denial_probe_observed = true
+result = "pass"
+
 [[peers]]
 id = "python"
 display_name = "Python"
@@ -495,6 +516,27 @@ if sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/curl -
   exit 97
 fi
 '''
+
+[peers.lock.last_execution]
+executed_at_utc = "2026-07-29T21:43:08Z"
+online_exit = 0
+offline_exit = 0
+closure_compare_exit = 0
+network_denial_probe_exit = 6
+network_denial_probe_stderr = "curl: (6) Could not resolve host: pypi.org"
+online_closure_content_sha256 = "45241e22188c095d3c71e3d05c425a2ae91dc7a0655a1d0fa21ffefbd9669678"
+offline_closure_content_sha256 = "45241e22188c095d3c71e3d05c425a2ae91dc7a0655a1d0fa21ffefbd9669678"
+checked_in_lock_sha256 = "735dc6f345e180c780bd44284e993ed3550669d19424285b9856b39a74b7a1e9"
+result = "pass"
+
+[peers.lock.last_revalidation]
+executed_at_utc = "2026-07-29T21:59:09Z"
+reproduction_script_sha256 = "9c733d9399c77ab8411662ab39f12bf5755a306817250fb8523f10b56057291d"
+script_exit = 0
+filename_closure_equal = true
+content_closure_equal = true
+network_denial_probe_observed = true
+result = "pass"
 
 [[peers]]
 id = "csharp"
@@ -620,6 +662,32 @@ if sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/curl -
   exit 97
 fi
 '''
+
+[peers.lock.last_execution]
+executed_at_utc = "2026-07-29T21:40:50Z"
+offline_restore_exit = 0
+offline_restore_stdout_summary = "Determining projects to restore; restored csharp-consumer.csproj in 103 ms."
+offline_restore_stdout_raw_sha256 = "a1e468cea40937ec5808c75f2579e069e50197d8afd2841a91f3f26220d1dd88"
+offline_restore_stdout_raw_digest_scope = "Exact path-bearing stdout bytes captured during the recorded execution; the human-readable summary is intentionally not claimed to hash to this value."
+offline_restore_stderr_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852e855"
+offline_project_assets_raw_byte_length = 46188
+offline_project_assets_raw_sha256 = "6b5184c088ea27c7beb2611b2a490c88f0ccb6693eacdf46022486aa83d879a7"
+raw_assets_digest_is_path_specific = true
+offline_project_assets_projection_sha256 = "6b3b7195ced5b6e3f2a7bc6236b7795c91f2c6cadd623f051cdce571ce8f11b3"
+offline_project_assets_package_count = 17
+checked_in_lock_sha256_after_restore = "2fa1a5a2d9e57debe29e41b34b6e08dc8dae988937e717663d22f5ee51ada2f2"
+network_denial_probe_exit = 6
+network_denial_probe_stderr = "curl: (6) Could not resolve host: api.nuget.org"
+result = "pass"
+
+[peers.lock.last_revalidation]
+executed_at_utc = "2026-07-29T21:59:09Z"
+reproduction_script_sha256 = "a5b3c164dde83de2edb27027eb413d7979f71bfd95b99517bfc38cf76af4f19c"
+script_exit = 0
+online_offline_project_assets_equal = true
+vendored_project_assets_projection_equal = true
+network_denial_probe_observed = true
+result = "pass"
 
 [[peers]]
 id = "go"
@@ -785,6 +853,33 @@ if sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/curl -
 fi
 '''
 
+[peers.lock.last_execution]
+executed_at_utc = "2026-07-29T21:43:36Z"
+online_exit = 0
+offline_download_exit = 0
+offline_list_exit = 0
+online_offline_lock_compare_exit = 0
+root_sdk_module_entry_verified = true
+network_denial_probe_exit = 6
+network_denial_probe_stderr = "curl: (6) Could not resolve host: proxy.golang.org"
+offline_environment_goproxy = "off"
+offline_environment_gosumdb = "off"
+offline_environment_govcs = "*:off"
+offline_sandbox_profile = "(version 1) (allow default) (deny network*)"
+offline_resolved_module_lock_sha256 = "ca8c375c4090d64f8658a081a4c815206ccfef126ed28692ca446eb504e73b61"
+offline_closure_sha256 = "5636d9bd1a83b90257b366339f1b31f58bf17f57926f4a4e9bba899bbd074465"
+checked_in_consumer_sum_sha256 = "3217ba72b22c5fffe92b8c0d35c6925a2564d8100a9b4b9fa5080a4fae91a4e4"
+result = "pass"
+
+[peers.lock.last_revalidation]
+executed_at_utc = "2026-07-29T21:59:09Z"
+reproduction_script_sha256 = "f493691b8fce43938bcfa4fd27ec834fac970a3e863f86bcfbf0948e48dddebf"
+script_exit = 0
+external_consumer_root_sdk_entry_verified = true
+online_offline_lock_and_module_list_equal = true
+network_denial_probe_observed = true
+result = "pass"
+
 [[vendored_artifacts]]
 id = "sdk-tier-catalog"
 path = "evidence/fnd-01/sdk-locks/sdk-tier-catalog-2026-07-28.mdx"
@@ -936,11 +1031,11 @@ preimage_algorithm = "Decode domain_separator_hex, manifest_record_tag_hex, lock
 included_input_classes = ["manifest authority and policy", "immutable catalog bytes", "all checked-in native lock and consumer bytes", "registry and source artifact identities", "reproduction commands and scripts", "both protocol eras", "Tier-1 peer matrix and capability evidence", "validator contract and one-component negative dimensions", "live catalog and release drift status", "typed execution-status facts"]
 self_excluded_manifest_fields = ["complete_input_binding.preimage_byte_length", "complete_input_binding.digest"]
 self_exclusion_contract = "Self-exclude only the two scalar RHS tokens: the ASCII decimal token after exact bytes `preimage_byte_length = ` and the complete TOML basic-string token, including quote delimiters, after exact bytes `digest = `. Preserve each assignment prefix and terminating LF in the preimage. Each line must have no trailing whitespace, comment, or extra bytes. Reject any duplicate or dotted-key spelling of either excluded field, either field outside the sole complete_input_binding table, a second complete_input_binding table, any additional exclusion, or any attempt to omit a prefix, separator, line ending, or non-RHS byte."
-execution_receipt_policy = "byte-absent typed-unverified: this manifest records expected closures and execution inputs, not live receipts. proof_environment.network_denial_execution_status and every peers.lock offline_resolution_status/current_execution_status remain unverified until the batch-owned verifier supplies execution facts."
+execution_receipt_policy = "Historical lock.last_execution and lock.last_revalidation records are immutable source-integrity observations only. They do not become current execution facts: proof_environment.network_denial_execution_status and every peers.lock offline_resolution_status/current_execution_status remain unverified until the batch-owned verifier supplies execution facts."
 artifact_count = 13
 artifact_total_bytes = 35759
-preimage_byte_length = 97482
-digest = "1614dde779da57a827fc69748ba842f66b71be04402d59ef8cad73476881279e"
+preimage_byte_length = 101874
+digest = "9b252c051e670e497402ad64d65880d59225633caf234e2f3bbea3001914f4d4"
 reacceptance_rule = "A production validator must recompute this complete-input preimage from the live manifest and live lock_root bytes before positive or one-component negative evaluation. Any digest, size, manifest, artifact, command, authority, era, matrix, capability, negative-dimension, or drift-status difference is a reacceptance failure; changing only the derived fields cannot reaccept input."
 
 [validator_contract]
