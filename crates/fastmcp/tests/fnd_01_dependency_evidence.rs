@@ -98868,7 +98868,7 @@ fn fallible(value: Option<u8>) {
 pub use bootstrap::harness_main;
 #[cfg(all(not(fnd01_bootstrap), not(test)))]
 pub use ordinary::harness_main;
-#[cfg(all(not(fnd01_bootstrap), not(test)))]
+#[cfg(not(fnd01_bootstrap))]
 pub(crate) use ordinary::{
     SdkBatchPlan, SdkBatchReceiptBody, SdkExecutableBinding, SdkExecutionObservation,
     SdkExecutionProcessBinding, SdkNetworkProbeBinding, SdkTranscriptBinding,
