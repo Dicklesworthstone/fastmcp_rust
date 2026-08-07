@@ -93014,22 +93014,11 @@ fn fallible(value: Option<u8>) {
             ),
         ];
         for &(path, bytes) in &integration_rows { ordinary_fixture_write_new(&root, path, bytes)?; }
-        let integration = super::trust_std::attest_fixture_outer_and_integration(
-            &run_id,
-            &authoring_marker,
-            integration_rows,
-        ).map_err(|error| pending!("Attest fixture integration: {error}"))?;
-        let producer_outer_relative = format!(".fnd01-run/controller/{run_id}/producer-outer.bin");
-        ordinary_fixture_write_new(
-            &root,
-            &producer_outer_relative,
-            &integration.producer_outer_bytes,
-        )?;
-        super::phase_b_std::materialize_attest_fixture_supply(&root, &run_id, &supply_bytes)
-            .map_err(|error| pending!("materialize Attest supply: {error}"))?;
+        let integration=super::trust_std::attest_fixture_outer_and_integration(&run_id,&authoring_marker,integration_rows).map_err(|error|pending!("Attest fixture integration: {error}"))?;
+        ordinary_fixture_write_new(&root,&format!(".fnd01-run/controller/{run_id}/producer-outer.bin"),&integration.producer_outer_bytes)?;
+        super::phase_b_std::materialize_attest_fixture_supply(&root,&run_id,&supply_bytes).map_err(|error|pending!("materialize Attest supply: {error}"))?;
 
-        let package_root =
-            format!(".fnd01-run/independent-attester/{run_id}/bootstrap-control-package");
+        let package_root=format!(".fnd01-run/independent-attester/{run_id}/bootstrap-control-package");
         for (relative, bytes) in [
             (
                 "Cargo.toml",
@@ -93047,43 +93036,20 @@ fn fallible(value: Option<u8>) {
             ordinary_fixture_write_new(&root, &format!("{package_root}/{relative}"), bytes)?;
         }
 
-        let selected_relative = format!(
-        ".fnd01-run/independent-attester/{run_id}/bootstrap-control-target/debug/fnd_01_evidence_harness"
-    );
+        let selected_relative=format!(".fnd01-run/independent-attester/{run_id}/bootstrap-control-target/debug/fnd_01_evidence_harness");
         let selected_executable = root.join(&selected_relative);
-        let public_harness = std::env::var_os("FASTMCP_FND01_PUBLIC_HARNESS_BIN")
-            .map(PathBuf::from)
-            .ok_or_else(|| pending!("FASTMCP_FND01_PUBLIC_HARNESS_BIN is required"))?;
-        if !public_harness.is_absolute() {
-            return Err(pending!("public harness path must be absolute"));
-        }
-        let expected = source_root.join("target/debug/examples/fnd_01_evidence_harness");
-        if public_harness != expected {
-            return Err(pending!("public harness must be the Cargo example artifact"));
-        }
-        let (_, public_binding) = ordinary_checked_file_binding(
-            &source_root,
-            "target/debug/examples/fnd_01_evidence_harness",
-            MAX_GATE_EXECUTABLE_BYTES,
-            None,
-            "Cargo-built public harness",
-        )?;
+        let public_harness=std::env::var_os("FASTMCP_FND01_PUBLIC_HARNESS_BIN").map(PathBuf::from).ok_or_else(||pending!("FASTMCP_FND01_PUBLIC_HARNESS_BIN is required"))?;
+        if !public_harness.is_absolute(){return Err(pending!("public harness path must be absolute"));}
+        let target=std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(||source_root.join("target"));
+        if !target.is_absolute(){return Err(pending!("CARGO_TARGET_DIR must be absolute"));}
+        let expected=target.join("debug/examples/fnd_01_evidence_harness");
+        if public_harness!=expected{return Err(pending!("public harness must be the Cargo example artifact"));}
+        let (_,public_binding)=ordinary_checked_file_binding(&target,"debug/examples/fnd_01_evidence_harness",MAX_GATE_EXECUTABLE_BYTES,None,"Cargo-built public harness")?;
         ordinary_fixture_install_executable(&public_harness, &selected_executable)?;
-        let (_, installed_binding) = ordinary_checked_file_binding(
-            &root,
-            &selected_relative,
-            MAX_GATE_EXECUTABLE_BYTES,
-            None,
-            "installed public harness",
-        )?;
-        if public_binding.binding != installed_binding.binding {
-            return Err(pending!("installed public harness bytes differ"));
-        }
-
-        let fixture_driver_source =
-            std::env::current_exe().map_err(|error| pending!("current test executable: {error}"))?;
+        let (_,installed_binding)=ordinary_checked_file_binding(&root,&selected_relative,MAX_GATE_EXECUTABLE_BYTES,None,"installed public harness")?;
+        if public_binding.binding!=installed_binding.binding{return Err(pending!("installed public harness bytes differ"));}
         let fixture_driver = selected_executable.with_file_name("fnd_01_evidence_fixture_driver");
-        ordinary_fixture_install_executable(&fixture_driver_source, &fixture_driver)?;
+        ordinary_fixture_install_executable(&std::env::current_exe().map_err(|error|pending!("current test executable: {error}"))?,&fixture_driver)?;
 
         Ok(OrdinaryAttestSelfReexecSubject {
             root,
