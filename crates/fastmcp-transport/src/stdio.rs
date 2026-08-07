@@ -2087,7 +2087,8 @@ mod tests {
     #[test]
     fn std_01_a_positive() {
         let input = b"{\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":\"request-7\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":1}}\n{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"request-8\"}\n";
-        assert_eq!(input.iter().filter(|byte| **byte == b'\n').count(), 3);
+        assert_eq!(input.split(|byte| *byte == b'\n').count(), 4);
+        assert!(input.ends_with(b"\n"));
         let mut transport = StdioTransport::new(Cursor::new(input.to_vec()), Vec::new());
         let cx = Cx::for_testing();
         let mut requests = Vec::new();
