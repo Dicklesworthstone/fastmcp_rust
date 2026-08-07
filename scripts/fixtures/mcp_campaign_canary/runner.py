@@ -24,7 +24,6 @@ ROOT = Path(__file__).resolve().parents[3]
 FIXTURE = Path(__file__).with_name("cases.json")
 SCRIPT = ROOT / "scripts" / "mcp_campaign_canary.sh"
 POLICY = ROOT / ".beads" / "policy.yaml"
-LIVE_PATHS = (ROOT / ".beads" / "beads.db", ROOT / ".beads" / "issues.jsonl")
 NEGATIVE_IDS = {
     "canary_direct_close_rejected",
     "canary_double_claim_rejected",
@@ -58,6 +57,16 @@ def digest_path(path: Path) -> str | None:
     return sha256_bytes(path.read_bytes()) if path.exists() else None
 
 
+def executable_path(name: str) -> Path:
+    located = shutil.which(name)
+    if not located:
+        raise SystemExit(f"required executable is unavailable: {name}")
+    path = Path(located).resolve()
+    if not path.is_file():
+        raise SystemExit(f"required executable is not a regular file: {path}")
+    return path
+
+
 def json_value(text: str) -> Any:
     try:
         return json.loads(text)  # ubs:ignore — malformed tracker JSON is retained as an unparsed receipt value below.
@@ -66,13 +75,16 @@ def json_value(text: str) -> Any:
 
 
 class Runner:
-    def __init__(self, output: Path, subject_revision: str) -> None:
+    def __init__(self, output: Path, subject_revision: str, br_binary: Path, bv_binary: Path) -> None:
         self.output = output
         self.workspace = output / "workspace"
         self.db = self.workspace / ".beads" / "canary.db"
         self.events: list[dict[str, Any]] = []
         self.commands: list[dict[str, Any]] = []
         self.subject_revision = subject_revision
+        self.br_binary = br_binary
+        self.bv_binary = bv_binary
+        self.live_paths: tuple[Path, Path] = ()
         self.receipt_revision = self.git("rev-parse", "HEAD")
         self.current_case = "preflight"
 
@@ -98,7 +110,7 @@ class Runner:
         return completed
 
     def br(self, *args: str, actor: str | None = None) -> subprocess.CompletedProcess[str]:
-        argv = ["br", *args, "--db", str(self.db), "--json"]
+        argv = [str(self.br_binary), *args, "--db", str(self.db), "--json"]
         if actor:
             argv.extend(["--actor", actor])
         completed = subprocess.run(
@@ -132,6 +144,12 @@ class Runner:
         completed = self.br("audit", "log", issue_id, actor=ORCHESTRATOR)
         return json_value(completed.stdout)
 
+    def snapshot(self, issue_id: str) -> tuple[Any, Any, Any]:
+        return self.issue(issue_id), self.ledger(issue_id), self.audit(issue_id)
+
+    def live_snapshot(self) -> dict[str, str | None]:
+        return {str(path): digest_path(path) for path in self.live_paths}
+
     def create_subject(self, case_id: str, *, checked: bool = True) -> str:
         created = self.br(
             "create", f"MCP canary {case_id}", "--status", "open", "--silent", actor=WORKER
@@ -159,10 +177,12 @@ class Runner:
             if completed.returncode:
                 raise RuntimeError(f"cannot move {issue_id} to {status}: {completed.stderr}")
 
-    def report_gate(self, issue_id: str, provider: str, status: str, actor: str) -> None:
+    def report_gate(
+        self, issue_id: str, provider: str, status: str, actor: str, *, note: str | None = None
+    ) -> None:
         completed = self.br(
             "gate", "report", issue_id, "--gate", "batch_verify", "--provider", provider,
-            "--status", status, "--note", f"{self.current_case}:{self.subject_revision}", actor=actor,
+            "--status", status, "--note", note or f"{self.current_case}:{self.subject_revision}", actor=actor,
         )
         if completed.returncode:
             raise RuntimeError(f"cannot report {provider} {status}: {completed.stderr}")
@@ -173,17 +193,23 @@ class Runner:
             args.extend(["--agent-name", actor, "--harness", HARNESS, "--model", MODEL])
         return self.br(*args, actor=actor)
 
-    def record_case(self, case: dict[str, str], issue_id: str | None, before: Any, after: Any,
-                    ledger_before: Any, ledger_after: Any, passed: bool, detail: str) -> None:
-        audit = self.audit(issue_id) if issue_id else []
+    def record_case(
+        self, case: dict[str, str], issue_id: str | None, before: Any, after: Any,
+        ledger_before: Any, ledger_after: Any, audit_before: Any, audit_after: Any,
+        passed: bool, detail: str,
+    ) -> None:
         self.events.append(
             {
                 "case_id": case["id"], "kind": case["kind"], "planted_dimension": case["planted_dimension"],
                 "actors": {"worker": WORKER, "orchestrator": ORCHESTRATOR},
                 "passed": passed, "detail": detail, "issue_before": before, "issue_after": after,
                 "gate_ledger_before": ledger_before, "gate_ledger_after": ledger_after,
-                "audit_records": audit,
+                "audit_before": audit_before, "audit_after": audit_after,
                 "command_indexes": [i for i, command in enumerate(self.commands) if command["case_id"] == case["id"]],
+                "first_attempt": 1, "retries": 0,
+                "execution_outcomes": {
+                    "early_aborted": 0, "stale": 0, "mixed": 0, "substituted": 0,
+                },
             }
         )
 
@@ -207,6 +233,10 @@ def same(value: Any, other: Any) -> bool:
     return json.dumps(value, sort_keys=True) == json.dumps(other, sort_keys=True)
 
 
+def unchanged(before: tuple[Any, Any, Any], after: tuple[Any, Any, Any]) -> bool:
+    return all(same(left, right) for left, right in zip(before, after, strict=True))
+
+
 def valid_reason() -> str:
     return "commit: canary-subject run: isolated-canary evidence: receipt incident: none"
 
@@ -218,101 +248,108 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
     after: Any = None
     ledger_before: Any = None
     ledger_after: Any = None
+    audit_before: Any = None
+    audit_after: Any = None
     passed = False
     detail = ""
     try:
         case_id = case["id"]
         if case_id == "canary_live_tracker_unchanged":
-            before = {str(path): digest_path(path) for path in LIVE_PATHS}
-            after = {str(path): digest_path(path) for path in LIVE_PATHS}
+            before = runner.live_snapshot()
+            after = runner.live_snapshot()
             passed = same(before, after)
             detail = "live tracker database and JSONL digests are unchanged"
         elif case_id == "canary_stale_pass_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
-            before = runner.issue(issue_id)
-            stale = "0" * 40
-            attempted = stale == runner.subject_revision
-            after = runner.issue(issue_id)
-            passed = not attempted and same(before, after)
-            detail = "harness freshness guard refused mismatched subject revision before br close"
+            runner.report_gate(
+                issue_id, "batch_verify", "pass", ORCHESTRATOR,
+                note=f"stale:{'0' * 40}:subject:{runner.subject_revision}",
+            )
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
+            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
+            passed = attempt.returncode != 0 and unchanged(
+                (before, ledger_before, audit_before), (after, ledger_after, audit_after)
+            )
+            detail = "actual stale batch_verify PASS cannot authorize the forbidden close transition"
         elif case_id == "canary_direct_close_rejected":
             issue_id = runner.create_subject(case_id)
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
-            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
-            passed = attempt.returncode != 0 and same(before, after)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
+            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "open-to-closed close rejects without changing issue state"
         elif case_id == "canary_double_claim_rejected":
             issue_id = runner.create_subject(case_id)
             first = runner.br("update", issue_id, "--claim", actor=WORKER)
             if first.returncode:
                 raise RuntimeError(first.stderr)
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.br("update", issue_id, "--claim", actor="SecondCanaryWorker")
-            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
-            passed = attempt.returncode != 0 and same(before, after)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
+            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "second atomic claimant rejects and preserves the first claim"
         elif case_id == "canary_self_close_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", WORKER)
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.close(issue_id, actor=WORKER, reason=valid_reason())
-            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
-            passed = attempt.returncode != 0 and same(before, after)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
+            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "claimant cannot self-close after in-progress"
         elif case_id == "canary_unchecked_acceptance_rejected":
             issue_id = runner.create_subject(case_id, checked=False)
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
-            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
-            passed = attempt.returncode != 0 and same(before, after)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
+            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "unchecked acceptance rejects without state mutation"
         elif case_id == "canary_short_close_reason_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason="short")
-            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
-            passed = attempt.returncode != 0 and same(before, after)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
+            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "short close reason rejects without state mutation"
         elif case_id == "canary_missing_typed_reference_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason="this deliberately long reason contains no required typed references")
-            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
-            passed = attempt.returncode != 0 and same(before, after)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
+            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "missing commit/run/evidence/incident references reject"
         elif case_id == "canary_missing_attribution_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(), attributed=False)
-            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
-            passed = attempt.returncode != 0 and same(before, after)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
+            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "missing tier-one attribution rejects"
         elif case_id == "canary_review_without_pass_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
-            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
-            passed = attempt.returncode != 0 and same(before, after)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
+            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "review issue without batch_verify PASS rejects"
         elif case_id == "canary_unauthorized_provider_limitation_detected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             runner.report_gate(issue_id, "impostor", "pass", "ImpostorProvider")
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
-            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
             statuses = provider_statuses(ledger_before)
             passed = attempt.returncode == 0 and ("impostor", "pass") in statuses
             detail = "installed br accepts an unauthorized provider PASS; harness records the limitation"
@@ -321,15 +358,15 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(issue_id, "impostor", "pass", "ImpostorProvider")
             runner.report_gate(issue_id, "old_batch", "pass", ORCHESTRATOR)
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, _scrub_audit = runner.snapshot(issue_id)
             for provider, _status in sorted(set(provider_statuses(ledger_before))):
                 runner.report_gate(issue_id, provider, "fail", ORCHESTRATOR)
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
-            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = (
                 attempt.returncode != 0
-                and same(before, after)
+                and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
                 and not any(status == "pass" for _, status in provider_statuses(ledger_after))
             )
             detail = "all observed providers are overwritten to FAIL and cannot close"
@@ -337,11 +374,11 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
-            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
+            before, ledger_before, audit_before = runner.snapshot(issue_id)
             statuses = provider_statuses(ledger_before)
             fresh = runner.subject_revision == runner.receipt_revision
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason()) if fresh and statuses == [("batch_verify", "pass")] else None
-            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt is not None and attempt.returncode == 0
             detail = "distinct orchestrator closes only with the fresh sole batch_verify PASS"
         else:
@@ -350,9 +387,11 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
         detail = f"exception: {error}"
         passed = False
         if issue_id:
-            after = runner.issue(issue_id)
-            ledger_after = runner.ledger(issue_id)
-    runner.record_case(case, issue_id, before, after, ledger_before, ledger_after, passed, detail)
+            after, ledger_after, audit_after = runner.snapshot(issue_id)
+    runner.record_case(
+        case, issue_id, before, after, ledger_before, ledger_after, audit_before, audit_after,
+        passed, detail,
+    )
 
 
 def main() -> int:
@@ -374,11 +413,21 @@ def main() -> int:
     expected_ids = NEGATIVE_IDS | {POSITIVE_ID}
     if actual_ids != expected_ids or len(cases) != len(expected_ids):
         raise SystemExit("frozen canary fixture has duplicate, missing, or substituted case IDs")
+    br_binary = executable_path("br")
+    bv_binary = executable_path("bv")
     subject_revision = args.subject_revision or subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=True
     ).stdout.strip()
-    runner = Runner(output, subject_revision)
-    live_before = {str(path): digest_path(path) for path in LIVE_PATHS}
+    runner = Runner(output, subject_revision, br_binary, bv_binary)
+    where = runner.run([str(br_binary), "where", "--json"])
+    location = json_value(where.stdout)
+    if where.returncode or not isinstance(location, dict):
+        raise SystemExit("cannot discover the effective live Beads tracker")
+    try:
+        runner.live_paths = (Path(location["database_path"]).resolve(), Path(location["jsonl_path"]).resolve())
+    except (KeyError, TypeError):
+        raise SystemExit("br where did not provide live database and JSONL paths") from None
+    live_before = runner.live_snapshot()
     tracked = subprocess.run(
         ["git", "ls-files", "--error-unmatch", ".beads/policy.yaml"], cwd=ROOT,
         text=True, capture_output=True, check=False,
@@ -387,8 +436,9 @@ def main() -> int:
         "policy_tracked": tracked, "policy_path": str(POLICY.relative_to(ROOT)),
         "policy_sha256": digest_path(POLICY), "harness_sha256": digest_path(SCRIPT),
         "fixture_sha256": digest_path(FIXTURE), "runner_sha256": digest_path(Path(__file__)),
-        "br_version": runner.run(["br", "--version"]).stdout.strip(),
-        "bv_version": runner.run(["bv", "--version"]).stdout.strip(),
+        "live_tracker": {"database_path": str(runner.live_paths[0]), "jsonl_path": str(runner.live_paths[1])},
+        "br": {"path": str(br_binary), "sha256": digest_path(br_binary), "version": runner.run([str(br_binary), "--version"]).stdout.strip()},
+        "bv": {"path": str(bv_binary), "sha256": digest_path(bv_binary), "version": runner.run([str(bv_binary), "--version"]).stdout.strip()},
         "subject_revision": subject_revision, "receipt_revision": runner.receipt_revision,
         "subject_tree": runner.git("rev-parse", f"{subject_revision}^{{tree}}"),
         "receipt_tree": runner.git("rev-parse", "HEAD^{tree}"),
@@ -407,14 +457,18 @@ def main() -> int:
             preflight["initialization_error"] = initialized.stderr
     else:
         preflight["initialization_error"] = "tracked .beads/policy.yaml is required; harness refused tracker mutation"
-    live_after = {str(path): digest_path(path) for path in LIVE_PATHS}
+    live_after = runner.live_snapshot()
     receipt = {
         "receipt_format": "mcp-campaign-canary-v1", "generated_at": now(), "preflight": preflight,
         "isolated_database": str(runner.db), "live_before": live_before, "live_after": live_after,
         "live_unchanged": live_before == live_after, "required": len(expected_ids),
         "discovered": len(cases), "started": len(runner.events),
-        "passed": sum(event["passed"] for event in runner.events), "ignored": 0, "filtered": 0,
-        "skipped": len(cases) - len(runner.events), "events_path": "events.jsonl",
+        "passed": sum(event["passed"] for event in runner.events), "first_attempts": len(runner.events),
+        "retries": 0, "ignored": 0, "filtered": 0, "skipped": len(cases) - len(runner.events),
+        "execution_integrity": {
+            "zero_run": 0, "early_aborted": 0, "stale": 0, "mixed": 0, "substituted": 0,
+        },
+        "events_path": "events.jsonl",
         "commands_path": "commands.jsonl", "named_consumers": ["CI-BASE-01", "GATE-ALL-MCP-READY"],
         "zero_capability_credit": True,
     }
