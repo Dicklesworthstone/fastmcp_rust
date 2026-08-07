@@ -59,6 +59,10 @@ use std::time::{Duration, Instant};
 
 use asupersync::{Cx, channel::mpsc};
 use fastmcp_core::draw_security_identifier;
+use fastmcp_protocol::protocol_version::{
+    FinalHttpRequestMetadata, RequestAdmissionError, RequestVersionMetadata,
+    admit_final_http_request,
+};
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 
 use crate::{Codec, CodecError, Transport, TransportError};
@@ -122,6 +126,7 @@ impl HttpStatus {
     pub const FORBIDDEN: Self = Self(403);
     pub const NOT_FOUND: Self = Self(404);
     pub const METHOD_NOT_ALLOWED: Self = Self(405);
+    pub const NOT_ACCEPTABLE: Self = Self(406);
     pub const INTERNAL_SERVER_ERROR: Self = Self(500);
     pub const SERVICE_UNAVAILABLE: Self = Self(503);
 
@@ -440,6 +445,10 @@ pub enum HttpError {
     InvalidHeader(String),
     /// Invalid Content-Type.
     InvalidContentType(String),
+    /// The request accepts neither modern JSON nor request-scoped SSE.
+    NotAcceptable,
+    /// The final MCP header/body admission boundary rejected the request.
+    ProtocolAdmission(RequestAdmissionError),
     /// Request path does not match the configured MCP endpoint.
     InvalidPath(String),
     /// Request Origin is not admitted by the configured policy.
@@ -469,6 +478,10 @@ impl std::fmt::Display for HttpError {
             Self::InvalidRequestLine(_) => write!(f, "invalid HTTP request line"),
             Self::InvalidHeader(_) => write!(f, "invalid HTTP header"),
             Self::InvalidContentType(_) => write!(f, "invalid content type"),
+            Self::NotAcceptable => {
+                write!(f, "no supported MCP response representation is acceptable")
+            }
+            Self::ProtocolAdmission(_) => write!(f, "final MCP request admission rejected"),
             Self::InvalidPath(_) => write!(f, "invalid MCP endpoint path"),
             Self::OriginNotAllowed(_) => write!(f, "origin is not allowed"),
             Self::HeadersTooLarge { size, max } => {
@@ -610,6 +623,65 @@ fn validate_mcp_request_policy(
     Ok(())
 }
 
+fn body_protocol_version(request: &JsonRpcRequest) -> Option<&str> {
+    request
+        .params
+        .as_ref()?
+        .as_object()?
+        .get("_meta")?
+        .as_object()?
+        .get("io.modelcontextprotocol/protocolVersion")?
+        .as_str()
+}
+
+fn body_mcp_name(request: &JsonRpcRequest) -> Option<&str> {
+    let parameter_name = match request.method.as_str() {
+        "tools/call" | "prompts/get" => "name",
+        "resources/read" => "uri",
+        _ => return None,
+    };
+    request
+        .params
+        .as_ref()?
+        .as_object()?
+        .get(parameter_name)?
+        .as_str()
+}
+
+fn response_representation(request: &HttpRequest) -> Result<HttpResponseRepresentation, HttpError> {
+    let Some(accept) = request.header("accept") else {
+        return Ok(HttpResponseRepresentation::Json);
+    };
+
+    if accepts_media_type(accept, "application", "json") {
+        Ok(HttpResponseRepresentation::Json)
+    } else if accepts_media_type(accept, "text", "event-stream") {
+        Ok(HttpResponseRepresentation::Sse)
+    } else {
+        Err(HttpError::NotAcceptable)
+    }
+}
+
+fn accepts_media_type(value: &str, expected_type: &str, expected_subtype: &str) -> bool {
+    value.split(',').any(|entry| {
+        let mut parameters = entry.split(';');
+        let media_type = parameters.next().unwrap_or("").trim();
+        let Some((type_part, subtype_part)) = media_type.split_once('/') else {
+            return false;
+        };
+        let quality_is_zero = parameters.any(|parameter| {
+            parameter
+                .trim()
+                .strip_prefix("q=")
+                .or_else(|| parameter.trim().strip_prefix("Q="))
+                .is_some_and(|quality| matches!(quality, "0" | "0.0" | "0.00" | "0.000"))
+        });
+        !quality_is_zero
+            && (type_part.eq_ignore_ascii_case(expected_type) || type_part == "*")
+            && (subtype_part.eq_ignore_ascii_case(expected_subtype) || subtype_part == "*")
+    })
+}
+
 // =============================================================================
 // HTTP Request Handler
 // =============================================================================
@@ -629,6 +701,65 @@ pub struct HttpHandlerConfig {
     pub cors_origins: Vec<String>,
     /// Maximum request body size in bytes.
     pub max_body_size: usize,
+}
+
+/// The response representation selected independently for one admitted request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpResponseRepresentation {
+    /// A finite `application/json` response body.
+    Json,
+    /// A finite `text/event-stream` response body bound to this request only.
+    Sse,
+}
+
+/// A modern HTTP request admitted before authentication or application dispatch.
+///
+/// The response representation is immutable and request-local. In particular,
+/// admitting this value does not create an SSE response body; callers must
+/// explicitly bind one only after downstream dispatch is ready to own its
+/// cancellation guard.
+#[derive(Debug, Clone)]
+pub struct ModernHttpRequestAdmission {
+    request: JsonRpcRequest,
+    response_representation: HttpResponseRepresentation,
+}
+
+impl ModernHttpRequestAdmission {
+    /// Returns the bounded, strictly decoded JSON-RPC request for downstream dispatch.
+    #[must_use]
+    pub const fn request(&self) -> &JsonRpcRequest {
+        &self.request
+    }
+
+    /// Returns this request's immutable response representation.
+    #[must_use]
+    pub const fn response_representation(&self) -> HttpResponseRepresentation {
+        self.response_representation
+    }
+
+    /// Binds the selected SSE response body to this request's JSON-RPC ID.
+    ///
+    /// Calling this for a JSON-selected request or a notification is rejected
+    /// before response-stream state is allocated. Dropping the returned body
+    /// cancels its paired request guard and releases the registry entry.
+    pub fn bind_sse_response_body(
+        &self,
+        responses: &StreamableHttpResponseStream,
+    ) -> Result<StreamableHttpRequestResponseStream, TransportError> {
+        if self.response_representation != HttpResponseRepresentation::Sse {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the admitted HTTP request selected a JSON response",
+            )));
+        }
+        let request_id = self.request.id.clone().ok_or_else(|| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a JSON-RPC notification cannot own an SSE response body",
+            ))
+        })?;
+        responses.for_request(request_id)
+    }
 }
 
 impl Default for HttpHandlerConfig {
@@ -723,6 +854,38 @@ impl HttpRequestHandler {
         // HTTP framing already supplies one complete body. Route it through
         // the shared strict JSON admission boundary before typed decoding.
         Ok(self.codec.decode_complete_request(&request.body)?)
+    }
+
+    /// Admits one final MCP 2026-07-28 request before authentication or dispatch.
+    ///
+    /// This applies the fixed endpoint/method/media/bounds boundary, strict
+    /// raw JSON-RPC object decoding (including batch rejection), PRT-03's
+    /// header/body mirrors, and request-local response selection. It does not
+    /// allocate a response body, authenticate, resolve a method, or mutate
+    /// application state.
+    pub fn admit_modern_request(
+        &self,
+        request: &HttpRequest,
+    ) -> Result<ModernHttpRequestAdmission, HttpError> {
+        validate_mcp_request_policy(request, &self.config)?;
+        let json_rpc = self.codec.decode_complete_request(&request.body)?;
+        admit_final_http_request(FinalHttpRequestMetadata {
+            version: RequestVersionMetadata {
+                header_version: request.header("MCP-Protocol-Version"),
+                body_version: body_protocol_version(&json_rpc),
+            },
+            header_method: request.header("Mcp-Method"),
+            body_method: Some(&json_rpc.method),
+            header_name: request.header("Mcp-Name"),
+            body_name: body_mcp_name(&json_rpc),
+        })
+        .map_err(HttpError::ProtocolAdmission)?;
+        let response_representation = response_representation(request)?;
+
+        Ok(ModernHttpRequestAdmission {
+            request: json_rpc,
+            response_representation,
+        })
     }
 
     /// Creates an HTTP response from a JSON-RPC response.
@@ -1250,6 +1413,7 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            406 => "Not Acceptable",
             500 => "Internal Server Error",
             503 => "Service Unavailable",
             _ => "Unknown",
@@ -1708,6 +1872,24 @@ impl StreamableHttpResponseStream {
     #[must_use]
     pub fn pending_responses(&self) -> usize {
         self.pending_count.load(Ordering::Acquire)
+    }
+
+    /// Returns the number of request-owned response bodies that remain live.
+    ///
+    /// This count excludes queued terminal responses: a body remains live only
+    /// while it can still accept its one terminal response or be cancelled by
+    /// its HTTP response teardown.
+    pub fn live_request_bodies(&self) -> Result<usize, TransportError> {
+        let request_states = match self.request_states.try_lock() {
+            Ok(request_states) => request_states,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err(streamable_queue_full_error(
+                    "streamable HTTP request-response registry is busy",
+                ));
+            }
+        };
+        Ok(request_states.len())
     }
 
     /// Returns the hard response-count capacity.
