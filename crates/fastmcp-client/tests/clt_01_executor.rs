@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_client::{
-    ExecutionTerminalReason, ExecutionTerminalState, OpaquePagination, PaginationBounds, Request,
-    RequestExecutor, RequestTimeoutPolicy, clt_01_a_manifest_digest, clt_01_b_manifest_digest,
+    clt_01_a_manifest_digest, clt_01_b_manifest_digest, ExecutionTerminalReason,
+    ExecutionTerminalState, OpaquePagination, PaginationBounds, Request, RequestExecutor,
+    RequestTimeoutPolicy,
 };
 use fastmcp_core::McpErrorCode;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
@@ -23,10 +24,10 @@ use fastmcp_transport::{Transport, TransportError};
 struct ProbeState {
     received: VecDeque<Result<JsonRpcMessage, TransportError>>,
     sent: Vec<JsonRpcMessage>,
+    send_error: Option<std::io::ErrorKind>,
     closed: bool,
 }
 
-#[derive(Debug)]
 struct ScriptedTransport {
     state: Rc<RefCell<ProbeState>>,
 }
@@ -40,6 +41,19 @@ impl ScriptedTransport {
     ) -> (Self, Probe) {
         let state = Rc::new(RefCell::new(ProbeState {
             received: received.into_iter().collect(),
+            ..ProbeState::default()
+        }));
+        (
+            Self {
+                state: state.clone(),
+            },
+            Probe(state),
+        )
+    }
+
+    fn backpressured() -> (Self, Probe) {
+        let state = Rc::new(RefCell::new(ProbeState {
+            send_error: Some(std::io::ErrorKind::WouldBlock),
             ..ProbeState::default()
         }));
         (
@@ -63,6 +77,9 @@ impl Probe {
 
 impl Transport for ScriptedTransport {
     fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if let Some(kind) = self.state.borrow().send_error {
+            return Err(TransportError::Io(std::io::Error::from(kind)));
+        }
         self.state.borrow_mut().sent.push(message.clone());
         Ok(())
     }
@@ -144,27 +161,136 @@ fn clt_01_a_positive() {
         Some(RequestId::Number(2))
     );
     assert_eq!(executor.take_notifications().len(), 1);
-    assert_eq!(executor.take_uncorrelated_responses().len(), 1);
+    let uncorrelated = executor.take_uncorrelated_responses();
+    assert_eq!(uncorrelated.len(), 1);
+    assert_eq!(uncorrelated[0].id, Some(RequestId::Number(999)));
     assert!(executor.pending_records().is_empty());
     assert_eq!(probe.sent_len(), 2);
 
-    let (closed_transport, _) = ScriptedTransport::new([Err(TransportError::Closed)]);
+    let (duplicate_transport, duplicate_probe) = ScriptedTransport::new([
+        Ok(response(4, serde_json::json!({"kind": "complete"}))),
+        Ok(response(4, serde_json::json!({"kind": "late-duplicate"}))),
+    ]);
+    let duplicate = RequestExecutor::new(duplicate_transport);
+    let mut duplicate_owner = duplicate
+        .execute(&cx, request(4))
+        .expect("duplicate-response owner request commits");
+    assert_eq!(
+        duplicate
+            .wait(&cx, &mut duplicate_owner)
+            .expect("first final response is delivered")
+            .id,
+        Some(RequestId::Number(4))
+    );
+    duplicate
+        .drive(&cx)
+        .expect("duplicate final is retained rather than reassigned");
+    let duplicate_response = duplicate.take_uncorrelated_responses();
+    assert_eq!(duplicate_response.len(), 1);
+    assert_eq!(duplicate_response[0].id, Some(RequestId::Number(4)));
+    assert_eq!(duplicate_probe.sent_len(), 1);
+
+    let (abandoned_transport, abandoned_probe) = ScriptedTransport::new([
+        Ok(response(31, serde_json::json!({"late": true}))),
+        Ok(response(32, serde_json::json!({"current": true}))),
+    ]);
+    let abandoned = RequestExecutor::new(abandoned_transport);
+    let dropped = abandoned
+        .execute(&cx, request(31))
+        .expect("owner request commits before its handle is dropped");
+    drop(dropped);
+    let mut current = abandoned
+        .execute(&cx, request(32))
+        .expect("next request drains the dropped owner");
+    assert_eq!(
+        abandoned
+            .wait(&cx, &mut current)
+            .expect("late tombstone response cannot poison the current owner")
+            .id,
+        Some(RequestId::Number(32))
+    );
+    assert!(abandoned.take_uncorrelated_responses().is_empty());
+    assert_eq!(abandoned_probe.sent_len(), 3);
+
+    let (malformed_transport, malformed_probe) = ScriptedTransport::new([Err(
+        TransportError::Codec(fastmcp_transport::CodecError::Json(
+            serde_json::from_str::<serde_json::Value>("{")
+                .expect_err("the transport probe supplies malformed JSON"),
+        )),
+    )]);
+    let malformed = RequestExecutor::new(malformed_transport);
+    let mut malformed_first = malformed
+        .execute(&cx, request(11))
+        .expect("first malformed-ingress owner request commits");
+    let mut malformed_second = malformed
+        .execute(&cx, request(12))
+        .expect("second malformed-ingress owner request commits");
+    assert_eq!(
+        malformed
+            .drive(&cx)
+            .expect_err("malformed ingress selects only local terminal outcomes")
+            .code,
+        McpErrorCode::InternalError
+    );
+    assert_eq!(
+        malformed
+            .wait(&cx, &mut malformed_first)
+            .expect_err("malformed ingress fans out to the first owner")
+            .code,
+        McpErrorCode::InternalError
+    );
+    assert_eq!(
+        malformed
+            .wait(&cx, &mut malformed_second)
+            .expect_err("malformed ingress fans out to the second owner")
+            .code,
+        McpErrorCode::InternalError
+    );
+    assert!(malformed.pending_records().is_empty());
+    assert_eq!(malformed_probe.sent_len(), 2);
+
+    let (backpressured_transport, backpressured_probe) = ScriptedTransport::backpressured();
+    let backpressured = RequestExecutor::new(backpressured_transport);
+    let backpressure_error = match backpressured.execute(&cx, request(21)) {
+        Ok(_) => panic!("would-block send must not create an execution"),
+        Err(error) => error,
+    };
+    assert_eq!(backpressure_error.code, McpErrorCode::InternalError);
+    assert!(backpressured.pending_records().is_empty());
+    assert!(backpressured.terminal_records().is_empty());
+    assert_eq!(backpressured_probe.sent_len(), 0);
+
+    let (closed_transport, closed_probe) = ScriptedTransport::new([Err(TransportError::Closed)]);
     let closed = RequestExecutor::new(closed_transport);
-    let mut owner = closed.execute(&cx, request(3)).expect("request commits");
+    let mut first_closed_owner = closed
+        .execute(&cx, request(3))
+        .expect("first connection-loss owner request commits");
+    let mut second_closed_owner = closed
+        .execute(&cx, request(5))
+        .expect("second connection-loss owner request commits");
     assert_eq!(
         closed
             .drive(&cx)
-            .expect_err("connection loss fails the owner")
+            .expect_err("connection loss fans out to every owner")
             .code,
         McpErrorCode::InternalError
     );
     assert_eq!(
         closed
-            .wait(&cx, &mut owner)
-            .expect_err("waiter fanout outcome")
+            .wait(&cx, &mut first_closed_owner)
+            .expect_err("first connection-loss waiter receives the fanout outcome")
             .code,
         McpErrorCode::InternalError
     );
+    assert_eq!(
+        closed
+            .wait(&cx, &mut second_closed_owner)
+            .expect_err("second connection-loss waiter receives the fanout outcome")
+            .code,
+        McpErrorCode::InternalError
+    );
+    assert!(closed.pending_records().is_empty());
+    assert_eq!(closed_probe.sent_len(), 2);
 }
 
 #[test]
@@ -178,14 +304,17 @@ fn clt_01_a_planted_negative() {
     let before = executor.pending_records();
 
     // One variable changes: the second request reuses the exact correlation ID.
-    let error = executor
-        .execute(&cx, request(7))
-        .expect_err("duplicate in-flight ID is rejected");
+    let error = match executor.execute(&cx, request(7)) {
+        Ok(_) => panic!("duplicate in-flight ID must be rejected"),
+        Err(error) => error,
+    };
     assert_eq!(error.code, McpErrorCode::InvalidRequest);
     assert_eq!(executor.pending_records(), before);
+    assert!(executor.terminal_records().is_empty());
     assert_eq!(probe.sent_len(), 1);
     assert!(executor.take_notifications().is_empty());
     assert!(executor.take_uncorrelated_responses().is_empty());
+    assert!(executor.take_cancellation_events().is_empty());
 }
 
 #[test]
@@ -270,21 +399,15 @@ fn clt_01_b_positive() {
     );
 
     let mut pagination = OpaquePagination::new(PaginationBounds::default(), Instant::now());
-    assert!(
-        pagination
-            .accept_page(Some(String::new()), 0, 0, Instant::now())
-            .expect("empty cursor")
-    );
-    assert!(
-        pagination
-            .accept_page(Some(String::new()), 0, 0, Instant::now())
-            .expect("repeat cursor")
-    );
-    assert!(
-        !pagination
-            .accept_page(None, 0, 0, Instant::now())
-            .expect("absent cursor")
-    );
+    assert!(pagination
+        .accept_page(Some(String::new()), 0, 0, Instant::now())
+        .expect("empty cursor"));
+    assert!(pagination
+        .accept_page(Some(String::new()), 0, 0, Instant::now())
+        .expect("repeat cursor"));
+    assert!(!pagination
+        .accept_page(None, 0, 0, Instant::now())
+        .expect("absent cursor"));
 
     let (shutdown_transport, shutdown_probe) = ScriptedTransport::new(std::iter::empty());
     let shutdown = RequestExecutor::new(shutdown_transport);
@@ -320,12 +443,10 @@ fn clt_01_b_planted_negative() {
         .drive(&cx)
         .expect("unrelated progress is peer activity");
     assert_eq!(executor.pending_records(), before);
-    assert!(
-        owner
-            .take_stream_notifications()
-            .expect("stream remains empty")
-            .is_empty()
-    );
+    assert!(owner
+        .take_stream_notifications()
+        .expect("stream remains empty")
+        .is_empty());
     assert_eq!(executor.take_notifications().len(), 1);
     assert!(executor.take_cancellation_events().is_empty());
     assert_eq!(probe.sent_len(), 1);
