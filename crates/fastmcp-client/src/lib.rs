@@ -78,16 +78,15 @@ use asupersync::{Cx, channel::oneshot};
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sha256_bounded};
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancelledParams,
-    ClientCapabilities, ClientInfo, Content, GetPromptParams, GetPromptResult, GetTaskParams,
-    GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION, JsonRpcError,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams, ListPromptsResult,
-    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListTasksParams, ListTasksResult, ListToolsParams, ListToolsResult,
-    LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage,
-    ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource, ResourceContent,
-    ResourceTemplate, ServerCapabilities, ServerInfo, SetLogLevelParams, SubmitTaskParams,
-    SubmitTaskResult, TaskId, TaskInfo, TaskResult, TaskStatus, Tool,
-    CorrelationKey,
+    ClientCapabilities, ClientInfo, Content, CorrelationKey, GetPromptParams, GetPromptResult,
+    GetTaskParams, GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION,
+    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
+    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListResourcesParams, ListResourcesResult, ListTasksParams, ListTasksResult, ListToolsParams,
+    ListToolsResult, LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt,
+    PromptMessage, ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource,
+    ResourceContent, ResourceTemplate, ServerCapabilities, ServerInfo, SetLogLevelParams,
+    SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo, TaskResult, TaskStatus, Tool,
 };
 
 /// Callback for receiving progress notifications during tool execution.
@@ -2716,8 +2715,8 @@ impl Client {
             }
         };
 
-        let protocol_plan = client.session.protocol_plan().clone();
         // Update session with server response
+        let protocol_plan = client.session.protocol_plan().clone();
         client.session = ClientSession::new(
             client.session.client_info().clone(),
             client.session.client_capabilities().clone(),
@@ -2874,8 +2873,8 @@ impl Client {
             Err(error) => return Err(self.record_initialization_failure(error)),
         };
 
-        let protocol_plan = self.session.protocol_plan().clone();
         // Update session with server response
+        let protocol_plan = self.session.protocol_plan().clone();
         self.session = ClientSession::new(
             self.session.client_info().clone(),
             self.session.client_capabilities().clone(),
@@ -6608,17 +6607,16 @@ mod tests {
         let expires_at = Instant::now()
             .checked_add(RESPONSE_TOMBSTONE_RETENTION)
             .expect("test clock must admit the fixed retention interval");
-        registry.tombstones.extend(
-            (0..MAX_RESPONSE_CORRELATIONS)
-                .map(|id| {
-                    (
-                        RequestId::String(format!("retired-{id}"))
-                            .correlation_key()
-                            .expect("test IDs are valid"),
-                        expires_at,
-                    )
-                }),
-        );
+        registry
+            .tombstones
+            .extend((0..MAX_RESPONSE_CORRELATIONS).map(|id| {
+                (
+                    RequestId::String(format!("retired-{id}"))
+                        .correlation_key()
+                        .expect("test IDs are valid"),
+                    expires_at,
+                )
+            }));
 
         let error = registry
             .register(RequestId::String("over-capacity".to_string()))
@@ -6634,17 +6632,16 @@ mod tests {
     #[test]
     fn response_registry_expired_tombstones_release_correlation_capacity() {
         let mut registry = ResponseRegistry::new();
-        registry.tombstones.extend(
-            (0..MAX_RESPONSE_CORRELATIONS)
-                .map(|id| {
-                    (
-                        RequestId::String(format!("expired-{id}"))
-                            .correlation_key()
-                            .expect("test IDs are valid"),
-                        Instant::now(),
-                    )
-                }),
-        );
+        registry
+            .tombstones
+            .extend((0..MAX_RESPONSE_CORRELATIONS).map(|id| {
+                (
+                    RequestId::String(format!("expired-{id}"))
+                        .correlation_key()
+                        .expect("test IDs are valid"),
+                    Instant::now(),
+                )
+            }));
 
         let waiter = registry
             .register(RequestId::String("new-owner".to_string()))
@@ -6699,14 +6696,10 @@ mod tests {
 
         let mut registry = ResponseRegistry::new();
         let expired_id = RequestId::String("expired-control".to_string());
-        registry
-            .cancellation_controls
-            .insert(
-                expired_id
-                    .correlation_key()
-                    .expect("test ID is valid"),
-                Instant::now(),
-            );
+        registry.cancellation_controls.insert(
+            expired_id.correlation_key().expect("test ID is valid"),
+            Instant::now(),
+        );
         assert!(
             registry
                 .claim_cancellation_control(&expired_id)
@@ -6718,17 +6711,16 @@ mod tests {
             .checked_add(CANCELLATION_CONTROL_RETENTION)
             .expect("test clock admits fixed control retention");
         registry.cancellation_controls.clear();
-        registry.cancellation_controls.extend(
-            (0..MAX_CANCELLATION_CONTROL_IDS)
-                .map(|id| {
-                    (
-                        RequestId::String(format!("control-{id}"))
-                            .correlation_key()
-                            .expect("test IDs are valid"),
-                        expires_at,
-                    )
-                }),
-        );
+        registry
+            .cancellation_controls
+            .extend((0..MAX_CANCELLATION_CONTROL_IDS).map(|id| {
+                (
+                    RequestId::String(format!("control-{id}"))
+                        .correlation_key()
+                        .expect("test IDs are valid"),
+                    expires_at,
+                )
+            }));
         let error = registry
             .claim_cancellation_control(&RequestId::String("overflow".to_string()))
             .expect_err("control retention has a deterministic hard bound");
@@ -6794,7 +6786,9 @@ mod tests {
         let state_before = registry.pending_len();
 
         assert!(
-            registry.register(RequestId::Integer("1.0".to_owned())).is_err(),
+            registry
+                .register(RequestId::Integer("1.0".to_owned()))
+                .is_err(),
             "an exact numeric alias cannot create a second active request"
         );
         assert_eq!(registry.pending_len(), state_before);
