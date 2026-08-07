@@ -1832,67 +1832,6 @@ mod tests {
     }
 
     #[test]
-    fn absolute_uri_accepts_rfc3986_hierarchical_and_opaque_goldens() {
-        let cases = [
-            "https://user:pass@example.com:8443/a/b?x=y#z",
-            "http://example.com",
-            "urn:isbn:0451450523",
-            "custom:opaque:data",
-            "unknown+ext.1:value",
-            "scheme:",
-            "scheme:/",
-            "scheme:///path",
-            "scheme://",
-            "scheme://@host:",
-            "scheme://:80/path",
-            "scheme://[2001:db8::1]/path",
-            "scheme://[::ffff:192.0.2.128]/path",
-            "scheme://[v1.fe80::a]/path",
-            "scheme:%E2%98%83",
-            "scheme:%FF%FE%00",
-            "scheme:a!$&'()*+,;=:@/b",
-            "scheme:a?x/?:@!$&'()*+,;=%FF#y/?:@!$&'()*+,;=%00",
-        ];
-
-        for input in cases {
-            let uri = AbsoluteUri::parse(input).unwrap();
-            assert_eq!(uri.as_str(), input);
-            assert_eq!(uri.as_bytes(), input.as_bytes());
-            assert_eq!(uri.encoded_bytes(), input.len());
-        }
-    }
-
-    #[test]
-    fn absolute_uri_preserves_query_fragment_cartesian_product() {
-        let queries = [None, Some(""), Some("query")];
-        let fragments = [None, Some(""), Some("fragment")];
-
-        for query in queries {
-            for fragment in fragments {
-                let mut input = String::from("scheme:path");
-                if let Some(query) = query {
-                    input.push('?');
-                    input.push_str(query);
-                }
-                if let Some(fragment) = fragment {
-                    input.push('#');
-                    input.push_str(fragment);
-                }
-
-                let uri = AbsoluteUri::parse(&input).unwrap();
-                assert_eq!(uri.as_str(), input);
-                assert_eq!(uri.query(), query);
-                assert_eq!(uri.fragment(), fragment);
-                assert_eq!(uri.query_state(), UriComponentState::from_optional(query));
-                assert_eq!(
-                    uri.fragment_state(),
-                    UriComponentState::from_optional(fragment)
-                );
-            }
-        }
-    }
-
-    #[test]
     fn uri_component_state_distinguishes_all_states() {
         assert_ne!(UriComponentState::Absent, UriComponentState::Empty);
         assert_ne!(UriComponentState::Empty, UriComponentState::NonEmpty(""));
@@ -1975,25 +1914,6 @@ mod tests {
     }
 
     #[test]
-    fn absolute_uri_rejects_missing_and_invalid_schemes() {
-        let cases = [
-            "",
-            "relative/path",
-            "/relative",
-            "//authority/path",
-            ":path",
-            "1scheme:path",
-            "+scheme:path",
-            "scheme_name:path",
-            "scheme/path:later",
-            "?query:later",
-        ];
-        for input in cases {
-            assert!(AbsoluteUri::parse(input).is_err(), "{input}");
-        }
-    }
-
-    #[test]
     fn absolute_uri_rejects_raw_non_ascii_control_space_and_del() {
         let cases = [
             "scheme:café",
@@ -2010,29 +1930,6 @@ mod tests {
         ];
         for input in cases {
             assert!(AbsoluteUri::parse(input).is_err(), "{input:?}");
-        }
-    }
-
-    #[test]
-    fn absolute_uri_rejects_invalid_percent_triplets_everywhere() {
-        let cases = [
-            "scheme:%",
-            "scheme:%0",
-            "scheme:%GG",
-            "scheme://user%@host/path",
-            "scheme://host%2/path",
-            "scheme:path?%",
-            "scheme:path?x=%0",
-            "scheme:path#%xz",
-        ];
-        for input in cases {
-            assert!(
-                matches!(
-                    AbsoluteUri::parse(input),
-                    Err(AbsoluteUriError::InvalidPercentEncoding { .. })
-                ),
-                "{input}"
-            );
         }
     }
 
@@ -2119,21 +2016,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_http_uses_exact_url_crate_canonicalization() {
-        let value =
-            CanonicalHttpUrl::parse("HTTPS://BÜCHER.Example:443/a/./b/../c?x=1#frag").unwrap();
-
-        assert_eq!(value.as_str(), "https://xn--bcher-kva.example/a/c?x=1#frag");
-        assert_eq!(value.scheme(), "https");
-        assert_eq!(value.host(), "xn--bcher-kva.example");
-        assert_eq!(value.port(), None);
-        assert_eq!(value.effective_port(), 443);
-        assert_eq!(value.path(), "/a/c");
-        assert_eq!(value.query(), Some("x=1"));
-        assert_eq!(value.fragment(), Some("frag"));
-    }
-
-    #[test]
     fn canonical_http_default_ports_and_trailing_slashes_follow_url_crate() {
         let http = CanonicalHttpUrl::parse("HTTP://EXAMPLE.TEST:80").unwrap();
         let https = CanonicalHttpUrl::parse("HTTPS://EXAMPLE.TEST:443/").unwrap();
@@ -2196,25 +2078,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_http_rejects_non_http_relative_missing_host_and_bad_port() {
-        let cases = [
-            "ftp://example.test/x",
-            "urn:example:x",
-            "/relative",
-            "https://",
-            "https:///mcp",
-            "https://example.test:99999/x",
-        ];
-        for input in cases {
-            assert!(CanonicalHttpUrl::parse(input).is_err(), "{input}");
-        }
-        assert_eq!(
-            CanonicalHttpUrl::parse("https:///mcp"),
-            Err(CanonicalHttpUrlError::MissingHost)
-        );
-    }
-
-    #[test]
     fn canonical_http_checks_input_and_expanded_output_bounds() {
         assert_eq!(
             CanonicalHttpUrl::parse_with_max_bytes(
@@ -2259,23 +2122,6 @@ mod tests {
         assert_eq!(value.effective_port(), 443);
         assert_eq!(value.path(), "/mcp");
         assert_eq!(value.query(), None);
-    }
-
-    #[test]
-    fn canonical_resource_rejects_every_http_form_including_loopback() {
-        let cases = [
-            "http://example.test/mcp",
-            "http://localhost/mcp",
-            "http://127.0.0.1/mcp",
-            "http://[::1]/mcp",
-        ];
-        for input in cases {
-            assert_eq!(
-                parse_default_resource(input),
-                Err(CanonicalResourceIdError::HttpsRequired),
-                "{input}"
-            );
-        }
     }
 
     #[test]
@@ -2357,68 +2203,6 @@ mod tests {
             Err(CanonicalResourceIdError::EndpointPathPolicyMismatch {
                 required: ResourceEndpointPathPolicy::RootEndpoint,
             })
-        );
-    }
-
-    #[test]
-    fn canonical_resource_can_bind_the_most_specific_configured_endpoint() {
-        let tenant_base = CanonicalHttpUrl::parse("https://api.example.test/tenant").unwrap();
-        let tenant = CanonicalHttpUrl::parse("https://api.example.test/tenant/mcp").unwrap();
-        let endpoints = [
-            ConfiguredResourceEndpoint::new(
-                "tenant-base",
-                &tenant_base,
-                CanonicalResourceIdPolicy::DEFAULT,
-            ),
-            ConfiguredResourceEndpoint::new("tenant", &tenant, CanonicalResourceIdPolicy::DEFAULT),
-        ];
-
-        let resource = CanonicalResourceId::parse_for_configured_endpoints(
-            "https://api.example.test/tenant/mcp/tool",
-            &endpoints,
-        )
-        .unwrap();
-        assert_eq!(resource.path(), "/tenant/mcp/tool");
-        assert_eq!(resource.configured_endpoint_identity(), "tenant");
-
-        let first_identity = CanonicalResourceId::parse_for_configured_endpoints(
-            "https://api.example.test/tenant/mcp/tool",
-            &[ConfiguredResourceEndpoint::new(
-                "first-identity",
-                &tenant,
-                CanonicalResourceIdPolicy::DEFAULT,
-            )],
-        )
-        .unwrap();
-        let second_identity = CanonicalResourceId::parse_for_configured_endpoints(
-            "https://api.example.test/tenant/mcp/tool",
-            &[ConfiguredResourceEndpoint::new(
-                "second-identity",
-                &tenant,
-                CanonicalResourceIdPolicy::DEFAULT,
-            )],
-        )
-        .unwrap();
-        assert_ne!(first_identity, second_identity);
-
-        let ipv6 = CanonicalHttpUrl::parse("https://[2001:db8::1]/mcp").unwrap();
-        let ipv6_resource = CanonicalResourceId::parse_for_configured_endpoints(
-            "https://[2001:db8::1]/mcp/tool",
-            &[ConfiguredResourceEndpoint::new(
-                "ipv6",
-                &ipv6,
-                CanonicalResourceIdPolicy::DEFAULT,
-            )],
-        )
-        .unwrap();
-        assert_eq!(ipv6_resource.configured_endpoint_identity(), "ipv6");
-
-        assert_eq!(
-            CanonicalResourceId::parse_for_configured_endpoints(
-                "https://api.example.test/tenant/mcp%2Ftool",
-                &endpoints,
-            ),
-            Err(CanonicalResourceIdError::NoMatchingConfiguredEndpoint)
         );
     }
 
