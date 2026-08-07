@@ -50901,7 +50901,7 @@ activate = 1\n";
         subject: &str,
     ) -> VResult<&'static [&'static str]> {
         let allowed = match reference {
-            ACTION_CHECKOUT => &["persist-credentials"],
+            ACTION_CHECKOUT => &["persist-credentials"][..],
             ACTION_RUST_TOOLCHAIN => &["toolchain", "targets", "components"],
             ACTION_RUST_CACHE => &["key"],
             ACTION_UPLOAD_ARTIFACT => &["name", "path", "if-no-files-found"],
