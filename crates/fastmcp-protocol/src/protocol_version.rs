@@ -8,6 +8,9 @@
 /// The final protocol version implemented by this narrow modern surface.
 pub const FINAL_PROTOCOL_VERSION: &str = "2026-07-28";
 
+/// The exact protocol versions admitted by this final-only surface.
+pub const SUPPORTED_FINAL_PROTOCOL_VERSIONS: &[&str] = &[FINAL_PROTOCOL_VERSION];
+
 /// The HTTP header that mirrors the body's protocol-version metadata.
 pub const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 
@@ -26,6 +29,134 @@ impl FinalProtocolVersion {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         FINAL_PROTOCOL_VERSION
+    }
+}
+
+/// The request metadata whose HTTP and JSON body values mirror each other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestVersionMetadata<'a> {
+    /// The already-decoded `MCP-Protocol-Version` HTTP header value.
+    pub header_version: Option<&'a str>,
+    /// The `io.modelcontextprotocol/protocolVersion` body metadata value.
+    pub body_version: Option<&'a str>,
+}
+
+/// A request admitted through the final protocol-version boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FinalRequestAdmission {
+    version: FinalProtocolVersion,
+}
+
+impl FinalRequestAdmission {
+    /// Returns the version whose header/body mirror was admitted.
+    #[must_use]
+    pub const fn protocol_version(self) -> FinalProtocolVersion {
+        self.version
+    }
+}
+
+/// The exact header/body condition that failed final request admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeaderMismatchReason {
+    /// The required protocol-version header was absent.
+    MissingHeader,
+    /// The required body protocol-version field was absent.
+    MissingBodyVersion,
+    /// The header value was empty.
+    EmptyHeader,
+    /// The body value was empty.
+    EmptyBodyVersion,
+    /// The supplied header and body values were different.
+    HeaderBodyVersionMismatch,
+}
+
+/// Typed local detail for a final `HeaderMismatchError`.
+///
+/// The detail is for local routing and diagnostics only. Canonical peer-facing
+/// header-mismatch emission has no required error-data shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeaderMismatchError {
+    reason: HeaderMismatchReason,
+}
+
+impl HeaderMismatchError {
+    /// Returns the local typed reason without constructing peer error data.
+    #[must_use]
+    pub const fn reason(self) -> HeaderMismatchReason {
+        self.reason
+    }
+
+    /// Returns the final MCP JSON-RPC header-mismatch code.
+    #[must_use]
+    pub const fn jsonrpc_error_code(self) -> i32 {
+        HEADER_MISMATCH_ERROR_CODE
+    }
+
+    /// Returns the final HTTP status for a header mismatch.
+    #[must_use]
+    pub const fn http_status(self) -> u16 {
+        400
+    }
+}
+
+/// Typed data for a final unsupported-protocol-version response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnsupportedProtocolVersionError {
+    requested: String,
+}
+
+impl UnsupportedProtocolVersionError {
+    /// Returns the exact matching header/body value the server rejected.
+    #[must_use]
+    pub fn requested(&self) -> &str {
+        &self.requested
+    }
+
+    /// Returns the exact final versions that this surface supports.
+    #[must_use]
+    pub const fn supported_versions(&self) -> &'static [&'static str] {
+        SUPPORTED_FINAL_PROTOCOL_VERSIONS
+    }
+
+    /// Returns the final MCP JSON-RPC unsupported-version code.
+    #[must_use]
+    pub const fn jsonrpc_error_code(&self) -> i32 {
+        UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE
+    }
+
+    /// Returns the final HTTP status for an unsupported version.
+    #[must_use]
+    pub const fn http_status(&self) -> u16 {
+        400
+    }
+}
+
+/// Typed failure from final request version admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestAdmissionError {
+    /// Required metadata was missing, empty, malformed, or failed the mirror check.
+    HeaderMismatch(HeaderMismatchError),
+    /// The mirror was valid but selected a version this surface does not support.
+    UnsupportedProtocolVersion(UnsupportedProtocolVersionError),
+}
+
+impl RequestAdmissionError {
+    /// Returns the HTTP status required by this final request-admission failure.
+    #[must_use]
+    pub const fn http_status(&self) -> u16 {
+        match self {
+            Self::HeaderMismatch(error) => error.http_status(),
+            Self::UnsupportedProtocolVersion(error) => error.http_status(),
+        }
+    }
+
+    /// Returns the final MCP JSON-RPC error code for this failure.
+    #[must_use]
+    pub const fn jsonrpc_error_code(&self) -> i32 {
+        match self {
+            Self::HeaderMismatch(error) => error.jsonrpc_error_code(),
+            Self::UnsupportedProtocolVersion(error) => error.jsonrpc_error_code(),
+        }
     }
 }
 
@@ -66,21 +197,72 @@ pub fn validate_final_protocol_version(
     header_version: Option<&str>,
     body_version: Option<&str>,
 ) -> Result<FinalProtocolVersion, ProtocolVersionError> {
-    let (Some(header_version), Some(body_version)) = (header_version, body_version) else {
-        return Err(ProtocolVersionError::HeaderMismatch);
-    };
+    admit_final_request(RequestVersionMetadata {
+        header_version,
+        body_version,
+    })
+    .map(|admission| admission.protocol_version())
+    .map_err(|error| match error {
+        RequestAdmissionError::HeaderMismatch(_) => ProtocolVersionError::HeaderMismatch,
+        RequestAdmissionError::UnsupportedProtocolVersion(error) => {
+            ProtocolVersionError::UnsupportedProtocolVersion {
+                requested: error.requested,
+            }
+        }
+    })
+}
 
-    if header_version.is_empty() || body_version.is_empty() || header_version != body_version {
-        return Err(ProtocolVersionError::HeaderMismatch);
+/// Admits final request metadata using the required error precedence.
+///
+/// Header/body validity is evaluated before version support. This prevents a
+/// mismatched or malformed mirror from being misclassified as an unsupported
+/// version and ensures callers never select policy from an untrusted header.
+pub fn admit_final_request(
+    metadata: RequestVersionMetadata<'_>,
+) -> Result<FinalRequestAdmission, RequestAdmissionError> {
+    let header_version = metadata.header_version.ok_or(RequestAdmissionError::HeaderMismatch(
+        HeaderMismatchError {
+            reason: HeaderMismatchReason::MissingHeader,
+        },
+    ))?;
+    let body_version = metadata.body_version.ok_or(RequestAdmissionError::HeaderMismatch(
+        HeaderMismatchError {
+            reason: HeaderMismatchReason::MissingBodyVersion,
+        },
+    ))?;
+
+    if header_version.is_empty() {
+        return Err(RequestAdmissionError::HeaderMismatch(
+            HeaderMismatchError {
+                reason: HeaderMismatchReason::EmptyHeader,
+            },
+        ));
     }
-
+    if body_version.is_empty() {
+        return Err(RequestAdmissionError::HeaderMismatch(
+            HeaderMismatchError {
+                reason: HeaderMismatchReason::EmptyBodyVersion,
+            },
+        ));
+    }
+    if header_version != body_version {
+        return Err(RequestAdmissionError::HeaderMismatch(
+            HeaderMismatchError {
+                reason: HeaderMismatchReason::HeaderBodyVersionMismatch,
+            },
+        ));
+    }
     if header_version != FINAL_PROTOCOL_VERSION {
-        return Err(ProtocolVersionError::UnsupportedProtocolVersion {
-            requested: header_version.to_owned(),
-        });
+        return Err(RequestAdmissionError::UnsupportedProtocolVersion(
+            UnsupportedProtocolVersionError {
+                requested: header_version.to_owned(),
+            },
+        ));
     }
 
-    Ok(FinalProtocolVersion)
+    Ok(FinalRequestAdmission {
+        version: FinalProtocolVersion,
+    })
 }
 
 #[cfg(test)]
@@ -144,5 +326,56 @@ mod tests {
                 Err(ProtocolVersionError::HeaderMismatch)
             );
         }
+    }
+
+    #[test]
+    fn prt_03_b_positive() {
+        let admission = admit_final_request(RequestVersionMetadata {
+            header_version: Some(FINAL_PROTOCOL_VERSION),
+            body_version: Some(FINAL_PROTOCOL_VERSION),
+        })
+        .expect("matching supported header and body versions must admit the request");
+
+        assert_eq!(admission.protocol_version().as_str(), FINAL_PROTOCOL_VERSION);
+        assert_eq!(SUPPORTED_FINAL_PROTOCOL_VERSIONS, [FINAL_PROTOCOL_VERSION]);
+    }
+
+    #[test]
+    fn prt_03_b_planted_negative() {
+        let body_version = Some(FINAL_PROTOCOL_VERSION);
+        let changed_header_version = Some("2025-11-25");
+
+        let error = admit_final_request(RequestVersionMetadata {
+            header_version: changed_header_version,
+            body_version,
+        })
+        .expect_err("changing only the header must retain header-mismatch precedence");
+
+        assert_eq!(
+            error,
+            RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
+                reason: HeaderMismatchReason::HeaderBodyVersionMismatch,
+            })
+        );
+        assert_eq!(error.jsonrpc_error_code(), HEADER_MISMATCH_ERROR_CODE);
+        assert_eq!(error.http_status(), 400);
+        assert_eq!(body_version, Some(FINAL_PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn matching_unsupported_version_is_classified_after_the_mirror_check() {
+        let error = admit_final_request(RequestVersionMetadata {
+            header_version: Some("2025-11-25"),
+            body_version: Some("2025-11-25"),
+        })
+        .expect_err("matching unsupported version must reject after mirror validation");
+
+        let RequestAdmissionError::UnsupportedProtocolVersion(error) = error else {
+            panic!("matching values must not use the header-mismatch error");
+        };
+        assert_eq!(error.requested(), "2025-11-25");
+        assert_eq!(error.supported_versions(), [FINAL_PROTOCOL_VERSION]);
+        assert_eq!(error.jsonrpc_error_code(), UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE);
+        assert_eq!(error.http_status(), 400);
     }
 }
