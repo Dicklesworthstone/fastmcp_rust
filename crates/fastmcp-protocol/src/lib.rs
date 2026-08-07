@@ -62,3 +62,30 @@ pub use messages::*;
 pub use result::*;
 pub use schema::{ValidationError, ValidationResult, validate, validate_strict};
 pub use types::*;
+
+// The FND-03 contract freezes unqualified `cargo test -- --exact` IDs. Keep
+// the executable entry points at the crate root while retaining their full
+// assertions beside the policy implementation.
+#[cfg(test)]
+#[test]
+fn fnd_03_policy_receipts_positive() {
+    protocol_policy::tests::fnd_03_policy_receipts_positive();
+}
+
+#[cfg(test)]
+#[test]
+fn fnd_03_policy_receipts_planted_negative() {
+    protocol_policy::tests::fnd_03_policy_receipts_planted_negative();
+}
+
+#[cfg(test)]
+#[test]
+fn fnd_03_era_classification_positive() {
+    protocol_policy::tests::fnd_03_era_classification_positive();
+}
+
+#[cfg(test)]
+#[test]
+fn fnd_03_era_classification_planted_negative() {
+    protocol_policy::tests::fnd_03_era_classification_planted_negative();
+}

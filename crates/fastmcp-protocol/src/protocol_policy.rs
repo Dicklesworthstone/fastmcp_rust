@@ -138,6 +138,7 @@ const MODERN_ONLY_VERSIONS: [ProtocolVersion; 1] = [ProtocolVersion::MODERN_2026
 const LEGACY_ONLY_VERSIONS: [ProtocolVersion; 1] = [ProtocolVersion::LEGACY_2024];
 const AUTO_SUPPORTED_VERSIONS: [ProtocolVersion; 2] =
     [ProtocolVersion::MODERN_2026, ProtocolVersion::LEGACY_2024];
+const NO_MODERN_DISCOVERY_VERSIONS: [ProtocolVersion; 0] = [];
 
 impl ProtocolPolicy {
     /// Returns whether this immutable policy admits a version.
@@ -150,13 +151,31 @@ impl ProtocolPolicy {
         }
     }
 
-    /// Returns the server's exact supported-version set for this policy.
+    /// Returns the policy-level exact supported-version set.
+    ///
+    /// This answers which eras the selected policy can operate, not which
+    /// versions a modern Streamable HTTP discovery response advertises. In
+    /// particular, `Auto` retains both eras here so its legacy adapter path
+    /// remains available after isolated transport classification.
     #[must_use]
     pub const fn supported_versions(self) -> &'static [ProtocolVersion] {
         match self {
             Self::Auto => &AUTO_SUPPORTED_VERSIONS,
             Self::ModernOnly => &MODERN_ONLY_VERSIONS,
             Self::LegacyOnly => &LEGACY_ONLY_VERSIONS,
+        }
+    }
+
+    /// Returns the versions advertised by modern Streamable HTTP discovery.
+    ///
+    /// Legacy `2024-11-05` is selected only through the isolated legacy
+    /// transport path. It is never included inline in a modern discovery
+    /// response, including when the immutable policy is `Auto`.
+    #[must_use]
+    pub const fn modern_discovery_versions(self) -> &'static [ProtocolVersion] {
+        match self {
+            Self::Auto | Self::ModernOnly => &MODERN_ONLY_VERSIONS,
+            Self::LegacyOnly => &NO_MODERN_DISCOVERY_VERSIONS,
         }
     }
 
@@ -925,11 +944,10 @@ impl HttpEraCache {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    #[test]
-    fn fnd_03_policy_receipts_positive() {
+    pub(crate) fn fnd_03_policy_receipts_positive() {
         assert_eq!(
             ProtocolVersion::parse(MODERN_PROTOCOL_VERSION),
             Ok(ProtocolVersion::MODERN_2026)
@@ -947,6 +965,13 @@ mod tests {
             policy.supported_versions(),
             [ProtocolVersion::MODERN_2026, ProtocolVersion::LEGACY_2024]
         );
+        assert_eq!(
+            policy.modern_discovery_versions(),
+            [ProtocolVersion::MODERN_2026]
+        );
+        assert!(ProtocolPolicy::LegacyOnly
+            .modern_discovery_versions()
+            .is_empty());
         assert_eq!(policy.preferred_versions(), policy.supported_versions());
         assert!(policy.permits(ProtocolVersion::MODERN_2026));
         assert!(policy.permits(ProtocolVersion::LEGACY_2024));
@@ -963,8 +988,7 @@ mod tests {
         assert_eq!(modern_server.role(), ProtocolRole::Server);
     }
 
-    #[test]
-    fn fnd_03_policy_receipts_planted_negative() {
+    pub(crate) fn fnd_03_policy_receipts_planted_negative() {
         let accepted_policy = ProtocolPolicy::ModernOnly;
         let accepted_state = accepted_policy
             .validate_for_client(None)
@@ -996,8 +1020,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fnd_03_era_classification_positive() {
+    pub(crate) fn fnd_03_era_classification_positive() {
         let mut stdio = StdioEraClassifier::new(ProtocolPolicy::Auto);
         assert_eq!(stdio.state(), &StdioEraState::Unclassified);
         assert_eq!(
@@ -1078,8 +1101,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fnd_03_era_classification_planted_negative() {
+    pub(crate) fn fnd_03_era_classification_planted_negative() {
         let baseline_frame = StdioOpeningFrame::ModernRequest {
             protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
         };
