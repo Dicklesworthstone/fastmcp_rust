@@ -1,0 +1,15 @@
+[
+  {"id":"canary_direct_close_rejected","kind":"negative","planted_dimension":"open-to-closed direct transition"},
+  {"id":"canary_double_claim_rejected","kind":"negative","planted_dimension":"second claimant"},
+  {"id":"canary_self_close_rejected","kind":"negative","planted_dimension":"claimant is closer"},
+  {"id":"canary_unchecked_acceptance_rejected","kind":"negative","planted_dimension":"unchecked acceptance criterion"},
+  {"id":"canary_short_close_reason_rejected","kind":"negative","planted_dimension":"short close reason"},
+  {"id":"canary_missing_typed_reference_rejected","kind":"negative","planted_dimension":"missing typed close references"},
+  {"id":"canary_missing_attribution_rejected","kind":"negative","planted_dimension":"missing tier-one attribution"},
+  {"id":"canary_review_without_pass_rejected","kind":"negative","planted_dimension":"review closure without batch_verify PASS"},
+  {"id":"canary_unauthorized_provider_limitation_detected","kind":"negative","planted_dimension":"non-batch_verify provider PASS"},
+  {"id":"canary_complete_provider_scrub_retained","kind":"negative","planted_dimension":"all observed providers overwritten to FAIL"},
+  {"id":"canary_stale_pass_rejected","kind":"negative","planted_dimension":"receipt subject revision mismatch"},
+  {"id":"canary_live_tracker_unchanged","kind":"negative","planted_dimension":"live database or JSONL mutation"},
+  {"id":"canary_distinct_orchestrator_closes_with_sole_fresh_pass","kind":"positive","planted_dimension":"fresh sole batch_verify PASS"}
+]

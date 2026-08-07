@@ -85056,6 +85056,7 @@ original = "value"
             baseline_source_tree_sha256,
         );
 
+        let exact_registries = "FND01|Error|E_CORE_CONFORMANCE_EXACT_BINDING|registries";
         for (family, pointer, replacement, expected) in [
         ("wrong byte length", "/artifacts/0/byte_length", "1", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|byte_length"),
         ("wrong SHA-256", "/artifacts/1/sha256", "0", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-json|sha256"),
@@ -85066,11 +85067,11 @@ original = "value"
         ("missing, duplicate, or changed scenario-local declared check ID", "/scenario_local_check_declarations/0/check_id", "complete-flow-jwt-bearer", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|scenario_local_check_declarations"),
         ("expected-success versus conditional-failure check-role mismatch", "/scenario_local_check_declarations/0/expected_success_path", "false", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|scenario_local_check_declarations"),
         ("incomplete transitive helper inventory mislabeled complete", "/conformance/check_inventory_scope/complete_transitive_helper_inventory_established", "true", "FND01|Error|E_CORE_CONFORMANCE_NO_CLAIM|check_inventory_scope"),
-        ("file-level auth scenario classification", "/artifacts/6/repository", "not-a-url", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|repository"),
-        ("nonfatal missing cache header mislabeled as forced input", "/artifacts/6/git_tree", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|git_tree"),
-        ("empty-scope omission mislabeled as a forced signed-scope failure", "/artifacts/6/source_page_url", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|source_page_url"),
-        ("missing exact-issuer ID-JAG policy mislabeled as production-only evidence", "/artifacts/7/retrieval_date", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-client-credentials|retrieval_date"),
-        ("expected policy rejection mislabeled as upstream pass", "/artifacts/7/vendored_path", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-client-credentials|vendored_path"),
+        ("file-level auth scenario classification", "/conformance_scenarios/0/raw_role", "applicable raw Basic wire evidence", exact_registries),
+        ("nonfatal missing cache header mislabeled as forced input", "/conformance_findings/9/category", "forced_input_incompatibility", exact_registries),
+        ("empty-scope omission mislabeled as a forced signed-scope failure", "/conformance_findings/12/category", "forced_input_incompatibility", exact_registries),
+        ("missing exact-issuer ID-JAG policy mislabeled as production-only evidence", "/conformance_findings/15/category", "missing_production_evidence", exact_registries),
+        ("expected policy rejection mislabeled as upstream pass", "/conformance_scenarios/0/upstream_pass_claimed", "true", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|conformance_scenarios"),
         ("wrong final error code", "/final_error_codes/2/code", "-32023", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|final_error_codes"),
         ("missing or duplicate Section 5 ambiguity entry", "/ambiguities/1/id", "5.1", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|ambiguities"),
     ] {
@@ -85082,6 +85083,7 @@ original = "value"
             toml::Value::Integer(replacement.parse().expect("integer mutation"))
         } else if pointer.ends_with("expected_success_path")
             || pointer.ends_with("complete_transitive_helper_inventory_established")
+            || pointer.ends_with("_claimed")
         {
             toml::Value::Boolean(replacement.parse().expect("boolean mutation"))
         } else {
