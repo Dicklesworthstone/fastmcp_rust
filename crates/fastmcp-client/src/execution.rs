@@ -16,7 +16,7 @@ use fastmcp_core::{McpError, McpResult, Sha256Digest, sha256_bounded};
 use fastmcp_protocol::{
     CancelledParams, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
 };
-use fastmcp_transport::{CodecError, Transport, TransportError};
+use fastmcp_transport::{Transport, TransportError};
 use serde_json::Value;
 
 use crate::{RequestTimeoutPolicy, transport_error_to_mcp};
@@ -1093,6 +1093,7 @@ impl<T> Drop for RequestExecution<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastmcp_transport::CodecError;
 
     #[derive(Debug)]
     struct ScriptedTransport {
