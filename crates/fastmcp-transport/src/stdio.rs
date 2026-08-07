@@ -44,6 +44,7 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::fd::AsFd;
@@ -52,7 +53,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use asupersync::Cx;
-use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
+use fastmcp_protocol::{CorrelationKey, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 #[cfg(unix)]
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 #[cfg(unix)]
@@ -177,6 +178,57 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
         match self.recv_with_completion(cx)?.0 {
             JsonRpcMessage::Request(request) => on_request(request),
             JsonRpcMessage::Response(response) => on_response(response),
+        }
+        Ok(())
+    }
+
+    /// Receives one complete frame and routes a response to its exact waiter.
+    ///
+    /// The waiter map uses the protocol's canonical correlation key, so
+    /// mathematically equivalent integer spellings resolve to the same owner
+    /// while string IDs remain distinct. A response consumes only its own
+    /// waiter; an unknown or missing ID is delivered solely to
+    /// `on_uncorrelated_response` and cannot wake, cancel, or otherwise alter
+    /// an unrelated request. Requests and identifier-free notifications remain
+    /// on the inbound direction and retain wire order with respect to every
+    /// other inbound request.
+    ///
+    /// The method writes nothing. In particular, malformed framing and codec
+    /// failures run no handler and never synthesize a reverse JSON-RPC error.
+    /// A caller cancellation observed by [`Self::recv_with_completion`] also
+    /// leaves the waiter registry untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns the framing, codec, closure, I/O, or cancellation error from
+    /// [`Self::recv_with_completion`].
+    pub fn dispatch_next_multiplexed<RequestHandler, Waiter, ResponseHandler, UnmatchedHandler>(
+        &mut self,
+        cx: &Cx,
+        waiters: &mut HashMap<CorrelationKey, Waiter>,
+        on_request: &mut RequestHandler,
+        on_response: &mut ResponseHandler,
+        on_uncorrelated_response: &mut UnmatchedHandler,
+    ) -> Result<(), TransportError>
+    where
+        RequestHandler: FnMut(JsonRpcRequest),
+        ResponseHandler: FnMut(Waiter, JsonRpcResponse),
+        UnmatchedHandler: FnMut(JsonRpcResponse),
+    {
+        match self.recv_with_completion(cx)?.0 {
+            JsonRpcMessage::Request(request) => on_request(request),
+            JsonRpcMessage::Response(response) => {
+                let waiter = response
+                    .id
+                    .as_ref()
+                    .and_then(|id| id.correlation_key().ok())
+                    .and_then(|key| waiters.remove(&key));
+                if let Some(waiter) = waiter {
+                    on_response(waiter, response);
+                } else {
+                    on_uncorrelated_response(response);
+                }
+            }
         }
         Ok(())
     }

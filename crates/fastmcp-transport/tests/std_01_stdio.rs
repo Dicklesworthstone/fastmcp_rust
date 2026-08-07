@@ -4,6 +4,7 @@
 //! exercise the crate's exported stdio transport rather than its private test
 //! module so `--exact` discovers one and only one entry for each frozen ID.
 
+use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use asupersync::Cx;
-use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
+use fastmcp_protocol::{CorrelationKey, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 use fastmcp_transport::{StdioTransport, TransportError};
 
 #[derive(Clone, Default)]
@@ -79,8 +80,19 @@ fn std_01_a_positive() {
     let writer = SharedWriter::default();
     let mut transport = StdioTransport::new(Cursor::new(input.to_vec()), writer.clone());
     let cx = Cx::for_testing();
+    let mut waiters = HashMap::from([
+        (
+            CorrelationKey::String("request-7".to_owned()),
+            "first-waiter",
+        ),
+        (
+            CorrelationKey::String("request-9".to_owned()),
+            "unrelated-waiter",
+        ),
+    ]);
     let mut requests = Vec::new();
     let mut responses = Vec::new();
+    let mut uncorrelated = Vec::new();
     let mut on_request = |request: JsonRpcRequest| {
         requests.push((
             request.method,
@@ -89,21 +101,42 @@ fn std_01_a_positive() {
                 .map(|id| serde_json::to_value(id).expect("request ID is serializable")),
         ));
     };
-    let mut on_response = |response: JsonRpcResponse| {
-        responses.push(serde_json::to_value(response.id).expect("response ID is serializable"));
+    let mut on_multiplexed_response = |waiter, response: JsonRpcResponse| {
+        responses.push((
+            waiter,
+            serde_json::to_value(response.id).expect("response ID is serializable"),
+        ));
+    };
+    let mut on_uncorrelated_response = |response: JsonRpcResponse| {
+        uncorrelated.push(response.id);
     };
 
     for _ in 0..3 {
         transport
-            .dispatch_next(&cx, &mut on_request, &mut on_response)
-            .expect("each complete newline frame dispatches exactly once");
+            .dispatch_next_multiplexed(
+                &cx,
+                &mut waiters,
+                &mut on_request,
+                &mut on_multiplexed_response,
+                &mut on_uncorrelated_response,
+            )
+            .expect("each complete newline frame routes exactly once");
     }
 
     assert_eq!(
         responses,
-        vec![serde_json::json!("request-7")],
-        "the response remains correlated with its exact wire ID"
+        vec![("first-waiter", serde_json::json!("request-7"))],
+        "the response consumes only its exact canonical waiter"
     );
+    assert_eq!(
+        waiters,
+        HashMap::from([(
+            CorrelationKey::String("request-9".to_owned()),
+            "unrelated-waiter",
+        )]),
+        "a response cannot consume an unrelated in-flight waiter"
+    );
+    assert!(uncorrelated.is_empty());
     assert_eq!(
         requests,
         vec![
@@ -124,28 +157,35 @@ fn std_01_a_positive() {
 #[test]
 fn std_01_a_planted_negative() {
     let valid = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"request-8\"}\n";
-    let forbidden = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools\n/list\",\"id\":\"request-8\"}\n";
+    let forbidden = b"[{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"request-8\"}]\n";
     let mut restored = forbidden.to_vec();
-    let embedded_newline = restored
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .expect("the planted frame contains an embedded newline");
-    restored.remove(embedded_newline);
+    restored.remove(0);
+    restored.remove(restored.len() - 2);
     assert_eq!(
         restored, valid,
-        "the planted negative differs only by one forbidden embedded newline byte"
+        "the planted negative differs only by the forbidden top-level batch dimension"
     );
 
     let writer = SharedWriter::default();
     let mut transport = StdioTransport::new(Cursor::new(forbidden.to_vec()), writer.clone());
     let cx = Cx::for_testing();
+    let mut waiters = HashMap::from([(
+        CorrelationKey::String("request-8".to_owned()),
+        "live-waiter",
+    )]);
+    let waiters_before = waiters.clone();
     let mut request_count = 0;
     let mut response_count = 0;
+    let mut uncorrelated_count = 0;
     let error = transport
-        .dispatch_next(&cx, &mut |_| request_count += 1, &mut |_| {
-            response_count += 1
-        })
-        .expect_err("an embedded newline must reject before either direction dispatches");
+        .dispatch_next_multiplexed(
+            &cx,
+            &mut waiters,
+            &mut |_| request_count += 1,
+            &mut |_, _| response_count += 1,
+            &mut |_| uncorrelated_count += 1,
+        )
+        .expect_err("a top-level batch must reject before either direction dispatches");
 
     assert!(matches!(error, TransportError::Codec(_)));
     assert_eq!(
@@ -155,6 +195,14 @@ fn std_01_a_planted_negative() {
     assert_eq!(
         response_count, 0,
         "rejected framing cannot dispatch a response"
+    );
+    assert_eq!(
+        uncorrelated_count, 0,
+        "rejected framing cannot consume an uncorrelated response path"
+    );
+    assert_eq!(
+        waiters, waiters_before,
+        "batch rejection leaves every waiter and correlation entry unchanged"
     );
     assert!(
         writer.recorded().is_empty(),
