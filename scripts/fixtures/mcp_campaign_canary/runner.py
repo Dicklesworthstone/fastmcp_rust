@@ -17,6 +17,7 @@ import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+import re
 from typing import Any
 
 
@@ -43,6 +44,7 @@ WORKER = "CanaryWorker"
 ORCHESTRATOR = "McpCampaignOrchestrator"
 HARNESS = "scripts/mcp_campaign_canary.sh"
 MODEL = "campaign-canary-v1"
+CHECKBOX = re.compile(r"^\s*[-*+]\s+\[([ xX])\]\s+")
 
 
 def now() -> str:
@@ -160,9 +162,9 @@ class Runner:
         if created.returncode:
             raise RuntimeError(f"cannot create {case_id}: {created.stderr}")
         issue_id = created.stdout.strip()
-        criterion = "[x] verified canary acceptance" if checked else "[ ] verified canary acceptance"
+        criterion = "- [x] verified canary acceptance" if checked else "- [ ] verified canary acceptance"
         updated = self.br(
-            "update", issue_id, "--acceptance-criteria", criterion, actor=WORKER
+            "update", issue_id, f"--acceptance-criteria={criterion}", actor=WORKER
         )
         if updated.returncode:
             raise RuntimeError(f"cannot update acceptance for {case_id}: {updated.stderr}")
@@ -185,7 +187,7 @@ class Runner:
     ) -> None:
         completed = self.br(
             "gate", "report", issue_id, "--gate", "batch_verify", "--provider", provider,
-            "--status", status, "--note", note or f"{self.current_case}:{self.subject_revision}", actor=actor,
+            "--status", status, "--note", note or f"subject_revision:{self.subject_revision}", actor=actor,
         )
         if completed.returncode:
             raise RuntimeError(f"cannot report {provider} {status}: {completed.stderr}")
@@ -196,30 +198,55 @@ class Runner:
             args.extend(["--agent-name", actor, "--harness", HARNESS, "--model", MODEL])
         return self.br(*args, actor=actor)
 
-    def close_if_fresh(
-        self, issue_id: str, *, ledger: Any, actor: str, reason: str,
+    def guarded_close(
+        self, issue_id: str, *, issue: Any, ledger: Any, actor: str, reason: str,
+        attributed: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        if provider_statuses(ledger) == [("batch_verify", "pass")] and retains_revision(
-            ledger, self.subject_revision
-        ):
-            return self.close(issue_id, actor=actor, reason=reason)
-        argv = [
-            "freshness_guard", "close", issue_id, "--expected-revision", self.subject_revision,
-        ]
-        completed = subprocess.CompletedProcess(
-            argv, 1, json.dumps({"rejected": "stale or non-sole gate evidence"}),
-            "freshness guard refused close before tracker transition",
+        """Require every non-bypass campaign closure to satisfy the frozen contract.
+
+        br 0.2.16 captures supplied attribution but does not enforce its presence.
+        This owned, auditable pre-transition guard supplies that missing operational
+        control without claiming it is tracker-native enforcement.
+        """
+        rejection = guarded_close_rejection(
+            issue=issue,
+            ledger=ledger,
+            actor=actor,
+            reason=reason,
+            attributed=attributed,
+            subject_revision=self.subject_revision,
+            explicit_db=self.db,
         )
+        argv = [
+            "guarded-close", issue_id, "--db", str(self.db),
+            "--expected-revision", self.subject_revision,
+        ]
+        if rejection:
+            completed = subprocess.CompletedProcess(
+                argv, 1, json.dumps({"rejected": rejection}),
+                "guarded-close refused close before tracker transition",
+            )
+            self.commands.append(
+                {
+                    "case_id": self.current_case, "actor": actor, "argv": argv,
+                    "exit_code": completed.returncode,
+                    "stdout_sha256": sha256_bytes(completed.stdout.encode()),
+                    "stderr_sha256": sha256_bytes(completed.stderr.encode()),
+                    "stdout": json_value(completed.stdout), "stderr": completed.stderr,
+                }
+            )
+            return completed
         self.commands.append(
             {
                 "case_id": self.current_case, "actor": actor, "argv": argv,
-                "exit_code": completed.returncode,
-                "stdout_sha256": sha256_bytes(completed.stdout.encode()),
-                "stderr_sha256": sha256_bytes(completed.stderr.encode()),
-                "stdout": json_value(completed.stdout), "stderr": completed.stderr,
+                "exit_code": 0,
+                "stdout_sha256": sha256_bytes(b'{"guarded_close":"accepted"}'),
+                "stderr_sha256": sha256_bytes(b""),
+                "stdout": {"guarded_close": "accepted", "closure_entry_point": "guarded-close"},
+                "stderr": "",
             }
         )
-        return completed
+        return self.close(issue_id, actor=actor, reason=reason, attributed=attributed)
 
     def record_case(
         self, case: dict[str, str], issue_id: str | None, before: Any, after: Any,
@@ -271,6 +298,66 @@ def retains_revision(value: Any, revision: str) -> bool:
     return revision in json.dumps(value, sort_keys=True)
 
 
+def issue_field(issue: Any, field: str) -> Any:
+    """Return a top-level issue field from br's object-or-singleton-list output."""
+    if isinstance(issue, list) and len(issue) == 1:
+        issue = issue[0]
+    return issue.get(field) if isinstance(issue, dict) else None
+
+
+def fully_checked_acceptance(issue: Any) -> bool:
+    criteria = issue_field(issue, "acceptance_criteria")
+    if not isinstance(criteria, str):
+        return False
+    checkboxes = [match.group(1).lower() for line in criteria.splitlines() if (match := CHECKBOX.match(line))]
+    return bool(checkboxes) and all(mark == "x" for mark in checkboxes)
+
+
+def has_concrete_typed_references(reason: str, subject_revision: str, case_id: str) -> bool:
+    expected = {
+        f"commit:{subject_revision}",
+        f"run:{case_id}",
+        f"evidence:receipt-{case_id}",
+        f"incident:canary-{case_id}",
+    }
+    return expected.issubset(set(reason.split()))
+
+
+def guarded_close_rejection(
+    *, issue: Any, ledger: Any, actor: str, reason: str, attributed: bool,
+    subject_revision: str, explicit_db: Path,
+) -> str | None:
+    if not explicit_db.is_file():
+        return "explicit isolated database is unavailable"
+    if issue_field(issue, "status") != "review":
+        return "issue is not in review"
+    if not fully_checked_acceptance(issue):
+        return "acceptance criteria are not fully checked"
+    if actor == WORKER:
+        return "closer must be distinct from the worker"
+    if not attributed:
+        return "tier-one closer attribution is required"
+    if provider_statuses(ledger) != [("batch_verify", "pass")]:
+        return "sole effective batch_verify PASS is required"
+    if not retains_revision(ledger, subject_revision):
+        return "batch_verify PASS is not bound to the subject revision"
+    if not has_concrete_typed_references(reason, subject_revision, reason_case_id(reason)):
+        return "concrete typed close references are required"
+    return None
+
+
+def reason_case_id(reason: str) -> str:
+    for token in reason.split():
+        if token.startswith("run:"):
+            return token.removeprefix("run:")
+    return ""
+
+
+def guard_rejected_for(attempt: subprocess.CompletedProcess[str], reason: str) -> bool:
+    result = json_value(attempt.stdout)
+    return attempt.returncode != 0 and isinstance(result, dict) and result.get("rejected") == reason
+
+
 def valid_reason(runner: Runner) -> str:
     return (
         f"commit:{runner.subject_revision} run:{runner.current_case} "
@@ -304,14 +391,15 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
                 note=f"subject_revision:{runner.stale_revision}",
             )
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close_if_fresh(
-                issue_id, ledger=ledger_before, actor=ORCHESTRATOR, reason=valid_reason(runner),
+            attempt = runner.guarded_close(
+                issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
+                reason=valid_reason(runner),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = (
                 runner.stale_revision != runner.subject_revision
                 and retains_revision(ledger_before, runner.stale_revision)
-                and attempt.returncode != 0
+                and guard_rejected_for(attempt, "batch_verify PASS is not bound to the subject revision")
                 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             )
             detail = "freshness guard rejects a ledger PASS bound to a distinct real ancestor revision before close"
@@ -337,7 +425,10 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", WORKER)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=WORKER, reason=valid_reason(runner))
+            attempt = runner.guarded_close(
+                issue_id, issue=before, ledger=ledger_before, actor=WORKER,
+                reason=valid_reason(runner),
+            )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "claimant cannot self-close after in-progress"
@@ -346,16 +437,25 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner))
+            attempt = runner.guarded_close(
+                issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
+                reason=valid_reason(runner),
+            )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
-            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
+            passed = (
+                issue_field(before, "acceptance_criteria") == "- [ ] verified canary acceptance"
+                and guard_rejected_for(attempt, "acceptance criteria are not fully checked")
+                and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
+            )
             detail = "unchecked acceptance rejects without state mutation"
         elif case_id == "canary_short_close_reason_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason="short")
+            attempt = runner.guarded_close(
+                issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR, reason="short",
+            )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "short close reason rejects without state mutation"
@@ -364,7 +464,10 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason="this deliberately long reason contains no required typed references")
+            attempt = runner.guarded_close(
+                issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
+                reason="this deliberately long reason contains no required typed references",
+            )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "missing commit/run/evidence/incident references reject"
@@ -373,15 +476,24 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner), attributed=False)
+            attempt = runner.guarded_close(
+                issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
+                reason=valid_reason(runner), attributed=False,
+            )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
-            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
+            passed = (
+                guard_rejected_for(attempt, "tier-one closer attribution is required")
+                and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
+            )
             detail = "missing tier-one attribution rejects"
         elif case_id == "canary_review_without_pass_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner))
+            attempt = runner.guarded_close(
+                issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
+                reason=valid_reason(runner),
+            )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "review issue without batch_verify PASS rejects"
@@ -390,11 +502,14 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(issue_id, "impostor", "pass", "ImpostorProvider")
             before, ledger_before, audit_before = runner.snapshot(issue_id)
+            # Intentional direct br close: this frozen limitation case proves that
+            # installed br accepts an unauthorized provider PASS.  It is never a
+            # passing campaign closure and the retained receipt names the bypass.
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner))
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             statuses = provider_statuses(ledger_before)
             passed = attempt.returncode == 0 and ("impostor", "pass") in statuses
-            detail = "installed br accepts an unauthorized provider PASS; harness records the limitation"
+            detail = "intentional direct-close bypass proves installed br accepts an unauthorized provider PASS; harness records the limitation"
         elif case_id == "canary_complete_provider_scrub_retained":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
@@ -404,7 +519,10 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             for provider, _status in sorted(set(provider_statuses(ledger_before))):
                 runner.report_gate(issue_id, provider, "fail", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner))
+            attempt = runner.guarded_close(
+                issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
+                reason=valid_reason(runner),
+            )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = (
                 attempt.returncode != 0
@@ -422,11 +540,16 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
                 runner.subject_revision == runner.receipt_revision
                 and retains_revision(ledger_before, runner.subject_revision)
             )
-            attempt = runner.close_if_fresh(
-                issue_id, ledger=ledger_before, actor=ORCHESTRATOR, reason=valid_reason(runner),
+            attempt = runner.guarded_close(
+                issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
+                reason=valid_reason(runner),
             ) if fresh and statuses == [("batch_verify", "pass")] else None
             after, ledger_after, audit_after = runner.snapshot(issue_id)
-            passed = attempt is not None and attempt.returncode == 0
+            passed = (
+                issue_field(before, "acceptance_criteria") == "- [x] verified canary acceptance"
+                and attempt is not None
+                and attempt.returncode == 0
+            )
             detail = "distinct orchestrator closes only with the fresh sole batch_verify PASS"
         else:
             raise RuntimeError(f"unknown frozen case {case_id}")
