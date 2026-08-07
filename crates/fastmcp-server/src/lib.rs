@@ -2867,16 +2867,13 @@ impl Server {
                                 {
                                     ProtocolEra::Modern2026
                                 } else {
-                                    if let Some(response) = protocol_era_refusal(&request)
-                                        && send
+                                    if let Some(response) = protocol_era_refusal(&request) {
+                                        let _ = send
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner)(
                                             cx,
                                             &JsonRpcMessage::Response(response),
-                                        )
-                                        .is_err()
-                                    {
-                                        exit_code = 1;
+                                        );
                                     }
                                     exit_code = 1;
                                     break 'receive;
@@ -2887,16 +2884,13 @@ impl Server {
                                     || (request.method == "initialize"
                                         && !is_exact_legacy_initialize(&request))
                                 {
-                                    if let Some(response) = protocol_era_refusal(&request)
-                                        && send
+                                    if let Some(response) = protocol_era_refusal(&request) {
+                                        let _ = send
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner)(
                                             cx,
                                             &JsonRpcMessage::Response(response),
-                                        )
-                                        .is_err()
-                                    {
-                                        exit_code = 1;
+                                        );
                                     }
                                     exit_code = 1;
                                     break 'receive;
@@ -2921,16 +2915,13 @@ impl Server {
                                     ProtocolEra::Legacy2024
                                 }
                                 _ => {
-                                    if let Some(response) = protocol_era_refusal(&request)
-                                        && send
+                                    if let Some(response) = protocol_era_refusal(&request) {
+                                        let _ = send
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner)(
                                             cx,
                                             &JsonRpcMessage::Response(response),
-                                        )
-                                        .is_err()
-                                    {
-                                        exit_code = 1;
+                                        );
                                     }
                                     exit_code = 1;
                                     break 'receive;
@@ -8297,7 +8288,6 @@ mod lib_unit_tests {
                     )))
                 },
                 Arc::new(|_| {}),
-                None,
                 "test",
             );
 
@@ -8344,7 +8334,6 @@ mod lib_unit_tests {
                     )))
                 },
                 Arc::new(|_| {}),
-                None,
                 "test",
             );
 
@@ -8376,7 +8365,6 @@ mod lib_unit_tests {
                     panic!("dispatch worker send callback panic")
                 },
                 Arc::new(|_| {}),
-                None,
                 "test",
             );
 
@@ -8431,7 +8419,6 @@ mod lib_unit_tests {
                     Ok(())
                 },
                 Arc::new(|_| {}),
-                None,
                 "test",
             );
 

@@ -7186,6 +7186,7 @@ mod helper_function_tests {
                         .map_err(|_| fastmcp_transport::TransportError::Closed)
                 },
                 Arc::new(|_| {}),
+                None,
                 "test",
             )
             .expect("scripted returning loop must close cleanly");
@@ -7299,6 +7300,7 @@ mod helper_function_tests {
                         .map_err(|_| fastmcp_transport::TransportError::Closed)
                 },
                 Arc::new(|_| {}),
+                None,
                 "test",
             )
             .expect("scripted returning loop must close cleanly");
