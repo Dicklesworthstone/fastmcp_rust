@@ -76247,63 +76247,27 @@ activate = 1\n";
         lower_hex(ring_digest(&SHA1_FOR_LEGACY_USE_ONLY, &canonical).as_ref())
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum CoreConformanceEra {
-        Legacy2024,
-        Modern2026,
+    #[derive(Clone, Debug, PartialEq)]
+    struct CoreConformanceRecord {
+        label: &'static str,
+        fields: toml::map::Map<String, toml::Value>,
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum CoreConformanceLicense {
-        Mit,
-        TransitionNotice,
+    #[derive(Clone, Debug, PartialEq)]
+    struct CoreConformanceTreeEdge {
+        fields: toml::map::Map<String, toml::Value>,
+        parent_edge: Option<usize>,
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct CoreConformanceTypedState {
-        eras: [CoreConformanceEra; 2],
-        artifact_ids: [&'static str; 8],
-        tree_corpus_edges: [usize; 3],
-        licenses: [CoreConformanceLicense; 3],
-        error_codes: [i64; 3],
-        no_claims: [bool; 5],
-    }
-
-    const CORE_CONFORMANCE_TYPED_STATE: CoreConformanceTypedState = CoreConformanceTypedState {
-        eras: [CoreConformanceEra::Legacy2024, CoreConformanceEra::Modern2026],
-        artifact_ids: [
-            "core-schema-ts", "core-schema-json", "legacy-core-schema-ts",
-            "legacy-core-schema-json", "core-changelog", "conformance-package",
-            "conformance-enterprise-auth", "conformance-client-credentials",
-        ],
-        tree_corpus_edges: [6, 3, 5],
-        licenses: [
-            CoreConformanceLicense::Mit,
-            CoreConformanceLicense::TransitionNotice,
-            CoreConformanceLicense::TransitionNotice,
-        ],
-        error_codes: [-32_020, -32_021, -32_022],
-        no_claims: [false; 5],
-    };
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     struct CoreConformanceAcceptedBinding {
         manifest_sha256: [u8; 32],
-        artifact_tree_sha256: [u8; 32],
-        typed: CoreConformanceTypedState,
-        authority_sha256: [u8; 32],
-        artifact_records_sha256: [u8; 32],
-        tree_chain_sha256: [u8; 32],
-        license_provenance_sha256: [u8; 32],
-        no_claim_sha256: [u8; 32],
-        registries_sha256: [u8; 32],
-        tree_chain_edges: usize,
-        final_error_codes: usize,
-        conformance_scenarios: usize,
-        scenario_local_checks: usize,
-        scenario_observations: usize,
-        conformance_findings: usize,
-        ambiguities: usize,
+        authority: Vec<CoreConformanceRecord>,
+        artifacts: Vec<CoreConformanceRecord>,
+        tree_chain: Vec<CoreConformanceTreeEdge>,
+        licenses: Vec<CoreConformanceRecord>,
+        no_claim: CoreConformanceRecord,
+        registries: Vec<CoreConformanceRecord>,
     }
 
     fn core_conformance_root(
@@ -76378,7 +76342,9 @@ activate = 1\n";
         Ok(digest)
     }
 
-    fn validate_core_conformance_tree_chain(document: &toml::Value) -> VResult<usize> {
+    fn validate_core_conformance_tree_chain(
+        document: &toml::Value,
+    ) -> VResult<Vec<CoreConformanceTreeEdge>> {
         let root = core_conformance_root(document)?;
         let chain = record_table(root, "immutable_tree_chain", "core-conformance")?;
         if record_string(chain, "execution", "immutable_tree_chain")? != "declarative_only" {
@@ -76389,7 +76355,8 @@ activate = 1\n";
         }
         let edges = record_array(chain, "edges", "immutable_tree_chain")?;
         let mut counts = BTreeMap::new();
-        let mut descendants = BTreeMap::<&str, BTreeSet<&str>>::new();
+        let mut predecessors = BTreeMap::<&str, BTreeMap<&str, usize>>::new();
+        let mut retained = Vec::with_capacity(edges.len());
         for edge in edges {
             let edge = edge.as_table().ok_or_else(|| {
                 Diagnostic::error("E_CORE_CONFORMANCE_TREE_CHAIN", "immutable_tree_chain")
@@ -76423,15 +76390,20 @@ activate = 1\n";
             {
                 return Err(Diagnostic::error("E_CORE_CONFORMANCE_TREE_CHAIN", corpus));
             }
-            let seen = descendants.entry(corpus).or_default();
+            let predecessor = predecessors.entry(corpus).or_default();
+            let parent_edge = predecessor.get(parent).copied();
             if (parent_kind == "commit"
-                && (parent != revision || child_path != "." || !seen.is_empty()))
-                || (parent_kind == "tree" && !seen.contains(parent))
-                || !seen.insert(child)
+                && (parent != revision || child_path != "." || !predecessor.is_empty()))
+                || (parent_kind == "tree" && parent_edge.is_none())
+                || predecessor.insert(child, retained.len()).is_some()
             {
                 return Err(Diagnostic::error("E_CORE_CONFORMANCE_TREE_CHAIN", corpus));
             }
             *counts.entry(corpus).or_insert(0usize) += 1;
+            retained.push(CoreConformanceTreeEdge {
+                fields: edge.clone(),
+                parent_edge,
+            });
         }
         if edges.len() != 14
             || counts.get("core_2026_07_28") != Some(&6)
@@ -76443,12 +76415,26 @@ activate = 1\n";
                 "immutable_tree_chain",
             ));
         }
-        Ok(edges.len())
+        Ok(retained)
+    }
+
+    fn core_conformance_records(
+        rows: &[toml::Value],
+        label: &'static str,
+    ) -> VResult<Vec<CoreConformanceRecord>> {
+        rows.iter()
+            .map(|row| {
+                row.as_table()
+                    .cloned()
+                    .map(|fields| CoreConformanceRecord { label, fields })
+                    .ok_or_else(|| Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", label))
+            })
+            .collect()
     }
 
     fn validate_core_conformance_registries(
         document: &toml::Value,
-    ) -> VResult<(usize, usize, usize, usize, usize, usize)> {
+    ) -> VResult<Vec<CoreConformanceRecord>> {
         let root = core_conformance_root(document)?;
         let conformance = record_table(root, "conformance", "core-conformance")?;
         for field in [
@@ -76629,14 +76615,11 @@ activate = 1\n";
                 return Err(Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "ambiguities"));
             }
         }
-        Ok((
-            error_codes.len(),
-            scenarios.len(),
-            declarations.len(),
-            observations.len(),
-            findings.len(),
-            ambiguities.len(),
-        ))
+        let mut retained = core_conformance_records(error_codes, "final_error_codes")?;
+        for (rows, label) in [(scenarios, "conformance_scenarios"), (declarations, "scenario_local_check_declarations"), (observations, "scenario_observations"), (findings, "conformance_findings"), (ambiguities, "ambiguities")] {
+            retained.extend(core_conformance_records(rows, label)?);
+        }
+        Ok(retained)
     }
 
     fn validate_core_conformance_license_provenance(document: &toml::Value) -> VResult<()> {
@@ -77073,16 +77056,9 @@ activate = 1\n";
             }
             admitted_artifacts.push(admitted);
         }
-        let tree_chain_edges = validate_core_conformance_tree_chain(document)?;
-        let (
-            final_error_codes,
-            conformance_scenarios,
-            scenario_local_checks,
-            scenario_observations,
-            conformance_findings,
-            ambiguities,
-        ) = validate_core_conformance_registries(document)?;
-        let authority_sha256 = core_conformance_exact_group(
+        let tree_chain = validate_core_conformance_tree_chain(document)?;
+        let registries = validate_core_conformance_registries(document)?;
+        let _ = core_conformance_exact_group(
             document,
             &[
                 "/manifest_format",
@@ -77105,31 +77081,31 @@ activate = 1\n";
             CORE_AUTHORITY_SHA256,
             "authority",
         )?;
-        let artifact_records_sha256 = core_conformance_exact_group(
+        let _ = core_conformance_exact_group(
             document,
             &["/artifacts"],
             CORE_ARTIFACTS_SHA256,
             "artifacts",
         )?;
-        let tree_chain_sha256 = core_conformance_exact_group(
+        let _ = core_conformance_exact_group(
             document,
             &["/immutable_tree_chain"],
             CORE_TREE_CHAIN_SHA256,
             "immutable_tree_chain",
         )?;
-        let license_provenance_sha256 = core_conformance_exact_group(
+        let _ = core_conformance_exact_group(
             document,
             &["/license_provenance"],
             CORE_LICENSE_SHA256,
             "license_provenance",
         )?;
-        let no_claim_sha256 = core_conformance_exact_group(
+        let _ = core_conformance_exact_group(
             document,
             &["/conformance"],
             CORE_NO_CLAIM_SHA256,
             "conformance",
         )?;
-        let registries_sha256 = core_conformance_exact_group(
+        let _ = core_conformance_exact_group(
             document,
             &[
                 "/final_error_codes",
@@ -77143,28 +77119,56 @@ activate = 1\n";
             "registries",
         )?;
         validate_core_conformance_manifest_binding(document, admitted_files)?;
-        let (artifact_tree_sha256, _) = source_tree_digest_refs(&admitted_artifacts)?;
+        let root = core_conformance_root(document)?;
+        let authority = [
+            "core",
+            "core_2024_11_05",
+            "verification",
+            "derived_negative_policy",
+            "fixture_provenance",
+            "manual_update",
+        ]
+        .into_iter()
+        .map(|label| {
+            record_table(root, label, "core-conformance")
+                .map(|fields| CoreConformanceRecord {
+                    label,
+                    fields: fields.clone(),
+                })
+        })
+        .collect::<VResult<Vec<_>>>()?;
+        let artifacts = core_conformance_records(artifacts, "artifacts")?;
+        let license_provenance = record_table(root, "license_provenance", "core-conformance")?;
+        let licenses = [
+            "core_2024_11_05",
+            "core_2026_07_28",
+            "conformance_2026_07_28_baseline",
+        ]
+        .into_iter()
+        .map(|label| {
+            record_table(license_provenance, label, "license_provenance")
+                .map(|fields| CoreConformanceRecord {
+                    label,
+                    fields: fields.clone(),
+                })
+        })
+        .collect::<VResult<Vec<_>>>()?;
+        let no_claim = CoreConformanceRecord {
+            label: "conformance",
+            fields: record_table(root, "conformance", "core-conformance")?.clone(),
+        };
         Ok(CoreConformanceAcceptedBinding {
             manifest_sha256: source_lookup(
                 admitted_files,
                 "evidence/fnd-01/core-conformance.toml",
             )?
             .digest,
-            artifact_tree_sha256,
-            typed: CORE_CONFORMANCE_TYPED_STATE,
-            authority_sha256,
-            artifact_records_sha256,
-            tree_chain_sha256,
-            license_provenance_sha256,
-            no_claim_sha256,
-            registries_sha256,
-            tree_chain_edges,
-            final_error_codes,
-            conformance_scenarios,
-            scenario_local_checks,
-            scenario_observations,
-            conformance_findings,
-            ambiguities,
+            authority,
+            artifacts,
+            tree_chain,
+            licenses,
+            no_claim,
+            registries,
         })
     }
 
@@ -78201,7 +78205,10 @@ activate = 1\n";
         policy: &Policy,
     ) -> VResult<()> {
         let core = parse_source_toml(files, "evidence/fnd-01/core-conformance.toml")?;
-        validate_core_conformance_sources(&core, files)?;
+        let accepted_core = validate_core_conformance_sources(&core, files)?;
+        if (accepted_core.authority.len(), accepted_core.artifacts.len(), accepted_core.tree_chain.len(), accepted_core.licenses.len(), accepted_core.registries.len(), accepted_core.tree_chain[1].parent_edge) != (6, 8, 14, 3, 85, Some(0)) {
+            return Err(Diagnostic::error("E_CORE_CONFORMANCE_ADMISSION", "accepted records"));
+        }
 
         let jose = parse_source_toml(files, "evidence/fnd-01/jose-ring.toml")?;
         if parse_rs256_source_vectors(files)?.len() != RS256_SOURCE_REGISTRY.len() {
@@ -84837,7 +84844,7 @@ original = "value"
     }
 
     fn assert_core_conformance_fresh_reacceptance(
-        baseline_binding: CoreConformanceAcceptedBinding,
+        baseline_binding: &CoreConformanceAcceptedBinding,
         baseline_source_tree_sha256: [u8; 32],
     ) {
         let (files, source_tree_sha256) = admitted_core_conformance_test_inputs();
@@ -84847,7 +84854,7 @@ original = "value"
         );
         let document = core_conformance_test_document(&files);
         assert_eq!(
-            validate_core_conformance_sources(&document, &files)
+            &validate_core_conformance_sources(&document, &files)
                 .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable())),
             baseline_binding,
             "fresh normal admission retains the accepted core binding"
@@ -84867,56 +84874,15 @@ original = "value"
             sha256(&manifest.bytes),
             "accepted manifest binding is the admitted manifest bytes"
         );
-        let artifact_paths = [
-            "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.ts",
-            "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.json",
-            "evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.ts",
-            "evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.json",
-            "evidence/fnd-01/vendor/core/mcp-changelog-2026-07-28-5f5440bb.mdx",
-            "evidence/fnd-01/vendor/core/conformance-package-49103de6.json",
-            "evidence/fnd-01/vendor/core/conformance-enterprise-managed-authorization-49103de6.ts",
-            "evidence/fnd-01/vendor/core/conformance-client-credentials-49103de6.ts",
-        ];
-        let admitted_artifacts = artifact_paths
-            .iter()
-            .map(|path| source_lookup(&files, path))
-            .collect::<VResult<Vec<_>>>()
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        assert_eq!(admitted_artifacts.len(), 8, "exact core artifact count");
-        let (artifact_tree_sha256, _) = source_tree_digest_refs(&admitted_artifacts)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        assert_eq!((accepted.authority.len(), accepted.artifacts.len()), (6, 8), "accepted records retain every authority and artifact row");
         assert_eq!(
-            accepted.artifact_tree_sha256, artifact_tree_sha256,
-            "accepted artifact binding is the independently derived eight-artifact tree"
+            (accepted.artifacts[0].fields.get("vendored_path").and_then(toml::Value::as_str), accepted.artifacts[0].fields.get("sha256").and_then(toml::Value::as_str)),
+            (Some("evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.ts"), Some("742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd")),
+            "accepted artifact records retain exact provenance fields"
         );
-        assert_eq!(
-            accepted.typed,
-            CORE_CONFORMANCE_TYPED_STATE,
-            "accepted state retains typed authority and registry identities"
-        );
-        for (subject, digest, expected) in [
-            ("authority", accepted.authority_sha256, CORE_AUTHORITY_SHA256),
-            ("artifacts", accepted.artifact_records_sha256, CORE_ARTIFACTS_SHA256),
-            ("tree", accepted.tree_chain_sha256, CORE_TREE_CHAIN_SHA256),
-            ("license", accepted.license_provenance_sha256, CORE_LICENSE_SHA256),
-            ("no-claim", accepted.no_claim_sha256, CORE_NO_CLAIM_SHA256),
-            ("registries", accepted.registries_sha256, CORE_REGISTRIES_SHA256),
-        ] {
-            assert_eq!(lower_hex(&digest), expected, "exact accepted {subject} binding");
-        }
-        assert_eq!(
-            (
-                accepted.tree_chain_edges,
-                accepted.final_error_codes,
-                accepted.conformance_scenarios,
-                accepted.scenario_local_checks,
-                accepted.scenario_observations,
-                accepted.conformance_findings,
-                accepted.ambiguities,
-            ),
-            (14, 3, 3, 9, 3, 41, 26),
-            "accepted binding exposes the complete frozen core registries"
-        );
+        assert_eq!((accepted.tree_chain.len(), accepted.tree_chain[1].parent_edge, accepted.tree_chain[4].parent_edge, accepted.tree_chain[1].fields.get("parent_object").and_then(toml::Value::as_str), accepted.tree_chain[4].fields.get("child_path").and_then(toml::Value::as_str)), (14, Some(0), Some(0), Some("8957e31e8ecd6fd7f52df82d44b3827cb44cecb1"), Some("schema")), "retained tree edges bind exact immediate parents, including the branch");
+        assert_eq!((accepted.licenses.len(), accepted.no_claim.label, accepted.registries.len()), (3, "conformance", 85), "accepted binding retains complete field-labelled registries");
+        assert_eq!(accepted.registries[..3].iter().map(|record| record.fields.get("code").and_then(toml::Value::as_integer)).collect::<Vec<_>>(), [Some(-32_020), Some(-32_021), Some(-32_022)], "accepted registry records retain exact final error codes");
     }
 
     fn assert_core_conformance_restores(
@@ -84955,7 +84921,7 @@ original = "value"
         candidate: &toml::Value,
         files: &[LoadedFile],
         expected: &str,
-        baseline_binding: CoreConformanceAcceptedBinding,
+        baseline_binding: &CoreConformanceAcceptedBinding,
         baseline_source_tree_sha256: [u8; 32],
     ) {
         assert_eq!(
@@ -84990,7 +84956,7 @@ original = "value"
             &license_drifted,
             &files,
             "FND01|Error|E_CORE_CONFORMANCE_LICENSE|license_provenance.core_2024_11_05",
-            baseline_binding,
+            &baseline_binding,
             baseline_source_tree_sha256,
         );
 
@@ -85010,7 +84976,7 @@ original = "value"
             &license_overclaim,
             &files,
             "FND01|Error|E_CORE_CONFORMANCE_LICENSE|license_provenance.core_2026_07_28",
-            baseline_binding,
+            &baseline_binding,
             baseline_source_tree_sha256,
         );
 
@@ -85024,7 +84990,7 @@ original = "value"
             &missing_artifact,
             &files,
             "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT_INVENTORY|artifacts|count",
-            baseline_binding,
+            &baseline_binding,
             baseline_source_tree_sha256,
         );
 
@@ -85044,7 +85010,7 @@ original = "value"
             &swapped_paths,
             &files,
             "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|vendored_path",
-            baseline_binding,
+            &baseline_binding,
             baseline_source_tree_sha256,
         );
 
@@ -85073,7 +85039,7 @@ original = "value"
             &baseline,
             &truncated_files,
             "FND01|Error|E_CORE_CONFORMANCE_SOURCE_INTEGRITY|core-schema-ts|byte_length",
-            baseline_binding,
+            &baseline_binding,
             baseline_source_tree_sha256,
         );
 
@@ -85085,7 +85051,7 @@ original = "value"
             &missing_provenance,
             &files,
             "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|core-changelog|fields",
-            baseline_binding,
+            &baseline_binding,
             baseline_source_tree_sha256,
         );
 
@@ -85102,7 +85068,7 @@ original = "value"
             &ancestry_drift,
             &files,
             "FND01|Error|E_CORE_CONFORMANCE_TREE_CHAIN|core_2026_07_28",
-            baseline_binding,
+            &baseline_binding,
             baseline_source_tree_sha256,
         );
 
@@ -85118,7 +85084,7 @@ original = "value"
             &missing_registry_field,
             &files,
             "FND01|Error|E_RECORD_TYPE|final_error_codes|http_status",
-            baseline_binding,
+            &baseline_binding,
             baseline_source_tree_sha256,
         );
 
@@ -85160,7 +85126,7 @@ original = "value"
             &drifted,
             &files,
             expected,
-            baseline_binding,
+            &baseline_binding,
             baseline_source_tree_sha256,
         );
     }
@@ -85182,7 +85148,7 @@ original = "value"
                 &drifted,
                 &files,
                 &format!("FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|{subject}|{field}"),
-                baseline_binding,
+            &baseline_binding,
                 baseline_source_tree_sha256,
             );
         }
