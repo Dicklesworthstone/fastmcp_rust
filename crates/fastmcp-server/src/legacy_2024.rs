@@ -160,7 +160,7 @@ impl LegacyServerAdapterInstalledReceipt {
     /// Returns whether this sealed receipt was emitted by the supplied
     /// authenticated transport binding.
     #[must_use]
-    pub const fn matches_binding(&self, binding: LegacyPeerBinding) -> bool {
+    pub fn matches_binding(&self, binding: LegacyPeerBinding) -> bool {
         self.binding == binding
     }
 }
