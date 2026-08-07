@@ -83,7 +83,7 @@ impl AbsoluteUri {
             || !scheme
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
-            || !valid_percent_escapes(&value)
+            || !valid_uri_remainder(&value[colon + 1..])
         {
             return Err(CommonTypeError::Invalid("absolute URI"));
         }
@@ -119,7 +119,106 @@ impl<'de> Deserialize<'de> for AbsoluteUri {
     }
 }
 
-fn valid_percent_escapes(value: &str) -> bool {
+fn valid_uri_remainder(value: &str) -> bool {
+    let (before_fragment, fragment) = match value.split_once('#') {
+        Some((before_fragment, fragment)) if !fragment.contains('#') => {
+            (before_fragment, Some(fragment))
+        }
+        Some(_) => return false,
+        None => (value, None),
+    };
+    let (hier_part, query) = match before_fragment.split_once('?') {
+        Some((hier_part, query)) if !query.contains('?') => (hier_part, Some(query)),
+        Some((hier_part, query)) => (hier_part, Some(query)),
+        None => (before_fragment, None),
+    };
+    valid_hier_part(hier_part)
+        && query.is_none_or(valid_query_or_fragment)
+        && fragment.is_none_or(valid_query_or_fragment)
+}
+
+fn valid_hier_part(value: &str) -> bool {
+    if let Some(authority_and_path) = value.strip_prefix("//") {
+        let (authority, path) = authority_and_path
+            .split_once('/')
+            .map_or((authority_and_path, ""), |(authority, suffix)| {
+                (authority, suffix)
+            });
+        valid_authority(authority) && valid_path(path)
+    } else {
+        valid_path(value)
+    }
+}
+
+fn valid_authority(value: &str) -> bool {
+    let (userinfo, host_and_port) = match value.rsplit_once('@') {
+        Some((userinfo, host_and_port)) if !userinfo.contains('@') && valid_userinfo(userinfo) => {
+            (Some(userinfo), host_and_port)
+        }
+        Some(_) => return false,
+        None => (None, value),
+    };
+    let _ = userinfo;
+    if let Some(host) = host_and_port.strip_prefix('[') {
+        let Some((literal, port)) = host.split_once(']') else {
+            return false;
+        };
+        if port.contains(']') || !valid_port(port) {
+            return false;
+        }
+        return valid_ip_literal(literal);
+    }
+    if host_and_port.contains('[') || host_and_port.contains(']') {
+        return false;
+    }
+    let (host, port) = host_and_port
+        .rsplit_once(':')
+        .map_or((host_and_port, ""), |(host, port)| (host, port));
+    valid_reg_name(host) && valid_port(port)
+}
+
+fn valid_ip_literal(value: &str) -> bool {
+    value.parse::<std::net::Ipv6Addr>().is_ok()
+        || value
+            .strip_prefix('v')
+            .or_else(|| value.strip_prefix('V'))
+            .is_some_and(|future| {
+                let Some((version, address)) = future.split_once('.') else {
+                    return false;
+                };
+                !version.is_empty()
+                    && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && !address.is_empty()
+                    && address.bytes().all(is_ip_future_character)
+            })
+}
+
+fn is_ip_future_character(byte: u8) -> bool {
+    is_unreserved(byte) || is_sub_delim(byte) || byte == b':'
+}
+
+fn valid_port(value: &str) -> bool {
+    value.is_empty()
+        || (value.starts_with(':') && value[1..].bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn valid_userinfo(value: &str) -> bool {
+    valid_component(value, |byte| is_pchar(byte) || byte == b':')
+}
+
+fn valid_reg_name(value: &str) -> bool {
+    valid_component(value, |byte| is_unreserved(byte) || is_sub_delim(byte))
+}
+
+fn valid_path(value: &str) -> bool {
+    valid_component(value, |byte| is_pchar(byte) || byte == b'/')
+}
+
+fn valid_query_or_fragment(value: &str) -> bool {
+    valid_component(value, |byte| is_pchar(byte) || matches!(byte, b'/' | b'?'))
+}
+
+fn valid_component(value: &str, permits: impl Fn(u8) -> bool) -> bool {
     let bytes = value.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
@@ -131,21 +230,61 @@ fn valid_percent_escapes(value: &str) -> bool {
                 return false;
             }
             index += 3;
-        } else {
+        } else if permits(bytes[index]) {
             index += 1;
+        } else {
+            return false;
         }
     }
     true
 }
 
+fn is_pchar(byte: u8) -> bool {
+    is_unreserved(byte) || is_sub_delim(byte) || matches!(byte, b':' | b'@')
+}
+
+fn is_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+fn is_sub_delim(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+    )
+}
+
 /// An opaque cursor where only absence means the end of a paginated result set.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OpaqueCursor {
     /// The wire field was absent.
     Absent,
     /// The wire field was present, including the valid empty string.
     Present(String),
+}
+
+impl Serialize for OpaqueCursor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            // A standalone value cannot represent an absent object member. `null` is therefore
+            // reserved for the helper's direct serde form; enclosing wire objects omit the field.
+            Self::Absent => serializer.serialize_none(),
+            Self::Present(value) => serializer.serialize_str(value),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OpaqueCursor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)
+            .and_then(|value| Self::try_from_presence(value).map_err(serde::de::Error::custom))
+    }
 }
 
 impl OpaqueCursor {
@@ -177,7 +316,7 @@ impl OpaqueCursor {
 }
 
 /// Final implementation identity.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Implementation {
     /// Programmatic implementation name.
@@ -245,6 +384,41 @@ impl Implementation {
     #[must_use]
     pub fn display_name(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.name)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImplementationWire {
+    name: String,
+    version: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    website_url: Option<AbsoluteUri>,
+    #[serde(default)]
+    icons: Vec<RawIcon>,
+}
+
+impl<'de> Deserialize<'de> for Implementation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        reject_explicit_null_fields(&value, &["title", "description", "websiteUrl", "icons"])
+            .map_err(serde::de::Error::custom)?;
+        let wire: ImplementationWire =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        let mut implementation =
+            Self::try_new(wire.name, wire.version).map_err(serde::de::Error::custom)?;
+        implementation.title = wire.title;
+        implementation.description = wire.description;
+        implementation.website_url = wire.website_url;
+        implementation.icons = wire.icons;
+        Ok(implementation)
     }
 }
 
@@ -403,6 +577,19 @@ fn valid_metadata_key(key: &str) -> bool {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
 }
 
+fn reject_explicit_null_fields(value: &Value, fields: &[&str]) -> Result<(), CommonTypeError> {
+    let object = value
+        .as_object()
+        .ok_or(CommonTypeError::Invalid("wire object"))?;
+    if fields
+        .iter()
+        .any(|field| object.get(*field).is_some_and(Value::is_null))
+    {
+        return Err(CommonTypeError::Invalid("optional non-null field"));
+    }
+    Ok(())
+}
+
 fn valid_reverse_dns_prefix(prefix: &str) -> bool {
     let labels = prefix.split('.').collect::<Vec<_>>();
     labels.len() >= 2
@@ -432,19 +619,57 @@ impl TraceContext {
     pub fn try_from_metadata(metadata: &OpenMetadata) -> Result<Self, CommonTypeError> {
         let field = |name| {
             metadata.optional_string(name).and_then(|value| {
-                if value.is_some_and(|field| field.len() > MAX_TRACE_FIELD_BYTES) {
+                if value.is_some_and(|field| {
+                    field.len() > MAX_TRACE_FIELD_BYTES
+                        || !field.is_ascii()
+                        || field.bytes().any(|byte| byte <= 0x20 || byte == 0x7f)
+                }) {
                     Err(CommonTypeError::TooLong("trace context"))
                 } else {
                     Ok(value.map(ToOwned::to_owned))
                 }
             })
         };
+        let traceparent = field("traceparent")?;
+        if traceparent
+            .as_deref()
+            .is_some_and(|value| !valid_traceparent(value))
+        {
+            return Err(CommonTypeError::Invalid("traceparent"));
+        }
         Ok(Self {
-            traceparent: field("traceparent")?,
+            traceparent,
             tracestate: field("tracestate")?,
             baggage: field("baggage")?,
         })
     }
+}
+
+fn valid_traceparent(value: &str) -> bool {
+    let mut fields = value.split('-');
+    let (Some(version), Some(trace_id), Some(parent_id), Some(flags), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return false;
+    };
+    valid_lower_hex(version, 2)
+        && version != "ff"
+        && valid_lower_hex(trace_id, 32)
+        && trace_id.bytes().any(|byte| byte != b'0')
+        && valid_lower_hex(parent_id, 16)
+        && parent_id.bytes().any(|byte| byte != b'0')
+        && valid_lower_hex(flags, 2)
+}
+
+fn valid_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// A peer cancellation request identifier.
@@ -506,7 +731,7 @@ pub enum IconTheme {
 }
 
 /// A raw, structurally valid icon source. Rendering admission is deliberately separate.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawIcon {
     /// Required schema URI source.
@@ -561,6 +786,32 @@ impl RawIcon {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawIconWire {
+    src: AbsoluteUri,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    sizes: Option<Vec<String>>,
+    #[serde(default)]
+    theme: Option<IconTheme>,
+}
+
+impl<'de> Deserialize<'de> for RawIcon {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        reject_explicit_null_fields(&value, &["mimeType", "sizes", "theme"])
+            .map_err(serde::de::Error::custom)?;
+        let wire: RawIconWire = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Self::try_with_details(wire.src.as_str(), wire.mime_type, wire.sizes, wire.theme)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Annotation audience values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -572,7 +823,7 @@ pub enum AnnotationAudience {
 }
 
 /// Optional content annotations.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Annotations {
     /// Intended audience roles.
@@ -599,8 +850,40 @@ impl Annotations {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnnotationsWire {
+    #[serde(default)]
+    audience: Option<Vec<AnnotationAudience>>,
+    #[serde(default)]
+    priority: Option<f64>,
+    #[serde(default)]
+    last_modified: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Annotations {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        reject_explicit_null_fields(&value, &["audience", "priority", "lastModified"])
+            .map_err(serde::de::Error::custom)?;
+        let wire: AnnotationsWire =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        if let Some(priority) = wire.priority {
+            Self::try_with_priority(priority).map_err(serde::de::Error::custom)?;
+        }
+        Ok(Self {
+            audience: wire.audience,
+            priority: wire.priority,
+            last_modified: wire.last_modified,
+        })
+    }
+}
+
 /// Link-style content block fields.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceLink {
     /// Exact resource identity.
@@ -615,8 +898,38 @@ pub struct ResourceLink {
     pub meta: Option<OpenMetadata>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceLinkWire {
+    uri: AbsoluteUri,
+    name: String,
+    #[serde(default)]
+    annotations: Option<Annotations>,
+    #[serde(rename = "_meta", default)]
+    meta: Option<OpenMetadata>,
+}
+
+impl<'de> Deserialize<'de> for ResourceLink {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        reject_explicit_null_fields(&value, &["annotations", "_meta"])
+            .map_err(serde::de::Error::custom)?;
+        let wire: ResourceLinkWire =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            uri: wire.uri,
+            name: wire.name,
+            annotations: wire.annotations,
+            meta: wire.meta,
+        })
+    }
+}
+
 /// Text or blob resource contents embedded in content.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(untagged)]
 pub enum EmbeddedResourceContents {
@@ -636,8 +949,60 @@ pub enum EmbeddedResourceContents {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
+enum EmbeddedResourceContentsWire {
+    Text {
+        uri: AbsoluteUri,
+        text: String,
+        #[serde(default)]
+        mime_type: Option<String>,
+    },
+    Blob {
+        uri: AbsoluteUri,
+        blob: String,
+        #[serde(default)]
+        mime_type: Option<String>,
+    },
+}
+
+impl<'de> Deserialize<'de> for EmbeddedResourceContents {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        reject_explicit_null_fields(&value, &["mimeType"]).map_err(serde::de::Error::custom)?;
+        let wire: EmbeddedResourceContentsWire =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        let resource = match wire {
+            EmbeddedResourceContentsWire::Text {
+                uri,
+                text,
+                mime_type,
+            } => Self::Text {
+                uri,
+                text,
+                mime_type,
+            },
+            EmbeddedResourceContentsWire::Blob {
+                uri,
+                blob,
+                mime_type,
+            } => Self::Blob {
+                uri,
+                blob,
+                mime_type,
+            },
+        };
+        validate_embedded_resource(&resource).map_err(serde::de::Error::custom)?;
+        Ok(resource)
+    }
+}
+
 /// Final common content discriminators.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     /// Text content.
@@ -685,6 +1050,137 @@ pub enum ContentBlock {
         #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentBlockWire {
+    Text {
+        text: String,
+        #[serde(default)]
+        annotations: Option<Annotations>,
+        #[serde(rename = "_meta", default)]
+        meta: Option<OpenMetadata>,
+    },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        #[serde(default)]
+        annotations: Option<Annotations>,
+        #[serde(rename = "_meta", default)]
+        meta: Option<OpenMetadata>,
+    },
+    Audio {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        #[serde(default)]
+        annotations: Option<Annotations>,
+        #[serde(rename = "_meta", default)]
+        meta: Option<OpenMetadata>,
+    },
+    ResourceLink {
+        uri: AbsoluteUri,
+        name: String,
+        #[serde(default)]
+        annotations: Option<Annotations>,
+        #[serde(rename = "_meta", default)]
+        meta: Option<OpenMetadata>,
+    },
+    Resource {
+        resource: EmbeddedResourceContents,
+        #[serde(default)]
+        annotations: Option<Annotations>,
+        #[serde(rename = "_meta", default)]
+        meta: Option<OpenMetadata>,
+    },
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        reject_explicit_null_fields(&value, &["annotations", "_meta"])
+            .map_err(serde::de::Error::custom)?;
+        if value.get("type").and_then(Value::as_str) == Some("resource") {
+            let resource = value
+                .get("resource")
+                .ok_or_else(|| serde::de::Error::custom("missing embedded resource"))?;
+            reject_explicit_null_fields(resource, &["mimeType"])
+                .map_err(serde::de::Error::custom)?;
+        }
+        let wire: ContentBlockWire =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        let content = match wire {
+            ContentBlockWire::Text {
+                text,
+                annotations,
+                meta,
+            } => Self::Text {
+                text,
+                annotations,
+                meta,
+            },
+            ContentBlockWire::Image {
+                data,
+                mime_type,
+                annotations,
+                meta,
+            } => {
+                valid_binary_content(&data, &mime_type, "image/")
+                    .map_err(serde::de::Error::custom)?;
+                Self::Image {
+                    data,
+                    mime_type,
+                    annotations,
+                    meta,
+                }
+            }
+            ContentBlockWire::Audio {
+                data,
+                mime_type,
+                annotations,
+                meta,
+            } => {
+                valid_binary_content(&data, &mime_type, "audio/")
+                    .map_err(serde::de::Error::custom)?;
+                Self::Audio {
+                    data,
+                    mime_type,
+                    annotations,
+                    meta,
+                }
+            }
+            ContentBlockWire::ResourceLink {
+                uri,
+                name,
+                annotations,
+                meta,
+            } => Self::ResourceLink {
+                uri,
+                name,
+                annotations,
+                meta,
+            },
+            ContentBlockWire::Resource {
+                resource,
+                annotations,
+                meta,
+            } => {
+                validate_embedded_resource(&resource).map_err(serde::de::Error::custom)?;
+                Self::Resource {
+                    resource,
+                    annotations,
+                    meta,
+                }
+            }
+        };
+        FinalCommonTypesSchema::validate_content(&content).map_err(serde::de::Error::custom)?;
+        Ok(content)
+    }
 }
 
 impl ContentBlock {
@@ -769,13 +1265,68 @@ fn valid_binary_content(
     if data.len() > MAX_CONTENT_ENCODED_BYTES {
         return Err(CommonTypeError::TooLong("binary content"));
     }
-    if !mime_type.starts_with(required_prefix) || mime_type.len() == required_prefix.len() {
+    if !mime_type.starts_with(required_prefix)
+        || mime_type.len() == required_prefix.len()
+        || !valid_mime_type(mime_type)
+    {
         return Err(CommonTypeError::Invalid("binary MIME type"));
     }
+    validate_standard_base64(data)
+}
+
+fn validate_embedded_resource(resource: &EmbeddedResourceContents) -> Result<(), CommonTypeError> {
+    match resource {
+        EmbeddedResourceContents::Text { mime_type, .. } => {
+            if mime_type
+                .as_deref()
+                .is_some_and(|value| !valid_mime_type(value))
+            {
+                return Err(CommonTypeError::Invalid("resource MIME type"));
+            }
+        }
+        EmbeddedResourceContents::Blob {
+            blob, mime_type, ..
+        } => {
+            if blob.len() > MAX_CONTENT_ENCODED_BYTES {
+                return Err(CommonTypeError::TooLong("binary content"));
+            }
+            validate_standard_base64(blob)?;
+            if mime_type
+                .as_deref()
+                .is_some_and(|value| !valid_mime_type(value))
+            {
+                return Err(CommonTypeError::Invalid("resource MIME type"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_standard_base64(value: &str) -> Result<(), CommonTypeError> {
     base64::engine::general_purpose::STANDARD
-        .decode(data)
+        .decode(value)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(value))
         .map(|_| ())
         .map_err(|_| CommonTypeError::Invalid("base64 content"))
+}
+
+fn valid_mime_type(value: &str) -> bool {
+    let Some((kind, subtype)) = value.split_once('/') else {
+        return false;
+    };
+    !kind.is_empty()
+        && !subtype.is_empty()
+        && !subtype.contains('/')
+        && kind.bytes().all(is_mime_token)
+        && subtype.bytes().all(is_mime_token)
+}
+
+fn is_mime_token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'-' | b'.' | b'+'
+        )
 }
 
 /// Direction of a final common-type wire envelope.
@@ -824,7 +1375,8 @@ impl FinalCommonTypesSchema {
                 return Err(CommonTypeError::Invalid("request metadata"));
             }
             (_, Some(meta)) => {
-                let _ = Self::validate_open_metadata(meta)?;
+                let metadata = Self::validate_open_metadata(meta)?;
+                let _ = TraceContext::try_from_metadata(&metadata)?;
             }
             (_, None) => {}
         }
@@ -947,6 +1499,7 @@ impl FinalCommonTypesSchema {
                 ..
             } => {
                 Self::validate_annotations(annotations)?;
+                validate_embedded_resource(resource)?;
                 match resource {
                     EmbeddedResourceContents::Text { uri, .. }
                     | EmbeddedResourceContents::Blob { uri, .. } => {
