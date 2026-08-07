@@ -833,9 +833,8 @@ where
         let abandoned = state
             .pending
             .iter()
-            .filter_map(|(request_id, pending)| {
-                pending.owner_dropped.get().then(|| request_id.clone())
-            })
+            .filter(|(_, pending)| pending.owner_dropped.get())
+            .map(|(request_id, _)| request_id.clone())
             .collect::<Vec<_>>();
         for request_id in abandoned {
             self.cancel_pending_locked(

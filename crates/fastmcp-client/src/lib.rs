@@ -1394,7 +1394,7 @@ struct ClientProgressParams {
     total: Option<f64>,
     message: Option<String>,
     #[serde(rename = "_meta")]
-    _meta: Option<serde_json::Map<String, serde_json::Value>>,
+    meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl ClientProgressParams {
@@ -6065,7 +6065,7 @@ mod tests {
         assert_eq!(params.marker, ProgressMarker::String("tok-1".to_string()));
         assert!(params.total.is_none());
         assert!(params.message.is_none());
-        assert!(params._meta.is_none());
+        assert!(params.meta.is_none());
     }
 
     #[test]
@@ -6081,7 +6081,7 @@ mod tests {
             parse_valid_client_progress(&valid, None).expect("first finite update is valid");
         assert_eq!(first.progress, -1.5);
         assert_eq!(
-            first._meta.as_ref().and_then(|meta| meta.get("trace")),
+            first.meta.as_ref().and_then(|meta| meta.get("trace")),
             Some(&serde_json::json!("accepted"))
         );
         assert!(parse_valid_client_progress(&valid, Some(-1.5)).is_none());
