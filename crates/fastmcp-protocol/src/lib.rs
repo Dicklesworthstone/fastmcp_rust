@@ -39,28 +39,35 @@
 #![allow(dead_code)]
 
 pub mod common_types;
+pub mod extensions;
 mod jsonrpc;
 mod messages;
+pub mod methods;
 pub mod protocol_policy;
 pub mod protocol_version;
 mod result;
-pub mod methods;
 pub mod schema;
+mod server_discovery;
 mod types;
 
 pub use jsonrpc::{
-    JSONRPC_VERSION, ClientIngressFailureScope, CorrelationKey, JsonRpcAdmissionError,
-    JsonRpcEndpointRole,
-    JsonRpcError, JsonRpcMessage, JsonRpcMessageDirection, JsonRpcRequest, JsonRpcResponse,
-    RawJsonAdmissionError, RawJsonRpcDisposition, RequestId, UncorrelatedJsonRpcErrorResponse,
-    MAX_JSONRPC_STRING_ID_ENCODED_BYTES, MAX_RAW_JSON_AGGREGATE_NUMBER_BYTES,
+    ClientIngressFailureScope, CorrelationKey, JSONRPC_VERSION, JsonRpcAdmissionError,
+    JsonRpcEndpointRole, JsonRpcError, JsonRpcMessage, JsonRpcMessageDirection, JsonRpcRequest,
+    JsonRpcResponse, MAX_JSONRPC_STRING_ID_ENCODED_BYTES, MAX_RAW_JSON_AGGREGATE_NUMBER_BYTES,
     MAX_RAW_JSON_CONTAINER_ENTRIES, MAX_RAW_JSON_EXPONENT, MAX_RAW_JSON_NESTING_DEPTH,
-    MAX_RAW_JSON_NUMBER_BYTES, admit_raw_jsonrpc_document, decode_strict_jsonrpc_message,
+    MAX_RAW_JSON_NUMBER_BYTES, RawJsonAdmissionError, RawJsonRpcDisposition, RequestId,
+    UncorrelatedJsonRpcErrorResponse, admit_raw_jsonrpc_document, decode_strict_jsonrpc_message,
     dispose_raw_jsonrpc_failure,
 };
 pub use messages::*;
 pub use result::*;
 pub use schema::{ValidationError, ValidationResult, validate, validate_strict};
+pub use server_discovery::{
+    DiscoveryCacheHintError, DiscoveryCacheHints, MAX_SERVER_INSTRUCTIONS_BYTES,
+    SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior,
+    ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
+    ServerDiscoverResult, ServerDiscoveryError, ServerInstructionError, ServerInstructions,
+};
 pub use types::*;
 
 // The FND-03 contract freezes unqualified `cargo test -- --exact` IDs. Keep
