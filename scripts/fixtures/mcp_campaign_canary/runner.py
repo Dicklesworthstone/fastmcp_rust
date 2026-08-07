@@ -86,6 +86,9 @@ class Runner:
         self.bv_binary = bv_binary
         self.live_paths: tuple[Path, Path] = ()
         self.receipt_revision = self.git("rev-parse", "HEAD")
+        self.stale_revision = self.git("rev-parse", f"{self.subject_revision}^")
+        if self.stale_revision == self.subject_revision:
+            raise RuntimeError("stale canary revision must differ from the subject revision")
         self.current_case = "preflight"
 
     def git(self, *args: str) -> str:
@@ -237,6 +240,10 @@ def unchanged(before: tuple[Any, Any, Any], after: tuple[Any, Any, Any]) -> bool
     return all(same(left, right) for left, right in zip(before, after, strict=True))
 
 
+def retains_revision(value: Any, revision: str) -> bool:
+    return revision in json.dumps(value, sort_keys=True)
+
+
 def valid_reason() -> str:
     return "commit: canary-subject run: isolated-canary evidence: receipt incident: none"
 
@@ -264,15 +271,18 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(
                 issue_id, "batch_verify", "pass", ORCHESTRATOR,
-                note=f"stale:{'0' * 40}:subject:{runner.subject_revision}",
+                note=f"subject_revision:{runner.stale_revision}",
             )
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
             after, ledger_after, audit_after = runner.snapshot(issue_id)
-            passed = attempt.returncode != 0 and unchanged(
-                (before, ledger_before, audit_before), (after, ledger_after, audit_after)
+            passed = (
+                runner.stale_revision != runner.subject_revision
+                and retains_revision(ledger_before, runner.stale_revision)
+                and attempt.returncode != 0
+                and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             )
-            detail = "actual stale batch_verify PASS cannot authorize the forbidden close transition"
+            detail = "a ledger PASS bound to a distinct real ancestor revision cannot authorize close"
         elif case_id == "canary_direct_close_rejected":
             issue_id = runner.create_subject(case_id)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
@@ -376,7 +386,10 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             statuses = provider_statuses(ledger_before)
-            fresh = runner.subject_revision == runner.receipt_revision
+            fresh = (
+                runner.subject_revision == runner.receipt_revision
+                and retains_revision(ledger_before, runner.subject_revision)
+            )
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason()) if fresh and statuses == [("batch_verify", "pass")] else None
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt is not None and attempt.returncode == 0
@@ -415,8 +428,10 @@ def main() -> int:
         raise SystemExit("frozen canary fixture has duplicate, missing, or substituted case IDs")
     br_binary = executable_path("br")
     bv_binary = executable_path("bv")
-    subject_revision = args.subject_revision or subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=True
+    subject_ref = args.subject_revision or "HEAD"
+    subject_revision = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{subject_ref}^{{commit}}"],
+        cwd=ROOT, text=True, capture_output=True, check=True,
     ).stdout.strip()
     runner = Runner(output, subject_revision, br_binary, bv_binary)
     where = runner.run([str(br_binary), "where", "--json"])
@@ -440,6 +455,7 @@ def main() -> int:
         "br": {"path": str(br_binary), "sha256": digest_path(br_binary), "version": runner.run([str(br_binary), "--version"]).stdout.strip()},
         "bv": {"path": str(bv_binary), "sha256": digest_path(bv_binary), "version": runner.run([str(bv_binary), "--version"]).stdout.strip()},
         "subject_revision": subject_revision, "receipt_revision": runner.receipt_revision,
+        "stale_revision": runner.stale_revision,
         "subject_tree": runner.git("rev-parse", f"{subject_revision}^{{tree}}"),
         "receipt_tree": runner.git("rev-parse", "HEAD^{tree}"),
         "dirty_inventory": runner.run(["git", "status", "--porcelain=v1", "--untracked-files=all"]).stdout.splitlines(),
