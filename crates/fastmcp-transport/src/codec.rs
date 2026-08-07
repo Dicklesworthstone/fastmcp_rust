@@ -1768,7 +1768,7 @@ mod tests {
             Err(CodecError::Json(_))
         ));
 
-        let invalid_request = codec.decode_complete_message(br#"[]"#).unwrap_err();
+        let invalid_request = codec.decode_complete_message(b"[]").unwrap_err();
         assert!(matches!(
             invalid_request,
             CodecError::InvalidMessage {
