@@ -3314,6 +3314,7 @@ impl Server {
                             &inbound,
                             &request,
                         )
+                        .map(HandledRequest::untracked)
                     } else {
                         self.handle_request_internal(
                             cx,
@@ -3643,6 +3644,7 @@ impl Server {
                             &inbound,
                             &request,
                         )
+                        .map(HandledRequest::untracked)
                     } else {
                         self.handle_request_internal(
                             cx,
