@@ -531,9 +531,9 @@ fn canonical_http_rejects_non_http_relative_missing_host_and_bad_port() {
         ),
         (
             "opaque-non-http-scheme",
-            "https://example.test/mcp",
+            "https:example.test/mcp",
             "scheme",
-            "urn://example.test/mcp",
+            "urn:example.test/mcp",
             CanonicalHttpUrlError::SchemeNotHttp,
         ),
         (
