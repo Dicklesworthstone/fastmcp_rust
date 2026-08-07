@@ -631,6 +631,12 @@ where
             if let Some(outcome) = execution.take_outcome()? {
                 return outcome;
             }
+            if cx.checkpoint().is_err() {
+                self.cancel(cx, execution)?;
+                return execution
+                    .take_outcome()?
+                    .expect("caller cancellation selects a terminal execution outcome");
+            }
             self.drive(cx)?;
         }
     }
@@ -911,8 +917,7 @@ where
         ));
         if let Err(error) = state.transport.send(cx, &cancellation) {
             let error = transport_error_to_mcp(error);
-            state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
-            return Err(error);
+            state.fail_all(error, ExecutionTerminalReason::ConnectionLost);
         }
         Ok(())
     }
@@ -1364,13 +1369,12 @@ mod tests {
         let mut explicitly_cancelled = explicit
             .execute(&cx, request(43))
             .expect("explicit-cancellation request commits");
-        explicit
-            .cancel(&cx, &mut explicitly_cancelled)
-            .expect("explicit caller cancellation selects one terminal transition");
+        let caller_cancelled = Cx::for_testing();
+        caller_cancelled.set_cancel_requested(true);
         assert_eq!(
             explicit
-                .wait(&cx, &mut explicitly_cancelled)
-                .expect_err("cancelled execution releases its waiter")
+                .wait(&caller_cancelled, &mut explicitly_cancelled)
+                .expect_err("caller cancellation selects and releases its exact waiter")
                 .code,
             fastmcp_core::McpErrorCode::RequestCancelled,
         );
