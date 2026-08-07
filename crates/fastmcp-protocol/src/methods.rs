@@ -485,7 +485,7 @@ fn validate_legacy_2024_capability_extensions(
     extensions: &BTreeMap<String, Value>,
     experimental: Option<&BTreeMap<String, Value>>,
 ) -> Result<(), Legacy2024WireError> {
-    if ["elicitation", "tasks", "apps"]
+    if ["elicitation", "tasks", "apps", "extensions"]
         .iter()
         .any(|name| extensions.contains_key(*name))
     {
@@ -720,17 +720,7 @@ pub fn validate_legacy_2024_11_05_method_params(
         }
         SAMPLING_CREATE_MESSAGE => {
             let params = required_params_object(method, params)?;
-            if params.get("messages").is_some_and(Value::is_array)
-                && params
-                    .get("maxTokens")
-                    .is_some_and(|value| value.is_i64() || value.is_u64())
-            {
-                Ok(())
-            } else {
-                Err(Legacy2024WireError(
-                    "sampling/createMessage requires messages array and integer maxTokens",
-                ))
-            }
+            validate_legacy_2024_sampling_create_message(params)
         }
         NOTIFICATIONS_MESSAGE => {
             let params = required_params_object(method, params)?;
@@ -789,8 +779,9 @@ fn required_params_object<'a>(
     method: &str,
     params: Option<&'a Value>,
 ) -> Result<&'a serde_json::Map<String, Value>, Legacy2024WireError> {
-    params.and_then(Value::as_object).ok_or_else(|| {
-        Legacy2024WireError(match method {
+    params
+        .and_then(Value::as_object)
+        .ok_or(Legacy2024WireError(match method {
             TOOLS_CALL => "tools/call requires object params",
             RESOURCES_READ => "resources/read requires object params",
             RESOURCES_SUBSCRIBE => "resources/subscribe requires object params",
@@ -806,8 +797,146 @@ fn required_params_object<'a>(
                 "notifications/resources/updated requires object params"
             }
             _ => "exact MCP 2024-11-05 method requires object params",
+        }))
+}
+
+fn validate_legacy_2024_sampling_create_message(
+    params: &serde_json::Map<String, Value>,
+) -> Result<(), Legacy2024WireError> {
+    let messages = params
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or(Legacy2024WireError(
+            "sampling/createMessage requires a messages array",
+        ))?;
+    if !params
+        .get("maxTokens")
+        .is_some_and(|value| value.is_i64() || value.is_u64())
+    {
+        return Err(Legacy2024WireError(
+            "sampling/createMessage requires integer maxTokens",
+        ));
+    }
+    for message in messages {
+        validate_legacy_2024_sampling_message(message)?;
+    }
+    if !params
+        .get("includeContext")
+        .is_none_or(|value| matches!(value.as_str(), Some("allServers" | "none" | "thisServer")))
+    {
+        return Err(Legacy2024WireError(
+            "sampling/createMessage includeContext must be allServers, none, or thisServer",
+        ));
+    }
+    if !params.get("systemPrompt").is_none_or(Value::is_string)
+        || !params.get("temperature").is_none_or(Value::is_number)
+        || !params.get("stopSequences").is_none_or(|value| {
+            value
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string))
         })
-    })
+        || !params.get("metadata").is_none_or(Value::is_object)
+    {
+        return Err(Legacy2024WireError(
+            "sampling/createMessage optional fields must match the exact 2024-11-05 shapes",
+        ));
+    }
+    if let Some(model_preferences) = params.get("modelPreferences") {
+        validate_legacy_2024_model_preferences(model_preferences)?;
+    }
+    Ok(())
+}
+
+fn validate_legacy_2024_sampling_message(value: &Value) -> Result<(), Legacy2024WireError> {
+    let message = value.as_object().ok_or(Legacy2024WireError(
+        "sampling/createMessage messages must contain objects",
+    ))?;
+    if !matches!(
+        message.get("role").and_then(Value::as_str),
+        Some("user" | "assistant")
+    ) {
+        return Err(Legacy2024WireError(
+            "sampling/createMessage messages require an exact user or assistant role",
+        ));
+    }
+    let content = message
+        .get("content")
+        .and_then(Value::as_object)
+        .ok_or(Legacy2024WireError(
+            "sampling/createMessage messages require text or image content",
+        ))?;
+    match content.get("type").and_then(Value::as_str) {
+        Some("text") if content.get("text").is_some_and(Value::is_string) => {}
+        Some("image")
+            if content.get("data").is_some_and(Value::is_string)
+                && content.get("mimeType").is_some_and(Value::is_string) => {}
+        _ => {
+            return Err(Legacy2024WireError(
+                "sampling/createMessage messages require exact text or image content",
+            ));
+        }
+    }
+    if let Some(annotations) = content.get("annotations") {
+        validate_legacy_2024_sampling_annotations(annotations)?;
+    }
+    Ok(())
+}
+
+fn validate_legacy_2024_sampling_annotations(value: &Value) -> Result<(), Legacy2024WireError> {
+    let annotations = value.as_object().ok_or(Legacy2024WireError(
+        "sampling content annotations must be an object",
+    ))?;
+    if !annotations.get("audience").is_none_or(|value| {
+        value.as_array().is_some_and(|audience| {
+            audience
+                .iter()
+                .all(|role| matches!(role.as_str(), Some("user" | "assistant")))
+        })
+    }) {
+        return Err(Legacy2024WireError(
+            "sampling content annotation audience must contain exact roles",
+        ));
+    }
+    if !annotations.get("priority").is_none_or(|value| {
+        value
+            .as_f64()
+            .is_some_and(|priority| (0.0..=1.0).contains(&priority))
+    }) {
+        return Err(Legacy2024WireError(
+            "sampling content annotation priority must be a number from zero through one",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_legacy_2024_model_preferences(value: &Value) -> Result<(), Legacy2024WireError> {
+    let preferences = value.as_object().ok_or(Legacy2024WireError(
+        "sampling/createMessage modelPreferences must be an object",
+    ))?;
+    for member in ["costPriority", "speedPriority", "intelligencePriority"] {
+        if !preferences.get(member).is_none_or(|value| {
+            value
+                .as_f64()
+                .is_some_and(|priority| (0.0..=1.0).contains(&priority))
+        }) {
+            return Err(Legacy2024WireError(
+                "sampling/createMessage model preference priorities must be numbers from zero through one",
+            ));
+        }
+    }
+    if !preferences.get("hints").is_none_or(|value| {
+        value.as_array().is_some_and(|hints| {
+            hints.iter().all(|hint| {
+                hint.as_object()
+                    .is_some_and(|hint| hint.get("name").is_none_or(Value::is_string))
+            })
+        })
+    }) {
+        return Err(Legacy2024WireError(
+            "sampling/createMessage model preference hints must be objects with optional string names",
+        ));
+    }
+    Ok(())
 }
 
 fn optional_params_object(params: Option<&Value>, method: &str) -> Result<(), Legacy2024WireError> {
