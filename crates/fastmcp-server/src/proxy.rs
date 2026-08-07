@@ -148,6 +148,7 @@ impl ProxyCatalog {
 #[derive(Clone)]
 pub struct ProxyClient {
     inner: Arc<Mutex<dyn ProxyBackend>>,
+    upstream_binding: Option<ProxyUpstreamBinding>,
 }
 
 /// Immutable adapter selected for one independently configured upstream leg.
@@ -445,7 +446,31 @@ impl ProxyClient {
     pub fn from_backend<B: ProxyBackend + 'static>(backend: B) -> Self {
         Self {
             inner: Arc::new(Mutex::new(backend)),
+            upstream_binding: None,
         }
+    }
+
+    /// Creates a proxy client for one already-selected upstream route.
+    ///
+    /// The exact upstream version is admitted before the backend can enter an
+    /// ordinary proxy handler. The immutable binding remains local to this
+    /// client, so one legacy route cannot alter an unrelated modern route.
+    pub fn from_backend_with_upstream_binding<B: ProxyBackend + 'static>(
+        backend: B,
+        binding: ProxyUpstreamBinding,
+        upstream_protocol_version: &str,
+    ) -> McpResult<Self> {
+        binding.admit_upstream_protocol_version(upstream_protocol_version)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(backend)),
+            upstream_binding: Some(binding),
+        })
+    }
+
+    /// Returns the immutable binding installed for this upstream, if any.
+    #[must_use]
+    pub const fn upstream_binding(&self) -> Option<ProxyUpstreamBinding> {
+        self.upstream_binding
     }
 
     /// Fetches a catalog by querying the backend.
@@ -464,14 +489,14 @@ impl ProxyClient {
         f(&mut *guard)
     }
 
-    fn call_tool(
+    pub fn call_tool(
         &self,
         ctx: &McpContext,
         name: &str,
         arguments: serde_json::Value,
     ) -> McpResult<Vec<Content>> {
         ctx.checkpoint()?;
-        self.with_backend(|backend| {
+        let content = self.with_backend(|backend| {
             if ctx.has_progress_reporter() {
                 let mut callback = |progress, total, message: Option<String>| {
                     if let Some(total) = total {
@@ -484,22 +509,62 @@ impl ProxyClient {
             } else {
                 backend.call_tool(name, arguments)
             }
-        })
+        })?;
+        self.translate_upstream_response("tools/call", "content", content)
     }
 
-    fn read_resource(&self, ctx: &McpContext, uri: &str) -> McpResult<Vec<ResourceContent>> {
+    pub fn read_resource(&self, ctx: &McpContext, uri: &str) -> McpResult<Vec<ResourceContent>> {
         ctx.checkpoint()?;
-        self.with_backend(|backend| backend.read_resource(uri))
+        let contents = self.with_backend(|backend| backend.read_resource(uri))?;
+        self.translate_upstream_response("resources/read", "contents", contents)
     }
 
-    fn get_prompt(
+    pub fn get_prompt(
         &self,
         ctx: &McpContext,
         name: &str,
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
         ctx.checkpoint()?;
-        self.with_backend(|backend| backend.get_prompt(name, arguments))
+        let messages = self.with_backend(|backend| backend.get_prompt(name, arguments))?;
+        self.translate_upstream_response("prompts/get", "messages", messages)
+    }
+
+    fn translate_upstream_response<T>(
+        &self,
+        method: &str,
+        member: &str,
+        response: T,
+    ) -> McpResult<T>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let Some(binding) = self.upstream_binding else {
+            return Ok(response);
+        };
+        if binding.era() == ProtocolEra::Modern2026 {
+            return Ok(response);
+        }
+
+        let mut envelope = serde_json::Map::new();
+        envelope.insert(
+            member.to_owned(),
+            serde_json::to_value(response).map_err(|_| {
+                McpError::invalid_params("Upstream result could not be represented for translation")
+            })?,
+        );
+        let translated =
+            binding.translate_upstream_result(method, serde_json::Value::Object(envelope))?;
+        let response = translated.get(member).cloned().ok_or_else(|| {
+            McpError::invalid_params(
+                "Lossless upstream translation omitted its required result member",
+            )
+        })?;
+        serde_json::from_value(response).map_err(|_| {
+            McpError::invalid_params(
+                "Lossless upstream translation produced an invalid result member",
+            )
+        })
     }
 }
 
