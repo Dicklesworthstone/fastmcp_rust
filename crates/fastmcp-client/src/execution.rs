@@ -16,7 +16,7 @@ use fastmcp_core::{McpError, McpResult, Sha256Digest, sha256_bounded};
 use fastmcp_protocol::{
     CancelledParams, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
 };
-use fastmcp_transport::{Transport, TransportError};
+use fastmcp_transport::{CodecError, Transport, TransportError};
 use serde_json::Value;
 
 use crate::{RequestTimeoutPolicy, transport_error_to_mcp};
@@ -1208,7 +1208,9 @@ mod tests {
         assert_eq!(uncorrelated[0].id, Some(RequestId::Number(999)));
 
         let malformed = RequestExecutor::new(ScriptedTransport::new([Err(TransportError::Codec(
-            serde_json::from_str::<serde_json::Value>("{").expect_err("invalid JSON"),
+            CodecError::Json(
+                serde_json::from_str::<serde_json::Value>("{").expect_err("invalid JSON"),
+            ),
         ))]));
         let mut malformed_first = malformed
             .execute(&cx, request(11))
