@@ -146,7 +146,7 @@ use fastmcp_protocol::{
     CallToolParams, CancelledParams, GetPromptParams, InitializeParams, JsonRpcError,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
     ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
-    Prompt, ReadResourceParams, RequestId, Resource, ResourceTemplate, ServerCapabilities,
+    CorrelationKey, Prompt, ReadResourceParams, RequestId, Resource, ResourceTemplate, ServerCapabilities,
     ServerInfo, SetLogLevelParams, SubscribeResourceParams, Tool, UnsubscribeResourceParams,
 };
 
@@ -301,10 +301,10 @@ struct DispatchQueueStateInner {
     /// Request IDs retain this reservation from admission until the response
     /// attempt completes. Keeping it across the queued-to-active transition
     /// closes both admission TOCTOU and post-commit ABA races with ID reuse.
-    reserved: HashSet<RequestId>,
+    reserved: HashSet<CorrelationKey>,
     /// Reserved requests that a worker has begun dispatching.
-    dispatching: HashSet<RequestId>,
-    cancelled: HashSet<RequestId>,
+    dispatching: HashSet<CorrelationKey>,
+    cancelled: HashSet<CorrelationKey>,
     queued_bytes: usize,
     stopping: bool,
 }
@@ -316,21 +316,27 @@ struct QueuedDispatchRequest {
 
 impl DispatchQueueState {
     fn admit(&self, id: &RequestId) -> bool {
+        let Ok(key) = id.correlation_key() else {
+            return false;
+        };
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        !inner.stopping && inner.reserved.insert(id.clone())
+        !inner.stopping && inner.reserved.insert(key)
     }
 
     fn discard(&self, id: &RequestId) {
+        let Ok(key) = id.correlation_key() else {
+            return;
+        };
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.reserved.remove(id);
-        inner.dispatching.remove(id);
-        inner.cancelled.remove(id);
+        inner.reserved.remove(&key);
+        inner.dispatching.remove(&key);
+        inner.cancelled.remove(&key);
     }
 
     fn reserve_queued_bytes(&self, serialized_bytes: usize) -> bool {
@@ -360,25 +366,31 @@ impl DispatchQueueState {
     }
 
     fn cancel_if_queued(&self, id: &RequestId) -> bool {
+        let Ok(key) = id.correlation_key() else {
+            return false;
+        };
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !inner.reserved.contains(id) || inner.dispatching.contains(id) {
+        if !inner.reserved.contains(&key) || inner.dispatching.contains(&key) {
             return false;
         }
-        inner.cancelled.insert(id.clone());
+        inner.cancelled.insert(key);
         true
     }
 
     fn begin_dispatch(&self, id: &RequestId) -> bool {
+        let Ok(key) = id.correlation_key() else {
+            return false;
+        };
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        debug_assert!(inner.reserved.contains(id));
-        inner.dispatching.insert(id.clone());
-        inner.cancelled.remove(id) || inner.stopping
+        debug_assert!(inner.reserved.contains(&key));
+        inner.dispatching.insert(key.clone());
+        inner.cancelled.remove(&key) || inner.stopping
     }
 
     fn is_stopping(&self) -> bool {

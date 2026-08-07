@@ -83,6 +83,7 @@ use fastmcp_protocol::{
     ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource, ResourceContent,
     ResourceTemplate, ServerCapabilities, ServerInfo, SetLogLevelParams, SubmitTaskParams,
     SubmitTaskResult, TaskId, TaskInfo, TaskResult, TaskStatus, Tool,
+    CorrelationKey,
 };
 
 /// Callback for receiving progress notifications during tool execution.
@@ -2187,14 +2188,14 @@ enum ResponseRoute {
 /// for every ID registered with the one receive loop and provides bounded
 /// state for a future multiplexed adapter.
 struct ResponseRegistry {
-    pending: std::collections::HashMap<RequestId, oneshot::Sender<CorrelatedResponse>>,
-    tombstones: std::collections::HashMap<RequestId, Instant>,
+    pending: std::collections::HashMap<CorrelationKey, oneshot::Sender<CorrelatedResponse>>,
+    tombstones: std::collections::HashMap<CorrelationKey, Instant>,
     /// IDs whose one permitted cancellation control has been claimed.
     ///
     /// This state is intentionally separate from response tombstones: callers
     /// may cancel an arbitrary peer-known ID, including one the local allocator
     /// has not reached, without preventing a later local waiter registration.
-    cancellation_controls: std::collections::HashMap<RequestId, Instant>,
+    cancellation_controls: std::collections::HashMap<CorrelationKey, Instant>,
     terminal_error: Option<McpError>,
     uncorrelated_diagnostics: u8,
 }
@@ -2215,10 +2216,13 @@ impl ResponseRegistry {
         if let Some(error) = &self.terminal_error {
             return Err(error.clone());
         }
-        if self.pending.contains_key(&id) {
+        let key = id
+            .correlation_key()
+            .map_err(|_| McpError::internal_error("Invalid JSON-RPC request ID"))?;
+        if self.pending.contains_key(&key) {
             return Err(McpError::internal_error("Duplicate in-flight request ID"));
         }
-        if self.tombstones.contains_key(&id) {
+        if self.tombstones.contains_key(&key) {
             return Err(McpError::internal_error(
                 "Retired request ID cannot be reused",
             ));
@@ -2239,8 +2243,8 @@ impl ResponseRegistry {
         // monotonic allocator reached it. Admission of a genuinely new waiter
         // starts a new request generation with its own one-control allowance;
         // unlike a response tombstone, the old control marker never blocks it.
-        self.cancellation_controls.remove(&id);
-        self.pending.insert(id.clone(), sender);
+        self.cancellation_controls.remove(&key);
+        self.pending.insert(key, sender);
         Ok(ResponseWaiter { id, receiver })
     }
 
@@ -2261,10 +2265,14 @@ impl ResponseRegistry {
             self.fail_all(error);
             return ResponseRoute::MissingId;
         };
-        if self.tombstones.remove(&id).is_some() {
+        let Ok(key) = id.correlation_key() else {
+            self.fail_all(McpError::internal_error(INVALID_RESPONSE_ENVELOPE_ERROR));
+            return ResponseRoute::InvalidEnvelope;
+        };
+        if self.tombstones.remove(&key).is_some() {
             return ResponseRoute::TombstoneRetired;
         }
-        let Some(sender) = self.pending.remove(&id) else {
+        let Some(sender) = self.pending.remove(&key) else {
             self.note_uncorrelated_response("response received for unknown or completed request");
             return ResponseRoute::UnknownId;
         };
@@ -2279,7 +2287,10 @@ impl ResponseRegistry {
     }
 
     fn fail(&mut self, id: &RequestId, error: McpError) -> bool {
-        let Some(sender) = self.pending.remove(id) else {
+        let Ok(key) = id.correlation_key() else {
+            return false;
+        };
+        let Some(sender) = self.pending.remove(&key) else {
             return false;
         };
         let _ = sender.send_blocking(Err(error));
@@ -2292,7 +2303,10 @@ impl ResponseRegistry {
         if let Some(terminal_error) = &self.terminal_error {
             return Err(terminal_error.clone());
         }
-        if self.tombstones.contains_key(id) || !self.pending.contains_key(id) {
+        let key = id
+            .correlation_key()
+            .map_err(|_| McpError::internal_error("Invalid JSON-RPC request ID"))?;
+        if self.tombstones.contains_key(&key) || !self.pending.contains_key(&key) {
             return Ok(false);
         }
         if self.tombstones.len() >= MAX_RESPONSE_CORRELATIONS {
@@ -2304,10 +2318,10 @@ impl ResponseRegistry {
         let expires_at = now
             .checked_add(RESPONSE_TOMBSTONE_RETENTION)
             .ok_or_else(|| McpError::internal_error("Tombstone retention exceeds clock range"))?;
-        let Some(sender) = self.pending.remove(id) else {
+        let Some(sender) = self.pending.remove(&key) else {
             return Ok(false);
         };
-        self.tombstones.insert(id.clone(), expires_at);
+        self.tombstones.insert(key, expires_at);
         let _ = sender.send_blocking(Err(error));
         Ok(true)
     }
@@ -2324,7 +2338,10 @@ impl ResponseRegistry {
         if let Some(terminal_error) = &self.terminal_error {
             return Err(terminal_error.clone());
         }
-        if self.cancellation_controls.contains_key(id) {
+        let key = id
+            .correlation_key()
+            .map_err(|_| McpError::internal_error("Invalid JSON-RPC request ID"))?;
+        if self.cancellation_controls.contains_key(&key) {
             return Ok(false);
         }
         if self.cancellation_controls.len() >= MAX_CANCELLATION_CONTROL_IDS {
@@ -2338,7 +2355,7 @@ impl ResponseRegistry {
             .ok_or_else(|| {
                 McpError::internal_error("Cancellation-control retention exceeds clock range")
             })?;
-        self.cancellation_controls.insert(id.clone(), expires_at);
+        self.cancellation_controls.insert(key, expires_at);
         Ok(true)
     }
 
@@ -6676,7 +6693,14 @@ mod tests {
         registry.cancellation_controls.clear();
         registry.cancellation_controls.extend(
             (0..MAX_CANCELLATION_CONTROL_IDS)
-                .map(|id| (RequestId::String(format!("control-{id}")), expires_at)),
+                .map(|id| {
+                    (
+                        RequestId::String(format!("control-{id}"))
+                            .correlation_key()
+                            .expect("test IDs are valid"),
+                        expires_at,
+                    )
+                }),
         );
         let error = registry
             .claim_cancellation_control(&RequestId::String("overflow".to_string()))
@@ -6686,6 +6710,68 @@ mod tests {
             registry.cancellation_control_len(),
             MAX_CANCELLATION_CONTROL_IDS
         );
+    }
+
+    #[test]
+    fn response_registry_correlates_numeric_aliases() {
+        let mut registry = ResponseRegistry::new();
+        let mut waiter = registry
+            .register(RequestId::Number(1))
+            .expect("the first numeric request claims one correlation key");
+
+        let response = JsonRpcResponse::success(
+            RequestId::Integer("1e0".to_owned()),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            registry.route(response),
+            ResponseRoute::Delivered,
+            "a mathematically equivalent numeric response reaches the live waiter"
+        );
+        let delivered = waiter
+            .try_response()
+            .expect("the live waiter receives its correlated response")
+            .expect("the response was delivered synchronously");
+        assert_eq!(delivered.id, Some(RequestId::Integer("1e0".to_owned())));
+        assert_eq!(registry.pending_len(), 0);
+    }
+
+    #[test]
+    fn response_registry_rejects_invalid_direct_integer_without_mutation() {
+        let mut registry = ResponseRegistry::new();
+        let baseline = RequestId::Integer("1".to_owned());
+        let planted_invalid = RequestId::Integer("1.5".to_owned());
+        let waiter = registry
+            .register(baseline)
+            .expect("the baseline mathematical integer request is admitted");
+        let state_before = registry.pending_len();
+
+        let error = registry
+            .register(planted_invalid)
+            .expect_err("changing only the lexeme to a fractional value cannot claim a slot");
+        assert!(error.message.contains("Invalid JSON-RPC request ID"));
+        assert_eq!(
+            registry.pending_len(),
+            state_before,
+            "the directly constructed rejected ID leaves the live correlation state unchanged"
+        );
+        drop(waiter);
+    }
+
+    #[test]
+    fn response_registry_rejects_live_numeric_alias_without_mutation() {
+        let mut registry = ResponseRegistry::new();
+        let waiter = registry
+            .register(RequestId::Number(1))
+            .expect("the baseline request is admitted");
+        let state_before = registry.pending_len();
+
+        assert!(
+            registry.register(RequestId::Integer("1.0".to_owned())).is_err(),
+            "an exact numeric alias cannot create a second active request"
+        );
+        assert_eq!(registry.pending_len(), state_before);
+        drop(waiter);
     }
 
     #[test]

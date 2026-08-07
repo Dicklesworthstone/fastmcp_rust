@@ -453,11 +453,12 @@ impl RequestId {
 
     /// Produces the canonical key used by request registries and correlation.
     #[must_use]
-    pub fn correlation_key(&self) -> CorrelationKey {
+    pub fn correlation_key(&self) -> Result<CorrelationKey, &'static str> {
+        self.validate()?;
         match self {
-            Self::Number(value) => CorrelationKey::Integer(value.to_string()),
-            Self::Integer(lexeme) => CorrelationKey::Integer(canonical_integer_lexeme(lexeme)),
-            Self::String(value) => CorrelationKey::String(value.clone()),
+            Self::Number(value) => Ok(CorrelationKey::Integer(value.to_string())),
+            Self::Integer(lexeme) => Ok(CorrelationKey::Integer(canonical_integer_lexeme(lexeme))),
+            Self::String(value) => Ok(CorrelationKey::String(value.clone())),
         }
     }
 }
@@ -1052,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_01_envelopes_positive() {
+    fn request_and_response_envelopes_decode() {
         let request = br#"{"jsonrpc":"2.0","method":"tools/list","id":42}"#;
         let notification = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let success = br#"{"jsonrpc":"2.0","result":null,"id":"request-42"}"#;
@@ -1096,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_01_a_positive() {
+    fn raw_admission_accepts_public_request_surface() {
         let frame = br#"{"jsonrpc":"2.0","method":"tools/list","id":"public-request"}"#;
         let mut state = AdmittedFrames::default();
         let admitted = admit_frame(&mut state, frame)
@@ -1115,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_01_envelopes_planted_negative() {
+    fn duplicate_envelope_member_is_rejected_without_state_change() {
         let baseline = br#"{"jsonrpc":"2.0","method":"tools/list","id":42}"#;
         let planted = br#"{"jsonrpc":"2.0","method":"tools/list","id":42,"id":42}"#;
         let mut state = AdmittedFrames::default();
@@ -1135,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_01_a_planted_negative() {
+    fn bom_is_rejected_without_state_change() {
         let baseline = br#"{"jsonrpc":"2.0","method":"tools/list","id":"public-request"}"#;
         let mut planted = baseline.to_vec();
         planted.splice(0..0, [0xef, 0xbb, 0xbf]);
@@ -1154,23 +1155,27 @@ mod tests {
     }
 
     #[test]
-    fn prt_01_id_correlation_positive() {
+    fn request_id_correlation_key_normalizes_numeric_aliases() {
         let numeric = RequestId::Number(1);
         let string = RequestId::String("1".to_owned());
         assert_ne!(numeric, string, "string and numeric request IDs are disjoint");
         assert_eq!(
-            numeric.correlation_key(),
-            RequestId::Integer("1.0".to_owned()).correlation_key(),
+            numeric.correlation_key().expect("valid numeric ID"),
+            RequestId::Integer("1.0".to_owned())
+                .correlation_key()
+                .expect("valid mathematical integer ID"),
             "numeric aliases share one exact mathematical correlation key"
         );
         assert_eq!(
-            numeric.correlation_key(),
-            RequestId::Integer("1e0".to_owned()).correlation_key(),
+            numeric.correlation_key().expect("valid numeric ID"),
+            RequestId::Integer("1e0".to_owned())
+                .correlation_key()
+                .expect("valid mathematical integer ID"),
             "exponent-form integer aliases share one exact mathematical correlation key"
         );
         assert_ne!(
-            numeric.correlation_key(),
-            string.correlation_key(),
+            numeric.correlation_key().expect("valid numeric ID"),
+            string.correlation_key().expect("valid string ID"),
             "a string ID never aliases its numeric spelling"
         );
         assert_eq!(
@@ -1208,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_01_id_correlation_planted_negative() {
+    fn request_id_fractional_lexeme_is_rejected_before_correlation() {
         let baseline = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
         let planted = br#"{"jsonrpc":"2.0","method":"tools/list","id":1.5}"#;
         let mut state = AdmittedFrames::default();
@@ -1226,7 +1231,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_01_duplicate_member_planted_negative() {
+    fn duplicate_nested_member_is_rejected_without_state_change() {
         let baseline = br#"{"jsonrpc":"2.0","method":"tools/list","params":{"cursor":"a"}}"#;
         let planted = br#"{"jsonrpc":"2.0","method":"tools/list","params":{"cursor":"a","cursor":"b"}}"#;
         let mut state = AdmittedFrames::default();
@@ -1246,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_01_top_level_batch_array_planted_negative() {
+    fn top_level_batches_are_rejected_without_state_change() {
         let baseline = br#"{"jsonrpc":"2.0","method":"tools/list"}"#;
         let array_of_one = br#"[{"jsonrpc":"2.0","method":"tools/list"}]"#;
         let mixed_array = br#"[{"jsonrpc":"2.0","method":"tools/list"},{"jsonrpc":"2.0","method":"notifications/initialized"}]"#;
