@@ -141,6 +141,14 @@ const AUTO_SUPPORTED_VERSIONS: [ProtocolVersion; 2] =
 const NO_MODERN_DISCOVERY_VERSIONS: [ProtocolVersion; 0] = [];
 
 impl ProtocolPolicy {
+    const fn display_name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ModernOnly => "modern-only",
+            Self::LegacyOnly => "legacy-only",
+        }
+    }
+
     /// Returns whether this immutable policy admits a version.
     #[must_use]
     pub const fn permits(self, version: ProtocolVersion) -> bool {
@@ -695,6 +703,20 @@ impl HttpRouteKind {
             Self::LegacySseGet => "GET",
         }
     }
+
+    const fn display_name(self) -> &'static str {
+        match self {
+            Self::ModernMcpPost => "modern MCP POST",
+            Self::LegacySseGet => "legacy SSE GET",
+            Self::LegacyMessagePost => "legacy message POST",
+        }
+    }
+}
+
+impl fmt::Display for HttpRouteKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.display_name())
+    }
 }
 
 /// Immutable, configured HTTP endpoint bundle for one policy selection.
@@ -755,6 +777,42 @@ pub enum HttpEndpointBundleError {
         target: String,
     },
 }
+
+impl fmt::Display for HttpEndpointBundleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingModernPostTarget { policy } => write!(
+                formatter,
+                "protocol policy {} requires a configured modern MCP POST target",
+                policy.display_name()
+            ),
+            Self::MissingLegacySseTarget { policy } => write!(
+                formatter,
+                "protocol policy {} requires a configured legacy SSE GET target",
+                policy.display_name()
+            ),
+            Self::MissingLegacyMessagePostTarget { policy } => write!(
+                formatter,
+                "protocol policy {} requires a configured legacy message POST target",
+                policy.display_name()
+            ),
+            Self::FragmentNotAllowed { route } => write!(
+                formatter,
+                "configured {route} target must not contain a fragment"
+            ),
+            Self::RouteCollision {
+                first,
+                second,
+                target,
+            } => write!(
+                formatter,
+                "configured {first} and {second} routes collide at {target}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HttpEndpointBundleError {}
 
 impl HttpEndpointBundle {
     /// Builds a trusted bundle exclusively from configured canonical targets.

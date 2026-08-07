@@ -2,9 +2,10 @@
 
 use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::protocol_policy::{
-    HttpEndpointBundle, HttpEraCache, HttpEraDecision, HttpModernProbe, HttpProbeBody,
-    ModernVersionSupport, ProtocolEra, ProtocolPolicy, ProtocolVersion, ProtocolVersionError,
-    StdioEraClassifier, StdioEraDecision, StdioEraRejection, StdioOpeningFrame,
+    HttpEndpointBundle, HttpEndpointBundleError, HttpEraCache, HttpEraDecision, HttpModernProbe,
+    HttpProbeBody, ModernVersionSupport, ProtocolEra, ProtocolPolicy, ProtocolVersion,
+    ProtocolVersionError, StdioEraClassifier, StdioEraDecision, StdioEraRejection,
+    StdioOpeningFrame,
 };
 
 fn auto_bundle(security_partition: &str, policy_generation: u64) -> HttpEndpointBundle {
@@ -155,5 +156,108 @@ fn fnd_03_b_planted_negative() {
     assert_eq!(
         rejected.state(),
         &fastmcp_protocol::protocol_policy::StdioEraState::Selected(ProtocolEra::Modern2026)
+    );
+}
+
+#[test]
+fn http_endpoint_bundle_errors_have_stable_display_and_error_surfaces() {
+    let modern = CanonicalHttpUrl::parse("https://api.example.test/mcp").unwrap();
+    let legacy_sse = CanonicalHttpUrl::parse("https://api.example.test/sse").unwrap();
+    let legacy_message = CanonicalHttpUrl::parse("https://api.example.test/messages").unwrap();
+
+    let errors = [
+        (
+            HttpEndpointBundle::new(
+                ProtocolPolicy::Auto,
+                None,
+                Some(legacy_sse.clone()),
+                Some(legacy_message.clone()),
+                "credential-partition-a".to_owned(),
+                "security-partition-a".to_owned(),
+                "http-sse-v2".to_owned(),
+                3,
+                7,
+                11,
+            )
+            .expect_err("Auto policy without modern target must be rejected"),
+            "protocol policy auto requires a configured modern MCP POST target",
+        ),
+        (
+            HttpEndpointBundle::new(
+                ProtocolPolicy::Auto,
+                Some(modern.clone()),
+                None,
+                Some(legacy_message.clone()),
+                "credential-partition-a".to_owned(),
+                "security-partition-a".to_owned(),
+                "http-sse-v2".to_owned(),
+                3,
+                7,
+                11,
+            )
+            .expect_err("Auto policy without legacy SSE target must be rejected"),
+            "protocol policy auto requires a configured legacy SSE GET target",
+        ),
+        (
+            HttpEndpointBundle::new(
+                ProtocolPolicy::Auto,
+                Some(modern.clone()),
+                Some(legacy_sse.clone()),
+                None,
+                "credential-partition-a".to_owned(),
+                "security-partition-a".to_owned(),
+                "http-sse-v2".to_owned(),
+                3,
+                7,
+                11,
+            )
+            .expect_err("Auto policy without legacy message target must be rejected"),
+            "protocol policy auto requires a configured legacy message POST target",
+        ),
+        (
+            HttpEndpointBundle::new(
+                ProtocolPolicy::ModernOnly,
+                Some(CanonicalHttpUrl::parse("https://api.example.test/mcp#fragment").unwrap()),
+                None,
+                None,
+                "credential-partition-a".to_owned(),
+                "security-partition-a".to_owned(),
+                "http-sse-v2".to_owned(),
+                3,
+                7,
+                11,
+            )
+            .expect_err("fragment-bearing modern target must be rejected"),
+            "configured modern MCP POST target must not contain a fragment",
+        ),
+        (
+            HttpEndpointBundle::new(
+                ProtocolPolicy::Auto,
+                Some(modern.clone()),
+                Some(legacy_sse),
+                Some(modern),
+                "credential-partition-a".to_owned(),
+                "security-partition-a".to_owned(),
+                "http-sse-v2".to_owned(),
+                3,
+                7,
+                11,
+            )
+            .expect_err("same-method canonical target collision must be rejected"),
+            "configured modern MCP POST and legacy message POST routes collide at https://api.example.test/mcp",
+        ),
+    ];
+
+    for (error, expected) in errors {
+        let error: &dyn std::error::Error = &error;
+        assert_eq!(error.to_string(), expected);
+    }
+
+    assert_eq!(
+        HttpEndpointBundleError::FragmentNotAllowed {
+            route: fastmcp_protocol::protocol_policy::HttpRouteKind::LegacySseGet,
+        }
+        .to_string(),
+        "configured legacy SSE GET target must not contain a fragment"
     );
 }
