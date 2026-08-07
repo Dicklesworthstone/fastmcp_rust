@@ -5,6 +5,41 @@
 //! `notifications/initialized` being sent as bare `initialized`), which the wire
 //! protocol silently ignores rather than rejecting.
 
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// The only legacy MCP wire version represented by this isolated surface.
+pub const LEGACY_2024_11_05_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// SHA-256 of the pinned official 2024-11-05 JSON schema.
+pub const LEGACY_2024_11_05_SCHEMA_SHA256: &str =
+    "61cea2392d4f284092d09bc84b9ac488c0d5618ac2b38a56942fc5b99fd960ce";
+
+/// Exact official MCP 2024-11-05 Draft 7 JSON schema, vendored as a read-only
+/// source input.  This is deliberately not synthesized from newer protocol
+/// types: consumers can inspect the pinned source of truth directly.
+pub const LEGACY_2024_11_05_SCHEMA_JSON: &str =
+    include_str!("../../../evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.json");
+
+/// Parses the pinned legacy schema, retaining its exact source bytes in
+/// [`LEGACY_2024_11_05_SCHEMA_JSON`].
+///
+/// This remains fallible so a malformed vendored input fails closed rather
+/// than introducing a process-wide panic in a protocol consumer.
+pub fn legacy_2024_11_05_schema() -> Result<&'static Value, Legacy2024WireError> {
+    static SCHEMA: OnceLock<Result<Value, Legacy2024WireError>> = OnceLock::new();
+    match SCHEMA.get_or_init(|| {
+        serde_json::from_str(LEGACY_2024_11_05_SCHEMA_JSON)
+            .map_err(|_| Legacy2024WireError("pinned MCP 2024-11-05 schema is not valid JSON"))
+    }) {
+        Ok(schema) => Ok(schema),
+        Err(error) => Err(error.clone()),
+    }
+}
+
 /// Lifecycle `initialize` request.
 pub const INITIALIZE: &str = "initialize";
 
@@ -44,9 +79,625 @@ pub const NOTIFICATIONS_MESSAGE: &str = "notifications/message";
 /// Ping request.
 pub const PING: &str = "ping";
 
+/// Completion request.
+pub const COMPLETION_COMPLETE: &str = "completion/complete";
+
+/// Server-to-client sampling request.
+pub const SAMPLING_CREATE_MESSAGE: &str = "sampling/createMessage";
+
+/// Server-to-client roots list request.
+pub const ROOTS_LIST: &str = "roots/list";
+
+/// Progress notification, valid in either direction.
+pub const NOTIFICATIONS_PROGRESS: &str = "notifications/progress";
+
+/// Prompt-list-change notification.
+pub const NOTIFICATIONS_PROMPTS_LIST_CHANGED: &str = "notifications/prompts/list_changed";
+
+/// Resource-list-change notification.
+pub const NOTIFICATIONS_RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";
+
+/// Resource-update notification.
+pub const NOTIFICATIONS_RESOURCES_UPDATED: &str = "notifications/resources/updated";
+
+/// Roots-list-change notification.
+pub const NOTIFICATIONS_ROOTS_LIST_CHANGED: &str = "notifications/roots/list_changed";
+
+/// Tool-list-change notification.
+pub const NOTIFICATIONS_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
+
+/// Resource-subscription request.
+pub const RESOURCES_SUBSCRIBE: &str = "resources/subscribe";
+
+/// Resource-unsubscription request.
+pub const RESOURCES_UNSUBSCRIBE: &str = "resources/unsubscribe";
+
+/// Direction permitted by the 2024-11-05 tagged union.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Legacy2024Direction {
+    /// Only clients may send this method.
+    ClientToServer,
+    /// Only servers may send this method.
+    ServerToClient,
+    /// Either peer may send this method.
+    Bidirectional,
+}
+
+/// JSON-RPC envelope kind required for a tagged method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Legacy2024EnvelopeKind {
+    /// The method is a request and therefore requires a non-null request ID.
+    Request,
+    /// The method is a notification and therefore must omit its request ID.
+    Notification,
+}
+
+/// Capability shape that owns a tagged method in the pinned legacy schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Legacy2024Capability {
+    /// Client `sampling` capability.
+    ClientSampling,
+    /// Client `roots` capability.
+    ClientRoots,
+    /// Client `roots.listChanged` capability.
+    ClientRootsListChanged,
+    /// Server `logging` capability.
+    ServerLogging,
+    /// Server `prompts` capability.
+    ServerPrompts,
+    /// Server `prompts.listChanged` capability.
+    ServerPromptsListChanged,
+    /// Server `resources` capability.
+    ServerResources,
+    /// Server `resources.subscribe` capability.
+    ServerResourcesSubscribe,
+    /// Server `resources.listChanged` capability.
+    ServerResourcesListChanged,
+    /// Server `tools` capability.
+    ServerTools,
+    /// Server `tools.listChanged` capability.
+    ServerToolsListChanged,
+}
+
+/// Exact direction, envelope, and capability metadata for one tagged legacy method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Legacy2024Method {
+    /// Exact JSON-RPC method literal.
+    pub name: &'static str,
+    /// Peer direction admitted by the tagged union.
+    pub direction: Legacy2024Direction,
+    /// Request-versus-notification envelope constraint.
+    pub envelope: Legacy2024EnvelopeKind,
+    /// Required advertised capability, when the 2024 schema defines one.
+    pub capability: Option<Legacy2024Capability>,
+}
+
+/// All and only the 24 method literals in the pinned MCP 2024-11-05 schema.
+pub const LEGACY_2024_11_05_METHODS: [Legacy2024Method; 24] = [
+    Legacy2024Method {
+        name: INITIALIZE,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: None,
+    },
+    Legacy2024Method {
+        name: NOTIFICATIONS_INITIALIZED,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Notification,
+        capability: None,
+    },
+    Legacy2024Method {
+        name: PING,
+        direction: Legacy2024Direction::Bidirectional,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: None,
+    },
+    Legacy2024Method {
+        name: TOOLS_LIST,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ServerTools),
+    },
+    Legacy2024Method {
+        name: TOOLS_CALL,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ServerTools),
+    },
+    Legacy2024Method {
+        name: RESOURCES_LIST,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ServerResources),
+    },
+    Legacy2024Method {
+        name: RESOURCES_TEMPLATES_LIST,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ServerResources),
+    },
+    Legacy2024Method {
+        name: RESOURCES_READ,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ServerResources),
+    },
+    Legacy2024Method {
+        name: RESOURCES_SUBSCRIBE,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ServerResourcesSubscribe),
+    },
+    Legacy2024Method {
+        name: RESOURCES_UNSUBSCRIBE,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ServerResourcesSubscribe),
+    },
+    Legacy2024Method {
+        name: PROMPTS_LIST,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ServerPrompts),
+    },
+    Legacy2024Method {
+        name: PROMPTS_GET,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ServerPrompts),
+    },
+    Legacy2024Method {
+        name: LOGGING_SET_LEVEL,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ServerLogging),
+    },
+    Legacy2024Method {
+        name: COMPLETION_COMPLETE,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: None,
+    },
+    Legacy2024Method {
+        name: SAMPLING_CREATE_MESSAGE,
+        direction: Legacy2024Direction::ServerToClient,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ClientSampling),
+    },
+    Legacy2024Method {
+        name: ROOTS_LIST,
+        direction: Legacy2024Direction::ServerToClient,
+        envelope: Legacy2024EnvelopeKind::Request,
+        capability: Some(Legacy2024Capability::ClientRoots),
+    },
+    Legacy2024Method {
+        name: NOTIFICATIONS_CANCELLED,
+        direction: Legacy2024Direction::Bidirectional,
+        envelope: Legacy2024EnvelopeKind::Notification,
+        capability: None,
+    },
+    Legacy2024Method {
+        name: NOTIFICATIONS_PROGRESS,
+        direction: Legacy2024Direction::Bidirectional,
+        envelope: Legacy2024EnvelopeKind::Notification,
+        capability: None,
+    },
+    Legacy2024Method {
+        name: NOTIFICATIONS_ROOTS_LIST_CHANGED,
+        direction: Legacy2024Direction::ClientToServer,
+        envelope: Legacy2024EnvelopeKind::Notification,
+        capability: Some(Legacy2024Capability::ClientRootsListChanged),
+    },
+    Legacy2024Method {
+        name: NOTIFICATIONS_MESSAGE,
+        direction: Legacy2024Direction::ServerToClient,
+        envelope: Legacy2024EnvelopeKind::Notification,
+        capability: Some(Legacy2024Capability::ServerLogging),
+    },
+    Legacy2024Method {
+        name: NOTIFICATIONS_PROMPTS_LIST_CHANGED,
+        direction: Legacy2024Direction::ServerToClient,
+        envelope: Legacy2024EnvelopeKind::Notification,
+        capability: Some(Legacy2024Capability::ServerPromptsListChanged),
+    },
+    Legacy2024Method {
+        name: NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+        direction: Legacy2024Direction::ServerToClient,
+        envelope: Legacy2024EnvelopeKind::Notification,
+        capability: Some(Legacy2024Capability::ServerResourcesListChanged),
+    },
+    Legacy2024Method {
+        name: NOTIFICATIONS_RESOURCES_UPDATED,
+        direction: Legacy2024Direction::ServerToClient,
+        envelope: Legacy2024EnvelopeKind::Notification,
+        capability: Some(Legacy2024Capability::ServerResourcesSubscribe),
+    },
+    Legacy2024Method {
+        name: NOTIFICATIONS_TOOLS_LIST_CHANGED,
+        direction: Legacy2024Direction::ServerToClient,
+        envelope: Legacy2024EnvelopeKind::Notification,
+        capability: Some(Legacy2024Capability::ServerToolsListChanged),
+    },
+];
+
+/// Looks up one exact tagged 2024-11-05 method literal.
+#[must_use]
+pub fn legacy_2024_11_05_method(name: &str) -> Option<&'static Legacy2024Method> {
+    LEGACY_2024_11_05_METHODS
+        .iter()
+        .find(|method| method.name == name)
+}
+
+/// Typed shape of the 2024-11-05 client capabilities object.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Legacy2024ClientCapabilities {
+    /// Non-standard client capabilities retained by the exact schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<BTreeMap<String, Value>>,
+    /// Sampling support, represented by an open object in the pinned schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<BTreeMap<String, Value>>,
+    /// Root-list support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roots: Option<Legacy2024RootsCapability>,
+    /// Additional non-standard capability members allowed by the 2024 schema.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// Exact 2024-11-05 root capability shape.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Legacy2024RootsCapability {
+    /// Whether root-list-change notifications are supported.
+    #[serde(
+        default,
+        rename = "listChanged",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub list_changed: bool,
+    /// Additional fields allowed by the pinned open object shape.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// Typed shape of the 2024-11-05 server capabilities object.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Legacy2024ServerCapabilities {
+    /// Non-standard server capabilities retained by the exact schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<BTreeMap<String, Value>>,
+    /// Server logging capability, represented by an open object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logging: Option<BTreeMap<String, Value>>,
+    /// Prompt capability shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<Legacy2024ListChangedCapability>,
+    /// Resource capability shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Legacy2024ResourcesCapability>,
+    /// Tool capability shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Legacy2024ListChangedCapability>,
+    /// Additional non-standard capability members allowed by the 2024 schema.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// Exact 2024-11-05 `listChanged` capability shape.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Legacy2024ListChangedCapability {
+    /// Whether list-change notifications are supported.
+    #[serde(
+        default,
+        rename = "listChanged",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub list_changed: bool,
+    /// Additional fields allowed by the pinned open object shape.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// Exact 2024-11-05 resources capability shape.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Legacy2024ResourcesCapability {
+    /// Whether resource subscriptions are supported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subscribe: bool,
+    /// Whether resource-list-change notifications are supported.
+    #[serde(
+        default,
+        rename = "listChanged",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub list_changed: bool,
+    /// Additional fields allowed by the pinned open object shape.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// Validates and decodes the exact 2024-11-05 client capability shape.
+pub fn decode_legacy_2024_11_05_client_capabilities(
+    value: Value,
+) -> Result<Legacy2024ClientCapabilities, Legacy2024WireError> {
+    let capabilities: Legacy2024ClientCapabilities = serde_json::from_value(value)
+        .map_err(|_| Legacy2024WireError("MCP 2024-11-05 client capabilities must be an object"))?;
+    validate_legacy_2024_capability_extensions(
+        &capabilities.extensions,
+        capabilities.experimental.as_ref(),
+    )?;
+    Ok(capabilities)
+}
+
+/// Validates and decodes the exact 2024-11-05 server capability shape.
+pub fn decode_legacy_2024_11_05_server_capabilities(
+    value: Value,
+) -> Result<Legacy2024ServerCapabilities, Legacy2024WireError> {
+    let capabilities: Legacy2024ServerCapabilities = serde_json::from_value(value)
+        .map_err(|_| Legacy2024WireError("MCP 2024-11-05 server capabilities must be an object"))?;
+    validate_legacy_2024_capability_extensions(
+        &capabilities.extensions,
+        capabilities.experimental.as_ref(),
+    )?;
+    Ok(capabilities)
+}
+
+/// Validates initialization-era server metadata before a consumer accepts it.
+pub fn validate_legacy_2024_11_05_initialize_result(
+    value: &Value,
+) -> Result<Legacy2024ServerCapabilities, Legacy2024WireError> {
+    let result = value.as_object().ok_or(Legacy2024WireError(
+        "MCP 2024-11-05 initialize result must be an object",
+    ))?;
+    if result.get("protocolVersion")
+        != Some(&Value::String(
+            LEGACY_2024_11_05_PROTOCOL_VERSION.to_owned(),
+        ))
+    {
+        return Err(Legacy2024WireError(
+            "initialize result protocolVersion must be exact MCP 2024-11-05",
+        ));
+    }
+    let server_info =
+        result
+            .get("serverInfo")
+            .and_then(Value::as_object)
+            .ok_or(Legacy2024WireError(
+                "MCP 2024-11-05 initialize result requires serverInfo object",
+            ))?;
+    if !server_info.get("name").is_some_and(Value::is_string)
+        || !server_info.get("version").is_some_and(Value::is_string)
+    {
+        return Err(Legacy2024WireError(
+            "MCP 2024-11-05 initialize result serverInfo requires string name and version",
+        ));
+    }
+    let capabilities = result
+        .get("capabilities")
+        .cloned()
+        .ok_or(Legacy2024WireError(
+            "MCP 2024-11-05 initialize result requires server capabilities",
+        ))?;
+    decode_legacy_2024_11_05_server_capabilities(capabilities)
+}
+
+fn validate_legacy_2024_capability_extensions(
+    extensions: &BTreeMap<String, Value>,
+    experimental: Option<&BTreeMap<String, Value>>,
+) -> Result<(), Legacy2024WireError> {
+    if ["elicitation", "tasks", "apps"]
+        .iter()
+        .any(|name| extensions.contains_key(*name))
+    {
+        return Err(Legacy2024WireError(
+            "modern-only capabilities are not part of exact MCP 2024-11-05",
+        ));
+    }
+    if experimental.is_some_and(|experimental| {
+        experimental
+            .values()
+            .any(|capability| !capability.is_object())
+    }) {
+        return Err(Legacy2024WireError(
+            "MCP 2024-11-05 experimental capabilities must map names to objects",
+        ));
+    }
+    Ok(())
+}
+
+/// A decoded exact-2024 JSON-RPC envelope.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Legacy2024Envelope {
+    /// A tagged request with a non-null JSON-RPC request ID.
+    Request {
+        method: &'static Legacy2024Method,
+        id: Value,
+        params: Option<Value>,
+    },
+    /// A tagged notification which omits JSON-RPC request ID.
+    Notification {
+        method: &'static Legacy2024Method,
+        params: Option<Value>,
+    },
+    /// A successful JSON-RPC result envelope.
+    Response { id: Value, result: Value },
+    /// A JSON-RPC error envelope.
+    Error { id: Value, error: Value },
+}
+
+/// An exact-2024 raw wire admission failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Legacy2024WireError(&'static str);
+
+impl Legacy2024WireError {
+    /// Stable reason intended for callers that need an exact refusal category.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Legacy2024WireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Legacy2024WireError {}
+
+/// Decodes one exact MCP 2024-11-05 JSON-RPC envelope before any lifecycle or
+/// dispatch work.  Top-level batches, modern method literals, invalid IDs, and
+/// 2025-11-25 initialization are rejected at this pure raw-admission boundary.
+pub fn decode_legacy_2024_11_05_envelope(
+    value: Value,
+) -> Result<Legacy2024Envelope, Legacy2024WireError> {
+    let object = value.as_object().ok_or(Legacy2024WireError(
+        "MCP 2024-11-05 requires one top-level JSON-RPC object; batch arrays are unsupported",
+    ))?;
+    if object.get("jsonrpc") != Some(&Value::String("2.0".to_owned())) {
+        return Err(Legacy2024WireError("jsonrpc must be exactly 2.0"));
+    }
+
+    if let Some(method_value) = object.get("method") {
+        let method_name = method_value
+            .as_str()
+            .ok_or(Legacy2024WireError("JSON-RPC method must be a string"))?;
+        let method = legacy_2024_11_05_method(method_name).ok_or(Legacy2024WireError(
+            "method is not part of exact MCP 2024-11-05",
+        ))?;
+        let params = object.get("params").cloned();
+        if params.as_ref().is_some_and(|params| !params.is_object()) {
+            return Err(Legacy2024WireError(
+                "JSON-RPC params must be an object when present",
+            ));
+        }
+        validate_legacy_2024_initialize(method.name, params.as_ref())?;
+
+        return match method.envelope {
+            Legacy2024EnvelopeKind::Request => {
+                let id = object.get("id").cloned().ok_or(Legacy2024WireError(
+                    "MCP 2024-11-05 request envelopes require a non-null string or signed integer id",
+                ))?;
+                if !legacy_2024_request_id(&id) {
+                    return Err(Legacy2024WireError(
+                        "MCP 2024-11-05 request envelopes require a non-null string or signed integer id",
+                    ));
+                }
+                Ok(Legacy2024Envelope::Request { method, id, params })
+            }
+            Legacy2024EnvelopeKind::Notification => {
+                if object.contains_key("id") {
+                    return Err(Legacy2024WireError(
+                        "MCP 2024-11-05 notification envelopes must omit id",
+                    ));
+                }
+                Ok(Legacy2024Envelope::Notification { method, params })
+            }
+        };
+    }
+
+    let id = object.get("id").cloned().ok_or(Legacy2024WireError(
+        "MCP 2024-11-05 response envelopes require a non-null string or signed integer id",
+    ))?;
+    if !legacy_2024_request_id(&id) {
+        return Err(Legacy2024WireError(
+            "MCP 2024-11-05 response envelopes require a non-null string or signed integer id",
+        ));
+    }
+    match (object.get("result"), object.get("error")) {
+        (Some(result), None) if result.is_object() => Ok(Legacy2024Envelope::Response {
+            id,
+            result: result.clone(),
+        }),
+        (Some(_), None) => Err(Legacy2024WireError(
+            "MCP 2024-11-05 response result must be an object",
+        )),
+        (None, Some(error)) if valid_legacy_2024_error(error) => Ok(Legacy2024Envelope::Error {
+            id,
+            error: error.clone(),
+        }),
+        (None, Some(_)) => Err(Legacy2024WireError(
+            "MCP 2024-11-05 error envelopes require integer code and string message",
+        )),
+        _ => Err(Legacy2024WireError(
+            "MCP 2024-11-05 response envelopes require exactly one of result or error",
+        )),
+    }
+}
+
+fn legacy_2024_request_id(value: &Value) -> bool {
+    value.is_string() || value.as_i64().is_some()
+}
+
+fn valid_legacy_2024_error(value: &Value) -> bool {
+    value.as_object().is_some_and(|error| {
+        error.get("code").is_some_and(Value::is_i64)
+            && error.get("message").is_some_and(Value::is_string)
+    })
+}
+
+fn validate_legacy_2024_initialize(
+    method: &str,
+    params: Option<&Value>,
+) -> Result<(), Legacy2024WireError> {
+    if method != INITIALIZE {
+        return Ok(());
+    }
+    let params = params
+        .and_then(Value::as_object)
+        .ok_or(Legacy2024WireError(
+            "MCP 2024-11-05 initialize requires object params",
+        ))?;
+    if params.get("protocolVersion")
+        != Some(&Value::String(
+            LEGACY_2024_11_05_PROTOCOL_VERSION.to_owned(),
+        ))
+    {
+        return Err(Legacy2024WireError(
+            "initialize protocolVersion must be exact MCP 2024-11-05",
+        ));
+    }
+    let client_info =
+        params
+            .get("clientInfo")
+            .and_then(Value::as_object)
+            .ok_or(Legacy2024WireError(
+                "MCP 2024-11-05 initialize requires clientInfo object",
+            ))?;
+    if !client_info.get("name").is_some_and(Value::is_string)
+        || !client_info.get("version").is_some_and(Value::is_string)
+    {
+        return Err(Legacy2024WireError(
+            "MCP 2024-11-05 initialize clientInfo requires string name and version",
+        ));
+    }
+    let capabilities = params
+        .get("capabilities")
+        .cloned()
+        .ok_or(Legacy2024WireError(
+            "MCP 2024-11-05 initialize requires client capabilities",
+        ))?;
+    decode_legacy_2024_11_05_client_capabilities(capabilities)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn initialize_wire() -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"sampling": {}, "roots": {"listChanged": true}},
+                "clientInfo": {"name": "exact-legacy-client", "version": "1.0.0"}
+            }
+        })
+    }
 
     #[test]
     fn method_constants_match_mcp_spec() {
@@ -66,5 +717,174 @@ mod tests {
         assert_eq!(NOTIFICATIONS_CANCELLED, "notifications/cancelled");
         assert_eq!(NOTIFICATIONS_MESSAGE, "notifications/message");
         assert_eq!(PING, "ping");
+    }
+
+    #[test]
+    fn leg_01_schema_parity_positive() {
+        let schema = legacy_2024_11_05_schema().unwrap();
+        assert_eq!(
+            LEGACY_2024_11_05_SCHEMA_SHA256,
+            "61cea2392d4f284092d09bc84b9ac488c0d5618ac2b38a56942fc5b99fd960ce"
+        );
+        assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
+        assert_eq!(
+            schema["definitions"]["InitializeRequest"]["properties"]["method"]["const"],
+            INITIALIZE
+        );
+        assert_eq!(
+            schema["definitions"]["ClientCapabilities"]["properties"].get("elicitation"),
+            None
+        );
+        assert!(LEGACY_2024_11_05_SCHEMA_JSON.as_bytes().starts_with(b"{\n"));
+    }
+
+    #[test]
+    fn leg_01_schema_parity_planted_negative() {
+        let mut wire = initialize_wire();
+        wire["params"]["protocolVersion"] = json!("2025-11-25");
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(wire)
+                .unwrap_err()
+                .reason(),
+            "initialize protocolVersion must be exact MCP 2024-11-05"
+        );
+    }
+
+    #[test]
+    fn leg_01_method_inventory_positive() {
+        let expected = [
+            "initialize",
+            "notifications/initialized",
+            "ping",
+            "tools/list",
+            "tools/call",
+            "resources/list",
+            "resources/templates/list",
+            "resources/read",
+            "resources/subscribe",
+            "resources/unsubscribe",
+            "prompts/list",
+            "prompts/get",
+            "logging/setLevel",
+            "completion/complete",
+            "sampling/createMessage",
+            "roots/list",
+            "notifications/cancelled",
+            "notifications/progress",
+            "notifications/roots/list_changed",
+            "notifications/message",
+            "notifications/prompts/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/resources/updated",
+            "notifications/tools/list_changed",
+        ];
+        let actual: Vec<_> = LEGACY_2024_11_05_METHODS
+            .iter()
+            .map(|method| method.name)
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 24);
+        assert_eq!(
+            legacy_2024_11_05_method(SAMPLING_CREATE_MESSAGE)
+                .unwrap()
+                .capability,
+            Some(Legacy2024Capability::ClientSampling)
+        );
+        assert_eq!(
+            legacy_2024_11_05_method(NOTIFICATIONS_RESOURCES_UPDATED)
+                .unwrap()
+                .capability,
+            Some(Legacy2024Capability::ServerResourcesSubscribe)
+        );
+    }
+
+    #[test]
+    fn leg_01_method_inventory_planted_negative() {
+        let mut wire = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list"});
+        wire["method"] = json!("elicitation/create");
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(wire)
+                .unwrap_err()
+                .reason(),
+            "method is not part of exact MCP 2024-11-05"
+        );
+    }
+
+    #[test]
+    fn leg_01_envelopes_positive() {
+        assert!(matches!(
+            decode_legacy_2024_11_05_envelope(initialize_wire()).unwrap(),
+            Legacy2024Envelope::Request { method, id, .. } if method.name == INITIALIZE && id == json!(1)
+        ));
+        assert!(matches!(
+            decode_legacy_2024_11_05_envelope(json!({"jsonrpc":"2.0", "id":"reply", "result": {}})).unwrap(),
+            Legacy2024Envelope::Response { id, result } if id == json!("reply") && result == json!({})
+        ));
+        assert!(matches!(
+            decode_legacy_2024_11_05_envelope(json!({"jsonrpc":"2.0", "method":"notifications/initialized"})).unwrap(),
+            Legacy2024Envelope::Notification { method, .. } if method.name == NOTIFICATIONS_INITIALIZED
+        ));
+    }
+
+    #[test]
+    fn leg_01_top_level_batch_array_planted_negative() {
+        let single = Value::Array(vec![initialize_wire()]);
+        let mixed = Value::Array(vec![
+            initialize_wire(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        ]);
+        let expected =
+            "MCP 2024-11-05 requires one top-level JSON-RPC object; batch arrays are unsupported";
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(single)
+                .unwrap_err()
+                .reason(),
+            expected
+        );
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(mixed)
+                .unwrap_err()
+                .reason(),
+            expected
+        );
+    }
+
+    #[test]
+    fn leg_01_cross_era_planted_negative() {
+        let mut wire = initialize_wire();
+        wire["params"]["capabilities"]["elicitation"] = json!({"form": {}});
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(wire)
+                .unwrap_err()
+                .reason(),
+            "modern-only capabilities are not part of exact MCP 2024-11-05"
+        );
+    }
+
+    #[test]
+    fn leg_01_a_positive() {
+        let server_capabilities = validate_legacy_2024_11_05_initialize_result(&json!({
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {"name": "exact-legacy-server", "version": "1.0.0"},
+            "capabilities": {
+                "logging": {}, "tools": {"listChanged": true},
+                "resources": {"subscribe": true, "listChanged": true},
+                "prompts": {"listChanged": true}
+            }
+        }))
+        .unwrap();
+        assert!(server_capabilities.resources.unwrap().subscribe);
+    }
+
+    #[test]
+    fn leg_01_a_planted_negative() {
+        let mut wire = initialize_wire();
+        wire["id"] = Value::Null;
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(wire)
+                .unwrap_err()
+                .reason(),
+            "MCP 2024-11-05 request envelopes require a non-null string or signed integer id"
+        );
     }
 }
