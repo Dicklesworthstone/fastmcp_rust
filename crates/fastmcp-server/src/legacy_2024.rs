@@ -439,8 +439,8 @@ where
         let client_capabilities_bytes = serde_json::to_vec(&client_capabilities).map_err(|_| {
             Legacy2024AdapterError::invalid_params("initialize capabilities cannot be represented")
         })?;
-        let client_capabilities =
-            decode_legacy_2024_11_05_client_capabilities(&client_capabilities).map_err(|_| {
+        let client_capabilities = decode_legacy_2024_11_05_client_capabilities(client_capabilities)
+            .map_err(|_| {
                 Legacy2024AdapterError::invalid_params("initialize client capabilities are invalid")
             })?;
         let client_info = params.get("clientInfo").and_then(Value::as_object).ok_or(
