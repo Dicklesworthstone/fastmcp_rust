@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex};
 
 use fastmcp_client::Client;
 use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpResult};
+use fastmcp_protocol::methods::translate_legacy_2024_result;
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleKey, HttpEraCache, HttpEraDecision, HttpModernProbe,
-    ModernVersionSupport, ProtocolEra, ProtocolPolicy, StdioEraClassifier, StdioEraDecision,
-    StdioOpeningFrame,
+    ModernVersionSupport, ProtocolEra, ProtocolPolicy, ProtocolVersion, StdioEraClassifier,
+    StdioEraDecision, StdioOpeningFrame,
 };
 use fastmcp_protocol::{
     Content, Prompt, PromptMessage, Resource, ResourceContent, ResourceTemplate, Tool,
@@ -212,6 +213,41 @@ impl ProxyUpstreamBinding {
     #[must_use]
     pub const fn configuration_generation(self) -> u64 {
         self.configuration_generation
+    }
+
+    /// Admits a version only when it is the exact immutable era of this route.
+    ///
+    /// This is intentionally route-local: an unsupported or sibling-era value
+    /// cannot cause this binding to renegotiate or alter another upstream.
+    pub fn admit_upstream_protocol_version(
+        self,
+        protocol_version: &str,
+    ) -> McpResult<ProtocolVersion> {
+        let version = ProtocolVersion::parse(protocol_version)
+            .map_err(|error| McpError::invalid_request(error.to_string()))?;
+        if version.era() != self.era {
+            return Err(McpError::invalid_request(
+                "Upstream protocol version does not match the route's immutable selected era",
+            ));
+        }
+        Ok(version)
+    }
+
+    /// Translates an upstream result only when this route selected exact 2024.
+    ///
+    /// Exact-2024 results must retain a lossless representation. Modern
+    /// results are already on the downstream era and therefore pass through
+    /// byte-for-byte without a legacy translation attempt.
+    pub fn translate_upstream_result(
+        self,
+        method: &str,
+        result: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        match self.era {
+            ProtocolEra::Modern2026 => Ok(result),
+            ProtocolEra::Legacy2024 => translate_legacy_2024_result(method, result)
+                .map_err(|error| McpError::invalid_params(error.to_string())),
+        }
     }
 }
 
