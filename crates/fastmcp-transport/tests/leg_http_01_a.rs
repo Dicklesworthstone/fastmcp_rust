@@ -56,7 +56,7 @@ fn leg_http_01_a_positive() {
     let captured_server = Arc::clone(&captured);
     let endpoint_server = endpoint.clone();
     let server = thread::spawn(move || {
-        let (mut sse_socket, _) = listener.accept().expect("the SSE GET connects");
+        let (sse_socket, _) = listener.accept().expect("the SSE GET connects");
         let get = read_http_request(sse_socket.try_clone().expect("the SSE socket clones"));
         let mut legacy_server = LegacySseServerTransport::new(
             sse_socket.try_clone().expect("the SSE socket clones"),
@@ -85,7 +85,7 @@ fn leg_http_01_a_positive() {
             .extend([get, post]);
     });
 
-    let sse_socket = TcpStream::connect(&authority).expect("the configured SSE GET connects");
+    let mut sse_socket = TcpStream::connect(&authority).expect("the configured SSE GET connects");
     sse_socket
         .write_all(b"GET /legacy/sse HTTP/1.1\r\nHost: loopback\r\n\r\n")
         .expect("the configured legacy SSE GET writes");
@@ -160,7 +160,7 @@ fn leg_http_01_a_planted_negative() {
         ));
     });
 
-    let sse_socket = TcpStream::connect(&authority).expect("the configured SSE GET connects");
+    let mut sse_socket = TcpStream::connect(&authority).expect("the configured SSE GET connects");
     sse_socket
         .write_all(b"GET /legacy/sse HTTP/1.1\r\nHost: loopback\r\n\r\n")
         .expect("the configured legacy SSE GET writes");
