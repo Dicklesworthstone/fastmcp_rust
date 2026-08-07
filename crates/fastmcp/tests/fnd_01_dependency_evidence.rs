@@ -78573,6 +78573,7 @@ activate = 1\n";
 
     /// Compatibility replay surface. Caller-provided JSON is intentionally
     /// incapable of selecting the trusted batch proof class or earning credit.
+    #[allow(dead_code)] // Invoked by the path-including SDK batch runner example.
     pub fn sdk_batch_verify_json(
         root: &Path,
         raw_bytes: Vec<u8>,
@@ -78589,6 +78590,7 @@ activate = 1\n";
         Err(sdk_no_credit_json(&diagnostic.code, &diagnostic.stable()))
     }
 
+    #[allow(dead_code)] // Invoked by the path-including SDK batch runner example.
     fn run_sdk_batch_verify_json_from_stdin() -> i32 {
         let read_limit = match u64::try_from(MAX_SDK_EXECUTION_FACT_BYTES)
             .ok()
@@ -94914,6 +94916,7 @@ fn fallible(value: Option<u8>) {
         )
     }
 
+    #[allow(dead_code)] // Invoked by the path-including ordinary handoff example.
     fn emit_ordinary_entry_failure_route(mode: &str, run_id: &str, failure: OrdinaryEntryFailure) {
         let mut stderr = io::stderr().lock();
         if write_ordinary_emitted_failure_frame(&mut stderr, mode, run_id, failure).is_ok() {
@@ -94995,6 +94998,7 @@ fn fallible(value: Option<u8>) {
     }
 
     impl OrdinaryEntryFailure {
+        #[allow(dead_code)] // Invoked by the path-including ordinary handoff example.
         fn from_handoff_argument_failure(
             error: super::trust_std::OrdinaryHandoffArgumentFailure,
         ) -> Self {
@@ -95035,6 +95039,7 @@ fn fallible(value: Option<u8>) {
             }
         }
 
+        #[allow(dead_code)] // Invoked by the path-including ordinary handoff example.
         fn from_handoff_environment_failure(
             error: super::trust_std::OrdinaryHandoffEnvironmentFailure,
         ) -> Self {
@@ -95073,6 +95078,7 @@ fn fallible(value: Option<u8>) {
         }
     }
 
+    #[allow(dead_code)] // Invoked by the path-including ordinary handoff example.
     fn run_ordinary_handoff_entry(arguments: Vec<std::ffi::OsString>) -> i32 {
         let mode = match arguments.get(1).and_then(|value| value.to_str()) {
             Some("produce") => "produce",
@@ -97928,6 +97934,7 @@ fn fallible(value: Option<u8>) {
         }
     }
 
+    #[allow(dead_code)] // Invoked by the path-including ordinary handoff example.
     pub fn harness_main<I>(arguments: I) -> i32
     where
         I: IntoIterator<Item = std::ffi::OsString>,
