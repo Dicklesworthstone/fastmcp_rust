@@ -23,23 +23,70 @@ use fastmcp_protocol::methods::{
 };
 use serde_json::{json, Value};
 
+/// Opaque, authenticated transport-owner partition for legacy peer state.
+///
+/// The transport creates this value only after it has authenticated its peer.
+/// This adapter deliberately does not inspect or authorize those bytes: it
+/// binds every lifecycle object and installation receipt to the supplied
+/// partition so a generation is never sufficient to select another peer's
+/// state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LegacyAuthenticatedPeerPartition {
+    bytes: [u8; 32],
+}
+
+impl LegacyAuthenticatedPeerPartition {
+    /// Fixed size of the opaque transport-authenticated partition identifier.
+    pub const BYTE_LEN: usize = 32;
+
+    /// Wraps the transport-authenticated owner partition without interpreting
+    /// the authentication mechanism or its credentials.
+    #[must_use]
+    pub const fn from_authenticated_transport(bytes: [u8; Self::BYTE_LEN]) -> Self {
+        Self { bytes }
+    }
+
+    fn bytes(self) -> [u8; Self::BYTE_LEN] {
+        self.bytes
+    }
+}
+
 /// Opaque transport-supplied identity for one exact-2024 peer lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LegacyPeerBinding {
+    owner_partition: LegacyAuthenticatedPeerPartition,
     generation: u64,
 }
 
 impl LegacyPeerBinding {
-    /// Creates a binding from the transport's monotonically unique generation.
+    /// Binds a transport-authenticated owner partition to a monotonically
+    /// unique transport generation.
+    ///
+    /// A generation alone cannot create a binding or select adapter state.
     #[must_use]
-    pub const fn new(generation: u64) -> Self {
-        Self { generation }
+    pub const fn from_authenticated_transport(
+        owner_partition: LegacyAuthenticatedPeerPartition,
+        generation: u64,
+    ) -> Self {
+        Self {
+            owner_partition,
+            generation,
+        }
     }
 
     /// Returns the opaque generation for receipt correlation.
     #[must_use]
     pub const fn generation(self) -> u64 {
         self.generation
+    }
+
+    fn canonical_bytes(self) -> [u8; LegacyAuthenticatedPeerPartition::BYTE_LEN + 8] {
+        let mut bytes = [0; LegacyAuthenticatedPeerPartition::BYTE_LEN + 8];
+        bytes[..LegacyAuthenticatedPeerPartition::BYTE_LEN]
+            .copy_from_slice(&self.owner_partition.bytes());
+        bytes[LegacyAuthenticatedPeerPartition::BYTE_LEN..]
+            .copy_from_slice(&self.generation.to_be_bytes());
+        bytes
     }
 }
 
@@ -99,15 +146,22 @@ impl LegacyServerAdapterInstalledReceipt {
     /// a receipt from these bytes or their constituent facts.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut bytes = b"fastmcp-legacy-server-install-v1\0".to_vec();
+        let mut bytes = b"fastmcp-legacy-server-install-v2\0".to_vec();
         for field in [
             self.protocol_version.as_bytes(),
-            &self.binding.generation().to_be_bytes(),
+            self.binding.canonical_bytes().as_slice(),
         ] {
             bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
             bytes.extend_from_slice(field);
         }
         bytes
+    }
+
+    /// Returns whether this sealed receipt was emitted by the supplied
+    /// authenticated transport binding.
+    #[must_use]
+    pub const fn matches_binding(&self, binding: LegacyPeerBinding) -> bool {
+        self.binding == binding
     }
 }
 
@@ -216,14 +270,45 @@ pub struct Legacy2024StateSnapshot {
     pub operating_transition_count: u64,
     /// Frozen exact client capability bytes, if initialization committed.
     pub client_capabilities_bytes: Vec<u8>,
-    /// Count of retained resource subscriptions.
-    pub subscription_count: usize,
+    /// Exact retained resource subscriptions in stable order.
+    pub subscriptions: Vec<String>,
+    /// Current client logging level, if one was admitted.
+    pub logging_level: Option<String>,
     /// Count of admitted cancellation/progress control notifications.
     pub control_notification_count: u64,
     /// Count of accepted client root-list-change notifications.
     pub roots_list_changed_count: u64,
     /// Count of completed terminal close releases.
     pub close_release_count: u64,
+    /// Next reverse request ID, before any later allocation.
+    pub next_reverse_request_id: i64,
+}
+
+impl Legacy2024StateSnapshot {
+    /// Returns the canonical byte representation used as a LEG-02 row's
+    /// adapter-state digest. This contains every mutable adapter-owned field
+    /// represented by this snapshot, in a stable order.
+    #[must_use]
+    pub fn canonical_digest(&self) -> Vec<u8> {
+        let mut bytes = b"fastmcp-legacy-2024-state-v1\0".to_vec();
+        append_length_prefixed(&mut bytes, lifecycle_bytes(self.lifecycle));
+        append_length_prefixed(&mut bytes, &self.operating_transition_count.to_be_bytes());
+        append_length_prefixed(&mut bytes, &self.client_capabilities_bytes);
+        append_length_prefixed(&mut bytes, &(self.subscriptions.len() as u32).to_be_bytes());
+        for subscription in &self.subscriptions {
+            append_length_prefixed(&mut bytes, subscription.as_bytes());
+        }
+        append_length_prefixed(&mut bytes, &[u8::from(self.logging_level.is_some())]);
+        append_length_prefixed(
+            &mut bytes,
+            self.logging_level.as_deref().unwrap_or_default().as_bytes(),
+        );
+        append_length_prefixed(&mut bytes, &self.control_notification_count.to_be_bytes());
+        append_length_prefixed(&mut bytes, &self.roots_list_changed_count.to_be_bytes());
+        append_length_prefixed(&mut bytes, &self.close_release_count.to_be_bytes());
+        append_length_prefixed(&mut bytes, &self.next_reverse_request_id.to_be_bytes());
+        bytes
+    }
 }
 
 /// Exact MCP 2024-11-05 server adapter for one transport-selected binding.
@@ -304,10 +389,12 @@ where
             lifecycle: self.lifecycle,
             operating_transition_count: self.operating_transition_count,
             client_capabilities_bytes: self.client_capabilities_bytes.clone(),
-            subscription_count: self.subscriptions.len(),
+            subscriptions: self.subscriptions.iter().cloned().collect(),
+            logging_level: self.logging_level.clone(),
             control_notification_count: self.control_notification_count,
             roots_list_changed_count: self.roots_list_changed_count,
             close_release_count: self.close_release_count,
+            next_reverse_request_id: self.next_reverse_request_id,
         }
     }
 
@@ -824,6 +911,11 @@ fn response_id_from_wire(wire: &Value) -> Option<Value> {
     }
 }
 
+fn append_length_prefixed(bytes: &mut Vec<u8>, field: &[u8]) {
+    bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(field);
+}
+
 /// Encodes the canonical LEG-02 A receipt digest preimage without hashing it.
 #[must_use]
 pub fn legacy_2024_a_digest_preimage(
@@ -849,8 +941,7 @@ pub fn legacy_2024_a_digest_preimage(
         lifecycle_bytes(output_lifecycle).to_vec(),
         state_digest.to_vec(),
     ] {
-        bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(&field);
+        append_length_prefixed(&mut bytes, &field);
     }
     bytes
 }
@@ -897,9 +988,16 @@ mod tests {
         }
     }
 
+    const TEST_TRANSPORT_PARTITION: LegacyAuthenticatedPeerPartition =
+        LegacyAuthenticatedPeerPartition::from_authenticated_transport([7; 32]);
+
+    fn binding() -> LegacyPeerBinding {
+        LegacyPeerBinding::from_authenticated_transport(TEST_TRANSPORT_PARTITION, 7)
+    }
+
     fn adapter() -> Legacy2024ServerAdapter<RecordingHandler> {
         Legacy2024ServerAdapter::install(
-            LegacyPeerBinding::new(7),
+            binding(),
             Legacy2024ServerConfig {
                 capabilities: Legacy2024ServerCapabilities {
                     logging: Some(BTreeMap::default()),
@@ -934,8 +1032,8 @@ mod tests {
     }
 
     #[test]
-    fn leg_02_a_positive() {
-        let binding = LegacyPeerBinding::new(7);
+    fn lifecycle_rows_cover_exact_2024_adapter() {
+        let binding = binding();
         let mut adapter = adapter();
         let mut lifecycle_rows = Vec::new();
 
@@ -1064,7 +1162,7 @@ mod tests {
         assert_eq!(adapter.lifecycle(), Legacy2024Lifecycle::Operating);
         assert_eq!(adapter.snapshot().operating_transition_count, 1);
         assert_eq!(adapter.snapshot().control_notification_count, 2);
-        assert_eq!(adapter.snapshot().subscription_count, 1);
+        assert_eq!(adapter.snapshot().subscriptions, ["file:///workspace"]);
         assert_eq!(
             adapter.handler.methods,
             vec![
@@ -1077,8 +1175,8 @@ mod tests {
     }
 
     #[test]
-    fn leg_02_a_planted_negative() {
-        let binding = LegacyPeerBinding::new(7);
+    fn first_wire_rejections_preserve_adapter_state() {
+        let binding = binding();
         let mut adapter = adapter();
         let before = adapter.snapshot();
 

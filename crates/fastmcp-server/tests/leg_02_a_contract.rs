@@ -1,19 +1,25 @@
-//! Literal frozen LEG-02 A runner entries.
+//! Literal frozen LEG-02 A runner entries through the non-test public surface.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use fastmcp_protocol::methods::{
-    Legacy2024ListChangedCapability, Legacy2024ResourcesCapability, Legacy2024ServerCapabilities,
-    COMPLETION_COMPLETE, NOTIFICATIONS_CANCELLED, NOTIFICATIONS_MESSAGE, NOTIFICATIONS_PROGRESS,
-    NOTIFICATIONS_ROOTS_LIST_CHANGED, ROOTS_LIST, SAMPLING_CREATE_MESSAGE,
+    Legacy2024Direction, Legacy2024ListChangedCapability, Legacy2024ResourcesCapability,
+    Legacy2024ServerCapabilities, COMPLETION_COMPLETE, NOTIFICATIONS_CANCELLED,
+    NOTIFICATIONS_INITIALIZED, NOTIFICATIONS_PROGRESS, RESOURCES_SUBSCRIBE,
+    RESOURCES_TEMPLATES_LIST, ROOTS_LIST, SAMPLING_CREATE_MESSAGE, TOOLS_LIST,
 };
 use fastmcp_server::legacy_2024::{
-    Legacy2024Handler, Legacy2024HandlerError, Legacy2024Lifecycle, Legacy2024Outbound,
-    Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo, LegacyPeerBinding,
+    legacy_2024_a_digest_preimage, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Lifecycle,
+    Legacy2024Outbound, Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo,
+    LegacyAuthenticatedPeerPartition, LegacyPeerBinding,
 };
 use serde_json::{json, Value};
+
+const OWNER_PARTITION: LegacyAuthenticatedPeerPartition =
+    LegacyAuthenticatedPeerPartition::from_authenticated_transport([0xA5; 32]);
+const BINDING_GENERATION: u64 = 20_241_105;
 
 #[derive(Clone)]
 struct RecordingHandler {
@@ -31,9 +37,13 @@ impl Legacy2024Handler for RecordingHandler {
     }
 }
 
+fn binding() -> LegacyPeerBinding {
+    LegacyPeerBinding::from_authenticated_transport(OWNER_PARTITION, BINDING_GENERATION)
+}
+
 fn adapter(methods: Rc<RefCell<Vec<&'static str>>>) -> Legacy2024ServerAdapter<RecordingHandler> {
     Legacy2024ServerAdapter::install(
-        LegacyPeerBinding::new(20241105),
+        binding(),
         Legacy2024ServerConfig {
             capabilities: Legacy2024ServerCapabilities {
                 logging: Some(BTreeMap::default()),
@@ -67,54 +77,175 @@ fn initialize() -> Value {
     })
 }
 
-fn operating_adapter(
-    methods: Rc<RefCell<Vec<&'static str>>>,
-) -> Legacy2024ServerAdapter<RecordingHandler> {
-    let binding = LegacyPeerBinding::new(20241105);
-    let mut adapter = adapter(methods);
-    assert!(matches!(
-        adapter
-            .receive(binding, initialize())
-            .expect("initialize response"),
-        Legacy2024Outbound::Response(_)
-    ));
-    assert_eq!(
-        adapter
-            .receive(
-                binding,
-                json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-            )
-            .expect("initialized notification"),
-        Legacy2024Outbound::NoResponse
+fn expected_install_receipt() -> Vec<u8> {
+    let mut receipt = b"fastmcp-legacy-server-install-v2\0".to_vec();
+    let binding_bytes = [[0xA5; 32].as_slice(), &BINDING_GENERATION.to_be_bytes()].concat();
+    for field in [b"2024-11-05".as_slice(), binding_bytes.as_slice()] {
+        receipt.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        receipt.extend_from_slice(field);
+    }
+    receipt
+}
+
+fn expected_row_preimage(
+    ordinal: u32,
+    group: &[u8],
+    input: Legacy2024Lifecycle,
+    wire: &[u8],
+    capabilities: &[u8],
+    method: &[u8],
+    direction: Legacy2024Direction,
+    output: Legacy2024Lifecycle,
+    state_digest: &[u8],
+) -> Vec<u8> {
+    let lifecycle = |value| match value {
+        Legacy2024Lifecycle::AwaitInitialize => b"AwaitInitialize".as_slice(),
+        Legacy2024Lifecycle::AwaitInitialized => b"AwaitInitialized".as_slice(),
+        Legacy2024Lifecycle::Operating => b"Operating".as_slice(),
+        Legacy2024Lifecycle::Closed => b"Closed".as_slice(),
+    };
+    let direction = match direction {
+        Legacy2024Direction::ClientToServer => b"ClientToServer".as_slice(),
+        Legacy2024Direction::ServerToClient => b"ServerToClient".as_slice(),
+        Legacy2024Direction::Bidirectional => b"Bidirectional".as_slice(),
+    };
+    let mut preimage = b"fastmcp-leg-02-a-v1\0".to_vec();
+    let ordinal = ordinal.to_be_bytes();
+    for field in [
+        ordinal.as_slice(),
+        group,
+        lifecycle(input),
+        wire,
+        capabilities,
+        method,
+        direction,
+        lifecycle(output),
+        state_digest,
+    ] {
+        preimage.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        preimage.extend_from_slice(field);
+    }
+    preimage
+}
+
+fn assert_row(
+    adapter: &Legacy2024ServerAdapter<RecordingHandler>,
+    ordinal: u32,
+    group: &[u8],
+    input: Legacy2024Lifecycle,
+    wire: &[u8],
+    capabilities: &[u8],
+    method: &[u8],
+    direction: Legacy2024Direction,
+    output: Legacy2024Lifecycle,
+) {
+    let receipt = adapter.installed_receipt();
+    assert_eq!(receipt.protocol_version(), "2024-11-05");
+    assert!(receipt.matches_binding(binding()));
+    assert_eq!(receipt.canonical_bytes(), expected_install_receipt());
+    assert_eq!(adapter.lifecycle(), output);
+    let state_digest = adapter.snapshot().canonical_digest();
+    let expected = expected_row_preimage(
+        ordinal,
+        group,
+        input,
+        wire,
+        capabilities,
+        method,
+        direction,
+        output,
+        &state_digest,
     );
-    adapter
+    assert_eq!(
+        legacy_2024_a_digest_preimage(
+            ordinal,
+            group,
+            input,
+            wire,
+            capabilities,
+            method,
+            direction,
+            output,
+            &state_digest,
+        ),
+        expected
+    );
 }
 
 #[test]
 fn leg_02_a_positive() {
-    let binding = LegacyPeerBinding::new(20241105);
     let methods = Rc::new(RefCell::new(Vec::new()));
-    let mut adapter = operating_adapter(methods.clone());
-    assert_eq!(adapter.installed_receipt().protocol_version(), "2024-11-05");
-    assert!(adapter
-        .installed_receipt()
-        .canonical_bytes()
-        .starts_with(b"fastmcp-legacy-server-install-v1\0"));
+    let mut adapter = adapter(methods.clone());
+    let capabilities = serde_json::to_vec(&initialize()["params"]["capabilities"])
+        .expect("exact capability object must serialize");
+
+    let initialize_wire = initialize();
+    let wire = serde_json::to_vec(&initialize_wire).expect("initialize wire must serialize");
+    assert_eq!(adapter.lifecycle(), Legacy2024Lifecycle::AwaitInitialize);
+    assert_eq!(
+        adapter.receive(binding(), initialize_wire),
+        Ok(Legacy2024Outbound::Response(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "logging": {}, "prompts": {},
+                    "resources": {"subscribe": true}, "tools": {},
+                },
+                "serverInfo": {"name": "public-legacy-server", "version": "1.0.0"},
+                "instructions": "exact 2024 server surface",
+            },
+        })))
+    );
+    assert_row(
+        &adapter,
+        1,
+        b"initialize/initialized lifecycle",
+        Legacy2024Lifecycle::AwaitInitialize,
+        &wire,
+        &capabilities,
+        b"initialize",
+        Legacy2024Direction::ClientToServer,
+        Legacy2024Lifecycle::AwaitInitialized,
+    );
+
+    let initialized_wire = json!({"jsonrpc": "2.0", "method": NOTIFICATIONS_INITIALIZED});
+    let wire = serde_json::to_vec(&initialized_wire).expect("initialized wire must serialize");
+    assert_eq!(
+        adapter.receive(binding(), initialized_wire),
+        Ok(Legacy2024Outbound::NoResponse)
+    );
+    assert_row(
+        &adapter,
+        2,
+        b"initialize/initialized lifecycle",
+        Legacy2024Lifecycle::AwaitInitialized,
+        &wire,
+        &capabilities,
+        NOTIFICATIONS_INITIALIZED.as_bytes(),
+        Legacy2024Direction::ClientToServer,
+        Legacy2024Lifecycle::Operating,
+    );
+
     let rows = [
-        adapter.receive(
-            binding,
-            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        (
+            b"tools".as_slice(),
+            TOOLS_LIST,
+            json!({"jsonrpc": "2.0", "id": 2, "method": TOOLS_LIST}),
         ),
-        adapter.receive(
-            binding,
-            json!({"jsonrpc": "2.0", "id": 3, "method": "resources/list"}),
+        (
+            b"resources/resource templates".as_slice(),
+            RESOURCES_TEMPLATES_LIST,
+            json!({"jsonrpc": "2.0", "id": 3, "method": RESOURCES_TEMPLATES_LIST}),
         ),
-        adapter.receive(
-            binding,
+        (
+            b"prompts".as_slice(),
+            "prompts/list",
             json!({"jsonrpc": "2.0", "id": 4, "method": "prompts/list"}),
         ),
-        adapter.receive(
-            binding,
+        (
+            b"completion".as_slice(),
+            COMPLETION_COMPLETE,
             json!({
                 "jsonrpc": "2.0", "id": 5, "method": COMPLETION_COMPLETE,
                 "params": {
@@ -123,147 +254,202 @@ fn leg_02_a_positive() {
                 },
             }),
         ),
-        adapter.receive(
-            binding,
+        (
+            b"resource subscribe/unsubscribe".as_slice(),
+            RESOURCES_SUBSCRIBE,
             json!({
-                "jsonrpc": "2.0", "id": 6, "method": "resources/subscribe",
+                "jsonrpc": "2.0", "id": 6, "method": RESOURCES_SUBSCRIBE,
                 "params": {"uri": "file:///workspace"},
             }),
         ),
     ];
-    assert!(rows
-        .into_iter()
-        .all(|row| matches!(row, Ok(Legacy2024Outbound::Response(_)))));
-    assert!(matches!(
-        adapter
-            .make_reverse_request(binding, ROOTS_LIST, json!({}))
-            .expect("roots request"),
-        Legacy2024Outbound::ReverseRequest(request) if request["method"] == ROOTS_LIST
-    ));
-    assert!(matches!(
-        adapter
-            .make_reverse_request(
-                binding,
-                SAMPLING_CREATE_MESSAGE,
-                json!({"messages": [], "maxTokens": 16}),
-            )
-            .expect("sampling request"),
-        Legacy2024Outbound::ReverseRequest(request) if request["method"] == SAMPLING_CREATE_MESSAGE
-    ));
-    assert!(matches!(
-        adapter
-            .receive(
-                binding,
-                json!({
-                    "jsonrpc": "2.0", "id": 7, "method": "logging/setLevel",
-                    "params": {"level": "info"},
-                })
-            )
-            .expect("logging response"),
-        Legacy2024Outbound::Response(_)
-    ));
+    for (offset, (group, method, request)) in rows.into_iter().enumerate() {
+        let wire = serde_json::to_vec(&request).expect("exact request wire must serialize");
+        let expected = if method == RESOURCES_SUBSCRIBE {
+            json!({"jsonrpc": "2.0", "id": 6, "result": {}})
+        } else {
+            json!({"jsonrpc": "2.0", "id": (offset as i64) + 2, "result": {"handled": method}})
+        };
+        assert_eq!(
+            adapter.receive(binding(), request),
+            Ok(Legacy2024Outbound::Response(expected))
+        );
+        assert_row(
+            &adapter,
+            (offset as u32) + 3,
+            group,
+            Legacy2024Lifecycle::Operating,
+            &wire,
+            &capabilities,
+            method.as_bytes(),
+            Legacy2024Direction::ClientToServer,
+            Legacy2024Lifecycle::Operating,
+        );
+    }
+
+    let roots = adapter
+        .make_reverse_request(binding(), ROOTS_LIST, json!({}))
+        .expect("negotiated roots must be permitted");
+    assert!(matches!(&roots, Legacy2024Outbound::ReverseRequest(_)));
+    let Legacy2024Outbound::ReverseRequest(roots_wire) = &roots else {
+        return;
+    };
+    let wire = serde_json::to_vec(roots_wire).expect("roots wire must serialize");
     assert_eq!(
-        adapter
-            .receive(
-                binding,
-                json!({
-                    "jsonrpc": "2.0", "method": NOTIFICATIONS_CANCELLED,
-                    "params": {"requestId": 6},
-                })
-            )
-            .expect("cancellation notification"),
-        Legacy2024Outbound::NoResponse
+        roots,
+        Legacy2024Outbound::ReverseRequest(
+            json!({"jsonrpc": "2.0", "id": 1, "method": ROOTS_LIST, "params": {}})
+        )
     );
+    assert_row(
+        &adapter,
+        8,
+        b"roots",
+        Legacy2024Lifecycle::Operating,
+        &wire,
+        &capabilities,
+        ROOTS_LIST.as_bytes(),
+        Legacy2024Direction::ServerToClient,
+        Legacy2024Lifecycle::Operating,
+    );
+
+    let sampling = adapter
+        .make_reverse_request(
+            binding(),
+            SAMPLING_CREATE_MESSAGE,
+            json!({"messages": [], "maxTokens": 16}),
+        )
+        .expect("negotiated sampling must be permitted");
+    assert!(matches!(&sampling, Legacy2024Outbound::ReverseRequest(_)));
+    let Legacy2024Outbound::ReverseRequest(sampling_wire) = &sampling else {
+        return;
+    };
+    let wire = serde_json::to_vec(sampling_wire).expect("sampling wire must serialize");
     assert_eq!(
-        adapter
-            .receive(
-                binding,
-                json!({
-                    "jsonrpc": "2.0", "method": NOTIFICATIONS_PROGRESS,
-                    "params": {"progressToken": 1, "progress": 1},
-                })
-            )
-            .expect("progress notification"),
-        Legacy2024Outbound::NoResponse
+        sampling,
+        Legacy2024Outbound::ReverseRequest(json!({
+            "jsonrpc": "2.0", "id": 2, "method": SAMPLING_CREATE_MESSAGE,
+            "params": {"messages": [], "maxTokens": 16},
+        }))
     );
+    assert_row(
+        &adapter,
+        9,
+        b"sampling/createMessage",
+        Legacy2024Lifecycle::Operating,
+        &wire,
+        &capabilities,
+        SAMPLING_CREATE_MESSAGE.as_bytes(),
+        Legacy2024Direction::ServerToClient,
+        Legacy2024Lifecycle::Operating,
+    );
+
+    let logging = json!({
+        "jsonrpc": "2.0", "id": 7, "method": "logging/setLevel",
+        "params": {"level": "info"},
+    });
+    let wire = serde_json::to_vec(&logging).expect("logging wire must serialize");
+    assert_eq!(
+        adapter.receive(binding(), logging),
+        Ok(Legacy2024Outbound::Response(
+            json!({"jsonrpc": "2.0", "id": 7, "result": {}})
+        ))
+    );
+    assert_row(
+        &adapter,
+        10,
+        b"logging/setLevel",
+        Legacy2024Lifecycle::Operating,
+        &wire,
+        &capabilities,
+        b"logging/setLevel",
+        Legacy2024Direction::ClientToServer,
+        Legacy2024Lifecycle::Operating,
+    );
+
+    for (ordinal, method, request) in [
+        (
+            11,
+            NOTIFICATIONS_CANCELLED,
+            json!({
+                "jsonrpc": "2.0", "method": NOTIFICATIONS_CANCELLED,
+                "params": {"requestId": 6},
+            }),
+        ),
+        (
+            12,
+            NOTIFICATIONS_PROGRESS,
+            json!({
+                "jsonrpc": "2.0", "method": NOTIFICATIONS_PROGRESS,
+                "params": {"progressToken": 1, "progress": 1},
+            }),
+        ),
+    ] {
+        let wire = serde_json::to_vec(&request).expect("notification wire must serialize");
+        assert_eq!(
+            adapter.receive(binding(), request),
+            Ok(Legacy2024Outbound::NoResponse)
+        );
+        assert_row(
+            &adapter,
+            ordinal,
+            b"cancellation/progress",
+            Legacy2024Lifecycle::Operating,
+            &wire,
+            &capabilities,
+            method.as_bytes(),
+            Legacy2024Direction::ClientToServer,
+            Legacy2024Lifecycle::Operating,
+        );
+    }
+
     let state = adapter.snapshot();
-    assert_eq!(adapter.lifecycle(), Legacy2024Lifecycle::Operating);
     assert_eq!(state.operating_transition_count, 1);
-    assert_eq!(state.subscription_count, 1);
+    assert_eq!(state.subscriptions, ["file:///workspace"]);
+    assert_eq!(state.logging_level.as_deref(), Some("info"));
     assert_eq!(state.control_notification_count, 2);
     assert_eq!(
         methods.borrow().as_slice(),
         [
-            "tools/list",
-            "resources/list",
+            TOOLS_LIST,
+            RESOURCES_TEMPLATES_LIST,
             "prompts/list",
-            COMPLETION_COMPLETE
+            COMPLETION_COMPLETE,
         ]
     );
 }
 
 #[test]
 fn leg_02_a_planted_negative() {
-    let binding = LegacyPeerBinding::new(20241105);
     let methods = Rc::new(RefCell::new(Vec::new()));
     let mut adapter = adapter(methods.clone());
     let before = adapter.snapshot();
+    let before_digest = before.canonical_digest();
+    let receipt = adapter.installed_receipt().canonical_bytes();
     let mut wrong_era = initialize();
     wrong_era["params"]["protocolVersion"] = json!("2025-11-25");
     let mut modern_shape = initialize();
     modern_shape["params"]["capabilities"]["elicitation"] = json!({"form": {}});
+
     for planted in [wrong_era, modern_shape] {
         let response = adapter
-            .receive(binding, planted)
-            .expect("valid request id receives error");
-        assert!(matches!(
+            .receive(binding(), planted)
+            .expect("invalid request IDs still receive JSON-RPC errors");
+        assert_eq!(
             response,
-            Legacy2024Outbound::Response(response) if response["error"]["code"] == -32600
-        ));
+            Legacy2024Outbound::Response(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "error": {
+                    "code": -32600,
+                    "message": "invalid exact MCP 2024-11-05 envelope",
+                },
+            }))
+        );
         assert_eq!(adapter.snapshot(), before);
+        assert_eq!(adapter.snapshot().canonical_digest(), before_digest);
+        assert_eq!(adapter.installed_receipt().canonical_bytes(), receipt);
     }
+    assert_eq!(adapter.lifecycle(), Legacy2024Lifecycle::AwaitInitialize);
+    assert_eq!(adapter.snapshot().close_release_count, 0);
     assert!(methods.borrow().is_empty());
-}
-
-#[test]
-fn legacy_2024_notification_surface_positive() {
-    let binding = LegacyPeerBinding::new(20241105);
-    let methods = Rc::new(RefCell::new(Vec::new()));
-    let mut adapter = operating_adapter(methods);
-    assert!(matches!(
-        adapter
-            .make_notification(
-                binding,
-                NOTIFICATIONS_MESSAGE,
-                Some(json!({"level": "info", "data": "exact"})),
-            )
-            .expect("advertised logging capability permits exact notification"),
-        Legacy2024Outbound::ReverseNotification(notification)
-            if notification["method"] == NOTIFICATIONS_MESSAGE
-    ));
-    assert_eq!(
-        adapter
-            .receive(
-                binding,
-                json!({
-                    "jsonrpc": "2.0", "method": NOTIFICATIONS_ROOTS_LIST_CHANGED,
-                    "params": {},
-                }),
-            )
-            .expect("negotiated roots list-change notification"),
-        Legacy2024Outbound::NoResponse
-    );
-    assert_eq!(adapter.snapshot().roots_list_changed_count, 1);
-}
-
-#[test]
-fn legacy_2024_notification_surface_planted_negative() {
-    let binding = LegacyPeerBinding::new(20241105);
-    let methods = Rc::new(RefCell::new(Vec::new()));
-    let adapter = operating_adapter(methods);
-    let before = adapter.snapshot();
-    assert!(adapter
-        .make_notification(binding, NOTIFICATIONS_ROOTS_LIST_CHANGED, Some(json!({})))
-        .is_err());
-    assert_eq!(adapter.snapshot(), before);
 }
