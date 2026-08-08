@@ -658,7 +658,7 @@ impl<'de> Deserialize<'de> for Implementation {
 }
 
 /// Open `_meta` values with typed access to final reserved keys.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct OpenMetadata(BTreeMap<String, Value>);
 

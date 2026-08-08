@@ -12,8 +12,9 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeMap};
 use serde_json::Value;
 
+use crate::common_types::OpenMetadata;
 use crate::{
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, OpenMetadata, ServerInfo,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, ServerInfo,
     protocol_version::FINAL_PROTOCOL_VERSION,
 };
 

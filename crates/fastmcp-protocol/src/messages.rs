@@ -2336,7 +2336,8 @@ fn decode_final_complete<T: DeserializeOwned>(
 fn subscription_id_from_result(
     result: &CompleteResult<FinalSubscriptionsListenResult>,
 ) -> Result<RequestId, CoreDispatchError> {
-    let Some(value) = result.meta.metadata().get(FINAL_SUBSCRIPTION_ID_META_KEY) else {
+    let metadata = result.meta.metadata();
+    let Some(value) = metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY) else {
         return Err(CoreDispatchError::InvalidResult {
             era: ProtocolEra::Modern2026,
             method: SUBSCRIPTIONS_LISTEN,
