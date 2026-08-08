@@ -1854,9 +1854,88 @@ pub struct LegacySseHttpClient {
     stream: LegacySseResponseStream,
 }
 
+/// Admits an advertised legacy message endpoint against the configured one.
+///
+/// The exact 2024-11-05 HTTP+SSE lane advertises its message endpoint with a
+/// server-generated session query (for example `?session_id=…`) that no
+/// client can preconfigure. Admission therefore accepts byte equality, or an
+/// advertised target that extends a query-free configured target with only a
+/// query component. Scheme, authority, and path can never change, so the
+/// admitted resource, era, authorization, and cache partition stay pinned to
+/// the immutable configured bundle; a configured target that already carries
+/// a query still requires byte equality.
+fn advertised_legacy_target_is_admissible(configured: &str, advertised: &str) -> bool {
+    if advertised == configured {
+        return true;
+    }
+    match advertised.split_once('?') {
+        Some((base, _session_query)) => base == configured && !configured.contains('?'),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod legacy_target_admission_tests {
+    use super::advertised_legacy_target_is_admissible;
+
+    #[test]
+    fn byte_equal_targets_are_admitted() {
+        assert!(advertised_legacy_target_is_admissible(
+            "http://127.0.0.1:9/messages",
+            "http://127.0.0.1:9/messages",
+        ));
+        assert!(advertised_legacy_target_is_admissible(
+            "http://127.0.0.1:9/messages?session=one",
+            "http://127.0.0.1:9/messages?session=one",
+        ));
+    }
+
+    #[test]
+    fn a_session_query_may_extend_a_query_free_configured_target() {
+        assert!(advertised_legacy_target_is_admissible(
+            "http://127.0.0.1:9/messages",
+            "http://127.0.0.1:9/messages?session_id=abc123",
+        ));
+    }
+
+    #[test]
+    fn resource_divergence_remains_a_mismatch() {
+        // Changed path.
+        assert!(!advertised_legacy_target_is_admissible(
+            "http://127.0.0.1:9/messages",
+            "http://127.0.0.1:9/other?session_id=abc",
+        ));
+        // Changed authority.
+        assert!(!advertised_legacy_target_is_admissible(
+            "http://127.0.0.1:9/messages",
+            "http://evil.example/messages?session_id=abc",
+        ));
+        // Changed scheme.
+        assert!(!advertised_legacy_target_is_admissible(
+            "https://127.0.0.1:9/messages",
+            "http://127.0.0.1:9/messages?session_id=abc",
+        ));
+        // A configured query is immutable: a different query is a mismatch.
+        assert!(!advertised_legacy_target_is_admissible(
+            "http://127.0.0.1:9/messages?session=one",
+            "http://127.0.0.1:9/messages?session=two",
+        ));
+        // Dropping a configured query is a mismatch.
+        assert!(!advertised_legacy_target_is_admissible(
+            "http://127.0.0.1:9/messages?session=one",
+            "http://127.0.0.1:9/messages",
+        ));
+    }
+}
+
 impl LegacySseHttpClient {
     /// Opens the configured SSE GET endpoint and admits its first `endpoint`
-    /// event only when it exactly matches the immutable configured POST route.
+    /// event only when it names the immutable configured POST resource: the
+    /// advertised target must equal the configured one exactly, or differ
+    /// from a query-free configured target solely by an appended query
+    /// component (the exact 2024-11-05 lane advertises a session-scoped
+    /// message endpoint). Any scheme, authority, or path divergence remains
+    /// a hard mismatch.
     pub async fn connect(
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
@@ -1903,7 +1982,10 @@ impl LegacySseHttpClient {
             }
             None => return Err(LegacySseHttpClientError::SseEndedBeforeEndpoint),
         };
-        if advertised_message_post_target != configured_message_post_target {
+        if !advertised_legacy_target_is_admissible(
+            &configured_message_post_target,
+            &advertised_message_post_target,
+        ) {
             return Err(
                 LegacySseHttpClientError::AdvertisedMessagePostTargetMismatch {
                     configured: configured_message_post_target,

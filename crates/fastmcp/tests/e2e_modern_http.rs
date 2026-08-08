@@ -7,11 +7,13 @@
 //! stands in for either endpoint.
 //!
 //! What this proves (and only this): the shipped dual-era HTTP server and
-//! the shipped modern HTTP client can complete modern discovery and a
-//! `tools/call` round trip against each other, over both the JSON and the
-//! request-scoped SSE response lanes, and the `Auto` policy selects the
-//! modern era against a live modern server without touching a legacy path.
-//! It is not an aggregate MCP 2026-07-28 conformance claim.
+//! the shipped HTTP clients can complete era negotiation and a round trip
+//! against each other — modern discovery plus `tools/call` over whichever
+//! JSON or request-scoped SSE lane the server selects, the `Auto` policy
+//! selecting the modern era against a live modern server without touching a
+//! legacy path, and the exact 2024-11-05 HTTP+SSE lane completing
+//! `initialize` through the server's session-scoped advertised message
+//! endpoint. It is not an aggregate MCP 2026-07-28 conformance claim.
 
 use std::net::SocketAddr;
 use std::sync::mpsc;
@@ -24,7 +26,7 @@ use fastmcp_client::http_executor::{
 };
 use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan, ProtocolEra, ProtocolPolicy};
-use fastmcp_protocol::{ClientCapabilities, ClientInfo, RequestId};
+use fastmcp_protocol::{ClientCapabilities, ClientInfo, JsonRpcMessage, JsonRpcRequest, RequestId};
 use fastmcp_rust::{McpContext, ServerBuilder, tool};
 use serde_json::json;
 
@@ -212,5 +214,73 @@ fn auto_policy_selects_the_modern_era_against_the_live_server() {
     assert!(
         document.get("error").is_none(),
         "echo over the Auto-selected connection must not fail: {document}"
+    );
+}
+
+#[test]
+fn legacy_only_initialize_round_trips_against_the_same_shipped_server() {
+    let addr = spawn_echo_server();
+    let cx = Cx::for_request();
+
+    // The same turnkey server serves the exact 2024-11-05 HTTP+SSE lane:
+    // its SSE stream advertises a session-scoped message endpoint that the
+    // shipped legacy client must admit as the configured resource.
+    let outcome = runtime_block_on(ModernHttpClient::connect(
+        &cx,
+        plan(addr, ProtocolPolicy::LegacyOnly),
+        client_info(),
+        ClientCapabilities::default(),
+    ))
+    .expect("legacy-only connect opens the shipped legacy SSE lane");
+    assert_eq!(outcome.selected_era(), Some(ProtocolEra::Legacy2024));
+    let mut legacy = outcome
+        .into_legacy_sse()
+        .expect("legacy-only negotiation yields the legacy client");
+    assert!(
+        legacy
+            .advertised_message_post_target()
+            .starts_with(legacy.configured_message_post_target()),
+        "the advertised endpoint extends the configured resource"
+    );
+
+    runtime_block_on(legacy.send(
+        &cx,
+        &JsonRpcMessage::Request(JsonRpcRequest::new(
+            "initialize",
+            Some(json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "e2e-legacy-http-client", "version": "1.0.0"}
+            })),
+            RequestId::Number(11),
+        )),
+    ))
+    .expect("legacy initialize POSTs to the advertised session endpoint");
+
+    let mut initialize_response = None;
+    for _ in 0..8 {
+        match runtime_block_on(legacy.next_message(&cx))
+            .expect("legacy SSE messages decode as strict JSON-RPC")
+        {
+            Some(message) => {
+                let value = serde_json::to_value(message).expect("legacy message reserializes");
+                if value.get("id") == Some(&json!(11)) {
+                    initialize_response = Some(value);
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    let document =
+        initialize_response.expect("the live legacy lane delivered the initialize response");
+    assert!(
+        document.get("error").is_none(),
+        "legacy initialize must not fail: {document}"
+    );
+    assert_eq!(
+        document["result"]["protocolVersion"],
+        json!("2024-11-05"),
+        "the legacy lane must negotiate the exact 2024-11-05 revision"
     );
 }
