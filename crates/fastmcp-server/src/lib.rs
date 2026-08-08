@@ -1563,20 +1563,26 @@ impl BoundHttpServer {
                     )));
                 }
             };
+            let Some(permit) = self.connection_limiter.try_acquire() else {
+                // A capacity rejection must not wait for a slow peer to read
+                // an HTTP error response. Dropping the socket applies the
+                // configured bound without creating an unbounded population
+                // of rejection tasks.
+                drop(stream);
+                continue;
+            };
             let endpoint = Arc::clone(&self.endpoint);
             let legacy_sessions = Arc::clone(&self.legacy_sessions);
-            let connection = match self.connection_limiter.try_acquire() {
-                Some(permit) => cx.spawn_in(&connection_scope, move |connection_cx| async move {
+            let connection = cx
+                .spawn_in(&connection_scope, move |connection_cx| async move {
                     let _permit = permit;
                     serve_http_connection(&connection_cx, stream, endpoint, legacy_sessions).await;
-                }),
-                None => cx.spawn_in(&connection_scope, move |_connection_cx| async move {
-                    let _ = send_http_connection_limit_response(stream).await;
-                }),
-            }
-            .map_err(|error| {
-                McpError::internal_error(format!("HTTP connection task admission failed: {error}"))
-            });
+                })
+                .map_err(|error| {
+                    McpError::internal_error(format!(
+                        "HTTP connection task admission failed: {error}"
+                    ))
+                });
             match connection {
                 Ok(connection) => connection_children.tasks.push(connection),
                 Err(error) => break Err(error),
@@ -1970,16 +1976,6 @@ async fn send_h1_response(
     std::future::poll_fn(|task_cx| framed.poll_close(task_cx))
         .await
         .map_err(|_| ())
-}
-
-async fn send_http_connection_limit_response(stream: AsyncTcpStream) -> Result<(), ()> {
-    let mut framed = Framed::new(stream, Http1Codec::new());
-    send_h1_response(
-        &mut framed,
-        HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
-            .with_json(&serde_json::json!({"error": "too many connections"})),
-    )
-    .await
 }
 
 fn legacy_sse_response_head(response: &HttpResponse) -> Result<Vec<u8>, ()> {
@@ -11047,7 +11043,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_honors_configured_connection_limit() {
+    fn live_http_connection_limit_hard_closes_idle_overflow_peers() {
         run_live_http_test(|cx| async move {
             let bound = Server::new("live-http-connection-limit", "1.0.0")
                 .http_config(HttpServerConfig::new().max_connections(0))
@@ -11059,52 +11055,33 @@ mod lib_unit_tests {
                 .local_addr()
                 .map_err(|error| format!("connection-limit address failed: {error}"))?;
             let caller_cx = cx.clone();
-            let request = JsonRpcRequest::new(
-                SERVER_DISCOVER_METHOD,
-                Some(serde_json::json!({
-                    "_meta": {
-                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                    },
-                })),
-                802_i64,
-            );
-            let body = serde_json::to_vec(&request)
-                .map_err(|error| format!("connection-limit request did not serialize: {error}"))?;
-            let request = live_http_post(
-                "/mcp",
-                &body,
-                &[
-                    ("Accept", "application/json"),
-                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
-                    ("Mcp-Method", SERVER_DISCOVER_METHOD),
-                ],
-            );
             let mut client = cx
                 .spawn(move |_client_cx| async move {
-                    let response = live_http_exchange(address, request).await;
+                    for peer in 0..8 {
+                        let mut stream = AsyncTcpStream::connect(address).await.map_err(|error| {
+                            format!("overflow peer {peer} failed to connect: {error}")
+                        })?;
+                        let mut response = Vec::new();
+                        stream.read_to_end(&mut response).await.map_err(|error| {
+                            format!("overflow peer {peer} failed while awaiting close: {error}")
+                        })?;
+                        if !response.is_empty() {
+                            return Err(format!(
+                                "overflow peer {peer} received a response instead of an immediate close: {response:?}"
+                            ));
+                        }
+                    }
                     caller_cx.cancel_with(CancelKind::User, Some("connection-limit complete"));
-                    response
+                    Ok::<(), String>(())
                 })
                 .map_err(|error| format!("connection-limit client admission failed: {error}"))?;
 
             let serve = bound.serve(&cx).await;
-            let response = client
+            client
                 .join(&cx)
                 .await
                 .map_err(|error| format!("connection-limit client failed: {error:?}"))??;
             serve.map_err(|error| format!("connection-limit server failed: {error}"))?;
-
-            let response = std::str::from_utf8(&response)
-                .map_err(|error| format!("connection-limit response was not UTF-8: {error}"))?;
-            if !response.starts_with("HTTP/1.1 503")
-                || !response
-                    .to_ascii_lowercase()
-                    .contains("\r\nconnection: close\r\n")
-            {
-                return Err(format!(
-                    "configured connection limit did not reject the public HTTP connection: {response}"
-                ));
-            }
             Ok(())
         });
     }
