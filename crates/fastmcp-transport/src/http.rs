@@ -7885,6 +7885,145 @@ X-Checksum: abc123\r\n\
     }
 
     #[test]
+    fn dual_era_modern_h1_sse_delivers_every_request_owned_event_before_terminal() {
+        let endpoint = dual_era_endpoint();
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let cx = Cx::for_testing();
+        let codec = Codec::new();
+
+        let response = session
+            .handle(&cx, dual_era_modern_sse_request(171))
+            .expect("a real modern H1 SSE request is admitted");
+        let DualEraHttpEndpointResponse::ModernSse(response) = response else {
+            panic!("Accept: text/event-stream creates a request-owned modern SSE body");
+        };
+        assert_eq!(
+            session
+                .recv_modern_request(&cx)
+                .expect("admitted H1 request reaches the modern dispatch side")
+                .method,
+            "tools/call"
+        );
+
+        let sender = response.sender();
+        sender
+            .send_notification(
+                &cx,
+                JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progress": 1})),
+                ),
+            )
+            .expect("the first request-owned notification is admitted");
+        sender
+            .send_notification(
+                &cx,
+                JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progress": 2})),
+                ),
+            )
+            .expect("the second request-owned notification is admitted");
+        sender
+            .send_response(
+                &cx,
+                JsonRpcResponse::success(RequestId::Number(171), serde_json::json!({"ok": true})),
+            )
+            .expect("the terminal response is admitted after both notifications");
+
+        let first = response
+            .pop_event()
+            .expect("the first event frames")
+            .expect("the first event is queued");
+        let second = response
+            .pop_event()
+            .expect("the second event frames")
+            .expect("the second event is queued");
+        let terminal = response
+            .pop_event()
+            .expect("the terminal event frames")
+            .expect("the terminal event is queued");
+        assert!(matches!(
+            codec
+                .decode_complete_message(first.data.as_bytes())
+                .expect("first SSE event remains JSON-RPC"),
+            JsonRpcMessage::Request(notification)
+                if notification.method == "notifications/progress"
+                    && notification.params == Some(serde_json::json!({"progress": 1}))
+        ));
+        assert!(matches!(
+            codec
+                .decode_complete_message(second.data.as_bytes())
+                .expect("second SSE event remains JSON-RPC"),
+            JsonRpcMessage::Request(notification)
+                if notification.method == "notifications/progress"
+                    && notification.params == Some(serde_json::json!({"progress": 2}))
+        ));
+        assert!(matches!(
+            codec
+                .decode_complete_message(terminal.data.as_bytes())
+                .expect("terminal SSE event remains JSON-RPC"),
+            JsonRpcMessage::Response(message) if message.id == Some(RequestId::Number(171))
+        ));
+        assert!(response.is_finished());
+    }
+
+    #[test]
+    fn dual_era_modern_h1_sse_disconnect_cancels_and_rejects_the_later_effect() {
+        let endpoint = dual_era_endpoint();
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let cx = Cx::for_testing();
+
+        let response = session
+            .handle(&cx, dual_era_modern_sse_request(172))
+            .expect("the otherwise identical modern H1 SSE request is admitted");
+        let DualEraHttpEndpointResponse::ModernSse(response) = response else {
+            panic!("Accept: text/event-stream creates a request-owned modern SSE body");
+        };
+        assert_eq!(
+            session
+                .recv_modern_request(&cx)
+                .expect("admitted H1 request reaches the modern dispatch side")
+                .method,
+            "tools/call"
+        );
+
+        let sender = response.sender();
+        sender
+            .send_notification(
+                &cx,
+                JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progress": 1})),
+                ),
+            )
+            .expect("the first request-owned notification is admitted");
+
+        // Planted forbidden dimension: the peer body closes before the
+        // otherwise identical second notification and terminal response.
+        drop(response);
+
+        assert!(sender.request_cancellation().is_cancel_requested());
+        assert!(matches!(
+            sender.send_notification(
+                &cx,
+                JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progress": 2})),
+                ),
+            ),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(matches!(
+            sender.send_response(
+                &cx,
+                JsonRpcResponse::success(RequestId::Number(172), serde_json::json!({"ok": true})),
+            ),
+            Err(TransportError::Cancelled)
+        ));
+    }
+
+    #[test]
     fn dual_era_endpoint_composes_resumable_legacy_sse_with_modern_request_bodies() {
         let endpoint = dual_era_endpoint();
         let mut session = endpoint.open_session().expect("endpoint opens a session");
