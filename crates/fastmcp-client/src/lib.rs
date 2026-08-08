@@ -101,9 +101,9 @@ use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancelledParams,
     ClientCapabilities, ClientInfo, Content, CoreDispatchError, CoreRequest, CorrelationKey,
-    FinalProgressNotificationParams, FinalRequestMeta, GetPromptParams, GetTaskParams,
-    GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION, JsonRpcError,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
+    FinalLogMessageParams, FinalProgressNotificationParams, FinalRequestMeta, GetPromptParams,
+    GetTaskParams, GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION,
+    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
     ListResourceTemplatesParams, ListResourcesParams, ListTasksParams, ListTasksResult,
     ListToolsParams, LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt,
     PromptArgument, PromptMessage, ReadResourceParams, RequestId, RequestMeta, Resource,
@@ -1594,6 +1594,24 @@ const FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR: &str =
 fn is_final_server_notification_method(request: &JsonRpcRequest) -> bool {
     final_2026_07_28_method(&request.method)
         .is_some_and(|method| method.admits_notification_from(Final2026Peer::Server))
+}
+
+fn final_log_message_sink_projection(message: &FinalLogMessageParams) -> Option<LogMessageParams> {
+    let level = match message.level {
+        LoggingLevel::Debug => LogLevel::Debug,
+        LoggingLevel::Info => LogLevel::Info,
+        LoggingLevel::Warning => LogLevel::Warning,
+        LoggingLevel::Error => LogLevel::Error,
+        LoggingLevel::Notice
+        | LoggingLevel::Critical
+        | LoggingLevel::Alert
+        | LoggingLevel::Emergency => return None,
+    };
+    Some(LogMessageParams {
+        level,
+        logger: message.logger.clone(),
+        data: message.data.clone(),
+    })
 }
 
 const INITIALIZE_REQUEST_ID: i64 = 1;
@@ -3824,7 +3842,14 @@ impl Client {
                     FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
                 ));
             }
+            let log_message = match &notification {
+                ServerNotification::Message(message) => final_log_message_sink_projection(message),
+                _ => None,
+            };
             self.final_server_notifications.push_back(notification);
+            if let Some(message) = log_message {
+                self.emit_log_message(message);
+            }
             return Ok(Some(ModernServerNotification::Retained));
         };
 
@@ -7392,6 +7417,52 @@ mod tests {
     }
 
     #[test]
+    fn final_log_message_sink_projection_preserves_only_lossless_levels() {
+        let message = FinalLogMessageParams {
+            level: LoggingLevel::Warning,
+            logger: Some("server.audit".to_string()),
+            data: serde_json::json!({"event": "tool-complete"}),
+            meta: Some(
+                fastmcp_protocol::OpenMetadata::try_from_entries([(
+                    "com.example/trace".to_string(),
+                    serde_json::json!("retained"),
+                )])
+                .expect("valid open final metadata"),
+            ),
+            additional: std::collections::BTreeMap::from([(
+                "com.example/extension".to_string(),
+                serde_json::json!(true),
+            )]),
+        };
+
+        let projection = final_log_message_sink_projection(&message)
+            .expect("warning is an exact legacy sink severity");
+        assert_eq!(projection.level, LogLevel::Warning);
+        assert_eq!(projection.logger.as_deref(), Some("server.audit"));
+        assert_eq!(
+            projection.data,
+            serde_json::json!({"event": "tool-complete"})
+        );
+        assert_eq!(
+            message
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("com.example/trace")),
+            Some(&serde_json::json!("retained"))
+        );
+        assert_eq!(
+            message.additional.get("com.example/extension"),
+            Some(&serde_json::json!(true))
+        );
+
+        let unsupported = FinalLogMessageParams {
+            level: LoggingLevel::Notice,
+            ..message
+        };
+        assert!(final_log_message_sink_projection(&unsupported).is_none());
+    }
+
+    #[test]
     fn automatic_pagination_limits_are_locked_to_the_security_budget() {
         assert_eq!(MAX_AUTO_PAGINATION_PAGES, 1_024);
         assert_eq!(MAX_AUTO_PAGINATION_ITEMS, 100_000);
@@ -10332,6 +10403,40 @@ mod tests {
                         == Some(&serde_json::json!("retained"))
         ));
         assert!(client.take_final_server_notifications().is_empty());
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_final_log_message_is_retained_after_sink_projection() {
+        let script = modern_server_notification_client_script(
+            r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"warning","logger":"server.audit","data":{"event":"tool-complete"},"_meta":{"com.example/trace":"retained"},"com.example/extension":true}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"notification result"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+
+        client
+            .call_tool("echo", serde_json::json!({"text": "notification"}))
+            .expect("the final log message must not consume its following response");
+
+        let notifications = client.take_final_server_notifications();
+        assert!(matches!(
+            notifications.as_slice(),
+            [ServerNotification::Message(message)]
+                if message.level == LoggingLevel::Warning
+                    && message.logger.as_deref() == Some("server.audit")
+                    && message.data == serde_json::json!({"event": "tool-complete"})
+                    && message.meta.as_ref().and_then(|meta| meta.get("com.example/trace"))
+                        == Some(&serde_json::json!("retained"))
+                    && message.additional.get("com.example/extension")
+                        == Some(&serde_json::json!(true))
+        ));
         client.close().expect("modern client cleanup");
     }
 
