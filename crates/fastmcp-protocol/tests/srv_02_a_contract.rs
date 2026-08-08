@@ -109,13 +109,16 @@ fn srv_02_a_planted_negative() {
     );
     let unchanged_before = serde_json::to_vec(&admitted).expect("admitted state encodes");
     let mut planted: Value = serde_json::to_value(&admitted).expect("baseline result encodes");
-    planted["resultType"] = json!("input_required");
+    planted
+        .as_object_mut()
+        .expect("baseline result is an object")
+        .remove("resultType");
 
     let rejection = serde_json::from_value::<ServerDiscoverResult>(planted);
 
     assert!(
         rejection.is_err(),
-        "only the incompatible result-type field changed"
+        "removing only the required resultType field rejects the discovery result"
     );
     assert_eq!(
         serde_json::to_vec(&admitted).expect("admitted state still encodes"),
