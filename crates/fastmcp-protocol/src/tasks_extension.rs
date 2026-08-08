@@ -1175,7 +1175,10 @@ mod tests {
         ledger
             .validate_responses(&responses)
             .expect("matching responses");
-        let task = Task::Failed { base: base(TaskStatus::Failed), error: serde_json::from_value(serde_json::json!({ "code": 123456789012345678901234567890, "message": "no", "x-peer": { "n": 1 } })).expect("open error") };
+        let arbitrary_precision_code: Value =
+            serde_json::from_str("123456789012345678901234567890")
+                .expect("arbitrary-precision JSON integer");
+        let task = Task::Failed { base: base(TaskStatus::Failed), error: serde_json::from_value(serde_json::json!({ "code": arbitrary_precision_code, "message": "no", "x-peer": { "n": 1 } })).expect("open error") };
         let wire = serde_json::to_value(CreateTaskResult {
             task,
             meta: None,
