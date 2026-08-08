@@ -16,7 +16,7 @@
 //!
 //! For a live context with a safe complete partition (or a standalone context
 //! with neither session nor auth), the default method policy permits caching:
-//! - `server/discover` - 5 minute TTL
+//! - `server/discover` - its final private `ttlMs` policy
 //! - `tools/list` - 5 minute TTL
 //! - `resources/list` - 5 minute TTL
 //! - `resources/templates/list` - 5 minute TTL
@@ -55,7 +55,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fastmcp_core::{McpContext, McpError, McpResult, Sha256Digest, sha256_bounded};
-use fastmcp_protocol::JsonRpcRequest;
+use fastmcp_protocol::protocol_policy::ProtocolEra;
+use fastmcp_protocol::{
+    FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY, JsonRpcRequest, SERVER_DISCOVER_METHOD,
+};
 
 use crate::{Middleware, MiddlewareDecision};
 
@@ -150,6 +153,25 @@ struct CacheKey {
     request_digest: Sha256Digest,
     invalidation_digest: Sha256Digest,
     partition_digest: Sha256Digest,
+    binding: CacheEntryBinding,
+}
+
+/// Extra identity attached only to final discovery cache entries.
+///
+/// Discovery is a final-only surface, but the cache can sit behind a dual-era
+/// transport. The selected era and the invalidation generation therefore
+/// participate in the key rather than being inferred from a previously cached
+/// payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DiscoveryCacheBinding {
+    era: ProtocolEra,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CacheEntryBinding {
+    Ordinary,
+    Discovery(DiscoveryCacheBinding),
 }
 
 impl CacheKey {
@@ -204,11 +226,13 @@ impl CacheKey {
         method: &str,
         params: Option<&serde_json::Value>,
         partition_digest: Sha256Digest,
+        binding: CacheEntryBinding,
     ) -> Option<Self> {
         Some(Self {
             request_digest: Self::try_request_digest(method, params)?,
             invalidation_digest: Self::try_invalidation_digest(method, params)?,
             partition_digest,
+            binding,
         })
     }
 
@@ -219,7 +243,12 @@ impl CacheKey {
             CACHE_STATELESS_PARTITION_DOMAIN.len(),
         )
         .ok()?;
-        Self::try_new_partitioned(method, params, partition_digest)
+        Self::try_new_partitioned(
+            method,
+            params,
+            partition_digest,
+            CacheEntryBinding::Ordinary,
+        )
     }
 
     #[cfg(test)]
@@ -473,6 +502,70 @@ fn response_is_cacheable_complete(response: &serde_json::Value) -> bool {
     }
 }
 
+/// The cache policy attached to an exact final discovery result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalDiscoveryCachePolicy {
+    Private(Duration),
+    Public,
+}
+
+/// Returns whether a result carries the exact final discovery shape relevant
+/// to caching. Full discovery validation remains owned by the protocol/server
+/// boundary; this narrower check prevents legacy lookalikes from selecting a
+/// final cache policy.
+fn is_final_discovery_result(response: &serde_json::Value) -> bool {
+    let Some(response) = response.as_object() else {
+        return false;
+    };
+    response
+        .get("capabilities")
+        .is_some_and(serde_json::Value::is_object)
+        && response
+            .get("supportedVersions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|versions| {
+                versions.len() == 1 && versions[0].as_str() == Some(FINAL_PROTOCOL_VERSION)
+            })
+}
+
+/// Reads the final discovery cache policy exactly as it appears on the wire.
+fn final_discovery_cache_policy(response: &serde_json::Value) -> Option<FinalDiscoveryCachePolicy> {
+    if !is_final_discovery_result(response) {
+        return None;
+    }
+    let response = response.as_object()?;
+    let ttl_ms = response.get("ttlMs")?.as_u64()?;
+    match response.get("cacheScope")?.as_str()? {
+        "private" => Some(FinalDiscoveryCachePolicy::Private(Duration::from_millis(
+            ttl_ms,
+        ))),
+        "public" => Some(FinalDiscoveryCachePolicy::Public),
+        _ => None,
+    }
+}
+
+/// Selects the request era used by the discovery cache.
+///
+/// Final transports remove the recognized version metadata before middleware
+/// runs, so missing metadata here represents an already-admitted final
+/// request. An explicitly supplied legacy or unsupported version is never
+/// allowed to reuse the final discovery cache.
+fn discovery_request_protocol_era(request: &JsonRpcRequest) -> Option<ProtocolEra> {
+    let version = request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("_meta"))
+        .and_then(|metadata| metadata.get(FINAL_PROTOCOL_VERSION_META_KEY))
+        .and_then(serde_json::Value::as_str);
+    match version {
+        None | Some(FINAL_PROTOCOL_VERSION) => Some(ProtocolEra::Modern2026),
+        Some(version) if version == ProtocolEra::Legacy2024.version().as_str() => {
+            Some(ProtocolEra::Legacy2024)
+        }
+        Some(_) => None,
+    }
+}
+
 /// Returns whether a method requires `ttlMs` and `cacheScope` in a modern
 /// complete result. This list is protocol-facing and deliberately independent
 /// from the internal memoization allowlist.
@@ -694,6 +787,21 @@ impl LruCache {
         self.current_size_bytes = retained_size;
     }
 
+    fn remove_discovery_entries(&mut self) {
+        let mut retained_size = self.current_size_bytes;
+        self.entries.retain(|key, entry| {
+            if matches!(key.binding, CacheEntryBinding::Discovery(_)) {
+                retained_size = retained_size.saturating_sub(entry.size_bytes);
+                false
+            } else {
+                true
+            }
+        });
+        self.order
+            .retain(|key| !matches!(key.binding, CacheEntryBinding::Discovery(_)));
+        self.current_size_bytes = retained_size;
+    }
+
     fn evict_expired(&mut self) {
         let mut retained_size = self.current_size_bytes;
         self.entries.retain(|_, entry| {
@@ -767,6 +875,12 @@ impl CacheStats {
 pub struct ResponseCachingMiddleware {
     /// Process-local identity used only for per-request hit bookkeeping.
     instance_id: u64,
+    /// Monotonic final-discovery invalidation generation.
+    ///
+    /// It is included in every final discovery key and is advanced under the
+    /// cache lock, preventing a response captured before invalidation from
+    /// becoming observable afterwards.
+    discovery_generation: AtomicU64,
     /// Cache storage.
     cache: Mutex<LruCache>,
     /// TTL for list operations.
@@ -793,6 +907,10 @@ impl std::fmt::Debug for ResponseCachingMiddleware {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResponseCachingMiddleware")
             .field("instance_available", &(self.instance_id != 0))
+            .field(
+                "discovery_generation",
+                &self.discovery_generation.load(Ordering::Acquire),
+            )
             .field("list_ttl", &self.list_ttl)
             .field("call_ttl", &self.call_ttl)
             .finish_non_exhaustive()
@@ -813,6 +931,7 @@ impl ResponseCachingMiddleware {
     pub fn new() -> Self {
         Self {
             instance_id: next_cache_instance_id(),
+            discovery_generation: AtomicU64::new(1),
             cache: Mutex::new(LruCache::new(
                 1000,
                 100 * 1024 * 1024,
@@ -1010,18 +1129,77 @@ impl ResponseCachingMiddleware {
         stats
     }
 
+    fn cache_entry_binding(&self, request: &JsonRpcRequest) -> Option<CacheEntryBinding> {
+        if request.method != SERVER_DISCOVER_METHOD {
+            return Some(CacheEntryBinding::Ordinary);
+        }
+
+        let era = discovery_request_protocol_era(request)?;
+        if era != ProtocolEra::Modern2026 {
+            return None;
+        }
+        let generation = self.discovery_generation.load(Ordering::Acquire);
+        (generation != 0).then_some(CacheEntryBinding::Discovery(DiscoveryCacheBinding {
+            era,
+            generation,
+        }))
+    }
+
+    fn cache_entry_binding_is_current(&self, binding: CacheEntryBinding) -> bool {
+        match binding {
+            CacheEntryBinding::Ordinary => true,
+            CacheEntryBinding::Discovery(binding) => {
+                binding.era == ProtocolEra::Modern2026
+                    && binding.generation == self.discovery_generation.load(Ordering::Acquire)
+            }
+        }
+    }
+
+    /// Advances the discovery generation, permanently disabling discovery
+    /// caching if the counter can no longer advance without wrapping.
+    fn advance_discovery_generation(&self) {
+        if self
+            .discovery_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                (generation != 0)
+                    .then(|| generation.checked_add(1))
+                    .flatten()
+            })
+            .is_err()
+        {
+            self.discovery_generation.store(0, Ordering::Release);
+        }
+    }
+
     /// Clears the entire cache.
     pub fn clear(&self) {
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.advance_discovery_generation();
         cache.clear();
+    }
+
+    /// Invalidates every final discovery response and advances its cache
+    /// generation. A response or lookup holding an older generation cannot
+    /// reuse or repopulate the invalidated discovery state.
+    pub fn invalidate_discovery(&self) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.advance_discovery_generation();
+        cache.remove_discovery_entries();
     }
 
     /// Invalidates every session/auth partition and every cursor page for a
     /// method and semantic-parameter set.
     pub fn invalidate(&self, method: &str, params: Option<&serde_json::Value>) {
+        if method == SERVER_DISCOVER_METHOD {
+            self.invalidate_discovery();
+            return;
+        }
         let Some(invalidation_digest) = CacheKey::try_invalidation_digest(method, params) else {
             return;
         };
@@ -1080,10 +1258,23 @@ impl ResponseCachingMiddleware {
     /// Normalizes modern protocol cache hints at the server boundary.
     ///
     /// A handler can reduce the configured TTL, including to immediate
-    /// staleness (`0`), but it cannot increase it. This middleware holds no
-    /// sealed public-cache proof, so every locally emitted hint is private;
-    /// an untrusted `cacheScope: "public"` value is never cache authority.
+    /// staleness (`0`), but it cannot increase it. Exact final discovery
+    /// carries its own required policy, so its `ttlMs` and `cacheScope` are
+    /// retained unchanged and interpreted when admitting the cache entry.
+    /// This middleware holds no sealed public-cache proof, so a final public
+    /// scope is delivered unchanged but is never cache authority.
     fn apply_protocol_cache_hints(&self, method: &str, response: &mut serde_json::Value) {
+        if method == SERVER_DISCOVER_METHOD {
+            if is_final_discovery_result(response) {
+                if final_discovery_cache_policy(response).is_none()
+                    && let Some(response) = response.as_object_mut()
+                {
+                    response.remove("ttlMs");
+                    response.remove("cacheScope");
+                }
+                return;
+            }
+        }
         let Some(response) = response.as_object_mut() else {
             return;
         };
@@ -1147,6 +1338,9 @@ impl Middleware for ResponseCachingMiddleware {
         if request_carries_uncacheable_continuation(request.params.as_ref()) {
             return Ok(MiddlewareDecision::Continue);
         }
+        let Some(binding) = self.cache_entry_binding(request) else {
+            return Ok(MiddlewareDecision::Continue);
+        };
 
         let Some(partition_digest) = context_cache_partition(ctx, CachePartitionPhase::Request)
         else {
@@ -1158,6 +1352,7 @@ impl Middleware for ResponseCachingMiddleware {
             &request.method,
             request.params.as_ref(),
             partition_digest,
+            binding,
         ) else {
             return Ok(MiddlewareDecision::Continue);
         };
@@ -1171,6 +1366,10 @@ impl Middleware for ResponseCachingMiddleware {
 
         if let Some(encoded) = encoded {
             if let Some(value) = decode_cached_json(&encoded) {
+                if !self.cache_entry_binding_is_current(binding) {
+                    self.record_miss();
+                    return Ok(MiddlewareDecision::Continue);
+                }
                 // Session state can change while this request waits for the
                 // cache mutex or decodes a cached payload. Revalidate after
                 // both operations so a hit linearizes against the admitted
@@ -1208,6 +1407,16 @@ impl Middleware for ResponseCachingMiddleware {
             return Ok(response);
         }
         self.apply_protocol_cache_hints(&request.method, &mut response);
+        let final_discovery_policy = (request.method == SERVER_DISCOVER_METHOD
+            && is_final_discovery_result(&response))
+        .then(|| final_discovery_cache_policy(&response))
+        .flatten();
+        if request.method == SERVER_DISCOVER_METHOD
+            && is_final_discovery_result(&response)
+            && final_discovery_policy.is_none()
+        {
+            return Ok(response);
+        }
         // Only cache if this method is cacheable
         if !self.should_cache_method(&request.method, request.params.as_ref()) {
             return Ok(response);
@@ -1220,6 +1429,9 @@ impl Middleware for ResponseCachingMiddleware {
         if ctx.response_was_cache_hit(self.instance_id) {
             return Ok(response);
         }
+        let Some(binding) = self.cache_entry_binding(request) else {
+            return Ok(response);
+        };
 
         let Some(partition_digest) = context_cache_partition(ctx, CachePartitionPhase::Response)
         else {
@@ -1231,10 +1443,15 @@ impl Middleware for ResponseCachingMiddleware {
             &request.method,
             request.params.as_ref(),
             partition_digest,
+            binding,
         ) else {
             return Ok(response);
         };
-        let ttl = self.get_ttl(&request.method);
+        let ttl = match final_discovery_policy {
+            Some(FinalDiscoveryCachePolicy::Private(ttl)) => ttl,
+            Some(FinalDiscoveryCachePolicy::Public) => return Ok(response),
+            None => self.get_ttl(&request.method),
+        };
 
         let admission_limit = {
             let cache = self
@@ -1259,6 +1476,9 @@ impl Middleware for ResponseCachingMiddleware {
         // boundary so cancellation, lease closure, or session mutation cannot
         // populate the cache after winning either race.
         if !context_cache_commit_is_admissible(ctx) {
+            return Ok(response);
+        }
+        if !self.cache_entry_binding_is_current(binding) {
             return Ok(response);
         }
         cache.insert_encoded(key, encoded, ttl);
@@ -1317,6 +1537,26 @@ mod tests {
             params,
             id: Some(fastmcp_protocol::RequestId::Number(1)),
         }
+    }
+
+    fn final_discovery_request(protocol_version: &str) -> JsonRpcRequest {
+        test_request(
+            SERVER_DISCOVER_METHOD,
+            Some(serde_json::json!({
+                "_meta": {
+                    FINAL_PROTOCOL_VERSION_META_KEY: protocol_version,
+                },
+            })),
+        )
+    }
+
+    fn final_discovery_response(ttl_ms: u64, cache_scope: &str) -> serde_json::Value {
+        serde_json::json!({
+            "supportedVersions": [FINAL_PROTOCOL_VERSION],
+            "capabilities": {},
+            "ttlMs": ttl_ms,
+            "cacheScope": cache_scope,
+        })
     }
 
     // ========================================
@@ -3091,6 +3331,151 @@ mod tests {
                 .on_request(&ctx, &request)
                 .expect("repeat continuation lookup is safe"),
             MiddlewareDecision::Continue
+        ));
+    }
+
+    #[test]
+    fn cache_discovery_final_policy_positive() {
+        let middleware = ResponseCachingMiddleware::new().list_ttl_secs(300);
+        let ctx = test_context();
+        let request = final_discovery_request(FINAL_PROTOCOL_VERSION);
+        let ttl = Duration::from_secs(30);
+        let response = final_discovery_response(30_000, "private");
+
+        let delivered = middleware
+            .on_response(&ctx, &request, response.clone())
+            .expect("final discovery response remains deliverable");
+
+        assert_eq!(delivered, response, "final hints remain public-observable");
+        let cache = middleware
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = cache
+            .entries
+            .values()
+            .next()
+            .expect("private final discovery response is cached");
+        assert!(
+            entry.expires_at <= Instant::now().checked_add(ttl).expect("short TTL is valid"),
+            "the stored expiry must use final ttlMs rather than the list default"
+        );
+        drop(cache);
+
+        assert!(matches!(
+            middleware
+                .on_request(&ctx, &request)
+                .expect("final discovery lookup is safe"),
+            MiddlewareDecision::Respond(value) if value == response
+        ));
+    }
+
+    #[test]
+    fn cache_discovery_public_scope_planted_negative() {
+        let middleware = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let request = final_discovery_request(FINAL_PROTOCOL_VERSION);
+        let response = final_discovery_response(30_000, "public");
+
+        // This differs from the cacheable final response only in cacheScope.
+        // A public wire claim is delivered faithfully but cannot authorize this
+        // private middleware cache.
+        let delivered = middleware
+            .on_response(&ctx, &request, response.clone())
+            .expect("public discovery response remains deliverable");
+
+        assert_eq!(delivered, response);
+        let before_lookup = middleware.stats();
+        assert_eq!(before_lookup.entries, 0);
+        assert_eq!(before_lookup.size_bytes, 0);
+        assert!(matches!(
+            middleware
+                .on_request(&ctx, &request)
+                .expect("public-scope lookup is safe"),
+            MiddlewareDecision::Continue
+        ));
+        let after_lookup = middleware.stats();
+        assert_eq!(after_lookup.entries, before_lookup.entries);
+        assert_eq!(after_lookup.size_bytes, before_lookup.size_bytes);
+    }
+
+    #[test]
+    fn cache_discovery_stale_generation_planted_negative() {
+        let middleware = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let request = final_discovery_request(FINAL_PROTOCOL_VERSION);
+        let response = final_discovery_response(30_000, "private");
+
+        middleware
+            .on_response(&ctx, &request, response)
+            .expect("initial final discovery response is cacheable");
+        let binding_before_invalidation = middleware
+            .cache_entry_binding(&request)
+            .expect("final discovery has a cache binding");
+        assert_eq!(middleware.stats().entries, 1);
+
+        // The request and result are unchanged; advancing only the discovery
+        // generation makes the previous entry stale.
+        middleware.invalidate(SERVER_DISCOVER_METHOD, request.params.as_ref());
+        let binding_after_invalidation = middleware
+            .cache_entry_binding(&request)
+            .expect("fresh generation has a cache binding");
+        assert_ne!(binding_after_invalidation, binding_before_invalidation);
+
+        let before_lookup = middleware.stats();
+        assert_eq!(before_lookup.entries, 0);
+        assert_eq!(before_lookup.size_bytes, 0);
+        assert!(matches!(
+            middleware
+                .on_request(&ctx, &request)
+                .expect("stale discovery lookup is safe"),
+            MiddlewareDecision::Continue
+        ));
+        let after_lookup = middleware.stats();
+        assert_eq!(after_lookup.entries, before_lookup.entries);
+        assert_eq!(after_lookup.size_bytes, before_lookup.size_bytes);
+    }
+
+    #[test]
+    fn cache_discovery_cross_era_planted_negative() {
+        let middleware = ResponseCachingMiddleware::new();
+        let final_ctx = test_context();
+        let legacy_ctx = test_context();
+        let final_request = final_discovery_request(FINAL_PROTOCOL_VERSION);
+        let mut legacy_request = final_request.clone();
+        legacy_request
+            .params
+            .as_mut()
+            .expect("test request has metadata")["_meta"][FINAL_PROTOCOL_VERSION_META_KEY] =
+            serde_json::json!(ProtocolEra::Legacy2024.version().as_str());
+        let response = final_discovery_response(30_000, "private");
+
+        middleware
+            .on_response(&final_ctx, &final_request, response.clone())
+            .expect("final discovery response is cacheable");
+        let before_legacy = middleware.stats();
+        assert_eq!(before_legacy.entries, 1);
+
+        // The only changed input is the exact protocol era. It must neither
+        // reuse the final entry nor add an entry in the final generation.
+        let delivered = middleware
+            .on_response(&legacy_ctx, &legacy_request, response.clone())
+            .expect("legacy response remains deliverable without caching");
+        assert_eq!(delivered, response);
+        assert!(matches!(
+            middleware
+                .on_request(&legacy_ctx, &legacy_request)
+                .expect("legacy lookup is safe"),
+            MiddlewareDecision::Continue
+        ));
+        let after_legacy = middleware.stats();
+        assert_eq!(after_legacy.entries, before_legacy.entries);
+        assert_eq!(after_legacy.size_bytes, before_legacy.size_bytes);
+        assert!(matches!(
+            middleware
+                .on_request(&final_ctx, &final_request)
+                .expect("final lookup remains safe"),
+            MiddlewareDecision::Respond(value) if value == response
         ));
     }
 }
