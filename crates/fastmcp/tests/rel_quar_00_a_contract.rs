@@ -4,16 +4,18 @@
 //! checked-in workflow bytes, cross-checks the source with an independent
 //! textual oracle that shares no code with the shipped evaluator, and
 //! accepts the inventory through the shipped public surface. The planted
-//! negative flips exactly one reachability cell in a clone, proves the
-//! stable typed refusal, and proves the accepted pristine state is
-//! byte-for-byte unchanged and re-acceptable.
+//! negative plants three independent one-variable mutations in fresh clones
+//! — a substituted well-formed revision, a substituted well-formed action
+//! commit pin, and a flipped reachability cell — proves the stable typed
+//! refusal for each, and proves the accepted pristine state is byte-for-byte
+//! unchanged and re-acceptable.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use fastmcp_rust::release_quarantine::{
-    CANONICAL_INPUT_LIMIT_BYTES, MutationSink, QuarantineContext, SinkReachability, WORKFLOW_PATH,
-    canonical_inventory_bytes, quarantine_workflow_inventory,
+    ActionIdentity, CANONICAL_INPUT_LIMIT_BYTES, MutationSink, QuarantineContext, SinkReachability,
+    WORKFLOW_PATH, canonical_inventory_bytes, quarantine_workflow_inventory,
     rel_quar_00_a_ambient_authority_inventory, sha256_bounded,
 };
 
@@ -109,10 +111,41 @@ fn rel_quar_00_a_planted_negative() {
     let accepted = rel_quar_00_a_ambient_authority_inventory(&pristine)
         .expect("pristine inventory is accepted before planting");
 
-    // Plant exactly one forbidden change: a single reachability cell flips
-    // from externally inert to mutation-reachable.
-    let mut planted = pristine.clone();
-    let cell = planted
+    // Plant 1: exactly one identity field changes — the quarantine revision
+    // is replaced with a different, well-formed lowercase-hex commit. Shape
+    // checks alone would accept this; the frozen-identity equality binding
+    // must refuse it.
+    let mut planted_revision = pristine.clone();
+    planted_revision.quarantine.revision = "0000000000000000000000000000000000000000";
+    let diagnostic = rel_quar_00_a_ambient_authority_inventory(&planted_revision)
+        .expect_err("a substituted well-formed revision is refused");
+    assert_eq!(diagnostic.code, "E_IDENTITY_BINDING");
+    assert_eq!(
+        diagnostic.to_string(),
+        "RELQUAR00A|Error|E_IDENTITY_BINDING|ambient-authority-inventory|\
+         identity[quarantine-verification].revision"
+    );
+
+    // Plant 2: exactly one pinned action commit identity changes to another
+    // valid lowercase-hex SHA (borrowed from a different real action), the
+    // precise bypass shape-only validation would admit.
+    let mut planted_action = pristine.clone();
+    let mut actions: Vec<ActionIdentity> = pristine.quarantine.actions.to_vec();
+    actions[0].commit_sha = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
+    planted_action.quarantine.actions = Box::leak(actions.into_boxed_slice());
+    let diagnostic = rel_quar_00_a_ambient_authority_inventory(&planted_action)
+        .expect_err("a substituted well-formed action pin is refused");
+    assert_eq!(diagnostic.code, "E_IDENTITY_BINDING");
+    assert_eq!(
+        diagnostic.to_string(),
+        "RELQUAR00A|Error|E_IDENTITY_BINDING|ambient-authority-inventory|\
+         identity[quarantine-verification].actions"
+    );
+
+    // Plant 3: exactly one reachability cell flips from externally inert to
+    // mutation-reachable.
+    let mut planted_cell = pristine.clone();
+    let cell = planted_cell
         .reachability_cells
         .iter_mut()
         .find(|cell| {
@@ -122,7 +155,7 @@ fn rel_quar_00_a_planted_negative() {
         .expect("manual-dispatch/registry-upload cell exists");
     cell.result = SinkReachability::MutationReachable;
 
-    let diagnostic = rel_quar_00_a_ambient_authority_inventory(&planted)
+    let diagnostic = rel_quar_00_a_ambient_authority_inventory(&planted_cell)
         .expect_err("a mutation-reachable cell is refused");
     assert_eq!(diagnostic.code, "E_MUTATION_REACHABLE");
     assert_eq!(

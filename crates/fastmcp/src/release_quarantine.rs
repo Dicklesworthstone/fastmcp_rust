@@ -7,7 +7,10 @@
 //! inventory against the ambient-authority predicate: zero ambient publish
 //! triggers, zero mutation-capable permissions, zero secret references, zero
 //! publication-capable processes, and seventy-two externally inert
-//! context-by-sink reachability cells.
+//! context-by-sink reachability cells. Supplied identities are
+//! equality-bound to the frozen expectations field by field, so a
+//! substituted-but-well-formed revision, digest, or action commit identity
+//! is refused, not merely shape-checked.
 //!
 //! Scope boundaries (REL-QUAR-00):
 //!
@@ -42,6 +45,15 @@ pub const WORKFLOW_PATH: &str = ".github/workflows/release.yml";
 
 /// Stable diagnostic slug used by every [`QuarantineDiagnostic`].
 pub const DIAGNOSTIC_SLUG: &str = "ambient-authority-inventory";
+
+/// The frozen standing unresolved provider-side observations. The evaluator
+/// equality-binds the inventory's list to exactly these entries; dropping,
+/// rewording, or resolving one from source state is refused.
+pub const UNRESOLVED_PROVIDER_OBSERVATIONS: [&str; 3] = [
+    "historical release.yml provider workflow-ID disablement unverified",
+    "ambient crates.io registry token removal/rotation unverified",
+    "pre-quarantine queued/in-progress run inventory and disposition unverified",
+];
 
 /// Role of a frozen workflow identity within the quarantine inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,11 +512,7 @@ pub fn quarantine_workflow_inventory() -> QuarantineWorkflowInventory {
         ordered_contexts: ORDERED_CONTEXTS.to_vec(),
         ordered_sinks: ORDERED_SINKS.to_vec(),
         reachability_cells,
-        unresolved_provider_observations: vec![
-            "historical release.yml provider workflow-ID disablement unverified",
-            "ambient crates.io registry token removal/rotation unverified",
-            "pre-quarantine queued/in-progress run inventory and disposition unverified",
-        ],
+        unresolved_provider_observations: UNRESOLVED_PROVIDER_OBSERVATIONS.to_vec(),
     }
 }
 
@@ -670,6 +678,56 @@ fn check_identity_shape(identity: &WorkflowIdentity) -> Result<(), QuarantineDia
     Ok(())
 }
 
+/// Equality-binds a supplied identity to its frozen expectation, field by
+/// field. Shape checks alone admit a one-variable substitution with another
+/// well-formed identity (for example a different valid lowercase-hex action
+/// commit); the frozen-identity predicate requires exact equality on every
+/// recorded field.
+fn check_identity_binding(
+    actual: &WorkflowIdentity,
+    frozen: &WorkflowIdentity,
+) -> Result<(), QuarantineDiagnostic> {
+    let role = frozen.role.tag();
+    let mismatch: Option<&'static str> = if actual.role != frozen.role {
+        Some("role")
+    } else if actual.workflow_name != frozen.workflow_name {
+        Some("workflow_name")
+    } else if actual.path != frozen.path {
+        Some("path")
+    } else if actual.revision != frozen.revision {
+        Some("revision")
+    } else if actual.definition_sha256_hex != frozen.definition_sha256_hex {
+        Some("definition_sha256_hex")
+    } else if actual.events != frozen.events {
+        Some("events")
+    } else if actual.jobs != frozen.jobs {
+        Some("jobs")
+    } else if actual.declared_permissions != frozen.declared_permissions {
+        Some("declared_permissions")
+    } else if actual.secret_references != frozen.secret_references {
+        Some("secret_references")
+    } else if actual.process_invocations != frozen.process_invocations {
+        Some("process_invocations")
+    } else if actual.actions != frozen.actions {
+        Some("actions")
+    } else {
+        None
+    };
+    if let Some(field) = mismatch {
+        return Err(reject(
+            "E_IDENTITY_BINDING",
+            format!("identity[{role}].{field}"),
+        ));
+    }
+    if actual.provider_disablement != frozen.provider_disablement {
+        return Err(reject(
+            "E_PROVIDER_INFERENCE",
+            format!("identity[{role}].provider_disablement"),
+        ));
+    }
+    Ok(())
+}
+
 fn check_quarantine_predicate(counts: AmbientAuthorityCounts) -> Result<(), QuarantineDiagnostic> {
     if counts.ambient_publish_triggers != 0 {
         return Err(reject("E_AMBIENT_TRIGGER", "quarantine.events"));
@@ -743,14 +801,16 @@ fn check_reachability_cells(
 
 /// The REL-QUAR-00 A evaluator.
 ///
-/// Validates the frozen inventory shape, enforces the ambient-authority
-/// predicate on the quarantine identity (zero ambient publish triggers, zero
-/// mutation-capable permissions, zero secret references, zero
-/// publication-capable processes), requires all seventy-two ordered
-/// reachability cells to terminate externally inert, requires the historical
-/// identity to actually record the discovered ambient authority, refuses any
-/// provider-side safety inference, and binds everything into the canonical
-/// digest.
+/// Equality-binds both supplied identities to the frozen expectations field
+/// by field (revision, definition digest, events, jobs, permissions,
+/// secrets, processes, pinned action names/SHAs, provider observation),
+/// enforces the ambient-authority predicate on the quarantine identity (zero
+/// ambient publish triggers, zero mutation-capable permissions, zero secret
+/// references, zero publication-capable processes), requires all seventy-two
+/// ordered reachability cells to terminate externally inert, requires the
+/// historical identity to actually record the discovered ambient authority,
+/// refuses any provider-side safety inference, and binds everything into the
+/// canonical digest.
 ///
 /// # Errors
 ///
@@ -759,20 +819,30 @@ fn check_reachability_cells(
 pub fn rel_quar_00_a_ambient_authority_inventory(
     inventory: &QuarantineWorkflowInventory,
 ) -> Result<QuarantineReceipt, QuarantineDiagnostic> {
-    if inventory.historical.role != WorkflowRole::HistoricalPublisher {
-        return Err(reject("E_IDENTITY_SET", "historical.role"));
-    }
-    if inventory.quarantine.role != WorkflowRole::QuarantineVerification {
-        return Err(reject("E_IDENTITY_SET", "quarantine.role"));
-    }
-    check_identity_shape(&inventory.historical)?;
-    check_identity_shape(&inventory.quarantine)?;
+    // Self-integrity of the frozen expectations: a defective re-freeze
+    // (truncated digest, malformed action pin) must fail before it can bind
+    // anything.
+    let frozen_historical = historical_identity();
+    let frozen_quarantine = quarantine_identity();
+    check_identity_shape(&frozen_historical)?;
+    check_identity_shape(&frozen_quarantine)?;
 
+    // Frozen-identity predicate: every recorded field of the supplied
+    // identities must equal the frozen expectation exactly. Shape checks
+    // alone would admit a one-variable substitution with another well-formed
+    // revision, digest, or action commit identity.
+    check_identity_binding(&inventory.historical, &frozen_historical)?;
+    check_identity_binding(&inventory.quarantine, &frozen_quarantine)?;
+
+    // The predicate checks below are intentionally kept even though equality
+    // binding subsumes them for the current constants: they refuse a future
+    // re-freeze that would reintroduce ambient authority into the quarantine
+    // identity or erase the historical discovery record.
     let counts = ambient_authority_counts(&inventory.quarantine);
     check_quarantine_predicate(counts)?;
     check_historical_discovery(&inventory.historical)?;
 
-    if inventory.unresolved_provider_observations.is_empty() {
+    if inventory.unresolved_provider_observations != UNRESOLVED_PROVIDER_OBSERVATIONS {
         return Err(reject(
             "E_PROVIDER_INFERENCE",
             "unresolved_provider_observations",
