@@ -10531,6 +10531,7 @@ mod lib_unit_tests {
         );
 
         let mut legacy_session = initialized_test_session(&server);
+        let notification_sender: NotificationSender = Arc::new(|_| {});
         let legacy = server
             .dispatch_request(
                 &Cx::for_testing(),
@@ -10543,7 +10544,7 @@ mod lib_unit_tests {
                     })),
                     81_i64,
                 ),
-                &Arc::new(|_| {}),
+                &notification_sender,
                 &test_request_sender(),
             )
             .expect("exact legacy tool call must respond through its original handler surface");
