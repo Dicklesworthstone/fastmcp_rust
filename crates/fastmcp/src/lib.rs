@@ -292,13 +292,14 @@ pub use fastmcp_transport::{event_store, http, memory};
 // FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
-    BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, HttpServerConfig,
-    InboundRequestContext, InboundRequestTransport, Middleware, MiddlewareDecision, MountResult,
-    NotificationSender, PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend,
-    ProxyCatalog, ProxyClient, RequestSender, ResourceHandler, Router, Server, ServerBuilder,
-    ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, ServerStats, Session,
-    StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolHandler,
-    TrafficVerbosity, TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalToolOutcome,
+    HttpServerConfig, InboundRequestContext, InboundRequestTransport, Middleware,
+    MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
+    ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog, ProxyClient,
+    RequestSender, ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint,
+    ServerHttpEndpointResponse, ServerHttpSession, ServerStats, Session, StaticTokenVerifier,
+    StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolHandler, TrafficVerbosity,
+    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
     create_context_with_progress, create_context_with_progress_and_senders,
 };
 
@@ -510,10 +511,10 @@ pub mod modern {
     };
     pub use fastmcp_server::{
         AuthProvider, AuthRequest, BidirectionalSenders, BoundHttpServer, BoxFuture,
-        CompletionHandler, HttpServerConfig, InboundRequestContext, InboundRequestTransport,
-        Middleware, MiddlewareDecision, MountResult, ProgressNotificationSender, PromptHandler,
-        ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint,
-        ServerHttpEndpointResponse, ServerHttpSession, TagFilters, ToolHandler,
+        CompletionHandler, FinalToolOutcome, HttpServerConfig, InboundRequestContext,
+        InboundRequestTransport, Middleware, MiddlewareDecision, MountResult,
+        ProgressNotificationSender, PromptHandler, ResourceHandler, Router, Server, ServerBuilder,
+        ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, TagFilters, ToolHandler,
         create_context_with_progress, create_context_with_progress_and_senders,
     };
     pub use fastmcp_transport::http::{
@@ -661,6 +662,7 @@ pub mod prelude {
         FinalReadResourceResult,
         FinalResourceUpdatedNotificationParams,
         FinalSubscriptionsAcknowledgedNotificationParams,
+        FinalToolOutcome,
         HttpEndpointBundle,
         HttpEndpointBundleError,
         HttpEndpointConfig,
@@ -977,6 +979,8 @@ mod tests {
         let _: Option<super::FinalSubscriptionsAcknowledgedNotificationParams> = None;
         let _: Option<super::ModernHttpClient> = None;
         let _: Option<super::MrtrExchangeRegistry> = None;
+        let _: Option<super::FinalToolOutcome> = None;
+        let _: Option<modern::FinalToolOutcome> = None;
         let _: Option<super::LegacySseHttpClient> = None;
         let mrtr_requests = modern::MrtrInputRequests::new([(
             "roots".to_owned(),
@@ -999,7 +1003,7 @@ mod tests {
             ClientNotification, Final2026Peer, FinalCancelledNotificationParams,
             FinalEmptyNotificationParams, FinalLogMessageParams, FinalNotificationError,
             FinalProgressNotificationParams, FinalResourceUpdatedNotificationParams,
-            FinalSubscriptionsAcknowledgedNotificationParams, ServerNotification,
+            FinalSubscriptionsAcknowledgedNotificationParams, FinalToolOutcome, ServerNotification,
         };
 
         let _: Option<ClientNotification> = None;
@@ -1012,6 +1016,7 @@ mod tests {
         let _: Option<FinalResourceUpdatedNotificationParams> = None;
         let _: Option<FinalEmptyNotificationParams> = None;
         let _: Option<FinalSubscriptionsAcknowledgedNotificationParams> = None;
+        let _: Option<FinalToolOutcome> = None;
     }
 
     #[test]
