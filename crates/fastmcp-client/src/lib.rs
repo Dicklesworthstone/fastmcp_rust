@@ -1640,123 +1640,234 @@ fn decode_response_payload<R: serde::de::DeserializeOwned>(
         .map_err(|_| McpError::internal_error(INVALID_RESPONSE_PAYLOAD_ERROR))
 }
 
-/// Projects one final icon collection to the one-icon legacy convenience
-/// surface without attempting to deserialize final component shapes as legacy
-/// wire values.
-fn final_icon_to_legacy(icons: Option<Vec<RawIcon>>) -> Option<fastmcp_protocol::Icon> {
-    icons
-        .and_then(|icons| icons.into_iter().next())
-        .map(|icon| fastmcp_protocol::Icon {
-            src: Some(icon.src.as_str().to_owned()),
-            mime_type: icon.mime_type,
-            sizes: icon.sizes.map(|sizes| sizes.join(" ")),
-        })
+/// Reports a final field that cannot be preserved by a legacy convenience
+/// projection.
+fn final_projection_error(field: &str) -> McpError {
+    McpError::invalid_request(format!(
+        "Final {field} cannot be represented by the legacy convenience API"
+    ))
 }
 
-fn final_tool_to_legacy(tool: fastmcp_protocol::FinalTool) -> Tool {
-    Tool {
+fn ensure_absent_final_field<T>(field: &str, value: Option<T>) -> McpResult<()> {
+    if value.is_some() {
+        return Err(final_projection_error(field));
+    }
+    Ok(())
+}
+
+fn ensure_empty_final_fields(
+    field: &str,
+    values: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> McpResult<()> {
+    if !values.is_empty() {
+        return Err(final_projection_error(field));
+    }
+    Ok(())
+}
+
+/// Final catalog cache hints with an immediate, private lifetime are
+/// observationally equivalent to the absence of cache hints in the legacy
+/// API. Any reusable or shared cache directive would otherwise be lost.
+fn ensure_legacy_cache_projection(
+    ttl_ms: u64,
+    cache_scope: fastmcp_protocol::CacheScope,
+) -> McpResult<()> {
+    if ttl_ms == 0 && cache_scope == fastmcp_protocol::CacheScope::Private {
+        return Ok(());
+    }
+    Err(final_projection_error("cache fields"))
+}
+
+/// A final icon collection, including its theme and per-icon metadata, has no
+/// exact counterpart in the legacy one-icon shape.
+fn final_icons_to_legacy(icons: Option<Vec<RawIcon>>) -> McpResult<Option<fastmcp_protocol::Icon>> {
+    ensure_absent_final_field("catalog icons", icons)?;
+    Ok(None)
+}
+
+fn final_tool_to_legacy(tool: fastmcp_protocol::FinalTool) -> McpResult<Tool> {
+    ensure_absent_final_field("catalog title", tool.title)?;
+    ensure_absent_final_field("catalog metadata", tool.meta)?;
+    let icon = final_icons_to_legacy(tool.icons)?;
+    let annotations = match tool.annotations {
+        Some(annotations) => {
+            ensure_absent_final_field("catalog annotation title", annotations.title)?;
+            Some(ToolAnnotations {
+                destructive: annotations.destructive,
+                idempotent: annotations.idempotent,
+                read_only: annotations.read_only,
+                open_world_hint: annotations.open_world_hint,
+            })
+        }
+        None => None,
+    };
+    Ok(Tool {
         name: tool.name,
         description: tool.description,
         input_schema: tool.input_schema,
         output_schema: tool.output_schema,
-        icon: final_icon_to_legacy(tool.icons),
+        icon,
         version: None,
         tags: Vec::new(),
-        annotations: tool.annotations.map(|annotations| ToolAnnotations {
-            destructive: annotations.destructive,
-            idempotent: annotations.idempotent,
-            read_only: annotations.read_only,
-            open_world_hint: annotations.open_world_hint,
-        }),
-    }
+        annotations,
+    })
 }
 
-fn final_resource_to_legacy(resource: fastmcp_protocol::FinalResource) -> Resource {
-    Resource {
+fn final_resource_to_legacy(resource: fastmcp_protocol::FinalResource) -> McpResult<Resource> {
+    ensure_absent_final_field("catalog title", resource.title)?;
+    ensure_absent_final_field("catalog annotations", resource.annotations)?;
+    ensure_absent_final_field("catalog size", resource.size)?;
+    ensure_absent_final_field("catalog metadata", resource.meta)?;
+    let icon = final_icons_to_legacy(resource.icons)?;
+    Ok(Resource {
         uri: resource.uri.as_str().to_owned(),
         name: resource.name,
         description: resource.description,
         mime_type: resource.mime_type,
-        icon: final_icon_to_legacy(resource.icons),
+        icon,
         version: None,
         tags: Vec::new(),
-    }
+    })
 }
 
 fn final_resource_template_to_legacy(
     template: fastmcp_protocol::FinalResourceTemplate,
-) -> ResourceTemplate {
-    ResourceTemplate {
+) -> McpResult<ResourceTemplate> {
+    ensure_absent_final_field("catalog title", template.title)?;
+    ensure_absent_final_field("catalog annotations", template.annotations)?;
+    ensure_absent_final_field("catalog metadata", template.meta)?;
+    let icon = final_icons_to_legacy(template.icons)?;
+    Ok(ResourceTemplate {
         uri_template: template.uri_template,
         name: template.name,
         description: template.description,
         mime_type: template.mime_type,
-        icon: final_icon_to_legacy(template.icons),
+        icon,
         version: None,
         tags: Vec::new(),
-    }
+    })
 }
 
-fn final_prompt_to_legacy(prompt: fastmcp_protocol::FinalPrompt) -> Prompt {
-    Prompt {
-        name: prompt.name,
-        description: prompt.description,
-        arguments: prompt
-            .arguments
-            .unwrap_or_default()
-            .into_iter()
-            .map(|argument| PromptArgument {
+fn final_prompt_to_legacy(prompt: fastmcp_protocol::FinalPrompt) -> McpResult<Prompt> {
+    ensure_absent_final_field("catalog title", prompt.title)?;
+    ensure_absent_final_field("catalog metadata", prompt.meta)?;
+    let icon = final_icons_to_legacy(prompt.icons)?;
+    let arguments = prompt
+        .arguments
+        .unwrap_or_default()
+        .into_iter()
+        .map(|argument| {
+            ensure_absent_final_field("prompt argument title", argument.title)?;
+            let required = argument
+                .required
+                .ok_or_else(|| final_projection_error("prompt argument required state"))?;
+            Ok(PromptArgument {
                 name: argument.name,
                 description: argument.description,
-                required: argument.required.unwrap_or(false),
+                required,
             })
-            .collect(),
-        icon: final_icon_to_legacy(prompt.icons),
+        })
+        .collect::<McpResult<Vec<_>>>()?;
+    Ok(Prompt {
+        name: prompt.name,
+        description: prompt.description,
+        arguments,
+        icon,
         version: None,
         tags: Vec::new(),
-    }
+    })
 }
 
-fn final_resource_content_to_legacy(resource: EmbeddedResourceContents) -> ResourceContent {
+fn final_resource_content_to_legacy(
+    resource: EmbeddedResourceContents,
+) -> McpResult<ResourceContent> {
     match resource {
         EmbeddedResourceContents::Text {
             uri,
             text,
             mime_type,
-        } => ResourceContent {
-            uri: uri.as_str().to_owned(),
-            mime_type,
-            text: Some(text),
-            blob: None,
-        },
+            meta,
+            additional,
+        } => {
+            ensure_absent_final_field("resource metadata", meta)?;
+            ensure_empty_final_fields("resource extension fields", &additional)?;
+            Ok(ResourceContent {
+                uri: uri.as_str().to_owned(),
+                mime_type,
+                text: Some(text),
+                blob: None,
+            })
+        }
         EmbeddedResourceContents::Blob {
             uri,
             blob,
             mime_type,
-        } => ResourceContent {
-            uri: uri.as_str().to_owned(),
-            mime_type,
-            text: None,
-            blob: Some(blob),
-        },
+            meta,
+            additional,
+        } => {
+            ensure_absent_final_field("resource metadata", meta)?;
+            ensure_empty_final_fields("resource extension fields", &additional)?;
+            Ok(ResourceContent {
+                uri: uri.as_str().to_owned(),
+                mime_type,
+                text: None,
+                blob: Some(blob),
+            })
+        }
     }
 }
 
 fn final_content_to_legacy(content: ContentBlock) -> McpResult<Content> {
     match content {
-        ContentBlock::Text { text, .. } => Ok(Content::Text { text }),
+        ContentBlock::Text {
+            text,
+            annotations,
+            meta,
+            additional,
+        } => {
+            ensure_absent_final_field("content annotations", annotations)?;
+            ensure_absent_final_field("content metadata", meta)?;
+            ensure_empty_final_fields("content extension fields", &additional)?;
+            Ok(Content::Text { text })
+        }
         ContentBlock::Image {
-            data, mime_type, ..
-        } => Ok(Content::Image { data, mime_type }),
+            data,
+            mime_type,
+            annotations,
+            meta,
+            additional,
+        } => {
+            ensure_absent_final_field("content annotations", annotations)?;
+            ensure_absent_final_field("content metadata", meta)?;
+            ensure_empty_final_fields("content extension fields", &additional)?;
+            Ok(Content::Image { data, mime_type })
+        }
         ContentBlock::Audio {
-            data, mime_type, ..
-        } => Ok(Content::Audio { data, mime_type }),
-        ContentBlock::Resource { resource, .. } => Ok(Content::Resource {
-            resource: final_resource_content_to_legacy(resource),
-        }),
-        ContentBlock::ResourceLink { .. } => Err(McpError::invalid_request(
-            "Final content cannot be represented by the legacy convenience API",
-        )),
+            data,
+            mime_type,
+            annotations,
+            meta,
+            additional,
+        } => {
+            ensure_absent_final_field("content annotations", annotations)?;
+            ensure_absent_final_field("content metadata", meta)?;
+            ensure_empty_final_fields("content extension fields", &additional)?;
+            Ok(Content::Audio { data, mime_type })
+        }
+        ContentBlock::Resource {
+            resource,
+            annotations,
+            meta,
+            additional,
+        } => {
+            ensure_absent_final_field("content annotations", annotations)?;
+            ensure_absent_final_field("content metadata", meta)?;
+            ensure_empty_final_fields("content extension fields", &additional)?;
+            Ok(Content::Resource {
+                resource: final_resource_content_to_legacy(resource)?,
+            })
+        }
+        ContentBlock::ResourceLink { .. } => Err(final_projection_error("resource_link content")),
     }
 }
 
@@ -1773,10 +1884,17 @@ fn convenience_tools_page(result: CoreResult) -> McpResult<(Vec<Tool>, Option<St
         }
         CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
             let fastmcp_protocol::FinalListToolsResult {
-                tools, next_cursor, ..
+                tools,
+                next_cursor,
+                ttl_ms,
+                cache_scope,
             } = result.payload;
+            ensure_legacy_cache_projection(ttl_ms, cache_scope)?;
             Ok((
-                tools.into_iter().map(final_tool_to_legacy).collect(),
+                tools
+                    .into_iter()
+                    .map(final_tool_to_legacy)
+                    .collect::<McpResult<Vec<_>>>()?,
                 next_cursor,
             ))
         }
@@ -1793,13 +1911,15 @@ fn convenience_resources_page(result: CoreResult) -> McpResult<(Vec<Resource>, O
             let fastmcp_protocol::FinalListResourcesResult {
                 resources,
                 next_cursor,
-                ..
+                ttl_ms,
+                cache_scope,
             } = result.payload;
+            ensure_legacy_cache_projection(ttl_ms, cache_scope)?;
             Ok((
                 resources
                     .into_iter()
                     .map(final_resource_to_legacy)
-                    .collect(),
+                    .collect::<McpResult<Vec<_>>>()?,
                 next_cursor,
             ))
         }
@@ -1818,13 +1938,15 @@ fn convenience_resource_templates_page(
             let fastmcp_protocol::FinalListResourceTemplatesResult {
                 resource_templates,
                 next_cursor,
-                ..
+                ttl_ms,
+                cache_scope,
             } = result.payload;
+            ensure_legacy_cache_projection(ttl_ms, cache_scope)?;
             Ok((
                 resource_templates
                     .into_iter()
                     .map(final_resource_template_to_legacy)
-                    .collect(),
+                    .collect::<McpResult<Vec<_>>>()?,
                 next_cursor,
             ))
         }
@@ -1841,10 +1963,15 @@ fn convenience_prompts_page(result: CoreResult) -> McpResult<(Vec<Prompt>, Optio
             let fastmcp_protocol::FinalListPromptsResult {
                 prompts,
                 next_cursor,
-                ..
+                ttl_ms,
+                cache_scope,
             } = result.payload;
+            ensure_legacy_cache_projection(ttl_ms, cache_scope)?;
             Ok((
-                prompts.into_iter().map(final_prompt_to_legacy).collect(),
+                prompts
+                    .into_iter()
+                    .map(final_prompt_to_legacy)
+                    .collect::<McpResult<Vec<_>>>()?,
                 next_cursor,
             ))
         }
@@ -1857,8 +1984,11 @@ fn convenience_tool_call(result: CoreResult) -> McpResult<CallToolResult> {
         CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => Ok(result),
         CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
             let fastmcp_protocol::FinalCallToolResult {
-                content, is_error, ..
+                content,
+                is_error,
+                structured_content,
             } = result.payload;
+            ensure_absent_final_field("structuredContent", structured_content)?;
             Ok(CallToolResult {
                 content: content
                     .into_iter()
@@ -1874,12 +2004,18 @@ fn convenience_tool_call(result: CoreResult) -> McpResult<CallToolResult> {
 fn convenience_resource_read(result: CoreResult) -> McpResult<Vec<ResourceContent>> {
     match result {
         CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => Ok(result.contents),
-        CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => Ok(result
-            .payload
-            .contents
-            .into_iter()
-            .map(final_resource_content_to_legacy)
-            .collect()),
+        CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => {
+            let fastmcp_protocol::FinalReadResourceResult {
+                contents,
+                ttl_ms,
+                cache_scope,
+            } = result.payload;
+            ensure_legacy_cache_projection(ttl_ms, cache_scope)?;
+            contents
+                .into_iter()
+                .map(final_resource_content_to_legacy)
+                .collect()
+        }
         _ => Err(unexpected_convenience_result("resources/read")),
     }
 }
@@ -1887,17 +2023,22 @@ fn convenience_resource_read(result: CoreResult) -> McpResult<Vec<ResourceConten
 fn convenience_prompt_get(result: CoreResult) -> McpResult<Vec<PromptMessage>> {
     match result {
         CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => Ok(result.messages),
-        CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) => result
-            .payload
-            .messages
-            .into_iter()
-            .map(|message| {
-                Ok(PromptMessage {
-                    role: message.role,
-                    content: final_content_to_legacy(message.content)?,
+        CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) => {
+            let fastmcp_protocol::FinalGetPromptResult {
+                description,
+                messages,
+            } = result.payload;
+            ensure_absent_final_field("prompt description", description)?;
+            messages
+                .into_iter()
+                .map(|message| {
+                    Ok(PromptMessage {
+                        role: message.role,
+                        content: final_content_to_legacy(message.content)?,
+                    })
                 })
-            })
-            .collect(),
+                .collect()
+        }
         _ => Err(unexpected_convenience_result("prompts/get")),
     }
 }
@@ -8984,19 +9125,19 @@ mod tests {
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r tools || exit 1; \
              case \"$tools\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[]}}}}' ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r resources || exit 1; \
              case \"$resources\" in *resources/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"resources\":[]}}}}' ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"resources\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r templates || exit 1; \
              case \"$templates\" in *resources/templates/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\",\"resourceTemplates\":[]}}}}' ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\",\"resourceTemplates\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r read_resource || exit 1; \
              case \"$read_resource\" in *resources/read*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{{\"resultType\":\"complete\",\"contents\":[]}}}}' ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{{\"resultType\":\"complete\",\"contents\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r prompts || exit 1; \
              case \"$prompts\" in *prompts/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{{\"resultType\":\"complete\",\"prompts\":[]}}}}' ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{{\"resultType\":\"complete\",\"prompts\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r get_prompt || exit 1; \
              case \"$get_prompt\" in *prompts/get*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"resultType\":\"complete\",\"messages\":[]}}}}' ;; *) exit 1 ;; esac; \
@@ -9298,7 +9439,7 @@ mod tests {
     #[test]
     fn clt_01_final_typed_client_result_positive() {
         let script = modern_typed_call_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"typed result"}],"isError":false}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"typed result","annotations":{"audience":["user"]},"_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}],"isError":false,"structuredContent":{"answer":"typed result"}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -9316,7 +9457,28 @@ mod tests {
         };
         assert!(diagnostic.is_none());
         assert!(!result.payload.is_error);
-        assert_eq!(result.payload.content.len(), 1);
+        assert_eq!(
+            result.payload.structured_content,
+            Some(serde_json::json!({"answer": "typed result"}))
+        );
+        let [
+            ContentBlock::Text {
+                text,
+                annotations,
+                meta,
+                additional,
+            },
+        ] = result.payload.content.as_slice()
+        else {
+            panic!("typed tools/call must retain the complete final content block");
+        };
+        assert_eq!(text, "typed result");
+        assert!(annotations.is_some());
+        assert!(meta.is_some());
+        assert_eq!(
+            additional.get("io.fastmcp.extension"),
+            Some(&serde_json::json!("retained"))
+        );
         client.close().expect("modern client cleanup");
     }
 
@@ -9324,7 +9486,7 @@ mod tests {
     #[test]
     fn clt_01_modern_convenience_tool_projects_final_content() {
         let script = modern_typed_call_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"convenience result","annotations":{"audience":["user"]}}],"isError":false}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"convenience result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -9346,10 +9508,61 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn clt_01_modern_convenience_tool_rejects_structured_content_loss() {
+        // This differs from the representable convenience result only in
+        // structuredContent.
+        let script = modern_typed_call_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"convenience result"}],"isError":false,"structuredContent":{"answer":"convenience result"}}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("same modern discovery initializes the public client");
+
+        let error = client
+            .call_tool("echo", serde_json::json!({"text": "convenience"}))
+            .expect_err("the legacy convenience API must not discard structuredContent");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(client.is_initialized());
+        assert!(client.responses.terminal_error().is_none());
+        client
+            .close()
+            .expect("local projection rejection leaves the client usable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_modern_convenience_tool_rejects_resource_link_loss() {
+        let script = modern_typed_call_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"resource_link","name":"manual","uri":"https://example.com/manual"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+
+        let error = client
+            .call_tool("echo", serde_json::json!({"text": "convenience"}))
+            .expect_err("the legacy convenience API cannot represent resource_link content");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(client.is_initialized());
+        client
+            .close()
+            .expect("local projection rejection leaves the client usable");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clt_01_modern_convenience_tool_null_discriminator_rejected() {
         // This differs from the accepted convenience result only in `resultType`.
         let script = modern_typed_call_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"convenience result","annotations":{"audience":["user"]}}],"isError":false}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"convenience result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -9553,7 +9766,7 @@ mod tests {
     #[test]
     fn clt_01_remaining_typed_list_result_positive() {
         let script = modern_typed_list_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[]}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -9574,11 +9787,158 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn clt_01_modern_convenience_list_projects_representable_catalog() {
+        let script = modern_typed_list_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"echo","description":"representable","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+
+        let tools = client
+            .list_tools()
+            .expect("neutral private cache hints and a representable catalog project exactly");
+        assert!(matches!(
+            tools.as_slice(),
+            [Tool { name, description, icon: None, .. }]
+                if name == "echo" && description.as_deref() == Some("representable")
+        ));
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_modern_convenience_list_rejects_cache_scope_loss() {
+        // This differs from the representable catalog only in cacheScope.
+        let script = modern_typed_list_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"echo","description":"representable","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"public"}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("same modern discovery initializes the public client");
+
+        let error = client
+            .list_tools()
+            .expect_err("the legacy convenience API cannot discard a public cache scope");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(client.is_initialized());
+        client
+            .close()
+            .expect("local projection rejection leaves the client usable");
+    }
+
+    #[test]
+    fn clt_01_final_catalog_projection_rejects_each_one_field_loss() {
+        let representable = serde_json::json!({
+            "uri": "file:///catalog.txt",
+            "name": "catalog",
+            "description": "representable",
+        });
+        let projected = final_resource_to_legacy(
+            serde_json::from_value::<fastmcp_protocol::FinalResource>(representable.clone())
+                .expect("representable final resource parses"),
+        )
+        .expect("representable final resource projects without loss");
+        assert_eq!(projected.name, "catalog");
+
+        for (field, value) in [
+            ("title", serde_json::json!("Catalog")),
+            ("annotations", serde_json::json!({"audience":["user"]})),
+            ("size", serde_json::json!(42)),
+            ("_meta", serde_json::json!({"io.fastmcp.retained":true})),
+            (
+                "icons",
+                serde_json::json!([{
+                    "src":"https://example.com/catalog.svg",
+                    "theme":"dark"
+                }]),
+            ),
+        ] {
+            let mut lossy = representable.clone();
+            lossy[field] = value;
+            let error = final_resource_to_legacy(
+                serde_json::from_value::<fastmcp_protocol::FinalResource>(lossy)
+                    .expect("one final-only field still parses as a final resource"),
+            )
+            .expect_err("one unrepresentable final catalog field must fail closed");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        }
+    }
+
+    #[test]
+    fn clt_01_final_content_projection_rejects_expanded_common_type_fields() {
+        let representable = serde_json::json!({
+            "type": "text",
+            "text": "representable",
+        });
+        assert!(
+            final_content_to_legacy(
+                serde_json::from_value::<ContentBlock>(representable.clone())
+                    .expect("representable final content parses"),
+            )
+            .is_ok()
+        );
+
+        for (field, value) in [
+            ("annotations", serde_json::json!({"audience":["user"]})),
+            ("_meta", serde_json::json!({"io.fastmcp.retained":true})),
+            ("io.fastmcp.extension", serde_json::json!("retained")),
+        ] {
+            let mut lossy = representable.clone();
+            lossy[field] = value;
+            let error = final_content_to_legacy(
+                serde_json::from_value::<ContentBlock>(lossy)
+                    .expect("one final-only content field still parses"),
+            )
+            .expect_err("one unrepresentable final content field must fail closed");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        }
+
+        let embedded_representable = serde_json::json!({
+            "type": "resource",
+            "resource": {
+                "uri": "file:///embedded.txt",
+                "text": "representable",
+            },
+        });
+        assert!(
+            final_content_to_legacy(
+                serde_json::from_value::<ContentBlock>(embedded_representable.clone())
+                    .expect("representable embedded resource parses"),
+            )
+            .is_ok()
+        );
+
+        for (field, value) in [
+            ("_meta", serde_json::json!({"io.fastmcp.retained":true})),
+            ("io.fastmcp.extension", serde_json::json!("retained")),
+        ] {
+            let mut lossy = embedded_representable.clone();
+            lossy["resource"][field] = value;
+            let error = final_content_to_legacy(
+                serde_json::from_value::<ContentBlock>(lossy)
+                    .expect("one final-only embedded resource field still parses"),
+            )
+            .expect_err("embedded final-only fields must fail closed");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clt_01_remaining_typed_list_null_discriminator_rejected() {
         // This differs from the accepted typed list result only in
         // `resultType`.
         let script = modern_typed_list_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"tools":[]}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -9754,7 +10114,7 @@ mod tests {
     #[test]
     fn clt_01_progress_client_result_positive() {
         let script = modern_progress_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"progress result","annotations":{"audience":["user"]}}],"isError":false}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -9788,7 +10148,7 @@ mod tests {
     fn clt_01_progress_client_result_null_discriminator_rejected() {
         // This differs from the accepted progress response only in `resultType`.
         let script = modern_progress_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"progress result","annotations":{"audience":["user"]}}],"isError":false}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
