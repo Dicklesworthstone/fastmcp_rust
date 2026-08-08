@@ -8062,6 +8062,7 @@ mod lib_unit_tests {
     use fastmcp_derive::tool;
     use fastmcp_protocol::{
         CallToolResult, CompletionValues, Content, FinalCompletionParams, LegacyCompletionParams,
+        LegacyContent,
     };
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -11962,7 +11963,7 @@ mod lib_unit_tests {
                     read_live_http_until(&mut stream, &mut received, expected_endpoint.as_bytes())
                         .await?;
                     caller_cx.cancel_with(CancelKind::User, Some("wildcard SSE complete"));
-                    Ok(())
+                    Ok::<(), String>(())
                 })
                 .map_err(|error| format!("wildcard SSE client admission failed: {error}"))?;
 
@@ -12409,10 +12410,11 @@ mod lib_unit_tests {
             )
         );
 
+        let legacy_session_id = session.legacy_session_id().to_owned();
         let post = |message: JsonRpcRequest| {
             HttpRequest::new(HttpMethod::Post, "/messages")
                 .with_header("content-type", "application/json")
-                .with_query("session_id", session.legacy_session_id())
+                .with_query("session_id", legacy_session_id.clone())
                 .with_body(serde_json::to_vec(&message).expect("legacy request must serialize"))
         };
         let initialize = JsonRpcRequest::new(
@@ -13509,7 +13511,7 @@ mod lib_unit_tests {
                 serde_json::from_value(result).expect("parse tool result payload");
             assert!(matches!(
                 tool_result.content.as_slice(),
-                [Content::Text { text }] if text == "principal-alpha"
+                [LegacyContent::Text { text, .. }] if text == "principal-alpha"
             ));
         }
 
@@ -13573,7 +13575,7 @@ mod lib_unit_tests {
                 serde_json::from_value(result).expect("parse tool result payload");
             assert!(!tool_result.is_error, "stateful tool unexpectedly errored");
             match tool_result.content.as_slice() {
-                [Content::Text { text }] => text.clone(),
+                [LegacyContent::Text { text, .. }] => text.clone(),
                 other => panic!("expected single text tool result, got {other:?}"),
             }
         };
@@ -13728,7 +13730,7 @@ mod lib_unit_tests {
         let tool_result: CallToolResult =
             serde_json::from_value(result).expect("parse tool result payload");
         match tool_result.content.as_slice() {
-            [Content::Text { text }] => assert_eq!(text, "principal-beta"),
+            [LegacyContent::Text { text, .. }] => assert_eq!(text, "principal-beta"),
             other => panic!("expected single text tool result, got {other:?}"),
         }
 
@@ -13794,7 +13796,7 @@ mod lib_unit_tests {
         let tool_result: CallToolResult =
             serde_json::from_value(result).expect("parse tool result payload");
         match tool_result.content.as_slice() {
-            [Content::Text { text }] => assert_eq!(text, "anonymous"),
+            [LegacyContent::Text { text, .. }] => assert_eq!(text, "anonymous"),
             other => panic!("expected single text tool result, got {other:?}"),
         }
     }
@@ -13851,7 +13853,7 @@ mod lib_unit_tests {
         let tool_result: CallToolResult =
             serde_json::from_value(result).expect("parse tool result payload");
         match tool_result.content.as_slice() {
-            [Content::Text { text }] => assert_eq!(text, "anonymous"),
+            [LegacyContent::Text { text, .. }] => assert_eq!(text, "anonymous"),
             other => panic!("expected single text tool result, got {other:?}"),
         }
     }
@@ -14074,7 +14076,7 @@ mod lib_unit_tests {
             .expect("tool call should succeed");
 
         match result.content.as_slice() {
-            [Content::Text { text }] => assert_eq!(text, "alpha"),
+            [LegacyContent::Text { text, .. }] => assert_eq!(text, "alpha"),
             other => panic!("expected single text tool result, got {other:?}"),
         }
     }
@@ -14434,7 +14436,7 @@ mod lib_unit_tests {
         .expect("decode nested tool result");
 
         match result.content.as_slice() {
-            [Content::Text { text }] => assert_eq!(text, "inner-result"),
+            [LegacyContent::Text { text, .. }] => assert_eq!(text, "inner-result"),
             other => panic!("expected nested tool text result, got {other:?}"),
         }
     }
