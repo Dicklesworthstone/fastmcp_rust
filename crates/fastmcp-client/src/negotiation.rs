@@ -144,8 +144,10 @@ impl ClientHttpNegotiation {
             return Err(ClientHttpNegotiationError::ModernProbeAlreadyDispatched);
         }
 
-        let decision = self.preflight_probe(probe)?;
+        // The observation proves that the one permitted probe was already
+        // sent, including when its response cannot select either era.
         self.state.probe_dispatched = true;
+        let decision = self.preflight_probe(probe)?;
 
         match decision {
             ClientHttpNegotiationDecision::ModernSelected => {
@@ -171,8 +173,7 @@ impl ClientHttpNegotiation {
             ProtocolPolicy::LegacyOnly => {
                 Err(ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly)
             }
-            ProtocolPolicy::ModernOnly => Ok(ClientHttpNegotiationDecision::ModernSelected),
-            ProtocolPolicy::Auto
+            ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto
                 if matches!(probe.body, HttpProbeBody::RecognizedModernJsonRpc) =>
             {
                 Ok(ClientHttpNegotiationDecision::ModernSelected)
@@ -186,15 +187,70 @@ impl ClientHttpNegotiation {
             {
                 Ok(ClientHttpNegotiationDecision::LegacySseFallbackAuthorized)
             }
-            ProtocolPolicy::Auto if matches!(probe.body, HttpProbeBody::TransportFailure) => {
+            ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto
+                if matches!(probe.body, HttpProbeBody::TransportFailure) =>
+            {
                 Err(ClientHttpNegotiationError::ModernProbeTransportFailure)
             }
-            ProtocolPolicy::Auto => Err(
+            ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto => Err(
                 ClientHttpNegotiationError::ModernProbeRejectedWithoutLegacyFallback {
                     status: probe.status,
                     body: probe.body,
                 },
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastmcp_core::CanonicalHttpUrl;
+
+    fn modern_only_plan() -> ClientProtocolPlan {
+        ClientProtocolPlan::http(
+            ProtocolPolicy::ModernOnly,
+            Some(CanonicalHttpUrl::parse("https://api.example.test/mcp").unwrap()),
+            None,
+            None,
+            "credential-partition".to_owned(),
+            "security-partition".to_owned(),
+            "http-test".to_owned(),
+            1,
+            1,
+            1,
+        )
+        .expect("a modern-only plan needs only its modern target")
+    }
+
+    #[test]
+    fn modern_only_rejects_one_unrecognized_probe_without_selecting_or_retrying() {
+        let mut negotiation = ClientHttpNegotiation::from_protocol_plan(&modern_only_plan())
+            .expect("the configured plan creates a negotiation attempt");
+
+        let error = negotiation
+            .observe_modern_probe(HttpModernProbe {
+                status: 404,
+                body: HttpProbeBody::Unrecognized,
+            })
+            .expect_err("changing only the probe body must not select modern");
+
+        assert_eq!(
+            error,
+            ClientHttpNegotiationError::ModernProbeRejectedWithoutLegacyFallback {
+                status: 404,
+                body: HttpProbeBody::Unrecognized,
+            }
+        );
+        assert!(negotiation.state().probe_dispatched());
+        assert_eq!(negotiation.state().selected_era(), None);
+        assert!(!negotiation.state().legacy_sse_fallback_authorized());
+        assert_eq!(
+            negotiation.observe_modern_probe(HttpModernProbe {
+                status: 200,
+                body: HttpProbeBody::RecognizedModernJsonRpc,
+            }),
+            Err(ClientHttpNegotiationError::ModernProbeAlreadyDispatched)
+        );
     }
 }

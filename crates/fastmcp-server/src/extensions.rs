@@ -14,7 +14,7 @@ use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::extensions::{
     ExtensionDispatchError, ExtensionRegistryError, MAX_EXTENSION_MEMBER_NAME_BYTES,
     NegotiatedExtensionSet, ServerExtensionDiscovery, official_mcp_apps_empty_server_settings,
-    register_official_mcp_apps_extension,
+    register_official_mcp_apps_extension, validate_official_mcp_apps_server_settings,
 };
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
@@ -315,6 +315,17 @@ impl ExtensionHandlerRegistry {
         self.server_metadata.len()
     }
 
+    /// Returns server metadata registered alongside descriptors before freeze.
+    ///
+    /// The live server runtime merges this snapshot with caller-supplied
+    /// discovery before it derives local extension enablement. The public
+    /// [`Self::server_discovery`] surface remains frozen-only.
+    pub(crate) fn configured_server_discovery(&self) -> ServerExtensionDiscovery {
+        ServerExtensionDiscovery {
+            extensions: self.server_metadata.clone(),
+        }
+    }
+
     /// Registers the exact server discovery settings for one extension.
     ///
     /// This is intentionally separate from request-handler registration: an
@@ -334,6 +345,10 @@ impl ExtensionHandlerRegistry {
             return Err(ExtensionHandlerRegistrationError::UnregisteredExtension(
                 extension_id.to_string(),
             ));
+        }
+        if extension_id == fastmcp_protocol::official_mcp_apps_extension_id() {
+            validate_official_mcp_apps_server_settings(&settings)
+                .map_err(ExtensionHandlerRegistrationError::Registry)?;
         }
         if self.server_metadata.contains_key(&extension_id) {
             return Err(ExtensionHandlerRegistrationError::DuplicateServerMetadata(
@@ -428,10 +443,11 @@ impl ExtensionHandlerRegistry {
 
     /// Freezes this registry and returns its matching discovery metadata.
     ///
-    /// This is the preferred handoff to
-    /// [`ServerBuilder::extension_registry`](crate::ServerBuilder::extension_registry):
-    /// the returned receipt, metadata, and handler registry all share one
-    /// immutable descriptor revision.
+    /// Use this after extension composition is complete to inspect one frozen
+    /// descriptor receipt with its matching metadata. During builder
+    /// composition, [`ServerBuilder::extension_registry`](crate::ServerBuilder::extension_registry)
+    /// derives registered metadata directly so later official Tasks installation
+    /// remains mutable.
     pub fn freeze_with_server_discovery(
         &mut self,
     ) -> Result<(ExtensionRegistryReceipt, ServerExtensionDiscovery), ExtensionRegistryError> {
@@ -444,9 +460,8 @@ impl ExtensionHandlerRegistry {
 
     /// Returns the server discovery data bound to this frozen registry.
     ///
-    /// Callers pass this value to the server builder together with this same
-    /// registry. Requiring the shared frozen state prevents server metadata
-    /// from being assembled from a descriptor set that can still change.
+    /// This frozen diagnostic/export surface is separate from builder-time
+    /// composition, which snapshots registered metadata before freeze.
     pub fn server_discovery(
         &self,
     ) -> Result<ServerExtensionDiscovery, ExtensionHandlerLookupError> {
@@ -530,8 +545,9 @@ mod tests {
     use asupersync::Cx;
     use fastmcp_core::{McpContext, McpErrorCode, McpResult};
     use fastmcp_protocol::extensions::{
-        ClientExtensionDiscovery, ExtensionLocalEnablement, ExtensionSettings,
-        ServerExtensionDiscovery, official_tasks_empty_settings, register_official_tasks_extension,
+        ClientExtensionDiscovery, ExtensionLocalEnablement, ExtensionRegistryError,
+        ExtensionSettings, ServerExtensionDiscovery, official_mcp_apps_empty_server_settings,
+        official_tasks_empty_settings, register_official_tasks_extension,
     };
     use fastmcp_protocol::protocol_policy::ProtocolEra;
     use fastmcp_protocol::{ExtensionDescriptorRegistry, ExtensionId};
@@ -698,6 +714,34 @@ mod tests {
             handlers.descriptor_registry().descriptor(&apps_id),
             Some(&fastmcp_protocol::official_mcp_apps_descriptor())
         );
+    }
+
+    #[test]
+    fn manually_registered_official_apps_metadata_requires_the_empty_marker() {
+        let mut descriptors = ExtensionDescriptorRegistry::new();
+        let apps_id = fastmcp_protocol::register_official_mcp_apps_extension(&mut descriptors)
+            .expect("the official Apps descriptor registers");
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+        let rejected = ExtensionSettings::new(json!({ "unexpected": true }))
+            .expect("the one-field alternate is generic extension metadata");
+
+        assert_eq!(
+            handlers.register_server_metadata(apps_id.clone(), rejected),
+            Err(ExtensionHandlerRegistrationError::Registry(
+                ExtensionRegistryError::OfficialMcpAppsServerSettingsNotEmpty
+            )),
+            "only the non-empty official Apps marker is rejected"
+        );
+        assert_eq!(
+            handlers.server_metadata_len(),
+            0,
+            "the rejected marker cannot be retained for later builder composition"
+        );
+
+        handlers
+            .register_server_metadata(apps_id, official_mcp_apps_empty_server_settings())
+            .expect("the exact empty official Apps marker remains accepted");
+        assert_eq!(handlers.server_metadata_len(), 1);
     }
 
     #[test]

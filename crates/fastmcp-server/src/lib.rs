@@ -88,7 +88,7 @@ pub use auth::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, StaticTokenVerifier, TokenAuthProvider,
     TokenVerifier,
 };
-pub use builder::ServerBuilder;
+pub use builder::{ServerBuilder, ServerLaunchPolicyError};
 pub use extensions::{
     ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
     ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
@@ -114,7 +114,8 @@ use session::{
     SubscriptionRemovalError,
 };
 pub use tasks::{
-    FinalTaskNotificationEmitter, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskStore,
+    DEFAULT_IN_MEMORY_FINAL_TASKS, FinalTaskNotificationEmitter, FinalTaskRuntime,
+    FinalTaskRuntimeConfig, FinalTaskStore, InMemoryFinalTaskStore,
 };
 #[cfg(test)]
 pub(crate) use tasks::{SharedTaskManager, TaskManager};
@@ -161,7 +162,7 @@ use fastmcp_core::{
 use fastmcp_protocol::common_types::{Implementation, OpenMetadata};
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, ExtensionNegotiationError, ExtensionSettingsCompatibilityResolver,
-    ExtensionSettingsResolution,
+    ExtensionSettingsResolution, McpAppsNegotiationResolver, TasksNegotiationResolver,
 };
 use fastmcp_protocol::methods::{
     Legacy2024ListChangedCapability, Legacy2024ResourcesCapability, Legacy2024ServerCapabilities,
@@ -222,6 +223,10 @@ pub enum ServerExtensionConfigurationError {
     AlreadyInstalled,
     /// Final Tasks was configured more than once for the same server.
     FinalTasksAlreadyInstalled,
+    /// Official MCP Apps was configured more than once for the same server.
+    OfficialMcpAppsAlreadyInstalled,
+    /// Caller discovery contradicts descriptor-bound server metadata.
+    ConflictingServerMetadata(String),
     /// Discovery attempted to advertise an identifier absent from the registry.
     UnregisteredAdvertisedExtension(String),
     /// The descriptor registry could not be frozen into a canonical receipt.
@@ -240,6 +245,15 @@ impl std::fmt::Display for ServerExtensionConfigurationError {
             }
             Self::FinalTasksAlreadyInstalled => {
                 formatter.write_str("the final Tasks extension is already installed")
+            }
+            Self::OfficialMcpAppsAlreadyInstalled => {
+                formatter.write_str("the official MCP Apps extension is already installed")
+            }
+            Self::ConflictingServerMetadata(id) => {
+                write!(
+                    formatter,
+                    "server discovery contradicts registered metadata: {id}"
+                )
             }
             Self::UnregisteredAdvertisedExtension(id) => {
                 write!(
@@ -267,6 +281,8 @@ impl std::error::Error for ServerExtensionConfigurationError {
             Self::Handler(error) => Some(error),
             Self::AlreadyInstalled
             | Self::FinalTasksAlreadyInstalled
+            | Self::OfficialMcpAppsAlreadyInstalled
+            | Self::ConflictingServerMetadata(_)
             | Self::UnregisteredAdvertisedExtension(_)
             | Self::ResolverPoisoned => None,
         }
@@ -341,12 +357,28 @@ pub(crate) struct ServerExtensionRuntime {
 impl ServerExtensionRuntime {
     pub(crate) fn new<R>(
         handlers: ExtensionHandlerRegistry,
-        server_discovery: ServerExtensionDiscovery,
+        mut server_discovery: ServerExtensionDiscovery,
         resolver: R,
     ) -> Result<Self, ServerExtensionConfigurationError>
     where
         R: ExtensionSettingsCompatibilityResolver + Send + 'static,
     {
+        let registered_discovery = handlers.configured_server_discovery();
+        for (id, settings) in registered_discovery.extensions {
+            match server_discovery.extensions.get(&id) {
+                Some(existing) if existing != &settings => {
+                    return Err(
+                        ServerExtensionConfigurationError::ConflictingServerMetadata(
+                            id.to_string(),
+                        ),
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    server_discovery.extensions.insert(id, settings);
+                }
+            }
+        }
         for id in server_discovery.extensions.keys() {
             if handlers.descriptor_registry().descriptor(id).is_none() {
                 return Err(
@@ -369,12 +401,40 @@ impl ServerExtensionRuntime {
             local_enablement.enable(id.clone());
         }
 
+        let resolver = BoxedExtensionSettingsResolver(Box::new(resolver));
+        let apps_id = fastmcp_protocol::extensions::official_mcp_apps_extension_id();
+        let resolver = if server_discovery.extensions.contains_key(&apps_id) {
+            BoxedExtensionSettingsResolver(Box::new(McpAppsNegotiationResolver::with_fallback(
+                resolver,
+            )))
+        } else {
+            resolver
+        };
+
         Ok(Self {
             handlers,
             local_enablement,
             server_discovery,
-            resolver: Mutex::new(BoxedExtensionSettingsResolver(Box::new(resolver))),
+            resolver: Mutex::new(resolver),
         })
+    }
+
+    pub(crate) fn with_official_mcp_apps() -> Result<Self, ServerExtensionConfigurationError> {
+        let handlers = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
+        let mut runtime = Self::new(
+            handlers,
+            ServerExtensionDiscovery::default(),
+            |descriptor: &ExtensionDescriptor,
+             _client: &ExtensionSettings,
+             _server: &ExtensionSettings|
+             -> Result<ExtensionSettings, ExtensionNegotiationError> {
+                Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                    descriptor.id.to_string(),
+                ))
+            },
+        )?;
+        runtime.install_official_mcp_apps()?;
+        Ok(runtime)
     }
 
     pub(crate) fn with_final_tasks(
@@ -473,7 +533,7 @@ impl ServerExtensionRuntime {
             .resolver
             .get_mut()
             .map_err(|_| ServerExtensionConfigurationError::ResolverPoisoned)?;
-        let mut previous = std::mem::replace(
+        let previous = std::mem::replace(
             resolver,
             BoxedExtensionSettingsResolver(Box::new(
                 |descriptor: &ExtensionDescriptor,
@@ -487,16 +547,55 @@ impl ServerExtensionRuntime {
             )),
         );
         *resolver = BoxedExtensionSettingsResolver(Box::new(
-            move |descriptor: &ExtensionDescriptor,
-                  client: &ExtensionSettings,
-                  server: &ExtensionSettings|
-                  -> Result<ExtensionSettings, ExtensionNegotiationError> {
-                if descriptor.id == tasks_id {
-                    Ok(fastmcp_protocol::extensions::official_tasks_empty_settings())
-                } else {
-                    previous.resolve(descriptor, client, server)
-                }
-            },
+            TasksNegotiationResolver::with_fallback(previous),
+        ));
+        Ok(())
+    }
+
+    /// Merges the official MCP Apps descriptor, its exact empty discovery
+    /// marker, and its disposition-preserving resolver branch into this
+    /// still-mutable runtime.
+    pub(crate) fn install_official_mcp_apps(
+        &mut self,
+    ) -> Result<(), ServerExtensionConfigurationError> {
+        let apps_id = fastmcp_protocol::extensions::official_mcp_apps_extension_id();
+        if self
+            .handlers
+            .descriptor_registry()
+            .descriptor(&apps_id)
+            .is_some()
+            || self.server_discovery.extensions.contains_key(&apps_id)
+        {
+            return Err(ServerExtensionConfigurationError::OfficialMcpAppsAlreadyInstalled);
+        }
+        self.handlers
+            .install_official_mcp_apps()
+            .map_err(ServerExtensionConfigurationError::Handler)?;
+        self.server_discovery.extensions.insert(
+            apps_id.clone(),
+            fastmcp_protocol::extensions::official_mcp_apps_empty_server_settings(),
+        );
+        self.local_enablement.enable(apps_id);
+
+        let resolver = self
+            .resolver
+            .get_mut()
+            .map_err(|_| ServerExtensionConfigurationError::ResolverPoisoned)?;
+        let previous = std::mem::replace(
+            resolver,
+            BoxedExtensionSettingsResolver(Box::new(
+                |descriptor: &ExtensionDescriptor,
+                 _client: &ExtensionSettings,
+                 _server: &ExtensionSettings|
+                 -> Result<ExtensionSettings, ExtensionNegotiationError> {
+                    Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                        descriptor.id.to_string(),
+                    ))
+                },
+            )),
+        );
+        *resolver = BoxedExtensionSettingsResolver(Box::new(
+            McpAppsNegotiationResolver::with_fallback(previous),
         ));
         Ok(())
     }
@@ -735,6 +834,16 @@ fn final_client_extension_discovery(
         parsed.insert(id, settings);
     }
     Ok(ClientExtensionDiscovery { extensions: parsed })
+}
+
+fn require_exact_modern_extension_metadata(request: &JsonRpcRequest) -> McpResult<()> {
+    if modern_protocol_version(request) == Some(MODERN_PROTOCOL_VERSION) {
+        Ok(())
+    } else {
+        Err(McpError::invalid_request(
+            "Extension requests require the admitted MCP 2026-07-28 protocol version",
+        ))
+    }
 }
 
 fn lock_http_session(session: &Mutex<Session>) -> std::sync::MutexGuard<'_, Session> {
@@ -2598,6 +2707,8 @@ impl Server {
         self,
         legacy_origin: impl Into<String>,
     ) -> Result<ServerHttpEndpoint, DualEraHttpEndpointError> {
+        self.ensure_launch_policy_is_valid()
+            .map_err(|error| DualEraHttpEndpointError::InvalidConfiguration(error.to_string()))?;
         let endpoint = ServerHttpEndpoint {
             server: Arc::new(self),
             legacy_origin: legacy_origin.into(),
@@ -2614,6 +2725,7 @@ impl Server {
     /// authority from the client's `Host` header, with the resolved local
     /// address as the fallback for direct embeddings.
     pub async fn bind_http(self, cx: &Cx, addr: impl Into<String>) -> McpResult<BoundHttpServer> {
+        self.ensure_launch_policy_is_valid()?;
         if cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
@@ -2741,8 +2853,7 @@ impl ServerHttpSession {
         cx: &Cx,
         endpoint_response: DualEraHttpEndpointResponse,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
-        let mut request = self.endpoint_session.recv_modern_request(cx)?;
-        remove_modern_protocol_metadata(&mut request);
+        let request = self.endpoint_session.recv_modern_request(cx)?;
         let inbound = InboundRequestContext::new(
             cx.clone(),
             request_id_to_u64(request.id.as_ref()),
@@ -2811,8 +2922,7 @@ impl ServerHttpSession {
         let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
             return self.handle_modern(cx, endpoint_response).map(Err);
         };
-        let mut request = self.endpoint_session.recv_modern_request(cx)?;
-        remove_modern_protocol_metadata(&mut request);
+        let request = self.endpoint_session.recv_modern_request(cx)?;
         Ok(Ok((request, sse)))
     }
 
@@ -3281,7 +3391,26 @@ async fn serve_http_connection(
         }
     }
     if !is_legacy_sse {
-        let response = dispatch_http_request(cx, &endpoint, &legacy_sessions, request);
+        let request_endpoint = Arc::clone(&endpoint);
+        let request_legacy_sessions = Arc::clone(&legacy_sessions);
+        let mut dispatch = match cx.spawn_blocking(move |request_cx| {
+            dispatch_http_request(
+                &request_cx,
+                &request_endpoint,
+                &request_legacy_sessions,
+                request,
+            )
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(_) => {
+                let _ = send_h1_response(&mut framed, HttpResponse::internal_error()).await;
+                return;
+            }
+        };
+        let response = match dispatch.join(cx).await {
+            Ok(response) => response,
+            Err(_) => HttpResponse::internal_error(),
+        };
         let _ = send_h1_response(&mut framed, response).await;
         return;
     }
@@ -3366,6 +3495,9 @@ pub struct Server {
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy selected by [`ServerBuilder`].
     protocol_policy: ProtocolPolicy,
+    /// Malformed reserved launch policy retained by the infallible builder so
+    /// every runtime entry point can reject startup before I/O begins.
+    launch_policy_error: Option<ServerLaunchPolicyError>,
     /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
     /// Frozen modern-only extension descriptors, handlers, and resolver.
@@ -3409,6 +3541,13 @@ impl Server {
     #[must_use]
     pub const fn protocol_policy(&self) -> ProtocolPolicy {
         self.protocol_policy
+    }
+
+    fn ensure_launch_policy_is_valid(&self) -> McpResult<()> {
+        match self.launch_policy_error {
+            Some(error) => Err(McpError::invalid_request(error.to_string())),
+            None => Ok(()),
+        }
     }
 
     /// Returns the installed frozen extension handler registry, if configured.
@@ -3616,6 +3755,11 @@ impl Server {
         extension_id: &ExtensionId,
         request: &JsonRpcRequest,
     ) -> McpResult<serde_json::Value> {
+        // Keep the exact metadata available for modern admission and
+        // negotiation, but never expose the transport-owned version marker to
+        // extension handlers.
+        let mut request = request.clone();
+        remove_modern_protocol_metadata(&mut request);
         let runtime = self
             .extension_runtime
             .as_deref()
@@ -3656,6 +3800,7 @@ impl Server {
         negotiated: &fastmcp_protocol::extensions::NegotiatedExtensionSet,
         request: &JsonRpcRequest,
     ) -> McpResult<serde_json::Value> {
+        require_exact_modern_extension_metadata(request)?;
         let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
             return Err(McpError::method_not_found(&request.method));
         };
@@ -3677,11 +3822,7 @@ impl Server {
         // shaped like an extension call reach either negotiation or an
         // extension handler: admission requires the exact final-era marker
         // carried by the current request.
-        if modern_protocol_version(request) != Some(MODERN_PROTOCOL_VERSION) {
-            return Err(McpError::invalid_request(
-                "Extension requests require the admitted MCP 2026-07-28 protocol version",
-            ));
-        }
+        require_exact_modern_extension_metadata(request)?;
         let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
             return Err(McpError::method_not_found(&request.method));
         };
@@ -3956,12 +4097,19 @@ impl Server {
             }
         };
 
+        // The protocol-version marker is part of typed modern admission. Once
+        // that admission has completed, keep the marker out of application
+        // middleware and handler parameter decoding just as stdio does.
+        let admission_request = request.clone();
+        let mut request = admission_request.clone();
+        remove_modern_protocol_metadata(&mut request);
+
         let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
         let result: McpResult<serde_json::Value> = (|| {
             for middleware in self.middleware.iter() {
                 Self::enforce_request_context(&request_ctx)?;
                 entered_middleware.push(middleware.as_ref());
-                match catch_extension_unwind(|| middleware.on_request(&request_ctx, request)) {
+                match catch_extension_unwind(|| middleware.on_request(&request_ctx, &request)) {
                     Ok(Ok(MiddlewareDecision::Continue)) => {}
                     Ok(Ok(MiddlewareDecision::Respond(value))) => return Ok(value),
                     Ok(Err(error)) => return Err(error),
@@ -3969,7 +4117,7 @@ impl Server {
                 }
             }
             if request.method == SERVER_DISCOVER_METHOD {
-                let params = request
+                let params = admission_request
                     .params
                     .clone()
                     .unwrap_or_else(|| serde_json::json!({}));
@@ -3977,9 +4125,9 @@ impl Server {
                     .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 serde_json::to_value(self.server_discovery()?).map_err(McpError::from)
             } else {
-                match self.router.dispatch_stateless(&request_ctx, request) {
+                match self.router.dispatch_stateless(&request_ctx, &request) {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
-                        self.dispatch_extension_fallback(&request_ctx, request)
+                        self.dispatch_extension_fallback(&request_ctx, &admission_request)
                     }
                     result => result,
                 }
@@ -3987,19 +4135,19 @@ impl Server {
         })();
         let result = match result {
             Ok(value) => self
-                .apply_middleware_response(&entered_middleware, &request_ctx, request, value)
+                .apply_middleware_response(&entered_middleware, &request_ctx, &request, value)
                 .and_then(|value| {
                     validate_final_core_middleware_response(
                         final_core_request.as_ref(),
-                        request,
+                        &request,
                         value,
                     )
                 })
                 .map_err(|error| {
-                    self.apply_middleware_error(&entered_middleware, &request_ctx, request, error)
+                    self.apply_middleware_error(&entered_middleware, &request_ctx, &request, error)
                 }),
             Err(error) => {
-                Err(self.apply_middleware_error(&entered_middleware, &request_ctx, request, error))
+                Err(self.apply_middleware_error(&entered_middleware, &request_ctx, &request, error))
             }
         };
         let result = Self::request_context_error(&request_ctx).map_or(result, Err);
@@ -4597,6 +4745,11 @@ impl Server {
         request: &JsonRpcRequest,
         request_cancellation: Option<McpRequestCancellation>,
     ) -> Option<JsonRpcResponse> {
+        if matches!(policy, ProtocolPolicy::LegacyOnly)
+            && modern_protocol_version(request).is_some()
+        {
+            return protocol_era_refusal(request);
+        }
         if matches!(policy, ProtocolPolicy::ModernOnly)
             && request.method == "initialize"
             && request.validate().is_ok()
@@ -4630,12 +4783,14 @@ impl Server {
         inbound: &InboundRequestContext,
         request: &JsonRpcRequest,
     ) -> HttpResponse {
-        let is_modern_only_initialize = matches!(policy, ProtocolPolicy::ModernOnly)
-            && request.method == "initialize"
-            && request.validate().is_ok()
-            && inbound.request_id() == request_id_to_u64(request.id.as_ref());
+        let is_cross_era_request = (matches!(policy, ProtocolPolicy::LegacyOnly)
+            && modern_protocol_version(request).is_some())
+            || (matches!(policy, ProtocolPolicy::ModernOnly)
+                && request.method == "initialize"
+                && request.validate().is_ok()
+                && inbound.request_id() == request_id_to_u64(request.id.as_ref()));
         match self.dispatch_with_protocol_policy(policy, inbound, request) {
-            Some(response) if is_modern_only_initialize => {
+            Some(response) if is_cross_era_request => {
                 HttpResponse::new(HttpStatus::BAD_REQUEST).with_json(&response)
             }
             Some(response) => HttpResponse::ok().with_json(&response),
@@ -4834,6 +4989,10 @@ impl Server {
     }
 
     fn run_stdio_pump(self, cx: &Cx, dispatch_cx: &Cx) -> i32 {
+        if let Err(error) = self.ensure_launch_policy_is_valid() {
+            log::error!(target: "fastmcp_rust::server", "Server startup rejected: {error}");
+            return 1;
+        }
         // Initialize rich logging first, before any log output
         self.init_rich_logging();
 
@@ -4999,6 +5158,7 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
+        self.ensure_launch_policy_is_valid()?;
         self.init_rich_logging();
 
         let shared = SharedTransport::new(transport);
@@ -5069,6 +5229,7 @@ impl Server {
         R: TransportRecvHalf + Send + 'static,
         S: TransportSendHalf + 'static,
     {
+        self.ensure_launch_policy_is_valid()?;
         self.init_rich_logging();
         let recv_half = SharedRecvHalf::new(recv_half);
         let send_half = SharedSendHalf::new(send_half);
@@ -6241,7 +6402,7 @@ impl Server {
                         }
                     }
                 }
-                JsonRpcMessage::Request(mut request) => {
+                JsonRpcMessage::Request(request) => {
                     if request.validate().is_err() {
                         if send_invalid_request(&send, cx, request.id).is_err() {
                             exit_code = 1;
@@ -6321,9 +6482,6 @@ impl Server {
                             },
                         }
                     };
-                    if matches!(era, ProtocolEra::Modern2026) {
-                        remove_modern_protocol_metadata(&mut request);
-                    }
                     let request_id = request.id.clone();
                     if let Some(id) = request_id.as_ref()
                         && (server.request_id_is_active(session_id, id) || !queue_state.admit(id))
@@ -6886,7 +7044,7 @@ impl Server {
 
             // Handle the message
             let response_opt = match message {
-                JsonRpcMessage::Request(mut request) => {
+                JsonRpcMessage::Request(request) => {
                     if request.validate().is_err() {
                         if send_invalid_request(&send, cx, request.id).is_err() {
                             self.graceful_shutdown(1);
@@ -6968,7 +7126,6 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
-                        remove_modern_protocol_metadata(&mut request);
                         let inbound = InboundRequestContext::new(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
@@ -7225,7 +7382,7 @@ impl Server {
 
             // Handle the message
             let response_opt = match message {
-                JsonRpcMessage::Request(mut request) => {
+                JsonRpcMessage::Request(request) => {
                     if request.validate().is_err() {
                         if let Err(send_error) = send_invalid_request(&send, cx, request.id) {
                             self.graceful_shutdown_returning();
@@ -7323,7 +7480,6 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
-                        remove_modern_protocol_metadata(&mut request);
                         let inbound = InboundRequestContext::new(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
@@ -9946,7 +10102,8 @@ mod lib_unit_tests {
     use asupersync::runtime::reactor::create_reactor;
     use fastmcp_derive::tool;
     use fastmcp_protocol::extensions::{
-        ExtensionNegotiationError, official_tasks_empty_settings, register_official_tasks_extension,
+        ExtensionInactiveReason, ExtensionNegotiationError, McpAppsClientSettings,
+        official_tasks_empty_settings, register_official_tasks_extension,
     };
     use fastmcp_protocol::{
         CallToolResult, CompletionValues, Content, ExtensionDescriptorRegistry,
@@ -10009,6 +10166,86 @@ mod lib_unit_tests {
             .expect("boxed resolver must retain an inactive disposition");
 
         assert_eq!(disposition, ExtensionSettingsResolution::Inactive);
+    }
+
+    #[test]
+    fn builder_mcp_apps_composes_with_final_tasks_and_preserves_inactive_apps() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let server = Server::new("apps-and-tasks-server", "1.0.0")
+            .mcp_apps()
+            .expect("official Apps installs before final Tasks")
+            .final_tasks(final_tasks_test_runtime(Arc::clone(&delivered)))
+            .expect("final Tasks composes with official Apps")
+            .build();
+        let apps_id = fastmcp_protocol::official_mcp_apps_extension_id();
+        let tasks_id = fastmcp_protocol::official_tasks_extension_id();
+
+        assert_eq!(
+            server
+                .extension_registry_receipt()
+                .expect("Apps and Tasks registry is frozen")
+                .descriptor_count(),
+            2
+        );
+        let discovery = serde_json::to_value(
+            server
+                .server_discovery()
+                .expect("Apps and Tasks discovery is available"),
+        )
+        .expect("Apps and Tasks discovery serializes");
+        assert_eq!(
+            discovery.pointer("/capabilities/extensions/io.modelcontextprotocol~1ui"),
+            Some(&serde_json::json!({}))
+        );
+        assert_eq!(
+            discovery.pointer("/capabilities/extensions/io.modelcontextprotocol~1tasks"),
+            Some(&serde_json::json!({}))
+        );
+
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([
+                (
+                    apps_id.clone(),
+                    McpAppsClientSettings::new(vec!["text/plain".to_owned()])
+                        .expect("another bounded MIME type is valid Apps settings")
+                        .to_extension_settings(),
+                ),
+                (tasks_id.clone(), official_tasks_empty_settings()),
+            ]),
+        };
+        let negotiated = server
+            .negotiate_extensions(&client)
+            .expect("valid inactive Apps settings do not reject Tasks negotiation");
+        assert_eq!(
+            negotiated.inactive_reason(&apps_id),
+            Some(ExtensionInactiveReason::SettingsInactiveFallback)
+        );
+        assert!(negotiated.active(&tasks_id).is_some());
+    }
+
+    #[test]
+    fn builder_final_tasks_then_mcp_apps_preserves_both_discovery_markers() {
+        let server = Server::new("tasks-then-apps-server", "1.0.0")
+            .final_tasks(final_tasks_test_runtime(Arc::new(Mutex::new(Vec::new()))))
+            .expect("final Tasks configures before official Apps")
+            .mcp_apps()
+            .expect("official Apps composes after final Tasks")
+            .build();
+        let discovery = serde_json::to_value(
+            server
+                .server_discovery()
+                .expect("Apps and Tasks discovery is available"),
+        )
+        .expect("Apps and Tasks discovery serializes");
+
+        assert_eq!(
+            discovery.pointer("/capabilities/extensions/io.modelcontextprotocol~1ui"),
+            Some(&serde_json::json!({}))
+        );
+        assert_eq!(
+            discovery.pointer("/capabilities/extensions/io.modelcontextprotocol~1tasks"),
+            Some(&serde_json::json!({}))
+        );
     }
 
     #[derive(Debug, Default)]
@@ -10230,6 +10467,7 @@ mod lib_unit_tests {
     {
         let runtime = RuntimeBuilder::current_thread()
             .with_reactor(create_reactor().expect("live HTTP test reactor must initialize"))
+            .blocking_threads(4, MAX_DISPATCH_QUEUE_DEPTH)
             .build()
             .expect("live HTTP test runtime must initialize");
         let (sender, receiver) = sync_channel(1);
@@ -10515,6 +10753,12 @@ mod lib_unit_tests {
                 "tasks/get",
                 move |context: &McpContext, request: serde_json::Value| {
                     assert_eq!(context.request_id(), 71);
+                    assert!(
+                        request
+                            .pointer("/_meta/io.modelcontextprotocol~1protocolVersion")
+                            .is_none(),
+                        "extension handlers must not receive transport protocol metadata"
+                    );
                     handler_calls.fetch_add(1, Ordering::SeqCst);
                     let value = request
                         .get("value")
@@ -10550,8 +10794,8 @@ mod lib_unit_tests {
             "tasks/get",
             Some(serde_json::json!({
                 "value": 41,
-                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
                 "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
                     "io.modelcontextprotocol/clientCapabilities": {
                         "extensions": {
                             "io.modelcontextprotocol/tasks": settings,
@@ -10561,6 +10805,24 @@ mod lib_unit_tests {
             })),
             71_i64,
         )
+    }
+
+    fn extension_tasks_get_http_request(protocol_version: &str) -> HttpRequest {
+        let mut request = extension_tasks_get_request(serde_json::json!({}));
+        *request
+            .params
+            .as_mut()
+            .and_then(|value| value.pointer_mut("/_meta/io.modelcontextprotocol~1protocolVersion"))
+            .expect("extension request has modern protocol metadata") =
+            serde_json::json!(protocol_version);
+        HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("accept", "application/json")
+            .with_header("mcp-protocol-version", protocol_version)
+            .with_header("mcp-method", "tasks/get")
+            .with_body(
+                serde_json::to_vec(&request).expect("modern extension request must serialize"),
+            )
     }
 
     #[test]
@@ -10606,6 +10868,25 @@ mod lib_unit_tests {
         assert_eq!(admitted.result, Some(serde_json::json!({ "next": 42 })));
         assert!(admitted.error.is_none());
 
+        let negotiated = server
+            .negotiate_extensions(
+                &final_client_extension_discovery(&extension_tasks_get_request(serde_json::json!(
+                    {}
+                )))
+                .expect("extension settings must decode"),
+            )
+            .expect("extension settings must negotiate");
+        assert_eq!(
+            server
+                .dispatch_negotiated_extension(
+                    &inbound.request_context(),
+                    &negotiated,
+                    &extension_tasks_get_request(serde_json::json!({})),
+                )
+                .expect("public negotiated extension dispatch must admit exact modern metadata"),
+            serde_json::json!({ "next": 42 })
+        );
+
         let mut rejected = extension_tasks_get_request(serde_json::json!({}));
         *rejected
             .params
@@ -10624,7 +10905,7 @@ mod lib_unit_tests {
             .error
             .expect("incompatible extension settings must fail closed");
         assert_eq!(error.code, i32::from(McpErrorCode::InvalidParams));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -10642,11 +10923,20 @@ mod lib_unit_tests {
             .expect("modern extension request must have a response");
         assert!(admitted.error.is_none());
 
+        let negotiated = server
+            .negotiate_extensions(
+                &final_client_extension_discovery(&extension_tasks_get_request(serde_json::json!(
+                    {}
+                )))
+                .expect("extension settings must decode"),
+            )
+            .expect("extension settings must negotiate");
+
         let mut rejected = extension_tasks_get_request(serde_json::json!({}));
         *rejected
             .params
             .as_mut()
-            .and_then(|value| value.get_mut("io.modelcontextprotocol/protocolVersion"))
+            .and_then(|value| value.pointer_mut("/_meta/io.modelcontextprotocol~1protocolVersion"))
             .expect("test request must contain its protocol version") =
             serde_json::json!(LEGACY_PROTOCOL_VERSION);
         let rejected = server
@@ -10655,6 +10945,24 @@ mod lib_unit_tests {
         assert_eq!(
             rejected.error.map(|error| error.code),
             Some(i32::from(McpErrorCode::InvalidRequest))
+        );
+        let mut public_rejected = extension_tasks_get_request(serde_json::json!({}));
+        *public_rejected
+            .params
+            .as_mut()
+            .and_then(|value| value.pointer_mut("/_meta/io.modelcontextprotocol~1protocolVersion"))
+            .expect("test request must contain its protocol version") =
+            serde_json::json!(LEGACY_PROTOCOL_VERSION);
+        assert_eq!(
+            server
+                .dispatch_negotiated_extension(
+                    &inbound.request_context(),
+                    &negotiated,
+                    &public_rejected,
+                )
+                .expect_err("public extension dispatch must reject the changed era metadata")
+                .code,
+            McpErrorCode::InvalidRequest
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -14049,6 +14357,7 @@ mod lib_unit_tests {
             Some(serde_json::json!({
                 "_meta": {
                     MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                 },
             })),
             905_i64,
@@ -14735,6 +15044,7 @@ mod lib_unit_tests {
             Some(serde_json::json!({
                 "_meta": {
                     MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                 },
             })),
             201_i64,
@@ -14766,9 +15076,182 @@ mod lib_unit_tests {
             response
                 .result
                 .as_ref()
-                .and_then(|result| result["serverInfo"]["name"].as_str()),
+                .and_then(|result| result["_meta"]["serverInfo"]["name"].as_str()),
             Some("modern-http-endpoint")
         );
+    }
+
+    #[test]
+    fn builder_http_endpoint_dispatches_admitted_extension_without_metadata_leakage() {
+        let cx = Cx::for_testing();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let endpoint = extension_registry_test_server(Arc::clone(&calls))
+            .into_http_endpoint("http://legacy.test")
+            .expect("extension server must construct the configured HTTP endpoint");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("endpoint must open a bounded live session");
+
+        let response = session
+            .handle(
+                &cx,
+                extension_tasks_get_http_request(MODERN_PROTOCOL_VERSION),
+            )
+            .expect("exact modern extension request must be admitted and dispatched");
+        let ServerHttpEndpointResponse::Immediate(response) = response else {
+            panic!("modern JSON extension dispatch must produce an immediate HTTP response");
+        };
+        assert_eq!(response.status, HttpStatus::OK);
+        let response: JsonRpcResponse =
+            serde_json::from_slice(&response.body).expect("modern response must be JSON-RPC");
+        assert_eq!(response.id, Some(71_i64.into()));
+        assert_eq!(response.result, Some(serde_json::json!({ "next": 42 })));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn builder_http_endpoint_rejects_one_variable_wrong_extension_version() {
+        let cx = Cx::for_testing();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let endpoint = extension_registry_test_server(Arc::clone(&calls))
+            .into_http_endpoint("http://legacy.test")
+            .expect("extension server must construct the configured HTTP endpoint");
+        let legacy_sessions: LiveHttpSessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let response = dispatch_http_request(
+            &cx,
+            &endpoint,
+            &legacy_sessions,
+            extension_tasks_get_http_request(LEGACY_PROTOCOL_VERSION),
+        );
+
+        assert_eq!(response.status, HttpStatus::BAD_REQUEST);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn live_modern_stdio_extension_preserves_metadata_through_admission() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        extension_registry_test_server(Arc::clone(&calls))
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyScriptTransport {
+                    inbound: std::collections::VecDeque::from([
+                        modern_discovery_opening_request(),
+                        JsonRpcMessage::Request(extension_tasks_get_request(serde_json::json!({}))),
+                    ]),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .expect("exact modern metadata must reach extension admission before sanitization");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn live_modern_stdio_extension_rejects_one_variable_wrong_version() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut wrong_version = extension_tasks_get_request(serde_json::json!({}));
+        *wrong_version
+            .params
+            .as_mut()
+            .and_then(|value| value.pointer_mut("/_meta/io.modelcontextprotocol~1protocolVersion"))
+            .expect("extension request has modern protocol metadata") =
+            serde_json::json!(LEGACY_PROTOCOL_VERSION);
+
+        extension_registry_test_server(Arc::clone(&calls))
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyScriptTransport {
+                    inbound: std::collections::VecDeque::from([
+                        modern_discovery_opening_request(),
+                        JsonRpcMessage::Request(wrong_version),
+                    ]),
+                    sent,
+                    receive_calls: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .expect_err("only the extension protocol version differs from the admitted positive");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn public_http_protocol_policy_rejects_opposite_era_requests_both_ways() {
+        let modern_request = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(serde_json::json!({
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                },
+            })),
+            218_i64,
+        );
+        let modern_inbound =
+            InboundRequestContext::new(Cx::for_testing(), 218, InboundRequestTransport::Http);
+        let legacy_only = Server::new("legacy-only-http-policy", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .build();
+        let modern_response = legacy_only.dispatch_http_with_protocol_policy(
+            ProtocolPolicy::LegacyOnly,
+            &modern_inbound,
+            &modern_request,
+        );
+        assert_eq!(modern_response.status, HttpStatus::BAD_REQUEST);
+
+        let legacy_request = JsonRpcRequest::new(
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "legacy-http-client", "version": "1.0.0"},
+            })),
+            219_i64,
+        );
+        let legacy_inbound =
+            InboundRequestContext::new(Cx::for_testing(), 219, InboundRequestTransport::Http);
+        let modern_only = Server::new("modern-only-http-policy", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .build();
+        let legacy_response = modern_only.dispatch_http_with_protocol_policy(
+            ProtocolPolicy::ModernOnly,
+            &legacy_inbound,
+            &legacy_request,
+        );
+        assert_eq!(legacy_response.status, HttpStatus::BAD_REQUEST);
+    }
+
+    #[test]
+    fn public_http_protocol_policy_admits_matching_modern_metadata() {
+        let request = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(serde_json::json!({
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                },
+            })),
+            220_i64,
+        );
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 220, InboundRequestTransport::Http);
+        let server = Server::new("modern-http-policy", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .build();
+
+        let response = server.dispatch_http_with_protocol_policy(
+            ProtocolPolicy::ModernOnly,
+            &inbound,
+            &request,
+        );
+
+        assert_eq!(response.status, HttpStatus::OK);
+        let response: JsonRpcResponse =
+            serde_json::from_slice(&response.body).expect("modern response must be JSON-RPC");
+        assert_eq!(response.id, Some(220_i64.into()));
+        assert!(response.error.is_none());
     }
 
     #[test]
@@ -14854,6 +15337,106 @@ mod lib_unit_tests {
             }
             Ok(())
         });
+    }
+
+    #[test]
+    fn live_http_ordinary_requests_overlap_in_request_owned_blocking_children() {
+        let _overlap_lock = http_overlap_lock()
+            .lock()
+            .expect("live HTTP overlap test lock poisoned");
+        reset_http_overlap_metrics();
+        let control = http_overlap_control();
+        let _control_guard = control.begin(usize::MAX);
+
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("live-http-request-owned-dispatch", "1.0.0")
+                .tool(HttpOverlapTool)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("request-owned HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("request-owned HTTP address failed: {error}"))?;
+            let request = |id| {
+                let request = JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "http_overlap_tool",
+                        "arguments": {},
+                        "_meta": {
+                            MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        },
+                    })),
+                    id,
+                );
+                let body = serde_json::to_vec(&request)
+                    .expect("request-owned HTTP request must serialize");
+                live_http_post(
+                    "/mcp",
+                    &body,
+                    &[
+                        ("Accept", "application/json"),
+                        ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                        ("Mcp-Method", "tools/call"),
+                    ],
+                )
+            };
+            let first_request = request(221_i64);
+            let second_request = request(222_i64);
+            let cancellation = cx.clone();
+            let controller = thread::spawn(move || -> Result<(), String> {
+                fn exchange(address: SocketAddr, request: Vec<u8>) -> Result<Vec<u8>, String> {
+                    let mut stream = std::net::TcpStream::connect(address)
+                        .map_err(|error| format!("request-owned HTTP connect failed: {error}"))?;
+                    std::io::Write::write_all(&mut stream, &request)
+                        .map_err(|error| format!("request-owned HTTP write failed: {error}"))?;
+                    std::io::Write::flush(&mut stream)
+                        .map_err(|error| format!("request-owned HTTP flush failed: {error}"))?;
+                    let mut response = Vec::new();
+                    std::io::Read::read_to_end(&mut stream, &mut response)
+                        .map_err(|error| format!("request-owned HTTP read failed: {error}"))?;
+                    Ok(response)
+                }
+
+                let first = thread::spawn(move || exchange(address, first_request));
+                let second = thread::spawn(move || exchange(address, second_request));
+                let both_entered =
+                    http_overlap_control().wait_for_entries(2, Duration::from_secs(2));
+                http_overlap_control().release_one();
+                http_overlap_control().release_one();
+                let first = first
+                    .join()
+                    .map_err(|_| "first request-owned HTTP client panicked".to_string())??;
+                let second = second
+                    .join()
+                    .map_err(|_| "second request-owned HTTP client panicked".to_string())??;
+                cancellation.cancel_with(CancelKind::User, Some("request-owned HTTP complete"));
+
+                if !both_entered {
+                    return Err("two ordinary HTTP requests did not enter concurrently".to_string());
+                }
+                for response in [first, second] {
+                    if !response.starts_with(b"HTTP/1.1 200") {
+                        return Err(format!("request-owned HTTP response failed: {response:?}"));
+                    }
+                }
+                Ok(())
+            });
+
+            let serve = bound.serve(&cx).await;
+            let controller = controller
+                .join()
+                .map_err(|_| "request-owned HTTP controller panicked".to_string())?;
+            controller?;
+            serve.map_err(|error| format!("request-owned HTTP server failed: {error}"))?;
+            Ok(())
+        });
+
+        assert!(
+            http_overlap_metrics().max.load(Ordering::SeqCst) >= 2,
+            "ordinary HTTP requests must overlap in independent request-owned children"
+        );
     }
 
     #[test]

@@ -101,16 +101,13 @@ fn fnd_03_b_positive() {
                 body: HttpProbeBody::Empty,
             },
         ),
-        HttpEraDecision::Selected(ProtocolEra::Legacy2024)
+        HttpEraDecision::LegacySseFallbackAuthorized
     );
     assert_eq!(
         cache.selected_era(&security_a.key()),
         Some(ProtocolEra::Modern2026)
     );
-    assert_eq!(
-        cache.selected_era(&security_b.key()),
-        Some(ProtocolEra::Legacy2024)
-    );
+    assert_eq!(cache.selected_era(&security_b.key()), None);
 }
 
 #[test]

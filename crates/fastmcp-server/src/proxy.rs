@@ -1088,6 +1088,9 @@ fn receive_modern_response(
                 return response_for_request(message, request_id);
             }
         }
+        ModernHttpResponseKind::EmptyAcknowledgement => Err(McpError::invalid_request(
+            "Proxy HTTP modern request received a notification acknowledgement where a correlated response was required",
+        )),
         ModernHttpResponseKind::HttpFailure => Err(McpError::invalid_request(
             "Proxy HTTP modern request received an unsuccessful HTTP response",
         )),
@@ -1468,6 +1471,11 @@ impl ProxyUpstreamBindingRegistry {
         }
         let era = match self.http_eras.classify_or_cached(&bundle, probe) {
             HttpEraDecision::Selected(era) => era,
+            HttpEraDecision::LegacySseFallbackAuthorized => {
+                return Err(McpError::invalid_request(
+                    "Upstream HTTP probe authorizes legacy SSE observation but cannot select an era before endpoint validation",
+                ));
+            }
             HttpEraDecision::RejectedWithoutLegacyFallback => {
                 return Err(McpError::invalid_request(
                     "Upstream HTTP probe cannot select an exact permitted MCP era",
@@ -2045,7 +2053,9 @@ mod tests {
     use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan};
     use fastmcp_core::{McpContext, McpErrorCode};
     use fastmcp_protocol::common_types::ContentBlock;
-    use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
+    use fastmcp_protocol::protocol_policy::{
+        HttpModernProbe, HttpProbeBody, ProtocolEra, ProtocolPolicy,
+    };
     use fastmcp_protocol::{
         CallToolResult, ClientCapabilities, ClientInfo, CompleteResult, Content, CoreResult,
         FinalCallToolResult, FinalCoreResult, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
@@ -2054,8 +2064,8 @@ mod tests {
 
     use super::{
         ProxyBackend, ProxyCatalog, ProxyClient, ProxyPromptHandler, ProxyToolHandler,
-        ProxyUpstreamAdapter, ProxyUpstreamBinding, legacy_contents_to_handler,
-        legacy_prompt_messages_to_handler, legacy_resource_to_handler,
+        ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
+        legacy_contents_to_handler, legacy_prompt_messages_to_handler, legacy_resource_to_handler,
     };
     use crate::handler::{PromptHandler, ToolHandler};
 
@@ -2242,6 +2252,65 @@ mod tests {
             },
             configuration_generation: 41,
         }
+    }
+
+    #[test]
+    fn proxy_auto_http_refusal_requires_legacy_endpoint_validation_before_binding() {
+        let modern = CanonicalHttpUrl::parse("https://api.example.test/mcp")
+            .expect("canonical modern target");
+        let legacy_sse = CanonicalHttpUrl::parse("https://api.example.test/sse")
+            .expect("canonical legacy SSE target");
+        let legacy_message = CanonicalHttpUrl::parse("https://api.example.test/messages")
+            .expect("canonical legacy POST target");
+        let mut bindings = ProxyUpstreamBindingRegistry::default();
+
+        let error = bindings
+            .bind_http(
+                "upstream-route",
+                "native-h1:upstream-route",
+                "adapter-receipt",
+                1,
+                ProtocolPolicy::Auto,
+                Some(modern.clone()),
+                Some(legacy_sse.clone()),
+                Some(legacy_message.clone()),
+                "credential-partition".to_owned(),
+                "security-partition".to_owned(),
+                "http-sse-v2".to_owned(),
+                1,
+                1,
+                HttpModernProbe {
+                    status: 404,
+                    body: HttpProbeBody::Empty,
+                },
+            )
+            .expect_err("an Auto fallback authorization cannot bind the legacy adapter");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(error.message.contains("before endpoint validation"));
+
+        let binding = bindings
+            .bind_http(
+                "upstream-route",
+                "native-h1:upstream-route",
+                "adapter-receipt",
+                1,
+                ProtocolPolicy::Auto,
+                Some(modern),
+                Some(legacy_sse),
+                Some(legacy_message),
+                "credential-partition".to_owned(),
+                "security-partition".to_owned(),
+                "http-sse-v2".to_owned(),
+                1,
+                1,
+                HttpModernProbe {
+                    status: 200,
+                    body: HttpProbeBody::RecognizedModernJsonRpc,
+                },
+            )
+            .expect("the unchanged binding can still select a recognized modern response");
+        assert_eq!(binding.era(), ProtocolEra::Modern2026);
+        assert_eq!(binding.adapter(), ProxyUpstreamAdapter::ModernHttp);
     }
 
     fn final_tool_result_with_open_members() -> CoreResult {
@@ -3156,6 +3225,69 @@ exec sleep 2
             serde_json::from_slice::<serde_json::Value>(&probes[1].body)
                 .expect("second modern probe JSON")["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"],
             serde_json::json!({"roots": {"listChanged": true}})
+        );
+    }
+
+    #[test]
+    fn proxy_http_modern_empty_acknowledgement_rejects_correlated_catalog_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read native HTTP listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let legacy_sse_target = format!("http://{address}/legacy-sse");
+        let legacy_message_target = format!("http://{address}/legacy-message");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern probe");
+            let probe_request = read_http_request(&mut probe);
+            write_http_response(
+                &mut probe,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+
+            let (mut request, _) = listener
+                .accept()
+                .expect("accept correlated modern catalog request");
+            let catalog_request = read_http_request(&mut request);
+            request
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write content-type-free notification acknowledgement");
+            request
+                .flush()
+                .expect("flush content-type-free notification acknowledgement");
+            (probe_request, catalog_request)
+        });
+        let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
+        let mut bindings = ProxyClient::upstream_binding_registry();
+        let proxy = bindings
+            .connect_http_with_protocol_plan(
+                "modern-empty-acknowledgement-backend",
+                "native-h1:modern-empty-acknowledgement-backend",
+                14,
+                plan,
+                proxy_http_client_info(),
+                ClientCapabilities::default(),
+                Cx::for_request(),
+            )
+            .expect("modern discovery opens the proxy backend");
+
+        let error = proxy.catalog().expect_err(
+            "a notification acknowledgement cannot satisfy a correlated catalog request",
+        );
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(error.message.contains("notification acknowledgement"));
+
+        let (probe, catalog_request) = server.join().expect("modern HTTP server must join");
+        assert!(probe.head.contains("Mcp-Method: server/discover\r\n"));
+        assert!(catalog_request.head.contains("Mcp-Method: tools/list\r\n"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&catalog_request.body)
+                .expect("modern catalog request must be JSON")["id"],
+            serde_json::json!(2),
         );
     }
 

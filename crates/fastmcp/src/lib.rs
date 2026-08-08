@@ -188,22 +188,25 @@ pub use fastmcp_protocol::{
     FinalCallToolResult, FinalCancelledNotificationParams, FinalCompletionArgument,
     FinalCompletionContext, FinalCompletionParams, FinalCompletionReference, FinalCompletionResult,
     FinalCoreRequest, FinalCoreResult, FinalCreateMessageInputRequiredResult,
-    FinalCreateMessageParams, FinalCreateMessageResult, FinalEmptyNotificationParams,
-    FinalEmptyParams, FinalEmptyResult, FinalGetPromptParams, FinalGetPromptResult,
-    FinalInputRequiredResultType, FinalListParams, FinalListPromptsResult,
-    FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult,
-    FinalLogMessageParams, FinalNotificationError, FinalProgressNotificationParams,
-    FinalPromptMessage, FinalReadResourceParams, FinalReadResourceResult, FinalRequestMeta,
-    FinalResourceUpdatedNotificationParams, FinalSubscriptionsAcknowledgedNotificationParams,
-    FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, IncludeContext,
-    InputRequiredResult, LegacyCoreRequest, LegacyCoreResult, LegacyEmptyResult,
-    MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
-    MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES, MetadataView, PaginatedResult,
-    RawResultEnvelope, ResultDecodeError, ResultDecodeErrorKind, ResultDiscriminatorDecision,
-    ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic, ResultPeerEra, ServerNotification,
-    TypedCompleteMembers, UnknownResultMembers, decode_peer_result, decode_peer_result_for_era,
-    decode_typed_complete, encode_complete_result, encode_result, exact_json_from_serde,
-    exact_json_to_serde, parse_exact_json,
+    FinalCreateMessageParams, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams,
+    FinalEmbeddedElicitationParams, FinalEmbeddedElicitationResult,
+    FinalEmbeddedFormElicitationParams, FinalEmbeddedInputKind, FinalEmbeddedInputRequest,
+    FinalEmbeddedInputResponse, FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult,
+    FinalEmbeddedUrlElicitationParams, FinalEmptyNotificationParams, FinalEmptyParams,
+    FinalEmptyResult, FinalGetPromptParams, FinalGetPromptResult, FinalInputRequiredResultType,
+    FinalListParams, FinalListPromptsResult, FinalListResourceTemplatesResult,
+    FinalListResourcesResult, FinalListToolsResult, FinalLogMessageParams, FinalNotificationError,
+    FinalProgressNotificationParams, FinalPromptMessage, FinalReadResourceParams,
+    FinalReadResourceResult, FinalRequestMeta, FinalResourceUpdatedNotificationParams,
+    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
+    FinalSubscriptionsListenResult, IncludeContext, InputRequiredResult, LegacyCoreRequest,
+    LegacyCoreResult, LegacyEmptyResult, MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH,
+    MAX_RESULT_ENCODED_BYTES, MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES, MetadataView,
+    PaginatedResult, RawResultEnvelope, ResultDecodeError, ResultDecodeErrorKind,
+    ResultDiscriminatorDecision, ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic,
+    ResultPeerEra, ServerNotification, TypedCompleteMembers, UnknownResultMembers,
+    decode_peer_result, decode_peer_result_for_era, decode_typed_complete, encode_complete_result,
+    encode_result, exact_json_from_serde, exact_json_to_serde, parse_exact_json,
 };
 
 // Exact final component and sampling models. These are deliberately separate
@@ -243,7 +246,8 @@ pub use fastmcp_protocol::extensions::{
     McpAppsNegotiationResolver, NegotiatedExtension, NegotiatedExtensionSet,
     OFFICIAL_MCP_APPS_EXTENSION_ID, OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID,
     OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID, OFFICIAL_TASKS_EXTENSION_ID, OFFICIAL_TASKS_METHODS,
-    OFFICIAL_TASKS_NOTIFICATION, ServerExtensionDiscovery, StdioCorrelationDescriptor,
+    OFFICIAL_TASKS_NOTIFICATION, OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+    OfficialTasksNegotiationResolver, ServerExtensionDiscovery, StdioCorrelationDescriptor,
     official_mcp_apps_descriptor, official_mcp_apps_empty_server_settings,
     official_mcp_apps_extension_id, official_mcp_apps_negotiation_resolver,
     official_tasks_descriptor, official_tasks_empty_settings, official_tasks_extension_id,
@@ -251,8 +255,14 @@ pub use fastmcp_protocol::extensions::{
     resolve_official_mcp_apps_settings,
 };
 
+pub use fastmcp_protocol::schema;
+pub use fastmcp_protocol::schema::FINAL_JSON_SCHEMA_DIALECT;
 pub use fastmcp_protocol::tasks_extension;
 pub use fastmcp_protocol::tasks_extension::TASK_UPDATE;
+pub use fastmcp_protocol::{
+    AdmittedSchema, FinalCoreResultType, SchemaAdmissionError, ValidationError, ValidationResult,
+    admit_final_schema, validate_final_core_result,
+};
 pub use fastmcp_protocol::{
     CompleteTaskResult, CreateTaskResult, EmptyTaskResult, FinalCancelTaskParams,
     FinalCancelTaskResult, FinalGetTaskParams, FinalGetTaskResult, FinalTaskCallToolResult,
@@ -364,13 +374,11 @@ pub use fastmcp_client::{
     ClientHttpConnectionError, ClientHttpNegotiation, ClientHttpNegotiationDecision,
     ClientHttpNegotiationError, ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
     ClientProtocolPlanError, ClientSession, CompletionContext, CompletionParams,
-    CompletionReference, ElicitationRequestHandler, ExecutionTerminalReason,
-    ExecutionTerminalRecord, ExecutionTerminalState, FinalTask, FinalTaskInputResponses,
-    FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, ListPageLimits,
-    OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback, Request,
-    RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
-    ReverseRequestHandlers, RootsRequestHandler, SamplingRequestHandler, SubscriptionFilter,
-    SubscriptionListenCollector,
+    CompletionReference, ExecutionTerminalReason, ExecutionTerminalRecord, ExecutionTerminalState,
+    FinalTask, FinalTaskInputResponses, FinalTaskStatusNotification, FinalToolCallOutcome,
+    FinalUpdateTaskResult, ListPageLimits, OpaquePagination, PaginationBounds,
+    PendingRequestRecord, ProgressCallback, Request, RequestExecution, RequestExecutor,
+    RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionFilter, SubscriptionListenCollector,
 };
 
 // Public client HTTP execution and configuration surfaces.
@@ -407,19 +415,30 @@ pub mod auto {
         Client, ClientBuilder, ClientHttpConnection, ClientHttpConnectionError,
         ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
         ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
-        ClientProtocolPlanError, ClientSession, ElicitationRequestHandler, FinalTask,
-        FinalTaskInputResponses, FinalToolCallOutcome, FinalUpdateTaskResult,
-        ReverseRequestHandlers, RootsRequestHandler, SamplingRequestHandler, SubscriptionFilter,
-        SubscriptionListenCollector,
+        ClientProtocolPlanError, ClientSession, FinalTask, FinalTaskInputResponses,
+        FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult,
+        SubscriptionFilter, SubscriptionListenCollector,
     };
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
+    pub use fastmcp_protocol::extensions::{
+        ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionNegotiationError,
+        ExtensionSettings, ExtensionSettingsCompatibilityResolver, ExtensionSettingsResolution,
+        OFFICIAL_TASKS_EXTENSION_ID, OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+        OfficialTasksNegotiationResolver, official_tasks_descriptor, official_tasks_empty_settings,
+        register_official_tasks_extension,
+    };
     pub use fastmcp_protocol::protocol_policy::{
         HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
     };
+    pub use fastmcp_protocol::schema::FINAL_JSON_SCHEMA_DIALECT;
+    pub use fastmcp_protocol::tasks_extension::TASK_UPDATE;
     pub use fastmcp_protocol::{
-        ClientCapabilities, ClientInfo, FinalCallToolResult, FinalCancelTaskResult,
-        FinalGetPromptResult, FinalGetTaskResult, FinalReadResourceResult, FinalTaskId, RequestId,
+        AdmittedSchema, ClientCapabilities, ClientInfo, FinalCallToolResult, FinalCancelTaskResult,
+        FinalCoreResultType, FinalGetPromptResult, FinalGetTaskResult, FinalReadResourceResult,
+        FinalTaskId, RequestId, SchemaAdmissionError, ValidationError, ValidationResult,
+        admit_final_schema, validate_final_core_result,
     };
+    pub use fastmcp_protocol::{schema, tasks_extension};
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
 
     /// Creates the public client builder with its immutable Auto stdio plan.
@@ -456,12 +475,11 @@ pub mod modern {
         ClientHttpConnectionError, ClientHttpNegotiation, ClientHttpNegotiationDecision,
         ClientHttpNegotiationError, ClientHttpNegotiationState, ClientHttpResponse,
         ClientProtocolPlan, ClientProtocolPlanError, ClientSession, CompletionContext,
-        CompletionParams, CompletionReference, ElicitationRequestHandler, ExecutionTerminalReason,
-        ExecutionTerminalRecord, ExecutionTerminalState, FinalTask, FinalTaskInputResponses,
-        FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, ListPageLimits,
-        OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback, Request,
-        RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
-        ReverseRequestHandlers, RootsRequestHandler, SamplingRequestHandler, SubscriptionFilter,
+        CompletionParams, CompletionReference, ExecutionTerminalReason, ExecutionTerminalRecord,
+        ExecutionTerminalState, FinalTask, FinalTaskInputResponses, FinalTaskStatusNotification,
+        FinalToolCallOutcome, FinalUpdateTaskResult, ListPageLimits, OpaquePagination,
+        PaginationBounds, PendingRequestRecord, ProgressCallback, Request, RequestExecution,
+        RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionFilter,
         SubscriptionListenCollector,
     };
     pub use fastmcp_client::{http_executor, mcp_config};
@@ -505,6 +523,7 @@ pub mod modern {
         NegotiatedExtensionSet, OFFICIAL_MCP_APPS_EXTENSION_ID,
         OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID, OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID,
         OFFICIAL_TASKS_EXTENSION_ID, OFFICIAL_TASKS_METHODS, OFFICIAL_TASKS_NOTIFICATION,
+        OFFICIAL_TASKS_RESULT_DISCRIMINATOR, OfficialTasksNegotiationResolver,
         ServerExtensionDiscovery, StdioCorrelationDescriptor, official_mcp_apps_descriptor,
         official_mcp_apps_empty_server_settings, official_mcp_apps_extension_id,
         official_mcp_apps_negotiation_resolver, official_tasks_descriptor,
@@ -520,60 +539,67 @@ pub mod modern {
         ProtocolPolicySelection, ProtocolRole, ProtocolVersion, ProtocolVersionError,
         StdioEraClassifier, StdioEraDecision, StdioEraRejection, StdioEraState, StdioOpeningFrame,
     };
+    pub use fastmcp_protocol::schema::FINAL_JSON_SCHEMA_DIALECT;
     pub use fastmcp_protocol::tasks_extension::TASK_UPDATE;
     pub use fastmcp_protocol::{
-        CacheScope, CacheTtl, CacheableResult, ClientCapabilities, ClientInfo, ClientNotification,
-        CompleteResult, CompleteResultPayload, CompleteTaskResult, CompletionValues,
-        CoreDispatchError, CoreRequest, CoreResult, CoreResultDiscriminatorPolicy,
-        CreateTaskResult, DecodedResult, DiscoveryCacheHints, EmptyTaskResult, ExactJsonMember,
-        ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
-        FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION as PROTOCOL_VERSION,
-        FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY, FinalBaseMetadata,
-        FinalCallToolParams, FinalCallToolResult, FinalCancelTaskParams, FinalCancelTaskResult,
-        FinalCancelledNotificationParams, FinalCompletionArgument, FinalCompletionContext,
-        FinalCompletionParams, FinalCompletionReference, FinalCompletionResult, FinalCoreRequest,
-        FinalCoreResult, FinalCreateMessageInputRequiredResult, FinalCreateMessageParams,
-        FinalCreateMessageResult, FinalEmptyNotificationParams, FinalEmptyParams, FinalEmptyResult,
-        FinalGetPromptParams, FinalGetPromptResult, FinalGetTaskParams, FinalGetTaskResult,
-        FinalHttpRequestMetadata, FinalInputRequiredResultType, FinalListParams,
-        FinalListPromptsResult, FinalListResourceTemplatesResult, FinalListResourcesResult,
-        FinalListToolsResult, FinalLogMessageParams, FinalNotificationError,
-        FinalProgressNotificationParams, FinalPrompt, FinalPromptArgument, FinalPromptMessage,
-        FinalProtocolVersion, FinalReadResourceParams, FinalReadResourceResult,
-        FinalRequestAdmission, FinalRequestMeta, FinalResource, FinalResourceTemplate,
-        FinalResourceUpdatedNotificationParams, FinalSamplingMessage, FinalSamplingMessageContent,
-        FinalSamplingMessageContentBlock, FinalSubscriptionsAcknowledgedNotificationParams,
-        FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, FinalTaskCallToolResult,
-        FinalTaskError, FinalTaskId, FinalTaskStatus, FinalTaskStatusNotificationParams, FinalTool,
-        FinalToolAnnotations, FinalToolChoice, FinalToolChoiceMode, HEADER_MISMATCH_ERROR_CODE,
-        HeaderMismatchError, HeaderMismatchReason, IncludeContext, InputRequiredResult,
-        MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
-        MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES, MAX_TASK_ID_BYTES,
-        MAX_TASK_INPUT_MAP_ENTRIES, MAX_TASK_SUBSCRIPTION_IDS, MCP_METHOD_HEADER, MCP_NAME_HEADER,
-        MCP_PROTOCOL_VERSION_HEADER, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MetadataView,
+        AdmittedSchema, CacheScope, CacheTtl, CacheableResult, ClientCapabilities, ClientInfo,
+        ClientNotification, CompleteResult, CompleteResultPayload, CompleteTaskResult,
+        CompletionValues, CoreDispatchError, CoreRequest, CoreResult,
+        CoreResultDiscriminatorPolicy, CreateTaskResult, DecodedResult, DiscoveryCacheHints,
+        EmptyTaskResult, ExactJsonMember, ExactJsonObject, ExactJsonValue,
+        FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
+        FINAL_PROTOCOL_VERSION as PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY,
+        FINAL_SERVER_INFO_META_KEY, FinalBaseMetadata, FinalCallToolParams, FinalCallToolResult,
+        FinalCancelTaskParams, FinalCancelTaskResult, FinalCancelledNotificationParams,
+        FinalCompletionArgument, FinalCompletionContext, FinalCompletionParams,
+        FinalCompletionReference, FinalCompletionResult, FinalCoreRequest, FinalCoreResult,
+        FinalCoreResultType, FinalCreateMessageInputRequiredResult, FinalCreateMessageParams,
+        FinalCreateMessageResult, FinalEmbeddedCreateMessageParams, FinalEmbeddedElicitationParams,
+        FinalEmbeddedElicitationResult, FinalEmbeddedFormElicitationParams, FinalEmbeddedInputKind,
+        FinalEmbeddedInputRequest, FinalEmbeddedInputResponse, FinalEmbeddedRootsListParams,
+        FinalEmbeddedRootsListResult, FinalEmbeddedUrlElicitationParams,
+        FinalEmptyNotificationParams, FinalEmptyParams, FinalEmptyResult, FinalGetPromptParams,
+        FinalGetPromptResult, FinalGetTaskParams, FinalGetTaskResult, FinalHttpRequestMetadata,
+        FinalInputRequiredResultType, FinalListParams, FinalListPromptsResult,
+        FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult,
+        FinalLogMessageParams, FinalNotificationError, FinalProgressNotificationParams,
+        FinalPrompt, FinalPromptArgument, FinalPromptMessage, FinalProtocolVersion,
+        FinalReadResourceParams, FinalReadResourceResult, FinalRequestAdmission, FinalRequestMeta,
+        FinalResource, FinalResourceTemplate, FinalResourceUpdatedNotificationParams,
+        FinalSamplingMessage, FinalSamplingMessageContent, FinalSamplingMessageContentBlock,
+        FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
+        FinalSubscriptionsListenResult, FinalTaskCallToolResult, FinalTaskError, FinalTaskId,
+        FinalTaskStatus, FinalTaskStatusNotificationParams, FinalTool, FinalToolAnnotations,
+        FinalToolChoice, FinalToolChoiceMode, HEADER_MISMATCH_ERROR_CODE, HeaderMismatchError,
+        HeaderMismatchReason, IncludeContext, InputRequiredResult, MAX_RESULT_CONTAINER_MEMBERS,
+        MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES, MAX_RESULT_NUMBER_BYTES,
+        MAX_RESULT_STRING_BYTES, MAX_TASK_ID_BYTES, MAX_TASK_INPUT_MAP_ENTRIES,
+        MAX_TASK_SUBSCRIPTION_IDS, MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
+        MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MetadataView,
         MissingRequiredClientCapabilityError, ModelHint, ModelPreferences, PaginatedResult,
         ProgressMarker, ProtocolVersionError as FinalProtocolVersionError, RELATED_TASK_META_KEY,
         RawResultEnvelope, RequestAdmissionError, RequestId, RequestVersionMetadata,
         RequiredCapabilitiesError, ResultDecodeError, ResultDecodeErrorKind,
         ResultDiscriminatorDecision, ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic,
         ResultPeerEra, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
-        SUPPORTED_FINAL_PROTOCOL_VERSIONS, ServerBehavior, ServerBehaviorRegistry,
-        ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
-        ServerDiscoveryError, ServerInstructionError, ServerInstructions, ServerNotification,
-        StopReason, TASK_CANCEL, TASK_GET, TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY,
-        TASKS_EXTENSION, TaskBase as FinalTaskBase, TaskDuration as FinalTaskDuration,
-        TaskInputLedger as FinalTaskInputLedger, TaskInputRequests as FinalTaskInputRequests,
-        TaskMethodRequest as FinalTaskMethodRequest, TaskRequestMeta as FinalTaskRequestMeta,
-        TaskTimestamp as FinalTaskTimestamp, TaskWireError, TypedCompleteMembers,
-        UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnknownResultMembers,
-        UnsupportedProtocolVersionError, UpdateTaskParams as FinalUpdateTaskParams,
-        admit_final_http_request, admit_final_request, decode_peer_result,
+        SUPPORTED_FINAL_PROTOCOL_VERSIONS, SchemaAdmissionError, ServerBehavior,
+        ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
+        ServerDiscoverResult, ServerDiscoveryError, ServerInstructionError, ServerInstructions,
+        ServerNotification, StopReason, TASK_CANCEL, TASK_GET, TASK_STATUS_NOTIFICATION,
+        TASK_SUBSCRIPTION_IDS_KEY, TASKS_EXTENSION, TaskBase as FinalTaskBase,
+        TaskDuration as FinalTaskDuration, TaskInputLedger as FinalTaskInputLedger,
+        TaskInputRequests as FinalTaskInputRequests, TaskMethodRequest as FinalTaskMethodRequest,
+        TaskRequestMeta as FinalTaskRequestMeta, TaskTimestamp as FinalTaskTimestamp,
+        TaskWireError, TypedCompleteMembers, UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE,
+        UnknownResultMembers, UnsupportedProtocolVersionError,
+        UpdateTaskParams as FinalUpdateTaskParams, ValidationError, ValidationResult,
+        admit_final_http_request, admit_final_request, admit_final_schema, decode_peer_result,
         decode_peer_result_for_era, decode_typed_complete, encode_complete_result, encode_result,
         exact_json_from_serde, exact_json_to_serde, parse_exact_json, set_task_subscription_ids,
-        task_subscription_ids, validate_final_protocol_version,
+        task_subscription_ids, validate_final_core_result, validate_final_protocol_version,
     };
     pub use fastmcp_protocol::{
-        common_types, extensions, methods, protocol_policy, tasks_extension,
+        common_types, extensions, methods, protocol_policy, schema, tasks_extension,
     };
     pub use fastmcp_server::bidirectional::{
         DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND, DEFAULT_MAX_MRTR_INPUT_REQUESTS_TOTAL,
@@ -629,8 +655,16 @@ pub mod modern {
 pub mod legacy_2024 {
     pub use fastmcp_client::http_executor::{LegacySseHttpClient, LegacySseHttpClientError};
     pub use fastmcp_client::{
-        Client, ClientBuilder, ClientProtocolPlan, ClientProtocolPlanError, ClientSession, Request,
-        RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
+        Client, ClientBuilder, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
+        CreateMessageParams as LegacyCreateMessageParams,
+        CreateMessageResult as LegacyCreateMessageResult,
+        ElicitRequestParams as LegacyElicitRequestParams, ElicitResult as LegacyElicitResult,
+        ElicitationRequestHandler as LegacyElicitationRequestHandler,
+        ListRootsParams as LegacyListRootsParams, ListRootsResult as LegacyListRootsResult,
+        Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
+        ReverseRequestHandlers as LegacyReverseRequestHandlers,
+        RootsRequestHandler as LegacyRootsRequestHandler,
+        SamplingRequestHandler as LegacySamplingRequestHandler,
     };
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::methods;
@@ -693,6 +727,7 @@ pub mod prelude {
     pub use crate::{
         // Context and errors
         AccessToken,
+        AdmittedSchema,
         AuthContext,
         BoundHttpServer,
         // Client
@@ -729,15 +764,30 @@ pub mod prelude {
         DualEraHttpEndpointConfig,
         DualEraHttpEndpointError,
         DuplicateBehavior,
-        ElicitationRequestHandler,
         ExtensionDescriptor,
         ExtensionDescriptorRegistry,
+        ExtensionSettings,
+        ExtensionSettingsCompatibilityResolver,
         ExtensionSettingsResolution,
+        FINAL_JSON_SCHEMA_DIALECT,
         FINAL_PROTOCOL_VERSION,
         Final2026Peer,
         FinalAbsoluteUri,
         FinalCallToolResult,
         FinalCancelledNotificationParams,
+        FinalCoreResultType,
+        FinalCreateMessageParams,
+        FinalCreateMessageResult,
+        FinalEmbeddedCreateMessageParams,
+        FinalEmbeddedElicitationParams,
+        FinalEmbeddedElicitationResult,
+        FinalEmbeddedFormElicitationParams,
+        FinalEmbeddedInputKind,
+        FinalEmbeddedInputRequest,
+        FinalEmbeddedInputResponse,
+        FinalEmbeddedRootsListParams,
+        FinalEmbeddedRootsListResult,
+        FinalEmbeddedUrlElicitationParams,
         FinalEmptyNotificationParams,
         FinalGetPromptResult,
         FinalLogMessageParams,
@@ -793,6 +843,8 @@ pub mod prelude {
         ModernHttpSubscriptionListenCollector,
         ModernHttpSubscriptionListenError,
         NegotiatedExtensionSet,
+        OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+        OfficialTasksNegotiationResolver,
         // Outcome types (4-valued result)
         Outcome,
         OutcomeExt,
@@ -813,10 +865,8 @@ pub mod prelude {
         Resource,
         ResourceContent,
         ResultExt,
-        ReverseRequestHandlers,
         Role,
-        RootsRequestHandler,
-        SamplingRequestHandler,
+        SchemaAdmissionError,
         Server,
         ServerBehavior,
         ServerBehaviorRegistry,
@@ -840,17 +890,26 @@ pub mod prelude {
         TransportRecvHalf,
         TransportSendHalf,
         TwoPhaseTransport,
+        ValidationError,
+        ValidationResult,
+        admit_final_schema,
         auto,
         cancelled,
         err,
         legacy_2024,
         modern,
+        official_tasks_descriptor,
+        official_tasks_empty_settings,
         ok,
         // Macros
         prompt,
         providers::FilesystemProvider,
+        register_official_tasks_extension,
         resource,
+        schema,
+        tasks_extension,
         tool,
+        validate_final_core_result,
     };
 }
 
@@ -1219,11 +1278,130 @@ mod tests {
     }
 
     #[test]
-    fn api_03_facade_exposes_apps_and_dual_era_configuration() {
+    fn api_03_facade_exposes_schema_admission_reverse_handlers_and_tasks_resolver() {
         use super::{
-            Client, DuplicateBehavior, LoggingConfig, ReverseRequestHandlers, ServerBuilder, auto,
-            modern,
+            AdmittedSchema, ExtensionSettingsCompatibilityResolver, FinalCoreResultType,
+            OfficialTasksNegotiationResolver, SchemaAdmissionError, ValidationResult,
+            admit_final_schema, auto, legacy_2024, modern, prelude, validate_final_core_result,
         };
+
+        let _: fn(super::JsonValue) -> Result<AdmittedSchema, SchemaAdmissionError> =
+            admit_final_schema;
+        let _: fn(&AdmittedSchema, &super::JsonValue, FinalCoreResultType) -> ValidationResult =
+            validate_final_core_result;
+        let descriptor = modern::official_tasks_descriptor();
+        let settings = modern::official_tasks_empty_settings();
+        let mut resolver = OfficialTasksNegotiationResolver;
+        let effective = resolver
+            .resolve(&descriptor, &settings, &settings)
+            .expect("the official Tasks resolver must accept its own empty settings");
+        assert!(effective.as_object().is_empty());
+        assert_eq!(
+            modern::OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+            super::OFFICIAL_TASKS_RESULT_DISCRIMINATOR
+        );
+        assert_eq!(auto::TASK_UPDATE, super::TASK_UPDATE);
+        assert_eq!(prelude::TASK_UPDATE, super::TASK_UPDATE);
+        assert_eq!(
+            auto::FINAL_JSON_SCHEMA_DIALECT,
+            super::FINAL_JSON_SCHEMA_DIALECT
+        );
+        assert_eq!(
+            modern::FINAL_JSON_SCHEMA_DIALECT,
+            super::FINAL_JSON_SCHEMA_DIALECT
+        );
+        assert_eq!(
+            prelude::FINAL_JSON_SCHEMA_DIALECT,
+            super::FINAL_JSON_SCHEMA_DIALECT
+        );
+
+        let _: fn(auto::JsonValue) -> Result<auto::AdmittedSchema, auto::SchemaAdmissionError> =
+            auto::admit_final_schema;
+        let _: fn(
+            modern::JsonValue,
+        ) -> Result<modern::AdmittedSchema, modern::SchemaAdmissionError> =
+            modern::admit_final_schema;
+        let _: fn(
+            prelude::JsonValue,
+        ) -> Result<prelude::AdmittedSchema, prelude::SchemaAdmissionError> =
+            prelude::admit_final_schema;
+        let _: Option<auto::AdmittedSchema> = None;
+        let _: Option<auto::OfficialTasksNegotiationResolver> = None;
+        let _: Option<auto::FinalTaskStatusNotification> = None;
+        let _: Option<modern::AdmittedSchema> = None;
+        let _: Option<modern::OfficialTasksNegotiationResolver> = None;
+        let _: Option<prelude::AdmittedSchema> = None;
+        let _: Option<prelude::OfficialTasksNegotiationResolver> = None;
+        let _: Option<legacy_2024::LegacyReverseRequestHandlers> = None;
+        let _: Option<legacy_2024::LegacySamplingRequestHandler> = None;
+        let _: Option<legacy_2024::LegacyRootsRequestHandler> = None;
+        let _: Option<legacy_2024::LegacyElicitationRequestHandler> = None;
+        let _: Option<legacy_2024::LegacyCreateMessageParams> = None;
+        let _: Option<legacy_2024::LegacyCreateMessageResult> = None;
+        let _: Option<legacy_2024::LegacyListRootsParams> = None;
+        let _: Option<legacy_2024::LegacyListRootsResult> = None;
+        let _: Option<legacy_2024::LegacyElicitRequestParams> = None;
+        let _: Option<legacy_2024::LegacyElicitResult> = None;
+    }
+
+    #[test]
+    fn api_03_facade_separates_reverse_request_wire_eras() {
+        use super::{
+            FinalCreateMessageParams, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams,
+            FinalEmbeddedElicitationParams, FinalEmbeddedElicitationResult,
+            FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult, legacy_2024, modern,
+            prelude,
+        };
+
+        let _: Option<FinalCreateMessageParams> = None;
+        let _: Option<FinalCreateMessageResult> = None;
+        let _: Option<FinalEmbeddedCreateMessageParams> = None;
+        let _: Option<FinalEmbeddedRootsListParams> = None;
+        let _: Option<FinalEmbeddedRootsListResult> = None;
+        let _: Option<FinalEmbeddedElicitationParams> = None;
+        let _: Option<FinalEmbeddedElicitationResult> = None;
+
+        let _: Option<modern::FinalCreateMessageParams> = None;
+        let _: Option<modern::FinalCreateMessageResult> = None;
+        let _: Option<modern::FinalEmbeddedRootsListParams> = None;
+        let _: Option<modern::FinalEmbeddedElicitationParams> = None;
+        let _: Option<prelude::FinalCreateMessageParams> = None;
+        let _: Option<prelude::FinalCreateMessageResult> = None;
+        let _: Option<prelude::FinalEmbeddedRootsListParams> = None;
+        let _: Option<prelude::FinalEmbeddedElicitationParams> = None;
+
+        let _: Option<legacy_2024::LegacyReverseRequestHandlers> = None;
+        let _: Option<legacy_2024::LegacyCreateMessageParams> = None;
+        let _: Option<legacy_2024::LegacyCreateMessageResult> = None;
+        let _: Option<legacy_2024::LegacyListRootsParams> = None;
+        let _: Option<legacy_2024::LegacyListRootsResult> = None;
+        let _: Option<legacy_2024::LegacyElicitRequestParams> = None;
+        let _: Option<legacy_2024::LegacyElicitResult> = None;
+    }
+
+    #[test]
+    fn api_03_facade_tasks_resolver_rejects_one_dimension_invalid_descriptor() {
+        use super::{
+            ExtensionSettingsCompatibilityResolver, OfficialTasksNegotiationResolver, modern,
+        };
+
+        let mut descriptor = modern::official_tasks_descriptor();
+        descriptor.resolver.version = 2;
+        let settings = modern::official_tasks_empty_settings();
+        let error = OfficialTasksNegotiationResolver
+            .resolve(&descriptor, &settings, &settings)
+            .expect_err("changing only the Tasks resolver version must reject");
+
+        assert!(matches!(
+            error,
+            modern::ExtensionNegotiationError::SettingsCompatibilityRejected(id)
+                if id == modern::OFFICIAL_TASKS_EXTENSION_ID
+        ));
+    }
+
+    #[test]
+    fn api_03_facade_exposes_apps_and_dual_era_configuration() {
+        use super::{Client, DuplicateBehavior, LoggingConfig, ServerBuilder, legacy_2024, modern};
 
         let settings =
             modern::McpAppsClientSettings::new(vec![modern::MCP_APPS_HTML_MIME_TYPE.to_owned()])
@@ -1235,23 +1413,20 @@ mod tests {
             .expect("facade must expose MCP Apps descriptor registration");
         assert_eq!(apps_id.as_str(), modern::OFFICIAL_MCP_APPS_EXTENSION_ID);
 
-        let _: fn(&mut Client, ReverseRequestHandlers) = Client::set_reverse_request_handlers;
+        let _: fn(&mut Client, legacy_2024::LegacyReverseRequestHandlers) =
+            Client::set_reverse_request_handlers;
         let _: fn(ServerBuilder, DuplicateBehavior) -> ServerBuilder = ServerBuilder::on_duplicate;
         let _: fn(ServerBuilder, LoggingConfig) -> ServerBuilder = ServerBuilder::logging;
         let _: Option<modern::ExtensionSettingsResolution> = None;
         let _: Option<modern::McpAppsNegotiationResolver> = None;
-        let _: Option<auto::ReverseRequestHandlers> = None;
-
         use super::prelude::{
             DuplicateBehavior as PreludeDuplicateBehavior, LoggingConfig as PreludeLoggingConfig,
             McpAppsClientSettings as PreludeMcpAppsClientSettings,
-            ReverseRequestHandlers as PreludeReverseRequestHandlers,
         };
 
         let _: Option<PreludeDuplicateBehavior> = None;
         let _: Option<PreludeLoggingConfig> = None;
         let _: Option<PreludeMcpAppsClientSettings> = None;
-        let _: Option<PreludeReverseRequestHandlers> = None;
     }
 
     #[test]

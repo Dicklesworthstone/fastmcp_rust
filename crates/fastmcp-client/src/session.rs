@@ -179,42 +179,43 @@ impl ClientSession {
         server_capabilities: ServerCapabilities,
         protocol_version: String,
     ) -> Result<Self, ProtocolVersionError> {
-        ProtocolVersion::parse(&protocol_version)?;
-        Ok(Self::new(
+        let selected_era = ProtocolVersion::parse(&protocol_version)?.era();
+        Ok(Self::from_parts(
             client_info,
             client_capabilities,
             server_info,
             server_capabilities,
             protocol_version,
+            Some(selected_era),
         ))
     }
 
-    /// Creates a new client session after successful initialization.
-    ///
-    /// An empty version is reserved for pre-initialization placeholder state.
-    /// Any nonempty version must be one of the two exact supported revisions.
-    ///
-    /// # Panics
-    ///
-    /// Panics for a nonempty unsupported version. Prefer [`Self::try_new`]
-    /// when the version was received from a peer.
+    /// Creates the unselected placeholder state used before initialization.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new_placeholder(
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        server_info: ServerInfo,
+        server_capabilities: ServerCapabilities,
+    ) -> Self {
+        Self::from_parts(
+            client_info,
+            client_capabilities,
+            server_info,
+            server_capabilities,
+            String::new(),
+            None,
+        )
+    }
+
+    fn from_parts(
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
         server_info: ServerInfo,
         server_capabilities: ServerCapabilities,
         protocol_version: String,
+        selected_era: Option<ProtocolEra>,
     ) -> Self {
-        let selected_era = if protocol_version.is_empty() {
-            None
-        } else {
-            Some(
-                ProtocolVersion::parse(&protocol_version)
-                    .expect("negotiated sessions require a supported protocol version")
-                    .era(),
-            )
-        };
         Self {
             client_info,
             client_capabilities,
@@ -342,7 +343,14 @@ mod tests {
     use fastmcp_protocol::{PromptsCapability, ResourcesCapability, ToolsCapability};
 
     fn test_session_with_protocol_version(protocol_version: &str) -> ClientSession {
-        ClientSession::new(
+        try_test_session_with_protocol_version(protocol_version)
+            .expect("test sessions use an exact supported protocol version")
+    }
+
+    fn try_test_session_with_protocol_version(
+        protocol_version: &str,
+    ) -> Result<ClientSession, ProtocolVersionError> {
+        ClientSession::try_new(
             ClientInfo {
                 name: "test-client".to_string(),
                 version: "1.0.0".to_string(),
@@ -442,31 +450,20 @@ mod tests {
     }
 
     #[test]
-    fn session_accepts_auto_plan_for_the_negotiated_era() {
-        let session = test_session()
-            .try_with_protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::Auto))
-            .expect("auto admits the selected legacy era");
+    fn session_try_new_preserves_admitted_configured_policy() {
+        let session = try_test_session_with_protocol_version(LEGACY_PROTOCOL_VERSION)
+            .expect("the supported legacy version constructs a session")
+            .try_with_protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+            .expect("the configured legacy-only policy admits the legacy session");
 
         assert_eq!(session.selected_era(), Some(ProtocolEra::Legacy2024));
-        assert_eq!(session.protocol_plan().policy(), ProtocolPolicy::Auto);
+        assert_eq!(session.protocol_plan().policy(), ProtocolPolicy::LegacyOnly);
     }
 
     #[test]
     fn session_try_new_rejects_unsupported_protocol_version() {
-        let error = ClientSession::try_new(
-            ClientInfo {
-                name: "test-client".to_string(),
-                version: "1.0.0".to_string(),
-            },
-            ClientCapabilities::default(),
-            ServerInfo {
-                name: "test-server".to_string(),
-                version: "2.0.0".to_string(),
-            },
-            ServerCapabilities::default(),
-            "2025-11-25".to_string(),
-        )
-        .expect_err("unsupported versions must not construct a negotiated session");
+        let error = try_test_session_with_protocol_version("2025-11-25")
+            .expect_err("only the peer version differs from the supported positive case");
 
         assert_eq!(
             error,
@@ -477,14 +474,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "negotiated sessions require a supported protocol version")]
-    fn session_new_rejects_unsupported_protocol_version() {
-        let _ = test_session_with_protocol_version("2025-11-25");
-    }
-
-    #[test]
     fn session_with_sampling_capabilities() {
-        let session = ClientSession::new(
+        let session = ClientSession::try_new(
             ClientInfo {
                 name: "sampler".to_string(),
                 version: "0.1.0".to_string(),
@@ -500,13 +491,14 @@ mod tests {
             },
             ServerCapabilities::default(),
             "2024-11-05".to_string(),
-        );
+        )
+        .expect("exact supported protocol version");
         assert!(session.client_capabilities().sampling.is_some());
     }
 
     #[test]
     fn session_with_empty_server_capabilities() {
-        let session = ClientSession::new(
+        let session = ClientSession::new_placeholder(
             ClientInfo {
                 name: "c".to_string(),
                 version: "0.1.0".to_string(),
@@ -517,7 +509,6 @@ mod tests {
                 version: "0.1.0".to_string(),
             },
             ServerCapabilities::default(),
-            String::new(),
         );
         assert!(session.server_capabilities().tools.is_none());
         assert!(session.server_capabilities().resources.is_none());

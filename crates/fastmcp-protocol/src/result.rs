@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use serde_json::Value;
+
 use crate::common_types::{Implementation, OpenMetadata};
 use crate::jsonrpc::{RawJsonAdmissionError, admit_raw_jsonrpc_document};
 use crate::protocol_policy::ProtocolEra;
@@ -416,6 +418,45 @@ impl UnknownResultMembers {
 }
 
 const COMMON_RESULT_MEMBER_NAMES: [&str; 3] = ["resultType", "_meta", "serverInfo"];
+
+/// Reserved `_meta` members introduced by the final protocol era.
+///
+/// Legacy envelopes may retain application-defined metadata, but cannot carry
+/// any of these protocol-defined members without crossing protocol eras.
+const FINAL_ONLY_METADATA_MEMBER_NAMES: [&str; 5] = [
+    "io.modelcontextprotocol/protocolVersion",
+    "io.modelcontextprotocol/clientCapabilities",
+    "io.modelcontextprotocol/clientInfo",
+    "io.modelcontextprotocol/serverInfo",
+    "io.modelcontextprotocol/subscriptionId",
+];
+
+/// Returns whether an otherwise legacy result envelope carries a reserved
+/// final-era metadata member.
+///
+/// A legacy decoder must reject these rather than silently dropping them
+/// through an open legacy result payload.
+pub(crate) fn has_final_only_metadata(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(|object| object.get("_meta"))
+        .and_then(Value::as_object)
+        .is_some_and(|metadata| {
+            FINAL_ONLY_METADATA_MEMBER_NAMES
+                .iter()
+                .any(|member| metadata.contains_key(*member))
+        })
+}
+
+fn exact_result_carries_final_only_metadata(members: &ExactJsonObject) -> bool {
+    matches!(
+        members.get("_meta"),
+        Some(ExactJsonValue::Object(metadata))
+            if FINAL_ONLY_METADATA_MEMBER_NAMES
+                .iter()
+                .any(|member| metadata.get(member).is_some())
+    )
+}
 
 fn validate_local_result_members(members: &[ExactJsonMember]) -> Result<(), ResultDecodeError> {
     let encoded_bytes = exact_json_members_len(members, 0)?;
@@ -836,6 +877,12 @@ pub fn decode_peer_result(
         return Err(ResultDecodeError::new(
             ResultDecodeErrorKind::InvalidKnownMember,
             "$.serverInfo",
+        ));
+    }
+    if era == ResultPeerEra::Legacy && exact_result_carries_final_only_metadata(&members) {
+        return Err(ResultDecodeError::new(
+            ResultDecodeErrorKind::InvalidKnownMember,
+            "$._meta",
         ));
     }
     match policy.decide(&result_type.0) {
@@ -1631,6 +1678,43 @@ mod tests {
         )
         .expect("rejections do not mutate final result admission");
         assert_eq!(encode_result(&baseline), accepted);
+        assert_eq!(encode_result(&reaccepted), accepted);
+    }
+
+    #[test]
+    fn legacy_results_reject_each_final_only_metadata_member_without_changing_valid_round_trip() {
+        let accepted = r#"{"resultType":"complete","_meta":{"trace":"legacy"},"extension":true}"#;
+        let (baseline, diagnostic) = decode_peer_result(
+            accepted,
+            ResultPeerEra::Legacy,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("baseline legacy result is admitted");
+        assert_eq!(diagnostic, None);
+        assert_eq!(encode_result(&baseline), accepted);
+
+        for final_metadata_member in FINAL_ONLY_METADATA_MEMBER_NAMES {
+            let mut planted: Value =
+                serde_json::from_str(accepted).expect("baseline result is JSON");
+            planted["_meta"][final_metadata_member] = Value::Bool(true);
+            let planted = serde_json::to_string(&planted).expect("planted result encodes");
+
+            let error = decode_peer_result(
+                &planted,
+                ResultPeerEra::Legacy,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .expect_err("adding one final-only metadata member rejects the legacy result");
+            assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
+            assert_eq!(error.path(), "$._meta");
+        }
+
+        let (reaccepted, _) = decode_peer_result(
+            accepted,
+            ResultPeerEra::Legacy,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("rejections leave the valid legacy result unchanged");
         assert_eq!(encode_result(&reaccepted), accepted);
     }
 

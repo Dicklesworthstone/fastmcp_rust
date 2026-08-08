@@ -28,7 +28,7 @@ use crate::result::{
     CompleteResult, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonMember,
     InputRequiredResult, ResultDecodeError, ResultPeerDiagnostic, UnknownResultMembers,
     decode_peer_result_for_era, encode_complete_result, encode_result, exact_json_from_serde,
-    exact_json_to_serde,
+    exact_json_to_serde, has_final_only_metadata,
 };
 use crate::types::{
     ClientCapabilities, ClientInfo, LegacyContent, LegacyMetadata, LegacyPromptMessage,
@@ -1955,6 +1955,8 @@ pub enum CoreDispatchError {
     CrossEraRequestMetadata { method: &'static str },
     /// A legacy result attempted to carry a final `resultType` discriminator.
     CrossEraResultType { method: &'static str },
+    /// A legacy result attempted to carry final result metadata.
+    CrossEraResultMetadata { method: &'static str },
     /// A result did not match the selected method-specific payload.
     InvalidResult {
         era: ProtocolEra,
@@ -1985,6 +1987,12 @@ impl std::fmt::Display for CoreDispatchError {
             }
             Self::CrossEraResultType { method } => {
                 write!(formatter, "legacy {method} cannot carry final resultType")
+            }
+            Self::CrossEraResultMetadata { method } => {
+                write!(
+                    formatter,
+                    "legacy {method} cannot carry final result metadata"
+                )
             }
             Self::InvalidResult { era, method } => {
                 write!(formatter, "invalid {method} result for {era:?}")
@@ -2666,14 +2674,7 @@ fn require_absent_or_empty_params(
 }
 
 fn legacy_params_carry_final_metadata(params: Option<&Value>) -> bool {
-    params
-        .and_then(Value::as_object)
-        .and_then(|params| params.get("_meta"))
-        .and_then(Value::as_object)
-        .is_some_and(|metadata| {
-            metadata.contains_key(FINAL_PROTOCOL_VERSION_META_KEY)
-                || metadata.contains_key(FINAL_CLIENT_CAPABILITIES_META_KEY)
-        })
+    params.is_some_and(has_final_only_metadata)
 }
 
 fn decode_legacy_result<T: DeserializeOwned>(
@@ -2690,6 +2691,9 @@ fn decode_legacy_result<T: DeserializeOwned>(
         .is_some_and(|object| object.contains_key("resultType"))
     {
         return Err(CoreDispatchError::CrossEraResultType { method });
+    }
+    if has_final_only_metadata(&value) {
+        return Err(CoreDispatchError::CrossEraResultMetadata { method });
     }
     serde_json::from_value(value).map_err(|_| CoreDispatchError::InvalidResult {
         era: ProtocolEra::Legacy2024,
@@ -2710,6 +2714,9 @@ fn encode_legacy_result<T: Serialize>(
         .is_some_and(|object| object.contains_key("resultType"))
     {
         return Err(CoreDispatchError::CrossEraResultType { method });
+    }
+    if has_final_only_metadata(&value) {
+        return Err(CoreDispatchError::CrossEraResultMetadata { method });
     }
     serde_json::to_string(&value).map_err(|_| CoreDispatchError::InvalidResult {
         era: ProtocolEra::Legacy2024,
@@ -5714,6 +5721,129 @@ mod tests {
                 .expect("reaccepted encodes")
                 .expect("reaccepted parameters"),
             "the one-field cross-era rejection leaves the accepted legacy request unchanged"
+        );
+    }
+
+    #[test]
+    fn core_request_envelope_admits_final_client_info() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "final-client",
+                    "version": "1.0.0"
+                }
+            }
+        });
+
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_LIST, Some(&params))
+            .expect("final clientInfo is admitted by the final request envelope");
+        assert_eq!(request.era(), ProtocolEra::Modern2026);
+        assert_eq!(
+            request
+                .encode_params()
+                .expect("admitted final request encodes"),
+            Some(params)
+        );
+    }
+
+    #[test]
+    fn core_request_envelope_rejects_one_final_client_info_member_in_legacy_era() {
+        let accepted = serde_json::json!({});
+        let baseline = CoreRequest::decode(ProtocolEra::Legacy2024, TOOLS_LIST, Some(&accepted))
+            .expect("baseline legacy list request");
+
+        let mut planted = accepted.clone();
+        planted["_meta"] = serde_json::json!({
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "final-client",
+                "version": "1.0.0"
+            }
+        });
+        assert!(
+            matches!(
+                CoreRequest::decode(ProtocolEra::Legacy2024, TOOLS_LIST, Some(&planted)),
+                Err(CoreDispatchError::CrossEraRequestMetadata { method: TOOLS_LIST })
+            ),
+            "only the final clientInfo metadata member changes the accepted legacy request"
+        );
+
+        let reaccepted = CoreRequest::decode(ProtocolEra::Legacy2024, TOOLS_LIST, Some(&accepted))
+            .expect("cross-era rejection cannot mutate legacy request admission");
+        assert_eq!(
+            baseline
+                .encode_params()
+                .expect("baseline legacy request encodes"),
+            reaccepted
+                .encode_params()
+                .expect("reaccepted legacy request encodes")
+        );
+    }
+
+    #[test]
+    fn core_result_envelope_admits_final_server_info() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_LIST, Some(&params))
+            .expect("final tools/list request");
+        let result = r#"{"resultType":"complete","tools":[],"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"final-server","version":"1.0.0"}}}"#;
+
+        let decoded = request
+            .decode_result(result)
+            .expect("final serverInfo is admitted by the final result envelope");
+        assert_eq!(
+            decoded.encode().expect("admitted final result encodes"),
+            result
+        );
+    }
+
+    #[test]
+    fn core_result_envelope_rejects_each_final_only_metadata_member_in_legacy_era() {
+        let request = CoreRequest::decode(ProtocolEra::Legacy2024, TOOLS_LIST, None)
+            .expect("baseline legacy request");
+        let accepted = r#"{"tools":[]}"#;
+        let baseline = request
+            .decode_result(accepted)
+            .expect("baseline legacy result is admitted");
+        assert_eq!(
+            baseline.encode().expect("baseline legacy result encodes"),
+            accepted
+        );
+
+        for final_metadata_member in [
+            FINAL_PROTOCOL_VERSION_META_KEY,
+            FINAL_CLIENT_CAPABILITIES_META_KEY,
+            FINAL_CLIENT_INFO_META_KEY,
+            FINAL_SERVER_INFO_META_KEY,
+            FINAL_SUBSCRIPTION_ID_META_KEY,
+        ] {
+            let planted = serde_json::json!({
+                "tools": [],
+                "_meta": {final_metadata_member: true}
+            })
+            .to_string();
+            assert!(
+                matches!(
+                    request.decode_result(&planted),
+                    Err(CoreDispatchError::CrossEraResultMetadata { method: TOOLS_LIST })
+                ),
+                "adding only {final_metadata_member} rejects the otherwise valid legacy result"
+            );
+        }
+
+        let reaccepted = request
+            .decode_result(accepted)
+            .expect("cross-era rejection cannot mutate legacy result admission");
+        assert_eq!(
+            reaccepted
+                .encode()
+                .expect("reaccepted legacy result encodes"),
+            accepted
         );
     }
 

@@ -1,12 +1,17 @@
 //! Server builder for configuring MCP servers.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
 use fastmcp_core::McpResult;
-use fastmcp_protocol::extensions::ExtensionSettingsCompatibilityResolver;
+use fastmcp_protocol::extensions::{
+    ExtensionSettingsCompatibilityResolver, official_mcp_apps_extension_id,
+    validate_official_mcp_apps_server_settings,
+};
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{
     LoggingCapability, PromptsCapability, ResourceTemplate, ResourcesCapability,
@@ -31,20 +36,52 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Reserved launch setting written by `fastmcp run` for FastMCP server targets.
 const FASTMCP_PROTOCOL_POLICY_ENV: &str = "FASTMCP_PROTOCOL_POLICY";
 
-fn protocol_policy_from_server_launch_value(value: Option<&str>) -> Option<ProtocolPolicy> {
-    match value {
-        Some("auto") => Some(ProtocolPolicy::Auto),
-        Some("modern-only") => Some(ProtocolPolicy::ModernOnly),
-        Some("legacy-only") => Some(ProtocolPolicy::LegacyOnly),
-        Some(_) | None => None,
+/// The reserved launch policy is absent, malformed, or not valid Unicode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerLaunchPolicyError {
+    /// The reserved launch setting was present but was not valid Unicode.
+    NonUnicode,
+    /// The reserved launch setting was not one of the exact supported values.
+    InvalidValue,
+}
+
+impl fmt::Display for ServerLaunchPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonUnicode => write!(
+                formatter,
+                "{FASTMCP_PROTOCOL_POLICY_ENV} must be valid Unicode"
+            ),
+            Self::InvalidValue => write!(
+                formatter,
+                "{FASTMCP_PROTOCOL_POLICY_ENV} must be auto, modern-only, or legacy-only"
+            ),
+        }
     }
 }
 
-fn protocol_policy_from_server_launch_environment() -> ProtocolPolicy {
+impl std::error::Error for ServerLaunchPolicyError {}
+
+fn protocol_policy_from_server_launch_value(
+    value: Option<&OsStr>,
+) -> Result<Option<ProtocolPolicy>, ServerLaunchPolicyError> {
+    match value {
+        None => Ok(None),
+        Some(value) => match value.to_str() {
+            Some("auto") => Ok(Some(ProtocolPolicy::Auto)),
+            Some("modern-only") => Ok(Some(ProtocolPolicy::ModernOnly)),
+            Some("legacy-only") => Ok(Some(ProtocolPolicy::LegacyOnly)),
+            Some(_) => Err(ServerLaunchPolicyError::InvalidValue),
+            None => Err(ServerLaunchPolicyError::NonUnicode),
+        },
+    }
+}
+
+fn protocol_policy_from_server_launch_environment()
+-> Result<Option<ProtocolPolicy>, ServerLaunchPolicyError> {
     protocol_policy_from_server_launch_value(
-        std::env::var(FASTMCP_PROTOCOL_POLICY_ENV).ok().as_deref(),
+        std::env::var_os(FASTMCP_PROTOCOL_POLICY_ENV).as_deref(),
     )
-    .unwrap_or_default()
 }
 
 /// Builder for configuring an MCP server.
@@ -81,6 +118,9 @@ pub struct ServerBuilder {
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy for live stdio/runtime connections.
     protocol_policy: ProtocolPolicy,
+    /// Reserved CLI launch policy, retaining malformed input for the
+    /// fallible build boundary.
+    launch_protocol_policy: Result<Option<ProtocolPolicy>, ServerLaunchPolicyError>,
     /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
     /// Installed extension handlers and current server discovery settings.
@@ -99,8 +139,25 @@ impl ServerBuilder {
     /// [`with_console_config`](Self::with_console_config) for programmatic control.
     #[must_use]
     pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self::from_launch_protocol_policy(
+            name,
+            version,
+            protocol_policy_from_server_launch_environment(),
+        )
+    }
+
+    fn from_launch_protocol_policy(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        launch_protocol_policy: Result<Option<ProtocolPolicy>, ServerLaunchPolicyError>,
+    ) -> Self {
         let console_config = ConsoleConfig::from_env();
         let logging = LoggingConfig::from(&console_config);
+        let protocol_policy = launch_protocol_policy
+            .as_ref()
+            .ok()
+            .and_then(|policy| *policy)
+            .unwrap_or(ProtocolPolicy::Auto);
         Self {
             info: ServerInfo {
                 name: name.into(),
@@ -126,7 +183,8 @@ impl ServerBuilder {
             strict_input_validation: false,
             max_bidirectional_requests_per_connection:
                 crate::bidirectional::DEFAULT_MAX_IN_FLIGHT_REQUESTS,
-            protocol_policy: protocol_policy_from_server_launch_environment(),
+            protocol_policy,
+            launch_protocol_policy,
             http_config: HttpServerConfig::default(),
             extension_runtime: None,
             final_task_runtime: None,
@@ -326,10 +384,13 @@ impl ServerBuilder {
     ///
     /// The default [`ProtocolPolicy::Auto`] classifies the first accepted opening frame and then
     /// pins that connection to its selected era. `ModernOnly` and `LegacyOnly` reject an opening
-    /// frame from the other exact supported era before it can enter request dispatch.
+    /// frame from the other exact supported era before it can enter request dispatch. A policy
+    /// supplied through the reserved launch environment takes precedence at [`Self::try_build`].
     #[must_use]
     pub fn protocol_policy(mut self, policy: ProtocolPolicy) -> Self {
-        self.protocol_policy = policy;
+        if matches!(self.launch_protocol_policy, Ok(None)) {
+            self.protocol_policy = policy;
+        }
         self
     }
 
@@ -351,12 +412,39 @@ impl ServerBuilder {
         if self.extension_runtime.is_some() {
             return Err(ServerExtensionConfigurationError::AlreadyInstalled);
         }
+        if let Some(settings) = server_discovery
+            .extensions
+            .get(&official_mcp_apps_extension_id())
+        {
+            validate_official_mcp_apps_server_settings(settings)
+                .map_err(ServerExtensionConfigurationError::Registry)?;
+        }
         let mut extension_runtime =
             ServerExtensionRuntime::new(handlers, server_discovery, resolver)?;
         if let Some(task_runtime) = self.final_task_runtime.as_ref() {
             extension_runtime.install_final_tasks(task_runtime)?;
         }
         self.extension_runtime = Some(extension_runtime);
+        Ok(self)
+    }
+
+    /// Installs the official MCP Apps descriptor and empty server discovery marker.
+    ///
+    /// Apps owns no client-to-server JSON-RPC method on this surface. This
+    /// opt-in therefore configures bilateral capability negotiation and
+    /// `server/discover` metadata only. It composes in either order with
+    /// [`Self::final_tasks`], preserving an Apps inactive disposition when a
+    /// client does not advertise the Apps HTML MIME type.
+    pub fn mcp_apps(mut self) -> Result<Self, ServerExtensionConfigurationError> {
+        if let Some(extension_runtime) = self.extension_runtime.as_mut() {
+            extension_runtime.install_official_mcp_apps()?;
+        } else {
+            let mut extension_runtime = ServerExtensionRuntime::with_official_mcp_apps()?;
+            if let Some(task_runtime) = self.final_task_runtime.as_ref() {
+                extension_runtime.install_final_tasks(task_runtime)?;
+            }
+            self.extension_runtime = Some(extension_runtime);
+        }
         Ok(self)
     }
 
@@ -408,7 +496,13 @@ impl ServerBuilder {
         self,
         legacy_origin: impl Into<String>,
     ) -> Result<crate::ServerHttpEndpoint, fastmcp_transport::http::DualEraHttpEndpointError> {
-        self.build().into_http_endpoint(legacy_origin)
+        self.try_build()
+            .map_err(|error| {
+                fastmcp_transport::http::DualEraHttpEndpointError::InvalidConfiguration(
+                    error.to_string(),
+                )
+            })?
+            .into_http_endpoint(legacy_origin)
     }
 
     /// Registers a middleware.
@@ -1228,6 +1322,11 @@ impl ServerBuilder {
     }
 
     /// Builds the server.
+    ///
+    /// This preserves the infallible construction API. Launch paths that
+    /// receive `FASTMCP_PROTOCOL_POLICY` must use [`Self::try_build`] so a
+    /// malformed reserved setting cannot start a server with an implicit
+    /// fallback policy.
     #[must_use]
     pub fn build(mut self) -> Server {
         // Configure router with strict input validation setting
@@ -1292,11 +1391,25 @@ impl ServerBuilder {
             max_bidirectional_requests_per_connection: self
                 .max_bidirectional_requests_per_connection,
             protocol_policy: self.protocol_policy,
+            launch_policy_error: self.launch_protocol_policy.err(),
             http_config: self.http_config,
             extension_runtime,
             final_task_runtime: self.final_task_runtime,
             final_subscriptions,
         }
+    }
+
+    /// Builds a server after validating the reserved CLI launch policy.
+    ///
+    /// A valid reserved policy takes precedence over an application-supplied
+    /// [`Self::protocol_policy`] choice. A malformed or non-Unicode reserved
+    /// value is retained from [`Self::new`] and returned without constructing
+    /// a server.
+    pub fn try_build(self) -> Result<Server, ServerLaunchPolicyError> {
+        self.launch_protocol_policy
+            .as_ref()
+            .map_err(|error| *error)?;
+        Ok(self.build())
     }
 }
 
@@ -1304,6 +1417,7 @@ impl ServerBuilder {
 mod tests {
     use super::*;
     use fastmcp_core::{McpContext, McpResult};
+    use fastmcp_protocol::extensions::ExtensionNegotiationError;
     use fastmcp_protocol::{Content, Prompt, Resource, ResourceContent, Tool};
 
     // ── Stub handlers ────────────────────────────────────────────────
@@ -1632,6 +1746,65 @@ mod tests {
     }
 
     #[test]
+    fn builder_manual_apps_discovery_requires_the_exact_empty_marker_before_build() {
+        let mut accepted_descriptors = fastmcp_protocol::ExtensionDescriptorRegistry::new();
+        let accepted_id =
+            fastmcp_protocol::register_official_mcp_apps_extension(&mut accepted_descriptors)
+                .expect("the official Apps descriptor registers");
+        let accepted = ServerBuilder::new("apps-marker", "1.0").extension_registry(
+            crate::ExtensionHandlerRegistry::new(accepted_descriptors),
+            ServerExtensionDiscovery {
+                extensions: std::collections::BTreeMap::from([(
+                    accepted_id,
+                    fastmcp_protocol::official_mcp_apps_empty_server_settings(),
+                )]),
+            },
+            |_descriptor: &fastmcp_protocol::ExtensionDescriptor,
+             _client: &fastmcp_protocol::ExtensionSettings,
+             _server: &fastmcp_protocol::ExtensionSettings|
+             -> Result<fastmcp_protocol::ExtensionSettings, ExtensionNegotiationError> {
+                Ok(fastmcp_protocol::official_mcp_apps_empty_server_settings())
+            },
+        );
+        assert!(
+            accepted.is_ok(),
+            "the exact empty official Apps marker is accepted during builder configuration"
+        );
+
+        let mut rejected_descriptors = fastmcp_protocol::ExtensionDescriptorRegistry::new();
+        let rejected_id =
+            fastmcp_protocol::register_official_mcp_apps_extension(&mut rejected_descriptors)
+                .expect("the official Apps descriptor registers");
+        let rejected = ServerBuilder::new("apps-marker", "1.0").extension_registry(
+            crate::ExtensionHandlerRegistry::new(rejected_descriptors),
+            ServerExtensionDiscovery {
+                extensions: std::collections::BTreeMap::from([(
+                    rejected_id,
+                    fastmcp_protocol::ExtensionSettings::new(serde_json::json!({
+                        "unexpected": true,
+                    }))
+                    .expect("the one-field alternate is generic extension metadata"),
+                )]),
+            },
+            |_descriptor: &fastmcp_protocol::ExtensionDescriptor,
+             _client: &fastmcp_protocol::ExtensionSettings,
+             _server: &fastmcp_protocol::ExtensionSettings|
+             -> Result<fastmcp_protocol::ExtensionSettings, ExtensionNegotiationError> {
+                Ok(fastmcp_protocol::official_mcp_apps_empty_server_settings())
+            },
+        );
+        assert!(
+            matches!(
+                rejected,
+                Err(crate::ServerExtensionConfigurationError::Registry(
+                    fastmcp_protocol::ExtensionRegistryError::OfficialMcpAppsServerSettingsNotEmpty
+                ))
+            ),
+            "adding one discovery setting is rejected by extension_registry before build"
+        );
+    }
+
+    #[test]
     fn builder_completion_handler_activates_exact_discovery_capability() {
         let server = ServerBuilder::new("srv", "1.0")
             .completion_handler(TestCompletion)
@@ -1782,35 +1955,99 @@ mod tests {
     }
 
     #[test]
-    fn explicit_builder_protocol_policy_overrides_launch_default() {
-        let server = ServerBuilder::new("srv", "1.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .build();
+    fn explicit_protocol_policy_applies_without_reserved_launch_setting() {
+        let server = ServerBuilder::from_launch_protocol_policy("srv", "1.0", Ok(None))
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .try_build()
+            .expect("unset launch policy must permit a server");
 
-        assert_eq!(server.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(server.protocol_policy(), ProtocolPolicy::ModernOnly);
     }
 
     #[test]
-    fn server_launch_protocol_policy_values_decode_to_exact_eras() {
+    fn launch_policy_unset_defaults_to_auto() {
+        assert_eq!(protocol_policy_from_server_launch_value(None), Ok(None));
+    }
+
+    #[test]
+    fn launch_policy_accepts_exact_public_values() {
         assert_eq!(
-            protocol_policy_from_server_launch_value(Some("auto")),
-            Some(ProtocolPolicy::Auto)
+            protocol_policy_from_server_launch_value(Some(OsStr::new("auto"))),
+            Ok(Some(ProtocolPolicy::Auto))
         );
         assert_eq!(
-            protocol_policy_from_server_launch_value(Some("modern-only")),
-            Some(ProtocolPolicy::ModernOnly)
+            protocol_policy_from_server_launch_value(Some(OsStr::new("modern-only"))),
+            Ok(Some(ProtocolPolicy::ModernOnly))
         );
         assert_eq!(
-            protocol_policy_from_server_launch_value(Some("legacy-only")),
-            Some(ProtocolPolicy::LegacyOnly)
+            protocol_policy_from_server_launch_value(Some(OsStr::new("legacy-only"))),
+            Ok(Some(ProtocolPolicy::LegacyOnly))
         );
     }
 
     #[test]
-    fn server_launch_protocol_policy_rejects_unrecognized_value() {
+    fn valid_launch_policy_wins_over_explicit_builder_policy() {
+        let server = ServerBuilder::from_launch_protocol_policy(
+            "srv",
+            "1.0",
+            Ok(Some(ProtocolPolicy::ModernOnly)),
+        )
+        .protocol_policy(ProtocolPolicy::LegacyOnly)
+        .try_build()
+        .expect("valid launch policy must build");
+
+        assert_eq!(server.protocol_policy(), ProtocolPolicy::ModernOnly);
+    }
+
+    #[test]
+    fn invalid_launch_policy_is_latched_through_fluent_configuration() {
+        let result = ServerBuilder::from_launch_protocol_policy(
+            "srv",
+            "1.0",
+            Err(ServerLaunchPolicyError::InvalidValue),
+        )
+        .protocol_policy(ProtocolPolicy::ModernOnly)
+        .try_build();
+
+        assert!(matches!(result, Err(ServerLaunchPolicyError::InvalidValue)));
+    }
+
+    #[test]
+    fn latched_invalid_launch_policy_blocks_infallible_build_http_startup() {
+        let endpoint = ServerBuilder::from_launch_protocol_policy(
+            "srv",
+            "1.0",
+            Err(ServerLaunchPolicyError::InvalidValue),
+        )
+        .build()
+        .into_http_endpoint("http://legacy.test");
+        let Err(error) = endpoint else {
+            panic!("latched launch policy must block endpoint startup");
+        };
+
+        assert!(matches!(
+            error,
+            fastmcp_transport::http::DualEraHttpEndpointError::InvalidConfiguration(message)
+                if message.contains(FASTMCP_PROTOCOL_POLICY_ENV)
+        ));
+    }
+
+    #[test]
+    fn launch_policy_parser_rejects_unknown_value_without_auto_fallback() {
         assert_eq!(
-            protocol_policy_from_server_launch_value(Some("mcp-2025-11-25")),
-            None
+            protocol_policy_from_server_launch_value(Some(OsStr::new("mcp-2025-11-25"))),
+            Err(ServerLaunchPolicyError::InvalidValue)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_policy_parser_rejects_non_unicode_value_without_panic() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(
+            protocol_policy_from_server_launch_value(Some(OsStr::from_bytes(b"modern-only\xff"))),
+            Err(ServerLaunchPolicyError::NonUnicode)
         );
     }
 

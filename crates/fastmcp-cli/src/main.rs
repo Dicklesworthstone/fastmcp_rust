@@ -671,6 +671,10 @@ enum Commands {
         #[arg(long, short = 'e')]
         env: Vec<String>,
 
+        /// Protocol-policy selection for the launched server (auto, modern-only, legacy-only).
+        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::Auto)]
+        protocol_policy: CliProtocolPolicy,
+
         /// Show detailed output.
         #[arg(long, short = 'v')]
         verbose: bool,
@@ -985,6 +989,7 @@ fn main() -> ExitCode {
             debounce,
             clear,
             env,
+            protocol_policy,
             verbose,
         } => cmd_dev(DevConfig {
             target,
@@ -994,6 +999,7 @@ fn main() -> ExitCode {
             debounce_ms: debounce,
             clear,
             env,
+            protocol_policy,
             verbose,
         }),
         Commands::Tasks { action } => cmd_tasks(action),
@@ -1075,6 +1081,18 @@ fn reject_reserved_protocol_policy_environment(
     }
 
     Ok(())
+}
+
+fn dev_launch_environment(
+    mut env_vars: HashMap<String, String>,
+    protocol_policy: CliProtocolPolicy,
+) -> McpResult<HashMap<String, String>> {
+    reject_reserved_protocol_policy_environment(&env_vars)?;
+    env_vars.insert(
+        FASTMCP_PROTOCOL_POLICY_ENV.to_owned(),
+        protocol_policy.server_launch_value().to_owned(),
+    );
+    Ok(env_vars)
 }
 
 fn child_exit_error(subject: &str, code: Option<i32>) -> fastmcp_core::McpError {
@@ -3889,6 +3907,7 @@ struct DevConfig {
     debounce_ms: u64,
     clear: bool,
     env: Vec<String>,
+    protocol_policy: CliProtocolPolicy,
     verbose: bool,
 }
 
@@ -4665,7 +4684,10 @@ fn cmd_dev_supported(config: DevConfig) -> McpResult<()> {
 
     let term = Term::stdout();
 
-    let env_vars = parse_environment_assignments(&config.env)?;
+    let env_vars = dev_launch_environment(
+        parse_environment_assignments(&config.env)?,
+        config.protocol_policy,
+    )?;
 
     let mut shutdown_signals = Some(DevShutdownSignals {
         interrupt: asupersync::signal::signal(asupersync::signal::SignalKind::interrupt())
@@ -10731,6 +10753,7 @@ mod tests {
                     no_reload,
                     debounce,
                     clear,
+                    protocol_policy,
                     verbose,
                     ..
                 } => {
@@ -10738,6 +10761,7 @@ mod tests {
                     assert!(!no_reload);
                     assert_eq!(debounce, 100);
                     assert!(!clear);
+                    assert_eq!(protocol_policy, CliProtocolPolicy::Auto);
                     assert!(!verbose);
                 }
                 _ => unreachable!("Expected Dev command"),
@@ -10754,6 +10778,8 @@ mod tests {
                 "250",
                 "--clear",
                 "-v",
+                "--protocol-policy",
+                "modern-only",
                 ".",
             ])
             .unwrap();
@@ -10762,16 +10788,43 @@ mod tests {
                     no_reload,
                     debounce,
                     clear,
+                    protocol_policy,
                     verbose,
                     ..
                 } => {
                     assert!(no_reload);
                     assert_eq!(debounce, 250);
                     assert!(clear);
+                    assert_eq!(protocol_policy, CliProtocolPolicy::ModernOnly);
                     assert!(verbose);
                 }
                 _ => unreachable!("Expected Dev command"),
             }
+        }
+
+        #[test]
+        fn dev_launch_environment_selects_policy_and_refuses_reserved_override() {
+            let selected = dev_launch_environment(
+                HashMap::from([("OTHER".to_owned(), "value".to_owned())]),
+                CliProtocolPolicy::ModernOnly,
+            )
+            .expect("an unrelated child environment entry is admitted");
+            assert_eq!(
+                selected
+                    .get(FASTMCP_PROTOCOL_POLICY_ENV)
+                    .map(String::as_str),
+                Some("modern-only")
+            );
+
+            let error = dev_launch_environment(
+                HashMap::from([(
+                    FASTMCP_PROTOCOL_POLICY_ENV.to_owned(),
+                    "mcp-2025-11-25".to_owned(),
+                )]),
+                CliProtocolPolicy::ModernOnly,
+            )
+            .expect_err("the reserved child setting must be refused before any dev child starts");
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
         }
 
         #[test]

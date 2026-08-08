@@ -605,7 +605,7 @@ impl ClientBuilder {
         protocol_plan: ClientProtocolPlan,
     ) -> Client {
         // Create a placeholder session - will be updated on first use
-        let session = ClientSession::new(
+        let session = ClientSession::new_placeholder(
             self.client_info.clone(),
             self.capabilities.clone(),
             fastmcp_protocol::ServerInfo {
@@ -613,7 +613,6 @@ impl ClientBuilder {
                 version: String::new(),
             },
             fastmcp_protocol::ServerCapabilities::default(),
-            String::new(),
         )
         .with_protocol_plan(protocol_plan);
 

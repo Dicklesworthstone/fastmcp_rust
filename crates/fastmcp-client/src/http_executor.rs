@@ -198,6 +198,9 @@ pub enum ModernHttpResponseKind {
     Json,
     /// A successful request-scoped SSE response stream.
     Sse,
+    /// A content-type-free `202 Accepted` notification acknowledgement whose
+    /// body must be checked by the notification caller before it is accepted.
+    EmptyAcknowledgement,
     /// A non-success response whose body remains opaque to this transport layer.
     HttpFailure,
 }
@@ -1233,6 +1236,26 @@ pub enum ClientHttpConnectionError {
         expected: RequestId,
         actual: Option<RequestId>,
     },
+    /// A convenience request expected a finite JSON response but received a
+    /// different admitted modern body lane.
+    ExpectedJsonResponse { actual: ModernHttpResponseKind },
+    /// A convenience request body was not one strictly admitted JSON-RPC
+    /// response envelope.
+    ResponseAdmission(JsonRpcAdmissionError),
+    /// A convenience request received a JSON-RPC request rather than its
+    /// correlated response.
+    UnexpectedResponseMessage { request_id: RequestId },
+    /// A modern convenience response did not retain the caller's request ID.
+    ResponseIdMismatch {
+        expected: RequestId,
+        actual: Option<RequestId>,
+    },
+    /// A modern notification acknowledgement did not use the required 202
+    /// status, so it cannot be treated as an accepted notification.
+    ModernNotificationUnexpectedStatus { status: u16 },
+    /// A modern notification acknowledgement carried a body rather than the
+    /// empty acknowledgement required by the stateless notification surface.
+    ModernNotificationUnexpectedBody,
     /// Final `subscriptions/listen` requires the modern HTTP transport.
     SubscriptionsListenRequiresModern,
     /// A modern subscription response stream failed typed admission or collection.
@@ -1264,6 +1287,30 @@ impl fmt::Display for ClientHttpConnectionError {
                     "legacy SSE response ID {actual:?} did not match request {expected:?}"
                 )
             }
+            Self::ExpectedJsonResponse { actual } => write!(
+                formatter,
+                "HTTP request expected a JSON response but received {actual:?}"
+            ),
+            Self::ResponseAdmission(error) => {
+                write!(
+                    formatter,
+                    "HTTP request response failed JSON-RPC admission: {error}"
+                )
+            }
+            Self::UnexpectedResponseMessage { request_id } => write!(
+                formatter,
+                "HTTP request received a JSON-RPC request while waiting for response {request_id:?}"
+            ),
+            Self::ResponseIdMismatch { expected, actual } => write!(
+                formatter,
+                "HTTP response ID {actual:?} did not match request {expected:?}"
+            ),
+            Self::ModernNotificationUnexpectedStatus { status } => write!(
+                formatter,
+                "modern HTTP notification acknowledgement used unexpected status {status}"
+            ),
+            Self::ModernNotificationUnexpectedBody => formatter
+                .write_str("modern HTTP notification acknowledgement must have an empty body"),
             Self::SubscriptionsListenRequiresModern => {
                 formatter.write_str("subscriptions/listen requires the modern HTTP transport")
             }
@@ -1282,8 +1329,14 @@ impl std::error::Error for ClientHttpConnectionError {
             Self::LegacyResponseStreamEnded { .. }
             | Self::LegacyUnexpectedMessage { .. }
             | Self::LegacyResponseIdMismatch { .. }
+            | Self::ExpectedJsonResponse { .. }
+            | Self::UnexpectedResponseMessage { .. }
+            | Self::ResponseIdMismatch { .. }
+            | Self::ModernNotificationUnexpectedStatus { .. }
+            | Self::ModernNotificationUnexpectedBody
             | Self::SubscriptionsListenRequiresModern
             | Self::FinalToolCallRequiresModern => None,
+            Self::ResponseAdmission(error) => Some(error),
             Self::SubscriptionsListen(error) => Some(error),
         }
     }
@@ -1385,6 +1438,58 @@ impl ClientHttpConnection {
         }
     }
 
+    /// Sends one request and returns its complete, strictly admitted JSON-RPC
+    /// response.
+    ///
+    /// This is the ordinary high-level request surface for callers that do
+    /// not need to retain a modern streaming response. It binds the response
+    /// ID to `request_id` in both eras. Modern request-scoped SSE remains
+    /// available through [`Self::request`].
+    pub async fn request_json(
+        &mut self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        maximum_response_bytes: usize,
+    ) -> Result<JsonRpcResponse, ClientHttpConnectionError> {
+        let response = self
+            .request(cx, method, parameters, request_id.clone())
+            .await?;
+        match response {
+            ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => Ok(response),
+            ClientHttpResponse::Legacy(JsonRpcMessage::Request(_)) => {
+                Err(ClientHttpConnectionError::UnexpectedResponseMessage { request_id })
+            }
+            ClientHttpResponse::Modern(response) => {
+                let kind = response.metadata().kind();
+                if !matches!(kind, ModernHttpResponseKind::Json) {
+                    return Err(ClientHttpConnectionError::ExpectedJsonResponse { actual: kind });
+                }
+                let body = response
+                    .read_to_end(cx, maximum_response_bytes)
+                    .await
+                    .map_err(|error| {
+                        ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error))
+                    })?;
+                let message = decode_strict_jsonrpc_message(&body, maximum_response_bytes)
+                    .map_err(ClientHttpConnectionError::ResponseAdmission)?;
+                let JsonRpcMessage::Response(response) = message else {
+                    return Err(ClientHttpConnectionError::UnexpectedResponseMessage {
+                        request_id,
+                    });
+                };
+                if response.id.as_ref() != Some(&request_id) {
+                    return Err(ClientHttpConnectionError::ResponseIdMismatch {
+                        expected: request_id,
+                        actual: response.id,
+                    });
+                }
+                Ok(response)
+            }
+        }
+    }
+
     /// Opens and consumes one typed final `subscriptions/listen` HTTP stream.
     ///
     /// This operation is unavailable once the immutable connection plan has
@@ -1453,12 +1558,22 @@ impl ClientHttpConnection {
                     )
                     .await
                     .map_err(ClientHttpConnectionError::Modern)?;
-                response
+                if response.metadata().status() != 202 {
+                    return Err(
+                        ClientHttpConnectionError::ModernNotificationUnexpectedStatus {
+                            status: response.metadata().status(),
+                        },
+                    );
+                }
+                let body = response
                     .read_to_end(cx, MAX_MODERN_HTTP_PROBE_BODY_BYTES)
                     .await
                     .map_err(|error| {
                         ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error))
                     })?;
+                if !body.is_empty() {
+                    return Err(ClientHttpConnectionError::ModernNotificationUnexpectedBody);
+                }
                 Ok(())
             }
             Self::LegacySse(client) => client
@@ -2726,6 +2841,7 @@ pub fn validate_response_head(
             .map(normalize_success_content_type)
             .transpose()?;
         match content_type {
+            None if status == 202 => ModernHttpResponseKind::EmptyAcknowledgement,
             Some(content_type) if content_type.eq_ignore_ascii_case("application/json") => {
                 ModernHttpResponseKind::Json
             }
@@ -2833,11 +2949,11 @@ mod tests {
     };
 
     use super::{
-        ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse,
-        LegacySseHttpClientError, MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS,
-        ModernHttpClientError, ModernHttpExecutorError, ModernHttpResponseKind,
-        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
-        decode_modern_discovery_response, validate_response_head,
+        ClientHttpConnection, ClientHttpConnectionError, LegacySseHttpClientError,
+        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpClientError,
+        ModernHttpExecutorError, ModernHttpResponseKind, ModernHttpSubscriptionListenCollector,
+        ModernHttpSubscriptionListenError, decode_modern_discovery_response,
+        validate_response_head,
     };
     use crate::sse::SseLimits;
     use crate::{
@@ -2938,6 +3054,27 @@ mod tests {
             .write_all(body)
             .expect("write native HTTP response body");
         stream.flush().expect("flush native HTTP response");
+    }
+
+    fn write_response_without_content_type(stream: &mut TcpStream, status: u16, body: &[u8]) {
+        let reason = match status {
+            200 => "OK",
+            202 => "Accepted",
+            404 => "Not Found",
+            _ => "Test Response",
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write content-type-free native HTTP response head");
+        stream
+            .write_all(body)
+            .expect("write content-type-free native HTTP response body");
+        stream
+            .flush()
+            .expect("flush content-type-free native HTTP response");
     }
 
     fn begin_chunked_sse(stream: &mut TcpStream) {
@@ -3224,7 +3361,8 @@ mod tests {
     }
 
     #[test]
-    fn public_http_connection_auto_selects_modern_and_issues_a_stateless_request() {
+    fn public_http_connection_auto_selects_modern_and_accepts_a_content_type_free_empty_notification_acknowledgement()
+     {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local modern listener");
         let address = listener.local_addr().expect("read local modern address");
         let modern_target = format!("http://{address}/mcp");
@@ -3265,6 +3403,20 @@ mod tests {
                 "application/json",
                 br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}"#,
             );
+
+            let (mut notification, _) = listener.accept().expect("accept modern notification");
+            let notification_request = read_request(&mut notification);
+            assert!(
+                notification_request
+                    .head
+                    .starts_with("POST /mcp HTTP/1.1\r\n")
+            );
+            let body = serde_json::from_slice::<serde_json::Value>(&notification_request.body)
+                .expect("modern notification must be JSON-RPC");
+            assert_eq!(body["method"], "notifications/cancelled");
+            assert!(body.get("id").is_none());
+            assert_eq!(body["params"]["requestId"], 2);
+            write_response_without_content_type(&mut notification, 202, b"");
         });
 
         let cx = Cx::for_request();
@@ -3282,24 +3434,142 @@ mod tests {
         .expect("recognized modern discovery selects the public HTTP connection");
         assert_eq!(connection.selected_protocol_era(), ProtocolEra::Modern2026);
 
-        let response = runtime_block_on(connection.request(
+        let response = runtime_block_on(connection.request_json(
             &cx,
             "ping",
             serde_json::json!({}),
             RequestId::Number(2),
+            4_096,
         ))
         .expect("the public HTTP request path retains the selected modern transport");
-        let ClientHttpResponse::Modern(response) = response else {
-            panic!("Auto modern selection must not open the legacy stream");
-        };
-        let body = runtime_block_on(response.read_to_end(&cx, 4_096))
-            .expect("modern JSON response remains readable");
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body)
-                .expect("modern response is JSON-RPC")["result"]["resultType"],
-            "complete"
+            response
+                .result
+                .as_ref()
+                .expect("modern response has result")["resultType"],
+            "complete",
         );
+        runtime_block_on(connection.notify(
+            &cx,
+            "notifications/cancelled",
+            Some(serde_json::json!({"requestId": 2})),
+        ))
+        .expect("a modern notification receives its exact empty 202 acknowledgement");
         server.join().expect("local modern server must join");
+    }
+
+    #[test]
+    fn public_http_connection_notify_rejects_only_one_nonempty_byte_in_a_content_type_free_202_acknowledgement()
+     {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind notification listener");
+        let address = listener
+            .local_addr()
+            .expect("read notification listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut notification, _) = listener.accept().expect("accept modern notification");
+            let notification_request = read_request(&mut notification);
+            let body = serde_json::from_slice::<serde_json::Value>(&notification_request.body)
+                .expect("modern notification must be JSON-RPC");
+            assert_eq!(body["method"], "notifications/cancelled");
+            assert!(body.get("id").is_none());
+            // The response differs from the accepted neighbour only by this
+            // single body byte.
+            write_response_without_content_type(&mut notification, 202, b"x");
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("modern discovery selects the stateless connection");
+        let error = runtime_block_on(connection.notify(
+            &cx,
+            "notifications/cancelled",
+            Some(serde_json::json!({"requestId": 2})),
+        ))
+        .expect_err("one nonempty acknowledgement byte must remain rejected");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::ModernNotificationUnexpectedBody
+        ));
+        server.join().expect("notification test server must join");
+    }
+
+    #[test]
+    fn public_http_connection_request_json_rejects_only_a_modern_response_id_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind modern mismatch listener");
+        let address = listener.local_addr().expect("read modern mismatch address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener.accept().expect("accept modern request");
+            let request = read_request(&mut stream);
+            let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("modern request must be JSON-RPC");
+            assert_eq!(body["id"], 2);
+            assert_eq!(body["method"], "ping");
+            // Only the response ID differs from the admitted positive request.
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete"}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("modern discovery selects the exact stateless connection");
+        let error = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(2),
+            4_096,
+        ))
+        .expect_err("only the response ID differs from the admitted modern request");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::ResponseIdMismatch {
+                expected: RequestId::Number(2),
+                actual: Some(RequestId::Number(3)),
+            }
+        ));
+        server.join().expect("modern mismatch server must join");
     }
 
     #[test]
@@ -3626,6 +3896,17 @@ mod tests {
             assert_eq!(message["method"], "ping");
             assert!(message["params"].get("_meta").is_none());
             write_response(&mut message_post, 202, "application/json", b"");
+
+            let (mut notification_post, _) =
+                listener.accept().expect("accept legacy notification POST");
+            let notification_request = read_request(&mut notification_post);
+            let notification =
+                serde_json::from_slice::<serde_json::Value>(&notification_request.body)
+                    .expect("legacy notification POST must contain JSON-RPC");
+            assert_eq!(notification["method"], "notifications/cancelled");
+            assert!(notification.get("id").is_none());
+            assert_eq!(notification["params"]["requestId"], 2);
+            write_response(&mut notification_post, 202, "application/json", b"");
         });
 
         let cx = Cx::for_request();
@@ -3642,21 +3923,77 @@ mod tests {
         .expect("legacy-only opens the exact configured SSE route");
         assert_eq!(connection.selected_protocol_era(), ProtocolEra::Legacy2024);
 
-        let response = runtime_block_on(connection.request(
+        let response = runtime_block_on(connection.request_json(
             &cx,
             "ping",
             serde_json::json!({}),
             RequestId::Number(2),
+            4_096,
         ))
         .expect("legacy request posts then waits for its exact SSE response");
-        let ClientHttpResponse::Legacy(message) = response else {
-            panic!("legacy-only must not issue a final stateless POST");
-        };
-        let fastmcp_protocol::JsonRpcMessage::Response(response) = message else {
-            panic!("legacy SSE must return a JSON-RPC response");
-        };
         assert_eq!(response.id, Some(RequestId::Number(2)));
+        runtime_block_on(connection.notify(
+            &cx,
+            "notifications/cancelled",
+            Some(serde_json::json!({"requestId": 2})),
+        ))
+        .expect("a legacy notification posts without an ID to the exact endpoint");
         server.join().expect("local legacy server must join");
+    }
+
+    #[test]
+    fn public_http_connection_request_json_rejects_only_a_legacy_response_id_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy mismatch listener");
+        let address = listener.local_addr().expect("read legacy mismatch address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            let sse_body = format!(
+                "event: endpoint\ndata: {advertised_message_target}\n\nevent: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{}}}}\n\n"
+            );
+            write_response(&mut sse, 200, "text/event-stream", sse_body.as_bytes());
+
+            let (mut message_post, _) = listener.accept().expect("accept legacy message POST");
+            let message_request = read_request(&mut message_post);
+            let message = serde_json::from_slice::<serde_json::Value>(&message_request.body)
+                .expect("legacy message POST must contain JSON-RPC");
+            assert_eq!(message["id"], 2);
+            assert_eq!(message["method"], "ping");
+            write_response(&mut message_post, 202, "application/json", b"");
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    "http://127.0.0.1:9/mcp",
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::LegacyOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("legacy-only opens the exact configured SSE route");
+        let error = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(2),
+            4_096,
+        ))
+        .expect_err("only the response ID differs from the admitted legacy request");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::LegacyResponseIdMismatch {
+                expected: RequestId::Number(2),
+                actual: Some(RequestId::Number(3)),
+            }
+        ));
+        server.join().expect("legacy mismatch server must join");
     }
 
     #[test]

@@ -49,7 +49,7 @@ fn clt_02_a_positive() {
     assert_eq!(error.code, McpErrorCode::InternalError);
     assert_eq!(builder.selected_protocol_plan(), &state_before_connect);
 
-    let session = ClientSession::new(
+    let session = ClientSession::try_new(
         ClientInfo {
             name: "test-client".to_owned(),
             version: "1.0.0".to_owned(),
@@ -62,6 +62,7 @@ fn clt_02_a_positive() {
         ServerCapabilities::default(),
         "2024-11-05".to_owned(),
     )
+    .expect("exact supported protocol version")
     .with_protocol_plan(plan);
     assert_eq!(session.selected_era(), Some(ProtocolEra::Legacy2024));
 }

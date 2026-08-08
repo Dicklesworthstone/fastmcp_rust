@@ -963,6 +963,11 @@ pub struct HttpModernProbe {
 pub enum HttpEraDecision {
     /// The bundle selected this era and may cache it under its exact key.
     Selected(ProtocolEra),
+    /// The modern probe permits one configured legacy SSE observation.
+    ///
+    /// This is not an era selection and must never be cached. Only a later
+    /// validated legacy SSE endpoint event may select exact MCP 2024-11-05.
+    LegacySseFallbackAuthorized,
     /// The response cannot signal downgrade and must not trigger legacy GET.
     RejectedWithoutLegacyFallback,
 }
@@ -1005,7 +1010,12 @@ impl HttpEraCache {
 
     fn classify_probe(policy: ProtocolPolicy, probe: HttpModernProbe) -> HttpEraDecision {
         match policy {
-            ProtocolPolicy::ModernOnly => HttpEraDecision::Selected(ProtocolEra::Modern2026),
+            ProtocolPolicy::ModernOnly
+                if matches!(probe.body, HttpProbeBody::RecognizedModernJsonRpc) =>
+            {
+                HttpEraDecision::Selected(ProtocolEra::Modern2026)
+            }
+            ProtocolPolicy::ModernOnly => HttpEraDecision::RejectedWithoutLegacyFallback,
             ProtocolPolicy::LegacyOnly => HttpEraDecision::Selected(ProtocolEra::Legacy2024),
             ProtocolPolicy::Auto
                 if matches!(probe.body, HttpProbeBody::RecognizedModernJsonRpc) =>
@@ -1019,7 +1029,7 @@ impl HttpEraCache {
                         HttpProbeBody::Empty | HttpProbeBody::Unrecognized
                     ) =>
             {
-                HttpEraDecision::Selected(ProtocolEra::Legacy2024)
+                HttpEraDecision::LegacySseFallbackAuthorized
             }
             ProtocolPolicy::Auto => HttpEraDecision::RejectedWithoutLegacyFallback,
         }
@@ -1309,16 +1319,43 @@ pub(crate) mod tests {
                     body: HttpProbeBody::Empty,
                 },
             ),
-            HttpEraDecision::Selected(ProtocolEra::Legacy2024)
+            HttpEraDecision::LegacySseFallbackAuthorized
         );
         assert_eq!(
             cache.selected_era(&first_bundle.key()),
             Some(ProtocolEra::Modern2026)
         );
+        assert_eq!(cache.selected_era(&second_bundle.key()), None);
+    }
+
+    #[test]
+    fn auto_http_refusal_authorizes_legacy_observation_without_selecting_or_caching_legacy() {
+        let bundle = HttpEndpointBundle::new(
+            ProtocolPolicy::Auto,
+            Some(CanonicalHttpUrl::parse("https://api.example.test/mcp").unwrap()),
+            Some(CanonicalHttpUrl::parse("https://api.example.test/sse").unwrap()),
+            Some(CanonicalHttpUrl::parse("https://api.example.test/messages").unwrap()),
+            "credential-partition-a".to_owned(),
+            "security-partition-a".to_owned(),
+            "http-sse-v2".to_owned(),
+            1,
+            1,
+            1,
+        )
+        .expect("complete Auto bundle is valid");
+
+        let mut cache = HttpEraCache::default();
         assert_eq!(
-            cache.selected_era(&second_bundle.key()),
-            Some(ProtocolEra::Legacy2024)
+            cache.classify_or_cached(
+                &bundle,
+                HttpModernProbe {
+                    status: 404,
+                    body: HttpProbeBody::Empty,
+                },
+            ),
+            HttpEraDecision::LegacySseFallbackAuthorized
         );
+        assert_eq!(cache.selected_era(&bundle.key()), None);
     }
 
     pub(crate) fn fnd_03_era_classification_planted_negative() {

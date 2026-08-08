@@ -287,6 +287,22 @@ pub fn official_mcp_apps_empty_server_settings() -> ExtensionSettings {
     ExtensionSettings(Map::new())
 }
 
+/// Validates the sole server settings marker admitted by official MCP Apps.
+///
+/// The official Apps descriptor is a server capability marker, not a
+/// server-configurable settings object. Reject a non-empty marker while the
+/// server is being configured so it cannot be advertised and fail later
+/// during per-request negotiation.
+pub fn validate_official_mcp_apps_server_settings(
+    settings: &ExtensionSettings,
+) -> Result<(), ExtensionRegistryError> {
+    if settings.as_object().is_empty() {
+        Ok(())
+    } else {
+        Err(ExtensionRegistryError::OfficialMcpAppsServerSettingsNotEmpty)
+    }
+}
+
 /// Returns the validated identifier for the official MCP Apps extension.
 #[must_use]
 pub fn official_mcp_apps_extension_id() -> ExtensionId {
@@ -360,6 +376,24 @@ impl<R> McpAppsNegotiationResolver<R> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OfficialTasksNegotiationResolver;
 
+/// Typed Tasks compatibility resolver that delegates every non-Tasks
+/// descriptor to its supplied fallback.
+///
+/// This adapter preserves an inactive disposition selected by the fallback,
+/// which lets Tasks compose with bilateral capabilities such as MCP Apps.
+#[derive(Clone, Debug)]
+pub struct TasksNegotiationResolver<R> {
+    fallback: R,
+}
+
+impl<R> TasksNegotiationResolver<R> {
+    /// Wraps an existing resolver with the official Tasks settings rules.
+    #[must_use]
+    pub const fn with_fallback(fallback: R) -> Self {
+        Self { fallback }
+    }
+}
+
 /// Returns the standalone typed resolver used by the official MCP Apps descriptor.
 ///
 /// Use [`McpAppsNegotiationResolver::with_fallback`] when the registry also
@@ -392,11 +426,9 @@ pub fn resolve_official_mcp_apps_settings(
             descriptor.id.to_string(),
         ));
     }
-    if !server.as_object().is_empty() {
-        return Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
-            descriptor.id.to_string(),
-        ));
-    }
+    validate_official_mcp_apps_server_settings(server).map_err(|_| {
+        ExtensionNegotiationError::SettingsCompatibilityRejected(descriptor.id.to_string())
+    })?;
     let client = McpAppsClientSettings::from_extension_settings(client).map_err(|_| {
         ExtensionNegotiationError::SettingsCompatibilityRejected(descriptor.id.to_string())
     })?;
@@ -715,6 +747,8 @@ pub enum ExtensionRegistryError {
     SettingsNotObject,
     /// Typed settings decoding rejected the otherwise preserved object.
     SettingsCodecRejected,
+    /// Official MCP Apps server settings must be the exact empty marker.
+    OfficialMcpAppsServerSettingsNotEmpty,
     /// Generic settings exceeded the fixed number of retained members.
     SettingsTooManyEntries,
     /// A generic settings key exceeded its fixed byte limit.
@@ -765,6 +799,9 @@ impl fmt::Display for ExtensionRegistryError {
             }
             Self::SettingsCodecRejected => {
                 formatter.write_str("extension settings codec rejected object")
+            }
+            Self::OfficialMcpAppsServerSettingsNotEmpty => {
+                formatter.write_str("official MCP Apps server settings must be empty")
             }
             Self::SettingsTooManyEntries => {
                 formatter.write_str("extension settings exceed their entry limit")
@@ -1127,6 +1164,40 @@ impl ExtensionSettingsCompatibilityResolver for OfficialTasksNegotiationResolver
             Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
                 descriptor.id.to_string(),
             ))
+        }
+    }
+}
+
+impl<R> ExtensionSettingsCompatibilityResolver for TasksNegotiationResolver<R>
+where
+    R: ExtensionSettingsCompatibilityResolver,
+{
+    fn resolve(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettings, ExtensionNegotiationError> {
+        match self.resolve_with_disposition(descriptor, client, server)? {
+            ExtensionSettingsResolution::Active(settings) => Ok(settings),
+            ExtensionSettingsResolution::Inactive => Err(
+                ExtensionNegotiationError::SettingsCompatibilityRejected(descriptor.id.to_string()),
+            ),
+        }
+    }
+
+    fn resolve_with_disposition(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettingsResolution, ExtensionNegotiationError> {
+        if descriptor.id.as_str() == OFFICIAL_TASKS_EXTENSION_ID {
+            resolve_official_tasks_settings(descriptor, client, server)
+                .map(ExtensionSettingsResolution::Active)
+        } else {
+            self.fallback
+                .resolve_with_disposition(descriptor, client, server)
         }
     }
 }
@@ -2253,6 +2324,28 @@ mod tests {
     }
 
     #[test]
+    fn apps_01_server_marker_requires_the_exact_empty_object() {
+        let accepted = official_mcp_apps_empty_server_settings();
+        assert_eq!(
+            validate_official_mcp_apps_server_settings(&accepted),
+            Ok(()),
+            "the official Apps server marker is exactly the empty object"
+        );
+
+        let rejected = ExtensionSettings::new(json!({ "unexpected": true }))
+            .expect("the one-field alternate is still generic extension settings");
+        assert_eq!(
+            validate_official_mcp_apps_server_settings(&rejected),
+            Err(ExtensionRegistryError::OfficialMcpAppsServerSettingsNotEmpty),
+            "adding one server setting makes the official Apps marker invalid"
+        );
+        assert!(
+            accepted.as_object().is_empty(),
+            "rejecting the alternate cannot alter the admitted marker"
+        );
+    }
+
+    #[test]
     fn apps_01_typed_mime_settings_cannot_bypass_generic_value_bound() {
         let oversized = vec!["x".repeat(MAX_MCP_APPS_MIME_TYPE_BYTES); MAX_MCP_APPS_MIME_TYPES];
 
@@ -2305,6 +2398,55 @@ mod tests {
 
         assert!(negotiated.active(&tasks).is_some());
         assert!(negotiated.active(&apps).is_some());
+    }
+
+    #[test]
+    fn apps_01_tasks_wrapper_preserves_apps_inactive_disposition() {
+        let mut registry = ExtensionDescriptorRegistry::new();
+        let tasks = register_official_tasks_extension(&mut registry)
+            .expect("the official Tasks descriptor registers");
+        let apps = register_official_mcp_apps_extension(&mut registry)
+            .expect("the official MCP Apps descriptor registers");
+        registry.freeze().expect("official descriptors freeze");
+
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([
+                (tasks.clone(), official_tasks_empty_settings()),
+                (
+                    apps.clone(),
+                    McpAppsClientSettings::new(vec!["text/plain".to_owned()])
+                        .expect("another bounded MIME type is valid Apps settings")
+                        .to_extension_settings(),
+                ),
+            ]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([
+                (tasks.clone(), official_tasks_empty_settings()),
+                (apps.clone(), official_mcp_apps_empty_server_settings()),
+            ]),
+        };
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(tasks.clone());
+        local.enable(apps.clone());
+        let mut resolver =
+            TasksNegotiationResolver::with_fallback(official_mcp_apps_negotiation_resolver());
+
+        let negotiated = registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            )
+            .expect("inactive Apps does not reject a composed Tasks resolver");
+
+        assert!(negotiated.active(&tasks).is_some());
+        assert_eq!(
+            negotiated.inactive_reason(&apps),
+            Some(ExtensionInactiveReason::SettingsInactiveFallback)
+        );
     }
 
     #[test]

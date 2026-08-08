@@ -122,6 +122,9 @@ fn final_response_document(cx: &Cx, response: ModernHttpResponseStream) -> serde
             }
             terminal.expect("SSE stream carried a final correlated response")
         }
+        ModernHttpResponseKind::EmptyAcknowledgement => {
+            panic!("a correlated request cannot complete with an empty acknowledgement")
+        }
         ModernHttpResponseKind::HttpFailure => panic!(
             "unexpected HTTP failure status {} from the shipped server",
             response.metadata().status()

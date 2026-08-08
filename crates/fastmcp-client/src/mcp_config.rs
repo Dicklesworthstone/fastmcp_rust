@@ -56,8 +56,9 @@ use fastmcp_transport::StdioTransport;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::{
-    ChildGuard, Client, ClientSession, RequestTimeoutPolicy, combine_cleanup_results,
-    combine_operation_with_cleanup, resolve_stdio_command, transport_error_to_mcp,
+    ChildGuard, Client, ClientProtocolPlan, ClientSession, RequestTimeoutPolicy,
+    combine_cleanup_results, combine_operation_with_cleanup, resolve_stdio_command,
+    transport_error_to_mcp,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, HttpRouteKind, ProtocolPolicy,
@@ -850,14 +851,47 @@ fn create_and_initialize_client(
         }
     };
 
-    // Create session
-    let session = ClientSession::new(
+    // The child peer controls the selected version, so keep this boundary
+    // fallible even though the shared initialization validator already checks it.
+    let session = match ClientSession::try_new(
         client_info,
         client_capabilities,
         init_result.server_info,
         init_result.capabilities,
         init_result.protocol_version,
-    );
+    ) {
+        Ok(session) => match session
+            .try_with_protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+        {
+            Ok(session) => session,
+            Err(_) => {
+                return combine_operation_with_cleanup(
+                    Err(McpError::internal_error(
+                        "Configured legacy initialization selected an incompatible protocol era",
+                    )),
+                    || {
+                        combine_cleanup_results(
+                            transport.close().map_err(transport_error_to_mcp),
+                            child_guard.cleanup(),
+                        )
+                    },
+                );
+            }
+        },
+        Err(_) => {
+            return combine_operation_with_cleanup(
+                Err(McpError::internal_error(
+                    "Server selected an unsupported MCP protocol version",
+                )),
+                || {
+                    combine_cleanup_results(
+                        transport.close().map_err(transport_error_to_mcp),
+                        child_guard.cleanup(),
+                    )
+                },
+            );
+        }
+    };
 
     // Return client
     Ok(Client::from_parts(
@@ -1671,6 +1705,85 @@ mod tests {
             Some(serde_json::json!({"timeoutSource": "idle"}))
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_legacy_initialization_returns_a_legacy_only_session_plan() {
+        let initialize_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": {"name": "configured-legacy", "version": "1.0.0"}
+            }
+        });
+        let response_line = serde_json::to_string(&initialize_response)
+            .expect("serialize exact legacy initialization response");
+        assert!(
+            !response_line.contains('\''),
+            "the shell fixture requires a single-quote-free JSON line"
+        );
+        let script = format!(
+            "IFS= read -r _; printf '%s\\n' '{response_line}'; IFS= read -r _; exec sleep 2"
+        );
+        let mut config = McpConfig::new();
+        config.add_server(
+            "legacy",
+            ServerConfig::new("sh").with_args(["-c", script.as_str()]),
+        );
+
+        let mut client = config
+            .client_with_cx("legacy", Cx::for_request())
+            .expect("configured stdio client completes exact legacy initialization");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::LegacyOnly);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        );
+        client.close().expect("configured legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_legacy_initialization_rejects_only_a_modern_peer_version() {
+        let initialize_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "serverInfo": {"name": "configured-legacy", "version": "1.0.0"}
+            }
+        });
+        let response_line = serde_json::to_string(&initialize_response)
+            .expect("serialize wrong-era initialization response");
+        assert!(
+            !response_line.contains('\''),
+            "the shell fixture requires a single-quote-free JSON line"
+        );
+        let script = format!("IFS= read -r _; printf '%s\\n' '{response_line}'; exec sleep 2");
+        let mut config = McpConfig::new();
+        config.add_server(
+            "legacy",
+            ServerConfig::new("sh").with_args(["-c", script.as_str()]),
+        );
+
+        let error = match config.client_with_cx("legacy", Cx::for_request()) {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("changing only the peer era must reject configured legacy initialization")
+            }
+        };
+
+        assert!(matches!(error, ConfigError::ClientError(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("Server selected an unsupported MCP protocol version")
+        );
     }
 
     #[test]

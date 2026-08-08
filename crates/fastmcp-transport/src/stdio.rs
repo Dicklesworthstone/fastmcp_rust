@@ -849,6 +849,33 @@ impl<R: Read> TransportRecvHalf for StdioRecvHalf<R> {
     }
 }
 
+#[cfg(unix)]
+impl<R: Read + AsFd> StdioRecvHalf<R> {
+    /// Receives through the bounded Unix readiness path and wakes when either
+    /// split half becomes terminal.
+    pub fn recv_until_or_closed(
+        &mut self,
+        cx: &Cx,
+        deadline: Option<Instant>,
+    ) -> Result<JsonRpcMessage, TransportError> {
+        if self.is_closed() {
+            return Err(TransportError::Closed);
+        }
+
+        let terminal = Arc::clone(&self.terminal);
+        let result = self
+            .transport
+            .recv_until_or_stopped(cx, deadline, || terminal.load(Ordering::Acquire));
+        if self.transport.is_closed() {
+            self.terminal.store(true, Ordering::Release);
+        }
+        if self.is_closed() {
+            return Err(TransportError::Closed);
+        }
+        result
+    }
+}
+
 /// Independently owned NDJSON send half for stdio transport.
 pub struct StdioSendHalf<W> {
     writer: Option<W>,
@@ -1284,6 +1311,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::Cursor;
     #[cfg(unix)]
+    use std::os::fd::{AsFd, BorrowedFd};
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream;
     #[cfg(unix)]
     use std::process::{Command, Stdio};
@@ -1367,6 +1396,27 @@ mod tests {
                     .map_err(|_| std::io::Error::other("gated reader continuation dropped"))?;
             }
             self.inner.read(buffer)
+        }
+    }
+
+    #[cfg(unix)]
+    struct PollableReader {
+        inner: UnixStream,
+        entered_poll: mpsc::Sender<()>,
+    }
+
+    #[cfg(unix)]
+    impl Read for PollableReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buffer)
+        }
+    }
+
+    #[cfg(unix)]
+    impl AsFd for PollableReader {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            let _send_result = self.entered_poll.send(());
+            self.inner.as_fd()
         }
     }
 
@@ -2383,6 +2433,39 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stdio_split_pollable_receive_wakes_on_send_close() {
+        let (_peer, reader) = UnixStream::pair().expect("create split peer");
+        let (entered_poll_tx, entered_poll_rx) = mpsc::channel();
+        let transport = StdioTransport::new(
+            PollableReader {
+                inner: reader,
+                entered_poll: entered_poll_tx,
+            },
+            Vec::new(),
+        );
+        let (mut recv_half, mut send_half) = transport.into_split();
+        let (result_tx, result_rx) = mpsc::channel();
+        let receive = std::thread::spawn(move || {
+            result_tx
+                .send(recv_half.recv_until_or_closed(&Cx::for_testing(), None))
+                .expect("report bounded split receive result");
+        });
+
+        entered_poll_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bounded split receive must enter readiness polling");
+        send_half.close().expect("close split writer");
+        assert!(matches!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("bounded split receive must wake after close"),
+            Err(TransportError::Closed)
+        ));
+        receive.join().expect("split receive thread must not panic");
+    }
+
     #[test]
     fn stdio_split_send_rejects_after_close_without_writing() {
         let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}\n";
@@ -2398,6 +2481,7 @@ mod tests {
                 Ok(JsonRpcMessage::Request(_))
             ));
             send_half.close().expect("close split writer");
+            assert!(matches!(recv_half.recv(&cx), Err(TransportError::Closed)));
             assert!(matches!(
                 send_half.send(
                     &cx,

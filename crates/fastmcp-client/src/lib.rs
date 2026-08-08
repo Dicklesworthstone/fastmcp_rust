@@ -4110,7 +4110,7 @@ impl Client {
             pending_process_cleanup_error: None,
             transport,
             cx,
-            session: ClientSession::new(
+            session: ClientSession::new_placeholder(
                 client_info.clone(),
                 client_capabilities.clone(),
                 ServerInfo {
@@ -4118,7 +4118,6 @@ impl Client {
                     version: String::new(),
                 },
                 ServerCapabilities::default(),
-                String::new(),
             )
             .with_protocol_plan(protocol_plan.clone()),
             // `initialize()` consumes ID 1 through the same monotonic
@@ -4144,7 +4143,10 @@ impl Client {
         };
 
         let init_protocol_version = initialization.protocol_version().to_owned();
-        client.replace_session_after_initialization(initialization);
+        if let Err(error) = client.replace_session_after_initialization(initialization) {
+            let cleanup = client.close();
+            return combine_operation_and_cleanup(Err(error), cleanup);
+        }
 
         // Send the spec-correct `notifications/initialized` lifecycle notification.
         if init_protocol_version == PROTOCOL_VERSION
@@ -4330,7 +4332,9 @@ impl Client {
         };
 
         let init_protocol_version = initialization.protocol_version().to_owned();
-        self.replace_session_after_initialization(initialization);
+        if let Err(error) = self.replace_session_after_initialization(initialization) {
+            return Err(self.record_initialization_failure(error));
+        }
 
         // Exact 2024-11-05 transitions require the lifecycle acknowledgement.
         // Modern discovery has no corresponding initialized notification.
@@ -4379,8 +4383,9 @@ impl Client {
     }
 
     fn record_initialization_failure(&mut self, error: McpError) -> McpError {
+        let error = self.terminate_connection(error);
         self.initialization_error = Some(error.clone());
-        self.terminate_connection(error)
+        error
     }
 
     /// Permanently closes a subprocess connection after a connection-wide
@@ -4407,7 +4412,14 @@ impl Client {
         } else {
             self.pending_process_cleanup_error = None;
         }
-        error
+        let cleanup = combine_cleanup_results(
+            self.cleanup_error.clone().map_or(Ok(()), Err),
+            self.pending_process_cleanup_error
+                .clone()
+                .map_or(Ok(()), Err),
+        );
+        combine_operation_and_cleanup::<()>(Err(error), cleanup)
+            .expect_err("a terminal operation error cannot become a successful cleanup result")
     }
 
     /// Returns whether the client has been initialized.
@@ -5622,32 +5634,39 @@ impl Client {
         }
     }
 
-    fn replace_session_after_initialization(&mut self, initialization: ClientInitialization) {
+    fn replace_session_after_initialization(
+        &mut self,
+        initialization: ClientInitialization,
+    ) -> McpResult<()> {
         let client_info = self.session.client_info().clone();
         let client_capabilities = self.session.client_capabilities().clone();
         let protocol_plan = self.session.protocol_plan().clone();
-        self.session = match initialization {
-            ClientInitialization::Legacy(result) => ClientSession::new(
+        let session = match initialization {
+            ClientInitialization::Legacy(result) => ClientSession::try_new(
                 client_info,
                 client_capabilities,
                 result.server_info,
                 result.capabilities,
                 result.protocol_version,
             )
-            .with_protocol_plan(protocol_plan),
+            .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?,
             ClientInitialization::Modern {
                 server_info,
                 discovery,
-            } => ClientSession::new(
+            } => ClientSession::try_new(
                 client_info,
                 client_capabilities,
                 server_info,
                 ServerCapabilities::default(),
                 MODERN_PROTOCOL_VERSION.to_owned(),
             )
-            .with_server_discovery(discovery)
-            .with_protocol_plan(protocol_plan),
+            .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?
+            .with_server_discovery(discovery),
         };
+        self.session = session.try_with_protocol_plan(protocol_plan).map_err(|_| {
+            McpError::internal_error("Configured protocol policy rejects the negotiated era")
+        })?;
+        Ok(())
     }
 
     fn initialize_legacy(
@@ -7509,7 +7528,7 @@ mod tests {
         let stdin = child.stdin.take().expect("child stdin");
         let stdout = child.stdout.take().expect("child stdout");
         let transport = StdioTransport::new(stdout, stdin);
-        let session = ClientSession::new(
+        let session = ClientSession::try_new(
             ClientInfo {
                 name: "test-client".to_string(),
                 version: "0.1.0".to_string(),
@@ -7521,7 +7540,8 @@ mod tests {
             },
             ServerCapabilities::default(),
             PROTOCOL_VERSION.to_string(),
-        );
+        )
+        .expect("test client uses the exact supported protocol version");
 
         if initialized {
             Client::from_parts(
@@ -7560,7 +7580,7 @@ mod tests {
         let stdin = child.stdin.take().expect("scripted peer stdin");
         let stdout = child.stdout.take().expect("scripted peer stdout");
         let transport = StdioTransport::new(stdout, stdin);
-        let session = ClientSession::new(
+        let session = ClientSession::try_new(
             ClientInfo {
                 name: "test-client".to_string(),
                 version: "0.1.0".to_string(),
@@ -7572,7 +7592,8 @@ mod tests {
             },
             ServerCapabilities::default(),
             PROTOCOL_VERSION.to_string(),
-        );
+        )
+        .expect("test client uses the exact supported protocol version");
         Client::from_parts(
             child,
             transport,
@@ -10576,6 +10597,47 @@ mod tests {
     }
 
     #[test]
+    fn initialization_failure_with_verified_cleanup_preserves_the_operation_error() {
+        let mut client = make_closed_client(false);
+
+        let error = client.record_initialization_failure(McpError::internal_error(
+            "deterministic initialization failure",
+        ));
+
+        assert_eq!(error.message, "deterministic initialization failure");
+        assert!(!is_cleanup_unverified(&error));
+        let recorded = client
+            .initialization_error
+            .as_ref()
+            .expect("initialization failure is retained");
+        assert_eq!(recorded.code, error.code);
+        assert_eq!(recorded.message, error.message);
+        assert!(!is_cleanup_unverified(recorded));
+    }
+
+    #[test]
+    fn initialization_failure_with_cleanup_failure_is_marked_unverified() {
+        let mut client = make_closed_client(false);
+        client.cleanup_error = Some(McpError::internal_error(
+            "deterministic retained transport cleanup failure",
+        ));
+
+        let error = client.record_initialization_failure(McpError::internal_error(
+            "deterministic initialization failure",
+        ));
+
+        assert!(is_cleanup_unverified(&error));
+        assert!(error.message.contains("cleanup failed"));
+        let recorded = client
+            .initialization_error
+            .as_ref()
+            .expect("unverified initialization cleanup failure is retained");
+        assert_eq!(recorded.code, error.code);
+        assert_eq!(recorded.message, error.message);
+        assert!(is_cleanup_unverified(recorded));
+    }
+
+    #[test]
     fn client_core_api_methods_error_cleanly_on_closed_transport() {
         let mut client = make_closed_client(true);
         std::thread::sleep(Duration::from_millis(50));
@@ -13414,7 +13476,7 @@ mod tests {
     fn client_close_terminates_and_reaps_direct_child() {
         let (child, stdout, stdin, pid) = spawn_long_running_child();
         let transport = StdioTransport::new(stdout, stdin);
-        let session = ClientSession::new(
+        let session = ClientSession::try_new(
             ClientInfo {
                 name: "cleanup-test".to_string(),
                 version: "1.0.0".to_string(),
@@ -13426,7 +13488,8 @@ mod tests {
             },
             ServerCapabilities::default(),
             PROTOCOL_VERSION.to_string(),
-        );
+        )
+        .expect("test client uses the exact supported protocol version");
         let mut client = Client::from_parts(
             child,
             transport,
@@ -13444,7 +13507,7 @@ mod tests {
     fn client_drop_terminates_and_reaps_live_direct_child() {
         let (child, stdout, stdin, pid) = spawn_long_running_child();
         let transport = StdioTransport::new(stdout, stdin);
-        let session = ClientSession::new(
+        let session = ClientSession::try_new(
             ClientInfo {
                 name: "drop-cleanup-test".to_string(),
                 version: "1.0.0".to_string(),
@@ -13456,7 +13519,8 @@ mod tests {
             },
             ServerCapabilities::default(),
             PROTOCOL_VERSION.to_string(),
-        );
+        )
+        .expect("test client uses the exact supported protocol version");
         let client = Client::from_parts(
             child,
             transport,

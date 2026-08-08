@@ -39,12 +39,32 @@
 //! preflight check.
 
 use std::io::{BufReader, Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use asupersync::Cx;
 use fastmcp_core::{WebSocketMask, draw_websocket_mask};
 
 use crate::{Codec, Transport, TransportError, TransportRecvHalf, TransportSendHalf};
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
+
+fn websocket_checkpoint(cx: &Cx) -> Result<(), TransportError> {
+    cx.checkpoint().map_err(|error| {
+        use asupersync::{CancelKind, error::ErrorKind};
+
+        match cx.cancel_reason().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => TransportError::Timeout,
+            Some(_) => TransportError::Cancelled,
+            None => match error.kind() {
+                ErrorKind::DeadlineExceeded | ErrorKind::CancelTimeout => TransportError::Timeout,
+                ErrorKind::Cancelled
+                | ErrorKind::PollQuotaExhausted
+                | ErrorKind::CostQuotaExhausted => TransportError::Cancelled,
+                _ => TransportError::Cancelled,
+            },
+        }
+    })
+}
 
 /// WebSocket frame types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,19 +523,21 @@ impl<R: Read, W: Write> WsTransport<R, W> {
         let Self {
             reader,
             writer,
-            codec: _,
+            codec,
             fragment_buffer,
             fragmented_text,
             max_message_size,
             closed,
         } = self;
         let writer = SharedWsWriter::new(writer, closed);
+        let mut send_codec = Codec::new();
+        send_codec.set_max_message_size(codec.max_message_size());
 
         (
             WsServerRecvHalf {
                 reader,
                 writer: writer.clone(),
-                codec: Codec::new(),
+                codec,
                 fragment_buffer,
                 fragmented_text,
                 max_message_size,
@@ -523,7 +545,7 @@ impl<R: Read, W: Write> WsTransport<R, W> {
             },
             WsServerSendHalf {
                 writer,
-                codec: Codec::new(),
+                codec: send_codec,
             },
         )
     }
@@ -542,9 +564,7 @@ impl<R: Read, W: Write> WsTransport<R, W> {
             return Err(TransportError::Closed);
         }
         // Check cancellation.
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        websocket_checkpoint(cx)?;
 
         // Encode message
         let bytes = match message {
@@ -591,9 +611,7 @@ impl<R: Read, W: Write> WsTransport<R, W> {
                 return Err(TransportError::Closed);
             }
             // Check cancellation.
-            if cx.is_cancel_requested() {
-                return Err(TransportError::Cancelled);
-            }
+            websocket_checkpoint(cx)?;
 
             // Read next frame
             let frame = match self.reader.read_frame() {
@@ -938,19 +956,21 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
         let Self {
             reader,
             writer,
-            codec: _,
+            codec,
             fragment_buffer,
             fragmented_text,
             max_message_size,
             closed,
         } = self;
         let writer = SharedWsWriter::new(writer, closed);
+        let mut send_codec = Codec::new();
+        send_codec.set_max_message_size(codec.max_message_size());
 
         (
             WsClientRecvHalf {
                 reader,
                 writer: writer.clone(),
-                codec: Codec::new(),
+                codec,
                 fragment_buffer,
                 fragmented_text,
                 max_message_size,
@@ -958,7 +978,7 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
             },
             WsClientSendHalf {
                 writer,
-                codec: Codec::new(),
+                codec: send_codec,
             },
         )
     }
@@ -979,9 +999,7 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
             return Err(TransportError::Closed);
         }
         // Check cancellation.
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        websocket_checkpoint(cx)?;
 
         // Encode message
         let bytes = match message {
@@ -1027,9 +1045,7 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
                 return Err(TransportError::Closed);
             }
             // Check cancellation.
-            if cx.is_cancel_requested() {
-                return Err(TransportError::Cancelled);
-            }
+            websocket_checkpoint(cx)?;
 
             // Read next frame
             let frame = match self.reader.read_frame() {
@@ -1221,13 +1237,15 @@ struct SplitWsWriter<F> {
 }
 
 struct SharedWsWriter<F> {
-    inner: std::sync::Arc<std::sync::Mutex<SplitWsWriter<F>>>,
+    inner: Arc<std::sync::Mutex<SplitWsWriter<F>>>,
+    terminal: Arc<AtomicBool>,
 }
 
 impl<F> Clone for SharedWsWriter<F> {
     fn clone(&self) -> Self {
         Self {
-            inner: std::sync::Arc::clone(&self.inner),
+            inner: Arc::clone(&self.inner),
+            terminal: Arc::clone(&self.terminal),
         }
     }
 }
@@ -1238,7 +1256,8 @@ where
 {
     fn new(writer: F, closed: bool) -> Self {
         Self {
-            inner: std::sync::Arc::new(std::sync::Mutex::new(SplitWsWriter { writer, closed })),
+            inner: Arc::new(std::sync::Mutex::new(SplitWsWriter { writer, closed })),
+            terminal: Arc::new(AtomicBool::new(closed)),
         }
     }
 
@@ -1247,6 +1266,7 @@ where
         operation: impl FnOnce(&mut SplitWsWriter<F>) -> Result<T, TransportError>,
     ) -> Result<T, TransportError> {
         let mut writer = self.inner.lock().map_err(|_| {
+            self.terminal.store(true, Ordering::Release);
             TransportError::Io(std::io::Error::other(
                 "WebSocket split writer lock poisoned",
             ))
@@ -1254,17 +1274,21 @@ where
         operation(&mut writer)
     }
 
-    fn is_closed(&self) -> Result<bool, TransportError> {
-        self.with_writer(|writer| Ok(writer.closed))
+    fn is_closed(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
     }
 
     fn send_frame(&self, frame: &WsFrame) -> Result<(), TransportError> {
+        if self.is_closed() {
+            return Err(TransportError::Closed);
+        }
         self.with_writer(|writer| {
             if writer.closed {
                 return Err(TransportError::Closed);
             }
             if let Err(error) = writer.writer.write_ws_frame(frame) {
                 writer.closed = true;
+                self.terminal.store(true, Ordering::Release);
                 return Err(error);
             }
             Ok(())
@@ -1272,6 +1296,7 @@ where
     }
 
     fn close_with_frame(&self, frame: WsFrame) -> Result<(), TransportError> {
+        self.terminal.store(true, Ordering::Release);
         self.with_writer(|writer| {
             if writer.closed {
                 return Ok(());
@@ -1282,6 +1307,7 @@ where
     }
 
     fn terminate(&self) {
+        self.terminal.store(true, Ordering::Release);
         if let Ok(mut writer) = self.inner.lock() {
             writer.closed = true;
         }
@@ -1297,12 +1323,10 @@ fn send_split_message<F>(
 where
     F: WsFrameSink,
 {
-    if writer.is_closed()? {
+    if writer.is_closed() {
         return Err(TransportError::Closed);
     }
-    if cx.is_cancel_requested() {
-        return Err(TransportError::Cancelled);
-    }
+    websocket_checkpoint(cx)?;
 
     let bytes = match message {
         JsonRpcMessage::Request(request) => codec.encode_request(request)?,
@@ -1342,12 +1366,10 @@ where
     F: WsFrameSink,
 {
     loop {
-        if *closed || writer.is_closed()? {
+        if *closed || writer.is_closed() {
             return Err(TransportError::Closed);
         }
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        websocket_checkpoint(cx)?;
 
         let frame = match reader.read_frame() {
             Ok(frame) => frame,
@@ -2241,6 +2263,87 @@ mod tests {
             server_reader.read_frame().expect("client close").frame_type,
             WsFrameType::Close
         );
+    }
+
+    #[test]
+    fn websocket_split_preserves_server_and_client_codec_limits() {
+        let mut server = WsTransport::new(Cursor::new(Vec::new()), Vec::new());
+        server.codec.set_max_message_size(128);
+        let (server_recv, server_send) = server.into_split();
+        assert_eq!(server_recv.codec.max_message_size(), 128);
+        assert_eq!(server_send.codec.max_message_size(), 128);
+
+        let mut client = WsClientTransport::new(Cursor::new(Vec::new()), Vec::new());
+        client.codec.set_max_message_size(256);
+        let (client_recv, client_send) = client.into_split();
+        assert_eq!(client_recv.codec.max_message_size(), 256);
+        assert_eq!(client_send.codec.max_message_size(), 256);
+    }
+
+    #[test]
+    fn websocket_split_cancelled_send_writes_no_frame() {
+        let (_recv_half, mut send_half) =
+            WsTransport::new(Cursor::new(Vec::new()), Vec::new()).into_split();
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        assert!(matches!(
+            send_half.send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    RequestId::Number(1),
+                    serde_json::json!({"cancelled": false}),
+                )),
+            ),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(
+            send_half
+                .writer
+                .inner
+                .lock()
+                .expect("split writer lock")
+                .writer
+                .writer
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn websocket_split_close_makes_pending_ingress_terminal() {
+        let request = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let (mut recv_half, mut send_half) = WsTransport::new(
+            Cursor::new(build_masked_frame(0x01, true, request)),
+            Vec::new(),
+        )
+        .into_split();
+
+        send_half.close().expect("close split writer");
+        assert!(matches!(
+            recv_half.recv(&Cx::for_testing()),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn websocket_split_terminal_close_wins_over_cancelled_context() {
+        let (mut recv_half, mut send_half) =
+            WsTransport::new(Cursor::new(Vec::new()), Vec::new()).into_split();
+        send_half.close().expect("close split writer");
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        assert!(matches!(recv_half.recv(&cx), Err(TransportError::Closed)));
+        assert!(matches!(
+            send_half.send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    RequestId::Number(1),
+                    serde_json::json!({"closed": true}),
+                )),
+            ),
+            Err(TransportError::Closed)
+        ));
     }
 
     #[test]
