@@ -143,6 +143,9 @@ use fastmcp_core::{
     McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
+use fastmcp_protocol::methods::{
+    Legacy2024ListChangedCapability, Legacy2024ResourcesCapability, Legacy2024ServerCapabilities,
+};
 use fastmcp_protocol::protocol_policy::{
     LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION, ModernVersionSupport, ProtocolEra,
     ProtocolPolicy, StdioEraClassifier, StdioEraDecision, StdioOpeningFrame,
@@ -156,6 +159,11 @@ use fastmcp_protocol::{
     ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult, ServerInfo,
     ServerInstructions, SetLogLevelParams, SubscribeResourceParams, Tool,
     UnsubscribeResourceParams,
+};
+use legacy_2024::{
+    Legacy2024AdapterError, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Outbound,
+    Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo,
+    LegacyAuthenticatedPeerPartition, LegacyPeerBinding,
 };
 
 const REDACTED_EXTENSION_PANIC_INCIDENT: &[u8] =
@@ -178,6 +186,47 @@ const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 static INSTALL_EXTENSION_PANIC_HOOK: Once = Once::new();
 #[cfg(test)]
 static REDACTED_EXTENSION_PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Bridges an exact legacy adapter operation to the server's stateless handler
+/// surface after the adapter has admitted the legacy envelope and lifecycle.
+///
+/// The adapter retains the wire request identity and constructs the final
+/// legacy response. The internal stateless request ID is intentionally local:
+/// it cannot escape through the adapter's result-only handler contract.
+struct LiveLegacy2024RuntimeHandler<'a> {
+    server: &'a Server,
+    cx: Cx,
+}
+
+impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
+    fn handle_legacy_2024(
+        &mut self,
+        method: &'static str,
+        params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, Legacy2024HandlerError> {
+        let request = JsonRpcRequest::new(method, params.cloned(), 0_i64);
+        let inbound = InboundRequestContext::new(
+            self.cx.clone(),
+            request_id_to_u64(request.id.as_ref()),
+            InboundRequestTransport::Stdio,
+        );
+        let response = self
+            .server
+            .dispatch_stateless(&inbound, &request)
+            .ok_or_else(|| {
+                Legacy2024HandlerError::new(
+                    "legacy runtime handler did not produce a request response",
+                )
+            })?;
+
+        match (response.result, response.error) {
+            (Some(result), None) => Ok(result),
+            _ => Err(Legacy2024HandlerError::new(
+                "legacy runtime handler rejected an admitted request",
+            )),
+        }
+    }
+}
 
 fn lock_http_session(session: &Mutex<Session>) -> std::sync::MutexGuard<'_, Session> {
     #[cfg(test)]
@@ -277,6 +326,36 @@ fn stdio_opening_frame(request: &JsonRpcRequest) -> StdioOpeningFrame {
         StdioOpeningFrame::LegacyInitialize
     } else {
         StdioOpeningFrame::RequestWithoutModernMetadata
+    }
+}
+
+fn runtime_legacy_binding(generation: u64) -> LegacyPeerBinding {
+    let mut partition = [0_u8; LegacyAuthenticatedPeerPartition::BYTE_LEN];
+    partition[..8].copy_from_slice(&generation.to_be_bytes());
+    partition[8..16].copy_from_slice(&(!generation).to_be_bytes());
+    LegacyPeerBinding::from_authenticated_transport(
+        LegacyAuthenticatedPeerPartition::from_authenticated_transport(partition),
+        generation,
+    )
+}
+
+fn legacy_adapter_response(
+    adapter: &mut Legacy2024ServerAdapter<LiveLegacy2024RuntimeHandler<'_>>,
+    binding: LegacyPeerBinding,
+    request: &JsonRpcRequest,
+) -> Result<Option<JsonRpcResponse>, Legacy2024AdapterError> {
+    let wire = serde_json::to_value(request)
+        .expect("a validated JSON-RPC request must serialize for the legacy adapter");
+    match adapter.receive(binding, wire)? {
+        Legacy2024Outbound::Response(response) => {
+            let response = serde_json::from_value(response)
+                .expect("the legacy adapter must emit a valid JSON-RPC response");
+            Ok(Some(response))
+        }
+        Legacy2024Outbound::NoResponse => Ok(None),
+        Legacy2024Outbound::ReverseRequest(_) | Legacy2024Outbound::ReverseNotification(_) => {
+            unreachable!("receiving a client frame cannot create a legacy reverse frame")
+        }
     }
 }
 
@@ -1119,6 +1198,39 @@ impl Server {
     #[must_use]
     pub const fn protocol_policy(&self) -> ProtocolPolicy {
         self.protocol_policy
+    }
+
+    fn legacy_2024_server_config(&self) -> Legacy2024ServerConfig {
+        Legacy2024ServerConfig {
+            capabilities: Legacy2024ServerCapabilities {
+                logging: self.capabilities.logging.as_ref().map(|_| BTreeMap::new()),
+                prompts: self.capabilities.prompts.as_ref().map(|capability| {
+                    Legacy2024ListChangedCapability {
+                        list_changed: capability.list_changed,
+                        ..Legacy2024ListChangedCapability::default()
+                    }
+                }),
+                resources: self.capabilities.resources.as_ref().map(|capability| {
+                    Legacy2024ResourcesCapability {
+                        subscribe: capability.subscribe,
+                        list_changed: capability.list_changed,
+                        ..Legacy2024ResourcesCapability::default()
+                    }
+                }),
+                tools: self.capabilities.tools.as_ref().map(|capability| {
+                    Legacy2024ListChangedCapability {
+                        list_changed: capability.list_changed,
+                        ..Legacy2024ListChangedCapability::default()
+                    }
+                }),
+                ..Legacy2024ServerCapabilities::default()
+            },
+            server_info: Legacy2024ServerInfo {
+                name: self.info.name.clone(),
+                version: self.info.version.clone(),
+            },
+            instructions: self.instructions.clone(),
+        }
     }
 
     /// Returns the final discovery result for this constructed server.
@@ -2561,7 +2673,7 @@ impl Server {
         cx: &Cx,
         mut recv: R,
         send: S,
-        notification_sender: NotificationSender,
+        _notification_sender: NotificationSender,
         transport_label: &'static str,
         detach_on_worker_timeout: bool,
         connection_failure: Option<Arc<AtomicBool>>,
@@ -2596,24 +2708,11 @@ impl Server {
         let (dispatch_sender, mut dispatch_receiver) =
             asupersync_mpsc::channel::<QueuedDispatchRequest>(MAX_DISPATCH_QUEUE_DEPTH);
 
-        let request_sender = {
-            let send = Arc::clone(&send);
-            let send_cx = cx.clone();
-            let send_fn: bidirectional::TransportSendFn = Arc::new(move |message| {
-                let mut guard = send
-                    .lock()
-                    .map_err(|_| "transport send lock unavailable".to_string())?;
-                guard(&send_cx, message).map_err(|_| "transport send failed".to_string())
-            });
-            bidirectional::RequestSender::new(Arc::clone(&pending_requests), send_fn)
-        };
-
         let worker_server = Arc::clone(&server);
         let worker_send = Arc::clone(&send);
         let worker_queue_state = Arc::clone(&queue_state);
         let worker_failed_flag = Arc::clone(&worker_failed);
         let worker_cx = cx.clone();
-        let worker_notification_sender = Arc::clone(&notification_sender);
         let worker_renderer = traffic_renderer.clone();
         let (worker_completion_sender, worker_completion_receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -2623,6 +2722,10 @@ impl Server {
                 Arc::clone(&worker_queue_state),
             );
             let mut session = session;
+            let legacy_binding = runtime_legacy_binding(session.id());
+            let mut legacy_adapter: Option<
+                Legacy2024ServerAdapter<LiveLegacy2024RuntimeHandler<'_>>,
+            > = None;
             let mut clean_exit = false;
             loop {
                 if worker_queue_state.is_stopping() {
@@ -2694,14 +2797,35 @@ impl Server {
                     }
                     continue;
                 }
-                let handled = worker_server.handle_request_from_dispatch_queue(
-                    &worker_cx,
-                    &mut session,
-                    request,
-                    &worker_notification_sender,
-                    &request_sender,
-                    &worker_queue_state,
-                );
+                let adapter = match legacy_adapter.as_mut() {
+                    Some(adapter) => adapter,
+                    None => {
+                        let adapter = Legacy2024ServerAdapter::install(
+                            legacy_binding,
+                            worker_server.legacy_2024_server_config(),
+                            LiveLegacy2024RuntimeHandler {
+                                server: worker_server.as_ref(),
+                                cx: worker_cx.clone(),
+                            },
+                        );
+                        let Ok(adapter) = adapter else {
+                            if let Some(id) = request_id.as_ref() {
+                                worker_queue_state.discard(id);
+                            }
+                            break;
+                        };
+                        legacy_adapter.insert(adapter)
+                    }
+                };
+                let handled = match legacy_adapter_response(adapter, legacy_binding, &request) {
+                    Ok(response) => response.map(HandledRequest::untracked),
+                    Err(_) => {
+                        if let Some(id) = request_id.as_ref() {
+                            worker_queue_state.discard(id);
+                        }
+                        break;
+                    }
+                };
                 let duration = start_time.elapsed();
                 let Some(handled) = handled else {
                     if let Some(id) = request_id.as_ref() {
@@ -3118,7 +3242,7 @@ impl Server {
         cx: &Cx,
         mut recv: R,
         send: S,
-        notification_sender: NotificationSender,
+        _notification_sender: NotificationSender,
         connection_failure: Option<Arc<AtomicBool>>,
         transport_label: &'static str,
     ) -> !
@@ -3127,18 +3251,15 @@ impl Server {
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let mut session = Session::new(self.info.clone(), self.capabilities.clone());
+        let legacy_binding = runtime_legacy_binding(session.id());
+        let mut legacy_adapter: Option<Legacy2024ServerAdapter<LiveLegacy2024RuntimeHandler<'_>>> =
+            None;
         let mut era_classifier = StdioEraClassifier::new(self.protocol_policy);
         let mut negotiated_era = None;
 
         // Wrap send in Arc<Mutex> for shared access from bidirectional requests
         let send = Arc::new(Mutex::new(send));
         let pending_requests = self.new_pending_requests_for_connection();
-
-        // Create a RequestSender for bidirectional communication
-        let request_sender = bidirectional::RequestSender::new(
-            Arc::clone(&pending_requests),
-            Arc::new(|_| Err("bidirectional requests require a split transport".to_string())),
-        );
 
         // Track connection opened
         if let Some(ref stats) = self.stats {
@@ -3319,15 +3440,27 @@ impl Server {
                         self.dispatch_with_protocol_policy(self.protocol_policy, &inbound, &request)
                             .map(HandledRequest::untracked)
                     } else {
-                        self.handle_request_internal(
-                            cx,
-                            &mut session,
-                            request,
-                            &notification_sender,
-                            &request_sender,
-                            None,
-                            None,
-                        )
+                        let adapter = match legacy_adapter.as_mut() {
+                            Some(adapter) => adapter,
+                            None => {
+                                let adapter = Legacy2024ServerAdapter::install(
+                                    legacy_binding,
+                                    self.legacy_2024_server_config(),
+                                    LiveLegacy2024RuntimeHandler {
+                                        server: &self,
+                                        cx: cx.clone(),
+                                    },
+                                );
+                                let Ok(adapter) = adapter else {
+                                    self.graceful_shutdown(1);
+                                };
+                                legacy_adapter.insert(adapter)
+                            }
+                        };
+                        match legacy_adapter_response(adapter, legacy_binding, &request) {
+                            Ok(response) => response.map(HandledRequest::untracked),
+                            Err(_) => self.graceful_shutdown(1),
+                        }
                     }
                 }
                 JsonRpcMessage::Response(response) => {
@@ -3404,7 +3537,7 @@ impl Server {
         cx: &Cx,
         mut recv: R,
         send: S,
-        notification_sender: NotificationSender,
+        _notification_sender: NotificationSender,
         connection_failure: Option<Arc<AtomicBool>>,
         transport_label: &'static str,
     ) -> McpResult<()>
@@ -3413,18 +3546,15 @@ impl Server {
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let mut session = Session::new(self.info.clone(), self.capabilities.clone());
+        let legacy_binding = runtime_legacy_binding(session.id());
+        let mut legacy_adapter: Option<Legacy2024ServerAdapter<LiveLegacy2024RuntimeHandler<'_>>> =
+            None;
         let mut era_classifier = StdioEraClassifier::new(self.protocol_policy);
         let mut negotiated_era = None;
 
         // Wrap send in Arc<Mutex> for shared access from bidirectional requests
         let send = Arc::new(Mutex::new(send));
         let pending_requests = self.new_pending_requests_for_connection();
-
-        // Create a RequestSender for bidirectional communication
-        let request_sender = bidirectional::RequestSender::new(
-            Arc::clone(&pending_requests),
-            Arc::new(|_| Err("bidirectional requests require a split transport".to_string())),
-        );
 
         // Track connection opened
         if let Some(ref stats) = self.stats {
@@ -3645,15 +3775,39 @@ impl Server {
                         self.dispatch_with_protocol_policy(self.protocol_policy, &inbound, &request)
                             .map(HandledRequest::untracked)
                     } else {
-                        self.handle_request_internal(
-                            cx,
-                            &mut session,
-                            request,
-                            &notification_sender,
-                            &request_sender,
-                            None,
-                            None,
-                        )
+                        let adapter = match legacy_adapter.as_mut() {
+                            Some(adapter) => adapter,
+                            None => {
+                                let adapter = Legacy2024ServerAdapter::install(
+                                    legacy_binding,
+                                    self.legacy_2024_server_config(),
+                                    LiveLegacy2024RuntimeHandler {
+                                        server: &self,
+                                        cx: cx.clone(),
+                                    },
+                                );
+                                let Ok(adapter) = adapter else {
+                                    self.graceful_shutdown_returning();
+                                    return Err(server_run_error(
+                                        "protocol",
+                                        "legacy_adapter_install",
+                                        "Legacy MCP 2024-11-05 adapter could not be installed",
+                                    ));
+                                };
+                                legacy_adapter.insert(adapter)
+                            }
+                        };
+                        match legacy_adapter_response(adapter, legacy_binding, &request) {
+                            Ok(response) => response.map(HandledRequest::untracked),
+                            Err(_) => {
+                                self.graceful_shutdown_returning();
+                                return Err(server_run_error(
+                                    "protocol",
+                                    "legacy_adapter",
+                                    "Legacy MCP 2024-11-05 adapter rejected a notification",
+                                ));
+                            }
+                        }
                     }
                 }
                 JsonRpcMessage::Response(response) => {
@@ -8551,6 +8705,37 @@ mod lib_unit_tests {
         receive_calls: Arc<AtomicUsize>,
     }
 
+    struct LiveRuntimeListedTool;
+
+    impl ToolHandler for LiveRuntimeListedTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "live_runtime_listed_tool".to_owned(),
+                description: Some("Proves legacy adapter runtime handler wiring".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("live runtime legacy adapter")])
+        }
+    }
+
+    struct ProtocolPolicyScriptTransport {
+        inbound: std::collections::VecDeque<JsonRpcMessage>,
+        sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
+        receive_calls: Arc<AtomicUsize>,
+    }
+
     fn modern_discovery_opening_request() -> JsonRpcMessage {
         JsonRpcMessage::Request(JsonRpcRequest::new(
             SERVER_DISCOVER_METHOD,
@@ -8560,6 +8745,24 @@ mod lib_unit_tests {
                 },
             })),
             905_i64,
+        ))
+    }
+
+    fn exact_legacy_initialize_request(
+        id: i64,
+        client_version: serde_json::Value,
+    ) -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::new(
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "live-legacy-client",
+                    "version": client_version,
+                },
+            })),
+            id,
         ))
     }
 
@@ -8784,6 +8987,25 @@ mod lib_unit_tests {
         }
     }
 
+    impl Transport for ProtocolPolicyScriptTransport {
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.sent
+                .lock()
+                .expect("protocol-policy test sent-message mutex must not be poisoned")
+                .push(message.clone());
+            Ok(())
+        }
+
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            self.receive_calls.fetch_add(1, Ordering::AcqRel);
+            self.inbound.pop_front().ok_or(TransportError::Closed)
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn server_builder_policy_admits_selected_modern_runtime_era() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -8859,6 +9081,157 @@ mod lib_unit_tests {
                 .as_ref()
                 .map(|response_error| response_error.code),
             Some(-32600)
+        );
+    }
+
+    #[test]
+    fn auto_runtime_keeps_a_modern_opening_on_the_modern_dispatch_path() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+
+        Server::new("auto-modern-runtime-policy", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyProbeTransport {
+                    next: Some(modern_discovery_opening_request()),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::clone(&receive_calls),
+                },
+            )
+            .expect("Auto must keep a supported modern opener on the modern path");
+
+        assert_eq!(receive_calls.load(Ordering::Acquire), 2);
+        let sent = sent
+            .lock()
+            .expect("protocol-policy test sent-message mutex must not be poisoned");
+        let [JsonRpcMessage::Response(response)] = sent.as_slice() else {
+            panic!("modern Auto selection must emit exactly one discovery response");
+        };
+        assert_eq!(response.id, Some(905_i64.into()));
+        assert!(response.error.is_none());
+        assert!(response.result.is_some());
+    }
+
+    #[test]
+    fn live_runtime_routes_exact_legacy_frames_through_the_2024_adapter() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+
+        Server::new("live-legacy-runtime", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .tool(LiveRuntimeListedTool)
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyScriptTransport {
+                    inbound: std::collections::VecDeque::from([
+                        exact_legacy_initialize_request(41, serde_json::json!("1.0.0")),
+                        JsonRpcMessage::Request(JsonRpcRequest::notification(
+                            "notifications/initialized",
+                            None,
+                        )),
+                        JsonRpcMessage::Request(JsonRpcRequest::new("tools/list", None, 42_i64)),
+                    ]),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::clone(&receive_calls),
+                },
+            )
+            .expect("an exact legacy lifecycle must complete through the live adapter");
+
+        assert_eq!(receive_calls.load(Ordering::Acquire), 4);
+        let sent = sent
+            .lock()
+            .expect("protocol-policy test sent-message mutex must not be poisoned");
+        let [
+            JsonRpcMessage::Response(initialize),
+            JsonRpcMessage::Response(tools),
+        ] = sent.as_slice()
+        else {
+            panic!("legacy initialize and tools/list must be the only adapter responses");
+        };
+        assert_eq!(initialize.id, Some(41_i64.into()));
+        assert_eq!(
+            initialize
+                .result
+                .as_ref()
+                .and_then(|result| result["protocolVersion"].as_str()),
+            Some(LEGACY_PROTOCOL_VERSION)
+        );
+        assert_eq!(tools.id, Some(42_i64.into()));
+        assert_eq!(
+            tools
+                .result
+                .as_ref()
+                .and_then(|result| result["tools"].as_array())
+                .and_then(|tools| tools.first())
+                .and_then(|tool| tool["name"].as_str()),
+            Some("live_runtime_listed_tool")
+        );
+    }
+
+    #[test]
+    fn live_runtime_rejects_only_the_invalid_legacy_client_version_without_advancing_lifecycle() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+
+        Server::new("live-legacy-runtime-negative", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .tool(LiveRuntimeListedTool)
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyScriptTransport {
+                    inbound: std::collections::VecDeque::from([
+                        exact_legacy_initialize_request(51, serde_json::json!(1)),
+                        exact_legacy_initialize_request(52, serde_json::json!("1.0.0")),
+                        JsonRpcMessage::Request(JsonRpcRequest::notification(
+                            "notifications/initialized",
+                            None,
+                        )),
+                        JsonRpcMessage::Request(JsonRpcRequest::new("tools/list", None, 53_i64)),
+                    ]),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .expect("only the changed invalid client-version field must be rejected");
+
+        let sent = sent
+            .lock()
+            .expect("protocol-policy test sent-message mutex must not be poisoned");
+        let [
+            JsonRpcMessage::Response(rejected),
+            JsonRpcMessage::Response(initialize),
+            JsonRpcMessage::Response(tools),
+        ] = sent.as_slice()
+        else {
+            panic!(
+                "a rejected initialize must leave the adapter ready for the unchanged valid lifecycle"
+            );
+        };
+        assert_eq!(rejected.id, Some(51_i64.into()));
+        assert_eq!(
+            rejected.error.as_ref().map(|error| error.code),
+            Some(-32600)
+        );
+        assert_eq!(initialize.id, Some(52_i64.into()));
+        assert_eq!(
+            initialize
+                .result
+                .as_ref()
+                .and_then(|result| result["protocolVersion"].as_str()),
+            Some(LEGACY_PROTOCOL_VERSION)
+        );
+        assert_eq!(tools.id, Some(53_i64.into()));
+        assert_eq!(
+            tools
+                .result
+                .as_ref()
+                .and_then(|result| result["tools"].as_array())
+                .and_then(|tools| tools.first())
+                .and_then(|tool| tool["name"].as_str()),
+            Some("live_runtime_listed_tool")
         );
     }
 
