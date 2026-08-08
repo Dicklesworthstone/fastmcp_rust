@@ -92,12 +92,13 @@ pub use tasks_extension::{
     CancelTaskParams as FinalCancelTaskParams, CancelTaskResult as FinalCancelTaskResult,
     CompleteTaskResult, CreateTaskResult, EmptyTaskResult, FinalTaskCallToolResult, FinalTaskError,
     GetTaskParams as FinalGetTaskParams, GetTaskResult as FinalGetTaskResult, MAX_TASK_ID_BYTES,
-    MAX_TASK_INPUT_MAP_ENTRIES, RELATED_TASK_META_KEY, TASK_CANCEL, TASK_GET,
-    TASK_STATUS_NOTIFICATION, TASKS_EXTENSION, Task, TaskBase, TaskDuration, TaskId as FinalTaskId,
-    TaskInputLedger, TaskInputRequests, TaskInputResponses, TaskMethodRequest, TaskRequestMeta,
-    TaskStatus as FinalTaskStatus, TaskStatusNotification,
+    MAX_TASK_INPUT_MAP_ENTRIES, MAX_TASK_SUBSCRIPTION_IDS, RELATED_TASK_META_KEY, TASK_CANCEL,
+    TASK_GET, TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY, TASKS_EXTENSION, Task, TaskBase,
+    TaskDuration, TaskId as FinalTaskId, TaskInputLedger, TaskInputRequests, TaskInputResponses,
+    TaskMethodRequest, TaskRequestMeta, TaskStatus as FinalTaskStatus, TaskStatusNotification,
     TaskStatusNotificationParams as FinalTaskStatusNotificationParams, TaskTimestamp,
-    TaskWireError, UpdateTaskParams, UpdateTaskResult,
+    TaskWireError, UpdateTaskParams, UpdateTaskResult, set_task_subscription_ids,
+    task_subscription_ids,
 };
 pub use types::*;
 

@@ -16,7 +16,7 @@ use crate::common_types::{JsonInteger, OpenMetadata};
 use crate::jsonrpc::{JSONRPC_VERSION, RequestId};
 use crate::messages::{
     FinalCallToolResult, FinalEmbeddedInputKind, FinalEmbeddedInputRequest,
-    FinalEmbeddedInputResponse,
+    FinalEmbeddedInputResponse, SubscriptionFilter,
 };
 use crate::protocol_version::FINAL_PROTOCOL_VERSION;
 
@@ -36,6 +36,54 @@ pub const RELATED_TASK_META_KEY: &str = "io.modelcontextprotocol/related-task";
 pub const MAX_TASK_ID_BYTES: usize = 1024;
 /// Maximum entries retained in either task input map.
 pub const MAX_TASK_INPUT_MAP_ENTRIES: usize = 128;
+/// Maximum task identifiers retained in one subscription filter fragment.
+pub const MAX_TASK_SUBSCRIPTION_IDS: usize = 128;
+/// Tasks-owned key composed into a final core subscription filter.
+pub const TASK_SUBSCRIPTION_IDS_KEY: &str = "taskIds";
+
+/// Composes the Tasks `taskIds` fragment into a final core subscription filter.
+///
+/// The core filter remains schema-open and extension-neutral. This function is
+/// the sole typed attachment point that assigns Tasks semantics to its
+/// `taskIds` member. Request order and duplicates are retained exactly; stream
+/// matching applies exact decoded-ID set semantics later.
+pub fn set_task_subscription_ids(
+    filter: &mut SubscriptionFilter,
+    task_ids: Vec<TaskId>,
+) -> Result<(), TaskWireError> {
+    validate_task_subscription_id_count(task_ids.len())?;
+    if filter.additional.contains_key(TASK_SUBSCRIPTION_IDS_KEY) {
+        return Err(TaskWireError::Invalid("taskIds"));
+    }
+    let encoded = serde_json::to_value(task_ids).map_err(|_| TaskWireError::Invalid("taskIds"))?;
+    filter
+        .additional
+        .insert(TASK_SUBSCRIPTION_IDS_KEY.to_owned(), encoded);
+    Ok(())
+}
+
+/// Decodes the Tasks fragment from a final core subscription filter.
+///
+/// Absence means that the subscription requests no Task events. An empty array
+/// is retained as a present, empty selection and likewise matches no events.
+pub fn task_subscription_ids(
+    filter: &SubscriptionFilter,
+) -> Result<Option<Vec<TaskId>>, TaskWireError> {
+    let Some(value) = filter.additional.get(TASK_SUBSCRIPTION_IDS_KEY) else {
+        return Ok(None);
+    };
+    let task_ids: Vec<TaskId> =
+        serde_json::from_value(value.clone()).map_err(|_| TaskWireError::Invalid("taskIds"))?;
+    validate_task_subscription_id_count(task_ids.len())?;
+    Ok(Some(task_ids))
+}
+
+fn validate_task_subscription_id_count(count: usize) -> Result<(), TaskWireError> {
+    if count > MAX_TASK_SUBSCRIPTION_IDS {
+        return Err(TaskWireError::Invalid("taskIds"));
+    }
+    Ok(())
+}
 
 /// A decoded opaque task identifier.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1154,6 +1202,77 @@ impl<'de> Deserialize<'de> for TaskStatusNotification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_subscription_fragment_preserves_order_duplicates_and_core_filter() {
+        let mut filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        set_task_subscription_ids(
+            &mut filter,
+            vec![
+                TaskId::parse("task-b").expect("task id"),
+                TaskId::parse("task-a").expect("task id"),
+                TaskId::parse("task-b").expect("task id"),
+            ],
+        )
+        .expect("compose Tasks fragment");
+
+        let decoded = task_subscription_ids(&filter)
+            .expect("decode Tasks fragment")
+            .expect("present Tasks fragment");
+        assert_eq!(
+            decoded.iter().map(TaskId::as_str).collect::<Vec<_>>(),
+            ["task-b", "task-a", "task-b"]
+        );
+        assert_eq!(filter.tools_list_changed, Some(true));
+    }
+
+    #[test]
+    fn malformed_task_subscription_fragment_rejects_without_mutation() {
+        let filter = SubscriptionFilter {
+            additional: BTreeMap::from([(
+                TASK_SUBSCRIPTION_IDS_KEY.to_owned(),
+                serde_json::json!("task-a"),
+            )]),
+            ..SubscriptionFilter::default()
+        };
+        let baseline = filter.clone();
+
+        assert_eq!(
+            task_subscription_ids(&filter),
+            Err(TaskWireError::Invalid("taskIds"))
+        );
+        assert_eq!(filter.additional, baseline.additional);
+        assert_eq!(filter.tools_list_changed, baseline.tools_list_changed);
+    }
+
+    #[test]
+    fn task_subscription_fragment_rejects_collision_and_one_past_limit() {
+        let mut collision = SubscriptionFilter {
+            additional: BTreeMap::from([(
+                TASK_SUBSCRIPTION_IDS_KEY.to_owned(),
+                serde_json::json!([]),
+            )]),
+            ..SubscriptionFilter::default()
+        };
+        assert_eq!(
+            set_task_subscription_ids(&mut collision, Vec::new()),
+            Err(TaskWireError::Invalid("taskIds"))
+        );
+
+        let mut oversized = SubscriptionFilter::default();
+        let ids = (0..=MAX_TASK_SUBSCRIPTION_IDS)
+            .map(|index| TaskId::parse(format!("task-{index}")))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("bounded identifiers");
+        assert_eq!(
+            set_task_subscription_ids(&mut oversized, ids),
+            Err(TaskWireError::Invalid("taskIds"))
+        );
+        assert!(oversized.additional.is_empty());
+    }
 
     fn base(status: TaskStatus) -> TaskBase {
         TaskBase {
