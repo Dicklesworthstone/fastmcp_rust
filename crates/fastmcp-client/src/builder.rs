@@ -33,24 +33,16 @@ use std::time::Duration;
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult, block_on};
+use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
-use fastmcp_transport::{StdioTransport, Transport};
+use fastmcp_transport::StdioTransport;
 
 use crate::{
     ChildGuard, ChildOwnership, Client, ClientHttpConnection, ClientHttpConnectionError,
-    ClientHttpNegotiation, ClientHttpNegotiationError, ClientProtocolPlan, ClientProtocolPlanError,
-    ClientSession, ProcessGroupAnchor, RequestTimeoutPolicy, combine_cleanup_results,
-    combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
-    transport_error_to_mcp,
+    ClientHttpNegotiation, ClientHttpNegotiationError, ClientProtocolPlan, ClientSession,
+    ProcessGroupAnchor, RequestTimeoutPolicy, combine_operation_with_cleanup,
+    is_cleanup_unverified, resolve_stdio_command,
 };
-
-fn protocol_plan_error_to_mcp(error: ClientProtocolPlanError) -> McpError {
-    match error {
-        ClientProtocolPlanError::LegacyAdapterUnavailable { policy } => McpError::invalid_params(
-            format!("{policy:?} requires the installed exact 2024-11-05 client adapter"),
-        ),
-    }
-}
 
 /// Builder for configuring an MCP client.
 ///
@@ -245,6 +237,11 @@ impl ClientBuilder {
     /// the first method call (e.g., `list_tools`, `call_tool`). This allows
     /// the subprocess to start immediately without blocking on initialization.
     ///
+    /// `ProtocolPolicy::Auto` is the exception: it completes its disposable
+    /// modern probe during connection so a recognized refusal can be followed
+    /// only by a fresh exact-legacy subprocess. Fixed modern and legacy plans
+    /// retain deferred initialization.
+    ///
     /// Default is `false` (initialize immediately on connect).
     ///
     /// # Example
@@ -371,9 +368,6 @@ impl ClientBuilder {
         // auto-initialize must never return a live client that cannot issue its
         // first protocol request.
         self.timeout_policy.validate()?;
-        self.protocol_plan
-            .validate_for_stdio()
-            .map_err(protocol_plan_error_to_mcp)?;
         let mut last_error = None;
         // Compute attempts in u64 to avoid overflow when max_retries == u32::MAX.
         let attempts = u64::from(self.max_retries) + 1;
@@ -414,6 +408,57 @@ impl ClientBuilder {
 
     /// Attempts a single connection.
     fn try_connect(&self, command: &str, args: &[&str], cx: &Cx) -> McpResult<Client> {
+        match self.protocol_plan.policy() {
+            ProtocolPolicy::ModernOnly | ProtocolPolicy::LegacyOnly => self
+                .try_connect_with_protocol_plan(
+                    command,
+                    args,
+                    cx,
+                    self.protocol_plan.clone(),
+                    self.auto_initialize,
+                ),
+            ProtocolPolicy::Auto => self.try_connect_auto(command, args, cx),
+        }
+    }
+
+    /// Selects an era with a disposable modern child before exposing a client.
+    ///
+    /// A stdio peer has one opening-frame classification, so the modern probe
+    /// can never be reused for exact legacy initialization. Only the
+    /// recognized JSON-RPC discovery refusal authorizes a second spawn.
+    fn try_connect_auto(&self, command: &str, args: &[&str], cx: &Cx) -> McpResult<Client> {
+        let modern_plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
+        match self.try_connect_with_protocol_plan(command, args, cx, modern_plan, false) {
+            Ok(mut client) => {
+                client.set_protocol_plan_after_selection(self.protocol_plan.clone());
+                Ok(client)
+            }
+            Err(error) if crate::auto_legacy_fallback_is_authorized(&error) => {
+                // The disposable modern child has been cleaned up before its
+                // error reaches this branch. Observe cancellation again before
+                // creating a fresh legacy child.
+                if cx.checkpoint().is_err() {
+                    return Err(McpError::request_cancelled());
+                }
+                let legacy_plan = ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly);
+                let mut client =
+                    self.try_connect_with_protocol_plan(command, args, cx, legacy_plan, false)?;
+                client.set_protocol_plan_after_selection(self.protocol_plan.clone());
+                Ok(client)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Spawns one configured subprocess and applies one fixed protocol era.
+    fn try_connect_with_protocol_plan(
+        &self,
+        command: &str,
+        args: &[&str],
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        defer_initialization: bool,
+    ) -> McpResult<Client> {
         // Build the command
         let executable = resolve_stdio_command(command, self.working_dir.as_deref())?;
         let (mut cmd, child_ownership, mut group_anchor) =
@@ -480,7 +525,7 @@ impl ClientBuilder {
         let transport = StdioTransport::new(stdout, stdin);
         let (child, group_anchor) = child_guard.disarm_all();
 
-        if self.auto_initialize {
+        if defer_initialization {
             // Create uninitialized client - initialization will happen on first use
             Ok(self.create_uninitialized_client(
                 child,
@@ -488,10 +533,17 @@ impl ClientBuilder {
                 group_anchor,
                 transport,
                 cx,
+                protocol_plan,
             ))
         } else {
-            // Perform initialization immediately
-            self.initialize_client(child, child_ownership, group_anchor, transport, cx)
+            self.initialize_client(
+                child,
+                child_ownership,
+                group_anchor,
+                transport,
+                cx,
+                protocol_plan,
+            )
         }
     }
 
@@ -530,6 +582,7 @@ impl ClientBuilder {
         group_anchor: Option<ProcessGroupAnchor>,
         transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
         cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
     ) -> Client {
         // Create a placeholder session - will be updated on first use
         let session = ClientSession::new(
@@ -542,7 +595,7 @@ impl ClientBuilder {
             fastmcp_protocol::ServerCapabilities::default(),
             String::new(),
         )
-        .with_protocol_plan(self.protocol_plan.clone());
+        .with_protocol_plan(protocol_plan);
 
         Client::from_parts_uninitialized_with_ownership(
             child,
@@ -561,55 +614,23 @@ impl ClientBuilder {
         child: Child,
         child_ownership: ChildOwnership,
         group_anchor: Option<ProcessGroupAnchor>,
-        mut transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
+        transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
         cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
     ) -> McpResult<Client> {
-        // Guard ensures child process is killed if initialization fails.
-        // Disarmed when client is successfully created.
-        let child_guard = match group_anchor {
-            Some(anchor) => ChildGuard::with_process_group(child, anchor),
-            None => ChildGuard::with_ownership(child, child_ownership),
-        };
-
-        let init_result = match crate::initialize_child_transport(
-            &mut transport,
-            cx,
-            &self.client_info,
-            &self.capabilities,
-            self.timeout_policy,
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                return combine_operation_with_cleanup(Err(error), || {
-                    combine_cleanup_results(
-                        transport.close().map_err(transport_error_to_mcp),
-                        child_guard.cleanup(),
-                    )
-                });
-            }
-        };
-
-        // Create session
-        let session = ClientSession::new(
-            self.client_info.clone(),
-            self.capabilities.clone(),
-            init_result.server_info,
-            init_result.capabilities,
-            init_result.protocol_version,
-        )
-        .with_protocol_plan(self.protocol_plan.clone());
-
-        // Create client - disarm guard since Client now owns the subprocess
-        let (child, group_anchor) = child_guard.disarm_all();
-        Ok(Client::from_parts_with_ownership(
+        let mut client = self.create_uninitialized_client(
             child,
             child_ownership,
             group_anchor,
             transport,
-            cx.clone(),
-            session,
-            self.timeout_policy,
-        ))
+            cx,
+            protocol_plan,
+        );
+        if let Err(error) = client.ensure_initialized() {
+            let cleanup = client.close();
+            return combine_operation_with_cleanup(Err(error), || cleanup);
+        }
+        Ok(client)
     }
 }
 

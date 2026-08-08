@@ -110,23 +110,14 @@ impl ClientProtocolPlan {
     pub fn legacy_message_post_target(&self) -> Option<&str> {
         self.legacy_message_post_target.as_deref()
     }
-
-    pub(crate) fn validate_for_stdio(&self) -> Result<(), ClientProtocolPlanError> {
-        if matches!(self.policy, ProtocolPolicy::LegacyOnly) {
-            return Err(ClientProtocolPlanError::LegacyAdapterUnavailable {
-                policy: self.policy,
-            });
-        }
-        Ok(())
-    }
 }
 
-/// Typed refusal raised before a client process can be spawned.
+/// Reserved error type for protocol-plan validation.
+///
+/// Stdio supports each declared [`ProtocolPolicy`] directly, so no stdio
+/// policy is rejected before process creation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientProtocolPlanError {
-    /// Legacy-only requires the exact installed LEG-03 adapter.
-    LegacyAdapterUnavailable { policy: ProtocolPolicy },
-}
+pub enum ClientProtocolPlanError {}
 
 /// Client-side session state.
 #[derive(Debug)]
