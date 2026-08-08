@@ -22,16 +22,12 @@
 #![allow(dead_code)]
 
 use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
-use fastmcp_protocol::common_types::{AbsoluteUri, EmbeddedResourceContents};
-use fastmcp_protocol::{
-    CacheScope, FinalCallToolResult, FinalGetPromptResult, FinalPromptMessage,
-    FinalReadResourceResult,
-};
 use fastmcp_rust::{
-    CompleteResult, Content, ContentBlock, Cx, FinalToolOutcome, Implementation,
-    InputRequiredResult, JsonSchema, LabConfig, LabRuntime, McpContext, McpError, McpOutcome,
-    McpResult, Outcome, PromptHandler, PromptMessage, ResourceContent, ResourceHandler, ResultMeta,
-    Role, ToolHandler, prompt, resource, tool,
+    AbsoluteUri, CacheScope, CompleteResult, Content, ContentBlock, Cx, EmbeddedResourceContents,
+    FinalCallToolResult, FinalGetPromptResult, FinalPromptMessage, FinalReadResourceResult,
+    FinalToolOutcome, Implementation, InputRequiredResult, JsonSchema, LabConfig, LabRuntime,
+    McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler, PromptMessage,
+    ResourceContent, ResourceHandler, ResultMeta, Role, ToolHandler, prompt, resource, tool,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};

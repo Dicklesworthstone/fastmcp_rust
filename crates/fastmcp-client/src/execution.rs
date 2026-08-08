@@ -588,12 +588,13 @@ where
         Self::with_result_peer_era(transport, ResultPeerEra::Legacy)
     }
 
-    /// Creates an executor bound to the result era negotiated with its peer.
+    /// Creates an executor bound to the negotiated peer era.
     ///
     /// The caller must select this from the completed initialize handshake and
-    /// keep it immutable for the connection. [`Self::new`] retains the
-    /// legacy-era default for callers that have not yet integrated
-    /// negotiation.
+    /// keep it immutable for the connection. The era controls exact result
+    /// decoding and whether legacy server-to-client requests reach the
+    /// handler boundary. [`Self::new`] retains the legacy-era default for
+    /// callers that have not yet integrated negotiation.
     #[must_use]
     pub fn with_result_peer_era(transport: T, result_peer_era: ResultPeerEra) -> Self {
         Self {
@@ -848,7 +849,9 @@ where
             JsonRpcMessage::Response(response) => self.route_response_locked(&mut state, response),
             JsonRpcMessage::Request(request) => {
                 if request.id.is_some() {
-                    if let Err(error) = state.retain_reverse_request(request) {
+                    if state.result_peer_era == ResultPeerEra::Modern {
+                        self.reject_modern_reverse_request_locked(cx, &mut state, request)?;
+                    } else if let Err(error) = state.retain_reverse_request(request) {
                         state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
                         return Err(error);
                     }
@@ -1071,12 +1074,12 @@ where
         self.state.borrow_mut().notifications.drain(..).collect()
     }
 
-    /// Removes and returns peer requests that require a client response.
+    /// Removes and returns exact-legacy peer requests that require a client response.
     pub fn take_reverse_requests(&self) -> Vec<JsonRpcRequest> {
         self.state.borrow_mut().reverse_requests.drain(..).collect()
     }
 
-    /// Sends one final result for a peer-authored reverse request.
+    /// Sends one final result for an exact-legacy peer-authored reverse request.
     pub fn respond_to_reverse_request(
         &self,
         cx: &Cx,
@@ -1224,6 +1227,23 @@ where
         let error = transport_error_to_mcp(transport_error);
         state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
         error
+    }
+
+    fn reject_modern_reverse_request_locked(
+        &self,
+        cx: &Cx,
+        state: &mut ExecutorState<T>,
+        request: JsonRpcRequest,
+    ) -> McpResult<()> {
+        let request_id = request.id.expect("modern reverse request has an ID");
+        let rejection = JsonRpcMessage::Response(JsonRpcResponse::error(
+            Some(request_id),
+            McpError::method_not_found(&request.method).into(),
+        ));
+        state
+            .transport
+            .send(cx, &rejection)
+            .map_err(|error| self.handle_send_error_locked(state, error))
     }
 
     fn wait_for_terminal(
@@ -1984,6 +2004,14 @@ mod tests {
         JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(id), result))
     }
 
+    fn legacy_reverse_request(id: i64) -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::new(
+            "sampling/createMessage",
+            Some(serde_json::json!({"messages": [], "maxTokens": 9})),
+            id,
+        ))
+    }
+
     fn tasks_subscription_request(id: i64, task_id: &TaskId) -> JsonRpcRequest {
         let mut notifications = SubscriptionFilter::default();
         fastmcp_protocol::set_task_subscription_ids(&mut notifications, vec![task_id.clone()])
@@ -2181,6 +2209,80 @@ mod tests {
         assert!(backpressured.execute(&cx, request(21)).is_err());
         assert!(backpressured.pending_records().is_empty());
         assert!(backpressured.execute(&cx, request(22)).is_err());
+    }
+
+    #[test]
+    fn modern_reverse_request_is_rejected_without_mutating_legacy_handler_state() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([Ok(legacy_reverse_request(700))]),
+            ResultPeerEra::Modern,
+        );
+        let _execution = executor
+            .execute(&cx, request(42))
+            .expect("outer request commits before modern peer ingress");
+        let pending_before = executor.pending_records();
+
+        executor
+            .drive(&cx)
+            .expect("modern legacy-shaped reverse request is rejected locally");
+
+        assert!(executor.take_reverse_requests().is_empty());
+        assert_eq!(executor.pending_records(), pending_before);
+        let state = executor.state.borrow();
+        assert!(state.pending_reverse_request_ids.is_empty());
+        assert_eq!(state.reverse_requests.len(), 0);
+        assert_eq!(state.transport.sent.len(), 2);
+        let JsonRpcMessage::Response(rejection) = &state.transport.sent[1] else {
+            panic!("modern reverse request receives one JSON-RPC error response");
+        };
+        assert_eq!(rejection.id, Some(RequestId::Number(700)));
+        let error = rejection
+            .error
+            .as_ref()
+            .expect("rejection carries an error");
+        assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound));
+        assert_eq!(error.message, "Method not found");
+    }
+
+    #[test]
+    fn legacy_reverse_request_remains_available_to_the_handler_boundary() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([Ok(legacy_reverse_request(700))]),
+            ResultPeerEra::Legacy,
+        );
+        let _execution = executor
+            .execute(&cx, request(42))
+            .expect("outer request commits before legacy peer ingress");
+        let pending_before = executor.pending_records();
+
+        executor
+            .drive(&cx)
+            .expect("legacy reverse request reaches the handler boundary");
+
+        let reverse_requests = executor.take_reverse_requests();
+        assert_eq!(reverse_requests.len(), 1);
+        assert_eq!(reverse_requests[0].id, Some(RequestId::Number(700)));
+        assert_eq!(reverse_requests[0].method, "sampling/createMessage");
+        assert_eq!(executor.pending_records(), pending_before);
+        executor
+            .respond_to_reverse_request(
+                &cx,
+                RequestId::Number(700),
+                serde_json::json!({"ok": true}),
+            )
+            .expect("legacy handler result is sent for its exact request ID");
+
+        let state = executor.state.borrow();
+        assert!(state.pending_reverse_request_ids.is_empty());
+        assert!(state.reverse_requests.is_empty());
+        assert_eq!(state.transport.sent.len(), 2);
+        let JsonRpcMessage::Response(response) = &state.transport.sent[1] else {
+            panic!("legacy handler result is a JSON-RPC response");
+        };
+        assert_eq!(response.id, Some(RequestId::Number(700)));
+        assert_eq!(response.result, Some(serde_json::json!({"ok": true})));
     }
 
     #[test]
@@ -2422,23 +2524,23 @@ mod tests {
             .execute(&cx, request(42))
             .expect("request commits before peer traffic arrives");
 
-        executor.drive(&cx).expect("reverse request is admitted");
-        assert_eq!(executor.take_reverse_requests().len(), 1);
         executor
-            .respond_to_reverse_request(
-                &cx,
-                RequestId::Number(700),
-                serde_json::json!({"model": "accepted"}),
-            )
-            .expect("the live reverse ID receives one response");
-        let duplicate = executor
-            .respond_to_reverse_request(
-                &cx,
-                RequestId::Number(700),
-                serde_json::json!({"model": "duplicate"}),
-            )
-            .expect_err("a completed reverse ID cannot produce another response");
-        assert_eq!(duplicate.code, McpErrorCode::InvalidRequest);
+            .drive(&cx)
+            .expect("modern legacy-shaped reverse request is rejected");
+        assert!(executor.take_reverse_requests().is_empty());
+        {
+            let state = executor.state.borrow();
+            let sent = &state.transport.sent;
+            assert_eq!(sent.len(), 2);
+            let JsonRpcMessage::Response(rejection) = &sent[1] else {
+                panic!("modern reverse request receives an error response");
+            };
+            assert_eq!(rejection.id, Some(RequestId::Number(700)));
+            assert_eq!(
+                rejection.error.as_ref().map(|error| error.code),
+                Some(i32::from(McpErrorCode::MethodNotFound))
+            );
+        }
 
         let (decoded, diagnostic, stream) = executor
             .wait_decoded_with_stream(&cx, &mut execution)

@@ -1660,13 +1660,18 @@ impl ClientHttpConnection {
                 }
                 Ok(())
             }
-            Self::LegacySse(client) => client
-                .send(
-                    cx,
-                    &JsonRpcMessage::Request(JsonRpcRequest::notification(method, parameters)),
-                )
-                .await
-                .map_err(ClientHttpConnectionError::Legacy),
+            Self::LegacySse(client) => {
+                if let Some(parameters) = parameters.as_ref() {
+                    reject_final_only_legacy_request_metadata(parameters)?;
+                }
+                client
+                    .send(
+                        cx,
+                        &JsonRpcMessage::Request(JsonRpcRequest::notification(method, parameters)),
+                    )
+                    .await
+                    .map_err(ClientHttpConnectionError::Legacy)
+            }
         }
     }
 }
@@ -3228,14 +3233,14 @@ mod tests {
                 discovery_body.as_bytes(),
             );
 
-            let (mut ping_stream, _) = listener.accept().expect("accept Apps ping request");
-            let ping_request = read_request(&mut ping_stream);
-            let ping = serde_json::from_slice::<serde_json::Value>(&ping_request.body)
-                .expect("Apps ping request must be JSON-RPC");
-            assert_eq!(ping["id"], 2);
-            assert_eq!(ping["method"], "ping");
+            let (mut list_stream, _) = listener.accept().expect("accept Apps tools/list request");
+            let list_request = read_request(&mut list_stream);
+            let list = serde_json::from_slice::<serde_json::Value>(&list_request.body)
+                .expect("Apps tools/list request must be JSON-RPC");
+            assert_eq!(list["id"], 2);
+            assert_eq!(list["method"], "tools/list");
             let advertised_apps =
-                ping["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                list["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
                     .get(OFFICIAL_MCP_APPS_EXTENSION_ID);
             if apps_active {
                 assert_eq!(
@@ -3251,10 +3256,10 @@ mod tests {
                 );
             }
             write_response(
-                &mut ping_stream,
+                &mut list_stream,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}"#,
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
             );
         });
 
@@ -3277,7 +3282,7 @@ mod tests {
         assert_eq!(connection.mcp_apps_active(), apps_active);
         let response = runtime_block_on(connection.request_json(
             &cx,
-            "ping",
+            "tools/list",
             serde_json::json!({}),
             RequestId::Number(2),
             4_096,
@@ -3715,7 +3720,7 @@ mod tests {
             );
             let body = serde_json::from_slice::<serde_json::Value>(&request.body)
                 .expect("modern request must be JSON-RPC");
-            assert_eq!(body["method"], "ping");
+            assert_eq!(body["method"], "tools/list");
             assert_eq!(
                 body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
                 "2026-07-28"
@@ -3724,7 +3729,7 @@ mod tests {
                 &mut stream,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}"#,
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
             );
 
             let (mut notification, _) = listener.accept().expect("accept modern notification");
@@ -3759,7 +3764,7 @@ mod tests {
 
         let response = runtime_block_on(connection.request_json(
             &cx,
-            "ping",
+            "tools/list",
             serde_json::json!({}),
             RequestId::Number(2),
             4_096,
@@ -3855,13 +3860,13 @@ mod tests {
             let body = serde_json::from_slice::<serde_json::Value>(&request.body)
                 .expect("modern request must be JSON-RPC");
             assert_eq!(body["id"], 2);
-            assert_eq!(body["method"], "ping");
+            assert_eq!(body["method"], "tools/list");
             // Only the response ID differs from the admitted positive request.
             write_response(
                 &mut stream,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete"}}"#,
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
             );
         });
 
@@ -3879,7 +3884,7 @@ mod tests {
         .expect("modern discovery selects the exact stateless connection");
         let error = runtime_block_on(connection.request_json(
             &cx,
-            "ping",
+            "tools/list",
             serde_json::json!({}),
             RequestId::Number(2),
             4_096,
@@ -4713,6 +4718,12 @@ mod tests {
         let advertised_message_target = message_target.clone();
         let server = thread::spawn(move || {
             let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            assert!(
+                !sse_request.head.contains("MCP-Protocol-Version:"),
+                "exact legacy SSE GET must not carry final headers"
+            );
             begin_chunked_sse(&mut sse);
             write_chunked_sse_event(
                 &mut sse,
@@ -4774,5 +4785,76 @@ mod tests {
         .expect("changing only final metadata leaves the legacy connection usable");
         assert_eq!(response.id, Some(RequestId::Number(42)));
         server.join().expect("legacy negative server must join");
+    }
+
+    #[test]
+    fn public_legacy_notification_rejects_only_final_metadata_without_sending_or_mutating() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local legacy listener");
+        let address = listener
+            .local_addr()
+            .expect("read local legacy listener address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            // The rejected notification must not create a POST. The first and
+            // only POST is the otherwise identical notification after it.
+            let (mut notification_post, _) = listener
+                .accept()
+                .expect("accept unchanged legacy notification POST");
+            let notification = read_request(&mut notification_post);
+            let notification = serde_json::from_slice::<serde_json::Value>(&notification.body)
+                .expect("recovered legacy notification remains JSON-RPC");
+            assert_eq!(notification["method"], "notifications/cancelled");
+            assert!(notification.get("id").is_none());
+            assert_eq!(notification["params"]["requestId"], 42);
+            assert!(notification["params"].get("_meta").is_none());
+            write_response(&mut notification_post, 202, "application/json", b"");
+            finish_chunked_sse(&mut sse);
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    "http://127.0.0.1:9/mcp",
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::LegacyOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("public connection opens the exact legacy lane");
+        let rejected = runtime_block_on(connection.notify(
+            &cx,
+            "notifications/cancelled",
+            Some(serde_json::json!({
+                "requestId": 42,
+                "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
+            })),
+        ));
+        assert!(matches!(
+            rejected,
+            Err(ClientHttpConnectionError::LegacyFinalMetadata {
+                member: "io.modelcontextprotocol/protocolVersion"
+            })
+        ));
+
+        runtime_block_on(connection.notify(
+            &cx,
+            "notifications/cancelled",
+            Some(serde_json::json!({"requestId": 42})),
+        ))
+        .expect("changing only final metadata leaves the legacy connection usable");
+        server.join().expect("legacy notification server must join");
     }
 }

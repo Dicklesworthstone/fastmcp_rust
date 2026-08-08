@@ -5757,6 +5757,13 @@ impl Client {
             })
             .and_then(|params| self.with_modern_request_metadata(params))?;
         let result: ServerDiscoverResult = self.send_request(SERVER_DISCOVER_METHOD, params)?;
+        if !result
+            .supported_versions()
+            .iter()
+            .any(|version| version == MODERN_PROTOCOL_VERSION)
+        {
+            return Err(McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR));
+        }
         let server_info = result.server_info().cloned().ok_or_else(|| {
             McpError::internal_error("Modern server/discover response has no _meta server info")
         })?;
@@ -8304,9 +8311,9 @@ mod tests {
             IFS= read -r roots; \
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"elicitation/create\",\"id\":43,\"params\":{\"mode\":\"form\",\"message\":\"approval\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}}\\n'; \
             IFS= read -r elicitation; \
-            case \"$sampling\" in *'\"id\":41'*'\"model\":\"handler-model\"'*) sampling_ok=true;; *) sampling_ok=false;; esac; \
-            case \"$roots\" in *'\"id\":42'*'file:///workspace'*) roots_ok=true;; *) roots_ok=false;; esac; \
-            case \"$elicitation\" in *'\"id\":43'*'\"action\":\"decline\"'*) elicitation_ok=true;; *) elicitation_ok=false;; esac; \
+            case \"$sampling\" in *'\"model\":\"handler-model\"'*'\"id\":41'*) sampling_ok=true;; *) sampling_ok=false;; esac; \
+            case \"$roots\" in *'file:///workspace'*'\"id\":42'*) roots_ok=true;; *) roots_ok=false;; esac; \
+            case \"$elicitation\" in *'\"action\":\"decline\"'*'\"id\":43'*) elicitation_ok=true;; *) elicitation_ok=false;; esac; \
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sampling\":%s,\"roots\":%s,\"elicitation\":%s}}\\n' \
             \"$sampling_ok\" \"$roots_ok\" \"$elicitation_ok\"; exec sleep 2";
         let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
@@ -8367,9 +8374,9 @@ mod tests {
             IFS= read -r roots; \
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"elicitation/create\",\"id\":43,\"params\":{\"mode\":\"form\",\"message\":\"approval\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}}\\n'; \
             IFS= read -r elicitation; \
-            case \"$sampling\" in *'\"id\":41'*'\"model\":\"handler-model\"'*) sampling_ok=true;; *) sampling_ok=false;; esac; \
-            case \"$roots\" in *'\"id\":42'*'\"code\":-32601'*) roots_missing=true;; *) roots_missing=false;; esac; \
-            case \"$elicitation\" in *'\"id\":43'*'\"action\":\"decline\"'*) elicitation_ok=true;; *) elicitation_ok=false;; esac; \
+            case \"$sampling\" in *'\"model\":\"handler-model\"'*'\"id\":41'*) sampling_ok=true;; *) sampling_ok=false;; esac; \
+            case \"$roots\" in *'\"code\":-32601'*'\"id\":42'*) roots_missing=true;; *) roots_missing=false;; esac; \
+            case \"$elicitation\" in *'\"action\":\"decline\"'*'\"id\":43'*) elicitation_ok=true;; *) elicitation_ok=false;; esac; \
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sampling\":%s,\"rootsMissing\":%s,\"elicitation\":%s}}\\n' \
             \"$sampling_ok\" \"$roots_missing\" \"$elicitation_ok\"; exec sleep 2";
         let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
@@ -11046,7 +11053,7 @@ mod tests {
              case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r request || exit 1; \
-             case \"$request\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"io.modelcontextprotocol/logLevel\":\"notice\"'*) \
+             case \"$request\" in *ping*'\"io.modelcontextprotocol/logLevel\":\"notice\"'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
@@ -11093,7 +11100,7 @@ mod tests {
              case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r request || exit 1; \
-             case \"$request\" in *tools/call*'\"progressToken\":2'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$request\" in *tools/call*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"progressToken\":2'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":2,\"progress\":0.5,\"total\":1.0,\"message\":\"modern progress\"}}}}'; \
              printf '%s\\n' '{call_response}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
@@ -11241,7 +11248,7 @@ mod tests {
              case \"$get_prompt\" in *prompts/get*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"resultType\":\"complete\",\"messages\":[]}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r ping || exit 1; \
-             case \"$ping\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"io.modelcontextprotocol/logLevel\":\"notice\"'*) \
+             case \"$ping\" in *ping*'\"io.modelcontextprotocol/logLevel\":\"notice\"'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
@@ -11256,7 +11263,10 @@ mod tests {
              case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r second || exit 1; \
-             case \"$second\" in *completion/complete*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"title\":\"Deploy\"'*'\"context\":{{\"arguments\":{{\"region\":\"us-east-1\"}}}}'*) \
+             case \"$second\" in *completion/complete*) ;; *) exit 1 ;; esac; \
+             case \"$second\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
+             case \"$second\" in *'\"context\":{{\"arguments\":{{\"region\":\"us-east-1\"}}}}'*) ;; *) exit 1 ;; esac; \
+             case \"$second\" in *'\"title\":\"Deploy\"'*) \
              printf '%s\\n' '{completion_response}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
@@ -11326,13 +11336,20 @@ mod tests {
              case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r get || exit 1; \
-             case \"$get\" in *'\"method\":\"tasks/get\"'*'\"taskId\":\"task-1\"'*'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
+             case \"$get\" in *'\"method\":\"tasks/get\"'*) ;; *) exit 1 ;; esac; \
+             case \"$get\" in *'\"taskId\":\"task-1\"'*) ;; *) exit 1 ;; esac; \
+             case \"$get\" in *'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
              printf '%s\\n' '{get_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r update || exit 1; \
-             case \"$update\" in *'\"method\":\"tasks/update\"'*'\"taskId\":\"task-1\"'*'\"inputResponses\":{{}}'*'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
+             case \"$update\" in *'\"method\":\"tasks/update\"'*) ;; *) exit 1 ;; esac; \
+             case \"$update\" in *'\"taskId\":\"task-1\"'*) ;; *) exit 1 ;; esac; \
+             case \"$update\" in *'\"inputResponses\":{{}}'*) ;; *) exit 1 ;; esac; \
+             case \"$update\" in *'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r cancel || exit 1; \
-             case \"$cancel\" in *'\"method\":\"tasks/cancel\"'*'\"taskId\":\"task-1\"'*'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
+             case \"$cancel\" in *'\"method\":\"tasks/cancel\"'*) ;; *) exit 1 ;; esac; \
+             case \"$cancel\" in *'\"taskId\":\"task-1\"'*) ;; *) exit 1 ;; esac; \
+             case \"$cancel\" in *'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
@@ -11347,7 +11364,9 @@ mod tests {
              case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r get || exit 1; \
-             case \"$get\" in *'\"method\":\"tasks/get\"'*'\"taskId\":\"task-1\"'*'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
+             case \"$get\" in *'\"method\":\"tasks/get\"'*) ;; *) exit 1 ;; esac; \
+             case \"$get\" in *'\"taskId\":\"task-1\"'*) ;; *) exit 1 ;; esac; \
+             case \"$get\" in *'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
              printf '%s\\n' '{get_response}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
@@ -12659,18 +12678,17 @@ mod tests {
             embedded_representable
         );
 
-        let mut unsupported = serde_json::json!({
-            "type": "image",
+        let unsupported = serde_json::json!({
+            "type": "audio",
             "data": "AA==",
-            "mimeType": "image/png",
+            "mimeType": "audio/mpeg",
             "annotations": {"audience": ["user"]},
             "_meta": {"io.fastmcp.retained": true},
             "io.fastmcp.extension": {"retained": true},
         });
-        unsupported["type"] = serde_json::json!("audio");
         let error = final_content_to_legacy(
             serde_json::from_value::<ContentBlock>(unsupported)
-                .expect("changing only the content kind still parses as final content"),
+                .expect("valid final audio content parses before projection"),
         )
         .expect_err("an exact legacy result cannot represent final audio content");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
