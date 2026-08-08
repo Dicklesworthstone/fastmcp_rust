@@ -7188,7 +7188,20 @@ mod router_tests {
                 None,
             )
             .expect("mounted resource is readable through its public URI");
-        assert_eq!(read.contents[0].uri, "ns/file:///a");
+        let [
+            LegacyResourceContent::Text {
+                uri,
+                text,
+                additional,
+                ..
+            },
+        ] = read.contents.as_slice()
+        else {
+            panic!("mounted resource must retain the exact legacy text shape");
+        };
+        assert_eq!(uri, "ns/file:///a");
+        assert_eq!(text, "content");
+        assert!(additional.is_empty());
     }
 
     #[test]
@@ -7250,7 +7263,20 @@ mod router_tests {
                 None,
             )
             .expect("nested mounted resource is readable");
-        assert_eq!(read.contents[0].uri, "ns/ns/file:///a");
+        let [
+            LegacyResourceContent::Text {
+                uri,
+                text,
+                additional,
+                ..
+            },
+        ] = read.contents.as_slice()
+        else {
+            panic!("nested mounted resource must retain the exact legacy text shape");
+        };
+        assert_eq!(uri, "ns/ns/file:///a");
+        assert_eq!(text, "content");
+        assert!(additional.is_empty());
     }
 
     #[test]
@@ -7323,8 +7349,20 @@ mod router_tests {
                 None,
             )
             .expect("mounted template is readable through its public URI");
-        assert_eq!(read.contents[0].uri, "peer/peer/db://users");
-        assert_eq!(read.contents[0].text.as_deref(), Some("users"));
+        let [
+            LegacyResourceContent::Text {
+                uri,
+                text,
+                additional,
+                ..
+            },
+        ] = read.contents.as_slice()
+        else {
+            panic!("mounted template must retain the exact legacy text shape");
+        };
+        assert_eq!(uri, "peer/peer/db://users");
+        assert_eq!(text, "users");
+        assert!(additional.is_empty());
     }
 
     #[test]
@@ -7432,8 +7470,20 @@ mod router_tests {
             .expect("true-async mounted template is readable through its public URI");
 
         assert_eq!(read.contents.len(), 1);
-        assert_eq!(read.contents[0].uri, "peer/async-db://users");
-        assert_eq!(read.contents[0].text.as_deref(), Some("async table users"));
+        let [
+            LegacyResourceContent::Text {
+                uri,
+                text,
+                additional,
+                ..
+            },
+        ] = read.contents.as_slice()
+        else {
+            panic!("async mounted template must retain the exact legacy text shape");
+        };
+        assert_eq!(uri, "peer/async-db://users");
+        assert_eq!(text, "async table users");
+        assert!(additional.is_empty());
         assert_eq!(
             *observed.lock().expect("observation mutex poisoned"),
             Some(("async-db://users".to_string(), "users".to_string()))
@@ -8761,7 +8811,20 @@ mod router_tests {
             .handle_resources_read(&request_ctx, &params, state, None, None)
             .unwrap();
         assert_eq!(result.contents.len(), 1);
-        assert_eq!(result.contents[0].uri, "file:///a");
+        let [
+            LegacyResourceContent::Text {
+                uri,
+                text,
+                additional,
+                ..
+            },
+        ] = result.contents.as_slice()
+        else {
+            panic!("resource read must retain the exact legacy text shape");
+        };
+        assert_eq!(uri, "file:///a");
+        assert_eq!(text, "content");
+        assert!(additional.is_empty());
     }
 
     // ── handle_resources_read: not found ─────────────────────────────────
