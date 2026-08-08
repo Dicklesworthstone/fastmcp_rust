@@ -1598,8 +1598,23 @@ struct QueuedRequest {
     serialized_bytes: usize,
 }
 
+/// One JSON-RPC message emitted through a request-owned modern SSE body.
+///
+/// A body may carry any number of server-to-client notifications and exactly
+/// one terminal response. Notifications retain the request body that owns
+/// their delivery, so independent modern requests cannot observe, consume, or
+/// cancel one another's outbound messages.
+#[derive(Debug, Clone)]
+pub enum StreamableHttpRequestResponseMessage {
+    /// A server-to-client JSON-RPC notification sent before the terminal response.
+    Notification(JsonRpcRequest),
+    /// The single terminal JSON-RPC response for the owning request.
+    Response(JsonRpcResponse),
+}
+
 struct QueuedResponse {
-    message: JsonRpcResponse,
+    request_id: Option<RequestId>,
+    message: StreamableHttpRequestResponseMessage,
     serialized_bytes: usize,
 }
 
@@ -1740,12 +1755,14 @@ impl StreamableHttpRequestIngress {
     }
 }
 
-/// Cloneable, accounting-aware consumer for streamable HTTP responses.
+/// Cloneable, accounting-aware consumer for streamable HTTP outbound messages.
 ///
 /// Every receive operation names its expected JSON-RPC request ID. Clones can
-/// therefore wait for different requests without consuming one another's
-/// responses. Dequeues release the corresponding count and serialized-byte
-/// reservations exactly once.
+/// therefore wait for different unowned responses without consuming one
+/// another's messages. Request-owned SSE bodies use their dedicated consumer
+/// instead, which preserves notification and terminal-response ordering.
+/// Dequeues release the corresponding count and serialized-byte reservations
+/// exactly once.
 pub struct StreamableHttpResponseStream {
     mailbox: Arc<Mutex<StreamableResponseMailbox>>,
     request_states: Arc<Mutex<HashMap<RequestId, Arc<StreamableHttpRequestCancellationState>>>>,
@@ -1794,21 +1811,47 @@ impl Drop for StreamableHttpResponseStream {
 }
 
 impl StreamableHttpResponseStream {
-    /// Pops the response for `request_id` without blocking.
+    /// Pops an unowned response for `request_id` without blocking.
     ///
     /// A null-ID JSON-RPC error can be selected with `None`. If another clone
     /// currently owns the mailbox lock, this returns `WouldBlock` rather than
-    /// blocking the calling thread.
+    /// blocking the calling thread. A live request-owned SSE body must consume
+    /// its own messages through [`StreamableHttpRequestResponseStream`].
     pub fn pop_response(
         &self,
         request_id: Option<&RequestId>,
     ) -> Result<Option<JsonRpcResponse>, TransportError> {
-        if let Some(response) =
-            try_pop_streamable_response(&self.mailbox, &self.pending_count, |response| {
-                response.id.as_ref() == request_id
-            })?
+        if let Some(request_id) = request_id {
+            if self.request_is_live(request_id)? {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "request-owned Streamable HTTP messages must use their bound SSE response body",
+                )));
+            }
+        }
+        let queued = self.pop_matching(|queued| {
+            matches!(
+                &queued.message,
+                StreamableHttpRequestResponseMessage::Response(response)
+                    if response.id.as_ref() == request_id
+            )
+        })?;
+        Ok(queued.map(|queued| match queued.message {
+            StreamableHttpRequestResponseMessage::Response(response) => response,
+            StreamableHttpRequestResponseMessage::Notification(_) => {
+                unreachable!("the response matcher cannot dequeue a notification")
+            }
+        }))
+    }
+
+    fn pop_matching(
+        &self,
+        matches: impl Fn(&QueuedResponse) -> bool,
+    ) -> Result<Option<QueuedResponse>, TransportError> {
+        if let Some(message) =
+            try_pop_streamable_message(&self.mailbox, &self.pending_count, &matches)?
         {
-            return Ok(Some(response));
+            return Ok(Some(message));
         }
         if !self.admissions_open.load(Ordering::Acquire)
             && self.active_admissions.load(Ordering::SeqCst) == 0
@@ -1817,10 +1860,8 @@ impl StreamableHttpResponseStream {
             // check and dropping its admission guard. Once the gate is closed
             // and the active count reaches zero, recheck under the mailbox
             // lock before declaring terminal closure.
-            match try_pop_streamable_response(&self.mailbox, &self.pending_count, |response| {
-                response.id.as_ref() == request_id
-            })? {
-                Some(response) => Ok(Some(response)),
+            match try_pop_streamable_message(&self.mailbox, &self.pending_count, &matches)? {
+                Some(message) => Ok(Some(message)),
                 None => Err(TransportError::Closed),
             }
         } else {
@@ -1857,13 +1898,89 @@ impl StreamableHttpResponseStream {
         }
     }
 
-    /// Returns whether at least one response is awaiting consumption.
+    fn pop_request_message(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<StreamableHttpRequestResponseMessage>, TransportError> {
+        Ok(self
+            .pop_matching(|queued| queued.request_id.as_ref() == Some(request_id))?
+            .map(|queued| queued.message))
+    }
+
+    fn pop_request_response(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<JsonRpcResponse>, TransportError> {
+        if let Some(response) =
+            try_pop_streamable_request_response(&self.mailbox, &self.pending_count, request_id)?
+        {
+            return Ok(Some(response));
+        }
+        if !self.admissions_open.load(Ordering::Acquire)
+            && self.active_admissions.load(Ordering::SeqCst) == 0
+        {
+            match try_pop_streamable_request_response(
+                &self.mailbox,
+                &self.pending_count,
+                request_id,
+            )? {
+                Some(response) => Ok(Some(response)),
+                None => Err(TransportError::Closed),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn request_is_live(&self, request_id: &RequestId) -> Result<bool, TransportError> {
+        let request_states = match self.request_states.try_lock() {
+            Ok(request_states) => request_states,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err(streamable_queue_full_error(
+                    "streamable HTTP request-response registry is busy",
+                ));
+            }
+        };
+        Ok(request_states.contains_key(request_id))
+    }
+
+    fn discard_request_messages(&self, request_id: &RequestId) {
+        let mut mailbox = self
+            .mailbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut discarded_count = 0;
+        let mut discarded_bytes = 0;
+        mailbox.queue.retain(|queued| {
+            if queued.request_id.as_ref() == Some(request_id) {
+                discarded_count += 1;
+                discarded_bytes += queued.serialized_bytes;
+                false
+            } else {
+                true
+            }
+        });
+        if discarded_count != 0 {
+            debug_assert!(mailbox.retained_bytes >= discarded_bytes);
+            mailbox.retained_bytes = mailbox.retained_bytes.saturating_sub(discarded_bytes);
+            let previous = self
+                .pending_count
+                .fetch_sub(discarded_count, Ordering::AcqRel);
+            debug_assert!(
+                previous >= discarded_count,
+                "response pending-count underflow while cancelling a request body"
+            );
+        }
+    }
+
+    /// Returns whether at least one outbound message is awaiting consumption.
     #[must_use]
     pub fn has_responses(&self) -> bool {
         self.pending_count.load(Ordering::Acquire) > 0
     }
 
-    /// Returns the number of responses awaiting consumption.
+    /// Returns the number of outbound messages awaiting consumption.
     #[must_use]
     pub fn pending_responses(&self) -> usize {
         self.pending_count.load(Ordering::Acquire)
@@ -1871,9 +1988,9 @@ impl StreamableHttpResponseStream {
 
     /// Returns the number of request-owned response bodies that remain live.
     ///
-    /// This count excludes queued terminal responses: a body remains live only
-    /// while it can still accept its one terminal response or be cancelled by
-    /// its HTTP response teardown.
+    /// This count excludes queued messages: a body remains live while it can
+    /// still accept notifications and its one terminal response, or be
+    /// cancelled by its HTTP response teardown.
     pub fn live_request_bodies(&self) -> Result<usize, TransportError> {
         let request_states = match self.request_states.try_lock() {
             Ok(request_states) => request_states,
@@ -1895,7 +2012,7 @@ impl StreamableHttpResponseStream {
 
     /// Closes the shared response-admission endpoint.
     ///
-    /// Already-admitted responses remain available to their matching
+    /// Already-admitted outbound messages remain available to their matching
     /// consumers. Closing any clone seals production for every clone. Dropping
     /// the final response-stream handle additionally discards responses that
     /// can no longer have a consumer. This is a synchronization barrier for
@@ -1935,13 +2052,13 @@ impl StreamableHttpResponseStream {
         !self.owner_open.load(Ordering::Acquire) || !self.admissions_open.load(Ordering::Acquire)
     }
 
-    /// Binds a response consumer to one request's final response.
+    /// Binds an SSE response consumer to one request's outbound messages.
     ///
     /// The returned stream carries the request ID internally, so an HTTP
     /// response body cannot accidentally consume another in-flight request's
-    /// response. Dropping it requests cancellation through the paired guard;
-    /// request handlers retain that guard and checkpoint it before committing
-    /// further work or writes.
+    /// notifications or terminal response. Dropping it requests cancellation
+    /// through the paired guard; request handlers retain that guard and
+    /// checkpoint it before committing further work or writes.
     #[must_use]
     pub fn for_request(
         &self,
@@ -2018,9 +2135,10 @@ impl StreamableHttpRequestCancellation {
         self.state.cancelled.store(true, Ordering::Release);
     }
 
-    fn with_response_commit<T>(
+    fn with_message_commit<T>(
         &self,
         cx: &Cx,
+        terminal: bool,
         commit: impl FnOnce() -> Result<T, TransportError>,
     ) -> Result<T, TransportError> {
         self.checkpoint(cx)?;
@@ -2041,7 +2159,9 @@ impl StreamableHttpRequestCancellation {
             return Err(TransportError::Closed);
         }
         let committed = commit()?;
-        self.state.terminal_committed.store(true, Ordering::Release);
+        if terminal {
+            self.state.terminal_committed.store(true, Ordering::Release);
+        }
         Ok(committed)
     }
 
@@ -2110,6 +2230,8 @@ impl StreamableHttpRequestResponseStream {
             {
                 request_states.remove(&self.request_id);
             }
+            drop(request_states);
+            self.responses.discard_request_messages(&self.request_id);
         }
     }
 
@@ -2132,8 +2254,53 @@ impl StreamableHttpRequestResponseStream {
         self.finished.load(Ordering::Acquire)
     }
 
+    /// Pops the next notification or terminal response for this request body
+    /// without blocking.
+    ///
+    /// Messages are emitted in commit order for this exact request. Receiving
+    /// the terminal response finishes the body; subsequent calls fail closed.
+    pub fn pop_message(
+        &self,
+    ) -> Result<Option<StreamableHttpRequestResponseMessage>, TransportError> {
+        if self.is_finished() {
+            return Err(TransportError::Closed);
+        }
+        if self.cancellation.is_cancelled() {
+            return Err(TransportError::Cancelled);
+        }
+
+        let message = self.responses.pop_request_message(&self.request_id)?;
+        if matches!(
+            message,
+            Some(StreamableHttpRequestResponseMessage::Response(_))
+        ) {
+            self.finish();
+        }
+        Ok(message)
+    }
+
+    /// Waits for the next notification or terminal response while observing
+    /// both caller cancellation and this response body's lifetime.
+    pub fn recv_message(
+        &self,
+        cx: &Cx,
+    ) -> Result<StreamableHttpRequestResponseMessage, TransportError> {
+        loop {
+            self.cancellation.checkpoint(cx)?;
+            match self.pop_message() {
+                Ok(Some(message)) => return Ok(message),
+                Ok(None) => {}
+                Err(error) if is_would_block(&error) => {}
+                Err(error) => return Err(error),
+            }
+            std::thread::sleep(self.responses.poll_interval);
+        }
+    }
+
     /// Pops the bound request's final response without blocking.
     ///
+    /// A pending notification must be consumed through [`Self::pop_message`]
+    /// before this compatibility method can receive the terminal response.
     /// A completed response is terminal for this body. Subsequent calls fail
     /// closed rather than allowing a second final response for the request.
     pub fn pop_response(&self) -> Result<Option<JsonRpcResponse>, TransportError> {
@@ -2144,7 +2311,7 @@ impl StreamableHttpRequestResponseStream {
             return Err(TransportError::Cancelled);
         }
 
-        let response = self.responses.pop_response(Some(&self.request_id))?;
+        let response = self.responses.pop_request_response(&self.request_id)?;
         if response.is_some() {
             self.finish();
         }
@@ -2154,21 +2321,72 @@ impl StreamableHttpRequestResponseStream {
     /// Waits for the bound request's final response while observing both the
     /// caller context and response-body cancellation.
     pub fn recv_response(&self, cx: &Cx) -> Result<JsonRpcResponse, TransportError> {
-        if self.is_finished() {
-            return Err(TransportError::Closed);
+        loop {
+            self.cancellation.checkpoint(cx)?;
+            match self.pop_response() {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => {}
+                Err(error) if is_would_block(&error) => {}
+                Err(error) => return Err(error),
+            }
+            std::thread::sleep(self.responses.poll_interval);
         }
-        self.cancellation.checkpoint(cx)?;
-
-        let response = self.responses.recv_response(cx, Some(&self.request_id))?;
-        self.finish();
-        Ok(response)
     }
+}
+
+fn try_pop_streamable_message(
+    mailbox: &Mutex<StreamableResponseMailbox>,
+    pending_count: &AtomicUsize,
+    matches: impl Fn(&QueuedResponse) -> bool,
+) -> Result<Option<QueuedResponse>, TransportError> {
+    let mut mailbox = match mailbox.try_lock() {
+        Ok(mailbox) => mailbox,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            return Err(streamable_queue_full_error(
+                "streamable response mailbox is busy",
+            ));
+        }
+    };
+    let Some(position) = mailbox.queue.iter().position(matches) else {
+        return Ok(None);
+    };
+    let response = mailbox
+        .queue
+        .remove(position)
+        .expect("response position was obtained from the same mailbox");
+    debug_assert!(mailbox.retained_bytes >= response.serialized_bytes);
+    mailbox.retained_bytes = mailbox
+        .retained_bytes
+        .saturating_sub(response.serialized_bytes);
+    let previous = pending_count.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous > 0, "response pending-count underflow");
+    Ok(Some(response))
 }
 
 fn try_pop_streamable_response(
     mailbox: &Mutex<StreamableResponseMailbox>,
     pending_count: &AtomicUsize,
     matches: impl Fn(&JsonRpcResponse) -> bool,
+) -> Result<Option<JsonRpcResponse>, TransportError> {
+    let queued = try_pop_streamable_message(mailbox, pending_count, |queued| {
+        matches!(
+            &queued.message,
+            StreamableHttpRequestResponseMessage::Response(response) if matches(response)
+        )
+    })?;
+    Ok(queued.map(|queued| match queued.message {
+        StreamableHttpRequestResponseMessage::Response(response) => response,
+        StreamableHttpRequestResponseMessage::Notification(_) => {
+            unreachable!("the response matcher cannot dequeue a notification")
+        }
+    }))
+}
+
+fn try_pop_streamable_request_response(
+    mailbox: &Mutex<StreamableResponseMailbox>,
+    pending_count: &AtomicUsize,
+    request_id: &RequestId,
 ) -> Result<Option<JsonRpcResponse>, TransportError> {
     let mut mailbox = match mailbox.try_lock() {
         Ok(mailbox) => mailbox,
@@ -2182,21 +2400,35 @@ fn try_pop_streamable_response(
     let Some(position) = mailbox
         .queue
         .iter()
-        .position(|response| matches(&response.message))
+        .position(|queued| queued.request_id.as_ref() == Some(request_id))
     else {
         return Ok(None);
     };
-    let response = mailbox
+    if matches!(
+        &mailbox.queue[position].message,
+        StreamableHttpRequestResponseMessage::Notification(_)
+    ) {
+        return Err(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a request-owned notification must be consumed before its terminal response",
+        )));
+    }
+    let queued = mailbox
         .queue
         .remove(position)
         .expect("response position was obtained from the same mailbox");
-    debug_assert!(mailbox.retained_bytes >= response.serialized_bytes);
+    debug_assert!(mailbox.retained_bytes >= queued.serialized_bytes);
     mailbox.retained_bytes = mailbox
         .retained_bytes
-        .saturating_sub(response.serialized_bytes);
+        .saturating_sub(queued.serialized_bytes);
     let previous = pending_count.fetch_sub(1, Ordering::AcqRel);
     debug_assert!(previous > 0, "response pending-count underflow");
-    Ok(Some(response.message))
+    match queued.message {
+        StreamableHttpRequestResponseMessage::Response(response) => Ok(Some(response)),
+        StreamableHttpRequestResponseMessage::Notification(_) => {
+            unreachable!("notification messages return before they are removed")
+        }
+    }
 }
 
 fn release_streamable_bytes(retained_bytes: &AtomicUsize, serialized_bytes: usize) {
@@ -2659,15 +2891,56 @@ impl StreamableHttpTransport {
                 "streamable HTTP response guard does not belong to this live transport request",
             )));
         }
-        cancellation.with_response_commit(cx, || {
-            self.enqueue_response(cx, &response, Some(cancellation))
+        cancellation.with_message_commit(cx, true, || {
+            self.enqueue_message(
+                cx,
+                Some(cancellation.request_id().clone()),
+                StreamableHttpRequestResponseMessage::Response(response),
+                Some(cancellation),
+            )
         })
     }
 
-    fn enqueue_response(
+    /// Commits one server-to-client notification for one live modern SSE body.
+    ///
+    /// The request cancellation guard identifies the only body that can emit
+    /// this notification. The shared bounded outbound queue provides
+    /// backpressure, while the request-local commit gate keeps notifications
+    /// ordered before the body's one terminal response.
+    pub fn send_notification_for_request(
         &mut self,
         cx: &Cx,
-        response: &JsonRpcResponse,
+        cancellation: &StreamableHttpRequestCancellation,
+        notification: JsonRpcRequest,
+    ) -> Result<(), TransportError> {
+        if !notification.is_notification() {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP request-owned messages must be JSON-RPC notifications",
+            )));
+        }
+        cancellation.checkpoint(cx)?;
+        if !self.request_response_guard_is_active(cancellation)? {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP notification guard does not belong to this live transport request",
+            )));
+        }
+        cancellation.with_message_commit(cx, false, || {
+            self.enqueue_message(
+                cx,
+                Some(cancellation.request_id().clone()),
+                StreamableHttpRequestResponseMessage::Notification(notification),
+                Some(cancellation),
+            )
+        })
+    }
+
+    fn enqueue_message(
+        &mut self,
+        cx: &Cx,
+        request_id: Option<RequestId>,
+        message: StreamableHttpRequestResponseMessage,
         request_cancellation: Option<&StreamableHttpRequestCancellation>,
     ) -> Result<(), TransportError> {
         if !self.owner_open.load(Ordering::Acquire)
@@ -2686,7 +2959,14 @@ impl StreamableHttpTransport {
             &self.response_admissions_open,
             &self.response_active_admissions,
         )?;
-        let serialized_bytes = self.codec.encode_response(response)?.len();
+        let serialized_bytes = match &message {
+            StreamableHttpRequestResponseMessage::Notification(notification) => {
+                self.codec.encode_request(notification)?.len()
+            }
+            StreamableHttpRequestResponseMessage::Response(response) => {
+                self.codec.encode_response(response)?.len()
+            }
+        };
         // Do not commit a response after cancellation or a deadline that
         // became observable during bounded serialization.
         http_checkpoint(cx)?;
@@ -2723,7 +3003,8 @@ impl StreamableHttpTransport {
                 streamable_queue_full_error("streamable response byte budget is full")
             })?;
         mailbox.queue.push_back(QueuedResponse {
-            message: response.clone(),
+            request_id,
+            message,
             serialized_bytes,
         });
         mailbox.retained_bytes = prospective;
@@ -2785,15 +3066,19 @@ impl Transport for StreamableHttpTransport {
                         "request-bound Streamable HTTP responses must use send_response_for_request",
                     )));
                 }
-                self.enqueue_response(cx, response, None)?;
+                self.enqueue_message(
+                    cx,
+                    response.id.clone(),
+                    StreamableHttpRequestResponseMessage::Response(response.clone()),
+                    None,
+                )?;
             }
             JsonRpcMessage::Request(_) => {
-                // This transport currently streams only JSON-RPC responses.
-                // Server-to-client requests/notifications cannot be represented
-                // in the current response queue shape, so fail explicitly to avoid
-                // silent message loss and potential protocol deadlocks.
+                // A server-to-client notification needs a request-owned modern
+                // SSE body. The generic transport trait has no such owner, so
+                // fail closed rather than routing it to another active stream.
                 return Err(TransportError::Io(std::io::Error::other(
-                    "StreamableHttpTransport cannot send server-to-client requests",
+                    "StreamableHttpTransport requires a request-owned guard for server-to-client notifications",
                 )));
             }
         }
@@ -3170,13 +3455,21 @@ impl DualEraHttpSseResponse {
         self.body.cancellation()
     }
 
-    /// Receives and frames the one response as an SSE `message` event.
+    /// Receives and frames the next notification or terminal response as an
+    /// SSE `message` event.
     ///
-    /// The modern event deliberately has no resumable ID; resumable IDs belong
-    /// only to the separately retained legacy SSE stream.
+    /// Modern notifications and the final response are ordered within this
+    /// request body. These events deliberately have no resumable ID; resumable
+    /// IDs belong only to the separately retained legacy SSE stream.
     pub fn recv_event(&self, cx: &Cx) -> Result<SseEvent, DualEraHttpEndpointError> {
-        let response = self.body.recv_response(cx)?;
-        let mut encoded = self.codec.encode_response(&response)?;
+        let mut encoded = match self.body.recv_message(cx)? {
+            StreamableHttpRequestResponseMessage::Notification(notification) => {
+                self.codec.encode_request(&notification)?
+            }
+            StreamableHttpRequestResponseMessage::Response(response) => {
+                self.codec.encode_response(&response)?
+            }
+        };
         if encoded.pop() != Some(b'\n') {
             return Err(DualEraHttpEndpointError::Transport(TransportError::Io(
                 std::io::Error::new(
@@ -3549,6 +3842,24 @@ impl DualEraHttpSession {
         }
         self.modern_transport
             .send_response_for_request(cx, cancellation, response)?;
+        Ok(())
+    }
+
+    /// Sends one request-owned notification through a modern SSE response body.
+    ///
+    /// The cancellation guard prevents a notification from being routed to a
+    /// different in-flight request or committed after its HTTP body closes.
+    pub fn send_modern_sse_notification(
+        &mut self,
+        cx: &Cx,
+        cancellation: &StreamableHttpRequestCancellation,
+        notification: JsonRpcRequest,
+    ) -> Result<(), DualEraHttpEndpointError> {
+        if self.closed {
+            return Err(DualEraHttpEndpointError::Closed);
+        }
+        self.modern_transport
+            .send_notification_for_request(cx, cancellation, notification)?;
         Ok(())
     }
 
@@ -5484,6 +5795,213 @@ X-Checksum: abc123\r\n\
     }
 
     #[test]
+    fn streamable_http_request_owned_notifications_are_ordered_bounded_and_terminal() {
+        let mut transport =
+            StreamableHttpTransport::with_capacity(2).expect("capacity two is valid");
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let request_id = RequestId::Number(704);
+        let request_body = response_stream
+            .for_request(request_id.clone())
+            .expect("the request receives one response body");
+        let cancellation = request_body.cancellation();
+        let cx = Cx::for_testing();
+
+        transport
+            .send_notification_for_request(
+                &cx,
+                &cancellation,
+                JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progress": 1})),
+                ),
+            )
+            .expect("the first notification is admitted");
+        transport
+            .send_notification_for_request(
+                &cx,
+                &cancellation,
+                JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progress": 2})),
+                ),
+            )
+            .expect("the second notification is admitted");
+        assert_eq!(response_stream.pending_responses(), 2);
+        assert!(matches!(
+            transport.send_notification_for_request(
+                &cx,
+                &cancellation,
+                JsonRpcRequest::notification("notifications/progress", None),
+            ),
+            Err(TransportError::Io(ref error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        assert!(matches!(
+            request_body
+                .recv_message(&cx)
+                .expect("the first queued message is readable"),
+            StreamableHttpRequestResponseMessage::Notification(notification)
+                if notification.method == "notifications/progress"
+                    && notification.params == Some(serde_json::json!({"progress": 1}))
+        ));
+        assert!(!request_body.is_finished());
+        transport
+            .send_response_for_request(
+                &cx,
+                &cancellation,
+                JsonRpcResponse::success(request_id.clone(), serde_json::json!({"complete": true})),
+            )
+            .expect("draining one notification makes room for the terminal response");
+        assert!(cancellation.is_terminal_committed());
+
+        assert!(matches!(
+            request_body
+                .recv_message(&cx)
+                .expect("the second notification remains ahead of the terminal response"),
+            StreamableHttpRequestResponseMessage::Notification(notification)
+                if notification.params == Some(serde_json::json!({"progress": 2}))
+        ));
+        assert!(matches!(
+            request_body
+                .recv_message(&cx)
+                .expect("the final message is the terminal response"),
+            StreamableHttpRequestResponseMessage::Response(response)
+                if response.id == Some(request_id)
+        ));
+        assert!(request_body.is_finished());
+        assert_eq!(response_stream.pending_responses(), 0);
+    }
+
+    #[test]
+    fn streamable_http_notification_rejects_a_foreign_request_owner_without_mutation() {
+        let mut transport = StreamableHttpTransport::new();
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let request_id = RequestId::Number(705);
+        let request_body = response_stream
+            .for_request(request_id.clone())
+            .expect("the local request body is registered");
+        let local_cancellation = request_body.cancellation();
+
+        let mut foreign_transport = StreamableHttpTransport::new();
+        let foreign_stream = foreign_transport
+            .response_stream()
+            .expect("the foreign response stream can be externalized once");
+        let foreign_body = foreign_stream
+            .for_request(request_id)
+            .expect("the foreign request has the same ID but a distinct owner");
+        let foreign_cancellation = foreign_body.cancellation();
+        let cx = Cx::for_testing();
+        let pending_before = response_stream.pending_responses();
+        let retained_before = transport
+            .response_mailbox
+            .lock()
+            .expect("response mailbox is available")
+            .retained_bytes;
+
+        // Planted forbidden dimension: only the guard belongs to a different
+        // transport; the JSON-RPC ID and notification are otherwise valid.
+        assert!(matches!(
+            transport.send_notification_for_request(
+                &cx,
+                &foreign_cancellation,
+                JsonRpcRequest::notification("notifications/progress", None),
+            ),
+            Err(TransportError::Io(ref error)) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(response_stream.pending_responses(), pending_before);
+        assert_eq!(
+            transport
+                .response_mailbox
+                .lock()
+                .expect("response mailbox is available")
+                .retained_bytes,
+            retained_before,
+            "a foreign owner must not mutate the local response stream"
+        );
+        assert!(
+            request_body
+                .pop_message()
+                .expect("the local body remains readable")
+                .is_none()
+        );
+        local_cancellation
+            .checkpoint(&cx)
+            .expect("the local body remains live after a foreign-owner rejection");
+    }
+
+    #[test]
+    fn streamable_http_notification_rejects_a_closed_request_body_without_mutation() {
+        let mut transport = StreamableHttpTransport::new();
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let request_body = response_stream
+            .for_request(RequestId::Number(706))
+            .expect("the request body is registered");
+        let cancellation = request_body.cancellation();
+        let cx = Cx::for_testing();
+        transport
+            .send_notification_for_request(
+                &cx,
+                &cancellation,
+                JsonRpcRequest::notification("notifications/progress", None),
+            )
+            .expect("the live request body accepts its notification");
+        assert_eq!(response_stream.pending_responses(), 1);
+        assert!(
+            transport
+                .response_mailbox
+                .lock()
+                .expect("response mailbox is available")
+                .retained_bytes
+                > 0
+        );
+
+        // Planted forbidden dimension: only the request body is dropped before
+        // the otherwise identical notification commit.
+        drop(request_body);
+
+        assert_eq!(
+            response_stream.pending_responses(),
+            0,
+            "closing a request body releases its queued notifications"
+        );
+        assert_eq!(
+            transport
+                .response_mailbox
+                .lock()
+                .expect("response mailbox is available")
+                .retained_bytes,
+            0,
+            "closing a request body releases its notification byte reservation"
+        );
+
+        assert!(matches!(
+            transport.send_notification_for_request(
+                &cx,
+                &cancellation,
+                JsonRpcRequest::notification("notifications/progress", None),
+            ),
+            Err(TransportError::Cancelled)
+        ));
+        assert_eq!(response_stream.pending_responses(), 0);
+        assert_eq!(
+            transport
+                .response_mailbox
+                .lock()
+                .expect("response mailbox is available")
+                .retained_bytes,
+            0,
+            "a closed request body must not retain a notification"
+        );
+        assert!(!response_stream.is_closed());
+    }
+
+    #[test]
     fn streamable_http_request_response_body_disconnect_cancels_before_commit() {
         let mut transport = StreamableHttpTransport::new();
         let response_stream = transport
@@ -7197,12 +7715,35 @@ X-Checksum: abc123\r\n\
         );
         let cancellation = modern_sse.cancellation();
         session
+            .send_modern_sse_notification(
+                &cx,
+                &cancellation,
+                JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progress": 50})),
+                ),
+            )
+            .expect("the request-owned modern notification is committed before the response");
+        session
             .send_modern_sse_response(
                 &cx,
                 &cancellation,
                 JsonRpcResponse::success(RequestId::Number(91), serde_json::json!({"ok": true})),
             )
             .expect("the bound modern SSE response is committed through its guard");
+        let notification_event = modern_sse
+            .recv_event(&cx)
+            .expect("the request-owned notification renders as the first modern SSE event");
+        assert!(notification_event.id.is_none());
+        assert!(matches!(
+            codec
+                .decode_complete_message(notification_event.data.as_bytes())
+                .expect("modern SSE notification data remains JSON-RPC"),
+            JsonRpcMessage::Request(notification)
+                if notification.is_notification()
+                    && notification.method == "notifications/progress"
+                    && notification.params == Some(serde_json::json!({"progress": 50}))
+        ));
         let modern_event = modern_sse
             .recv_event(&cx)
             .expect("the bound modern response renders as an SSE event");
