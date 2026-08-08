@@ -43,7 +43,7 @@ use std::io::{BufReader, Read, Write};
 use asupersync::Cx;
 use fastmcp_core::{WebSocketMask, draw_websocket_mask};
 
-use crate::{Codec, Transport, TransportError};
+use crate::{Codec, Transport, TransportError, TransportRecvHalf, TransportSendHalf};
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 
 /// WebSocket frame types.
@@ -491,6 +491,43 @@ impl<R: Read, W: Write> WsTransport<R, W> {
         }
     }
 
+    /// Separates server-side WebSocket ingress from egress.
+    ///
+    /// The returned halves retain the server wire direction: incoming frames
+    /// must be masked and outgoing frames are unmasked. The receive half holds
+    /// a shared control-frame writer solely for RFC 6455 ping/pong and close
+    /// handshakes; application messages remain exclusively owned by the send
+    /// half.
+    #[must_use]
+    pub fn into_split(self) -> (WsServerRecvHalf<R, W>, WsServerSendHalf<W>) {
+        let Self {
+            reader,
+            writer,
+            codec: _,
+            fragment_buffer,
+            fragmented_text,
+            max_message_size,
+            closed,
+        } = self;
+        let writer = SharedWsWriter::new(writer, closed);
+
+        (
+            WsServerRecvHalf {
+                reader,
+                writer: writer.clone(),
+                codec: Codec::new(),
+                fragment_buffer,
+                fragmented_text,
+                max_message_size,
+                closed,
+            },
+            WsServerSendHalf {
+                writer,
+                codec: Codec::new(),
+            },
+        )
+    }
+
     /// Sends a JSON-RPC message over the WebSocket.
     ///
     /// # Cancel-Safety
@@ -889,6 +926,43 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
         }
     }
 
+    /// Separates client-side WebSocket ingress from egress.
+    ///
+    /// The returned halves retain the client wire direction: incoming frames
+    /// must be unmasked and outgoing frames are masked. The receive half holds
+    /// a shared control-frame writer solely for RFC 6455 ping/pong and close
+    /// handshakes; application messages remain exclusively owned by the send
+    /// half.
+    #[must_use]
+    pub fn into_split(self) -> (WsClientRecvHalf<R, W>, WsClientSendHalf<W>) {
+        let Self {
+            reader,
+            writer,
+            codec: _,
+            fragment_buffer,
+            fragmented_text,
+            max_message_size,
+            closed,
+        } = self;
+        let writer = SharedWsWriter::new(writer, closed);
+
+        (
+            WsClientRecvHalf {
+                reader,
+                writer: writer.clone(),
+                codec: Codec::new(),
+                fragment_buffer,
+                fragmented_text,
+                max_message_size,
+                closed,
+            },
+            WsClientSendHalf {
+                writer,
+                codec: Codec::new(),
+            },
+        )
+    }
+
     /// Sends a JSON-RPC message over the WebSocket.
     ///
     /// The frame will be masked as required for clients.
@@ -1125,10 +1199,356 @@ impl<R: Read, W: Write> Transport for WsClientTransport<R, W> {
     }
 }
 
+trait WsFrameSink {
+    fn write_ws_frame(&mut self, frame: &WsFrame) -> Result<(), TransportError>;
+}
+
+impl<W: Write> WsFrameSink for WsWriter<W> {
+    fn write_ws_frame(&mut self, frame: &WsFrame) -> Result<(), TransportError> {
+        self.write_frame(frame)
+    }
+}
+
+impl<W: Write> WsFrameSink for WsClientWriter<W> {
+    fn write_ws_frame(&mut self, frame: &WsFrame) -> Result<(), TransportError> {
+        self.write_frame(frame)
+    }
+}
+
+struct SplitWsWriter<F> {
+    writer: F,
+    closed: bool,
+}
+
+struct SharedWsWriter<F> {
+    inner: std::sync::Arc<std::sync::Mutex<SplitWsWriter<F>>>,
+}
+
+impl<F> Clone for SharedWsWriter<F> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: std::sync::Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<F> SharedWsWriter<F>
+where
+    F: WsFrameSink,
+{
+    fn new(writer: F, closed: bool) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(SplitWsWriter { writer, closed })),
+        }
+    }
+
+    fn with_writer<T>(
+        &self,
+        operation: impl FnOnce(&mut SplitWsWriter<F>) -> Result<T, TransportError>,
+    ) -> Result<T, TransportError> {
+        let mut writer = self.inner.lock().map_err(|_| {
+            TransportError::Io(std::io::Error::other("WebSocket split writer lock poisoned"))
+        })?;
+        operation(&mut writer)
+    }
+
+    fn is_closed(&self) -> Result<bool, TransportError> {
+        self.with_writer(|writer| Ok(writer.closed))
+    }
+
+    fn send_frame(&self, frame: &WsFrame) -> Result<(), TransportError> {
+        self.with_writer(|writer| {
+            if writer.closed {
+                return Err(TransportError::Closed);
+            }
+            if let Err(error) = writer.writer.write_ws_frame(frame) {
+                writer.closed = true;
+                return Err(error);
+            }
+            Ok(())
+        })
+    }
+
+    fn close_with_frame(&self, frame: WsFrame) -> Result<(), TransportError> {
+        self.with_writer(|writer| {
+            if writer.closed {
+                return Ok(());
+            }
+            writer.closed = true;
+            writer.writer.write_ws_frame(&frame)
+        })
+    }
+
+    fn terminate(&self) {
+        if let Ok(mut writer) = self.inner.lock() {
+            writer.closed = true;
+        }
+    }
+}
+
+fn send_split_message<F>(
+    writer: &SharedWsWriter<F>,
+    codec: &Codec,
+    cx: &Cx,
+    message: &JsonRpcMessage,
+) -> Result<(), TransportError>
+where
+    F: WsFrameSink,
+{
+    if writer.is_closed()? {
+        return Err(TransportError::Closed);
+    }
+    if cx.is_cancel_requested() {
+        return Err(TransportError::Cancelled);
+    }
+
+    let bytes = match message {
+        JsonRpcMessage::Request(request) => codec.encode_request(request)?,
+        JsonRpcMessage::Response(response) => codec.encode_response(response)?,
+    };
+    let text = String::from_utf8(bytes).map_err(|error| {
+        websocket_invalid_data(format!("Invalid UTF-8 in message: {error}"))
+    })?;
+    writer.send_frame(&WsFrame::text(text.trim_end()))
+}
+
+fn terminate_split_receive<F>(
+    writer: &SharedWsWriter<F>,
+    fragment_buffer: &mut Vec<u8>,
+    fragmented_text: &mut bool,
+    closed: &mut bool,
+) where
+    F: WsFrameSink,
+{
+    *closed = true;
+    fragment_buffer.clear();
+    *fragmented_text = false;
+    writer.terminate();
+}
+
+fn recv_split_message<R, F>(
+    reader: &mut WsReader<R>,
+    writer: &SharedWsWriter<F>,
+    codec: &Codec,
+    fragment_buffer: &mut Vec<u8>,
+    fragmented_text: &mut bool,
+    max_message_size: usize,
+    closed: &mut bool,
+    cx: &Cx,
+) -> Result<JsonRpcMessage, TransportError>
+where
+    R: Read,
+    F: WsFrameSink,
+{
+    loop {
+        if *closed || writer.is_closed()? {
+            return Err(TransportError::Closed);
+        }
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+
+        let frame = match reader.read_frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                terminate_split_receive(writer, fragment_buffer, fragmented_text, closed);
+                return Err(error);
+            }
+        };
+
+        match frame.frame_type {
+            WsFrameType::Text => {
+                if *fragmented_text {
+                    terminate_split_receive(writer, fragment_buffer, fragmented_text, closed);
+                    return Err(websocket_invalid_data(
+                        "Received Text frame while inside fragmented message",
+                    ));
+                }
+                if frame.fin {
+                    if let Err(error) = std::str::from_utf8(&frame.payload) {
+                        *closed = true;
+                        fragment_buffer.clear();
+                        *fragmented_text = false;
+                        let _close_result = writer.close_with_frame(invalid_utf8_close_frame());
+                        return Err(websocket_invalid_data(format!(
+                            "Invalid UTF-8 in WebSocket text message: {error}"
+                        )));
+                    }
+                    return codec.decode_complete_message(&frame.payload).map_err(Into::into);
+                }
+
+                *fragmented_text = true;
+                let next_len = fragment_buffer.len().saturating_add(frame.payload.len());
+                if next_len > max_message_size {
+                    terminate_split_receive(writer, fragment_buffer, fragmented_text, closed);
+                    return Err(websocket_invalid_data(
+                        "Fragmented message exceeds size limit",
+                    ));
+                }
+                fragment_buffer.extend(frame.payload);
+            }
+            WsFrameType::Continuation => {
+                if !*fragmented_text {
+                    terminate_split_receive(writer, fragment_buffer, fragmented_text, closed);
+                    return Err(websocket_invalid_data(
+                        "Received Continuation frame without start frame",
+                    ));
+                }
+
+                let next_len = fragment_buffer.len().saturating_add(frame.payload.len());
+                if next_len > max_message_size {
+                    terminate_split_receive(writer, fragment_buffer, fragmented_text, closed);
+                    return Err(websocket_invalid_data(
+                        "Fragmented message exceeds size limit",
+                    ));
+                }
+                fragment_buffer.extend(frame.payload);
+                if frame.fin {
+                    let payload = std::mem::take(fragment_buffer);
+                    *fragmented_text = false;
+                    if let Err(error) = std::str::from_utf8(&payload) {
+                        *closed = true;
+                        fragment_buffer.clear();
+                        *fragmented_text = false;
+                        let _close_result = writer.close_with_frame(invalid_utf8_close_frame());
+                        return Err(websocket_invalid_data(format!(
+                            "Invalid UTF-8 in WebSocket text message: {error}"
+                        )));
+                    }
+                    return codec.decode_complete_message(&payload).map_err(Into::into);
+                }
+            }
+            WsFrameType::Binary => {
+                terminate_split_receive(writer, fragment_buffer, fragmented_text, closed);
+                return Err(websocket_invalid_data(
+                    "Binary WebSocket messages are not supported by MCP",
+                ));
+            }
+            WsFrameType::Close => {
+                *closed = true;
+                fragment_buffer.clear();
+                *fragmented_text = false;
+                writer.close_with_frame(WsFrame {
+                    frame_type: WsFrameType::Close,
+                    payload: frame.payload,
+                    fin: true,
+                })?;
+                return Err(TransportError::Closed);
+            }
+            WsFrameType::Ping => {
+                if let Err(error) = writer.send_frame(&WsFrame::pong(frame.payload)) {
+                    terminate_split_receive(writer, fragment_buffer, fragmented_text, closed);
+                    return Err(error);
+                }
+            }
+            WsFrameType::Pong => {}
+        }
+    }
+}
+
+/// Independently owned server-side WebSocket ingress.
+pub struct WsServerRecvHalf<R, W> {
+    reader: WsReader<R>,
+    writer: SharedWsWriter<WsWriter<W>>,
+    codec: Codec,
+    fragment_buffer: Vec<u8>,
+    fragmented_text: bool,
+    max_message_size: usize,
+    closed: bool,
+}
+
+impl<R: Read, W: Write> TransportRecvHalf for WsServerRecvHalf<R, W> {
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        recv_split_message(
+            &mut self.reader,
+            &self.writer,
+            &self.codec,
+            &mut self.fragment_buffer,
+            &mut self.fragmented_text,
+            self.max_message_size,
+            &mut self.closed,
+            cx,
+        )
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.closed = true;
+        self.fragment_buffer.clear();
+        self.fragmented_text = false;
+        self.writer.close_with_frame(WsFrame::close())
+    }
+}
+
+/// Independently owned server-side WebSocket egress.
+pub struct WsServerSendHalf<W> {
+    writer: SharedWsWriter<WsWriter<W>>,
+    codec: Codec,
+}
+
+impl<W: Write + Send> TransportSendHalf for WsServerSendHalf<W> {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        send_split_message(&self.writer, &self.codec, cx, message)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.writer.close_with_frame(WsFrame::close())
+    }
+}
+
+/// Independently owned client-side WebSocket ingress.
+pub struct WsClientRecvHalf<R, W> {
+    reader: WsReader<R>,
+    writer: SharedWsWriter<WsClientWriter<W>>,
+    codec: Codec,
+    fragment_buffer: Vec<u8>,
+    fragmented_text: bool,
+    max_message_size: usize,
+    closed: bool,
+}
+
+impl<R: Read, W: Write> TransportRecvHalf for WsClientRecvHalf<R, W> {
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        recv_split_message(
+            &mut self.reader,
+            &self.writer,
+            &self.codec,
+            &mut self.fragment_buffer,
+            &mut self.fragmented_text,
+            self.max_message_size,
+            &mut self.closed,
+            cx,
+        )
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.closed = true;
+        self.fragment_buffer.clear();
+        self.fragmented_text = false;
+        self.writer.close_with_frame(WsFrame::close())
+    }
+}
+
+/// Independently owned client-side WebSocket egress.
+pub struct WsClientSendHalf<W> {
+    writer: SharedWsWriter<WsClientWriter<W>>,
+    codec: Codec,
+}
+
+impl<W: Write + Send> TransportSendHalf for WsClientSendHalf<W> {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        send_split_message(&self.writer, &self.codec, cx, message)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.writer.close_with_frame(WsFrame::close())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::CodecError;
+    use fastmcp_protocol::RequestId;
     use std::io::Cursor;
 
     #[test]
@@ -1736,6 +2156,114 @@ mod tests {
             panic!("expected request");
         };
         assert_eq!(request.method, "empty-first");
+    }
+
+    #[test]
+    fn websocket_split_halves_preserve_full_duplex_server_and_client_directions() {
+        let cx = Cx::for_testing();
+        let server_request = br#"{"jsonrpc":"2.0","method":"server/split","id":7}"#;
+        let (mut server_recv, mut server_send) = WsTransport::new(
+            Cursor::new(build_masked_frame(0x01, true, server_request)),
+            Vec::new(),
+        )
+        .into_split();
+
+        let JsonRpcMessage::Request(request) = server_recv.recv(&cx).expect("server split receive") else {
+            panic!("server split must preserve a client request");
+        };
+        assert_eq!(request.method, "server/split");
+        server_send
+            .send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    RequestId::Number(7),
+                    serde_json::json!({"server": true}),
+                )),
+            )
+            .expect("server split response");
+        server_send.close().expect("server split close");
+
+        let server_output = server_send
+            .writer
+            .inner
+            .lock()
+            .expect("server split writer lock")
+            .writer
+            .writer
+            .clone();
+        let mut client_reader = WsReader::new_client(Cursor::new(server_output));
+        let response = client_reader.read_frame().expect("unmasked server response");
+        assert_eq!(response.frame_type, WsFrameType::Text);
+        assert_eq!(
+            client_reader.read_frame().expect("server close").frame_type,
+            WsFrameType::Close
+        );
+
+        let client_response = br#"{"jsonrpc":"2.0","id":8,"result":{"client":true}}"#;
+        let (mut client_recv, mut client_send) = WsClientTransport::new(
+            Cursor::new(build_unmasked_frame(0x01, true, client_response)),
+            Vec::new(),
+        )
+        .into_split();
+
+        let JsonRpcMessage::Response(response) = client_recv.recv(&cx).expect("client split receive") else {
+            panic!("client split must preserve a server response");
+        };
+        assert_eq!(response.id, RequestId::Number(8));
+        client_send
+            .send(
+                &cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::new("client/split", None, 8_i64)),
+            )
+            .expect("client split request");
+        client_send.close().expect("client split close");
+
+        let client_output = client_send
+            .writer
+            .inner
+            .lock()
+            .expect("client split writer lock")
+            .writer
+            .writer
+            .clone();
+        let mut server_reader = WsReader::new(Cursor::new(client_output));
+        let request = server_reader.read_frame().expect("masked client request");
+        assert_eq!(request.frame_type, WsFrameType::Text);
+        assert_eq!(
+            server_reader.read_frame().expect("client close").frame_type,
+            WsFrameType::Close
+        );
+    }
+
+    #[test]
+    fn websocket_server_split_rejects_unmasked_client_frame_without_control_write() {
+        let request = br#"{"jsonrpc":"2.0","method":"server/split","id":7}"#;
+        let (mut recv_half, mut send_half) = WsTransport::new(
+            Cursor::new(build_unmasked_frame(0x01, true, request)),
+            Vec::new(),
+        )
+        .into_split();
+
+        let error = recv_half.recv(&Cx::for_testing()).unwrap_err();
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source) if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert!(matches!(
+            send_half.send(
+                &Cx::for_testing(),
+                &JsonRpcMessage::Request(JsonRpcRequest::new("client/split", None, 8_i64)),
+            ),
+            Err(TransportError::Closed)
+        ));
+        assert!(send_half
+            .writer
+            .inner
+            .lock()
+            .expect("server split writer lock")
+            .writer
+            .writer
+            .is_empty());
     }
 
     #[test]
