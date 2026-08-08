@@ -117,17 +117,17 @@ use fastmcp_protocol::tasks_extension::{
 };
 use fastmcp_protocol::{
     CallToolParams, CancelTaskParams, CancelTaskResult, CancelledParams, ClientCapabilities,
-    ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey, FINAL_SUBSCRIPTION_ID_META_KEY,
-    FinalLogMessageParams, FinalProgressNotificationParams, FinalRequestMeta,
-    FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams, GetTaskParams,
-    GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION, JsonRpcError,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyPromptMessage,
-    LegacyResourceContent, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
-    ListTasksParams, ListTasksResult, ListToolsParams, LogLevel, LogMessageParams,
-    PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, ReadResourceParams, RequestId,
-    RequestMeta, Resource, ResourceTemplate, ServerCapabilities, ServerInfo, ServerNotification,
-    SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo, TaskResult,
-    TaskStatus, Tool, ToolAnnotations,
+    ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalLogMessageParams, FinalProgressNotificationParams,
+    FinalRequestMeta, FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams,
+    GetTaskParams, GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION,
+    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent,
+    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListResourceTemplatesParams,
+    ListResourcesParams, ListTasksParams, ListTasksResult, ListToolsParams, LogLevel,
+    LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, ReadResourceParams,
+    RequestId, RequestMeta, Resource, ResourceTemplate, ServerCapabilities, ServerInfo,
+    ServerNotification, SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo,
+    TaskResult, TaskStatus, Tool, ToolAnnotations,
 };
 use fastmcp_protocol::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionDirection, ExtensionSettings,
