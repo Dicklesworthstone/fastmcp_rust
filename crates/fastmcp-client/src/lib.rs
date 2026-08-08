@@ -2816,6 +2816,7 @@ impl Client {
         };
 
         // Update session with server response
+        let init_protocol_version = init_result.protocol_version.clone();
         let protocol_plan = client.session.protocol_plan().clone();
         client.session = ClientSession::new(
             client.session.client_info().clone(),
@@ -2827,7 +2828,7 @@ impl Client {
         .with_protocol_plan(protocol_plan);
 
         // Send the spec-correct `notifications/initialized` lifecycle notification.
-        if init_result.protocol_version == PROTOCOL_VERSION
+        if init_protocol_version == PROTOCOL_VERSION
             && let Err(error) = client.send_initialized_notification()
         {
             let cleanup = client.close();
@@ -2989,6 +2990,7 @@ impl Client {
         };
 
         // Update session with server response
+        let init_protocol_version = init_result.protocol_version.clone();
         let protocol_plan = self.session.protocol_plan().clone();
         self.session = ClientSession::new(
             self.session.client_info().clone(),
@@ -3001,7 +3003,7 @@ impl Client {
 
         // Exact 2024-11-05 transitions require the lifecycle acknowledgement.
         // Modern discovery has no corresponding initialized notification.
-        if init_result.protocol_version == PROTOCOL_VERSION
+        if init_protocol_version == PROTOCOL_VERSION
             && let Err(error) = self.send_initialized_notification()
         {
             return Err(self.record_initialization_failure(error));
@@ -8205,7 +8207,8 @@ mod tests {
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
             Cx::for_request(),
         )
-        .expect_err("modern-only must reject a legacy-only discovery success");
+        .err()
+        .expect("modern-only must reject a legacy-only discovery success");
 
         assert_eq!(error.code, McpErrorCode::InternalError);
     }
@@ -8247,7 +8250,8 @@ mod tests {
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
             Cx::for_request(),
         )
-        .expect_err("auto must not downgrade from a malformed modern discovery result");
+        .err()
+        .expect("auto must not downgrade from a malformed modern discovery result");
 
         assert_eq!(error.code, McpErrorCode::InternalError);
     }
@@ -8286,7 +8290,8 @@ mod tests {
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
             Cx::for_request(),
         )
-        .expect_err("modern-only must reject a legacy-only peer before initialization");
+        .err()
+        .expect("modern-only must reject a legacy-only peer before initialization");
 
         assert_eq!(error.code, McpErrorCode::InternalError);
     }
