@@ -1593,7 +1593,7 @@ id = "SURF-WORKFLOW-ACTION-IDENTITIES"
 path = ".github/workflows/ci.yml|.github/workflows/release.yml"
 scope = "all-uses-sites"
 match_kind = "workflow-action-identity-closure"
-pattern = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1|8|3;dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c|8|2;Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32|7|2;actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a|3|1;actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c|0|1;taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf|2|0;softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65|0|1"
+pattern = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1|8|3;dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c|8|2;Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32|7|2;actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a|3|1;actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c|0|1;taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed|2|0;softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65|0|1"
 expected_count = 38
 reason = "every action use is one approved owner/repository at one exact immutable commit with the closed per-workflow multiplicity"
 
