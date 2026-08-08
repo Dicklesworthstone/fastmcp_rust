@@ -826,11 +826,7 @@ pub trait ResourceHandler: Send + Sync {
         uri: &str,
         params: &UriParams,
     ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
-        if params.is_empty() {
-            self.read_final(ctx)
-        } else {
-            promote_legacy_resource_contents(self.read_with_uri(ctx, uri, params)?)
-        }
+        promote_legacy_resource_contents(self.read_with_uri(ctx, uri, params)?)
     }
 
     /// Asynchronously reads the resource through the final result surface.
@@ -2142,6 +2138,50 @@ mod tests {
         ));
         assert_eq!(final_result.payload.ttl_ms, DEFAULT_FINAL_RESOURCE_TTL_MS);
         assert_eq!(final_result.payload.cache_scope, CacheScope::Private);
+    }
+
+    #[test]
+    fn final_resource_default_preserves_uri_without_template_params() {
+        struct UriAwareResource;
+
+        impl ResourceHandler for UriAwareResource {
+            fn definition(&self) -> Resource {
+                StubResource.definition()
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Err(McpError::internal_error(
+                    "final URI dispatch must not fall back to read",
+                ))
+            }
+
+            fn read_with_uri(
+                &self,
+                _ctx: &McpContext,
+                uri: &str,
+                _params: &UriParams,
+            ) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![ResourceContent {
+                    uri: uri.to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    text: Some("matched URI".to_owned()),
+                    blob: None,
+                }])
+            }
+        }
+
+        let resource = UriAwareResource;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = resource
+            .read_final_with_uri(&ctx, "file:///requested", &UriParams::new())
+            .expect("final resource dispatch preserves its URI without template parameters");
+
+        assert!(matches!(
+            result.payload.contents.as_slice(),
+            [EmbeddedResourceContents::Text { uri, text, .. }]
+                if uri.as_str() == "file:///requested" && text == "matched URI"
+        ));
     }
 
     // ── Minimal PromptHandler impl for testing ───────────────────────

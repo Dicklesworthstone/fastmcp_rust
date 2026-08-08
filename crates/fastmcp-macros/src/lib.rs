@@ -1320,17 +1320,31 @@ fn generate_prompt_execution_methods(
                 }
             }
         });
-        return quote! {
-            fn get(
-                &self,
-                ctx: &fastmcp_core::McpContext,
-                arguments: std::collections::HashMap<String, String>,
-            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::PromptMessage>> {
-                #(#param_extractions)*
-                let result = #sync_invocation;
-                #result_conversion
+        let legacy_methods = if final_result_conversion.is_some() {
+            quote! {
+                fn get(
+                    &self,
+                    _ctx: &fastmcp_core::McpContext,
+                    _arguments: std::collections::HashMap<String, String>,
+                ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+                    #result_conversion
+                }
             }
-
+        } else {
+            quote! {
+                fn get(
+                    &self,
+                    ctx: &fastmcp_core::McpContext,
+                    arguments: std::collections::HashMap<String, String>,
+                ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+                    #(#param_extractions)*
+                    let result = #sync_invocation;
+                    #result_conversion
+                }
+            }
+        };
+        return quote! {
+            #legacy_methods
             #final_method
         };
     }
@@ -1371,41 +1385,56 @@ fn generate_prompt_execution_methods(
         }
     });
 
+    let legacy_methods = if final_result_conversion.is_some() {
+        quote! {
+            fn get(
+                &self,
+                _ctx: &fastmcp_core::McpContext,
+                _arguments: std::collections::HashMap<String, String>,
+            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+                #result_conversion
+            }
+        }
+    } else {
+        quote! {
+            fn get(
+                &self,
+                _ctx: &fastmcp_core::McpContext,
+                _arguments: std::collections::HashMap<String, String>,
+            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+                Err(fastmcp_core::McpError::internal_error(
+                    "async #[prompt] handlers must be invoked through PromptHandler::get_async",
+                ))
+            }
+
+            fn get_async<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                arguments: std::collections::HashMap<String, String>,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<Vec<fastmcp_protocol::PromptMessage>>,
+            > {
+                Box::pin(async move {
+                    let result: fastmcp_core::McpResult<
+                        Vec<fastmcp_protocol::PromptMessage>,
+                    > = async move {
+                        #(#param_extractions)*
+                        let result = #async_invocation;
+                        #result_conversion
+                    }.await;
+
+                    match result {
+                        Ok(value) => fastmcp_core::Outcome::Ok(value),
+                        Err(error) => fastmcp_core::Outcome::Err(error),
+                    }
+                })
+            }
+        }
+    };
+
     quote! {
-        fn get(
-            &self,
-            _ctx: &fastmcp_core::McpContext,
-            _arguments: std::collections::HashMap<String, String>,
-        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::PromptMessage>> {
-            Err(fastmcp_core::McpError::internal_error(
-                "async #[prompt] handlers must be invoked through PromptHandler::get_async",
-            ))
-        }
-
-        fn get_async<'a>(
-            &'a self,
-            ctx: &'a fastmcp_core::McpContext,
-            arguments: std::collections::HashMap<String, String>,
-        ) -> fastmcp_server::BoxFuture<
-            'a,
-            fastmcp_core::McpOutcome<Vec<fastmcp_protocol::PromptMessage>>,
-        > {
-            Box::pin(async move {
-                let result: fastmcp_core::McpResult<
-                    Vec<fastmcp_protocol::PromptMessage>,
-                > = async move {
-                    #(#param_extractions)*
-                    let result = #async_invocation;
-                    #result_conversion
-                }.await;
-
-                match result {
-                    Ok(value) => fastmcp_core::Outcome::Ok(value),
-                    Err(error) => fastmcp_core::Outcome::Err(error),
-                }
-            })
-        }
-
+        #legacy_methods
         #final_method
     }
 }
@@ -1641,43 +1670,56 @@ fn generate_resource_execution_methods(
                 }
             }
         });
+        let legacy_methods = if final_result_conversion.is_some() {
+            quote! {
+                fn read(
+                    &self,
+                    _ctx: &fastmcp_core::McpContext,
+                ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                    #result_conversion
+                }
+            }
+        } else {
+            quote! {
+                fn read(
+                    &self,
+                    ctx: &fastmcp_core::McpContext,
+                ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                    let uri_params = std::collections::HashMap::new();
+                    self.read_with_uri(ctx, #uri, &uri_params)
+                }
+
+                fn read_with_uri(
+                    &self,
+                    ctx: &fastmcp_core::McpContext,
+                    uri: &str,
+                    uri_params: &std::collections::HashMap<String, String>,
+                ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                    #(#param_extractions)*
+                    let result = #fn_name(#call_args);
+                    #result_conversion
+                }
+
+                fn read_async_with_uri<'a>(
+                    &'a self,
+                    ctx: &'a fastmcp_core::McpContext,
+                    uri: &'a str,
+                    uri_params: &'a std::collections::HashMap<String, String>,
+                ) -> fastmcp_server::BoxFuture<
+                    'a,
+                    fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
+                > {
+                    Box::pin(async move {
+                        match self.read_with_uri(ctx, uri, uri_params) {
+                            Ok(value) => fastmcp_core::Outcome::Ok(value),
+                            Err(error) => fastmcp_core::Outcome::Err(error),
+                        }
+                    })
+                }
+            }
+        };
         return quote! {
-            fn read(
-                &self,
-                ctx: &fastmcp_core::McpContext,
-            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
-                let uri_params = std::collections::HashMap::new();
-                self.read_with_uri(ctx, #uri, &uri_params)
-            }
-
-            fn read_with_uri(
-                &self,
-                ctx: &fastmcp_core::McpContext,
-                uri: &str,
-                uri_params: &std::collections::HashMap<String, String>,
-            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
-                #(#param_extractions)*
-                let result = #fn_name(#call_args);
-                #result_conversion
-            }
-
-            fn read_async_with_uri<'a>(
-                &'a self,
-                ctx: &'a fastmcp_core::McpContext,
-                uri: &'a str,
-                uri_params: &'a std::collections::HashMap<String, String>,
-            ) -> fastmcp_server::BoxFuture<
-                'a,
-                fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
-            > {
-                Box::pin(async move {
-                    match self.read_with_uri(ctx, uri, uri_params) {
-                        Ok(value) => fastmcp_core::Outcome::Ok(value),
-                        Err(error) => fastmcp_core::Outcome::Err(error),
-                    }
-                })
-            }
-
+            #legacy_methods
             #final_method
         };
     }
@@ -1728,54 +1770,68 @@ fn generate_resource_execution_methods(
         }
     });
 
+    let legacy_methods = if final_result_conversion.is_some() {
+        quote! {
+            fn read(
+                &self,
+                _ctx: &fastmcp_core::McpContext,
+            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                #result_conversion
+            }
+        }
+    } else {
+        quote! {
+            fn read(
+                &self,
+                _ctx: &fastmcp_core::McpContext,
+            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                Err(fastmcp_core::McpError::internal_error(
+                    "async #[resource] handlers must be invoked through ResourceHandler::read_async",
+                ))
+            }
+
+            fn read_async_with_uri<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                uri: &'a str,
+                uri_params: &'a std::collections::HashMap<String, String>,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
+            > {
+                Box::pin(async move {
+                    let result: fastmcp_core::McpResult<
+                        Vec<fastmcp_protocol::ResourceContent>,
+                    > = async move {
+                        #(#param_extractions)*
+                        let result = #fn_name(#call_args).await;
+                        #result_conversion
+                    }.await;
+
+                    match result {
+                        Ok(value) => fastmcp_core::Outcome::Ok(value),
+                        Err(error) => fastmcp_core::Outcome::Err(error),
+                    }
+                })
+            }
+
+            fn read_async<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
+            > {
+                Box::pin(async move {
+                    let uri_params = std::collections::HashMap::new();
+                    self.read_async_with_uri(ctx, #uri, &uri_params).await
+                })
+            }
+        }
+    };
+
     quote! {
-        fn read(
-            &self,
-            _ctx: &fastmcp_core::McpContext,
-        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
-            Err(fastmcp_core::McpError::internal_error(
-                "async #[resource] handlers must be invoked through ResourceHandler::read_async",
-            ))
-        }
-
-        fn read_async_with_uri<'a>(
-            &'a self,
-            ctx: &'a fastmcp_core::McpContext,
-            uri: &'a str,
-            uri_params: &'a std::collections::HashMap<String, String>,
-        ) -> fastmcp_server::BoxFuture<
-            'a,
-            fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
-        > {
-            Box::pin(async move {
-                let result: fastmcp_core::McpResult<
-                    Vec<fastmcp_protocol::ResourceContent>,
-                > = async move {
-                    #(#param_extractions)*
-                    let result = #fn_name(#call_args).await;
-                    #result_conversion
-                }.await;
-
-                match result {
-                    Ok(value) => fastmcp_core::Outcome::Ok(value),
-                    Err(error) => fastmcp_core::Outcome::Err(error),
-                }
-            })
-        }
-
-        fn read_async<'a>(
-            &'a self,
-            ctx: &'a fastmcp_core::McpContext,
-        ) -> fastmcp_server::BoxFuture<
-            'a,
-            fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
-        > {
-            Box::pin(async move {
-                let uri_params = std::collections::HashMap::new();
-                self.read_async_with_uri(ctx, #uri, &uri_params).await
-            })
-        }
-
+        #legacy_methods
         #final_method
     }
 }
@@ -1949,6 +2005,12 @@ mod async_handler_expansion_tests {
     #[test]
     fn final_resource_and_prompt_hooks_preserve_final_result_algebras() {
         let resource_name = format_ident!("final_resource");
+        let resource_param_extractions = [quote! {
+            let segment: String = uri_params
+                .get("segment")
+                .expect("matched resource URI segment")
+                .clone();
+        }];
         let resource_output: syn::ReturnType = syn::parse_quote!(
             -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>
         );
@@ -1957,19 +2019,29 @@ mod async_handler_expansion_tests {
         let resource_tokens = generate_resource_execution_methods(
             false,
             &resource_name,
-            &quote! { ctx },
+            &quote! { ctx, segment },
             "example://resource",
-            &[],
+            &resource_param_extractions,
             &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
             Some(&resource_conversion),
         )
         .to_string();
-        let (_, resource_final_hook) = resource_tokens
+        let (resource_legacy_hook, resource_final_hook) = resource_tokens
             .split_once("fn read_final")
             .expect("final resource expansion has a direct final hook");
 
         assert_eq!(resource_conversion.to_string(), "Ok (result)");
+        assert!(
+            resource_legacy_hook.contains("legacy"),
+            "{resource_legacy_hook}"
+        );
+        assert!(
+            !resource_legacy_hook.contains("final_resource ("),
+            "a legacy projection must reject before evaluating the final resource: {resource_legacy_hook}"
+        );
         assert!(resource_final_hook.contains("FinalReadResourceResult"));
+        assert!(resource_final_hook.contains("uri_params . get"));
+        assert!(resource_final_hook.contains("segment"));
         assert!(resource_final_hook.contains("Ok (result)"));
         assert!(!resource_final_hook.contains("payload"));
         assert!(!resource_final_hook.contains("contents . into_iter"));
@@ -1977,9 +2049,9 @@ mod async_handler_expansion_tests {
         let resource_async_tokens = generate_resource_execution_methods(
             true,
             &resource_name,
-            &quote! { ctx },
+            &quote! { ctx, segment },
             "example://resource",
-            &[],
+            &resource_param_extractions,
             &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
             Some(&resource_conversion),
         );
@@ -1988,13 +2060,27 @@ mod async_handler_expansion_tests {
             "fn read_final_async_with_uri",
         );
         let resource_async_expansion = resource_async_tokens.to_string();
-        let (_, resource_final_async_hook) = resource_async_expansion
+        let (resource_legacy_async_hook, resource_final_async_hook) = resource_async_expansion
             .split_once("fn read_final_async_with_uri")
             .expect("async final resource expansion has a direct final hook");
+        assert!(
+            !resource_legacy_async_hook.contains("final_resource ("),
+            "a legacy projection must reject before awaiting the final resource: {resource_legacy_async_hook}"
+        );
         assert!(resource_final_async_hook.contains("Ok (result)"));
+        assert!(resource_final_async_hook.contains("uri_params . get"));
+        assert!(resource_final_async_hook.contains("segment"));
         assert!(!resource_final_async_hook.contains("payload"));
 
         let prompt_name = format_ident!("final_prompt");
+        let prompt_param = format_ident!("topic");
+        let prompt_params = [prompt_param];
+        let prompt_param_extractions = [quote! {
+            let topic: String = arguments
+                .get("topic")
+                .expect("prompt argument")
+                .clone();
+        }];
         let prompt_output: syn::ReturnType = syn::parse_quote!(
             -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalGetPromptResult>
         );
@@ -2004,18 +2090,28 @@ mod async_handler_expansion_tests {
             false,
             false,
             &prompt_name,
-            &[],
-            &[],
+            &prompt_params,
+            &prompt_param_extractions,
             &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
             Some(&prompt_conversion),
         )
         .to_string();
-        let (_, prompt_final_hook) = prompt_tokens
+        let (prompt_legacy_hook, prompt_final_hook) = prompt_tokens
             .split_once("fn get_final")
             .expect("final prompt expansion has a direct final hook");
 
         assert_eq!(prompt_conversion.to_string(), "Ok (result)");
+        assert!(
+            prompt_legacy_hook.contains("legacy"),
+            "{prompt_legacy_hook}"
+        );
+        assert!(
+            !prompt_legacy_hook.contains("final_prompt ("),
+            "a legacy projection must reject before evaluating the final prompt: {prompt_legacy_hook}"
+        );
         assert!(prompt_final_hook.contains("FinalGetPromptResult"));
+        assert!(prompt_final_hook.contains("arguments . get"));
+        assert!(prompt_final_hook.contains("topic"));
         assert!(prompt_final_hook.contains("Ok (result)"));
         assert!(!prompt_final_hook.contains("payload"));
         assert!(!prompt_final_hook.contains("messages . into_iter"));
@@ -2024,17 +2120,23 @@ mod async_handler_expansion_tests {
             true,
             false,
             &prompt_name,
-            &[],
-            &[],
+            &prompt_params,
+            &prompt_param_extractions,
             &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
             Some(&prompt_conversion),
         );
         assert_direct_async_expansion(prompt_async_tokens.clone(), "fn get_final_async");
         let prompt_async_expansion = prompt_async_tokens.to_string();
-        let (_, prompt_final_async_hook) = prompt_async_expansion
+        let (prompt_legacy_async_hook, prompt_final_async_hook) = prompt_async_expansion
             .split_once("fn get_final_async")
             .expect("async final prompt expansion has a direct final hook");
+        assert!(
+            !prompt_legacy_async_hook.contains("final_prompt ("),
+            "a legacy projection must reject before awaiting the final prompt: {prompt_legacy_async_hook}"
+        );
         assert!(prompt_final_async_hook.contains("Ok (result)"));
+        assert!(prompt_final_async_hook.contains("arguments . get"));
+        assert!(prompt_final_async_hook.contains("topic"));
         assert!(!prompt_final_async_hook.contains("payload"));
     }
 
