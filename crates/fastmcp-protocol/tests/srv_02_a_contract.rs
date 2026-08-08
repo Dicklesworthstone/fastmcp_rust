@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use fastmcp_protocol::{
-    DiscoveryCacheHints, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
-    ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
-    ServerDiscoverResult, ServerInfo, ServerInstructions,
+    DiscoveryCacheHints, ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities,
+    ServerDiscoverRequest, ServerDiscoverResult, ServerInfo, ServerInstructions,
+    SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[test]
 fn srv_02_a_positive() {
@@ -41,7 +41,16 @@ fn srv_02_a_positive() {
     let wire = serde_json::to_value(&result).expect("result encodes");
 
     assert_eq!(SERVER_DISCOVER_METHOD, "server/discover");
-    assert_eq!(request, json!({}));
+    assert_eq!(
+        request,
+        json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })
+    );
+    assert_eq!(wire["resultType"], json!("complete"));
     assert_eq!(
         wire["supportedVersions"],
         json!(SERVER_DISCOVER_SUPPORTED_VERSIONS)
@@ -66,6 +75,20 @@ fn srv_02_a_positive() {
         u64::MAX,
         "the typed cache-hint field admits its complete nonnegative wire domain"
     );
+
+    let mut multi_version_peer = wire;
+    multi_version_peer["supportedVersions"] = json!(["2024-11-05", "2026-07-28"]);
+    let decoded: ServerDiscoverResult = serde_json::from_value(multi_version_peer)
+        .expect("final discovery accepts every schema-valid string version array");
+    assert_eq!(
+        decoded
+            .supported_versions()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["2024-11-05", "2026-07-28"],
+        "version selection remains the negotiation layer's responsibility"
+    );
 }
 
 #[test]
@@ -86,13 +109,13 @@ fn srv_02_a_planted_negative() {
     );
     let unchanged_before = serde_json::to_vec(&admitted).expect("admitted state encodes");
     let mut planted: Value = serde_json::to_value(&admitted).expect("baseline result encodes");
-    planted["supportedVersions"] = json!(["2024-11-05"]);
+    planted["resultType"] = json!("input_required");
 
     let rejection = serde_json::from_value::<ServerDiscoverResult>(planted);
 
     assert!(
         rejection.is_err(),
-        "only the forbidden version field changed"
+        "only the incompatible result-type field changed"
     );
     assert_eq!(
         serde_json::to_vec(&admitted).expect("admitted state still encodes"),
