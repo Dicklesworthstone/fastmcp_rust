@@ -45,6 +45,7 @@ pub mod http_executor;
 pub mod mcp_config;
 mod negotiation;
 mod session;
+pub mod sse;
 
 pub use builder::ClientBuilder;
 pub use execution::{
