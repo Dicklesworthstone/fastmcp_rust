@@ -1613,6 +1613,7 @@ mod async_handler_expansion_tests {
         found_crate_path, generate_final_tool_payload_projection,
         generate_final_tool_result_conversion, generate_prompt_execution_methods,
         generate_resource_execution_methods, generate_tool_execution_methods,
+        validate_final_handler_return,
     };
     use proc_macro_crate::FoundCrate;
     use quote::{format_ident, quote};
@@ -1689,6 +1690,7 @@ mod async_handler_expansion_tests {
 
         assert!(tokens.contains("fn call"), "{tokens}");
         assert!(!tokens.contains("fn call_async"), "{tokens}");
+        assert!(!tokens.contains("fn call_final"), "{tokens}");
         assert!(!tokens.contains(". await"), "{tokens}");
     }
 
@@ -1714,6 +1716,81 @@ mod async_handler_expansion_tests {
         assert!(tokens.contains("fn call_final"), "{tokens}");
         assert!(tokens.contains("FinalCallToolResult"), "{tokens}");
         assert!(!tokens.contains("result . payload"), "{tokens}");
+    }
+
+    #[test]
+    fn final_tool_hook_preserves_complete_result_metadata_and_open_fields() {
+        let fn_name = format_ident!("final_tool");
+        let output: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>
+        );
+        let final_conversion = generate_final_tool_result_conversion(&output)
+            .expect("the complete final tool result selects the final hook");
+        let legacy_conversion = generate_final_tool_payload_projection(quote! { result.payload });
+        let tokens = generate_tool_execution_methods(
+            false,
+            false,
+            &fn_name,
+            &[],
+            &[],
+            &legacy_conversion,
+            Some(&final_conversion),
+        )
+        .to_string();
+        let (_, final_hook) = tokens
+            .split_once("fn call_final")
+            .expect("final tool expansion has a direct final hook");
+
+        assert_eq!(final_conversion.to_string(), "Ok (result)");
+        assert!(final_hook.contains("CompleteResult"), "{final_hook}");
+        assert!(final_hook.contains("FinalCallToolResult"), "{final_hook}");
+        assert!(final_hook.contains("Ok (result)"), "{final_hook}");
+        assert!(!final_hook.contains("payload"), "{final_hook}");
+        assert!(!final_hook.contains("content . into_iter"), "{final_hook}");
+
+        let async_tokens = generate_tool_execution_methods(
+            true,
+            false,
+            &fn_name,
+            &[],
+            &[],
+            &legacy_conversion,
+            Some(&final_conversion),
+        );
+        assert_direct_async_expansion(async_tokens.clone(), "fn call_final_async");
+        let async_expansion = async_tokens.to_string();
+        let (_, final_async_hook) = async_expansion
+            .split_once("fn call_final_async")
+            .expect("async final tool expansion has a direct final hook");
+        assert!(
+            final_async_hook.contains("Ok (result)"),
+            "{final_async_hook}"
+        );
+        assert!(!final_async_hook.contains("payload"), "{final_async_hook}");
+    }
+
+    #[test]
+    fn final_tool_signature_rejects_legacy_payload_with_one_type_change() {
+        let accepted: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>
+        );
+        let rejected: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::CallToolResult>
+        );
+
+        assert!(validate_final_handler_return(
+            &accepted,
+            "tool",
+            "FinalCallToolResult",
+            "Vec<Content>",
+        )
+        .is_ok());
+        let error =
+            validate_final_handler_return(&rejected, "tool", "FinalCallToolResult", "Vec<Content>")
+                .expect_err("changing only result payload type must fail closed");
+
+        assert!(error.to_string().contains("FinalCallToolResult"));
+        assert!(error.to_string().contains("legacy handler"));
     }
 
     #[test]
