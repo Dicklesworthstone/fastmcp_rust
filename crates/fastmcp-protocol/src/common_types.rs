@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use base64::Engine as _;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1028,31 +1029,98 @@ impl<'de> Deserialize<'de> for Annotations {
     }
 }
 
-/// Link-style content block fields.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// A final `resource_link` content block.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ResourceLink {
+    /// Optional sized icons for display.
+    pub icons: Option<Vec<RawIcon>>,
+    /// Required programmatic resource name.
+    pub name: String,
+    /// Optional user-facing resource title.
+    pub title: Option<String>,
     /// Exact resource identity.
     pub uri: AbsoluteUri,
-    /// Required display name.
-    pub name: String,
+    /// Optional description of the resource.
+    pub description: Option<String>,
+    /// Optional MIME type declared for the resource.
+    pub mime_type: Option<String>,
     /// Optional link annotations.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Annotations>,
+    /// Optional raw size of the resource in bytes.
+    pub size: Option<f64>,
     /// Preserved open metadata.
-    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<OpenMetadata>,
+}
+
+impl Serialize for ResourceLink {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let field_count = 3
+            + usize::from(self.icons.is_some())
+            + usize::from(self.title.is_some())
+            + usize::from(self.description.is_some())
+            + usize::from(self.mime_type.is_some())
+            + usize::from(self.annotations.is_some())
+            + usize::from(self.size.is_some())
+            + usize::from(self.meta.is_some());
+        let mut state = serializer.serialize_struct("ResourceLink", field_count)?;
+        state.serialize_field("type", "resource_link")?;
+        if let Some(icons) = &self.icons {
+            state.serialize_field("icons", icons)?;
+        }
+        state.serialize_field("name", &self.name)?;
+        if let Some(title) = &self.title {
+            state.serialize_field("title", title)?;
+        }
+        state.serialize_field("uri", &self.uri)?;
+        if let Some(description) = &self.description {
+            state.serialize_field("description", description)?;
+        }
+        if let Some(mime_type) = &self.mime_type {
+            state.serialize_field("mimeType", mime_type)?;
+        }
+        if let Some(annotations) = &self.annotations {
+            state.serialize_field("annotations", annotations)?;
+        }
+        if let Some(size) = self.size {
+            state.serialize_field("size", &size)?;
+        }
+        if let Some(meta) = &self.meta {
+            state.serialize_field("_meta", meta)?;
+        }
+        state.end()
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ResourceLinkWire {
-    uri: AbsoluteUri,
+    #[serde(rename = "type")]
+    kind: ResourceLinkKind,
+    #[serde(default)]
+    icons: Option<Vec<RawIcon>>,
     name: String,
     #[serde(default)]
+    title: Option<String>,
+    uri: AbsoluteUri,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(rename = "mimeType", default)]
+    mime_type: Option<String>,
+    #[serde(default)]
     annotations: Option<Annotations>,
+    #[serde(default)]
+    size: Option<f64>,
     #[serde(rename = "_meta", default)]
     meta: Option<OpenMetadata>,
+}
+
+#[derive(Deserialize)]
+enum ResourceLinkKind {
+    #[serde(rename = "resource_link")]
+    ResourceLink,
 }
 
 impl<'de> Deserialize<'de> for ResourceLink {
@@ -1061,16 +1129,47 @@ impl<'de> Deserialize<'de> for ResourceLink {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        reject_unknown_fields(&value, &["uri", "name", "annotations", "_meta"])
-            .map_err(serde::de::Error::custom)?;
-        reject_explicit_null_fields(&value, &["annotations", "_meta"])
-            .map_err(serde::de::Error::custom)?;
+        reject_unknown_fields(
+            &value,
+            &[
+                "type",
+                "icons",
+                "name",
+                "title",
+                "uri",
+                "description",
+                "mimeType",
+                "annotations",
+                "size",
+                "_meta",
+            ],
+        )
+        .map_err(serde::de::Error::custom)?;
+        reject_explicit_null_fields(
+            &value,
+            &[
+                "icons",
+                "title",
+                "description",
+                "mimeType",
+                "annotations",
+                "size",
+                "_meta",
+            ],
+        )
+        .map_err(serde::de::Error::custom)?;
         let wire: ResourceLinkWire =
             serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        let ResourceLinkKind::ResourceLink = wire.kind;
         Ok(Self {
-            uri: wire.uri,
+            icons: wire.icons,
             name: wire.name,
+            title: wire.title,
+            uri: wire.uri,
+            description: wire.description,
+            mime_type: wire.mime_type,
             annotations: wire.annotations,
+            size: wire.size,
             meta: wire.meta,
         })
     }
@@ -1202,10 +1301,20 @@ pub enum ContentBlock {
     },
     /// A resource link uses the exact `resource_link` discriminator.
     ResourceLink {
-        uri: AbsoluteUri,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        icons: Option<Vec<RawIcon>>,
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        uri: AbsoluteUri,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<Annotations>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size: Option<f64>,
         #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
     },
@@ -1248,10 +1357,20 @@ enum ContentBlockWire {
         meta: Option<OpenMetadata>,
     },
     ResourceLink {
-        uri: AbsoluteUri,
+        #[serde(default)]
+        icons: Option<Vec<RawIcon>>,
         name: String,
         #[serde(default)]
+        title: Option<String>,
+        uri: AbsoluteUri,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(rename = "mimeType", default)]
+        mime_type: Option<String>,
+        #[serde(default)]
         annotations: Option<Annotations>,
+        #[serde(default)]
+        size: Option<f64>,
         #[serde(rename = "_meta", default)]
         meta: Option<OpenMetadata>,
     },
@@ -1277,12 +1396,35 @@ impl<'de> Deserialize<'de> for ContentBlock {
         let allowed = match kind {
             "text" => &["type", "text", "annotations", "_meta"][..],
             "image" | "audio" => &["type", "data", "mimeType", "annotations", "_meta"][..],
-            "resource_link" => &["type", "uri", "name", "annotations", "_meta"][..],
+            "resource_link" => &[
+                "type",
+                "icons",
+                "name",
+                "title",
+                "uri",
+                "description",
+                "mimeType",
+                "annotations",
+                "size",
+                "_meta",
+            ][..],
             "resource" => &["type", "resource", "annotations", "_meta"][..],
             _ => return Err(serde::de::Error::custom("content discriminator")),
         };
         reject_unknown_fields(&value, allowed).map_err(serde::de::Error::custom)?;
-        reject_explicit_null_fields(&value, &["annotations", "_meta"])
+        let optional_non_null_fields = match kind {
+            "resource_link" => &[
+                "icons",
+                "title",
+                "description",
+                "mimeType",
+                "annotations",
+                "size",
+                "_meta",
+            ][..],
+            _ => &["annotations", "_meta"][..],
+        };
+        reject_explicit_null_fields(&value, optional_non_null_fields)
             .map_err(serde::de::Error::custom)?;
         if kind == "resource" {
             let resource = value
@@ -1334,14 +1476,24 @@ impl<'de> Deserialize<'de> for ContentBlock {
                 }
             }
             ContentBlockWire::ResourceLink {
-                uri,
+                icons,
                 name,
+                title,
+                uri,
+                description,
+                mime_type,
                 annotations,
+                size,
                 meta,
             } => Self::ResourceLink {
-                uri,
+                icons,
                 name,
+                title,
+                uri,
+                description,
+                mime_type,
                 annotations,
+                size,
                 meta,
             },
             ContentBlockWire::Resource {
@@ -1411,9 +1563,14 @@ impl ContentBlock {
         name: impl Into<String>,
     ) -> Result<Self, CommonTypeError> {
         Ok(Self::ResourceLink {
-            uri: AbsoluteUri::parse(uri)?,
+            icons: None,
             name: name.into(),
+            title: None,
+            uri: AbsoluteUri::parse(uri)?,
+            description: None,
+            mime_type: None,
             annotations: None,
+            size: None,
             meta: None,
         })
     }
@@ -1667,9 +1824,13 @@ impl FinalCommonTypesSchema {
                 valid_binary_content(data, mime_type, "audio/")
             }
             ContentBlock::ResourceLink {
-                uri, annotations, ..
+                uri,
+                icons,
+                annotations,
+                ..
             } => {
                 Self::validate_annotations(annotations)?;
+                Self::validate_icons(icons)?;
                 AbsoluteUri::parse(uri.as_str()).map(|_| ())
             }
             ContentBlock::Resource {
@@ -1697,6 +1858,20 @@ impl FinalCommonTypesSchema {
             .is_some_and(|priority| !priority.is_finite() || !(0.0..=1.0).contains(&priority))
         {
             return Err(CommonTypeError::Invalid("annotation priority"));
+        }
+        Ok(())
+    }
+
+    fn validate_icons(icons: &Option<Vec<RawIcon>>) -> Result<(), CommonTypeError> {
+        if let Some(icons) = icons {
+            for icon in icons {
+                let _ = RawIcon::try_with_details(
+                    icon.src.as_str(),
+                    icon.mime_type.clone(),
+                    icon.sizes.clone(),
+                    icon.theme,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1859,6 +2034,124 @@ mod tests {
             Some(MAX_CURSOR_BYTES)
         );
         assert_eq!(FinalCommonTypesSchema::FINAL_URI_OWNERS.len(), 12);
+    }
+
+    #[test]
+    fn final_common_content_bridge_round_trips_complete_resource_link() {
+        let icon = RawIcon::try_with_details(
+            "https://example.test/icons/report.svg",
+            Some("image/svg+xml".to_owned()),
+            Some(vec!["48x48".to_owned(), "any".to_owned()]),
+            Some(IconTheme::Dark),
+        )
+        .expect("final icon");
+        let annotations = Annotations {
+            audience: Some(vec![
+                AnnotationAudience::User,
+                AnnotationAudience::Assistant,
+            ]),
+            priority: Some(0.75),
+            last_modified: Some("2026-07-28T15:00:58Z".to_owned()),
+        };
+        let metadata = OpenMetadata::try_from_entries([(
+            "com.example/renderHint".to_owned(),
+            json!({"preserve": true}),
+        )])
+        .expect("content metadata");
+        let resource_link = ResourceLink {
+            icons: Some(vec![icon.clone()]),
+            name: "report".to_owned(),
+            title: Some("Quarterly report".to_owned()),
+            uri: AbsoluteUri::parse("https://example.test/reports/q3").expect("resource URI"),
+            description: Some("Raw quarterly figures".to_owned()),
+            mime_type: Some("text/markdown".to_owned()),
+            annotations: Some(annotations.clone()),
+            size: Some(4096.0),
+            meta: Some(metadata.clone()),
+        };
+        let resource_link_wire = serde_json::to_value(&resource_link).expect("resource link");
+        assert_eq!(resource_link_wire["type"], "resource_link");
+        assert_eq!(
+            resource_link_wire["icons"][0]["sizes"],
+            json!(["48x48", "any"])
+        );
+        assert_eq!(resource_link_wire["icons"][0]["theme"], "dark");
+        assert_eq!(
+            resource_link_wire["annotations"]["audience"],
+            json!(["user", "assistant"])
+        );
+        assert_eq!(
+            resource_link_wire["_meta"]["com.example/renderHint"]["preserve"],
+            true
+        );
+        assert_eq!(
+            serde_json::from_value::<ResourceLink>(resource_link_wire.clone())
+                .expect("resource link round trip"),
+            resource_link
+        );
+        FinalCommonTypesSchema::validate(CommonWireDirection::Result, &resource_link_wire)
+            .expect("final resource link schema");
+
+        let content = ContentBlock::ResourceLink {
+            icons: Some(vec![icon]),
+            name: "report".to_owned(),
+            title: Some("Quarterly report".to_owned()),
+            uri: AbsoluteUri::parse("https://example.test/reports/q3").expect("content URI"),
+            description: Some("Raw quarterly figures".to_owned()),
+            mime_type: Some("text/markdown".to_owned()),
+            annotations: Some(annotations),
+            size: Some(4096.0),
+            meta: Some(metadata),
+        };
+        let content_wire = serde_json::to_value(&content).expect("content wire");
+        assert_eq!(
+            serde_json::from_value::<ContentBlock>(content_wire).expect("content round trip"),
+            content
+        );
+
+        for (level, wire) in [
+            (LoggingLevel::Debug, "debug"),
+            (LoggingLevel::Info, "info"),
+            (LoggingLevel::Notice, "notice"),
+            (LoggingLevel::Warning, "warning"),
+            (LoggingLevel::Error, "error"),
+            (LoggingLevel::Critical, "critical"),
+            (LoggingLevel::Alert, "alert"),
+            (LoggingLevel::Emergency, "emergency"),
+        ] {
+            assert_eq!(serde_json::to_value(level).expect("logging level"), wire);
+            assert_eq!(
+                serde_json::from_value::<LoggingLevel>(json!(wire)).expect("logging level"),
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn final_resource_link_rejects_legacy_icon_sizes_without_mutating_accepted_wire() {
+        let accepted = json!({
+            "type": "resource_link",
+            "icons": [{
+                "src": "https://example.test/icons/report.svg",
+                "sizes": ["48x48"],
+                "theme": "dark"
+            }],
+            "name": "report",
+            "uri": "https://example.test/reports/q3"
+        });
+        FinalCommonTypesSchema::validate(CommonWireDirection::Result, &accepted)
+            .expect("accepted final resource link");
+        let baseline = accepted.clone();
+        let mut planted = accepted.clone();
+        planted["icons"][0]["sizes"] = json!("48x48");
+        assert_eq!(
+            FinalCommonTypesSchema::validate(CommonWireDirection::Result, &planted),
+            Err(CommonTypeError::Invalid("content block"))
+        );
+        assert_eq!(
+            accepted, baseline,
+            "the rejected one-field legacy size spelling cannot mutate final wire state"
+        );
     }
 
     #[test]

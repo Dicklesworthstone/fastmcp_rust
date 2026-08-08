@@ -223,7 +223,7 @@ pub struct ClientInfo {
 /// Icons provide visual representation for tools, resources, and prompts
 /// in client UIs. All fields are optional to support various use cases.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Icon {
     /// URL or data URI for the icon.
     ///
@@ -484,7 +484,7 @@ pub struct PromptArgument {
 
 /// Content types in MCP messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Content {
     /// Text content.
     Text {
@@ -601,6 +601,7 @@ impl Content {
 
 /// Resource content in a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceContent {
     /// Resource URI.
     pub uri: String,
@@ -1167,6 +1168,28 @@ mod tests {
         assert_ne!(a, c);
     }
 
+    #[test]
+    fn legacy_icon_rejects_final_theme_without_mutating_accepted_wire() {
+        let accepted = json!({
+            "src": "https://example.com/icon.svg",
+            "mimeType": "image/svg+xml",
+            "sizes": "48x48"
+        });
+        let legacy: Icon = serde_json::from_value(accepted.clone()).expect("legacy icon");
+        let baseline = accepted.clone();
+        let mut planted = accepted.clone();
+        planted["theme"] = json!("dark");
+        assert!(
+            serde_json::from_value::<Icon>(planted).is_err(),
+            "the final-only theme field must not be silently discarded by the legacy icon"
+        );
+        assert_eq!(
+            accepted, baseline,
+            "the rejected one-field final addition cannot mutate accepted legacy wire state"
+        );
+        assert_eq!(serde_json::to_value(legacy).expect("legacy wire"), accepted);
+    }
+
     // ========================================================================
     // Content Tests
     // ========================================================================
@@ -1256,6 +1279,24 @@ mod tests {
         };
         assert_eq!(data.as_deref(), Some("abc123"));
         assert_eq!(mime_type.as_deref(), Some("audio/mpeg"));
+    }
+
+    #[test]
+    fn legacy_content_rejects_final_metadata_without_mutating_accepted_wire() {
+        let accepted = json!({"type": "text", "text": "legacy text"});
+        let legacy: Content = serde_json::from_value(accepted.clone()).expect("legacy content");
+        let baseline = accepted.clone();
+        let mut planted = accepted.clone();
+        planted["_meta"] = json!({"com.example/renderHint": true});
+        assert!(
+            serde_json::from_value::<Content>(planted).is_err(),
+            "the final-only content metadata must not be silently discarded by legacy content"
+        );
+        assert_eq!(
+            accepted, baseline,
+            "the rejected one-field final metadata addition cannot mutate accepted legacy wire state"
+        );
+        assert_eq!(serde_json::to_value(legacy).expect("legacy wire"), accepted);
     }
 
     // ========================================================================
