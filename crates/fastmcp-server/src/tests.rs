@@ -21,10 +21,11 @@ use fastmcp_derive::tool;
 use fastmcp_protocol::{
     CallToolParams, CancelTaskParams, CancelledParams, ClientCapabilities, ClientInfo, Content,
     CreateMessageResult, GetPromptParams, GetTaskParams, InitializeParams, JsonRpcMessage,
-    JsonRpcRequest, JsonRpcResponse, ListTasksParams, LogLevel, LogMessageParams, Prompt,
-    PromptArgument, PromptMessage, ReadResourceParams, RequestId, Resource, ResourceContent,
-    ResourceTemplate, ResourceUpdatedNotificationParams, Role, SamplingCapability,
-    ServerCapabilities, ServerInfo, SetLogLevelParams, SubmitTaskParams, TaskStatus, Tool,
+    JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyResourceContent, ListTasksParams,
+    LogLevel, LogMessageParams, Prompt, PromptArgument, PromptMessage, ReadResourceParams,
+    RequestId, Resource, ResourceContent, ResourceTemplate, ResourceUpdatedNotificationParams,
+    Role, SamplingCapability, ServerCapabilities, ServerInfo, SetLogLevelParams, SubmitTaskParams,
+    TaskStatus, Tool,
 };
 
 use crate::bidirectional::{PendingRequests, RequestSender, TransportSendFn};
@@ -2715,8 +2716,8 @@ mod router_tests {
         assert!(!call_result.is_error);
         assert_eq!(call_result.content.len(), 1);
 
-        assert!(matches!(call_result.content[0], Content::Text { .. }));
-        let Content::Text { text } = &call_result.content[0] else {
+        assert!(matches!(call_result.content[0], LegacyContent::Text { .. }));
+        let LegacyContent::Text { text, .. } = &call_result.content[0] else {
             return;
         };
         assert_eq!(text, "Hello, Alice!");
@@ -2828,10 +2829,10 @@ mod router_tests {
         assert!(result.is_ok());
         let read_result = result.unwrap();
         assert_eq!(read_result.contents.len(), 1);
-        assert_eq!(
-            read_result.contents[0].text,
-            Some("Test content".to_string())
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Test content"
+        ));
     }
 
     #[test]
@@ -2851,10 +2852,10 @@ mod router_tests {
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
-        assert_eq!(
-            read_result.contents[0].text,
-            Some("Template abc".to_string())
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Template abc"
+        ));
     }
 
     #[test]
@@ -2874,10 +2875,10 @@ mod router_tests {
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
-        assert_eq!(
-            read_result.contents[0].text,
-            Some("Template hello world".to_string())
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Template hello world"
+        ));
     }
 
     #[test]
@@ -2897,10 +2898,10 @@ mod router_tests {
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
-        assert_eq!(
-            read_result.contents[0].text,
-            Some("Template foo/bar".to_string())
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Template foo/bar"
+        ));
     }
 
     #[test]
@@ -2923,10 +2924,10 @@ mod router_tests {
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
-        assert_eq!(
-            read_result.contents[0].text,
-            Some("Specific 123".to_string())
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Specific 123"
+        ));
     }
 
     #[test]
@@ -2951,10 +2952,10 @@ mod router_tests {
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
-        assert_eq!(
-            read_result.contents[0].text.as_deref(),
-            Some("Logged dir/file.txt")
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Logged dir/file.txt"
+        ));
 
         let guard = events.lock().expect("template log lock poisoned");
         assert_eq!(guard.len(), 1);
@@ -3033,9 +3034,9 @@ mod router_tests {
 
         assert!(matches!(
             get_result.messages[0].content,
-            Content::Text { .. }
+            LegacyContent::Text { .. }
         ));
-        let Content::Text { text } = &get_result.messages[0].content else {
+        let LegacyContent::Text { text, .. } = &get_result.messages[0].content else {
             return;
         };
         assert!(text.contains("Bob"));
@@ -3609,8 +3610,8 @@ mod multi_handler_tests {
         assert!(result2.is_ok());
 
         // Verify different outputs
-        if let Content::Text { text: text1 } = &result1.unwrap().content[0] {
-            if let Content::Text { text: text2 } = &result2.unwrap().content[0] {
+        if let LegacyContent::Text { text: text1, .. } = &result1.unwrap().content[0] {
+            if let LegacyContent::Text { text: text2, .. } = &result2.unwrap().content[0] {
                 assert_eq!(text1, "Hello, Alice!");
                 assert_eq!(text2, "Good day, Alice.");
             }
@@ -3662,14 +3663,14 @@ mod multi_handler_tests {
             None,
         );
 
-        assert_eq!(
-            result_a.unwrap().contents[0].text,
-            Some("Content A".to_string())
-        );
-        assert_eq!(
-            result_b.unwrap().contents[0].text,
-            Some("Content B".to_string())
-        );
+        assert!(matches!(
+            &result_a.unwrap().contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Content A"
+        ));
+        assert!(matches!(
+            &result_b.unwrap().contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Content B"
+        ));
     }
 }
 
@@ -3702,7 +3703,7 @@ mod session_state_tests {
         let result1 =
             router.handle_tools_call(&request_ctx1, params.clone(), state.clone(), None, None);
         assert!(result1.is_ok());
-        if let Content::Text { text } = &result1.unwrap().content[0] {
+        if let LegacyContent::Text { text, .. } = &result1.unwrap().content[0] {
             assert_eq!(text, "Counter: 1");
         }
 
@@ -3712,7 +3713,7 @@ mod session_state_tests {
         let result2 =
             router.handle_tools_call(&request_ctx2, params.clone(), state.clone(), None, None);
         assert!(result2.is_ok());
-        if let Content::Text { text } = &result2.unwrap().content[0] {
+        if let LegacyContent::Text { text, .. } = &result2.unwrap().content[0] {
             assert_eq!(text, "Counter: 2");
         }
 
@@ -3720,7 +3721,7 @@ mod session_state_tests {
         let request_ctx3 = McpContext::with_state(cx, 3, state.clone()).with_budget_ceiling(budget);
         let result3 = router.handle_tools_call(&request_ctx3, params, state.clone(), None, None);
         assert!(result3.is_ok());
-        if let Content::Text { text } = &result3.unwrap().content[0] {
+        if let LegacyContent::Text { text, .. } = &result3.unwrap().content[0] {
             assert_eq!(text, "Counter: 3");
         }
     }
@@ -3763,10 +3764,10 @@ mod session_state_tests {
             .unwrap();
 
         // state1 should have counter=2, state2 should have counter=1
-        if let Content::Text { text } = &result1.content[0] {
+        if let LegacyContent::Text { text, .. } = &result1.content[0] {
             assert_eq!(text, "Counter: 2");
         }
-        if let Content::Text { text } = &result2.content[0] {
+        if let LegacyContent::Text { text, .. } = &result2.content[0] {
             assert_eq!(text, "Counter: 1");
         }
     }
