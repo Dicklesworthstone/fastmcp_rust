@@ -11,7 +11,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use fastmcp_core::CanonicalHttpUrl;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// The exact modern MCP protocol revision supported by this policy surface.
 pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
@@ -45,7 +45,7 @@ impl ProtocolEra {
 /// Callers must retain an unsupported input separately after
 /// [`ProtocolVersion::parse`] rejects it; in particular, `2025-11-25` cannot
 /// be parsed, aliased, or normalized into either supported era.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProtocolVersion(ProtocolEra);
 
 impl ProtocolVersion {
@@ -93,6 +93,25 @@ impl FromStr for ProtocolVersion {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
+    }
+}
+
+impl Serialize for ProtocolVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProtocolVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1010,6 +1029,137 @@ impl HttpEraCache {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_version_serde_uses_only_exact_wire_versions() {
+        for (version, wire_value) in [
+            (ProtocolVersion::MODERN_2026, MODERN_PROTOCOL_VERSION),
+            (ProtocolVersion::LEGACY_2024, LEGACY_PROTOCOL_VERSION),
+        ] {
+            assert_eq!(
+                serde_json::to_value(version).expect("supported version serializes"),
+                serde_json::json!(wire_value),
+            );
+            assert_eq!(
+                serde_json::from_value::<ProtocolVersion>(serde_json::json!(wire_value))
+                    .expect("exact supported wire version deserializes"),
+                version,
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_version_serde_planted_negative_rejects_internal_variant_spelling() {
+        let accepted_wire_value = serde_json::json!(MODERN_PROTOCOL_VERSION);
+        let accepted = serde_json::from_value::<ProtocolVersion>(accepted_wire_value.clone())
+            .expect("exact modern wire version is admitted");
+
+        // The wire spelling is the only changed dimension. Internal enum
+        // labels are never protocol-version aliases.
+        let rejected = serde_json::from_value::<ProtocolVersion>(serde_json::json!("Modern2026"))
+            .expect_err("internal enum spelling must not be admitted on the wire");
+
+        assert!(
+            rejected
+                .to_string()
+                .contains("unsupported MCP protocol version \"Modern2026\"")
+        );
+        assert_eq!(accepted, ProtocolVersion::MODERN_2026);
+        assert_eq!(
+            serde_json::to_value(accepted).expect("accepted version remains serializable"),
+            accepted_wire_value,
+        );
+    }
+
+    #[test]
+    fn auto_stdio_planted_negative_treats_exact_legacy_claim_as_modern_contradiction() {
+        let mut accepted = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        assert_eq!(
+            accepted.classify_opening(StdioOpeningFrame::ModernRequest {
+                protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
+            }),
+            StdioEraDecision::Selected {
+                era: ProtocolEra::Modern2026,
+                modern_version: Some(ModernVersionSupport::Supported),
+            }
+        );
+        let accepted_state = accepted.state().clone();
+
+        let mut contradictory = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        assert_eq!(
+            contradictory.classify_opening(StdioOpeningFrame::ModernRequest {
+                protocol_version: LEGACY_PROTOCOL_VERSION.to_owned(),
+            }),
+            StdioEraDecision::Selected {
+                era: ProtocolEra::Modern2026,
+                modern_version: Some(ModernVersionSupport::Unsupported {
+                    received: LEGACY_PROTOCOL_VERSION.to_owned(),
+                }),
+            }
+        );
+        assert_eq!(
+            contradictory.classify_opening(StdioOpeningFrame::LegacyInitialize),
+            StdioEraDecision::RejectedUnderSelectedEra {
+                era: ProtocolEra::Modern2026,
+                reason: StdioEraRejection::CrossEraTraffic,
+            }
+        );
+        assert_eq!(accepted.state(), &accepted_state);
+        assert_eq!(
+            contradictory.state(),
+            &StdioEraState::Selected(ProtocolEra::Modern2026)
+        );
+    }
+
+    #[test]
+    fn auto_http_planted_negative_does_not_downgrade_a_recognized_modern_refusal() {
+        let bundle = HttpEndpointBundle::new(
+            ProtocolPolicy::Auto,
+            Some(CanonicalHttpUrl::parse("https://api.example.test/mcp").unwrap()),
+            Some(CanonicalHttpUrl::parse("https://api.example.test/sse").unwrap()),
+            Some(CanonicalHttpUrl::parse("https://api.example.test/messages").unwrap()),
+            "credential-partition-a".to_owned(),
+            "security-partition-a".to_owned(),
+            "http-sse-v2".to_owned(),
+            1,
+            1,
+            1,
+        )
+        .expect("complete Auto bundle is valid");
+
+        let mut accepted = HttpEraCache::default();
+        assert_eq!(
+            accepted.classify_or_cached(
+                &bundle,
+                HttpModernProbe {
+                    status: 200,
+                    body: HttpProbeBody::RecognizedModernJsonRpc,
+                },
+            ),
+            HttpEraDecision::Selected(ProtocolEra::Modern2026)
+        );
+        let accepted_era = accepted.selected_era(&bundle.key());
+
+        // The HTTP status is the sole changed dimension. A recognized modern
+        // JSON-RPC response confirms the modern era even when it refuses the
+        // discovery request, so it cannot authorize legacy fallback.
+        let mut refusal = HttpEraCache::default();
+        assert_eq!(
+            refusal.classify_or_cached(
+                &bundle,
+                HttpModernProbe {
+                    status: 404,
+                    body: HttpProbeBody::RecognizedModernJsonRpc,
+                },
+            ),
+            HttpEraDecision::Selected(ProtocolEra::Modern2026)
+        );
+        assert_eq!(accepted.selected_era(&bundle.key()), accepted_era);
+        assert_eq!(
+            refusal.selected_era(&bundle.key()),
+            Some(ProtocolEra::Modern2026)
+        );
+    }
 
     pub(crate) fn fnd_03_policy_receipts_positive() {
         assert_eq!(
