@@ -23,6 +23,22 @@ pub const FINAL_JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-
 /// Maximum nested schema applications on a single validation path.
 pub const MAX_SCHEMA_VALIDATION_DEPTH: usize = 64;
 
+/// Maximum schema nodes admitted for one final-dialect schema document.
+pub const MAX_SCHEMA_ADMISSION_NODES: usize = 4_096;
+
+/// Maximum JSON instance nodes traversed by one validation call.
+pub const MAX_SCHEMA_INSTANCE_NODES: usize = 4_096;
+
+/// Maximum JSON instance nesting depth accepted by one validation call.
+pub const MAX_SCHEMA_INSTANCE_DEPTH: usize = 64;
+
+/// Maximum UTF-8 bytes in one instance string or object member name.
+pub const MAX_SCHEMA_INSTANCE_STRING_BYTES: usize = 64 * 1024;
+
+/// Maximum schema applications performed by one validation call, including
+/// local-reference, composition, and conditional branch evaluation.
+pub const MAX_SCHEMA_VALIDATION_WORK: usize = 4_096;
+
 /// Maximum local `$ref` hops on a single validation path.
 pub const MAX_LOCAL_REFERENCE_DEPTH: usize = 32;
 
@@ -146,7 +162,8 @@ impl FinalCoreResultType {
 /// schema can be retained. External references are refused rather than being
 /// interpreted as I/O authority.
 pub fn admit_final_schema(schema: Value) -> Result<AdmittedSchema, SchemaAdmissionError> {
-    validate_final_schema_node(&schema, "$", true)?;
+    let mut node_count = 0;
+    validate_final_schema_node(&schema, &schema, "$", true, 0, &mut node_count)?;
     Ok(AdmittedSchema { schema })
 }
 
@@ -200,9 +217,25 @@ pub fn validate_final_core_result(
 
 fn validate_final_schema_node(
     schema: &Value,
+    root_schema: &Value,
     path: &str,
     root: bool,
+    depth: usize,
+    node_count: &mut usize,
 ) -> Result<(), SchemaAdmissionError> {
+    if depth >= MAX_SCHEMA_VALIDATION_DEPTH {
+        return Err(SchemaAdmissionError::new(
+            path,
+            "schema admission nesting limit exceeded",
+        ));
+    }
+    *node_count += 1;
+    if *node_count > MAX_SCHEMA_ADMISSION_NODES {
+        return Err(SchemaAdmissionError::new(
+            path,
+            "schema admission node limit exceeded",
+        ));
+    }
     if schema.is_boolean() {
         return Ok(());
     }
@@ -229,6 +262,12 @@ fn validate_final_schema_node(
             return Err(SchemaAdmissionError::new(
                 format!("{path}.$ref"),
                 "external schema reference is not allowed",
+            ));
+        }
+        if resolve_local_reference(root_schema, reference).is_err() {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.$ref"),
+                "unresolved local schema reference",
             ));
         }
     }
@@ -312,7 +351,14 @@ fn validate_final_schema_node(
                 }
             }
             for (name, subschema) in subschemas {
-                validate_final_schema_node(subschema, &format!("{path}.{keyword}.{name}"), false)?;
+                validate_final_schema_node(
+                    subschema,
+                    root_schema,
+                    &format!("{path}.{keyword}.{name}"),
+                    false,
+                    depth + 1,
+                    node_count,
+                )?;
             }
         }
     }
@@ -328,7 +374,14 @@ fn validate_final_schema_node(
         "propertyNames",
     ] {
         if let Some(subschema) = object.get(keyword) {
-            validate_final_schema_node(subschema, &format!("{path}.{keyword}"), false)?;
+            validate_final_schema_node(
+                subschema,
+                root_schema,
+                &format!("{path}.{keyword}"),
+                false,
+                depth + 1,
+                node_count,
+            )?;
         }
     }
 
@@ -343,8 +396,11 @@ fn validate_final_schema_node(
             for (index, subschema) in subschemas.iter().enumerate() {
                 validate_final_schema_node(
                     subschema,
+                    root_schema,
                     &format!("{path}.{keyword}[{index}]"),
                     false,
+                    depth + 1,
+                    node_count,
                 )?;
             }
         }
@@ -539,13 +595,19 @@ fn validate_pattern_keyword(
 /// ```
 pub fn validate(schema: &Value, value: &Value) -> ValidationResult {
     let mut errors = Vec::new();
-    validate_internal(
-        schema,
-        value,
-        "root",
-        &mut errors,
-        ValidationContext::new(schema),
-    );
+    let mut instance_nodes = 0;
+    if !validate_instance_bounds(value, "root", 0, &mut instance_nodes, &mut errors) {
+        return Err(errors);
+    }
+    let mut context = ValidationContext::new(schema);
+    validate_internal(schema, value, "root", &mut errors, &mut context);
+    if context.work_exhausted
+        && !errors
+            .iter()
+            .any(|error| error.message == "schema validation work limit exceeded")
+    {
+        push_error(&mut errors, "root", "schema validation work limit exceeded");
+    }
 
     if errors.is_empty() {
         Ok(())
@@ -662,11 +724,12 @@ fn make_strict_schema(schema: &Value) -> Value {
     }
 }
 
-#[derive(Clone, Copy)]
 struct ValidationContext<'a> {
     root_schema: &'a Value,
     schema_depth: usize,
     reference_depth: usize,
+    remaining_work: usize,
+    work_exhausted: bool,
 }
 
 impl<'a> ValidationContext<'a> {
@@ -675,24 +738,106 @@ impl<'a> ValidationContext<'a> {
             root_schema,
             schema_depth: 0,
             reference_depth: 0,
+            remaining_work: MAX_SCHEMA_VALIDATION_WORK,
+            work_exhausted: false,
         }
     }
 
-    const fn descend(self) -> Self {
-        Self {
-            root_schema: self.root_schema,
-            schema_depth: self.schema_depth + 1,
-            reference_depth: self.reference_depth,
-        }
+    fn consume_work(&mut self) -> bool {
+        let Some(remaining_work) = self.remaining_work.checked_sub(1) else {
+            self.work_exhausted = true;
+            return false;
+        };
+        self.remaining_work = remaining_work;
+        true
     }
 
-    const fn follow_reference(self) -> Self {
-        Self {
-            root_schema: self.root_schema,
-            schema_depth: self.schema_depth,
-            reference_depth: self.reference_depth + 1,
+    fn enter_schema(&mut self) -> bool {
+        if self.schema_depth >= MAX_SCHEMA_VALIDATION_DEPTH || !self.consume_work() {
+            return false;
         }
+        self.schema_depth += 1;
+        true
     }
+
+    fn leave_schema(&mut self) {
+        self.schema_depth -= 1;
+    }
+
+    fn enter_reference(&mut self) -> bool {
+        if self.reference_depth >= MAX_LOCAL_REFERENCE_DEPTH {
+            return false;
+        }
+        self.reference_depth += 1;
+        true
+    }
+
+    fn leave_reference(&mut self) {
+        self.reference_depth -= 1;
+    }
+}
+
+fn validate_instance_bounds(
+    value: &Value,
+    path: &str,
+    depth: usize,
+    node_count: &mut usize,
+    errors: &mut Vec<ValidationError>,
+) -> bool {
+    if depth >= MAX_SCHEMA_INSTANCE_DEPTH {
+        push_error(errors, path, "instance nesting limit exceeded");
+        return false;
+    }
+    *node_count += 1;
+    if *node_count > MAX_SCHEMA_INSTANCE_NODES {
+        push_error(errors, path, "instance node limit exceeded");
+        return false;
+    }
+
+    match value {
+        Value::String(string) => {
+            if string.len() > MAX_SCHEMA_INSTANCE_STRING_BYTES {
+                push_error(errors, path, "instance string byte limit exceeded");
+                return false;
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                if !validate_instance_bounds(
+                    item,
+                    &format!("{path}[{index}]"),
+                    depth + 1,
+                    node_count,
+                    errors,
+                ) {
+                    return false;
+                }
+            }
+        }
+        Value::Object(members) => {
+            for (name, member) in members {
+                if name.len() > MAX_SCHEMA_INSTANCE_STRING_BYTES {
+                    push_error(
+                        errors,
+                        path,
+                        "instance object member-name byte limit exceeded",
+                    );
+                    return false;
+                }
+                if !validate_instance_bounds(
+                    member,
+                    &format!("{path}.{name}"),
+                    depth + 1,
+                    node_count,
+                    errors,
+                ) {
+                    return false;
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+    true
 }
 
 fn push_error(errors: &mut Vec<ValidationError>, path: &str, message: impl Into<String>) {
@@ -710,24 +855,30 @@ fn validate_internal(
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) {
-    if context.schema_depth >= MAX_SCHEMA_VALIDATION_DEPTH {
-        push_error(errors, path, "schema validation nesting limit exceeded");
+    if !context.enter_schema() {
+        let reason = if context.remaining_work == 0 {
+            "schema validation work limit exceeded"
+        } else {
+            "schema validation nesting limit exceeded"
+        };
+        push_error(errors, path, reason);
         return;
     }
-    let context = context.descend();
 
     // Handle boolean schemas (true = accept all, false = reject all)
     if let Some(b) = schema.as_bool() {
         if !b {
             push_error(errors, path, "schema rejects all values");
         }
+        context.leave_schema();
         return;
     }
 
     // Schema must be an object
     let Some(schema_obj) = schema.as_object() else {
+        context.leave_schema();
         return; // Invalid schema, skip validation
     };
 
@@ -744,6 +895,7 @@ fn validate_internal(
                 path,
                 format!("expected type {expected}, got {}", json_type_name(value)),
             );
+            context.leave_schema();
             return; // Type mismatch, skip further validation
         }
     }
@@ -783,6 +935,7 @@ fn validate_internal(
         }
         _ => {}
     }
+    context.leave_schema();
 }
 
 fn validate_local_reference(
@@ -790,19 +943,21 @@ fn validate_local_reference(
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) {
     let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
         return;
     };
-    if context.reference_depth >= MAX_LOCAL_REFERENCE_DEPTH {
+    if !context.enter_reference() {
         push_error(errors, path, "local schema reference depth limit exceeded");
         return;
     }
-    match resolve_local_reference(context.root_schema, reference) {
-        Ok(target) => validate_internal(target, value, path, errors, context.follow_reference()),
+    let root_schema = context.root_schema;
+    match resolve_local_reference(root_schema, reference) {
+        Ok(target) => validate_internal(target, value, path, errors, context),
         Err(message) => push_error(errors, path, message),
     }
+    context.leave_reference();
 }
 
 fn resolve_local_reference<'a>(
@@ -855,7 +1010,7 @@ fn validate_composition(
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) {
     validate_all_of(schema, value, path, errors, context);
     validate_any_of(schema, value, path, errors, context);
@@ -887,7 +1042,7 @@ fn validate_all_of(
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) {
     if let Some(subschemas) = bounded_subschemas(schema, "allOf", path, errors) {
         for subschema in subschemas {
@@ -901,15 +1056,19 @@ fn validate_any_of(
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) {
     let Some(subschemas) = bounded_subschemas(schema, "anyOf", path, errors) else {
         return;
     };
-    if !subschemas
-        .iter()
-        .any(|subschema| branch_is_valid(subschema, value, path, context))
-    {
+    let mut matched = false;
+    for subschema in subschemas {
+        if branch_is_valid(subschema, value, path, context) {
+            matched = true;
+            break;
+        }
+    }
+    if !matched {
         push_error(errors, path, "no subschema in anyOf matched");
     }
 }
@@ -919,15 +1078,17 @@ fn validate_one_of(
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) {
     let Some(subschemas) = bounded_subschemas(schema, "oneOf", path, errors) else {
         return;
     };
-    let matches = subschemas
-        .iter()
-        .filter(|subschema| branch_is_valid(subschema, value, path, context))
-        .count();
+    let mut matches = 0;
+    for subschema in subschemas {
+        if branch_is_valid(subschema, value, path, context) {
+            matches += 1;
+        }
+    }
     if matches != 1 {
         push_error(errors, path, "exactly one subschema in oneOf must match");
     }
@@ -938,7 +1099,7 @@ fn validate_not(
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) {
     if let Some(subschema) = schema.get("not") {
         if branch_is_valid(subschema, value, path, context) {
@@ -952,7 +1113,7 @@ fn validate_conditional(
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) {
     let Some(condition) = schema.get("if") else {
         return;
@@ -971,7 +1132,7 @@ fn branch_is_valid(
     schema: &Value,
     value: &Value,
     path: &str,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) -> bool {
     let mut branch_errors = Vec::new();
     validate_internal(schema, value, path, &mut branch_errors, context);
@@ -1029,7 +1190,7 @@ fn validate_object(
     obj: &serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) {
     // Check required fields
     if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
@@ -1158,7 +1319,7 @@ fn validate_dependencies(
     obj: &serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) {
     if let Some(dependent_required) = schema.get("dependentRequired").and_then(Value::as_object) {
         for (trigger, required) in dependent_required {
@@ -1196,7 +1357,7 @@ fn validate_array(
     arr: &[Value],
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: ValidationContext<'_>,
+    context: &mut ValidationContext<'_>,
 ) {
     // Validate prefixItems (tuple validation)
     let mut prefix_len = 0;
@@ -1268,10 +1429,12 @@ fn validate_array(
     }
 
     if let Some(contains) = schema.get("contains") {
-        let matches = arr
-            .iter()
-            .filter(|item| branch_is_valid(contains, item, path, context))
-            .count();
+        let mut matches = 0;
+        for item in arr {
+            if branch_is_valid(contains, item, path, context) {
+                matches += 1;
+            }
+        }
         let minimum = schema
             .get("minContains")
             .and_then(Value::as_u64)
@@ -1551,6 +1714,178 @@ mod tests {
             accepted,
             json!({"resultType": "complete", "content": ["ready"]})
         );
+    }
+
+    fn bounded_draft_2020_12_schema() -> AdmittedSchema {
+        admit_final_schema(json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$defs": {
+                "positive": {
+                    "allOf": [
+                        {"type": "integer"},
+                        {"minimum": 1}
+                    ]
+                },
+                "entry": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"enum": ["number", "label"]},
+                        "value": {}
+                    },
+                    "required": ["kind", "value"],
+                    "additionalProperties": false,
+                    "allOf": [{
+                        "if": {
+                            "properties": {"kind": {"const": "number"}},
+                            "required": ["kind"]
+                        },
+                        "then": {
+                            "properties": {"value": {"$ref": "#/$defs/positive"}}
+                        },
+                        "else": {
+                            "properties": {"value": {"type": "string", "minLength": 3}}
+                        }
+                    }]
+                }
+            },
+            "type": "object",
+            "properties": {
+                "entries": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/entry"}
+                }
+            },
+            "required": ["entries"],
+            "additionalProperties": false
+        }))
+        .expect("bounded local-reference schema admits")
+    }
+
+    #[test]
+    fn bounded_draft_2020_12_local_ref_composition_conditional_positive() {
+        let schema = bounded_draft_2020_12_schema();
+        let instance = json!({
+            "entries": [
+                {"kind": "number", "value": 7},
+                {"kind": "label", "value": "ready"}
+            ]
+        });
+
+        schema
+            .validate(&instance)
+            .expect("local references, allOf, and the selected conditional branch validate");
+    }
+
+    #[test]
+    fn bounded_draft_2020_12_local_ref_composition_conditional_planted_negative() {
+        let schema = bounded_draft_2020_12_schema();
+        let accepted = json!({
+            "entries": [
+                {"kind": "number", "value": 7},
+                {"kind": "label", "value": "ready"}
+            ]
+        });
+        let mut planted = accepted.clone();
+        planted["entries"][0]["value"] = json!(0);
+
+        let errors = schema.validate(&planted).expect_err(
+            "changing only the local-reference value violates the selected then branch",
+        );
+        assert!(errors.iter().any(|error| {
+            error.path == "root.entries[0].value" && error.message == "value must be >= 1"
+        }));
+        assert_eq!(
+            accepted,
+            json!({
+                "entries": [
+                    {"kind": "number", "value": 7},
+                    {"kind": "label", "value": "ready"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn schema_admission_node_limit_positive_and_planted_negative() {
+        let mut properties = serde_json::Map::new();
+        for index in 0..(MAX_SCHEMA_ADMISSION_NODES - 1) {
+            properties.insert(format!("field-{index}"), Value::Bool(true));
+        }
+        let accepted = json!({"type": "object", "properties": properties});
+        admit_final_schema(accepted.clone())
+            .expect("the exact schema-admission node budget is accepted");
+
+        let mut planted = accepted.clone();
+        planted["properties"]
+            .as_object_mut()
+            .expect("schema properties stay an object")
+            .insert(
+                format!("field-{}", MAX_SCHEMA_ADMISSION_NODES - 1),
+                Value::Bool(true),
+            );
+        let error = admit_final_schema(planted)
+            .expect_err("adding one schema node beyond the admission budget must reject");
+        assert_eq!(error.reason(), "schema admission node limit exceeded");
+        assert_eq!(
+            accepted["properties"].as_object().unwrap().len(),
+            MAX_SCHEMA_ADMISSION_NODES - 1
+        );
+    }
+
+    #[test]
+    fn instance_node_limit_positive_and_planted_negative() {
+        let schema = admit_final_schema(json!({"type": "array", "items": true}))
+            .expect("the bounded array schema admits");
+        let accepted = Value::Array(vec![Value::Null; MAX_SCHEMA_INSTANCE_NODES - 1]);
+        schema
+            .validate(&accepted)
+            .expect("the exact instance-node budget is accepted");
+
+        let mut planted = accepted.clone();
+        planted.as_array_mut().unwrap().push(Value::Null);
+        let errors = schema
+            .validate(&planted)
+            .expect_err("adding one instance node beyond the budget must reject");
+        assert_eq!(
+            errors[0].path,
+            format!("root[{}]", MAX_SCHEMA_INSTANCE_NODES - 1)
+        );
+        assert_eq!(errors[0].message, "instance node limit exceeded");
+        assert_eq!(
+            accepted.as_array().unwrap().len(),
+            MAX_SCHEMA_INSTANCE_NODES - 1
+        );
+    }
+
+    fn composition_work_schema(branches: usize) -> Value {
+        let unit = json!({"allOf": vec![Value::Bool(true); MAX_COMPOSITION_BRANCHES]});
+        json!({"allOf": vec![unit; branches]})
+    }
+
+    #[test]
+    fn composition_work_limit_positive_and_planted_negative() {
+        let accepted = composition_work_schema(MAX_COMPOSITION_BRANCHES - 1);
+        validate(&accepted, &Value::Null)
+            .expect("the exact shared composition-work budget is accepted");
+
+        let planted = composition_work_schema(MAX_COMPOSITION_BRANCHES);
+        let errors = validate(&planted, &Value::Null)
+            .expect_err("adding one composition branch beyond the shared work budget must reject");
+        assert!(errors
+            .iter()
+            .any(|error| error.message == "schema validation work limit exceeded"));
+        assert_eq!(
+            accepted["allOf"].as_array().unwrap().len(),
+            MAX_COMPOSITION_BRANCHES - 1
+        );
+    }
+
+    #[test]
+    fn admitted_schema_rejects_unresolved_local_reference() {
+        let error = admit_final_schema(json!({"$ref": "#/$defs/missing"}))
+            .expect_err("unresolved local references fail before validation");
+        assert_eq!(error.path(), "$.$ref");
+        assert_eq!(error.reason(), "unresolved local schema reference");
     }
 
     #[test]

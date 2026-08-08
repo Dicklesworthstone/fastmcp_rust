@@ -1,21 +1,46 @@
 //! Native modern HTTP request and response-stream execution.
 //!
-//! This module deliberately owns one POST exchange at a time. The client
-//! facade wires it into connection and era selection in a later integration
-//! wave; this layer neither retries an MCP request nor follows redirects.
+//! This module owns modern MCP POST execution, disposable first-probe
+//! negotiation, and the public response stream surface. It neither retries an
+//! MCP request nor follows redirects.
 
+use std::collections::VecDeque;
 use std::fmt;
+use std::future::poll_fn;
+use std::pin::Pin;
 
 use asupersync::Cx;
+use asupersync::bytes::Buf;
+use asupersync::http::Body;
 use asupersync::http::h1::http_client::ClientIo;
 use asupersync::http::h1::{
     ClientError, ClientStreamingResponse, HttpClient, Method, RedirectPolicy, RetryPolicy,
+};
+use fastmcp_protocol::methods::{
+    Final2026Direction, Final2026EnvelopeKind, PROMPTS_GET, RESOURCES_READ, TOOLS_CALL,
+    final_2026_07_28_method,
+};
+use fastmcp_protocol::protocol_policy::{
+    HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
+};
+use fastmcp_protocol::{
+    ClientCapabilities, ClientInfo, FinalRequestMeta, JsonRpcMessage, JsonRpcRequest, RequestId,
+    SERVER_DISCOVER, decode_strict_jsonrpc_message,
+};
+
+use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError};
+use crate::{
+    ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
+    ClientProtocolPlan,
 };
 
 /// Exact request headers required for a modern MCP JSON-RPC POST.
 pub const MODERN_MCP_ACCEPT: &str = "application/json, text/event-stream";
 pub const MODERN_MCP_ACCEPT_ENCODING: &str = "identity";
 pub const MODERN_MCP_CONTENT_TYPE: &str = "application/json";
+
+/// Maximum response bytes retained while classifying a disposable modern probe.
+pub const MAX_MODERN_HTTP_PROBE_BODY_BYTES: usize = 64 * 1024;
 
 /// LIMIT-01's default cap for ignored RFC 9110 list elements in one
 /// `Content-Encoding` field value.
@@ -159,6 +184,161 @@ impl ModernHttpResponseStream {
     pub fn into_native(self) -> ClientStreamingResponse<ClientIo> {
         self.response
     }
+
+    /// Converts a validated modern SSE response into a bounded event stream.
+    ///
+    /// The parser is the crate's shipped WHATWG event-stream implementation;
+    /// it retains neither reconnect nor event-ID state. Callers receive data
+    /// payloads in wire order and remain responsible for JSON-RPC admission.
+    /// Passing explicit limits keeps response-stream memory bounded without
+    /// assigning ambient parser ceilings to the HTTP executor.
+    pub fn into_sse_stream(
+        self,
+        limits: SseLimits,
+    ) -> Result<ModernHttpSseResponseStream, ModernHttpExecutorError> {
+        if !matches!(self.metadata.kind, ModernHttpResponseKind::Sse) {
+            return Err(ModernHttpExecutorError::ExpectedSseResponse {
+                actual: self.metadata.kind,
+            });
+        }
+        Ok(ModernHttpSseResponseStream {
+            response: Some(self.response),
+            parser: Some(BoundedSseParser::new(limits)),
+            pending_events: VecDeque::new(),
+            end_of_stream: None,
+        })
+    }
+
+    /// Reads a finite response body into memory under an explicit caller bound.
+    ///
+    /// This consumes the stream. It is appropriate for the disposable modern
+    /// connection probe and ordinary JSON responses; callers expecting an SSE
+    /// stream should retain [`Self::into_native`] instead.
+    pub async fn read_to_end(
+        self,
+        cx: &Cx,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, ModernHttpExecutorError> {
+        let mut response = self.response;
+        let mut bytes = Vec::new();
+
+        loop {
+            if cx.checkpoint().is_err() {
+                return Err(ModernHttpExecutorError::Cancelled);
+            }
+            let Some(frame) =
+                poll_fn(|task_cx| Pin::new(&mut response.body).poll_frame(task_cx)).await
+            else {
+                break;
+            };
+            if cx.checkpoint().is_err() {
+                return Err(ModernHttpExecutorError::Cancelled);
+            }
+            let Some(mut data) = frame
+                .map_err(|_| ModernHttpExecutorError::ResponseBodyReadFailed)?
+                .into_data()
+            else {
+                continue;
+            };
+
+            while data.has_remaining() {
+                let chunk = data.chunk();
+                if chunk.len() > maximum_bytes.saturating_sub(bytes.len()) {
+                    return Err(ModernHttpExecutorError::ResponseBodyTooLarge { maximum_bytes });
+                }
+                bytes.extend_from_slice(chunk);
+                data.advance(chunk.len());
+            }
+        }
+
+        Ok(bytes)
+    }
+}
+
+/// A live bounded parser over one modern HTTP SSE response body.
+///
+/// This owns both the native response body and the parser, so a parser
+/// refusal immediately drops the response body instead of allowing callers
+/// to continue using a malformed stream.
+#[derive(Debug)]
+pub struct ModernHttpSseResponseStream {
+    response: Option<ClientStreamingResponse<ClientIo>>,
+    parser: Option<BoundedSseParser>,
+    pending_events: VecDeque<String>,
+    end_of_stream: Option<SseEndOfStream>,
+}
+
+impl ModernHttpSseResponseStream {
+    /// Returns the next completed SSE `data` payload, or `None` at EOF.
+    ///
+    /// The returned payload is not JSON-RPC-admitted. Its caller must decode
+    /// it through the protocol's strict response/notification admission path.
+    pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<String>, ModernHttpExecutorError> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(Some(event));
+        }
+        if self.end_of_stream.is_some() {
+            return Ok(None);
+        }
+
+        loop {
+            if cx.checkpoint().is_err() {
+                return Err(ModernHttpExecutorError::Cancelled);
+            }
+            let response = self
+                .response
+                .as_mut()
+                .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
+            let Some(frame) =
+                poll_fn(|task_cx| Pin::new(&mut response.body).poll_frame(task_cx)).await
+            else {
+                let parser = self
+                    .parser
+                    .take()
+                    .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
+                let end_of_stream = parser.finish().map_err(ModernHttpExecutorError::SseParse)?;
+                self.response = None;
+                self.end_of_stream = Some(end_of_stream);
+                return Ok(None);
+            };
+            if cx.checkpoint().is_err() {
+                return Err(ModernHttpExecutorError::Cancelled);
+            }
+            let Some(mut data) = frame
+                .map_err(|_| ModernHttpExecutorError::ResponseBodyReadFailed)?
+                .into_data()
+            else {
+                continue;
+            };
+
+            while data.has_remaining() {
+                let chunk = data.chunk();
+                let parser = self
+                    .parser
+                    .as_mut()
+                    .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
+                match parser.push(chunk) {
+                    Ok(events) => self.pending_events.extend(events),
+                    Err(error) => {
+                        self.response = None;
+                        self.parser = None;
+                        self.pending_events.clear();
+                        return Err(ModernHttpExecutorError::SseParse(error));
+                    }
+                }
+                data.advance(chunk.len());
+            }
+            if let Some(event) = self.pending_events.pop_front() {
+                return Ok(Some(event));
+            }
+        }
+    }
+
+    /// Returns the parser's EOF report once [`Self::next_event`] observed EOF.
+    #[must_use]
+    pub const fn end_of_stream(&self) -> Option<SseEndOfStream> {
+        self.end_of_stream
+    }
 }
 
 /// Errors raised before or while executing one modern POST.
@@ -178,6 +358,22 @@ pub enum ModernHttpExecutorError {
     DuplicateResponseHeader { name: &'static str },
     /// A successful response did not select JSON or SSE exactly.
     UnsupportedSuccessContentType,
+    /// An API requiring a modern SSE response received another admitted kind.
+    ExpectedSseResponse {
+        /// The body lane selected from the response head.
+        actual: ModernHttpResponseKind,
+    },
+    /// A response body exceeded the caller's explicit retained-byte limit.
+    ResponseBodyTooLarge {
+        /// Maximum bytes that could be retained before the stream was dropped.
+        maximum_bytes: usize,
+    },
+    /// The native response body could not be decoded while being consumed.
+    ResponseBodyReadFailed,
+    /// The bounded SSE parser refused a response body.
+    SseParse(SseParseError),
+    /// The SSE stream was already consumed, closed, or refused.
+    SseStreamClosed,
 }
 
 impl fmt::Display for ModernHttpExecutorError {
@@ -202,6 +398,25 @@ impl fmt::Display for ModernHttpExecutorError {
             }
             Self::UnsupportedSuccessContentType => {
                 formatter.write_str("modern MCP success response has unsupported content type")
+            }
+            Self::ExpectedSseResponse { actual } => {
+                write!(
+                    formatter,
+                    "modern MCP operation requires an SSE response, received {actual:?}"
+                )
+            }
+            Self::ResponseBodyTooLarge { maximum_bytes } => {
+                write!(
+                    formatter,
+                    "modern MCP response body exceeds the {maximum_bytes}-byte limit"
+                )
+            }
+            Self::ResponseBodyReadFailed => {
+                formatter.write_str("modern MCP response body could not be read")
+            }
+            Self::SseParse(error) => error.fmt(formatter),
+            Self::SseStreamClosed => {
+                formatter.write_str("modern MCP SSE response stream is closed")
             }
         }
     }
@@ -260,6 +475,379 @@ impl ModernHttpExecutor {
         }
         let metadata = validate_response_head(response.head.status, &response.head.headers)?;
         Ok(ModernHttpResponseStream { metadata, response })
+    }
+}
+
+/// A configured native modern HTTP client after one successful modern probe.
+///
+/// The executor retained here is deliberately created only after the probe has
+/// been consumed and classified. Probe connection/body state is therefore not
+/// reusable by ordinary requests.
+#[derive(Clone)]
+pub struct ModernHttpClient {
+    protocol_plan: ClientProtocolPlan,
+    modern_post_target: String,
+    client_info: ClientInfo,
+    client_capabilities: ClientCapabilities,
+    executor: ModernHttpExecutor,
+}
+
+/// The result of a policy-bound modern HTTP connection attempt.
+#[derive(Clone)]
+pub enum ModernHttpConnectOutcome {
+    /// The probe selected MCP 2026-07-28 and a modern request client is ready.
+    Modern(ModernHttpClient),
+    /// The disposable probe authorized the separately configured legacy SSE
+    /// adapter. This modern runtime does not fabricate a legacy transport.
+    LegacySseFallbackAuthorized(LegacySseFallbackAuthorization),
+}
+
+impl ModernHttpConnectOutcome {
+    /// Returns the selected era after this connection attempt, if any.
+    ///
+    /// A recognized auto-policy refusal authorizes a separate legacy SSE
+    /// observation but deliberately does not select or cache legacy state.
+    #[must_use]
+    pub const fn selected_era(&self) -> Option<ProtocolEra> {
+        match self {
+            Self::Modern(_) => Some(ProtocolEra::Modern2026),
+            Self::LegacySseFallbackAuthorized(_) => None,
+        }
+    }
+
+    /// Returns the ready modern client when the probe selected the modern era.
+    #[must_use]
+    pub fn into_modern(self) -> Option<ModernHttpClient> {
+        match self {
+            Self::Modern(client) => Some(client),
+            Self::LegacySseFallbackAuthorized(_) => None,
+        }
+    }
+}
+
+/// Immutable proof that exactly one disposable modern probe authorized legacy
+/// SSE observation for the configured endpoint bundle.
+#[derive(Clone)]
+pub struct LegacySseFallbackAuthorization {
+    protocol_plan: ClientProtocolPlan,
+}
+
+impl LegacySseFallbackAuthorization {
+    /// Returns the immutable plan whose exact bundle authorized this fallback.
+    #[must_use]
+    pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
+        &self.protocol_plan
+    }
+}
+
+/// Errors raised while connecting or issuing a policy-bound modern HTTP request.
+#[derive(Debug)]
+pub enum ModernHttpClientError {
+    /// The supplied plan has no configured modern HTTP POST target.
+    MissingModernPostTarget,
+    /// The native modern runtime cannot claim a legacy-only connection without
+    /// the separately installed exact legacy SSE adapter.
+    LegacyAdapterRequired,
+    /// A normal modern request requires object parameters so final metadata can
+    /// be bound without changing the method-specific parameter shape.
+    RequestParametersMustBeObject,
+    /// `tools/call`, `prompts/get`, and `resources/read` omitted their required
+    /// value for the final `Mcp-Name` header mirror.
+    MissingRequestName { method: String },
+    /// The caller selected no active final client-to-server method.
+    UnsupportedFinalMethod { method: String },
+    /// The caller selected a final method that only the server may send.
+    ServerInitiatedFinalMethod { method: String },
+    /// The caller omitted the request ID required by the selected final method.
+    MissingRequestId { method: String },
+    /// The caller supplied an ID for a final notification method.
+    NotificationHasRequestId { method: String },
+    /// JSON-RPC or final metadata serialization failed before a native POST.
+    RequestEncodingFailed,
+    /// The native executor rejected or failed the HTTP exchange.
+    Executor(ModernHttpExecutorError),
+    /// The immutable-plan classifier rejected the disposable probe.
+    Negotiation(ClientHttpNegotiationError),
+}
+
+impl fmt::Display for ModernHttpClientError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingModernPostTarget => {
+                formatter.write_str("the protocol plan has no modern MCP POST target")
+            }
+            Self::LegacyAdapterRequired => formatter.write_str(
+                "legacy-only HTTP requires the separately installed exact legacy SSE adapter",
+            ),
+            Self::RequestParametersMustBeObject => {
+                formatter.write_str("modern MCP request parameters must be an object")
+            }
+            Self::MissingRequestName { method } => {
+                write!(
+                    formatter,
+                    "modern MCP {method} request is missing its header name value"
+                )
+            }
+            Self::UnsupportedFinalMethod { method } => {
+                write!(formatter, "{method} is not an active final MCP method")
+            }
+            Self::ServerInitiatedFinalMethod { method } => {
+                write!(formatter, "{method} is a server-initiated final MCP method")
+            }
+            Self::MissingRequestId { method } => {
+                write!(formatter, "modern MCP request {method} requires an ID")
+            }
+            Self::NotificationHasRequestId { method } => {
+                write!(
+                    formatter,
+                    "modern MCP notification {method} must not have an ID"
+                )
+            }
+            Self::RequestEncodingFailed => {
+                formatter.write_str("modern MCP request encoding failed")
+            }
+            Self::Executor(error) => error.fmt(formatter),
+            Self::Negotiation(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ModernHttpClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Executor(error) => Some(error),
+            Self::Negotiation(error) => Some(error),
+            Self::MissingModernPostTarget
+            | Self::LegacyAdapterRequired
+            | Self::RequestParametersMustBeObject
+            | Self::MissingRequestName { .. }
+            | Self::UnsupportedFinalMethod { .. }
+            | Self::ServerInitiatedFinalMethod { .. }
+            | Self::MissingRequestId { .. }
+            | Self::NotificationHasRequestId { .. }
+            | Self::RequestEncodingFailed => None,
+        }
+    }
+}
+
+impl ModernHttpClient {
+    /// Connects using one immutable HTTP protocol plan and a disposable modern
+    /// `server/discover` probe.
+    ///
+    /// `ModernOnly` always retains the modern result. `LegacyOnly` refuses
+    /// before native network I/O because it requires the exact legacy adapter.
+    /// `Auto` returns a legacy authorization only for the negotiation layer's
+    /// recognized 400/404/405 empty-or-unrecognized refusal shapes; transport,
+    /// body, and malformed-response failures never authorize a downgrade.
+    pub async fn connect(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+    ) -> Result<ModernHttpConnectOutcome, ModernHttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(ModernHttpClientError::Executor(
+                ModernHttpExecutorError::Cancelled,
+            ));
+        }
+        if matches!(protocol_plan.policy(), ProtocolPolicy::LegacyOnly) {
+            return Err(ModernHttpClientError::LegacyAdapterRequired);
+        }
+
+        let modern_post_target = protocol_plan
+            .modern_post_target()
+            .ok_or(ModernHttpClientError::MissingModernPostTarget)?
+            .to_owned();
+        let mut negotiation = ClientHttpNegotiation::from_protocol_plan(&protocol_plan)
+            .map_err(ModernHttpClientError::Negotiation)?;
+        let probe_request = build_modern_request(
+            &modern_post_target,
+            &client_info,
+            &client_capabilities,
+            SERVER_DISCOVER,
+            serde_json::json!({}),
+            Some(RequestId::Number(1)),
+        )?;
+
+        let probe_response = ModernHttpExecutor::new()
+            .execute(cx, &probe_request)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        let probe_status = probe_response.metadata().status();
+        let probe_body = probe_response
+            .read_to_end(cx, MAX_MODERN_HTTP_PROBE_BODY_BYTES)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        let probe = HttpModernProbe {
+            status: probe_status,
+            body: classify_modern_probe_body(&probe_body),
+        };
+
+        match negotiation
+            .observe_modern_probe(probe)
+            .map_err(ModernHttpClientError::Negotiation)?
+        {
+            ClientHttpNegotiationDecision::ModernSelected => {
+                Ok(ModernHttpConnectOutcome::Modern(Self {
+                    protocol_plan,
+                    modern_post_target,
+                    client_info,
+                    client_capabilities,
+                    executor: ModernHttpExecutor::new(),
+                }))
+            }
+            ClientHttpNegotiationDecision::LegacySseFallbackAuthorized => {
+                Ok(ModernHttpConnectOutcome::LegacySseFallbackAuthorized(
+                    LegacySseFallbackAuthorization { protocol_plan },
+                ))
+            }
+        }
+    }
+
+    /// Returns the immutable policy and endpoint plan selected before connect.
+    #[must_use]
+    pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
+        &self.protocol_plan
+    }
+
+    /// Returns the configured immutable modern POST target.
+    #[must_use]
+    pub fn modern_post_target(&self) -> &str {
+        &self.modern_post_target
+    }
+
+    /// Issues one modern JSON-RPC request through the native HTTP executor.
+    ///
+    /// The runtime overwrites the final metadata keys in `_meta` from its
+    /// immutable client identity and capability values, then mirrors the exact
+    /// protocol version, method, and conditional name in the HTTP request
+    /// headers. The response body stays live for the caller to stream or drain.
+    pub async fn request(
+        &self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        request_id: Option<RequestId>,
+    ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
+        let request = build_modern_request(
+            &self.modern_post_target,
+            &self.client_info,
+            &self.client_capabilities,
+            method.as_ref(),
+            parameters,
+            request_id,
+        )?;
+        self.executor
+            .execute(cx, &request)
+            .await
+            .map_err(ModernHttpClientError::Executor)
+    }
+}
+
+fn build_modern_request(
+    target: &str,
+    client_info: &ClientInfo,
+    client_capabilities: &ClientCapabilities,
+    method: &str,
+    parameters: serde_json::Value,
+    request_id: Option<RequestId>,
+) -> Result<ModernHttpRequest, ModernHttpClientError> {
+    validate_final_method(method, request_id.is_some())?;
+    let mut parameters = parameters
+        .as_object()
+        .cloned()
+        .ok_or(ModernHttpClientError::RequestParametersMustBeObject)?;
+    let name = request_name_header_value(method, &parameters)?;
+    let mut metadata = parameters
+        .remove("_meta")
+        .map(|metadata| {
+            metadata
+                .as_object()
+                .cloned()
+                .ok_or(ModernHttpClientError::RequestParametersMustBeObject)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut final_request_meta = FinalRequestMeta::new(client_capabilities.clone());
+    final_request_meta.client_info = Some(client_info.clone());
+    let final_metadata = serde_json::to_value(final_request_meta)
+        .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
+    let final_metadata = final_metadata
+        .as_object()
+        .ok_or(ModernHttpClientError::RequestEncodingFailed)?;
+    metadata.extend(final_metadata.clone());
+    parameters.insert("_meta".to_owned(), serde_json::Value::Object(metadata));
+
+    let request = match request_id {
+        Some(request_id) => JsonRpcRequest::new(
+            method,
+            Some(serde_json::Value::Object(parameters)),
+            request_id,
+        ),
+        None => JsonRpcRequest::notification(method, Some(serde_json::Value::Object(parameters))),
+    };
+    let body =
+        serde_json::to_vec(&request).map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
+    ModernHttpRequest::new(target, body, MODERN_PROTOCOL_VERSION, method, name)
+        .map_err(ModernHttpClientError::Executor)
+}
+
+fn request_name_header_value(
+    method: &str,
+    parameters: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<String>, ModernHttpClientError> {
+    let Some(field) = (match method {
+        TOOLS_CALL | PROMPTS_GET => Some("name"),
+        RESOURCES_READ => Some("uri"),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    parameters
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .map(Some)
+        .ok_or_else(|| ModernHttpClientError::MissingRequestName {
+            method: method.to_owned(),
+        })
+}
+
+fn validate_final_method(method: &str, has_request_id: bool) -> Result<(), ModernHttpClientError> {
+    let final_method = final_2026_07_28_method(method).ok_or_else(|| {
+        ModernHttpClientError::UnsupportedFinalMethod {
+            method: method.to_owned(),
+        }
+    })?;
+    if !matches!(
+        final_method.direction,
+        Final2026Direction::ClientToServer | Final2026Direction::Bidirectional
+    ) {
+        return Err(ModernHttpClientError::ServerInitiatedFinalMethod {
+            method: method.to_owned(),
+        });
+    }
+    match (final_method.envelope, has_request_id) {
+        (Final2026EnvelopeKind::Request, false) => Err(ModernHttpClientError::MissingRequestId {
+            method: method.to_owned(),
+        }),
+        (Final2026EnvelopeKind::Notification, true) => {
+            Err(ModernHttpClientError::NotificationHasRequestId {
+                method: method.to_owned(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+fn classify_modern_probe_body(body: &[u8]) -> HttpProbeBody {
+    if body.is_empty() {
+        return HttpProbeBody::Empty;
+    }
+    match decode_strict_jsonrpc_message(body, MAX_MODERN_HTTP_PROBE_BODY_BYTES) {
+        Ok(JsonRpcMessage::Response(_)) => HttpProbeBody::RecognizedModernJsonRpc,
+        Ok(JsonRpcMessage::Request(_)) | Err(_) => HttpProbeBody::Unrecognized,
     }
 }
 
