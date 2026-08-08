@@ -1230,7 +1230,7 @@ fn serialized_cache_identity<T: serde::Serialize>(value: &T, member: &str) -> Mc
 #[derive(Debug, Default)]
 pub struct ProxyUpstreamBindingRegistry {
     stdio: HashMap<StdioBindingKey, ProxyUpstreamBinding>,
-    live_stdio: HashMap<LiveStdioBindingKey, ProxyUpstreamBinding>,
+    live_stdio: HashMap<LiveStdioBindingKey, ProxyClient>,
     http: HashMap<HttpBindingKey, ProxyUpstreamBinding>,
     http_eras: HttpEraCache,
     live_http: HashMap<LiveHttpBindingKey, ProxyClient>,
@@ -1243,7 +1243,10 @@ impl ProxyUpstreamBindingRegistry {
     /// from caller-provided opening-frame assumptions. `Auto` therefore uses
     /// the client's modern-first discovery and only observes the client's
     /// narrowly authorized fallback behavior. A cache entry is inserted only
-    /// after both connection and exact selected-era admission succeed.
+    /// after both connection and exact selected-era admission succeed. Later
+    /// establishments for the same immutable upstream reuse that live client,
+    /// rather than allowing a caller-provided classification or a fresh
+    /// negotiation to alter the pinned era.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_stdio_with_protocol_plan(
         &mut self,
@@ -1272,23 +1275,12 @@ impl ProxyUpstreamBindingRegistry {
             policy: protocol_plan.policy(),
             configuration_generation,
         };
-        let mut client =
-            Client::stdio_with_protocol_plan_with_cx(command, args, protocol_plan, cx)?;
-        let binding = binding_from_live_stdio_client(&client, configuration_generation)?;
-
-        if let Some(existing) = self.live_stdio.get(&key)
-            && *existing != binding
-        {
-            let mismatch = McpError::invalid_request(
-                "A live upstream selected an era that conflicts with its successful cached binding",
-            );
-            return match client.close() {
-                Ok(()) => Err(mismatch),
-                Err(cleanup_error) => Err(McpError::internal_error(format!(
-                    "{mismatch}; additionally failed to close the conflicting upstream: {cleanup_error}"
-                ))),
-            };
+        if let Some(existing) = self.live_stdio.get(&key) {
+            return Ok(existing.clone());
         }
+
+        let client = Client::stdio_with_protocol_plan_with_cx(command, args, protocol_plan, cx)?;
+        let binding = binding_from_live_stdio_client(&client, configuration_generation)?;
 
         let upstream_protocol_version = client.protocol_version().to_owned();
         let proxy = ProxyClient::from_backend_with_upstream_binding(
@@ -1296,7 +1288,7 @@ impl ProxyUpstreamBindingRegistry {
             binding,
             &upstream_protocol_version,
         )?;
-        self.live_stdio.insert(key, binding);
+        self.live_stdio.insert(key, proxy.clone());
         Ok(proxy)
     }
 
@@ -3595,6 +3587,91 @@ exec sleep 2
 
     #[cfg(unix)]
     #[test]
+    fn proxy_outbound_auto_pins_live_stdio_era_per_upstream() {
+        let discovery = modern_discovery_response_line("pinned-auto-proxy-peer", &["2026-07-28"]);
+        let first_tool_result = scripted_response_line(
+            2,
+            serde_json::json!({"content": [{"type": "text", "text": "first"}]}),
+        );
+        let second_tool_result = scripted_response_line(
+            3,
+            serde_json::json!({"content": [{"type": "text", "text": "second"}]}),
+        );
+        let script = format!(
+            r#"
+IFS= read -r discovery || exit 90
+case "$discovery" in *"\"method\":\"server/discover\""*) ;; *) exit 91 ;; esac
+printf '%s\n' '{discovery}'
+IFS= read -r first_tool || exit 92
+case "$first_tool" in *"\"method\":\"tools/call\""*) ;; *) exit 93 ;; esac
+printf '%s\n' '{first_tool_result}'
+IFS= read -r second_tool || exit 94
+case "$second_tool" in *"\"method\":\"tools/call\""*) ;; *) exit 95 ;; esac
+printf '%s\n' '{second_tool_result}'
+exec sleep 2
+"#
+        );
+        let mut bindings = ProxyClient::upstream_binding_registry();
+        let first = bindings
+            .connect_stdio_with_protocol_plan(
+                "pinned-auto-route",
+                "stdio:pinned-auto-peer",
+                22,
+                "sh",
+                &["-c", script.as_str()],
+                ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+                Cx::for_testing(),
+            )
+            .expect("the real Auto discovery selects the modern upstream");
+        let selected = first
+            .upstream_binding()
+            .expect("the selected era is retained");
+        let second = bindings
+            .connect_stdio_with_protocol_plan(
+                "pinned-auto-route",
+                "stdio:pinned-auto-peer",
+                22,
+                "sh",
+                &["-c", script.as_str()],
+                ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+                Cx::for_testing(),
+            )
+            .expect("the same immutable upstream reuses its pinned selection");
+
+        assert_eq!(selected.era(), ProtocolEra::Modern2026);
+        assert_eq!(selected.policy(), ProtocolPolicy::Auto);
+        assert_eq!(second.upstream_binding(), Some(selected));
+        assert!(matches!(
+            first
+                .call_tool_final(
+                    &McpContext::new(Cx::for_testing(), 112),
+                    "echo",
+                    serde_json::json!({}),
+                )
+                .expect("the first request uses the live modern client")
+                .payload
+                .content
+                .as_slice(),
+            [ContentBlock::Text { text, .. }] if text == "first"
+        ));
+        assert!(matches!(
+            second
+                .call_tool_final(
+                    &McpContext::new(Cx::for_testing(), 113),
+                    "echo",
+                    serde_json::json!({}),
+                )
+                .expect("the cached proxy advances the same selected client")
+                .payload
+                .content
+                .as_slice(),
+            [ContentBlock::Text { text, .. }] if text == "second"
+        ));
+        assert_eq!(bindings.live_stdio.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn proxy_outbound_auto_authorized_refusal_selects_live_legacy_client_and_forwards_tool() {
         let discovery_refusal = method_not_found_response_line();
         let initialize = legacy_initialize_response_line();
@@ -3674,14 +3751,15 @@ exec sleep 2
 
     #[cfg(unix)]
     #[test]
-    fn proxy_outbound_auto_malformed_modern_discovery_never_falls_back_to_legacy() {
-        let malformed_discovery = modern_discovery_response_line(
-            "auto-proxy-peer",
-            &[fastmcp_protocol::PROTOCOL_VERSION],
-        );
+    fn proxy_outbound_auto_rejects_one_field_contradictory_live_stdio_era() {
+        // This differs from the modern live-positive fixture only in the
+        // advertised discovery version: exact legacy cannot be accepted as a
+        // successful modern discovery or authorize a fallback.
+        let contradictory_discovery =
+            modern_discovery_response_line("auto-proxy-peer", &["2024-11-05"]);
         let legacy_initialize = legacy_initialize_response_line();
         let script =
-            malformed_modern_or_legacy_peer_script(&malformed_discovery, &legacy_initialize);
+            malformed_modern_or_legacy_peer_script(&contradictory_discovery, &legacy_initialize);
         let mut bindings = ProxyClient::upstream_binding_registry();
 
         let error = bindings
@@ -3695,7 +3773,7 @@ exec sleep 2
                 Cx::for_testing(),
             )
             .err()
-            .expect("a malformed modern success must not start the available legacy peer");
+            .expect("a contradictory modern success must not start the available legacy peer");
 
         assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
         assert!(
