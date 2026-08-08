@@ -27,9 +27,9 @@ use fastmcp_protocol::{
     CacheScope, CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy,
     DecodedResult, FinalCallToolResult, FinalCompletionParams, FinalGetPromptResult,
     FinalPromptMessage, FinalReadResourceResult, Icon, JsonRpcRequest, LegacyCompletionParams,
-    ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource, ResourceContent,
-    ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations, decode_peer_result,
-    encode_result,
+    InputRequiredResult, ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource,
+    ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations,
+    decode_peer_result, encode_result,
 };
 
 // ============================================================================
@@ -233,6 +233,27 @@ where
 /// A boxed future for async handler results.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// One application-authored result of a final method that may require input.
+///
+/// The `InputRequired` branch carries the protocol-owned value directly, so
+/// its exact request state, metadata, and open members remain intact until
+/// the router selects the final response envelope. Legacy handler defaults
+/// continue to produce only the exact legacy projection promoted as
+/// [`Self::Complete`](FinalMethodOutcome::Complete).
+#[derive(Debug, Clone)]
+pub enum FinalMethodOutcome<T> {
+    /// Complete the request with its method-specific final payload.
+    Complete(CompleteResult<T>),
+    /// Ask the final peer for additional input before retrying the request.
+    InputRequired(InputRequiredResult),
+}
+
+impl<T> From<CompleteResult<T>> for FinalMethodOutcome<T> {
+    fn from(result: CompleteResult<T>) -> Self {
+        Self::Complete(result)
+    }
+}
+
 /// One application-authored outcome of a final `tools/call` handler.
 ///
 /// `CreateTask` is deliberately a request for the router to create durable
@@ -242,6 +263,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub enum FinalToolOutcome {
     /// Complete this tool call synchronously through the final result algebra.
     Complete(CompleteResult<FinalCallToolResult>),
+    /// Ask the final peer for additional input before retrying this tool call.
+    ///
+    /// This retains the protocol-owned input-required result without trying
+    /// to coerce it into the legacy complete-result projection.
+    InputRequired(InputRequiredResult),
     /// Create one durable working task after negotiated capability admission.
     CreateTask {
         /// Optional initial status message retained by the task state machine.
@@ -252,6 +278,12 @@ pub enum FinalToolOutcome {
 impl From<CompleteResult<FinalCallToolResult>> for FinalToolOutcome {
     fn from(result: CompleteResult<FinalCallToolResult>) -> Self {
         Self::Complete(result)
+    }
+}
+
+impl From<InputRequiredResult> for FinalToolOutcome {
+    fn from(result: InputRequiredResult) -> Self {
+        Self::InputRequired(result)
     }
 }
 
@@ -889,6 +921,35 @@ pub trait ResourceHandler: Send + Sync {
         promote_legacy_resource_contents(self.read_with_uri(ctx, uri, params)?)
     }
 
+    /// Reads the resource through the complete-or-input-required final algebra.
+    ///
+    /// The default preserves the exact legacy projection by promoting
+    /// [`Self::read_final`] into the complete branch. A final-only handler may
+    /// override this method to return `input_required` without coercing that
+    /// state into a legacy resource result.
+    fn read_final_outcome(
+        &self,
+        ctx: &McpContext,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        self.read_final(ctx).map(FinalMethodOutcome::Complete)
+    }
+
+    /// Reads the resource through the complete-or-input-required final algebra
+    /// with URI parameters.
+    fn read_final_outcome_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &UriParams,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        if params.is_empty() {
+            self.read_final_outcome(ctx)
+        } else {
+            self.read_final_with_uri(ctx, uri, params)
+                .map(FinalMethodOutcome::Complete)
+        }
+    }
+
     /// Asynchronously reads the resource through the final result surface.
     fn read_final_async<'a>(
         &'a self,
@@ -921,6 +982,40 @@ pub trait ResourceHandler: Send + Sync {
         })
     }
 
+    /// Asynchronously reads the resource through the complete-or-input-required
+    /// final algebra.
+    fn read_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            match self.read_final_outcome(ctx) {
+                Ok(value) => Outcome::Ok(value),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
+    /// Asynchronously reads the resource through the complete-or-input-required
+    /// final algebra with URI parameters.
+    fn read_final_outcome_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            if params.is_empty() {
+                self.read_final_outcome_async(ctx).await
+            } else {
+                match self.read_final_outcome_with_uri(ctx, uri, params) {
+                    Ok(value) => Outcome::Ok(value),
+                    Err(error) => Outcome::Err(error),
+                }
+            }
+        })
+    }
+
     /// Reads the resource from a request-owned structured child.
     ///
     /// Modern router dispatch supplies the child [`Cx`] that owns this read.
@@ -946,6 +1041,18 @@ pub trait ResourceHandler: Send + Sync {
         params: &'a UriParams,
     ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
         self.read_final_async_with_uri(ctx, uri, params)
+    }
+
+    /// Reads the resource's complete-or-input-required final outcome from a
+    /// request-owned structured child.
+    fn read_final_outcome_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        self.read_final_outcome_async_with_uri(ctx, uri, params)
     }
 }
 
@@ -1061,6 +1168,21 @@ pub trait PromptHandler: Send + Sync {
         promote_legacy_prompt_messages(self.get(ctx, arguments)?)
     }
 
+    /// Gets the prompt through the complete-or-input-required final algebra.
+    ///
+    /// The default preserves the exact legacy projection by promoting
+    /// [`Self::get_final`] into the complete branch. A final-only handler may
+    /// override this method to return `input_required` without coercing that
+    /// state into a legacy prompt result.
+    fn get_final_outcome(
+        &self,
+        ctx: &McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+        self.get_final(ctx, arguments)
+            .map(FinalMethodOutcome::Complete)
+    }
+
     /// Asynchronously gets the prompt through the final result surface.
     fn get_final_async<'a>(
         &'a self,
@@ -1069,6 +1191,21 @@ pub trait PromptHandler: Send + Sync {
     ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
         Box::pin(async move {
             match self.get_final(ctx, arguments) {
+                Ok(value) => Outcome::Ok(value),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
+    /// Asynchronously gets the prompt through the complete-or-input-required
+    /// final algebra.
+    fn get_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        Box::pin(async move {
+            match self.get_final_outcome(ctx, arguments) {
                 Ok(value) => Outcome::Ok(value),
                 Err(error) => Outcome::Err(error),
             }
@@ -1097,6 +1234,17 @@ pub trait PromptHandler: Send + Sync {
         arguments: std::collections::HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
         self.get_final_async(ctx, arguments)
+    }
+
+    /// Gets the prompt's complete-or-input-required final outcome from a
+    /// request-owned structured child.
+    fn get_final_outcome_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        self.get_final_outcome_async(ctx, arguments)
     }
 }
 
@@ -1466,12 +1614,41 @@ impl MountedResourceHandler {
         Ok(result)
     }
 
+    fn translate_outgoing_final_method_outcome(
+        &self,
+        outcome: FinalMethodOutcome<FinalReadResourceResult>,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        match outcome {
+            FinalMethodOutcome::Complete(result) => self
+                .translate_outgoing_final_result(result)
+                .map(FinalMethodOutcome::Complete),
+            FinalMethodOutcome::InputRequired(result) => {
+                Ok(FinalMethodOutcome::InputRequired(result))
+            }
+        }
+    }
+
     fn translate_outgoing_final_outcome(
         &self,
         outcome: McpOutcome<CompleteResult<FinalReadResourceResult>>,
     ) -> McpOutcome<CompleteResult<FinalReadResourceResult>> {
         match outcome {
             Outcome::Ok(result) => match self.translate_outgoing_final_result(result) {
+                Ok(result) => Outcome::Ok(result),
+                Err(error) => Outcome::Err(error),
+            },
+            Outcome::Err(error) => Outcome::Err(error),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        }
+    }
+
+    fn translate_outgoing_final_method_outcome_async(
+        &self,
+        outcome: McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>,
+    ) -> McpOutcome<FinalMethodOutcome<FinalReadResourceResult>> {
+        match outcome {
+            Outcome::Ok(result) => match self.translate_outgoing_final_method_outcome(result) {
                 Ok(result) => Outcome::Ok(result),
                 Err(error) => Outcome::Err(error),
             },
@@ -1607,6 +1784,27 @@ impl ResourceHandler for MountedResourceHandler {
             .and_then(|result| self.translate_outgoing_final_result(result))
     }
 
+    fn read_final_outcome(
+        &self,
+        ctx: &McpContext,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        self.inner
+            .read_final_outcome(ctx)
+            .and_then(|result| self.translate_outgoing_final_method_outcome(result))
+    }
+
+    fn read_final_outcome_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &UriParams,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        let source_uri = self.translate_incoming_uri(uri)?;
+        self.inner
+            .read_final_outcome_with_uri(ctx, &source_uri, params)
+            .and_then(|result| self.translate_outgoing_final_method_outcome(result))
+    }
+
     fn read_final_async<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -1630,6 +1828,36 @@ impl ResourceHandler for MountedResourceHandler {
             self.translate_outgoing_final_outcome(
                 self.inner
                     .read_final_async_with_uri(ctx, &source_uri, params)
+                    .await,
+            )
+        })
+    }
+
+    fn read_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            self.translate_outgoing_final_method_outcome_async(
+                self.inner.read_final_outcome_async(ctx).await,
+            )
+        })
+    }
+
+    fn read_final_outcome_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            let source_uri = match self.translate_incoming_uri(uri) {
+                Ok(source_uri) => source_uri,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.translate_outgoing_final_method_outcome_async(
+                self.inner
+                    .read_final_outcome_async_with_uri(ctx, &source_uri, params)
                     .await,
             )
         })
@@ -1669,6 +1897,31 @@ impl ResourceHandler for MountedResourceHandler {
             self.translate_outgoing_final_outcome(
                 self.inner
                     .read_final_async_with_uri_in_request(ctx, request_cx, &source_uri, params)
+                    .await,
+            )
+        })
+    }
+
+    fn read_final_outcome_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            let source_uri = match self.translate_incoming_uri(uri) {
+                Ok(source_uri) => source_uri,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.translate_outgoing_final_method_outcome_async(
+                self.inner
+                    .read_final_outcome_async_with_uri_in_request(
+                        ctx,
+                        request_cx,
+                        &source_uri,
+                        params,
+                    )
                     .await,
             )
         })
@@ -1752,12 +2005,28 @@ impl PromptHandler for MountedPromptHandler {
         self.inner.get_final(ctx, arguments)
     }
 
+    fn get_final_outcome(
+        &self,
+        ctx: &McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+        self.inner.get_final_outcome(ctx, arguments)
+    }
+
     fn get_final_async<'a>(
         &'a self,
         ctx: &'a McpContext,
         arguments: std::collections::HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
         self.inner.get_final_async(ctx, arguments)
+    }
+
+    fn get_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        self.inner.get_final_outcome_async(ctx, arguments)
     }
 
     fn get_async_in_request<'a>(
@@ -1778,13 +2047,44 @@ impl PromptHandler for MountedPromptHandler {
         self.inner
             .get_final_async_in_request(ctx, request_cx, arguments)
     }
+
+    fn get_final_outcome_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        self.inner
+            .get_final_outcome_async_in_request(ctx, request_cx, arguments)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use asupersync::Cx;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, OnceLock, atomic::{AtomicUsize, Ordering}};
+
+    fn input_required_result(request_state: &str) -> InputRequiredResult {
+        let input = format!(
+            r#"{{"resultType":"input_required","inputRequests":{{"confirmation":{{"type":"boolean"}}}},"requestState":"{request_state}"}}"#
+        );
+        let (decoded, diagnostic) = decode_peer_result(
+            &input,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("final input-required result is admitted");
+        assert_eq!(diagnostic, None);
+        let DecodedResult::InputRequired(result) = decoded else {
+            panic!("input-required discriminator selects its final result branch");
+        };
+        result
+    }
+
+    fn encode_input_required(result: &InputRequiredResult) -> String {
+        encode_result(&DecodedResult::InputRequired(result.clone()))
+    }
 
     #[test]
     fn handler_final_complete_contract_positive() {
@@ -2082,6 +2382,106 @@ mod tests {
             [ContentBlock::Text { .. }]
         ));
         assert!(final_result.meta.server_info.is_none());
+    }
+
+    #[test]
+    fn tool_handler_final_outcome_preserves_input_required_algebra() {
+        struct InputRequiredTool {
+            result: InputRequiredResult,
+            legacy_calls: AtomicUsize,
+        }
+
+        impl ToolHandler for InputRequiredTool {
+            fn definition(&self) -> Tool {
+                StubTool.definition()
+            }
+
+            fn call(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
+                self.legacy_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![Content::text("legacy projection")])
+            }
+
+            fn call_final_outcome(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<FinalToolOutcome> {
+                Ok(FinalToolOutcome::InputRequired(self.result.clone()))
+            }
+        }
+
+        let tool = InputRequiredTool {
+            result: input_required_result("retry-tool-7"),
+            legacy_calls: AtomicUsize::new(0),
+        };
+        let expected = encode_input_required(&tool.result);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+
+        let outcome = tool
+            .call_final_outcome(&ctx, serde_json::json!({}))
+            .expect("final handler result");
+
+        let FinalToolOutcome::InputRequired(result) = outcome else {
+            panic!("final handler must preserve the input-required result branch");
+        };
+        assert_eq!(encode_input_required(&result), expected);
+        assert_eq!(tool.legacy_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn tool_handler_legacy_projection_leaves_unprojectable_input_state_unchanged() {
+        struct InputRequiredTool {
+            result: InputRequiredResult,
+            legacy_calls: AtomicUsize,
+        }
+
+        impl ToolHandler for InputRequiredTool {
+            fn definition(&self) -> Tool {
+                StubTool.definition()
+            }
+
+            fn call(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
+                self.legacy_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![Content::text("legacy projection")])
+            }
+
+            fn call_final_outcome(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<FinalToolOutcome> {
+                Ok(FinalToolOutcome::InputRequired(self.result.clone()))
+            }
+        }
+
+        let tool = InputRequiredTool {
+            result: input_required_result("retry-tool-7"),
+            legacy_calls: AtomicUsize::new(0),
+        };
+        let original = encode_input_required(&tool.result);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+
+        let legacy = tool
+            .call(&ctx, serde_json::json!({}))
+            .expect("legacy handler result remains exact");
+
+        assert!(matches!(legacy.as_slice(), [Content::Text { text }] if text == "legacy projection"));
+        assert_eq!(tool.legacy_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            encode_input_required(&tool.result),
+            original,
+            "legacy projection must not coerce or mutate final-only requestState"
+        );
     }
 
     #[test]
