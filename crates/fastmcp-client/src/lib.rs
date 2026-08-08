@@ -77,6 +77,7 @@ pub use session::{ClientProtocolPlan, ClientProtocolPlanError, ClientSession};
 
 use std::any::Any;
 use std::cell::Cell;
+use std::collections::VecDeque;
 #[cfg(target_os = "linux")]
 use std::io::Read as _;
 use std::io::Write as _;
@@ -95,18 +96,20 @@ use std::time::{Duration, Instant};
 use asupersync::{Cx, channel::oneshot};
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sha256_bounded};
 use fastmcp_protocol::common_types::{ContentBlock, EmbeddedResourceContents, RawIcon};
+use fastmcp_protocol::methods::{Final2026Peer, final_2026_07_28_method};
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancelledParams,
     ClientCapabilities, ClientInfo, Content, CoreDispatchError, CoreRequest, CorrelationKey,
-    FinalRequestMeta, GetPromptParams, GetTaskParams, GetTaskResult, InitializeParams,
-    InitializeResult, JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
-    ListTasksParams, ListTasksResult, ListToolsParams, LogLevel, LogMessageParams,
-    PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, PromptMessage, ReadResourceParams,
-    RequestId, RequestMeta, Resource, ResourceContent, ResourceTemplate, ServerCapabilities,
-    ServerInfo, SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo,
-    TaskResult, TaskStatus, Tool, ToolAnnotations,
+    FinalProgressNotificationParams, FinalRequestMeta, GetPromptParams, GetTaskParams,
+    GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION, JsonRpcError,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
+    ListResourceTemplatesParams, ListResourcesParams, ListTasksParams, ListTasksResult,
+    ListToolsParams, LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt,
+    PromptArgument, PromptMessage, ReadResourceParams, RequestId, RequestMeta, Resource,
+    ResourceContent, ResourceTemplate, ServerCapabilities, ServerInfo, ServerNotification,
+    SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo, TaskResult,
+    TaskStatus, Tool, ToolAnnotations,
 };
 use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
 
@@ -1564,6 +1567,11 @@ enum ServerNotificationKind {
     LogMessage,
 }
 
+enum ModernServerNotification {
+    Progress(FinalProgressNotificationParams),
+    Retained,
+}
+
 fn server_notification_kind(request: &JsonRpcRequest) -> Option<ServerNotificationKind> {
     if request.id.is_some() {
         return None;
@@ -1574,6 +1582,18 @@ fn server_notification_kind(request: &JsonRpcRequest) -> Option<ServerNotificati
         "notifications/message" => Some(ServerNotificationKind::LogMessage),
         _ => None,
     }
+}
+
+/// Maximum number of non-progress final server notifications retained for a
+/// modern client session before the connection fails closed.
+pub const MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS: usize = 64;
+
+const FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR: &str =
+    "Final server notification queue capacity exceeded";
+
+fn is_final_server_notification_method(request: &JsonRpcRequest) -> bool {
+    final_2026_07_28_method(&request.method)
+        .is_some_and(|method| method.admits_notification_from(Final2026Peer::Server))
 }
 
 const INITIALIZE_REQUEST_ID: i64 = 1;
@@ -2987,6 +3007,8 @@ pub struct Client {
     next_id: AtomicU64,
     /// Strict response correlation for every in-flight request.
     responses: ResponseRegistry,
+    /// Exact non-progress notifications received from a modern server.
+    final_server_notifications: VecDeque<ServerNotification>,
     /// Idle/absolute policy for ordinary stdio responses.
     ///
     /// Unix child pipes use bounded readiness polling, including while a peer
@@ -3316,6 +3338,7 @@ impl Client {
             // allocator, leaving ID 2 as the first ordinary request ID.
             next_id: AtomicU64::new(1),
             responses: ResponseRegistry::new(),
+            final_server_notifications: VecDeque::new(),
             timeout_policy: RequestTimeoutPolicy::default(),
             auto_initialize: false,
             initialized: AtomicBool::new(false),
@@ -3403,6 +3426,7 @@ impl Client {
             session,
             next_id: AtomicU64::new(2), // Start at 2 since initialize used 1
             responses: ResponseRegistry::new(),
+            final_server_notifications: VecDeque::new(),
             timeout_policy,
             auto_initialize: false,
             initialized: AtomicBool::new(true), // Already initialized by builder
@@ -3453,6 +3477,7 @@ impl Client {
             session,
             next_id: AtomicU64::new(1), // Start at 1 since initialize hasn't happened
             responses: ResponseRegistry::new(),
+            final_server_notifications: VecDeque::new(),
             timeout_policy,
             auto_initialize: true,
             initialized: AtomicBool::new(false),
@@ -3626,6 +3651,16 @@ impl Client {
         self.session.selected_era()
     }
 
+    /// Drains final server notifications received during modern requests.
+    ///
+    /// Progress notifications remain request-scoped and are delivered only to
+    /// the progress callback. Exact 2024-11-05 sessions never retain values in
+    /// this queue.
+    #[must_use]
+    pub fn take_final_server_notifications(&mut self) -> Vec<ServerNotification> {
+        self.final_server_notifications.drain(..).collect()
+    }
+
     /// Returns the immutable transport policy and endpoint configuration.
     #[must_use]
     pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
@@ -3764,6 +3799,36 @@ impl Client {
                 "Client core request parameters do not match the negotiated protocol era",
             )),
         }
+    }
+
+    fn retain_modern_server_notification(
+        &mut self,
+        request: &JsonRpcRequest,
+    ) -> McpResult<Option<ModernServerNotification>> {
+        let modern_session = match self.session.selected_era() {
+            Some(ProtocolEra::Modern2026) => true,
+            Some(ProtocolEra::Legacy2024) => false,
+            None => self.session.protocol_plan().policy() == ProtocolPolicy::ModernOnly,
+        };
+        if !modern_session || !is_final_server_notification_method(request) {
+            return Ok(None);
+        }
+
+        let notification = ServerNotification::decode(request).map_err(|error| {
+            McpError::invalid_request(format!("Invalid final server notification: {error}"))
+        })?;
+
+        let ServerNotification::Progress(progress) = notification else {
+            if self.final_server_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+                return Err(McpError::invalid_request(
+                    FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+                ));
+            }
+            self.final_server_notifications.push_back(notification);
+            return Ok(Some(ModernServerNotification::Retained));
+        };
+
+        Ok(Some(ModernServerNotification::Progress(progress)))
     }
 
     /// Sends a request and waits for response.
@@ -4125,6 +4190,14 @@ impl Client {
                 }
             }
             JsonRpcMessage::Request(request) => {
+                match self.retain_modern_server_notification(&request) {
+                    Ok(Some(_)) => return timeout,
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = self.terminate_connection(error);
+                        return timeout;
+                    }
+                }
                 if let Some(response) = server_request_response(&request) {
                     if let Err(error) = self.send_bounded_control_message(response) {
                         let _ = self.terminate_connection(error);
@@ -4218,6 +4291,11 @@ impl Client {
                     }
                 }
                 JsonRpcMessage::Request(request) => {
+                    match self.retain_modern_server_notification(&request) {
+                        Ok(Some(_)) => continue,
+                        Ok(None) => {}
+                        Err(error) => return Err(self.terminate_connection(error)),
+                    }
                     if let Some(response) = server_request_response(&request) {
                         if let Err(error) = self.send_server_response_during_receive(response) {
                             return Err(self.terminate_connection(error));
@@ -4719,6 +4797,42 @@ impl Client {
                     }
                 }
                 JsonRpcMessage::Request(request) => {
+                    match self.retain_modern_server_notification(&request) {
+                        Ok(Some(ModernServerNotification::Progress(progress))) => {
+                            if progress.progress.is_finite()
+                                && progress.total.is_none_or(f64::is_finite)
+                                && last_progress.is_none_or(|last| progress.progress > last)
+                                && progress.progress_token == *expected_marker
+                            {
+                                if invoke_tool_progress_callback(
+                                    &mut *on_progress,
+                                    progress.progress,
+                                    progress.total,
+                                    progress.message.as_deref(),
+                                )
+                                .is_err()
+                                {
+                                    let error =
+                                        McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR);
+                                    return Err(
+                                        self.finish_committed_request_locally(&expected_id, error)
+                                    );
+                                }
+                                last_progress = Some(progress.progress);
+                                if timeout_policy.reset_idle_on_matching_progress
+                                    && let Err(error) = deadlines.reset_idle_at(received_at)
+                                {
+                                    return Err(
+                                        self.finish_committed_request_locally(&expected_id, error)
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        Ok(Some(_)) => continue,
+                        Ok(None) => {}
+                        Err(error) => return Err(self.terminate_connection(error)),
+                    }
                     if let Some(response) = server_request_response(&request) {
                         if let Err(error) = self.send_server_response_during_receive(response) {
                             return Err(self.terminate_connection(error));
@@ -9087,6 +9201,22 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_server_notification_client_script(notification: &str, call_response: &str) -> String {
+        let discovery_response =
+            modern_discovery_response("notification-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r request || exit 1; \
+             case \"$request\" in *tools/call*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{notification}'; \
+             printf '%s\\n' '{call_response}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
     fn modern_subscriptions_listen_client_script() -> String {
         let discovery_response =
             modern_discovery_response("subscriptions-modern-server", &[MODERN_PROTOCOL_VERSION]);
@@ -10170,6 +10300,64 @@ mod tests {
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(!client.is_initialized());
         assert!(client.responses.terminal_error().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_final_server_notifications_are_typed_and_drained() {
+        let script = modern_server_notification_client_script(
+            r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///workspace/guide.md","_meta":{"com.example/trace":"retained"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"notification result"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+
+        let content = client
+            .call_tool("echo", serde_json::json!({"text": "notification"}))
+            .expect("the typed notification must not consume its following response");
+        assert_eq!(content.len(), 1);
+
+        let notifications = client.take_final_server_notifications();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0],
+            ServerNotification::ResourceUpdated(params)
+                if params.uri.as_str() == "file:///workspace/guide.md"
+                    && params.meta.as_ref().and_then(|meta| meta.get("com.example/trace"))
+                        == Some(&serde_json::json!("retained"))
+        ));
+        assert!(client.take_final_server_notifications().is_empty());
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_final_server_notification_null_uri_fails_closed() {
+        // This differs from the accepted notification only in the required URI.
+        let script = modern_server_notification_client_script(
+            r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":null,"_meta":{"com.example/trace":"retained"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"notification result"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("same modern discovery initializes the public client");
+
+        let error = client
+            .call_tool("echo", serde_json::json!({"text": "notification"}))
+            .expect_err("a malformed final notification must fail the modern connection");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(!client.is_initialized());
+        assert!(client.responses.terminal_error().is_some());
+        assert!(client.take_final_server_notifications().is_empty());
     }
 
     #[cfg(unix)]
