@@ -54,15 +54,15 @@ use base64::Engine as _;
 #[cfg(test)]
 use fastmcp_core::logging::{debug, info, targets, warn};
 use fastmcp_core::{McpError, McpResult, draw_security_identifier};
+use fastmcp_protocol::tasks_extension::TaskStatusNotificationParams as FinalTaskStatusNotificationParams;
 use fastmcp_protocol::{
     CreateTaskResult, FinalCancelTaskResult, FinalGetTaskResult, FinalTaskCallToolResult,
     FinalTaskError, FinalTaskId, FinalTaskStatus, GetTaskParams, Task as FinalTask,
     TaskBase as FinalTaskBase, TaskDuration as FinalTaskDuration,
     TaskInputLedger as FinalTaskInputLedger, TaskInputRequests as FinalTaskInputRequests,
     TaskInputResponses as FinalTaskInputResponses,
-    TaskStatusNotification as FinalTaskStatusNotification,
-    TaskStatusNotificationParams as FinalTaskStatusNotificationParams,
-    TaskTimestamp as FinalTaskTimestamp, UpdateTaskParams, UpdateTaskResult,
+    TaskStatusNotification as FinalTaskStatusNotification, TaskTimestamp as FinalTaskTimestamp,
+    UpdateTaskParams, UpdateTaskResult,
 };
 #[cfg(test)]
 use fastmcp_protocol::{
