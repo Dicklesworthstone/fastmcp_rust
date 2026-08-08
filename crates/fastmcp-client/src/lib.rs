@@ -66,11 +66,12 @@ pub use fastmcp_protocol::tasks_extension::{
     UpdateTaskResult as FinalUpdateTaskResult,
 };
 pub use fastmcp_protocol::{
-    CallToolResult, CompleteResult, CoreResult, FinalCallToolResult,
+    CallToolResult, CompleteResult, CoreResult, CreateMessageParams, CreateMessageResult,
+    ElicitRequestParams, ElicitResult, FinalCallToolResult,
     FinalCompletionArgument as CompletionArgument, FinalCompletionContext as CompletionContext,
     FinalCompletionReference as CompletionReference, FinalCoreResult, FinalGetPromptResult,
     FinalReadResourceResult, FinalSubscriptionsListenResult, GetPromptResult, LegacyCoreResult,
-    ReadResourceResult, SubscriptionFilter,
+    ListRootsParams, ListRootsResult, ReadResourceResult, SubscriptionFilter,
 };
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, LegacySseHttpClient,
@@ -141,6 +142,66 @@ use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDisc
 ///
 /// The callback receives the progress value, optional total, and optional message.
 pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<&str>);
+
+/// Handler for a server-initiated `sampling/createMessage` request.
+pub type SamplingRequestHandler =
+    Box<dyn FnMut(CreateMessageParams) -> McpResult<CreateMessageResult>>;
+
+/// Handler for a server-initiated `roots/list` request.
+pub type RootsRequestHandler = Box<dyn FnMut(ListRootsParams) -> McpResult<ListRootsResult>>;
+
+/// Handler for a server-initiated `elicitation/create` request.
+pub type ElicitationRequestHandler = Box<dyn FnMut(ElicitRequestParams) -> McpResult<ElicitResult>>;
+
+/// Configurable handlers for reverse requests received from a live MCP server.
+#[derive(Default)]
+pub struct ReverseRequestHandlers {
+    sampling_create_message: Option<SamplingRequestHandler>,
+    roots_list: Option<RootsRequestHandler>,
+    elicitation_create: Option<ElicitationRequestHandler>,
+}
+
+impl ReverseRequestHandlers {
+    /// Creates an empty handler set. Unconfigured methods receive `MethodNotFound`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            sampling_create_message: None,
+            roots_list: None,
+            elicitation_create: None,
+        }
+    }
+
+    /// Configures handling for `sampling/createMessage`.
+    #[must_use]
+    pub fn with_sampling_create_message<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut(CreateMessageParams) -> McpResult<CreateMessageResult> + 'static,
+    {
+        self.sampling_create_message = Some(Box::new(handler));
+        self
+    }
+
+    /// Configures handling for `roots/list`.
+    #[must_use]
+    pub fn with_roots_list<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut(ListRootsParams) -> McpResult<ListRootsResult> + 'static,
+    {
+        self.roots_list = Some(Box::new(handler));
+        self
+    }
+
+    /// Configures handling for `elicitation/create`.
+    #[must_use]
+    pub fn with_elicitation_create<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut(ElicitRequestParams) -> McpResult<ElicitResult> + 'static,
+    {
+        self.elicitation_create = Some(Box::new(handler));
+        self
+    }
+}
 use fastmcp_transport::{StdioTransport, Transport, TransportError};
 
 use crate::execution::decode_core_result;
@@ -1896,6 +1957,92 @@ fn server_request_response(request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
     method_not_found_response(request)
 }
 
+fn reverse_request_response<T>(request_id: RequestId, result: McpResult<T>) -> JsonRpcMessage
+where
+    T: serde::Serialize,
+{
+    match result.and_then(|result| {
+        serde_json::to_value(result)
+            .map_err(|_| McpError::internal_error("Failed to serialize reverse request result"))
+    }) {
+        Ok(result) => JsonRpcMessage::Response(JsonRpcResponse::success(request_id, result)),
+        Err(error) => {
+            JsonRpcMessage::Response(JsonRpcResponse::error(Some(request_id), error.into()))
+        }
+    }
+}
+
+fn decode_reverse_request_params<T>(request: &JsonRpcRequest) -> McpResult<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let params = request
+        .params
+        .clone()
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    serde_json::from_value(params)
+        .map_err(|_| McpError::invalid_params("Invalid reverse request parameters"))
+}
+
+fn invoke_reverse_request_handler<P, R>(
+    handler: &mut dyn FnMut(P) -> McpResult<R>,
+    params: P,
+) -> McpResult<R> {
+    catch_client_callback_unwind(|| handler(params))
+        .map_err(|_| McpError::internal_error("Client reverse request handler failed"))?
+}
+
+fn live_server_request_response(
+    handlers: &mut ReverseRequestHandlers,
+    request: &JsonRpcRequest,
+) -> Option<JsonRpcMessage> {
+    let id = request.id.clone()?;
+    if request.method.starts_with("notifications/") {
+        return invalid_notification_request_response(request);
+    }
+    if request.method == "ping" {
+        return Some(JsonRpcMessage::Response(JsonRpcResponse::success(
+            id,
+            serde_json::json!({}),
+        )));
+    }
+
+    let response = match request.method.as_str() {
+        "sampling/createMessage" => reverse_request_response(
+            id,
+            handlers.sampling_create_message.as_mut().map_or_else(
+                || Err(McpError::method_not_found("sampling/createMessage")),
+                |handler| {
+                    decode_reverse_request_params(request)
+                        .and_then(|params| invoke_reverse_request_handler(handler.as_mut(), params))
+                },
+            ),
+        ),
+        "roots/list" => reverse_request_response(
+            id,
+            handlers.roots_list.as_mut().map_or_else(
+                || Err(McpError::method_not_found("roots/list")),
+                |handler| {
+                    decode_reverse_request_params(request)
+                        .and_then(|params| invoke_reverse_request_handler(handler.as_mut(), params))
+                },
+            ),
+        ),
+        "elicitation/create" => reverse_request_response(
+            id,
+            handlers.elicitation_create.as_mut().map_or_else(
+                || Err(McpError::method_not_found("elicitation/create")),
+                |handler| {
+                    decode_reverse_request_params(request)
+                        .and_then(|params| invoke_reverse_request_handler(handler.as_mut(), params))
+                },
+            ),
+        ),
+        _ => return method_not_found_response(request),
+    };
+    Some(response)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ServerNotificationKind {
     Progress,
@@ -3394,6 +3541,8 @@ pub struct Client {
     responses: ResponseRegistry,
     /// Exact non-progress notifications received from a modern server.
     final_server_notifications: VecDeque<ServerNotification>,
+    /// Application handlers for server-initiated requests on this connection.
+    reverse_request_handlers: ReverseRequestHandlers,
     /// Idle/absolute policy for ordinary stdio responses.
     ///
     /// Unix child pipes use bounded readiness polling, including while a peer
@@ -3724,6 +3873,7 @@ impl Client {
             next_id: AtomicU64::new(1),
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            reverse_request_handlers: ReverseRequestHandlers::new(),
             timeout_policy: RequestTimeoutPolicy::default(),
             auto_initialize: false,
             initialized: AtomicBool::new(false),
@@ -3812,6 +3962,7 @@ impl Client {
             next_id: AtomicU64::new(2), // Start at 2 since initialize used 1
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            reverse_request_handlers: ReverseRequestHandlers::new(),
             timeout_policy,
             auto_initialize: false,
             initialized: AtomicBool::new(true), // Already initialized by builder
@@ -3863,6 +4014,7 @@ impl Client {
             next_id: AtomicU64::new(1), // Start at 1 since initialize hasn't happened
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            reverse_request_handlers: ReverseRequestHandlers::new(),
             timeout_policy,
             auto_initialize: true,
             initialized: AtomicBool::new(false),
@@ -4100,6 +4252,15 @@ impl Client {
         policy.validate()?;
         self.timeout_policy = policy;
         Ok(())
+    }
+
+    /// Replaces the reverse request handlers used by this live client session.
+    pub fn set_reverse_request_handlers(&mut self, handlers: ReverseRequestHandlers) {
+        self.reverse_request_handlers = handlers;
+    }
+
+    fn server_request_response(&mut self, request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
+        live_server_request_response(&mut self.reverse_request_handlers, request)
     }
 
     /// Verifies that the initialized server can answer an MCP ping request.
@@ -4739,7 +4900,7 @@ impl Client {
                         return timeout;
                     }
                 }
-                if let Some(response) = server_request_response(&request) {
+                if let Some(response) = self.server_request_response(&request) {
                     if let Err(error) = self.send_bounded_control_message(response) {
                         let _ = self.terminate_connection(error);
                     }
@@ -4837,7 +4998,7 @@ impl Client {
                         Ok(None) => {}
                         Err(error) => return Err(self.terminate_connection(error)),
                     }
-                    if let Some(response) = server_request_response(&request) {
+                    if let Some(response) = self.server_request_response(&request) {
                         if let Err(error) = self.send_server_response_during_receive(response) {
                             return Err(self.terminate_connection(error));
                         }
@@ -5148,7 +5309,7 @@ impl Client {
                         continue;
                     }
 
-                    if let Some(response) = server_request_response(&request) {
+                    if let Some(response) = self.server_request_response(&request) {
                         if let Err(error) = self.send_server_response_during_receive(response) {
                             return Err(self.terminate_connection(error));
                         }
@@ -5775,7 +5936,7 @@ impl Client {
                         Ok(None) => {}
                         Err(error) => return Err(self.terminate_connection(error)),
                     }
-                    if let Some(response) = server_request_response(&request) {
+                    if let Some(response) = self.server_request_response(&request) {
                         if let Err(error) = self.send_server_response_during_receive(response) {
                             return Err(self.terminate_connection(error));
                         }
@@ -7774,6 +7935,128 @@ mod tests {
         );
         assert!(client.is_initialized());
         assert!(!client.transport.is_closed());
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_reverse_request_handlers_positive() {
+        let script = "IFS= read -r request; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
+            IFS= read -r sampling; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"roots/list\",\"id\":42}\\n'; \
+            IFS= read -r roots; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"elicitation/create\",\"id\":43,\"params\":{\"mode\":\"form\",\"message\":\"approval\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}}\\n'; \
+            IFS= read -r elicitation; \
+            case \"$sampling\" in *'\"id\":41'*'\"model\":\"handler-model\"'*) sampling_ok=true;; *) sampling_ok=false;; esac; \
+            case \"$roots\" in *'\"id\":42'*'file:///workspace'*) roots_ok=true;; *) roots_ok=false;; esac; \
+            case \"$elicitation\" in *'\"id\":43'*'\"action\":\"decline\"'*) elicitation_ok=true;; *) elicitation_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sampling\":%s,\"roots\":%s,\"elicitation\":%s}}\\n' \
+            \"$sampling_ok\" \"$roots_ok\" \"$elicitation_ok\"; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+        let sampling_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let roots_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let elicitation_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let handlers = ReverseRequestHandlers::new()
+            .with_sampling_create_message({
+                let sampling_calls = std::rc::Rc::clone(&sampling_calls);
+                move |params| {
+                    sampling_calls.set(sampling_calls.get() + 1);
+                    assert_eq!(params.max_tokens, 9);
+                    Ok(CreateMessageResult::text("handled", "handler-model"))
+                }
+            })
+            .with_roots_list({
+                let roots_calls = std::rc::Rc::clone(&roots_calls);
+                move |_params| {
+                    roots_calls.set(roots_calls.get() + 1);
+                    Ok(ListRootsResult::new(vec![fastmcp_protocol::Root::new(
+                        "file:///workspace",
+                    )]))
+                }
+            })
+            .with_elicitation_create({
+                let elicitation_calls = std::rc::Rc::clone(&elicitation_calls);
+                move |params| {
+                    elicitation_calls.set(elicitation_calls.get() + 1);
+                    assert_eq!(params.message(), "approval");
+                    Ok(ElicitResult::decline())
+                }
+            });
+        client.set_reverse_request_handlers(handlers);
+
+        let result: serde_json::Value = client
+            .send_request("test/reverse-handlers", serde_json::json!({}))
+            .expect("configured reverse handlers must answer live server requests");
+
+        assert_eq!(
+            result,
+            serde_json::json!({"sampling": true, "roots": true, "elicitation": true})
+        );
+        assert_eq!(sampling_calls.get(), 1);
+        assert_eq!(roots_calls.get(), 1);
+        assert_eq!(elicitation_calls.get(), 1);
+        assert!(client.is_initialized());
+        assert!(!client.transport.is_closed());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_reverse_request_handlers_missing_handler_preserves_state() {
+        let script = "IFS= read -r request; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
+            IFS= read -r sampling; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"roots/list\",\"id\":42}\\n'; \
+            IFS= read -r roots; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"elicitation/create\",\"id\":43,\"params\":{\"mode\":\"form\",\"message\":\"approval\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}}\\n'; \
+            IFS= read -r elicitation; \
+            case \"$sampling\" in *'\"id\":41'*'\"model\":\"handler-model\"'*) sampling_ok=true;; *) sampling_ok=false;; esac; \
+            case \"$roots\" in *'\"id\":42'*'\"code\":-32601'*) roots_missing=true;; *) roots_missing=false;; esac; \
+            case \"$elicitation\" in *'\"id\":43'*'\"action\":\"decline\"'*) elicitation_ok=true;; *) elicitation_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sampling\":%s,\"rootsMissing\":%s,\"elicitation\":%s}}\\n' \
+            \"$sampling_ok\" \"$roots_missing\" \"$elicitation_ok\"; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+        let sampling_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let roots_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let elicitation_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let handlers = ReverseRequestHandlers::new()
+            .with_sampling_create_message({
+                let sampling_calls = std::rc::Rc::clone(&sampling_calls);
+                move |_params| {
+                    sampling_calls.set(sampling_calls.get() + 1);
+                    Ok(CreateMessageResult::text("handled", "handler-model"))
+                }
+            })
+            .with_elicitation_create({
+                let elicitation_calls = std::rc::Rc::clone(&elicitation_calls);
+                move |_params| {
+                    elicitation_calls.set(elicitation_calls.get() + 1);
+                    Ok(ElicitResult::decline())
+                }
+            });
+        client.set_reverse_request_handlers(handlers);
+
+        let result: serde_json::Value = client
+            .send_request("test/reverse-handlers", serde_json::json!({}))
+            .expect("a missing reverse handler must not disturb the live session");
+
+        assert_eq!(
+            result,
+            serde_json::json!({"sampling": true, "rootsMissing": true, "elicitation": true})
+        );
+        assert_eq!(sampling_calls.get(), 1);
+        assert_eq!(
+            roots_calls.get(),
+            0,
+            "missing handler must leave state unchanged"
+        );
+        assert_eq!(elicitation_calls.get(), 1);
+        assert!(client.is_initialized());
+        assert!(!client.transport.is_closed());
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 0);
         assert!(client.responses.terminal_error().is_none());
         client.close().expect("client cleanup");
     }
