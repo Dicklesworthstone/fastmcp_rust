@@ -28,10 +28,9 @@ use fastmcp_protocol::{
     FinalReadResourceResult,
 };
 use fastmcp_rust::{
-    CompleteResult, Content, ContentBlock, Cx, GetPromptResult, Implementation, JsonSchema,
-    LabConfig, LabRuntime, McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler,
-    PromptMessage, ReadResourceResult, ResourceContent, ResourceHandler, ResultMeta, Role,
-    ToolHandler, prompt, resource, tool,
+    CompleteResult, Content, ContentBlock, Cx, Implementation, JsonSchema, LabConfig, LabRuntime,
+    McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler, PromptMessage,
+    ResourceContent, ResourceHandler, ResultMeta, Role, ToolHandler, prompt, resource, tool,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
