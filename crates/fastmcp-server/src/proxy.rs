@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
 use fastmcp_client::http_executor::{
-    LegacySseHttpClient, ModernHttpClient, ModernHttpConnectOutcome,
+    LegacySseHttpClient, ModernHttpClient, ModernHttpConnectOutcome, ModernHttpResponseKind,
 };
+use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{Client, ClientProtocolPlan};
 use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpResult, block_on};
 use fastmcp_protocol::methods::translate_legacy_2024_result;
@@ -19,8 +20,11 @@ use fastmcp_protocol::protocol_policy::{
     StdioEraDecision, StdioOpeningFrame,
 };
 use fastmcp_protocol::{
-    ClientCapabilities, ClientInfo, Content, Prompt, PromptMessage, Resource, ResourceContent,
-    ResourceTemplate, Tool,
+    ClientCapabilities, ClientInfo, Content, ContentBlock, CoreRequest, CoreResult,
+    EmbeddedResourceContents, FinalCoreResult, FinalRequestMeta, InitializeParams,
+    InitializeResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCoreResult, Prompt,
+    PromptArgument, PromptMessage, RequestId, Resource, ResourceContent, ResourceTemplate, Tool,
+    ToolAnnotations, decode_strict_jsonrpc_message,
 };
 
 use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
@@ -300,18 +304,24 @@ struct LiveHttpBindingKey {
     transport_identity: String,
     configuration_generation: u64,
     bundle: HttpEndpointBundleKey,
+    client_info_wire: Vec<u8>,
+    client_capabilities_wire: Vec<u8>,
 }
 
 /// One cached native HTTP upstream selected by an immutable protocol plan.
 ///
 /// The enclosed connection is either the shipped final HTTP client or the
-/// exact legacy SSE GET plus advertised-POST client. A selection is held
-/// behind one mutex so clones cannot concurrently consume one legacy SSE
-/// stream or create cross-era request routing.
-#[derive(Clone)]
+/// exact legacy SSE GET plus advertised-POST client. [`ProxyClient`] owns this
+/// backend behind its route-local mutex, so a legacy SSE stream cannot be
+/// advanced concurrently or leak into another upstream's selected era.
 pub struct ProxyHttpClient {
     binding: ProxyUpstreamBinding,
-    connection: Arc<Mutex<ModernHttpConnectOutcome>>,
+    connection: ModernHttpConnectOutcome,
+    cx: Cx,
+    client_info: ClientInfo,
+    client_capabilities: ClientCapabilities,
+    next_request_id: i64,
+    legacy_initialized: bool,
 }
 
 impl std::fmt::Debug for ProxyHttpClient {
@@ -324,51 +334,548 @@ impl std::fmt::Debug for ProxyHttpClient {
 }
 
 impl ProxyHttpClient {
+    const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+    const SSE_LIMITS: SseLimits = match SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256) {
+        Some(limits) => limits,
+        None => unreachable!("nonzero HTTP proxy SSE bounds are valid"),
+    };
+
+    fn new(
+        binding: ProxyUpstreamBinding,
+        connection: ModernHttpConnectOutcome,
+        cx: Cx,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+    ) -> Self {
+        let next_request_id = match connection.selected_era() {
+            Some(ProtocolEra::Modern2026) => 2,
+            Some(ProtocolEra::Legacy2024) | None => 1,
+        };
+        Self {
+            binding,
+            connection,
+            cx,
+            client_info,
+            client_capabilities,
+            next_request_id,
+            legacy_initialized: false,
+        }
+    }
+
     /// Returns the immutable era binding selected for this backend.
     #[must_use]
     pub const fn upstream_binding(&self) -> ProxyUpstreamBinding {
         self.binding
     }
 
-    /// Uses the selected modern client without exposing the legacy client.
-    ///
-    /// The callback runs while this backend's connection is exclusively held,
-    /// which preserves the backend-local selection and request ordering.
-    pub fn with_modern_client<R>(
+    fn next_request_id(&mut self) -> McpResult<RequestId> {
+        let id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| McpError::internal_error("Proxy HTTP request ID sequence exhausted"))?;
+        Ok(RequestId::Number(id))
+    }
+
+    fn request_parameters(
         &self,
-        callback: impl FnOnce(&ModernHttpClient) -> McpResult<R>,
-    ) -> McpResult<R> {
-        let guard = self
-            .connection
-            .lock()
-            .map_err(|_| McpError::internal_error("Proxy HTTP client lock poisoned"))?;
-        match &*guard {
-            ModernHttpConnectOutcome::Modern(client) => callback(client),
-            ModernHttpConnectOutcome::LegacySse(_) => Err(McpError::invalid_request(
-                "This proxy HTTP backend selected exact MCP 2024-11-05, not modern HTTP",
-            )),
+        mut parameters: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        if self.binding.era() == ProtocolEra::Legacy2024 {
+            return Ok(parameters);
+        }
+        let object = parameters.as_object_mut().ok_or_else(|| {
+            McpError::invalid_params("Proxy HTTP request parameters must be an object")
+        })?;
+        let mut metadata = FinalRequestMeta::new(self.client_capabilities.clone());
+        metadata.client_info = Some(self.client_info.clone());
+        object.insert(
+            "_meta".to_owned(),
+            serde_json::to_value(metadata).map_err(|error| {
+                McpError::internal_error(format!(
+                    "Proxy HTTP final request metadata could not be encoded: {error}"
+                ))
+            })?,
+        );
+        Ok(parameters)
+    }
+
+    fn ensure_legacy_initialized(&mut self) -> McpResult<()> {
+        if self.legacy_initialized {
+            return Ok(());
+        }
+        let request_id = self.next_request_id()?;
+        let parameters = InitializeParams {
+            protocol_version: fastmcp_protocol::PROTOCOL_VERSION.to_owned(),
+            capabilities: self.client_capabilities.clone(),
+            client_info: self.client_info.clone(),
+        };
+        let message = JsonRpcMessage::Request(JsonRpcRequest::new(
+            fastmcp_protocol::methods::INITIALIZE,
+            Some(serde_json::to_value(parameters).map_err(|error| {
+                McpError::internal_error(format!(
+                    "Proxy HTTP legacy initialize parameters could not be encoded: {error}"
+                ))
+            })?),
+            request_id.clone(),
+        ));
+        let response = match &mut self.connection {
+            ModernHttpConnectOutcome::LegacySse(client) => {
+                block_on(client.send(&self.cx, &message)).map_err(legacy_http_error)?;
+                receive_legacy_response(client, &self.cx, &request_id)?
+            }
+            ModernHttpConnectOutcome::Modern(_) => {
+                return Err(McpError::internal_error(
+                    "Modern HTTP proxy connection entered legacy initialization",
+                ));
+            }
+        };
+        if let Some(error) = response.error.as_ref() {
+            return Err(McpError::internal_error(format!(
+                "Proxy HTTP legacy initialize was rejected: {} ({})",
+                error.message, error.code
+            )));
+        }
+        let result = response.result.ok_or_else(|| {
+            McpError::invalid_request("Legacy initialize response omitted its result")
+        })?;
+        let initialized: InitializeResult = serde_json::from_value(result).map_err(|error| {
+            McpError::invalid_request(format!(
+                "Legacy initialize response was invalid for the exact 2024-11-05 era: {error}"
+            ))
+        })?;
+        if initialized.protocol_version != fastmcp_protocol::PROTOCOL_VERSION {
+            return Err(McpError::invalid_request(
+                "Legacy initialize response selected a protocol version other than 2024-11-05",
+            ));
+        }
+
+        let notification = JsonRpcMessage::Request(JsonRpcRequest::initialized_notification());
+        match &mut self.connection {
+            ModernHttpConnectOutcome::LegacySse(client) => {
+                block_on(client.send(&self.cx, &notification)).map_err(legacy_http_error)?;
+            }
+            ModernHttpConnectOutcome::Modern(_) => {
+                return Err(McpError::internal_error(
+                    "Modern HTTP proxy connection entered legacy lifecycle acknowledgement",
+                ));
+            }
+        }
+        self.legacy_initialized = true;
+        Ok(())
+    }
+
+    fn request_result(
+        &mut self,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        if self.binding.era() == ProtocolEra::Legacy2024 {
+            self.ensure_legacy_initialized()?;
+        }
+        let parameters = self.request_parameters(parameters)?;
+        let request = CoreRequest::decode(self.binding.era(), method, Some(&parameters)).map_err(
+            |error| {
+                McpError::invalid_params(format!(
+                    "Proxy HTTP request is invalid for the selected upstream era: {error}"
+                ))
+            },
+        )?;
+        let request_id = self.next_request_id()?;
+        let response = match &mut self.connection {
+            ModernHttpConnectOutcome::Modern(client) => {
+                receive_modern_response(client, &self.cx, method, parameters, &request_id)?
+            }
+            ModernHttpConnectOutcome::LegacySse(client) => {
+                let message = JsonRpcMessage::Request(JsonRpcRequest::new(
+                    method,
+                    Some(parameters),
+                    request_id.clone(),
+                ));
+                block_on(client.send(&self.cx, &message)).map_err(legacy_http_error)?;
+                receive_legacy_response(client, &self.cx, &request_id)?
+            }
+        };
+        if let Some(error) = response.error.as_ref() {
+            return Err(McpError::internal_error(format!(
+                "Proxy HTTP upstream rejected {method}: {} ({})",
+                error.message, error.code
+            )));
+        }
+        request.decode_response(&response).map_err(|error| {
+            McpError::invalid_request(format!(
+                "Proxy HTTP upstream response is invalid for the selected era: {error}"
+            ))
+        })
+    }
+}
+
+impl ProxyBackend for ProxyHttpClient {
+    fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
+        match self.request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}))? {
+            CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => Ok(result.tools),
+            CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => Ok(result
+                .payload
+                .tools
+                .into_iter()
+                .map(final_tool_to_legacy)
+                .collect()),
+            _ => Err(unexpected_proxy_result("tools/list")),
         }
     }
 
-    /// Uses the selected exact legacy SSE client without exposing modern HTTP.
-    ///
-    /// The callback receives exclusive access because reading one SSE message
-    /// advances the backend-owned stream.
-    pub fn with_legacy_sse_client<R>(
-        &self,
-        callback: impl FnOnce(&mut LegacySseHttpClient) -> McpResult<R>,
-    ) -> McpResult<R> {
-        let mut guard = self
-            .connection
-            .lock()
-            .map_err(|_| McpError::internal_error("Proxy HTTP client lock poisoned"))?;
-        match &mut *guard {
-            ModernHttpConnectOutcome::Modern(_) => Err(McpError::invalid_request(
-                "This proxy HTTP backend selected MCP 2026-07-28, not legacy SSE",
-            )),
-            ModernHttpConnectOutcome::LegacySse(client) => callback(client),
+    fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
+        match self.request_result(
+            fastmcp_protocol::methods::RESOURCES_LIST,
+            serde_json::json!({}),
+        )? {
+            CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => Ok(result.resources),
+            CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => Ok(result
+                .payload
+                .resources
+                .into_iter()
+                .map(final_resource_to_legacy)
+                .collect()),
+            _ => Err(unexpected_proxy_result("resources/list")),
         }
     }
+
+    fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
+        match self.request_result(
+            fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
+            serde_json::json!({}),
+        )? {
+            CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => {
+                Ok(result.resource_templates)
+            }
+            CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) => Ok(result
+                .payload
+                .resource_templates
+                .into_iter()
+                .map(final_resource_template_to_legacy)
+                .collect()),
+            _ => Err(unexpected_proxy_result("resources/templates/list")),
+        }
+    }
+
+    fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
+        match self.request_result(
+            fastmcp_protocol::methods::PROMPTS_LIST,
+            serde_json::json!({}),
+        )? {
+            CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => Ok(result.prompts),
+            CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => Ok(result
+                .payload
+                .prompts
+                .into_iter()
+                .map(final_prompt_to_legacy)
+                .collect()),
+            _ => Err(unexpected_proxy_result("prompts/list")),
+        }
+    }
+
+    fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        match self.request_result(
+            fastmcp_protocol::methods::TOOLS_CALL,
+            serde_json::json!({"name": name, "arguments": arguments}),
+        )? {
+            CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => Ok(result.content),
+            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => result
+                .payload
+                .content
+                .into_iter()
+                .map(final_content_to_legacy)
+                .collect(),
+            _ => Err(unexpected_proxy_result("tools/call")),
+        }
+    }
+
+    fn call_tool_with_progress(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+        _on_progress: ProgressCallback<'_>,
+    ) -> McpResult<Vec<Content>> {
+        self.call_tool(name, arguments)
+    }
+
+    fn read_resource(&mut self, uri: &str) -> McpResult<Vec<ResourceContent>> {
+        match self.request_result(
+            fastmcp_protocol::methods::RESOURCES_READ,
+            serde_json::json!({"uri": uri}),
+        )? {
+            CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => Ok(result.contents),
+            CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => Ok(result
+                .payload
+                .contents
+                .into_iter()
+                .map(embedded_resource_to_legacy)
+                .collect()),
+            _ => Err(unexpected_proxy_result("resources/read")),
+        }
+    }
+
+    fn get_prompt(
+        &mut self,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        match self.request_result(
+            fastmcp_protocol::methods::PROMPTS_GET,
+            serde_json::json!({"name": name, "arguments": arguments}),
+        )? {
+            CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => Ok(result.messages),
+            CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) => result
+                .payload
+                .messages
+                .into_iter()
+                .map(|message| {
+                    Ok(PromptMessage {
+                        role: message.role,
+                        content: final_content_to_legacy(message.content)?,
+                    })
+                })
+                .collect(),
+            _ => Err(unexpected_proxy_result("prompts/get")),
+        }
+    }
+}
+
+fn receive_modern_response(
+    client: &ModernHttpClient,
+    cx: &Cx,
+    method: &str,
+    parameters: serde_json::Value,
+    request_id: &RequestId,
+) -> McpResult<JsonRpcResponse> {
+    let response = block_on(client.request(cx, method, parameters, Some(request_id.clone())))
+        .map_err(|error| {
+            McpError::internal_error(format!("Proxy HTTP modern request failed: {error}"))
+        })?;
+    match response.metadata().kind() {
+        ModernHttpResponseKind::Json => {
+            let body = block_on(response.read_to_end(cx, ProxyHttpClient::MAX_RESPONSE_BYTES))
+                .map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Proxy HTTP modern JSON response could not be read: {error}"
+                    ))
+                })?;
+            response_for_request(
+                decode_strict_jsonrpc_message(&body, ProxyHttpClient::MAX_RESPONSE_BYTES).map_err(
+                    |_| McpError::invalid_request("Proxy HTTP modern response was not JSON-RPC"),
+                )?,
+                request_id,
+            )
+        }
+        ModernHttpResponseKind::Sse => {
+            let mut stream = response
+                .into_sse_stream(ProxyHttpClient::SSE_LIMITS)
+                .map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Proxy HTTP modern SSE response could not be opened: {error}"
+                    ))
+                })?;
+            loop {
+                let event = block_on(stream.next_event(cx)).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Proxy HTTP modern SSE response could not be read: {error}"
+                    ))
+                })?;
+                let Some(event) = event else {
+                    return Err(McpError::invalid_request(
+                        "Proxy HTTP modern SSE response ended before its correlated result",
+                    ));
+                };
+                let message = decode_strict_jsonrpc_message(
+                    event.as_bytes(),
+                    ProxyHttpClient::MAX_RESPONSE_BYTES,
+                )
+                .map_err(|_| {
+                    McpError::invalid_request("Proxy HTTP modern SSE event was not JSON-RPC")
+                })?;
+                if matches!(&message, JsonRpcMessage::Request(request) if request.id.is_none()) {
+                    continue;
+                }
+                return response_for_request(message, request_id);
+            }
+        }
+        ModernHttpResponseKind::HttpFailure => Err(McpError::invalid_request(
+            "Proxy HTTP modern request received an unsuccessful HTTP response",
+        )),
+    }
+}
+
+fn receive_legacy_response(
+    client: &mut LegacySseHttpClient,
+    cx: &Cx,
+    request_id: &RequestId,
+) -> McpResult<JsonRpcResponse> {
+    loop {
+        let message = block_on(client.next_message(cx)).map_err(legacy_http_error)?;
+        let Some(message) = message else {
+            return Err(McpError::invalid_request(
+                "Proxy HTTP legacy SSE stream ended before its correlated result",
+            ));
+        };
+        if matches!(&message, JsonRpcMessage::Request(request) if request.id.is_none()) {
+            continue;
+        }
+        return response_for_request(message, request_id);
+    }
+}
+
+fn response_for_request(
+    message: JsonRpcMessage,
+    request_id: &RequestId,
+) -> McpResult<JsonRpcResponse> {
+    let JsonRpcMessage::Response(response) = message else {
+        return Err(McpError::invalid_request(
+            "Proxy HTTP upstream sent a request while its response was required",
+        ));
+    };
+    if response.id.as_ref() != Some(request_id) {
+        return Err(McpError::invalid_request(
+            "Proxy HTTP upstream response ID does not match its request",
+        ));
+    }
+    Ok(response)
+}
+
+fn legacy_http_error(error: impl std::fmt::Display) -> McpError {
+    McpError::internal_error(format!("Proxy HTTP legacy request failed: {error}"))
+}
+
+fn unexpected_proxy_result(method: &str) -> McpError {
+    McpError::invalid_request(format!(
+        "Proxy HTTP upstream returned a result for another method instead of {method}"
+    ))
+}
+
+fn legacy_icon(icons: Option<Vec<fastmcp_protocol::RawIcon>>) -> Option<fastmcp_protocol::Icon> {
+    icons
+        .and_then(|icons| icons.into_iter().next())
+        .map(|icon| fastmcp_protocol::Icon {
+            src: Some(icon.src.as_str().to_owned()),
+            mime_type: icon.mime_type,
+            sizes: icon.sizes.map(|sizes| sizes.join(" ")),
+        })
+}
+
+fn final_tool_to_legacy(tool: fastmcp_protocol::FinalTool) -> Tool {
+    Tool {
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.input_schema,
+        output_schema: tool.output_schema,
+        icon: legacy_icon(tool.icons),
+        version: None,
+        tags: Vec::new(),
+        annotations: tool.annotations.map(|annotations| ToolAnnotations {
+            destructive: annotations.destructive,
+            idempotent: annotations.idempotent,
+            read_only: annotations.read_only,
+            open_world_hint: annotations.open_world_hint,
+        }),
+    }
+}
+
+fn final_resource_to_legacy(resource: fastmcp_protocol::FinalResource) -> Resource {
+    Resource {
+        uri: resource.uri.as_str().to_owned(),
+        name: resource.name,
+        description: resource.description,
+        mime_type: resource.mime_type,
+        icon: legacy_icon(resource.icons),
+        version: None,
+        tags: Vec::new(),
+    }
+}
+
+fn final_resource_template_to_legacy(
+    template: fastmcp_protocol::FinalResourceTemplate,
+) -> ResourceTemplate {
+    ResourceTemplate {
+        uri_template: template.uri_template,
+        name: template.name,
+        description: template.description,
+        mime_type: template.mime_type,
+        icon: legacy_icon(template.icons),
+        version: None,
+        tags: Vec::new(),
+    }
+}
+
+fn final_prompt_to_legacy(prompt: fastmcp_protocol::FinalPrompt) -> Prompt {
+    Prompt {
+        name: prompt.name,
+        description: prompt.description,
+        arguments: prompt
+            .arguments
+            .unwrap_or_default()
+            .into_iter()
+            .map(|argument| PromptArgument {
+                name: argument.name,
+                description: argument.description,
+                required: argument.required.unwrap_or(false),
+            })
+            .collect(),
+        icon: legacy_icon(prompt.icons),
+        version: None,
+        tags: Vec::new(),
+    }
+}
+
+fn final_content_to_legacy(content: ContentBlock) -> McpResult<Content> {
+    match content {
+        ContentBlock::Text { text, .. } => Ok(Content::Text { text }),
+        ContentBlock::Image {
+            data, mime_type, ..
+        } => Ok(Content::Image { data, mime_type }),
+        ContentBlock::Audio {
+            data, mime_type, ..
+        } => Ok(Content::Audio { data, mime_type }),
+        ContentBlock::Resource { resource, .. } => Ok(Content::Resource {
+            resource: embedded_resource_to_legacy(resource),
+        }),
+        ContentBlock::ResourceLink { .. }
+        | ContentBlock::ToolUse { .. }
+        | ContentBlock::ToolResult { .. } => Err(McpError::invalid_request(
+            "Proxy HTTP final content cannot be represented by the legacy proxy handler surface",
+        )),
+    }
+}
+
+fn embedded_resource_to_legacy(resource: EmbeddedResourceContents) -> ResourceContent {
+    match resource {
+        EmbeddedResourceContents::Text {
+            uri,
+            text,
+            mime_type,
+        } => ResourceContent {
+            uri: uri.as_str().to_owned(),
+            text: Some(text),
+            mime_type,
+            blob: None,
+        },
+        EmbeddedResourceContents::Blob {
+            uri,
+            blob,
+            mime_type,
+        } => ResourceContent {
+            uri: uri.as_str().to_owned(),
+            text: None,
+            mime_type,
+            blob: Some(blob),
+        },
+    }
+}
+
+fn serialized_cache_identity<T: serde::Serialize>(value: &T, member: &str) -> McpResult<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|error| {
+        McpError::internal_error(format!(
+            "Proxy HTTP cache identity could not encode {member}: {error}"
+        ))
+    })
 }
 
 /// Cache of immutable selections for independently configured proxy upstreams.
@@ -376,13 +883,13 @@ impl ProxyHttpClient {
 /// A cache entry is never keyed by an origin alone. Route, complete transport
 /// identity, policy (inside the HTTP bundle), adapter receipt identity, and
 /// configuration generation all participate in its identity.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ProxyUpstreamBindingRegistry {
     stdio: HashMap<StdioBindingKey, ProxyUpstreamBinding>,
     live_stdio: HashMap<LiveStdioBindingKey, ProxyUpstreamBinding>,
     http: HashMap<HttpBindingKey, ProxyUpstreamBinding>,
     http_eras: HttpEraCache,
-    live_http: HashMap<LiveHttpBindingKey, ProxyHttpClient>,
+    live_http: HashMap<LiveHttpBindingKey, ProxyClient>,
 }
 
 impl ProxyUpstreamBindingRegistry {
@@ -467,7 +974,7 @@ impl ProxyUpstreamBindingRegistry {
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
         cx: Cx,
-    ) -> McpResult<ProxyHttpClient> {
+    ) -> McpResult<ProxyClient> {
         if route_identity.is_empty() || transport_identity.is_empty() {
             return Err(McpError::invalid_params(
                 "Upstream route and transport identities must be non-empty",
@@ -481,6 +988,11 @@ impl ProxyUpstreamBindingRegistry {
             transport_identity: transport_identity.to_owned(),
             configuration_generation,
             bundle: bundle.key(),
+            client_info_wire: serialized_cache_identity(&client_info, "clientInfo")?,
+            client_capabilities_wire: serialized_cache_identity(
+                &client_capabilities,
+                "clientCapabilities",
+            )?,
         };
         if let Some(existing) = self.live_http.get(&key) {
             return Ok(existing.clone());
@@ -489,8 +1001,8 @@ impl ProxyUpstreamBindingRegistry {
         let connection = block_on(ModernHttpClient::connect(
             &cx,
             protocol_plan.clone(),
-            client_info,
-            client_capabilities,
+            client_info.clone(),
+            client_capabilities.clone(),
         ))
         .map_err(|error| {
             McpError::internal_error(format!("HTTP proxy upstream connect failed: {error}"))
@@ -500,10 +1012,13 @@ impl ProxyUpstreamBindingRegistry {
             protocol_plan.policy(),
             configuration_generation,
         )?;
-        let proxy = ProxyHttpClient {
+        let backend =
+            ProxyHttpClient::new(binding, connection, cx, client_info, client_capabilities);
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            backend,
             binding,
-            connection: Arc::new(Mutex::new(connection)),
-        };
+            binding.era().version().as_str(),
+        )?;
         self.live_http.insert(key, proxy.clone());
         Ok(proxy)
     }
@@ -1072,11 +1587,11 @@ mod tests {
     #[cfg(unix)]
     use fastmcp_client::RequestTimeoutPolicy;
     use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan};
-    use fastmcp_core::{McpContext, McpError, McpErrorCode, block_on};
+    use fastmcp_core::{McpContext, McpErrorCode};
     use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
     use fastmcp_protocol::{
-        ClientCapabilities, ClientInfo, Content, JsonRpcMessage, JsonRpcRequest, Prompt,
-        PromptMessage, RequestId, Resource, ResourceContent, Tool,
+        ClientCapabilities, ClientInfo, Content, Prompt, PromptMessage, Resource, ResourceContent,
+        Tool,
     };
 
     use super::{ProxyBackend, ProxyCatalog, ProxyClient, ProxyPromptHandler, ProxyToolHandler};
@@ -1342,6 +1857,7 @@ exec sleep 2
 
     struct CapturedHttpRequest {
         head: String,
+        body: Vec<u8>,
     }
 
     fn read_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
@@ -1375,7 +1891,10 @@ exec sleep 2
             wire.extend_from_slice(&buffer[..read]);
         }
 
-        CapturedHttpRequest { head }
+        CapturedHttpRequest {
+            head,
+            body: wire[head_end..head_end + content_length].to_vec(),
+        }
     }
 
     fn write_http_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
@@ -1428,7 +1947,7 @@ exec sleep 2
     }
 
     #[test]
-    fn proxy_outbound_http_auto_selects_modern_and_caches_the_backend() {
+    fn proxy_outbound_http_auto_modern_catalog_and_handler_use_negotiated_backend() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
         let address = listener
             .local_addr()
@@ -1446,15 +1965,21 @@ exec sleep 2
                 br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
             );
 
-            let (mut normal, _) = listener.accept().expect("accept modern ordinary request");
-            let normal_request = read_http_request(&mut normal);
-            write_http_response(
-                &mut normal,
-                200,
-                "application/json",
-                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[]}}"#,
-            );
-            (probe_request, normal_request)
+            let responses = [
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"echo","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","resources":[],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","resourceTemplates":[],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","prompts":[],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":6,"result":{"resultType":"complete","content":[{"type":"text","text":"forwarded"}]}}"#.as_slice(),
+            ];
+            let mut normal_requests = Vec::new();
+            for response in responses {
+                let (mut normal, _) = listener.accept().expect("accept modern proxy request");
+                let request = read_http_request(&mut normal);
+                write_http_response(&mut normal, 200, "application/json", response);
+                normal_requests.push(request);
+            }
+            (probe_request, normal_requests)
         });
         let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
         let mut bindings = ProxyClient::upstream_binding_registry();
@@ -1470,29 +1995,27 @@ exec sleep 2
                 Cx::for_request(),
             )
             .expect("recognized modern discovery must select the native modern proxy client");
-        let binding = proxy.upstream_binding();
+        let binding = proxy.upstream_binding().expect("live binding is retained");
         assert_eq!(binding.era(), ProtocolEra::Modern2026);
         assert_eq!(binding.adapter(), super::ProxyUpstreamAdapter::ModernHttp);
         assert_eq!(binding.policy(), ProtocolPolicy::Auto);
-        proxy
-            .with_modern_client(|client| {
-                assert_eq!(client.modern_post_target(), modern_target);
-                let request_cx = Cx::for_request();
-                let response = block_on(client.request(
-                    &request_cx,
-                    "tools/list",
-                    serde_json::json!({}),
-                    Some(RequestId::Number(2)),
-                ))
-                .map_err(|error| McpError::internal_error(error.to_string()))?;
-                let body = block_on(response.read_to_end(&request_cx, 64 * 1024))
-                    .map_err(|error| McpError::internal_error(error.to_string()))?;
-                let response: serde_json::Value = serde_json::from_slice(&body)
-                    .map_err(|error| McpError::internal_error(error.to_string()))?;
-                assert_eq!(response["result"]["resultType"], "complete");
-                Ok(())
-            })
-            .expect("modern selection retains the shipped modern client");
+        let catalog = proxy
+            .catalog()
+            .expect("public proxy catalog uses modern HTTP");
+        let tool = catalog
+            .tools
+            .first()
+            .expect("modern HTTP catalog returns the remote tool")
+            .clone();
+        let handler = ProxyToolHandler::new(tool, proxy.clone());
+        assert_forwarded_tool(
+            handler
+                .call(
+                    &McpContext::new(Cx::for_testing(), 700),
+                    serde_json::json!({"value": 1}),
+                )
+                .expect("public proxy handler forwards over modern HTTP"),
+        );
 
         let cached = bindings
             .connect_http_with_protocol_plan(
@@ -1505,20 +2028,48 @@ exec sleep 2
                 Cx::for_request(),
             )
             .expect("the exact backend returns its cached selected client");
-        assert_eq!(cached.upstream_binding(), binding);
+        assert_eq!(cached.upstream_binding(), Some(binding));
         assert_eq!(bindings.live_http.len(), 1);
 
         let (probe, normal) = server.join().expect("modern HTTP server must join");
         assert!(probe.head.starts_with("POST /mcp HTTP/1.1\r\n"));
         assert!(probe.head.contains("MCP-Protocol-Version: 2026-07-28\r\n"));
         assert!(probe.head.contains("Mcp-Method: server/discover\r\n"));
-        assert!(normal.head.starts_with("POST /mcp HTTP/1.1\r\n"));
-        assert!(normal.head.contains("MCP-Protocol-Version: 2026-07-28\r\n"));
-        assert!(normal.head.contains("Mcp-Method: tools/list\r\n"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&probe.body).expect("modern probe JSON")["params"]
+                ["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
+            "proxy-http-test-client"
+        );
+        let expected_methods = [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+            "tools/call",
+        ];
+        assert_eq!(normal.len(), expected_methods.len());
+        for (request, method) in normal.iter().zip(expected_methods) {
+            assert!(request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+            );
+            assert!(request.head.contains(&format!("Mcp-Method: {method}\r\n")));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("modern normal request JSON")["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"],
+                serde_json::json!({})
+            );
+        }
+        let call = serde_json::from_slice::<serde_json::Value>(&normal[4].body)
+            .expect("modern handler request JSON");
+        assert_eq!(call["method"], "tools/call");
+        assert_eq!(call["params"]["name"], "echo");
     }
 
     #[test]
-    fn proxy_outbound_http_auto_authorized_refusal_selects_legacy_and_caches_the_backend() {
+    fn proxy_outbound_http_auto_legacy_catalog_and_handler_use_negotiated_backend() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
         let address = listener
             .local_addr()
@@ -1534,15 +2085,25 @@ exec sleep 2
 
             let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
             let sse_request = read_http_request(&mut sse);
-            let body = format!(
-                "event: endpoint\ndata: {expected_message_target}\n\nevent: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"legacy\":true}}}}\n\n"
-            );
+            let mut body = format!("event: endpoint\ndata: {expected_message_target}\n\n");
+            body.push_str(concat!(
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"inputSchema\":{}}]}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resources\":[]}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"resourceTemplates\":[]}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"prompts\":[]}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"forwarded\"}]}}\n\n"
+            ));
             write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
 
-            let (mut post, _) = listener.accept().expect("accept advertised legacy POST");
-            let post_request = read_http_request(&mut post);
-            write_http_response(&mut post, 202, "application/json", b"");
-            (probe_request, sse_request, post_request)
+            let mut posts = Vec::new();
+            for _ in 0..7 {
+                let (mut post, _) = listener.accept().expect("accept advertised legacy POST");
+                let request = read_http_request(&mut post);
+                write_http_response(&mut post, 202, "application/json", b"");
+                posts.push(request);
+            }
+            (probe_request, sse_request, posts)
         });
         let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
         let mut bindings = ProxyClient::upstream_binding_registry();
@@ -1558,44 +2119,32 @@ exec sleep 2
                 Cx::for_request(),
             )
             .expect("only the authorized disposable refusal may select legacy SSE");
-        let binding = proxy.upstream_binding();
+        let binding = proxy.upstream_binding().expect("live binding is retained");
         assert_eq!(binding.era(), ProtocolEra::Legacy2024);
         assert_eq!(
             binding.adapter(),
             super::ProxyUpstreamAdapter::LegacyHttpSse
         );
         assert_eq!(binding.policy(), ProtocolPolicy::Auto);
-        proxy
-            .with_legacy_sse_client(|client| {
-                assert_eq!(
-                    client.configured_message_post_target(),
-                    legacy_message_target
-                );
-                assert_eq!(
-                    client.advertised_message_post_target(),
-                    legacy_message_target
-                );
-                let request_cx = Cx::for_request();
-                block_on(client.send(
-                    &request_cx,
-                    &JsonRpcMessage::Request(JsonRpcRequest::new(
-                        "initialize",
-                        Some(serde_json::json!({"protocolVersion": "2024-11-05"})),
-                        RequestId::Number(2),
-                    )),
-                ))
-                .map_err(|error| McpError::internal_error(error.to_string()))?;
-                let response = block_on(client.next_message(&request_cx))
-                    .map_err(|error| McpError::internal_error(error.to_string()))?
-                    .ok_or_else(|| {
-                        McpError::internal_error("legacy SSE ended before a response")
-                    })?;
-                let response = serde_json::to_value(response)
-                    .map_err(|error| McpError::internal_error(error.to_string()))?;
-                assert_eq!(response["result"]["legacy"], true);
-                Ok(())
-            })
-            .expect("legacy selection retains the exact shipped SSE client");
+        let catalog = proxy
+            .catalog()
+            .expect("public proxy catalog uses legacy SSE");
+        let handler = ProxyToolHandler::new(
+            catalog
+                .tools
+                .first()
+                .expect("legacy HTTP catalog returns the remote tool")
+                .clone(),
+            proxy.clone(),
+        );
+        assert_forwarded_tool(
+            handler
+                .call(
+                    &McpContext::new(Cx::for_testing(), 701),
+                    serde_json::json!({"value": 1}),
+                )
+                .expect("public proxy handler forwards over legacy SSE"),
+        );
 
         let cached = bindings
             .connect_http_with_protocol_plan(
@@ -1608,21 +2157,177 @@ exec sleep 2
                 Cx::for_request(),
             )
             .expect("the exact legacy backend returns its cached selected client");
-        assert_eq!(cached.upstream_binding(), binding);
+        assert_eq!(cached.upstream_binding(), Some(binding));
         assert_eq!(bindings.live_http.len(), 1);
 
-        let (probe, sse, post) = server.join().expect("legacy HTTP server must join");
+        let (probe, sse, posts) = server.join().expect("legacy HTTP server must join");
         assert!(probe.head.starts_with("POST /mcp HTTP/1.1\r\n"));
         assert!(probe.head.contains("MCP-Protocol-Version: 2026-07-28\r\n"));
         assert!(sse.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
         assert!(sse.head.contains("Accept: text/event-stream\r\n"));
         assert!(!sse.head.contains("MCP-Protocol-Version:"));
-        assert!(
-            post.head
-                .starts_with("POST /legacy-message?session=proxy HTTP/1.1\r\n")
+        let expected_methods = [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+            "tools/call",
+        ];
+        assert_eq!(posts.len(), expected_methods.len());
+        for (request, method) in posts.iter().zip(expected_methods) {
+            assert!(
+                request
+                    .head
+                    .starts_with("POST /legacy-message?session=proxy HTTP/1.1\r\n")
+            );
+            assert!(request.head.contains("Content-Type: application/json\r\n"));
+            assert!(!request.head.contains("MCP-Protocol-Version:"));
+            let message = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("legacy proxy request JSON");
+            assert_eq!(message["method"], method);
+        }
+        let initialize = serde_json::from_slice::<serde_json::Value>(&posts[0].body)
+            .expect("legacy initialize JSON");
+        assert_eq!(
+            initialize["params"]["clientInfo"]["name"],
+            "proxy-http-test-client"
         );
-        assert!(post.head.contains("Content-Type: application/json\r\n"));
-        assert!(!post.head.contains("MCP-Protocol-Version:"));
+    }
+
+    #[test]
+    fn proxy_http_cache_does_not_share_one_field_client_identity_change() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read native HTTP listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let legacy_sse_target = format!("http://{address}/legacy-sse");
+        let legacy_message_target = format!("http://{address}/legacy-message");
+        let server = thread::spawn(move || {
+            let mut probes = Vec::new();
+            for _ in 0..2 {
+                let (mut probe, _) = listener.accept().expect("accept modern probe");
+                let request = read_http_request(&mut probe);
+                write_http_response(
+                    &mut probe,
+                    200,
+                    "application/json",
+                    br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+                );
+                probes.push(request);
+            }
+            probes
+        });
+        let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
+        let mut bindings = ProxyClient::upstream_binding_registry();
+        let first = bindings
+            .connect_http_with_protocol_plan(
+                "identity-cache-backend",
+                "native-h1:identity-cache-backend",
+                12,
+                plan.clone(),
+                proxy_http_client_info(),
+                ClientCapabilities::default(),
+                Cx::for_request(),
+            )
+            .expect("first identity opens the modern upstream");
+        let second = bindings
+            .connect_http_with_protocol_plan(
+                "identity-cache-backend",
+                "native-h1:identity-cache-backend",
+                12,
+                plan,
+                ClientInfo {
+                    name: "proxy-http-test-client".to_owned(),
+                    version: "1.0.1".to_owned(),
+                },
+                ClientCapabilities::default(),
+                Cx::for_request(),
+            )
+            .expect("one clientInfo field change opens a separate modern upstream");
+
+        assert_eq!(bindings.live_http.len(), 2);
+        assert_eq!(first.upstream_binding(), second.upstream_binding());
+        let probes = server.join().expect("identity cache server must join");
+        let versions = probes
+            .iter()
+            .map(|probe| {
+                serde_json::from_slice::<serde_json::Value>(&probe.body).expect("modern probe JSON")
+                    ["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["version"]
+                    .as_str()
+                    .expect("client identity version")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(versions, vec!["1.0.0".to_owned(), "1.0.1".to_owned()]);
+    }
+
+    #[test]
+    fn proxy_http_cache_does_not_share_one_field_client_capability_change() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read native HTTP listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let legacy_sse_target = format!("http://{address}/legacy-sse");
+        let legacy_message_target = format!("http://{address}/legacy-message");
+        let server = thread::spawn(move || {
+            let mut probes = Vec::new();
+            for _ in 0..2 {
+                let (mut probe, _) = listener.accept().expect("accept modern probe");
+                let request = read_http_request(&mut probe);
+                write_http_response(
+                    &mut probe,
+                    200,
+                    "application/json",
+                    br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+                );
+                probes.push(request);
+            }
+            probes
+        });
+        let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
+        let mut bindings = ProxyClient::upstream_binding_registry();
+        bindings
+            .connect_http_with_protocol_plan(
+                "capability-cache-backend",
+                "native-h1:capability-cache-backend",
+                13,
+                plan.clone(),
+                proxy_http_client_info(),
+                ClientCapabilities::default(),
+                Cx::for_request(),
+            )
+            .expect("first capability set opens the modern upstream");
+        bindings
+            .connect_http_with_protocol_plan(
+                "capability-cache-backend",
+                "native-h1:capability-cache-backend",
+                13,
+                plan,
+                proxy_http_client_info(),
+                ClientCapabilities {
+                    roots: Some(fastmcp_protocol::RootsCapability { list_changed: true }),
+                    ..ClientCapabilities::default()
+                },
+                Cx::for_request(),
+            )
+            .expect("one clientCapabilities field change opens a separate modern upstream");
+
+        assert_eq!(bindings.live_http.len(), 2);
+        let probes = server.join().expect("capability cache server must join");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&probes[0].body)
+                .expect("first modern probe JSON")["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&probes[1].body)
+                .expect("second modern probe JSON")["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"],
+            serde_json::json!({"roots": {"listChanged": true}})
+        );
     }
 
     #[test]
