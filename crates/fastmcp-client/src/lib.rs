@@ -60,9 +60,10 @@ pub use fastmcp_protocol::protocol_policy::{
     ProtocolPolicy, ProtocolVersion,
 };
 pub use fastmcp_protocol::{
-    CompleteResult, CoreResult, FinalCompletionArgument as CompletionArgument,
+    CompleteResult, CoreResult, FinalCallToolResult, FinalCompletionArgument as CompletionArgument,
     FinalCompletionContext as CompletionContext, FinalCompletionReference as CompletionReference,
-    FinalCoreResult, FinalSubscriptionsListenResult, LegacyCoreResult, SubscriptionFilter,
+    FinalCoreResult, FinalGetPromptResult, FinalReadResourceResult, FinalSubscriptionsListenResult,
+    LegacyCoreResult, SubscriptionFilter,
 };
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, LegacySseHttpClient,
@@ -3732,6 +3733,22 @@ impl Client {
         Ok(())
     }
 
+    /// Admits an API that returns an exact final result payload.
+    ///
+    /// The selected era is immutable after initialization. Check it before
+    /// constructing request parameters or allocating a request ID so a legacy
+    /// session remains completely untouched by modern-only conveniences.
+    fn require_modern_final_result_session(&mut self, method: &str) -> McpResult<()> {
+        self.ensure_initialized()?;
+        if self.session.selected_era() == Some(ProtocolEra::Modern2026) {
+            return Ok(());
+        }
+
+        Err(McpError::invalid_params(format!(
+            "{method} exact final result is available only for MCP 2026-07-28"
+        )))
+    }
+
     fn record_initialization_failure(&mut self, error: McpError) -> McpError {
         self.initialization_error = Some(error.clone());
         self.terminate_connection(error)
@@ -4526,8 +4543,11 @@ impl Client {
 
     /// Collects one final `subscriptions/listen` stream until its complete
     /// result. The listener owns only its acknowledgement, subscription
-    /// change events, and matching cancellation; ordinary final log/progress
-    /// notifications keep their existing connection-wide handling.
+    /// change events, and matching cancellation. Its retained events use the
+    /// same bound as the connection-wide final notification queue; a matching
+    /// cancellation retires the waiter so one late terminal result is safely
+    /// consumed. Ordinary final log/progress notifications keep their existing
+    /// connection-wide handling.
     fn recv_subscription_listener(
         &mut self,
         mut waiter: ResponseWaiter,
@@ -4688,7 +4708,19 @@ impl Client {
                                     ));
                                 }
                                 let error = McpError::request_cancelled();
-                                self.responses.fail(&expected_id, error.clone());
+                                match self.responses.tombstone(&expected_id, error.clone()) {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        return Err(self.terminate_connection(
+                                            subscription_listener_protocol_error(
+                                                "Subscription cancellation could not retire its listen request",
+                                            ),
+                                        ));
+                                    }
+                                    Err(tombstone_error) => {
+                                        return Err(self.terminate_connection(tombstone_error));
+                                    }
+                                }
                                 return Err(error);
                             }
                             notification @ (ServerNotification::ResourcesListChanged(_)
@@ -4707,6 +4739,13 @@ impl Client {
                                     accepted_filter,
                                 ) {
                                     return Err(self.terminate_connection(error));
+                                }
+                                if notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+                                    return Err(self.terminate_connection(
+                                        McpError::invalid_request(
+                                            FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+                                        ),
+                                    ));
                                 }
                                 notifications.push(notification);
                             }
@@ -4920,6 +4959,28 @@ impl Client {
             meta: None,
         };
         self.send_typed_core_request("tools/call", params)
+    }
+
+    /// Calls a tool and returns its exact MCP 2026-07-28 result payload.
+    ///
+    /// Unlike [`Self::call_tool`], this convenience API does not project final
+    /// content or `structuredContent` into the legacy result vocabulary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before request mutation unless the negotiated session
+    /// is MCP 2026-07-28. It also returns an error when the request fails or
+    /// the peer contradicts the final `tools/call` result contract.
+    pub fn call_tool_final(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalCallToolResult> {
+        self.require_modern_final_result_session("tools/call")?;
+        match self.call_tool_typed(name, arguments)? {
+            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => Ok(result.payload),
+            _ => Err(unexpected_convenience_result("tools/call")),
+        }
     }
 
     /// Calls a tool with the given arguments.
@@ -5511,6 +5572,24 @@ impl Client {
         )
     }
 
+    /// Reads a resource and returns its exact MCP 2026-07-28 result payload.
+    ///
+    /// This retains final cache directives and resource open fields without a
+    /// projection into [`LegacyResourceContent`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before request mutation unless the negotiated session
+    /// is MCP 2026-07-28. It also returns an error when the request fails or
+    /// the peer contradicts the final `resources/read` result contract.
+    pub fn read_resource_final(&mut self, uri: &str) -> McpResult<FinalReadResourceResult> {
+        self.require_modern_final_result_session("resources/read")?;
+        match self.read_resource_typed(uri)? {
+            CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => Ok(result.payload),
+            _ => Err(unexpected_convenience_result("resources/read")),
+        }
+    }
+
     /// Reads a resource by URI.
     ///
     /// # Errors
@@ -5608,6 +5687,28 @@ impl Client {
             meta: None,
         };
         self.send_typed_core_request("prompts/get", params)
+    }
+
+    /// Gets a prompt and returns its exact MCP 2026-07-28 result payload.
+    ///
+    /// This retains the final prompt description, final content vocabulary,
+    /// and open fields without a projection into [`LegacyPromptMessage`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before request mutation unless the negotiated session
+    /// is MCP 2026-07-28. It also returns an error when the request fails or
+    /// the peer contradicts the final `prompts/get` result contract.
+    pub fn get_prompt_final(
+        &mut self,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<FinalGetPromptResult> {
+        self.require_modern_final_result_session("prompts/get")?;
+        match self.get_prompt_typed(name, arguments)? {
+            CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) => Ok(result.payload),
+            _ => Err(unexpected_convenience_result("prompts/get")),
+        }
     }
 
     /// Gets a prompt with the given arguments.
@@ -9687,6 +9788,23 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_final_convenience_client_script(method: &str, response: &str) -> String {
+        let discovery_response = modern_discovery_response(
+            "final-convenience-modern-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r second || exit 1; \
+             case \"$second\" in *{method}*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{response}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
     fn modern_progress_client_script(call_response: &str) -> String {
         let discovery_response =
             modern_discovery_response("progress-modern-server", &[MODERN_PROTOCOL_VERSION]);
@@ -9745,6 +9863,28 @@ mod tests {
              IFS= read -r request || exit 1; \
              case \"$request\" in *subscriptions/listen*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"toolsListChanged\":true'*) \
              printf '%s\\n' '{acknowledgement}'{stream_frames} ;; *) exit 1 ;; esac"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_subscription_cancellation_late_terminal_client_script() -> String {
+        let discovery_response = modern_discovery_response(
+            "subscriptions-cancellation-modern-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r listen || exit 1; \
+             case \"$listen\" in *subscriptions/listen*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"toolsListChanged\":true'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}},\"notifications\":{{\"toolsListChanged\":true}}}}}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":2}}}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r ping || exit 1; \
+             case \"$ping\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
         )
     }
 
@@ -10132,6 +10272,167 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn clt_01_exact_final_conveniences_preserve_final_open_fields() {
+        let script = modern_final_convenience_client_script(
+            "tools/call",
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"exact tool result","_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}],"isError":false,"structuredContent":{"answer":"exact tool result"}}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the final tool convenience client");
+
+        let tool_result: FinalCallToolResult = client
+            .call_tool_final("echo", serde_json::json!({"text": "exact"}))
+            .expect("the exact final tool convenience retains structured output");
+        assert_eq!(
+            tool_result.structured_content,
+            Some(serde_json::json!({"answer": "exact tool result"}))
+        );
+        let [
+            ContentBlock::Text {
+                text,
+                meta,
+                additional,
+                ..
+            },
+        ] = tool_result.content.as_slice()
+        else {
+            panic!("the exact final tool convenience retains final text content");
+        };
+        assert_eq!(text, "exact tool result");
+        assert!(meta.is_some());
+        assert_eq!(
+            additional.get("io.fastmcp.extension"),
+            Some(&serde_json::json!("retained"))
+        );
+        client.close().expect("modern tool client cleanup");
+
+        let script = modern_final_convenience_client_script(
+            "resources/read",
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","contents":[{"uri":"file:///exact.txt","text":"exact resource","mimeType":"text/plain","_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}],"ttlMs":73,"cacheScope":"public"}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the final resource convenience client");
+
+        let resource_result: FinalReadResourceResult = client
+            .read_resource_final("file:///exact.txt")
+            .expect("the exact final resource convenience retains cache directives");
+        assert_eq!(resource_result.ttl_ms, 73);
+        assert_eq!(
+            resource_result.cache_scope,
+            fastmcp_protocol::CacheScope::Public
+        );
+        let [
+            EmbeddedResourceContents::Text {
+                uri,
+                text,
+                mime_type,
+                meta,
+                additional,
+            },
+        ] = resource_result.contents.as_slice()
+        else {
+            panic!("the exact final resource convenience retains final resource content");
+        };
+        assert_eq!(uri.as_str(), "file:///exact.txt");
+        assert_eq!(text, "exact resource");
+        assert_eq!(mime_type.as_deref(), Some("text/plain"));
+        assert!(meta.is_some());
+        assert_eq!(
+            additional.get("io.fastmcp.extension"),
+            Some(&serde_json::json!("retained"))
+        );
+        client.close().expect("modern resource client cleanup");
+
+        let script = modern_final_convenience_client_script(
+            "prompts/get",
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","description":"exact prompt","messages":[{"role":"user","content":{"type":"text","text":"exact prompt content","_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}}]}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the final prompt convenience client");
+
+        let prompt_result: FinalGetPromptResult = client
+            .get_prompt_final("summary", HashMap::new())
+            .expect("the exact final prompt convenience retains the final description");
+        assert_eq!(prompt_result.description.as_deref(), Some("exact prompt"));
+        let [
+            fastmcp_protocol::FinalPromptMessage {
+                role: fastmcp_protocol::Role::User,
+                content:
+                    ContentBlock::Text {
+                        text,
+                        meta,
+                        additional,
+                        ..
+                    },
+            },
+        ] = prompt_result.messages.as_slice()
+        else {
+            panic!("the exact final prompt convenience retains final prompt content");
+        };
+        assert_eq!(text, "exact prompt content");
+        assert!(meta.is_some());
+        assert_eq!(
+            additional.get("io.fastmcp.extension"),
+            Some(&serde_json::json!("retained"))
+        );
+        client.close().expect("modern prompt client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_exact_final_conveniences_reject_one_field_cross_era_before_request_mutation() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_public_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only initializes the exact client");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        let tool_error = client
+            .call_tool_final("echo", serde_json::json!({"text": "legacy"}))
+            .expect_err("the exact final tool convenience must reject a legacy session");
+        assert_eq!(tool_error.code, McpErrorCode::InvalidParams);
+
+        let resource_error = client
+            .read_resource_final("file:///legacy.txt")
+            .expect_err("the exact final resource convenience must reject a legacy session");
+        assert_eq!(resource_error.code, McpErrorCode::InvalidParams);
+
+        let prompt_error = client
+            .get_prompt_final("summary", HashMap::new())
+            .expect_err("the exact final prompt convenience must reject a legacy session");
+        assert_eq!(prompt_error.code, McpErrorCode::InvalidParams);
+
+        assert_eq!(
+            client.next_id.load(Ordering::SeqCst),
+            next_id_before,
+            "changing only the selected era must reject every final convenience before ID allocation"
+        );
+        client
+            .ping()
+            .expect("the rejected final conveniences leave the legacy request stream untouched");
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clt_01_modern_convenience_tool_projects_final_content() {
         let script = modern_typed_call_client_script(
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"convenience result"}],"isError":false}}"#,
@@ -10427,6 +10728,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn clt_01_subscriptions_listen_notification_overflow_fails_closed() {
+        let stream_frames = vec![
+            r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
+            MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS + 1
+        ];
+        let script = modern_subscriptions_listen_client_script(2, &stream_frames);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the subscription client");
+
+        let error = client
+            .listen_subscriptions_typed(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect_err("subscription-owned notification retention must use the final queue bound");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR
+        );
+        assert!(!client.is_initialized());
+        assert!(client.responses.terminal_error().is_some());
+        assert!(client.take_final_server_notifications().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clt_01_subscriptions_listen_matching_cancellation_is_request_owned() {
         let script = modern_subscriptions_listen_client_script(
             2,
@@ -10452,6 +10785,38 @@ mod tests {
         client
             .close()
             .expect("cancellation leaves the client closable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_subscriptions_listen_cancellation_tombstones_late_terminal_response() {
+        let script = modern_subscription_cancellation_late_terminal_client_script();
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the subscription client");
+
+        let error = client
+            .listen_subscriptions_typed(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect_err("matching final cancellation terminates only the listener");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 1);
+
+        client
+            .ping()
+            .expect("the next request consumes the listener's late terminal response");
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert_eq!(client.responses.uncorrelated_diagnostics, 0);
+        assert!(client.is_initialized());
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("modern client cleanup");
     }
 
     #[cfg(unix)]
