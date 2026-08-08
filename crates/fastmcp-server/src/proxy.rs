@@ -13,6 +13,7 @@ use fastmcp_client::http_executor::{
 use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{Client, ClientProtocolPlan};
 use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpResult, block_on};
+use fastmcp_protocol::common_types::{ContentBlock, EmbeddedResourceContents, RawIcon};
 use fastmcp_protocol::methods::translate_legacy_2024_result;
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleKey, HttpEraCache, HttpEraDecision, HttpModernProbe,
@@ -20,11 +21,10 @@ use fastmcp_protocol::protocol_policy::{
     StdioEraDecision, StdioOpeningFrame,
 };
 use fastmcp_protocol::{
-    ClientCapabilities, ClientInfo, Content, ContentBlock, CoreRequest, CoreResult,
-    EmbeddedResourceContents, FinalCoreResult, FinalRequestMeta, InitializeParams,
-    InitializeResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCoreResult, Prompt,
-    PromptArgument, PromptMessage, RequestId, Resource, ResourceContent, ResourceTemplate, Tool,
-    ToolAnnotations, decode_strict_jsonrpc_message,
+    ClientCapabilities, ClientInfo, Content, CoreRequest, CoreResult, FinalCoreResult,
+    FinalRequestMeta, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, LegacyCoreResult, Prompt, PromptArgument, PromptMessage, RequestId, Resource,
+    ResourceContent, ResourceTemplate, Tool, ToolAnnotations, decode_strict_jsonrpc_message,
 };
 
 use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
@@ -335,10 +335,11 @@ impl std::fmt::Debug for ProxyHttpClient {
 
 impl ProxyHttpClient {
     const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-    const SSE_LIMITS: SseLimits = match SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256) {
-        Some(limits) => limits,
-        None => unreachable!("nonzero HTTP proxy SSE bounds are valid"),
-    };
+
+    fn sse_limits() -> SseLimits {
+        SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256)
+            .expect("nonzero HTTP proxy SSE bounds are valid")
+    }
 
     fn new(
         binding: ProxyUpstreamBinding,
@@ -669,7 +670,7 @@ fn receive_modern_response(
         }
         ModernHttpResponseKind::Sse => {
             let mut stream = response
-                .into_sse_stream(ProxyHttpClient::SSE_LIMITS)
+                .into_sse_stream(ProxyHttpClient::sse_limits())
                 .map_err(|error| {
                     McpError::internal_error(format!(
                         "Proxy HTTP modern SSE response could not be opened: {error}"
@@ -751,7 +752,7 @@ fn unexpected_proxy_result(method: &str) -> McpError {
     ))
 }
 
-fn legacy_icon(icons: Option<Vec<fastmcp_protocol::RawIcon>>) -> Option<fastmcp_protocol::Icon> {
+fn legacy_icon(icons: Option<Vec<RawIcon>>) -> Option<fastmcp_protocol::Icon> {
     icons
         .and_then(|icons| icons.into_iter().next())
         .map(|icon| fastmcp_protocol::Icon {
@@ -2387,9 +2388,9 @@ exec sleep 2
 
                 let mut requests = Vec::new();
                 for response in responses {
-                    let (mut request, _) = listener.accept().expect("accept public proxy request");
-                    let request = read_http_request(&mut request);
-                    write_http_response(&mut request, 200, "application/json", &response);
+                    let (mut stream, _) = listener.accept().expect("accept public proxy request");
+                    let request = read_http_request(&mut stream);
+                    write_http_response(&mut stream, 200, "application/json", &response);
                     requests.push(request);
                 }
                 (probe_request, requests)
