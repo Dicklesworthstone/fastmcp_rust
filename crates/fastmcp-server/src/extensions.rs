@@ -19,6 +19,9 @@ use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     ExtensionDescriptorRegistry, ExtensionDirection, ExtensionId, ExtensionRegistryReceipt,
 };
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 /// A typed implementation for one client-to-server extension request.
 ///
@@ -36,6 +39,34 @@ where
 {
     fn handle(&self, context: &McpContext, request: Request) -> McpResult<Response> {
         self(context, request)
+    }
+}
+
+/// Object-safe bridge that retains each registered handler's Rust types.
+trait ErasedExtensionHandler: Send + Sync {
+    fn invoke(&self, context: &McpContext, parameters: Value) -> McpResult<Value>;
+}
+
+/// Typed serde adapter retained behind the heterogeneous handler map.
+struct SerdeExtensionHandler<Request, Response, Handler> {
+    handler: Handler,
+    marker: PhantomData<fn(Request) -> Response>,
+}
+
+impl<Request, Response, Handler> ErasedExtensionHandler
+    for SerdeExtensionHandler<Request, Response, Handler>
+where
+    Request: DeserializeOwned,
+    Response: Serialize,
+    Handler: ExtensionHandler<Request, Response>,
+{
+    fn invoke(&self, context: &McpContext, parameters: Value) -> McpResult<Value> {
+        let request = serde_json::from_value(parameters)
+            .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        let response = self.handler.handle(context, request)?;
+        serde_json::to_value(response).map_err(|_| {
+            McpError::internal_error("typed extension handler response serialization failed")
+        })
     }
 }
 
@@ -182,19 +213,19 @@ impl std::error::Error for ExtensionHandlerInvocationError {
 
 /// Frozen, typed server handlers bound to one protocol descriptor registry.
 ///
-/// A registry is parameterized by the decoded request and response types, so
-/// a caller cannot register a handler with an incompatible request/result
-/// shape. Method ownership, direction, negotiated capability activation, and
-/// descriptor receipt are still enforced by the protocol registry at every
-/// invocation.
-pub struct ExtensionHandlerRegistry<Request, Response> {
+/// The map is erased only internally. Each [`Self::register`] call fixes that
+/// method's own decoded request and encoded response types in a serde adapter,
+/// so one registry can hold heterogeneous extension methods without weakening
+/// a handler's typed Rust boundary. Method ownership, direction, negotiated
+/// capability activation, and descriptor receipt are still enforced by the
+/// protocol registry at every invocation.
+pub struct ExtensionHandlerRegistry {
     descriptor_registry: ExtensionDescriptorRegistry,
-    handlers: BTreeMap<ExtensionHandlerKey, Box<dyn ExtensionHandler<Request, Response>>>,
+    handlers: BTreeMap<ExtensionHandlerKey, Box<dyn ErasedExtensionHandler>>,
     frozen: bool,
-    marker: PhantomData<fn(Request) -> Response>,
 }
 
-impl<Request, Response> ExtensionHandlerRegistry<Request, Response> {
+impl ExtensionHandlerRegistry {
     /// Starts a handler registry around the supplied protocol descriptor registry.
     #[must_use]
     pub fn new(descriptor_registry: ExtensionDescriptorRegistry) -> Self {
@@ -202,7 +233,6 @@ impl<Request, Response> ExtensionHandlerRegistry<Request, Response> {
             descriptor_registry,
             handlers: BTreeMap::new(),
             frozen: false,
-            marker: PhantomData,
         }
     }
 
@@ -236,13 +266,15 @@ impl<Request, Response> ExtensionHandlerRegistry<Request, Response> {
     /// client-to-server direction remain request-specific protocol checks, so
     /// [`Self::invoke`] performs them against the current negotiated extension
     /// set before this handler can run.
-    pub fn register<Handler>(
+    pub fn register<Request, Response, Handler>(
         &mut self,
         extension_id: ExtensionId,
         method: impl Into<String>,
         handler: Handler,
     ) -> Result<(), ExtensionHandlerRegistrationError>
     where
+        Request: DeserializeOwned + 'static,
+        Response: Serialize + 'static,
         Handler: ExtensionHandler<Request, Response> + 'static,
     {
         if self.frozen {
@@ -267,7 +299,13 @@ impl<Request, Response> ExtensionHandlerRegistry<Request, Response> {
             return Err(ExtensionHandlerRegistrationError::DuplicateHandler(key));
         }
 
-        self.handlers.insert(key, Box::new(handler));
+        self.handlers.insert(
+            key,
+            Box::new(SerdeExtensionHandler::<Request, Response, Handler> {
+                handler,
+                marker: PhantomData,
+            }),
+        );
         Ok(())
     }
 
@@ -283,14 +321,14 @@ impl<Request, Response> ExtensionHandlerRegistry<Request, Response> {
         &self,
         extension_id: &ExtensionId,
         method: &str,
-    ) -> Result<&dyn ExtensionHandler<Request, Response>, ExtensionHandlerLookupError> {
+    ) -> Result<&ExtensionHandlerKey, ExtensionHandlerLookupError> {
         if !self.frozen {
             return Err(ExtensionHandlerLookupError::RegistryNotFrozen);
         }
         let key = ExtensionHandlerKey::new(extension_id.clone(), method);
         self.handlers
-            .get(&key)
-            .map(Box::as_ref)
+            .get_key_value(&key)
+            .map(|(registered_key, _)| registered_key)
             .ok_or(ExtensionHandlerLookupError::HandlerNotFound(key))
     }
 
@@ -306,8 +344,8 @@ impl<Request, Response> ExtensionHandlerRegistry<Request, Response> {
         extension_id: &ExtensionId,
         method: &str,
         context: &McpContext,
-        request: Request,
-    ) -> Result<Response, ExtensionHandlerInvocationError> {
+        parameters: Value,
+    ) -> Result<Value, ExtensionHandlerInvocationError> {
         if !self.frozen {
             return Err(ExtensionHandlerInvocationError::RegistryNotFrozen);
         }
@@ -321,7 +359,7 @@ impl<Request, Response> ExtensionHandlerRegistry<Request, Response> {
                 ExtensionDirection::ClientToServer,
             )
             .map_err(ExtensionHandlerInvocationError::Protocol)?;
-        let handler = self
+        let key = self
             .lookup(extension_id, method)
             .map_err(|error| match error {
                 ExtensionHandlerLookupError::RegistryNotFrozen => {
@@ -331,8 +369,12 @@ impl<Request, Response> ExtensionHandlerRegistry<Request, Response> {
                     ExtensionHandlerInvocationError::HandlerNotFound(key)
                 }
             })?;
+        let handler = self
+            .handlers
+            .get(key)
+            .ok_or_else(|| ExtensionHandlerInvocationError::HandlerNotFound(key.clone()))?;
         handler
-            .handle(context, request)
+            .invoke(context, parameters)
             .map_err(ExtensionHandlerInvocationError::Handler)
     }
 }
@@ -340,17 +382,24 @@ impl<Request, Response> ExtensionHandlerRegistry<Request, Response> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use asupersync::Cx;
-    use fastmcp_core::{McpContext, McpResult};
+    use fastmcp_core::{McpContext, McpErrorCode, McpResult};
     use fastmcp_protocol::extensions::{
         ClientExtensionDiscovery, ExtensionLocalEnablement, ExtensionSettings,
         ServerExtensionDiscovery, official_tasks_empty_settings, register_official_tasks_extension,
     };
     use fastmcp_protocol::protocol_policy::ProtocolEra;
     use fastmcp_protocol::{ExtensionDescriptorRegistry, ExtensionId};
+    use serde::{Deserialize, Serialize};
+    use serde_json::json;
 
-    use super::{ExtensionHandlerRegistrationError, ExtensionHandlerRegistry};
+    use super::{
+        ExtensionHandlerInvocationError, ExtensionHandlerKey, ExtensionHandlerRegistrationError,
+        ExtensionHandlerRegistry,
+    };
 
     fn tasks_descriptors() -> (ExtensionDescriptorRegistry, ExtensionId) {
         let mut descriptors = ExtensionDescriptorRegistry::new();
@@ -359,14 +408,51 @@ mod tests {
         (descriptors, id)
     }
 
-    fn increment_task(context: &McpContext, value: u32) -> McpResult<u32> {
-        assert_eq!(context.request_id(), 71);
-        Ok(value + 1)
+    #[derive(Deserialize)]
+    struct GetTaskRequest {
+        value: u32,
     }
 
-    fn decrement_task(context: &McpContext, value: u32) -> McpResult<u32> {
+    #[derive(Debug, PartialEq, Serialize)]
+    struct GetTaskResponse {
+        next: u32,
+    }
+
+    #[derive(Deserialize)]
+    struct UpdateTaskRequest {
+        title: String,
+    }
+
+    #[derive(Debug, PartialEq, Serialize)]
+    struct UpdateTaskResponse {
+        updated_title: String,
+    }
+
+    fn get_task(context: &McpContext, request: GetTaskRequest) -> McpResult<GetTaskResponse> {
         assert_eq!(context.request_id(), 71);
-        Ok(value - 1)
+        Ok(GetTaskResponse {
+            next: request.value + 1,
+        })
+    }
+
+    fn alternate_get_task(
+        context: &McpContext,
+        request: GetTaskRequest,
+    ) -> McpResult<GetTaskResponse> {
+        assert_eq!(context.request_id(), 71);
+        Ok(GetTaskResponse {
+            next: request.value + 2,
+        })
+    }
+
+    fn update_task(
+        context: &McpContext,
+        request: UpdateTaskRequest,
+    ) -> McpResult<UpdateTaskResponse> {
+        assert_eq!(context.request_id(), 71);
+        Ok(UpdateTaskResponse {
+            updated_title: request.title.to_uppercase(),
+        })
     }
 
     fn negotiated_tasks(
@@ -400,9 +486,9 @@ mod tests {
     #[test]
     fn extension_handler_registry_freezes_and_looks_up_registered_handler() {
         let (descriptors, id) = tasks_descriptors();
-        let mut handlers = ExtensionHandlerRegistry::<u32, u32>::new(descriptors);
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
         handlers
-            .register(id.clone(), "tasks/get", increment_task)
+            .register(id.clone(), "tasks/get", get_task)
             .expect("typed Tasks handler registers");
 
         let receipt = handlers.freeze().expect("handler registry freezes");
@@ -410,42 +496,52 @@ mod tests {
         assert!(handlers.is_frozen());
         assert_eq!(handlers.len(), 1);
         assert_eq!(handlers.descriptor_registry().receipt(), Some(&receipt));
-        assert_eq!(
-            handlers
-                .lookup(&id, "tasks/get")
-                .expect("frozen registry finds its handler")
-                .handle(&McpContext::new(Cx::for_testing(), 71), 4)
-                .expect("lookup returns the original typed handler"),
-            5
-        );
+        let registered = handlers
+            .lookup(&id, "tasks/get")
+            .expect("frozen registry finds its handler registration");
+        assert_eq!(registered.extension_id(), &id);
+        assert_eq!(registered.method(), "tasks/get");
     }
 
     #[test]
     fn extension_handler_registry_rejects_duplicate_key_one_variable_negative() {
         let (descriptors, id) = tasks_descriptors();
-        let mut handlers = ExtensionHandlerRegistry::<u32, u32>::new(descriptors);
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
         handlers
-            .register(id.clone(), "tasks/get", increment_task)
+            .register(id.clone(), "tasks/get", get_task)
             .expect("baseline handler registers");
 
         assert_eq!(
-            handlers.register(id.clone(), "tasks/get", decrement_task),
+            handlers.register(id.clone(), "tasks/get", alternate_get_task),
             Err(ExtensionHandlerRegistrationError::DuplicateHandler(
-                super::ExtensionHandlerKey::new(id, "tasks/get")
+                ExtensionHandlerKey::new(id, "tasks/get")
             )),
             "only the handler implementation changes from the registered request location"
         );
     }
 
     #[test]
-    fn extension_handler_registry_admits_and_invokes_negotiated_handler() {
+    fn extension_handler_registry_erases_heterogeneous_types_and_rejects_malformed_input() {
         let (descriptors, id) = tasks_descriptors();
-        let mut handlers = ExtensionHandlerRegistry::<u32, u32>::new(descriptors);
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let counted_get_calls = Arc::clone(&get_calls);
         handlers
-            .register(id.clone(), "tasks/get", increment_task)
-            .expect("typed Tasks handler registers");
+            .register(
+                id.clone(),
+                "tasks/get",
+                move |context: &McpContext, request: GetTaskRequest| {
+                    counted_get_calls.fetch_add(1, Ordering::Relaxed);
+                    get_task(context, request)
+                },
+            )
+            .expect("typed Tasks get handler registers");
+        handlers
+            .register(id.clone(), "tasks/update", update_task)
+            .expect("differently typed Tasks update handler registers");
         handlers.freeze().expect("handler registry freezes");
         let negotiated = negotiated_tasks(handlers.descriptor_registry(), &id);
+        let context = McpContext::new(Cx::for_testing(), 71);
 
         assert_eq!(
             handlers
@@ -454,11 +550,45 @@ mod tests {
                     ProtocolEra::Modern2026,
                     &id,
                     "tasks/get",
-                    &McpContext::new(Cx::for_testing(), 71),
-                    41,
+                    &context,
+                    json!({"value": 41}),
                 )
-                .expect("negotiated protocol admission invokes the typed handler"),
-            42
+                .expect("negotiated protocol admission invokes the typed get handler"),
+            json!({"next": 42})
+        );
+        assert_eq!(
+            handlers
+                .invoke(
+                    &negotiated,
+                    ProtocolEra::Modern2026,
+                    &id,
+                    "tasks/update",
+                    &context,
+                    json!({"title": "review"}),
+                )
+                .expect("the same registry invokes the differently typed update handler"),
+            json!({"updated_title": "REVIEW"})
+        );
+        assert_eq!(get_calls.load(Ordering::Relaxed), 1);
+
+        let error = handlers
+            .invoke(
+                &negotiated,
+                ProtocolEra::Modern2026,
+                &id,
+                "tasks/get",
+                &context,
+                json!({"unexpected": true}),
+            )
+            .expect_err("one malformed request field shape must reject before the handler runs");
+        let ExtensionHandlerInvocationError::Handler(error) = error else {
+            panic!("malformed parameters must reach the typed serde admission boundary");
+        };
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            get_calls.load(Ordering::Relaxed),
+            1,
+            "failed typed decoding cannot invoke the registered handler"
         );
     }
 }
