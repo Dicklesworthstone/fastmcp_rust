@@ -148,12 +148,11 @@ pub use fastmcp_core::logging;
 pub use fastmcp_protocol::{
     CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, Content, GetPromptParams,
     GetPromptResult, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
-    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
-    ListToolsResult, LogLevel, Prompt, PromptArgument, PromptMessage, ReadResourceParams,
-    ReadResourceResult, Resource, ResourceContent, ResourceTemplate, ResourcesCapability, Role,
-    ServerCapabilities, ServerInfo, SubscribeResourceParams, Tool, ToolAnnotations,
-    ToolsCapability, UnsubscribeResourceParams,
+    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel, Prompt,
+    PromptArgument, PromptMessage, ReadResourceParams, ReadResourceResult, Resource,
+    ResourceContent, ResourceTemplate, ResourcesCapability, Role, ServerCapabilities, ServerInfo,
+    SubscribeResourceParams, Tool, ToolAnnotations, ToolsCapability, UnsubscribeResourceParams,
 };
 
 /// Historical exact-2024 protocol constant retained for existing consumers.
@@ -233,23 +232,23 @@ pub mod modern {
     };
     pub use fastmcp_core::{Cx, McpContext, McpError, McpOutcome, McpResult, Outcome};
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
+    pub use fastmcp_protocol::protocol_policy::{
+        HttpEndpointBundle, HttpEndpointBundleError, HttpEraCache, HttpEraDecision,
+        HttpModernProbe, HttpProbeBody, HttpRouteKind, MODERN_PROTOCOL_VERSION as PROTOCOL_VERSION,
+        ProtocolEra, ProtocolPolicy, ProtocolPolicyError, ProtocolPolicySelection, ProtocolRole,
+        ProtocolVersion, ProtocolVersionError,
+    };
     pub use fastmcp_protocol::{
         ClientExtensionDiscovery, DiscoveryCacheHints, ExtensionDescriptor,
         ExtensionDescriptorRegistry, ExtensionDirection, ExtensionDiscovery,
         ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId,
-        ExtensionMethodDescriptor, ExtensionNegotiationResolver,
-        ExtensionNotificationDescriptor, ExtensionRegistryError, ExtensionRegistryReceipt,
-        ExtensionRoutingHeaderDescriptor, ExtensionSettings, ExtensionSettingsSchema,
-        SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior,
-        ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
-        ServerDiscoverResult, ServerDiscoveryError, ServerExtensionDiscovery,
-        ServerInstructionError, ServerInstructions, StdioCorrelationDescriptor,
-    };
-    pub use fastmcp_protocol::protocol_policy::{
-        HttpEndpointBundle, HttpEndpointBundleError, HttpEraCache, HttpEraDecision,
-        HttpModernProbe, HttpProbeBody, HttpRouteKind, MODERN_PROTOCOL_VERSION as PROTOCOL_VERSION,
-        ProtocolEra, ProtocolPolicy, ProtocolPolicyError, ProtocolPolicySelection,
-        ProtocolRole, ProtocolVersion, ProtocolVersionError,
+        ExtensionMethodDescriptor, ExtensionNegotiationResolver, ExtensionNotificationDescriptor,
+        ExtensionRegistryError, ExtensionRegistryReceipt, ExtensionRoutingHeaderDescriptor,
+        ExtensionSettings, ExtensionSettingsSchema, SERVER_DISCOVER_METHOD,
+        SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior, ServerBehaviorRegistry,
+        ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
+        ServerDiscoveryError, ServerExtensionDiscovery, ServerInstructionError, ServerInstructions,
+        StdioCorrelationDescriptor,
     };
     pub use fastmcp_server::{
         AuthProvider, AuthRequest, HttpServerConfig, PromptHandler, ResourceHandler, Router,
@@ -271,24 +270,23 @@ pub mod modern {
 /// the responsibility of the immutable policy and the transport-specific
 /// negotiation layer.
 pub mod legacy_2024 {
-    pub use fastmcp_protocol::{
-        CancelledParams, InitializeParams, InitializeResult, PROTOCOL_VERSION,
-    };
     pub use fastmcp_protocol::methods;
     pub use fastmcp_protocol::protocol_policy::{
         LEGACY_PROTOCOL_VERSION, LegacyClientAdapterInstalledReceipt,
         LegacyServerAdapterInstalledReceipt, ProtocolEra, ProtocolPolicy, ProtocolVersion,
     };
+    pub use fastmcp_protocol::{
+        CancelledParams, InitializeParams, InitializeResult, PROTOCOL_VERSION,
+    };
     pub use fastmcp_server::legacy_2024::{
         LEGACY_2024_MAX_ADAPTER_RESERVATIONS, Legacy2024AdapterError, Legacy2024Handler,
-        Legacy2024HandlerError, Legacy2024Lifecycle, Legacy2024Outbound,
-        Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo,
-        Legacy2024StateSnapshot, LegacyAuthenticatedPeerPartition, LegacyPeerBinding,
+        Legacy2024HandlerError, Legacy2024Lifecycle, Legacy2024Outbound, Legacy2024ServerAdapter,
+        Legacy2024ServerConfig, Legacy2024ServerInfo, Legacy2024StateSnapshot,
+        LegacyAuthenticatedPeerPartition, LegacyPeerBinding,
         LegacyServerAdapterInstalledReceipt as ServerAdapterInstalledReceipt,
     };
     pub use fastmcp_transport::sse::{
-        LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink,
-        LegacySseServerTransport,
+        LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink, LegacySseServerTransport,
     };
 }
 
@@ -416,11 +414,9 @@ mod tests {
     fn api_01_exact_2024_surface_remains_explicit_and_available() {
         use super::legacy_2024;
 
-        let partition =
-            legacy_2024::LegacyAuthenticatedPeerPartition::from_authenticated_transport([
-                0_u8;
-                legacy_2024::LegacyAuthenticatedPeerPartition::BYTE_LEN
-            ]);
+        let partition = legacy_2024::LegacyAuthenticatedPeerPartition::from_authenticated_transport(
+            [0_u8; legacy_2024::LegacyAuthenticatedPeerPartition::BYTE_LEN],
+        );
         let binding = legacy_2024::LegacyPeerBinding::from_authenticated_transport(partition, 7);
 
         assert_eq!(binding.generation(), 7);

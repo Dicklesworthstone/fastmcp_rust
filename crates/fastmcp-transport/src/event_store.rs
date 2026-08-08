@@ -1172,10 +1172,18 @@ mod tests {
         )
         .unwrap();
 
-        let id1 = store.store_event("subscription", Some(serde_json::json!(1))).unwrap();
-        let id2 = store.store_event("subscription", Some(serde_json::json!(2))).unwrap();
-        let id3 = store.store_event("subscription", Some(serde_json::json!(3))).unwrap();
-        let id4 = store.store_event("subscription", Some(serde_json::json!(4))).unwrap();
+        let id1 = store
+            .store_event("subscription", Some(serde_json::json!(1)))
+            .unwrap();
+        let id2 = store
+            .store_event("subscription", Some(serde_json::json!(2)))
+            .unwrap();
+        let id3 = store
+            .store_event("subscription", Some(serde_json::json!(3)))
+            .unwrap();
+        let id4 = store
+            .store_event("subscription", Some(serde_json::json!(4)))
+            .unwrap();
 
         (store, id1, id2, id3, id4)
     }
@@ -1246,9 +1254,15 @@ mod tests {
     #[test]
     fn bounded_replay_rejects_a_cursor_from_another_stream_without_mutation() {
         let store = EventStore::with_config(EventStoreConfig::no_expiry()).unwrap();
-        let target_cursor = store.store_event("target", Some(serde_json::json!(1))).unwrap();
-        let target_tail = store.store_event("target", Some(serde_json::json!(2))).unwrap();
-        let foreign_cursor = store.store_event("other", Some(serde_json::json!(3))).unwrap();
+        let target_cursor = store
+            .store_event("target", Some(serde_json::json!(1)))
+            .unwrap();
+        let target_tail = store
+            .store_event("target", Some(serde_json::json!(2)))
+            .unwrap();
+        let foreign_cursor = store
+            .store_event("other", Some(serde_json::json!(3)))
+            .unwrap();
         let before_event_ids = store
             .get_events_after("target", None)
             .into_iter()
@@ -1290,9 +1304,15 @@ mod tests {
                 .max_replay_payload_bytes(2),
         )
         .unwrap();
-        let id1 = store.store_event("subscription", Some(serde_json::json!(1))).unwrap();
-        let id2 = store.store_event("subscription", Some(serde_json::json!(2))).unwrap();
-        let id3 = store.store_event("subscription", Some(serde_json::json!(3))).unwrap();
+        let id1 = store
+            .store_event("subscription", Some(serde_json::json!(1)))
+            .unwrap();
+        let id2 = store
+            .store_event("subscription", Some(serde_json::json!(2)))
+            .unwrap();
+        let id3 = store
+            .store_event("subscription", Some(serde_json::json!(3)))
+            .unwrap();
 
         let first = store
             .replay_bounded("subscription", None)

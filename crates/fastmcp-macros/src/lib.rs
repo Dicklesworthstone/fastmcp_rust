@@ -1576,8 +1576,7 @@ fn output_schema_source<'a>(
 ) -> OutputSchemaSource<'a> {
     match schema_expr {
         syn::Expr::Path(path)
-            if path.qself.is_none()
-                && typed_output_schema_matches_return(&path.path, output) =>
+            if path.qself.is_none() && typed_output_schema_matches_return(&path.path, output) =>
         {
             OutputSchemaSource::Type(&path.path)
         }
@@ -1620,10 +1619,7 @@ fn tool_success_type(output: &syn::ReturnType) -> Option<&Type> {
     })
 }
 
-fn typed_output_schema_matches_return(
-    schema_type: &syn::Path,
-    output: &syn::ReturnType,
-) -> bool {
+fn typed_output_schema_matches_return(schema_type: &syn::Path, output: &syn::ReturnType) -> bool {
     tool_success_type(output).is_some_and(|success_type| {
         quote! { #schema_type }.to_string() == quote! { #success_type }.to_string()
     })
@@ -1672,8 +1668,7 @@ mod schema_bound_tool_expansion_tests {
 
     #[test]
     fn sch_02_a_positive() {
-        let inline_schema: syn::Expr =
-            syn::parse_quote!(serde_json::json!({ "type": "object" }));
+        let inline_schema: syn::Expr = syn::parse_quote!(serde_json::json!({ "type": "object" }));
         validate_output_schema_expr(&inline_schema).expect("object schemas are accepted");
 
         let output_type: syn::Expr = syn::parse_quote!(FinalToolResult);
@@ -1681,8 +1676,8 @@ mod schema_bound_tool_expansion_tests {
         let OutputSchemaSource::Type(_) = output_schema_source(&output_type, &return_type) else {
             panic!("a bare output type must generate its final schema");
         };
-        let schema = output_schema_value(output_schema_source(&output_type, &return_type))
-            .to_string();
+        let schema =
+            output_schema_value(output_schema_source(&output_type, &return_type)).to_string();
         assert!(schema.contains("FinalToolResult"), "{schema}");
         assert!(schema.contains("json_schema"), "{schema}");
 
@@ -1698,9 +1693,15 @@ mod schema_bound_tool_expansion_tests {
         else {
             unreachable!("the schema source was checked above");
         };
-        assert!(typed_output_schema_matches_return(schema_type, &return_type));
+        assert!(typed_output_schema_matches_return(
+            schema_type,
+            &return_type
+        ));
         let conversion = generate_tool_result_conversion(&return_type, true).to_string();
-        assert!(conversion.contains("serde_json :: to_value"), "{conversion}");
+        assert!(
+            conversion.contains("serde_json :: to_value"),
+            "{conversion}"
+        );
         assert!(conversion.contains("result ?"), "{conversion}");
     }
 

@@ -9,11 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::Error as _,
-    ser::SerializeMap,
-};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeMap};
 use serde_json::Value;
 
 use crate::{ServerInfo, protocol_version::FINAL_PROTOCOL_VERSION};
@@ -461,7 +457,10 @@ pub struct ServerDiscoverResult {
     #[serde(rename = "supportedVersions")]
     supported_versions: Vec<String>,
     capabilities: ServerDiscoverCapabilities,
-    #[serde(rename = "_meta", skip_serializing_if = "ServerDiscoverResultMetadata::is_empty")]
+    #[serde(
+        rename = "_meta",
+        skip_serializing_if = "ServerDiscoverResultMetadata::is_empty"
+    )]
     metadata: ServerDiscoverResultMetadata,
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<ServerInstructions>,
@@ -638,9 +637,8 @@ mod tests {
 
     use crate::{
         DiscoveryCacheHints, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
-        ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities,
-        ServerDiscoverRequest, ServerDiscoverResult, ServerDiscoveryError, ServerInfo,
-        ServerInstructions,
+        ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
+        ServerDiscoverResult, ServerDiscoveryError, ServerInfo, ServerInstructions,
     };
 
     fn fully_installed_capabilities() -> ServerDiscoverCapabilities {
@@ -658,10 +656,7 @@ mod tests {
                 ServerBehavior::PromptsList,
                 ServerBehavior::PromptsListChangedNotification,
             ]),
-            BTreeMap::from([(
-                "io.fastmcp.example".to_owned(),
-                json!({"enabled": true}),
-            )]),
+            BTreeMap::from([("io.fastmcp.example".to_owned(), json!({"enabled": true}))]),
         )
         .expect("the bounded installed behavior registry is discoverable")
     }
@@ -680,8 +675,8 @@ mod tests {
 
         let request = serde_json::to_value(ServerDiscoverRequest::default())
             .expect("the typed request encodes through the public API");
-        let wire = serde_json::to_value(&result)
-            .expect("the typed result encodes through the public API");
+        let wire =
+            serde_json::to_value(&result).expect("the typed result encodes through the public API");
 
         assert_eq!(SERVER_DISCOVER_METHOD, "server/discover");
         assert_eq!(request, json!({}));
@@ -700,10 +695,7 @@ mod tests {
         assert_eq!(wire["ttlMs"], json!(60_000));
         assert_eq!(wire["cacheScope"], json!("private"));
         assert_eq!(wire["capabilities"]["tools"]["listChanged"], json!(true));
-        assert_eq!(
-            wire["capabilities"]["resources"]["subscribe"],
-            json!(true)
-        );
+        assert_eq!(wire["capabilities"]["resources"]["subscribe"], json!(true));
         assert_eq!(
             wire["capabilities"]["resources"]["listChanged"],
             json!(true)

@@ -1143,7 +1143,11 @@ impl Router {
             }
             "resources/list" => {
                 let params = parse_stateless_params_or_default(params)?;
-                encode_stateless_handler_result(self.handle_resources_list(request_ctx, params, None))?
+                encode_stateless_handler_result(self.handle_resources_list(
+                    request_ctx,
+                    params,
+                    None,
+                ))?
             }
             "resources/templates/list" => {
                 let params = parse_stateless_params_or_default(params)?;
@@ -1165,7 +1169,11 @@ impl Router {
             }
             "prompts/list" => {
                 let params = parse_stateless_params_or_default(params)?;
-                encode_stateless_handler_result(self.handle_prompts_list(request_ctx, params, None))?
+                encode_stateless_handler_result(self.handle_prompts_list(
+                    request_ctx,
+                    params,
+                    None,
+                ))?
             }
             "prompts/get" => {
                 let params = parse_stateless_params(params)?;
@@ -7948,7 +7956,10 @@ mod router_tests {
             )
             .expect("the modern router invokes the same installed handler");
 
-        assert_eq!(modern.get("resultType"), Some(&serde_json::json!("complete")));
+        assert_eq!(
+            modern.get("resultType"),
+            Some(&serde_json::json!("complete"))
+        );
         assert_eq!(modern.get("content"), legacy_wire.get("content"));
         assert_eq!(modern.get("isError"), legacy_wire.get("isError"));
     }
@@ -7974,7 +7985,10 @@ mod router_tests {
             .as_mut()
             .and_then(serde_json::Value::as_object_mut)
             .expect("tools/call parameters are an object")
-            .insert("name".to_string(), serde_json::json!("missing-final-contract-tool"));
+            .insert(
+                "name".to_string(),
+                serde_json::json!("missing-final-contract-tool"),
+            );
 
         assert_eq!(baseline.method, planted.method);
         assert_eq!(baseline.id, planted.id);

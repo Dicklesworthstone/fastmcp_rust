@@ -387,8 +387,8 @@ pub trait TwoPhaseTransport: Transport {
 mod tests {
     use super::{
         Codec, CodecError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
-        HttpResponseRepresentation, SendPermit, StreamableHttpTransport, Transport,
-        TransportError, TwoPhaseTransport,
+        HttpResponseRepresentation, SendPermit, StreamableHttpTransport, Transport, TransportError,
+        TwoPhaseTransport,
     };
     use asupersync::Cx;
     use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};

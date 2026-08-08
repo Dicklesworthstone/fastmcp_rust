@@ -240,7 +240,9 @@ pub type UriParams = HashMap<String, String>;
 pub(crate) fn encode_final_complete_result<T: serde::Serialize>(
     payload: T,
 ) -> McpResult<serde_json::Value> {
-    let serde_json::Value::Object(mut members) = serde_json::to_value(payload).map_err(McpError::from)? else {
+    let serde_json::Value::Object(mut members) =
+        serde_json::to_value(payload).map_err(McpError::from)?
+    else {
         return Err(McpError::internal_error(
             "modern complete result payload must serialize as an object",
         ));
@@ -892,7 +894,10 @@ mod tests {
         let encoded = encode_final_complete_result(payload.clone())
             .expect("a complete handler payload is admitted by the final result contract");
 
-        assert_eq!(encoded.get("resultType"), Some(&serde_json::json!("complete")));
+        assert_eq!(
+            encoded.get("resultType"),
+            Some(&serde_json::json!("complete"))
+        );
         assert_eq!(encoded.get("content"), payload.get("content"));
         assert_eq!(encoded.get("isError"), payload.get("isError"));
     }
@@ -907,7 +912,10 @@ mod tests {
         planted
             .as_object_mut()
             .expect("complete payload is an object")
-            .insert("resultType".to_string(), serde_json::json!("input_required"));
+            .insert(
+                "resultType".to_string(),
+                serde_json::json!("input_required"),
+            );
 
         assert_eq!(
             baseline.get("content"),

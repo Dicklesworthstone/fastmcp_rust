@@ -435,7 +435,8 @@ where
             (self.make_handler)(binding),
         )?;
         let index = self.bindings.len();
-        self.bindings.push(LiveLegacy2024Binding { binding, adapter });
+        self.bindings
+            .push(LiveLegacy2024Binding { binding, adapter });
         Ok(self.bindings[index].adapter.installed_receipt())
     }
 
@@ -494,7 +495,8 @@ where
         method: &'static str,
         params: Option<Value>,
     ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
-        self.adapter(binding)?.make_notification(binding, method, params)
+        self.adapter(binding)?
+            .make_notification(binding, method, params)
     }
 
     /// Closes one live binding, releases its owned state, and removes it.
@@ -1544,15 +1546,14 @@ mod tests {
         );
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handler_calls = Arc::clone(&calls);
-        let mut lifecycle = Legacy2024LiveServerLifecycle::new(
-            server_config(),
-            2,
-            move |binding| LiveRecordingHandler {
-                binding,
-                calls: Arc::clone(&handler_calls),
-            },
-        )
-        .expect("bounded exact-2024 live lifecycle must install");
+        let mut lifecycle =
+            Legacy2024LiveServerLifecycle::new(server_config(), 2, move |binding| {
+                LiveRecordingHandler {
+                    binding,
+                    calls: Arc::clone(&handler_calls),
+                }
+            })
+            .expect("bounded exact-2024 live lifecycle must install");
 
         assert_eq!(lifecycle.max_live_bindings(), 2);
         assert!(lifecycle.install(left).unwrap().matches_binding(left));
@@ -1659,15 +1660,14 @@ mod tests {
         );
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handler_calls = Arc::clone(&calls);
-        let mut lifecycle = Legacy2024LiveServerLifecycle::new(
-            server_config(),
-            2,
-            move |binding| LiveRecordingHandler {
-                binding,
-                calls: Arc::clone(&handler_calls),
-            },
-        )
-        .expect("bounded exact-2024 live lifecycle must install");
+        let mut lifecycle =
+            Legacy2024LiveServerLifecycle::new(server_config(), 2, move |binding| {
+                LiveRecordingHandler {
+                    binding,
+                    calls: Arc::clone(&handler_calls),
+                }
+            })
+            .expect("bounded exact-2024 live lifecycle must install");
 
         for binding in [left, right] {
             lifecycle.install(binding).unwrap();
@@ -1693,10 +1693,12 @@ mod tests {
         assert_eq!(lifecycle.snapshot(left).unwrap(), left_before);
         assert_eq!(lifecycle.snapshot(right).unwrap(), right_before);
         assert_eq!(lifecycle.active_binding_count(), 2);
-        assert!(calls
-            .lock()
-            .expect("live handler call log must not be poisoned")
-            .is_empty());
+        assert!(
+            calls
+                .lock()
+                .expect("live handler call log must not be poisoned")
+                .is_empty()
+        );
 
         assert_eq!(lifecycle.close(left).unwrap().close_release_count, 1);
         assert_eq!(lifecycle.close(right).unwrap().close_release_count, 1);

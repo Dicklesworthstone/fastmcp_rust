@@ -174,11 +174,7 @@ impl CacheKey {
         if let Some(serde_json::Value::Object(object)) = projection.as_mut() {
             object.remove("cursor");
         }
-        Self::try_digest(
-            CACHE_INVALIDATION_KEY_DOMAIN,
-            method,
-            projection.as_ref(),
-        )
+        Self::try_digest(CACHE_INVALIDATION_KEY_DOMAIN, method, projection.as_ref())
     }
 
     fn try_digest(
@@ -1092,7 +1088,10 @@ impl ResponseCachingMiddleware {
             return;
         };
         if !method_requires_protocol_cache_hints(method)
-            || response.get("resultType").and_then(serde_json::Value::as_str) != Some("complete")
+            || response
+                .get("resultType")
+                .and_then(serde_json::Value::as_str)
+                != Some("complete")
         {
             // Cache hints are valid only on the explicitly cacheable modern
             // complete-result branches. Do not preserve a handler- or peer-
@@ -2957,8 +2956,14 @@ mod tests {
                 )
                 .expect("the middleware must preserve a complete result");
 
-            assert_eq!(response.get("ttlMs"), Some(&serde_json::json!(expected_ttl_ms)));
-            assert_eq!(response.get("cacheScope"), Some(&serde_json::json!("private")));
+            assert_eq!(
+                response.get("ttlMs"),
+                Some(&serde_json::json!(expected_ttl_ms))
+            );
+            assert_eq!(
+                response.get("cacheScope"),
+                Some(&serde_json::json!("private"))
+            );
         }
     }
 
@@ -2983,12 +2988,17 @@ mod tests {
             )
             .expect("input-required results remain ordinary middleware output");
 
-        assert_eq!(response.get("resultType"), Some(&serde_json::json!("inputRequired")));
+        assert_eq!(
+            response.get("resultType"),
+            Some(&serde_json::json!("inputRequired"))
+        );
         assert!(response.get("ttlMs").is_none());
         assert!(response.get("cacheScope").is_none());
         assert_eq!(middleware.stats().entries, 0);
         assert!(matches!(
-            middleware.on_request(&ctx, &request).expect("lookup is safe"),
+            middleware
+                .on_request(&ctx, &request)
+                .expect("lookup is safe"),
             MiddlewareDecision::Continue
         ));
     }
@@ -3014,11 +3024,15 @@ mod tests {
         }
 
         assert!(matches!(
-            middleware.on_request(&ctx, &first_page).expect("first lookup is safe"),
+            middleware
+                .on_request(&ctx, &first_page)
+                .expect("first lookup is safe"),
             MiddlewareDecision::Respond(_)
         ));
         assert!(matches!(
-            middleware.on_request(&ctx, &second_page).expect("second lookup is safe"),
+            middleware
+                .on_request(&ctx, &second_page)
+                .expect("second lookup is safe"),
             MiddlewareDecision::Respond(_)
         ));
 
@@ -3054,7 +3068,9 @@ mod tests {
         // The only semantic change from the cacheable page is continuation
         // state. It must neither read nor populate an internal cache entry.
         assert!(matches!(
-            middleware.on_request(&ctx, &request).expect("continuation lookup is safe"),
+            middleware
+                .on_request(&ctx, &request)
+                .expect("continuation lookup is safe"),
             MiddlewareDecision::Continue
         ));
         let response = middleware
@@ -3065,10 +3081,15 @@ mod tests {
             )
             .expect("the continuation result remains deliverable");
 
-        assert_eq!(response.get("cacheScope"), Some(&serde_json::json!("private")));
+        assert_eq!(
+            response.get("cacheScope"),
+            Some(&serde_json::json!("private"))
+        );
         assert_eq!(middleware.stats().entries, 0);
         assert!(matches!(
-            middleware.on_request(&ctx, &request).expect("repeat continuation lookup is safe"),
+            middleware
+                .on_request(&ctx, &request)
+                .expect("repeat continuation lookup is safe"),
             MiddlewareDecision::Continue
         ));
     }

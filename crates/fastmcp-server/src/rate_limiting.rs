@@ -26,8 +26,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use fastmcp_core::{
-    sha256_bounded, McpContext, McpError, McpErrorCode, McpResult, Sha256Digest,
-    SHA256_DIGEST_BYTES,
+    McpContext, McpError, McpErrorCode, McpResult, SHA256_DIGEST_BYTES, Sha256Digest,
+    sha256_bounded,
 };
 use fastmcp_protocol::JsonRpcRequest;
 
@@ -1136,7 +1136,7 @@ mod tests {
     #[test]
     fn token_bucket_available_tokens_caps_at_capacity() {
         let limiter = TokenBucketRateLimiter::new(5, 1000.0); // Very high refill
-                                                              // Even with high refill rate, wait a bit — should not exceed capacity
+        // Even with high refill rate, wait a bit — should not exceed capacity
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(limiter.available_tokens() <= 5.0 + 0.1);
     }
@@ -1172,7 +1172,7 @@ mod tests {
         assert!(limiter.is_allowed());
         assert!(limiter.is_allowed());
         assert!(!limiter.is_allowed()); // denied
-                                        // Only 2 requests counted (not the denied one)
+        // Only 2 requests counted (not the denied one)
         assert_eq!(limiter.current_requests(), 2);
     }
 
@@ -1681,9 +1681,11 @@ mod tests {
             .burst_capacity(inexact_capacity)
             .global();
         assert_eq!(middleware.burst_capacity, 0);
-        assert!(middleware
-            .on_request(&test_context(), &test_request("tools/call"))
-            .is_err());
+        assert!(
+            middleware
+                .on_request(&test_context(), &test_request("tools/call"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1742,9 +1744,11 @@ mod tests {
             MAX_NAMED_CLIENT_PARTITIONS
         );
 
-        assert!(middleware
-            .on_request(&ctx, &test_request("overflow-client-a"))
-            .is_ok());
+        assert!(
+            middleware
+                .on_request(&ctx, &test_request("overflow-client-a"))
+                .is_ok()
+        );
         assert!(
             middleware
                 .on_request(&ctx, &test_request("overflow-client-b"))
@@ -1780,9 +1784,11 @@ mod tests {
             MAX_NAMED_CLIENT_PARTITIONS
         );
 
-        assert!(middleware
-            .on_request(&ctx, &test_request("overflow-client-a"))
-            .is_ok());
+        assert!(
+            middleware
+                .on_request(&ctx, &test_request("overflow-client-a"))
+                .is_ok()
+        );
         assert!(
             middleware
                 .on_request(&ctx, &test_request("overflow-client-b"))
@@ -1809,16 +1815,20 @@ mod tests {
         let ctx = test_context();
         let legitimate_id = "recent-legitimate-token-client";
 
-        assert!(middleware
-            .on_request(&ctx, &test_request(legitimate_id))
-            .is_ok());
+        assert!(
+            middleware
+                .on_request(&ctx, &test_request(legitimate_id))
+                .is_ok()
+        );
         for index in 0..(MAX_NAMED_CLIENT_PARTITIONS - 1) {
-            assert!(middleware
-                .on_request(
-                    &ctx,
-                    &test_request(&format!("stale-token-attacker-{index}"))
-                )
-                .is_ok());
+            assert!(
+                middleware
+                    .on_request(
+                        &ctx,
+                        &test_request(&format!("stale-token-attacker-{index}"))
+                    )
+                    .is_ok()
+            );
         }
         assert!(
             middleware
@@ -1914,16 +1924,20 @@ mod tests {
         let ctx = test_context();
         let legitimate_id = "recent-legitimate-window-client";
 
-        assert!(middleware
-            .on_request(&ctx, &test_request(legitimate_id))
-            .is_ok());
+        assert!(
+            middleware
+                .on_request(&ctx, &test_request(legitimate_id))
+                .is_ok()
+        );
         for index in 0..(MAX_NAMED_CLIENT_PARTITIONS - 1) {
-            assert!(middleware
-                .on_request(
-                    &ctx,
-                    &test_request(&format!("stale-window-attacker-{index}"))
-                )
-                .is_ok());
+            assert!(
+                middleware
+                    .on_request(
+                        &ctx,
+                        &test_request(&format!("stale-window-attacker-{index}"))
+                    )
+                    .is_ok()
+            );
         }
         assert!(
             middleware
@@ -2044,19 +2058,23 @@ mod tests {
 
         let token_error = token.on_request(&ctx, &request).unwrap_err();
         assert_eq!(token_error.message, RATE_LIMIT_EXCEEDED_MESSAGE);
-        assert!(token
-            .limiters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty());
+        assert!(
+            token
+                .limiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
 
         let sliding_error = sliding.on_request(&ctx, &request).unwrap_err();
         assert_eq!(sliding_error.message, RATE_LIMIT_EXCEEDED_MESSAGE);
-        assert!(sliding
-            .limiters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty());
+        assert!(
+            sliding
+                .limiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2066,15 +2084,19 @@ mod tests {
         assert_eq!(zero_window.current_requests(), 0);
 
         let zero_window_middleware = SlidingWindowRateLimitingMiddleware::new(10, 0);
-        assert!(zero_window_middleware
-            .on_request(&test_context(), &test_request("tools/call"))
-            .is_err());
+        assert!(
+            zero_window_middleware
+                .on_request(&test_context(), &test_request("tools/call"))
+                .is_err()
+        );
 
         let overflowing_minutes = SlidingWindowRateLimitingMiddleware::per_minute(10, u64::MAX);
         assert_eq!(overflowing_minutes.window_seconds, 0);
-        assert!(overflowing_minutes
-            .on_request(&test_context(), &test_request("tools/call"))
-            .is_err());
+        assert!(
+            overflowing_minutes
+                .on_request(&test_context(), &test_request("tools/call"))
+                .is_err()
+        );
 
         let maximum_seconds = SlidingWindowRateLimiter::new(1, u64::MAX);
         assert!(maximum_seconds.is_allowed());

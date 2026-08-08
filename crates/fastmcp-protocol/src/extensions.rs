@@ -148,10 +148,7 @@ fn validate_settings_map(map: &Map<String, Value>) -> Result<(), ExtensionRegist
     Ok(())
 }
 
-fn validate_settings_value(
-    value: &Value,
-    depth: usize,
-) -> Result<(), ExtensionRegistryError> {
+fn validate_settings_value(value: &Value, depth: usize) -> Result<(), ExtensionRegistryError> {
     if depth > MAX_EXTENSION_SETTINGS_NESTING {
         return Err(ExtensionRegistryError::SettingsTooDeep);
     }
@@ -638,10 +635,16 @@ impl fmt::Display for ExtensionNegotiationError {
                 formatter.write_str("extension descriptor registry is not frozen")
             }
             Self::UnregisteredLocalEnablement(id) => {
-                write!(formatter, "local extension enablement has no descriptor: {id}")
+                write!(
+                    formatter,
+                    "local extension enablement has no descriptor: {id}"
+                )
             }
             Self::DiscoveryTooManyExtensions(peer) => {
-                write!(formatter, "{peer:?} extension discovery exceeds its entry limit")
+                write!(
+                    formatter,
+                    "{peer:?} extension discovery exceeds its entry limit"
+                )
             }
             Self::OneSidedSupport { id, missing } => {
                 write!(formatter, "extension {id} is missing {missing:?} support")
@@ -650,7 +653,10 @@ impl fmt::Display for ExtensionNegotiationError {
                 write!(formatter, "extension settings are incompatible: {id}")
             }
             Self::EffectiveSettingsTooLarge(id) => {
-                write!(formatter, "effective extension settings exceed their bound: {id}")
+                write!(
+                    formatter,
+                    "effective extension settings exceed their bound: {id}"
+                )
             }
         }
     }
@@ -718,7 +724,10 @@ impl fmt::Display for ExtensionDispatchError {
                 formatter.write_str("extension dispatch registry does not match negotiation")
             }
             Self::NameTooLong(value) => {
-                write!(formatter, "extension dispatch name exceeds its byte limit: {value}")
+                write!(
+                    formatter,
+                    "extension dispatch name exceeds its byte limit: {value}"
+                )
             }
             Self::NoActiveOwner { field, value } => {
                 write!(formatter, "no active extension owns {field}: {value}")
@@ -886,7 +895,8 @@ impl ExtensionDescriptorRegistry {
                 }
                 (None, Some(_)) => match descriptor.resolver.fallback {
                     ExtensionFallbackPolicy::ServerInactiveFallback => {
-                        inactive.insert(id.clone(), ExtensionInactiveReason::ServerInactiveFallback);
+                        inactive
+                            .insert(id.clone(), ExtensionInactiveReason::ServerInactiveFallback);
                     }
                     ExtensionFallbackPolicy::RejectOneSided
                     | ExtensionFallbackPolicy::ClientInactiveFallback => {
@@ -898,7 +908,8 @@ impl ExtensionDescriptorRegistry {
                 },
                 (Some(_), None) => match descriptor.resolver.fallback {
                     ExtensionFallbackPolicy::ClientInactiveFallback => {
-                        inactive.insert(id.clone(), ExtensionInactiveReason::ClientInactiveFallback);
+                        inactive
+                            .insert(id.clone(), ExtensionInactiveReason::ClientInactiveFallback);
                     }
                     ExtensionFallbackPolicy::RejectOneSided
                     | ExtensionFallbackPolicy::ServerInactiveFallback => {
@@ -961,9 +972,7 @@ fn effective_settings_fingerprint(
         "serverSchema": descriptor.server_settings.schema_id,
         "effective": canonicalize_value(&Value::Object(effective.as_object().clone())),
     }))
-    .map_err(|_| {
-        ExtensionNegotiationError::EffectiveSettingsTooLarge(descriptor.id.to_string())
-    })?;
+    .map_err(|_| ExtensionNegotiationError::EffectiveSettingsTooLarge(descriptor.id.to_string()))?;
     if subject.len() > MAX_EXTENSION_REGISTRY_CANONICAL_BYTES {
         return Err(ExtensionNegotiationError::EffectiveSettingsTooLarge(
             descriptor.id.to_string(),
@@ -1244,14 +1253,19 @@ fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Extension
             return Err(ExtensionRegistryError::MissingOwner("stdio correlation"));
         }
         ExtensionId::parse(correlation.metadata_key.clone())?;
-        if correlation.methods.is_empty() || correlation.methods.len() > MAX_STDIO_CORRELATION_METHODS {
+        if correlation.methods.is_empty()
+            || correlation.methods.len() > MAX_STDIO_CORRELATION_METHODS
+        {
             return Err(ExtensionRegistryError::MissingOwner("stdio correlation"));
         }
         let Some(notification) = &descriptor.notification else {
             return Err(ExtensionRegistryError::MissingOwner("stdio notification"));
         };
         if notification.direction != correlation.direction
-            || !correlation.methods.iter().any(|method| method == &notification.name)
+            || !correlation
+                .methods
+                .iter()
+                .any(|method| method == &notification.name)
         {
             return Err(ExtensionRegistryError::LocalOwnershipCollision {
                 field: "stdio correlation notification",
@@ -1478,7 +1492,9 @@ mod tests {
                 "com.example/weather_result",
             ))
             .expect("descriptor registers");
-        registry.freeze().expect("registry freezes before negotiation");
+        registry
+            .freeze()
+            .expect("registry freezes before negotiation");
 
         let client_settings = ExtensionSettings::new(json!({
             "unit": "celsius",
@@ -1505,19 +1521,17 @@ mod tests {
         };
         let mut local = ExtensionLocalEnablement::default();
         local.enable(id.clone());
-        let mut resolver = |
-            descriptor: &ExtensionDescriptor,
-            client: &ExtensionSettings,
-            server: &ExtensionSettings,
-        | {
+        let mut resolver = |descriptor: &ExtensionDescriptor,
+                            client: &ExtensionSettings,
+                            server: &ExtensionSettings| {
             assert_eq!(descriptor.resolver.id, "weather-compatibility-v1");
             ExtensionSettings::new(json!({
                 "unit": client.as_object()["unit"].clone(),
                 "maxCities": server.as_object()["maxCities"].clone(),
             }))
-            .map_err(|_| ExtensionNegotiationError::SettingsCompatibilityRejected(
-                descriptor.id.to_string(),
-            ))
+            .map_err(|_| {
+                ExtensionNegotiationError::SettingsCompatibilityRejected(descriptor.id.to_string())
+            })
         };
         let negotiated = registry
             .negotiate(&local, &client, &server, &mut resolver)
