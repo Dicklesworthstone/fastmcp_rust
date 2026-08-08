@@ -2241,7 +2241,7 @@ fn decode_modern_discovery_response(
     let result = response
         .result
         .ok_or(ModernHttpClientError::InvalidDiscoveryResponse)?;
-    let discovery = serde_json::from_value(result)
+    let discovery: ServerDiscoverResult = serde_json::from_value(result)
         .map_err(|_| ModernHttpClientError::InvalidDiscoveryResponse)?;
     if !discovery
         .supported_versions()
