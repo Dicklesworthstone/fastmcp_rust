@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use fastmcp_protocol::{
-    DiscoveryCacheHints, ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities,
-    ServerDiscoverRequest, ServerDiscoverResult, ServerInfo, ServerInstructions,
-    SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
+    DiscoveryCacheHints, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
+    ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
+    ServerDiscoverResult, ServerInfo, ServerInstructions,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[test]
 fn srv_02_a_positive() {
