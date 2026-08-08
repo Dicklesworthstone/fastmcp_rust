@@ -12,11 +12,15 @@ use serde_json::Value;
 use crate::common_types::{
     AbsoluteUri, ContentBlock, EmbeddedResourceContents, LoggingLevel, OpenMetadata,
 };
-use crate::jsonrpc::{JsonRpcResponse, RequestId};
+use crate::jsonrpc::{JsonRpcRequest, JsonRpcResponse, RequestId};
 use crate::methods::{
-    COMPLETION_COMPLETE, INITIALIZE, LOGGING_SET_LEVEL, PING, PROMPTS_GET, PROMPTS_LIST,
-    RESOURCES_LIST, RESOURCES_READ, RESOURCES_TEMPLATES_LIST, SAMPLING_CREATE_MESSAGE,
-    SUBSCRIPTIONS_LISTEN, TOOLS_CALL, TOOLS_LIST,
+    COMPLETION_COMPLETE, Final2026EnvelopeKind, Final2026Peer, INITIALIZE, LOGGING_SET_LEVEL,
+    NOTIFICATIONS_CANCELLED, NOTIFICATIONS_MESSAGE, NOTIFICATIONS_PROGRESS,
+    NOTIFICATIONS_PROMPTS_LIST_CHANGED, NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+    NOTIFICATIONS_RESOURCES_UPDATED, NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
+    NOTIFICATIONS_TOOLS_LIST_CHANGED, PING, PROMPTS_GET, PROMPTS_LIST, RESOURCES_LIST,
+    RESOURCES_READ, RESOURCES_TEMPLATES_LIST, SAMPLING_CREATE_MESSAGE, SERVER_DISCOVER,
+    SUBSCRIPTIONS_LISTEN, TOOLS_CALL, TOOLS_LIST, final_2026_07_28_method,
 };
 use crate::protocol_policy::ProtocolEra;
 use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
@@ -425,7 +429,7 @@ pub struct FinalCompletionParams {
     pub context: Option<FinalCompletionContext>,
 }
 
-/// Final empty request parameters, used by `ping`.
+/// Final empty request parameters, used by `server/discover`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalEmptyParams {
@@ -520,6 +524,67 @@ pub struct FinalLogMessageParams {
     pub meta: Option<OpenMetadata>,
 }
 
+/// Exact final `notifications/cancelled` parameters.
+///
+/// This is deliberately separate from legacy [`CancelledParams`]: the final
+/// wire shape does not admit the legacy-only `awaitCleanup` member.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalCancelledNotificationParams {
+    /// The client request ID whose result is no longer needed.
+    #[serde(rename = "requestId")]
+    pub request_id: RequestId,
+    /// Optional open cancellation reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Optional final notification metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+/// Exact final `notifications/progress` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalProgressNotificationParams {
+    /// Token from the client request being progressed.
+    #[serde(rename = "progressToken")]
+    pub progress_token: ProgressMarker,
+    /// Progress completed so far.
+    pub progress: f64,
+    /// Total work, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<f64>,
+    /// Optional progress message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Optional final notification metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+/// Exact final `notifications/resources/updated` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalResourceUpdatedNotificationParams {
+    /// Absolute URI for the changed resource or provider-defined sub-resource.
+    pub uri: AbsoluteUri,
+    /// Optional final notification metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+/// Exact optional parameter object for final catalog-change notifications.
+///
+/// `None` in a [`ServerNotification`] omits `params` entirely; `Some` retains
+/// a present notification parameter object, including a metadata-only one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalEmptyNotificationParams {
+    /// Optional final notification metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
 /// Exact final `sampling/createMessage` parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -595,6 +660,12 @@ pub struct FinalCreateMessageResult {
         skip_serializing_if = "Option::is_none"
     )]
     pub stop_reason: Option<String>,
+    /// Optional final metadata on this embedded MRTR input response value.
+    ///
+    /// This payload is not a JSON-RPC result envelope, so it deliberately
+    /// carries no `resultType` discriminator.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
 }
 
 /// Exact final `sampling/createMessage` input-required result.
@@ -809,6 +880,324 @@ pub struct FinalGetPromptResult {
     pub messages: Vec<FinalPromptMessage>,
 }
 
+// ============================================================================
+// Final directional notification unions
+// ============================================================================
+
+/// Typed admission error for an MCP 2026-07-28 notification union.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalNotificationError {
+    /// The public JSON-RPC struct contained invalid envelope data.
+    InvalidEnvelope { method: String },
+    /// A notification union was given a request with an ID.
+    RequestIdPresent { method: String },
+    /// The method is not part of the active final core method table.
+    UnsupportedMethod { method: String },
+    /// The method is a final request rather than a final notification.
+    WrongEnvelope { method: String },
+    /// The selected peer cannot originate this notification method.
+    WrongDirection {
+        /// Exact notification method literal.
+        method: String,
+        /// Peer that attempted to originate it.
+        sender: Final2026Peer,
+    },
+    /// The method's required parameter shape was missing or invalid.
+    InvalidParams { method: &'static str },
+    /// A locally constructed typed parameter object could not be encoded.
+    EncodeFailure { method: &'static str },
+}
+
+impl std::fmt::Display for FinalNotificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidEnvelope { method } => {
+                write!(
+                    formatter,
+                    "invalid JSON-RPC notification envelope for {method}"
+                )
+            }
+            Self::RequestIdPresent { method } => {
+                write!(formatter, "{method} must be a JSON-RPC notification")
+            }
+            Self::UnsupportedMethod { method } => {
+                write!(formatter, "{method} is not an active final notification")
+            }
+            Self::WrongEnvelope { method } => {
+                write!(formatter, "{method} is a final request, not a notification")
+            }
+            Self::WrongDirection { method, sender } => {
+                write!(
+                    formatter,
+                    "{sender:?} cannot send final notification {method}"
+                )
+            }
+            Self::InvalidParams { method } => {
+                write!(
+                    formatter,
+                    "invalid final notification parameters for {method}"
+                )
+            }
+            Self::EncodeFailure { method } => {
+                write!(
+                    formatter,
+                    "unable to encode final notification parameters for {method}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FinalNotificationError {}
+
+/// The one notification a final client may originate.
+#[derive(Debug, Clone)]
+pub enum ClientNotification {
+    /// `notifications/cancelled` for a client-owned request.
+    Cancelled(FinalCancelledNotificationParams),
+}
+
+impl ClientNotification {
+    /// Admits one JSON-RPC notification only from the exact final client union.
+    pub fn decode(request: &JsonRpcRequest) -> Result<Self, FinalNotificationError> {
+        admit_final_notification(request, Final2026Peer::Client)?;
+        match request.method.as_str() {
+            NOTIFICATIONS_CANCELLED => {
+                decode_required_final_notification_params(request).map(Self::Cancelled)
+            }
+            _ => Err(FinalNotificationError::WrongDirection {
+                method: request.method.clone(),
+                sender: Final2026Peer::Client,
+            }),
+        }
+    }
+
+    /// Returns this notification's exact method literal.
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::Cancelled(_) => NOTIFICATIONS_CANCELLED,
+        }
+    }
+
+    /// Encodes this typed union as an ID-free JSON-RPC notification.
+    pub fn encode(&self) -> Result<JsonRpcRequest, FinalNotificationError> {
+        let params = match self {
+            Self::Cancelled(params) => {
+                encode_final_notification_params(NOTIFICATIONS_CANCELLED, params)?
+            }
+        };
+        Ok(JsonRpcRequest::notification(self.method(), Some(params)))
+    }
+}
+
+/// The eight notifications a final server may originate.
+#[derive(Debug, Clone)]
+pub enum ServerNotification {
+    /// `notifications/cancelled` for a server-terminated subscription stream.
+    Cancelled(FinalCancelledNotificationParams),
+    /// `notifications/progress` for an in-flight client request.
+    Progress(FinalProgressNotificationParams),
+    /// `notifications/message` log event.
+    Message(FinalLogMessageParams),
+    /// `notifications/resources/updated` resource change event.
+    ResourceUpdated(FinalResourceUpdatedNotificationParams),
+    /// `notifications/resources/list_changed` catalog change event.
+    ResourcesListChanged(Option<FinalEmptyNotificationParams>),
+    /// `notifications/tools/list_changed` catalog change event.
+    ToolsListChanged(Option<FinalEmptyNotificationParams>),
+    /// `notifications/prompts/list_changed` catalog change event.
+    PromptsListChanged(Option<FinalEmptyNotificationParams>),
+    /// `notifications/subscriptions/acknowledged` stream acknowledgement.
+    SubscriptionsAcknowledged(FinalSubscriptionsAcknowledgedNotificationParams),
+}
+
+impl ServerNotification {
+    /// Admits one JSON-RPC notification only from the exact final server union.
+    pub fn decode(request: &JsonRpcRequest) -> Result<Self, FinalNotificationError> {
+        admit_final_notification(request, Final2026Peer::Server)?;
+        match request.method.as_str() {
+            NOTIFICATIONS_CANCELLED => {
+                decode_required_final_notification_params(request).map(Self::Cancelled)
+            }
+            NOTIFICATIONS_PROGRESS => {
+                decode_required_final_notification_params(request).map(Self::Progress)
+            }
+            NOTIFICATIONS_MESSAGE => {
+                decode_required_final_notification_params(request).map(Self::Message)
+            }
+            NOTIFICATIONS_RESOURCES_UPDATED => {
+                decode_required_final_notification_params(request).map(Self::ResourceUpdated)
+            }
+            NOTIFICATIONS_RESOURCES_LIST_CHANGED => {
+                decode_optional_final_notification_params(request).map(Self::ResourcesListChanged)
+            }
+            NOTIFICATIONS_TOOLS_LIST_CHANGED => {
+                decode_optional_final_notification_params(request).map(Self::ToolsListChanged)
+            }
+            NOTIFICATIONS_PROMPTS_LIST_CHANGED => {
+                decode_optional_final_notification_params(request).map(Self::PromptsListChanged)
+            }
+            NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED => {
+                decode_required_final_notification_params(request)
+                    .map(Self::SubscriptionsAcknowledged)
+            }
+            _ => Err(FinalNotificationError::WrongDirection {
+                method: request.method.clone(),
+                sender: Final2026Peer::Server,
+            }),
+        }
+    }
+
+    /// Returns this notification's exact method literal.
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::Cancelled(_) => NOTIFICATIONS_CANCELLED,
+            Self::Progress(_) => NOTIFICATIONS_PROGRESS,
+            Self::Message(_) => NOTIFICATIONS_MESSAGE,
+            Self::ResourceUpdated(_) => NOTIFICATIONS_RESOURCES_UPDATED,
+            Self::ResourcesListChanged(_) => NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+            Self::ToolsListChanged(_) => NOTIFICATIONS_TOOLS_LIST_CHANGED,
+            Self::PromptsListChanged(_) => NOTIFICATIONS_PROMPTS_LIST_CHANGED,
+            Self::SubscriptionsAcknowledged(_) => NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
+        }
+    }
+
+    /// Encodes this typed union as an ID-free JSON-RPC notification.
+    pub fn encode(&self) -> Result<JsonRpcRequest, FinalNotificationError> {
+        let params = match self {
+            Self::Cancelled(params) => Some(encode_final_notification_params(
+                NOTIFICATIONS_CANCELLED,
+                params,
+            )?),
+            Self::Progress(params) => Some(encode_final_notification_params(
+                NOTIFICATIONS_PROGRESS,
+                params,
+            )?),
+            Self::Message(params) => Some(encode_final_notification_params(
+                NOTIFICATIONS_MESSAGE,
+                params,
+            )?),
+            Self::ResourceUpdated(params) => Some(encode_final_notification_params(
+                NOTIFICATIONS_RESOURCES_UPDATED,
+                params,
+            )?),
+            Self::ResourcesListChanged(params) => params
+                .as_ref()
+                .map(|params| {
+                    encode_final_notification_params(NOTIFICATIONS_RESOURCES_LIST_CHANGED, params)
+                })
+                .transpose()?,
+            Self::ToolsListChanged(params) => params
+                .as_ref()
+                .map(|params| {
+                    encode_final_notification_params(NOTIFICATIONS_TOOLS_LIST_CHANGED, params)
+                })
+                .transpose()?,
+            Self::PromptsListChanged(params) => params
+                .as_ref()
+                .map(|params| {
+                    encode_final_notification_params(NOTIFICATIONS_PROMPTS_LIST_CHANGED, params)
+                })
+                .transpose()?,
+            Self::SubscriptionsAcknowledged(params) => Some(encode_final_notification_params(
+                NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
+                params,
+            )?),
+        };
+        Ok(JsonRpcRequest::notification(self.method(), params))
+    }
+}
+
+fn admit_final_notification(
+    request: &JsonRpcRequest,
+    sender: Final2026Peer,
+) -> Result<(), FinalNotificationError> {
+    if request.validate().is_err() {
+        return Err(FinalNotificationError::InvalidEnvelope {
+            method: request.method.clone(),
+        });
+    }
+    if !request.is_notification() {
+        return Err(FinalNotificationError::RequestIdPresent {
+            method: request.method.clone(),
+        });
+    }
+    let Some(method) = final_2026_07_28_method(&request.method) else {
+        return Err(FinalNotificationError::UnsupportedMethod {
+            method: request.method.clone(),
+        });
+    };
+    if !matches!(method.envelope, Final2026EnvelopeKind::Notification) {
+        return Err(FinalNotificationError::WrongEnvelope {
+            method: request.method.clone(),
+        });
+    }
+    if !method.admits_notification_from(sender) {
+        return Err(FinalNotificationError::WrongDirection {
+            method: request.method.clone(),
+            sender,
+        });
+    }
+    Ok(())
+}
+
+fn decode_required_final_notification_params<T: DeserializeOwned>(
+    request: &JsonRpcRequest,
+) -> Result<T, FinalNotificationError> {
+    request
+        .params
+        .as_ref()
+        .ok_or(FinalNotificationError::InvalidParams {
+            method: notification_method_literal(request),
+        })
+        .and_then(|params| {
+            serde_json::from_value(params.clone()).map_err(|_| {
+                FinalNotificationError::InvalidParams {
+                    method: notification_method_literal(request),
+                }
+            })
+        })
+}
+
+fn decode_optional_final_notification_params<T: DeserializeOwned>(
+    request: &JsonRpcRequest,
+) -> Result<Option<T>, FinalNotificationError> {
+    request
+        .params
+        .as_ref()
+        .map(|params| {
+            serde_json::from_value(params.clone()).map_err(|_| {
+                FinalNotificationError::InvalidParams {
+                    method: notification_method_literal(request),
+                }
+            })
+        })
+        .transpose()
+}
+
+fn encode_final_notification_params<T: Serialize>(
+    method: &'static str,
+    params: &T,
+) -> Result<Value, FinalNotificationError> {
+    serde_json::to_value(params).map_err(|_| FinalNotificationError::EncodeFailure { method })
+}
+
+fn notification_method_literal(request: &JsonRpcRequest) -> &'static str {
+    match request.method.as_str() {
+        NOTIFICATIONS_CANCELLED => NOTIFICATIONS_CANCELLED,
+        NOTIFICATIONS_PROGRESS => NOTIFICATIONS_PROGRESS,
+        NOTIFICATIONS_MESSAGE => NOTIFICATIONS_MESSAGE,
+        NOTIFICATIONS_RESOURCES_UPDATED => NOTIFICATIONS_RESOURCES_UPDATED,
+        NOTIFICATIONS_RESOURCES_LIST_CHANGED => NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+        NOTIFICATIONS_TOOLS_LIST_CHANGED => NOTIFICATIONS_TOOLS_LIST_CHANGED,
+        NOTIFICATIONS_PROMPTS_LIST_CHANGED => NOTIFICATIONS_PROMPTS_LIST_CHANGED,
+        NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED => NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
+        _ => unreachable!("notification admission rejects unknown method literals"),
+    }
+}
+
 /// Completion candidates returned by either protocol era.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionValues {
@@ -995,6 +1384,8 @@ pub enum LegacyCoreRequest {
 /// Final core requests use final metadata and common vocabulary throughout.
 #[derive(Debug, Clone)]
 pub enum FinalCoreRequest {
+    /// `server/discover`.
+    Discover(FinalEmptyParams),
     /// `completion/complete`.
     Completion(FinalCompletionParams),
     /// `tools/list`.
@@ -1013,8 +1404,6 @@ pub enum FinalCoreRequest {
     PromptsGet(FinalGetPromptParams),
     /// `subscriptions/listen`.
     SubscriptionsListen(FinalSubscriptionsListenParams),
-    /// `ping`.
-    Ping(FinalEmptyParams),
 }
 
 /// Public, era-aware dispatch for the currently supported core request set.
@@ -1062,6 +1451,8 @@ pub enum LegacyCoreResult {
 /// peer conformance.
 #[derive(Debug, Clone)]
 pub enum FinalCoreResult {
+    /// `server/discover`.
+    Discover(crate::server_discovery::ServerDiscoverResult),
     /// `completion/complete`.
     Completion {
         result: CompleteResult<FinalCompletionResult>,
@@ -1107,11 +1498,6 @@ pub enum FinalCoreResult {
         result: CompleteResult<FinalSubscriptionsListenResult>,
         /// The required subscription ID extracted from the result metadata.
         subscription_id: RequestId,
-        diagnostic: Option<ResultPeerDiagnostic>,
-    },
-    /// `ping` acknowledgement.
-    Ping {
-        result: CompleteResult<FinalEmptyResult>,
         diagnostic: Option<ResultPeerDiagnostic>,
     },
 }
@@ -1364,6 +1750,9 @@ impl CoreRequest {
 
     fn decode_final(method: &str, params: Option<&Value>) -> Result<Self, CoreDispatchError> {
         let request = match method {
+            SERVER_DISCOVER => {
+                FinalCoreRequest::Discover(decode_final_params(SERVER_DISCOVER, params)?)
+            }
             COMPLETION_COMPLETE => {
                 FinalCoreRequest::Completion(decode_final_params(COMPLETION_COMPLETE, params)?)
             }
@@ -1386,7 +1775,6 @@ impl CoreRequest {
                 SUBSCRIPTIONS_LISTEN,
                 params,
             )?),
-            PING => FinalCoreRequest::Ping(decode_final_params(PING, params)?),
             _ => {
                 return Err(CoreDispatchError::UnsupportedMethod {
                     era: ProtocolEra::Modern2026,
@@ -1406,6 +1794,7 @@ impl LegacyCoreRequest {
         match self {
             Self::Initialize(_) => INITIALIZE,
             Self::Completion(_) => COMPLETION_COMPLETE,
+            Self::SamplingCreateMessage(_) => SAMPLING_CREATE_MESSAGE,
             Self::ToolsList(_) => TOOLS_LIST,
             Self::ToolsCall(_) => TOOLS_CALL,
             Self::ResourcesList(_) => RESOURCES_LIST,
@@ -1492,6 +1881,7 @@ impl FinalCoreRequest {
     #[must_use]
     pub const fn method(&self) -> &'static str {
         match self {
+            Self::Discover(_) => SERVER_DISCOVER,
             Self::Completion(_) => COMPLETION_COMPLETE,
             Self::ToolsList(_) => TOOLS_LIST,
             Self::ToolsCall(_) => TOOLS_CALL,
@@ -1501,12 +1891,12 @@ impl FinalCoreRequest {
             Self::PromptsList(_) => PROMPTS_LIST,
             Self::PromptsGet(_) => PROMPTS_GET,
             Self::SubscriptionsListen(_) => SUBSCRIPTIONS_LISTEN,
-            Self::Ping(_) => PING,
         }
     }
 
     fn validate_metadata(&self) -> Result<(), CoreDispatchError> {
         let metadata = match self {
+            Self::Discover(params) => &params.meta,
             Self::Completion(params) => &params.meta,
             Self::ToolsList(params)
             | Self::ResourcesList(params)
@@ -1516,7 +1906,6 @@ impl FinalCoreRequest {
             Self::ResourcesRead(params) => &params.meta,
             Self::PromptsGet(params) => &params.meta,
             Self::SubscriptionsListen(params) => &params.meta,
-            Self::Ping(params) => &params.meta,
         };
         let valid_version = metadata.protocol_version().ok().flatten()
             == Some(ProtocolEra::Modern2026.version().as_str());
@@ -1533,6 +1922,9 @@ impl FinalCoreRequest {
     fn encode_params(&self) -> Result<Option<Value>, CoreDispatchError> {
         self.validate_metadata()?;
         match self {
+            Self::Discover(params) => {
+                encode_params(ProtocolEra::Modern2026, SERVER_DISCOVER, params)
+            }
             Self::Completion(params) => {
                 encode_params(ProtocolEra::Modern2026, COMPLETION_COMPLETE, params)
             }
@@ -1554,7 +1946,6 @@ impl FinalCoreRequest {
             Self::SubscriptionsListen(params) => {
                 encode_params(ProtocolEra::Modern2026, SUBSCRIPTIONS_LISTEN, params)
             }
-            Self::Ping(params) => encode_params(ProtocolEra::Modern2026, PING, params),
         }
     }
 
@@ -1564,6 +1955,12 @@ impl FinalCoreRequest {
         response_id: Option<&RequestId>,
     ) -> Result<FinalCoreResult, CoreDispatchError> {
         match self {
+            Self::Discover(_) => serde_json::from_str(input)
+                .map(FinalCoreResult::Discover)
+                .map_err(|_| CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: SERVER_DISCOVER,
+                }),
             Self::Completion(_) => {
                 decode_final_complete(COMPLETION_COMPLETE, input, &["completion"])
                     .map(|(result, diagnostic)| FinalCoreResult::Completion { result, diagnostic })
@@ -1625,8 +2022,6 @@ impl FinalCoreRequest {
                     diagnostic,
                 })
             }
-            Self::Ping(_) => decode_final_complete(PING, input, &[])
-                .map(|(result, diagnostic)| FinalCoreResult::Ping { result, diagnostic }),
         }
     }
 }
@@ -1706,6 +2101,7 @@ impl FinalCoreResult {
     #[must_use]
     pub const fn method(&self) -> &'static str {
         match self {
+            Self::Discover(_) => SERVER_DISCOVER,
             Self::Completion { .. } => COMPLETION_COMPLETE,
             Self::ToolsList { .. } => TOOLS_LIST,
             Self::ToolsCall { .. } => TOOLS_CALL,
@@ -1715,12 +2111,17 @@ impl FinalCoreResult {
             Self::PromptsList { .. } => PROMPTS_LIST,
             Self::PromptsGet { .. } => PROMPTS_GET,
             Self::SubscriptionsListen { .. } => SUBSCRIPTIONS_LISTEN,
-            Self::Ping { .. } => PING,
         }
     }
 
     fn encode(&self) -> Result<String, CoreDispatchError> {
         match self {
+            Self::Discover(result) => {
+                serde_json::to_string(result).map_err(|_| CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: SERVER_DISCOVER,
+                })
+            }
             Self::Completion { result, .. } => {
                 encode_final_complete(COMPLETION_COMPLETE, result, &["completion"])
             }
@@ -1755,7 +2156,6 @@ impl FinalCoreResult {
             Self::PromptsGet { result, .. } => {
                 encode_final_complete(PROMPTS_GET, result, &["description", "messages"])
             }
-            Self::Ping { result, .. } => encode_final_complete(self.method(), result, &[]),
             Self::SubscriptionsListen {
                 result,
                 subscription_id,
@@ -2559,7 +2959,7 @@ pub struct TaskStatusNotificationParams {
 // Sampling (Server-to-Client LLM requests)
 // ============================================================================
 
-use crate::types::{ModelPreferences, SamplingContent, SamplingMessage, StopReason};
+use crate::types::{ModelPreferences, SamplingContent, SamplingMessage};
 
 /// sampling/createMessage request params.
 ///
@@ -2661,9 +3061,13 @@ pub struct CreateMessageResult {
     pub role: crate::types::Role,
     /// Model that was used.
     pub model: String,
-    /// Reason generation stopped.
-    #[serde(rename = "stopReason")]
-    pub stop_reason: StopReason,
+    /// Optional open provider stop reason.
+    #[serde(
+        rename = "stopReason",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stop_reason: Option<String>,
     /// Opaque legacy result metadata preserved in its received key order.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<LegacyOpaqueMetadata>,
@@ -2677,15 +3081,15 @@ impl CreateMessageResult {
             content: SamplingContent::Text { text: text.into() },
             role: crate::types::Role::Assistant,
             model: model.into(),
-            stop_reason: StopReason::EndTurn,
+            stop_reason: Some("endTurn".to_owned()),
             meta: None,
         }
     }
 
     /// Sets the stop reason.
     #[must_use]
-    pub fn with_stop_reason(mut self, reason: StopReason) -> Self {
-        self.stop_reason = reason;
+    pub fn with_stop_reason(mut self, reason: impl Into<String>) -> Self {
+        self.stop_reason = Some(reason.into());
         self
     }
 
@@ -3254,7 +3658,8 @@ mod tests {
             "content": {"type": "tool_result", "toolUseId": "call-1", "content": [{"type": "text", "text": "sunny"}]},
             "model": "final-model",
             "role": "assistant",
-            "stopReason": "toolUse"
+            "stopReason": "toolUse",
+            "_meta": {"com.example/retryTrace": {"attempt": 2}}
         });
         let final_result: FinalCreateMessageResult =
             serde_json::from_value(final_result_wire.clone())
@@ -3262,6 +3667,24 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&final_result).expect("final sampling complete encodes"),
             final_result_wire
+        );
+        assert!(
+            serde_json::to_value(&final_result)
+                .expect("final sampling complete encodes")
+                .get("resultType")
+                .is_none(),
+            "embedded input responses are not JSON-RPC result envelopes"
+        );
+        let mut planted_result_type = final_result_wire.clone();
+        planted_result_type["resultType"] = serde_json::json!("complete");
+        assert!(
+            serde_json::from_value::<FinalCreateMessageResult>(planted_result_type).is_err(),
+            "only adding an envelope resultType must reject the embedded MRTR response"
+        );
+        assert_eq!(
+            serde_json::to_value(&final_result).expect("accepted embedded result is unchanged"),
+            final_result_wire,
+            "rejecting a resultType does not alter the admitted result value"
         );
         let input_required_wire = serde_json::json!({
             "resultType": "input_required",
@@ -3290,6 +3713,178 @@ mod tests {
                 method,
             }) if method == SAMPLING_CREATE_MESSAGE
         ));
+    }
+
+    #[test]
+    fn final_notification_unions_round_trip_the_exact_client_and_server_members() {
+        let client_wire = JsonRpcRequest::notification(
+            NOTIFICATIONS_CANCELLED,
+            Some(serde_json::json!({
+                "requestId": "client-request-7",
+                "reason": "client no longer needs this response"
+            })),
+        );
+        let client = ClientNotification::decode(&client_wire)
+            .expect("the final client union admits its cancellation notification");
+        assert_eq!(client.method(), NOTIFICATIONS_CANCELLED);
+        assert!(client_wire.is_notification());
+        assert_eq!(
+            serde_json::to_value(client.encode().expect("client notification re-encodes"))
+                .expect("client notification remains JSON"),
+            serde_json::to_value(&client_wire).expect("client notification wire remains JSON")
+        );
+
+        let server_wires = vec![
+            JsonRpcRequest::notification(
+                NOTIFICATIONS_CANCELLED,
+                Some(serde_json::json!({"requestId": "subscription-9"})),
+            ),
+            JsonRpcRequest::notification(
+                NOTIFICATIONS_PROGRESS,
+                Some(serde_json::json!({
+                    "progressToken": "job-9",
+                    "progress": 1.0,
+                    "total": 2.0,
+                    "message": "halfway"
+                })),
+            ),
+            JsonRpcRequest::notification(
+                NOTIFICATIONS_MESSAGE,
+                Some(serde_json::json!({
+                    "level": "notice",
+                    "logger": "discovery-server",
+                    "data": {"event": "catalog-refreshed"}
+                })),
+            ),
+            JsonRpcRequest::notification(
+                NOTIFICATIONS_RESOURCES_UPDATED,
+                Some(serde_json::json!({"uri": "file:///workspace/status"})),
+            ),
+            JsonRpcRequest::notification(NOTIFICATIONS_RESOURCES_LIST_CHANGED, None),
+            JsonRpcRequest::notification(
+                NOTIFICATIONS_TOOLS_LIST_CHANGED,
+                Some(serde_json::json!({"_meta": {"com.example/trace": "tools-4"}})),
+            ),
+            JsonRpcRequest::notification(NOTIFICATIONS_PROMPTS_LIST_CHANGED, None),
+            JsonRpcRequest::notification(
+                NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
+                Some(serde_json::json!({
+                    "notifications": {"toolsListChanged": true}
+                })),
+            ),
+        ];
+        let expected_methods = [
+            NOTIFICATIONS_CANCELLED,
+            NOTIFICATIONS_PROGRESS,
+            NOTIFICATIONS_MESSAGE,
+            NOTIFICATIONS_RESOURCES_UPDATED,
+            NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+            NOTIFICATIONS_TOOLS_LIST_CHANGED,
+            NOTIFICATIONS_PROMPTS_LIST_CHANGED,
+            NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
+        ];
+
+        for (wire, expected_method) in server_wires.iter().zip(expected_methods) {
+            let notification = ServerNotification::decode(wire)
+                .expect("every exact final server notification member is admitted");
+            assert_eq!(notification.method(), expected_method);
+            assert!(wire.is_notification());
+            assert_eq!(
+                serde_json::to_value(
+                    notification
+                        .encode()
+                        .expect("server notification re-encodes")
+                )
+                .expect("server notification remains JSON"),
+                serde_json::to_value(wire).expect("server notification wire remains JSON"),
+                "{expected_method} preserves its exact notification parameter shape"
+            );
+        }
+    }
+
+    #[test]
+    fn final_notification_unions_reject_wrong_direction_and_legacy_only_field() {
+        let progress = JsonRpcRequest::notification(
+            NOTIFICATIONS_PROGRESS,
+            Some(serde_json::json!({"progressToken": "job-9", "progress": 1.0})),
+        );
+        let progress_wire = serde_json::to_value(&progress).expect("progress wire serializes");
+        assert!(
+            matches!(
+                ClientNotification::decode(&progress),
+                Err(FinalNotificationError::WrongDirection { method, sender: Final2026Peer::Client })
+                    if method == NOTIFICATIONS_PROGRESS
+            ),
+            "only the originating peer changes: client admission rejects server-only progress"
+        );
+        assert_eq!(
+            serde_json::to_value(&progress).expect("rejected progress remains serializable"),
+            progress_wire,
+            "wrong-direction rejection leaves the original notification wire unchanged"
+        );
+
+        let cancellation = JsonRpcRequest::notification(
+            NOTIFICATIONS_CANCELLED,
+            Some(serde_json::json!({"requestId": "client-request-7"})),
+        );
+        let admitted = ClientNotification::decode(&cancellation)
+            .expect("final cancellation without legacy fields is admitted");
+        let accepted_wire = serde_json::to_value(&cancellation).expect("accepted wire serializes");
+        let mut planted = cancellation.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("cancellation owns object parameters")
+            .insert("awaitCleanup".to_owned(), serde_json::json!(true));
+        assert!(
+            matches!(
+                ClientNotification::decode(&planted),
+                Err(FinalNotificationError::InvalidParams {
+                    method: NOTIFICATIONS_CANCELLED
+                })
+            ),
+            "changing only legacy awaitCleanup rejects the final cancellation shape"
+        );
+        assert_eq!(
+            serde_json::to_value(admitted.encode().expect("accepted cancellation re-encodes"))
+                .expect("accepted cancellation remains JSON"),
+            accepted_wire,
+            "the one-field cross-era rejection leaves the admitted final cancellation unchanged"
+        );
+    }
+
+    #[test]
+    fn legacy_sampling_stop_reason_is_optional_and_open() {
+        let absent_wire = serde_json::json!({
+            "content": {"type": "text", "text": "summary"},
+            "role": "assistant",
+            "model": "legacy-model"
+        });
+        let absent: CreateMessageResult = serde_json::from_value(absent_wire.clone())
+            .expect("exact legacy sampling permits an absent stopReason");
+        assert_eq!(absent.stop_reason, None);
+        assert_eq!(
+            serde_json::to_value(&absent).expect("absent legacy stopReason re-encodes"),
+            absent_wire
+        );
+
+        let arbitrary_wire = serde_json::json!({
+            "content": {"type": "text", "text": "summary"},
+            "role": "assistant",
+            "model": "legacy-model",
+            "stopReason": "provider_safety_limit"
+        });
+        let arbitrary: CreateMessageResult = serde_json::from_value(arbitrary_wire.clone())
+            .expect("exact legacy sampling retains an arbitrary provider stopReason");
+        assert_eq!(
+            arbitrary.stop_reason.as_deref(),
+            Some("provider_safety_limit")
+        );
+        assert_eq!(
+            serde_json::to_value(arbitrary).expect("open legacy stopReason re-encodes"),
+            arbitrary_wire
+        );
     }
 
     #[test]
@@ -3528,10 +4123,14 @@ mod tests {
                 "io.modelcontextprotocol/logLevel": "notice"
             }
         });
-        let request = CoreRequest::decode(ProtocolEra::Modern2026, PING, Some(&final_params))
-            .expect("final request metadata carries log level");
-        let CoreRequest::Final(FinalCoreRequest::Ping(params)) = request else {
-            panic!("final ping request");
+        let request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            SERVER_DISCOVER,
+            Some(&final_params),
+        )
+        .expect("final discovery metadata carries log level");
+        let CoreRequest::Final(FinalCoreRequest::Discover(params)) = request else {
+            panic!("final discovery request");
         };
         assert_eq!(
             params.meta.log_level().expect("typed final log level"),
@@ -3554,22 +4153,113 @@ mod tests {
         assert!(matches!(
             CoreRequest::decode(
                 ProtocolEra::Modern2026,
-                LOGGING_SET_LEVEL,
-                Some(&serde_json::json!({"level": "notice"}))
+                PING,
+                Some(&serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }))
             ),
             Err(CoreDispatchError::UnsupportedMethod {
                 era: ProtocolEra::Modern2026,
                 method,
-            }) if method == LOGGING_SET_LEVEL
+            }) if method == PING
         ));
         assert!(
-            CoreRequest::decode(
-                ProtocolEra::Legacy2024,
-                LOGGING_SET_LEVEL,
-                Some(&serde_json::json!({"level": "warning"}))
+            CoreRequest::decode(ProtocolEra::Legacy2024, PING, None).is_ok(),
+            "the exact legacy ping request remains available only in its legacy era"
+        );
+    }
+
+    #[test]
+    fn final_discover_core_result_round_trips_typed_capabilities_and_cache_hints() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, SERVER_DISCOVER, Some(&params))
+            .expect("final server/discover request is typed");
+        let advertised = crate::ServerDiscoverResult::new(
+            crate::ServerDiscoverCapabilities::from_registry(
+                &crate::ServerBehaviorRegistry::from_behaviors([
+                    crate::ServerBehavior::ToolsList,
+                    crate::ServerBehavior::ToolsListChangedNotification,
+                ]),
+                std::collections::BTreeMap::new(),
             )
-            .is_ok(),
-            "the legacy set-level request remains available only in its legacy era"
+            .expect("installed server behavior derives typed discovery capabilities"),
+            ServerInfo {
+                name: "discovery-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            Some(
+                crate::ServerInstructions::new("Use tools before answering.")
+                    .expect("bounded discovery instructions"),
+            ),
+            crate::DiscoveryCacheHints::private_ttl_ms(60_000),
+        );
+        let accepted = serde_json::to_value(&advertised).expect("typed discovery result encodes");
+        let result = request
+            .decode_result(
+                &serde_json::to_string(&accepted).expect("discovery wire serializes for dispatch"),
+            )
+            .expect("typed discovery result is admitted by final core dispatch");
+        let CoreResult::Final(FinalCoreResult::Discover(decoded)) = &result else {
+            panic!("server/discover selects its typed final result");
+        };
+        assert_eq!(
+            decoded.supported_versions(),
+            [FINAL_PROTOCOL_VERSION.to_owned()],
+            "the final discovery version set round-trips exactly"
+        );
+        assert_eq!(
+            decoded
+                .server_info()
+                .map(|info| (info.name.as_str(), info.version.as_str())),
+            Some(("discovery-server", "1.0.0")),
+            "serverInfo remains final result metadata"
+        );
+        assert_eq!(
+            decoded
+                .instructions()
+                .map(crate::ServerInstructions::as_str),
+            Some("Use tools before answering."),
+            "instructions remain part of the typed discovery result"
+        );
+        assert_eq!(decoded.cache_hints().ttl_ms(), 60_000);
+        assert!(!decoded.cache_hints().is_public());
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.encode().expect("typed result re-encodes"))
+                .expect("encoded typed result remains JSON"),
+            accepted,
+            "capabilities, serverInfo, instructions, and cache hints all survive core dispatch"
+        );
+
+        let mut planted = accepted.clone();
+        planted["cacheScope"] = serde_json::json!("shared");
+        assert!(
+            matches!(
+                request.decode_result(
+                    &serde_json::to_string(&planted)
+                        .expect("one-field malformed discovery wire serializes"),
+                ),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: SERVER_DISCOVER,
+                })
+            ),
+            "changing only cacheScope to an unrecognized value rejects the typed discovery result"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                &result.encode().expect("accepted result stays immutable")
+            )
+            .expect("accepted result stays JSON"),
+            accepted,
+            "the malformed peer field cannot mutate the admitted discovery result"
         );
     }
 
@@ -4447,6 +5137,11 @@ mod tests {
         assert_eq!(value["requestId"], "req-7");
         assert_eq!(value["reason"], "User cancelled");
         assert_eq!(value["awaitCleanup"], true);
+        assert_eq!(
+            serde_json::to_string(&params).expect("legacy cancellation serializes"),
+            r#"{"requestId":"req-7","reason":"User cancelled","awaitCleanup":true}"#,
+            "the exact legacy cancellation wire retains its legacy-only field"
+        );
     }
 
     #[test]
@@ -4858,10 +5553,7 @@ mod tests {
 
     #[test]
     fn create_message_result_max_tokens() {
-        use crate::types::StopReason;
-
-        let result =
-            CreateMessageResult::text("Truncated", "gpt-4").with_stop_reason(StopReason::MaxTokens);
+        let result = CreateMessageResult::text("Truncated", "gpt-4").with_stop_reason("maxTokens");
         let value = serde_json::to_value(&result).expect("serialize");
         assert_eq!(value["stopReason"], "maxTo\x6bens");
     }
@@ -4919,7 +5611,7 @@ mod tests {
             },
             role: crate::types::Role::Assistant,
             model: "model".to_string(),
-            stop_reason: StopReason::EndTurn,
+            stop_reason: None,
             meta: None,
         };
         assert_eq!(result.text_content(), None);

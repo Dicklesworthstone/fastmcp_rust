@@ -136,6 +136,28 @@ pub enum Final2026Direction {
     Bidirectional,
 }
 
+/// Peer that originated an MCP 2026-07-28 core message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Final2026Peer {
+    /// A client-originated message.
+    Client,
+    /// A server-originated message.
+    Server,
+}
+
+impl Final2026Direction {
+    /// Returns whether this direction admits a message from `peer`.
+    #[must_use]
+    pub const fn admits_sender(self, peer: Final2026Peer) -> bool {
+        matches!(
+            (self, peer),
+            (Self::ClientToServer, Final2026Peer::Client)
+                | (Self::ServerToClient, Final2026Peer::Server)
+                | (Self::Bidirectional, _)
+        )
+    }
+}
+
 /// JSON-RPC envelope kind required by an active MCP 2026-07-28 core method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Final2026EnvelopeKind {
@@ -155,6 +177,15 @@ pub struct Final2026Method {
     pub direction: Final2026Direction,
     /// Request-versus-notification envelope constraint.
     pub envelope: Final2026EnvelopeKind,
+}
+
+impl Final2026Method {
+    /// Returns whether this method is a notification admitted from `peer`.
+    #[must_use]
+    pub const fn admits_notification_from(self, peer: Final2026Peer) -> bool {
+        matches!(self.envelope, Final2026EnvelopeKind::Notification)
+            && self.direction.admits_sender(peer)
+    }
 }
 
 /// All and only the method literals in the active MCP 2026-07-28 core
@@ -1528,6 +1559,29 @@ mod tests {
                 direction: Final2026Direction::ServerToClient,
                 envelope: Final2026EnvelopeKind::Notification,
             })
+        );
+    }
+
+    #[test]
+    fn final_2026_notification_direction_admission_is_exact() {
+        let cancelled = final_2026_07_28_method(NOTIFICATIONS_CANCELLED)
+            .expect("cancelled belongs to the final method table");
+        assert!(cancelled.admits_notification_from(Final2026Peer::Client));
+        assert!(cancelled.admits_notification_from(Final2026Peer::Server));
+
+        let acknowledged = final_2026_07_28_method(NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED)
+            .expect("subscription acknowledgement belongs to the final method table");
+        assert!(acknowledged.admits_notification_from(Final2026Peer::Server));
+        assert!(
+            !acknowledged.admits_notification_from(Final2026Peer::Client),
+            "changing only the sender rejects the server-only notification"
+        );
+
+        let discover = final_2026_07_28_method(SERVER_DISCOVER)
+            .expect("server/discover belongs to the final method table");
+        assert!(
+            !discover.admits_notification_from(Final2026Peer::Client),
+            "a client-to-server request never enters either notification union"
         );
     }
 
