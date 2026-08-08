@@ -551,6 +551,168 @@ impl ModernHttpConnectOutcome {
     }
 }
 
+/// A connected client HTTP transport selected by its immutable protocol plan.
+///
+/// Auto performs the modern probe and, only for an authorized refusal, opens
+/// the exact configured legacy SSE route. Callers use one connection and
+/// request method; they do not classify the probe result themselves.
+pub enum ClientHttpConnection {
+    /// Stateless MCP 2026-07-28 POST transport.
+    Modern(ModernHttpClient),
+    /// Exact MCP 2024-11-05 SSE plus message POST transport.
+    LegacySse(LegacySseHttpClient),
+}
+
+/// One response returned through `ClientHttpConnection::request`.
+pub enum ClientHttpResponse {
+    /// The still-live HTTP response from a stateless modern POST.
+    Modern(ModernHttpResponseStream),
+    /// One strict JSON-RPC response received over the exact legacy SSE stream.
+    Legacy(JsonRpcMessage),
+}
+
+/// Errors raised by the unified client HTTP connection and request surface.
+#[derive(Debug)]
+pub enum ClientHttpConnectionError {
+    /// Connection selection, modern request construction, or modern execution failed.
+    Modern(ModernHttpClientError),
+    /// Exact legacy SSE setup, message POST, or stream decoding failed.
+    Legacy(LegacySseHttpClientError),
+    /// The exact legacy SSE stream ended before the correlated response arrived.
+    LegacyResponseStreamEnded { request_id: RequestId },
+    /// The exact legacy stream emitted an envelope other than the correlated response.
+    LegacyUnexpectedMessage { request_id: RequestId },
+    /// The exact legacy stream emitted a response for a different request.
+    LegacyResponseIdMismatch {
+        expected: RequestId,
+        actual: Option<RequestId>,
+    },
+}
+
+impl fmt::Display for ClientHttpConnectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Modern(error) => error.fmt(formatter),
+            Self::Legacy(error) => error.fmt(formatter),
+            Self::LegacyResponseStreamEnded { request_id } => {
+                write!(
+                    formatter,
+                    "legacy SSE ended before response {request_id:?} arrived"
+                )
+            }
+            Self::LegacyUnexpectedMessage { request_id } => {
+                write!(
+                    formatter,
+                    "legacy SSE emitted a non-response while waiting for {request_id:?}"
+                )
+            }
+            Self::LegacyResponseIdMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "legacy SSE response ID {actual:?} did not match request {expected:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClientHttpConnectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Modern(error) => Some(error),
+            Self::Legacy(error) => Some(error),
+            Self::LegacyResponseStreamEnded { .. }
+            | Self::LegacyUnexpectedMessage { .. }
+            | Self::LegacyResponseIdMismatch { .. } => None,
+        }
+    }
+}
+
+impl ClientHttpConnection {
+    /// Connects using the selected policy without exposing a probe-outcome
+    /// classification step to the caller.
+    pub async fn connect(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+    ) -> Result<Self, ClientHttpConnectionError> {
+        match ModernHttpClient::connect(cx, protocol_plan, client_info, client_capabilities)
+            .await
+            .map_err(ClientHttpConnectionError::Modern)?
+        {
+            ModernHttpConnectOutcome::Modern(client) => Ok(Self::Modern(client)),
+            ModernHttpConnectOutcome::LegacySse(client) => Ok(Self::LegacySse(client)),
+        }
+    }
+
+    /// Returns the era admitted by this completed connection.
+    #[must_use]
+    pub const fn selected_protocol_era(&self) -> ProtocolEra {
+        match self {
+            Self::Modern(_) => ProtocolEra::Modern2026,
+            Self::LegacySse(_) => ProtocolEra::Legacy2024,
+        }
+    }
+
+    /// Returns the immutable policy and endpoint bundle used for this connection.
+    #[must_use]
+    pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
+        match self {
+            Self::Modern(client) => client.protocol_plan(),
+            Self::LegacySse(client) => client.protocol_plan(),
+        }
+    }
+
+    /// Sends one active client request through the selected transport.
+    ///
+    /// Modern requests execute as one stateless final POST. Exact legacy
+    /// requests are posted to the pinned endpoint and then require the next
+    /// SSE envelope to be the response with this exact request ID.
+    pub async fn request(
+        &mut self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+    ) -> Result<ClientHttpResponse, ClientHttpConnectionError> {
+        let method = method.as_ref();
+        match self {
+            Self::Modern(client) => client
+                .request(cx, method, parameters, Some(request_id))
+                .await
+                .map(ClientHttpResponse::Modern)
+                .map_err(ClientHttpConnectionError::Modern),
+            Self::LegacySse(client) => {
+                let request = JsonRpcRequest::new(method, Some(parameters), request_id.clone());
+                client
+                    .send(cx, &JsonRpcMessage::Request(request))
+                    .await
+                    .map_err(ClientHttpConnectionError::Legacy)?;
+                let message = client
+                    .next_message(cx)
+                    .await
+                    .map_err(ClientHttpConnectionError::Legacy)?;
+                let message = message.ok_or_else(|| {
+                    ClientHttpConnectionError::LegacyResponseStreamEnded {
+                        request_id: request_id.clone(),
+                    }
+                })?;
+                let JsonRpcMessage::Response(response) = &message else {
+                    return Err(ClientHttpConnectionError::LegacyUnexpectedMessage { request_id });
+                };
+                if response.id.as_ref() != Some(&request_id) {
+                    return Err(ClientHttpConnectionError::LegacyResponseIdMismatch {
+                        expected: request_id,
+                        actual: response.id.clone(),
+                    });
+                }
+                Ok(ClientHttpResponse::Legacy(message))
+            }
+        }
+    }
+}
+
 /// Errors raised while connecting or issuing a policy-bound modern HTTP request.
 #[derive(Debug)]
 pub enum ModernHttpClientError {
@@ -1581,11 +1743,120 @@ fn contains_header_control(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    use asupersync::Cx;
+    use asupersync::runtime::RuntimeBuilder;
+    use fastmcp_protocol::RequestId;
+
     use super::{
+        ClientHttpConnectionError, ClientHttpResponse, LegacySseHttpClientError,
         MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpClientError,
         ModernHttpExecutorError, ModernHttpResponseKind, decode_modern_discovery_response,
         validate_response_head,
     };
+    use crate::{CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ProtocolEra, ProtocolPolicy};
+
+    #[derive(Debug)]
+    struct CapturedHttpRequest {
+        head: String,
+        body: Vec<u8>,
+    }
+
+    fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("native HTTP test runtime must build")
+            .block_on(future)
+    }
+
+    fn plan(
+        modern_target: &str,
+        legacy_sse_target: &str,
+        legacy_message_target: &str,
+        policy: ProtocolPolicy,
+    ) -> ClientProtocolPlan {
+        let modern_target =
+            CanonicalHttpUrl::parse(modern_target).expect("local modern target must be canonical");
+        let legacy_sse = CanonicalHttpUrl::parse(legacy_sse_target)
+            .expect("local legacy SSE target must be canonical");
+        let legacy_message = CanonicalHttpUrl::parse(legacy_message_target)
+            .expect("local legacy message target must be canonical");
+        ClientProtocolPlan::http(
+            policy,
+            (!matches!(policy, ProtocolPolicy::LegacyOnly)).then_some(modern_target),
+            (!matches!(policy, ProtocolPolicy::ModernOnly)).then_some(legacy_sse),
+            (!matches!(policy, ProtocolPolicy::ModernOnly)).then_some(legacy_message),
+            "client-http-public-test".to_owned(),
+            "client-http-public-test".to_owned(),
+            "native-h1-client-test".to_owned(),
+            1,
+            1,
+            0,
+        )
+        .expect("complete local HTTP plan must be accepted")
+    }
+
+    fn read_request(stream: &mut TcpStream) -> CapturedHttpRequest {
+        let mut wire = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let head_end = loop {
+            let read = stream.read(&mut buffer).expect("read native HTTP request");
+            assert!(read > 0, "client closed before a complete request arrived");
+            wire.extend_from_slice(&buffer[..read]);
+            if let Some(position) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let head = std::str::from_utf8(&wire[..head_end])
+            .expect("request head must be UTF-8")
+            .to_owned();
+        let content_length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("Content-Length must be numeric")
+            })
+            .unwrap_or(0);
+        while wire.len() < head_end.saturating_add(content_length) {
+            let read = stream
+                .read(&mut buffer)
+                .expect("read native HTTP request body");
+            assert!(read > 0, "client closed before its advertised body arrived");
+            wire.extend_from_slice(&buffer[..read]);
+        }
+        CapturedHttpRequest {
+            head,
+            body: wire[head_end..head_end + content_length].to_vec(),
+        }
+    }
+
+    fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+        let reason = match status {
+            200 => "OK",
+            202 => "Accepted",
+            404 => "Not Found",
+            _ => "Test Response",
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write native HTTP response head");
+        stream
+            .write_all(body)
+            .expect("write native HTTP response body");
+        stream.flush().expect("flush native HTTP response");
+    }
+
+    fn modern_discovery_body() -> &'static [u8] {
+        br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#
+    }
 
     #[test]
     fn bounded_empty_content_encoding_elements_preserve_the_identity_stream_lane() {
@@ -1646,5 +1917,196 @@ mod tests {
             decode_modern_discovery_response(planted),
             Err(ModernHttpClientError::InvalidDiscoveryResponse)
         ));
+    }
+
+    #[test]
+    fn public_http_connection_auto_selects_modern_and_issues_a_stateless_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local modern listener");
+        let address = listener.local_addr().expect("read local modern address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern probe");
+            let probe_request = read_request(&mut probe);
+            assert!(probe_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert!(
+                probe_request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut request, _) = listener.accept().expect("accept modern request");
+            let request = read_request(&mut request);
+            assert!(request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+            );
+            let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("modern request must be JSON-RPC");
+            assert_eq!(body["method"], "ping");
+            assert_eq!(
+                body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                "2026-07-28"
+            );
+            write_response(
+                &mut request,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::Auto,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("recognized modern discovery selects the public HTTP connection");
+        assert_eq!(connection.selected_protocol_era(), ProtocolEra::Modern2026);
+
+        let response = runtime_block_on(connection.request(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(2),
+        ))
+        .expect("the public HTTP request path retains the selected modern transport");
+        let ClientHttpResponse::Modern(response) = response else {
+            panic!("Auto modern selection must not open the legacy stream");
+        };
+        let body = runtime_block_on(response.read_to_end(&cx, 4_096))
+            .expect("modern JSON response remains readable");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .expect("modern response is JSON-RPC")["result"]["resultType"],
+            "complete"
+        );
+        server.join().expect("local modern server must join");
+    }
+
+    #[test]
+    fn public_http_connection_legacy_only_posts_and_reads_exact_sse_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local legacy listener");
+        let address = listener.local_addr().expect("read local legacy address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            let sse_body = format!(
+                "event: endpoint\ndata: {advertised_message_target}\n\nevent: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}\n\n"
+            );
+            write_response(&mut sse, 200, "text/event-stream", sse_body.as_bytes());
+
+            let (mut message_post, _) = listener.accept().expect("accept legacy message POST");
+            let message_request = read_request(&mut message_post);
+            assert!(
+                message_request
+                    .head
+                    .starts_with("POST /legacy-message HTTP/1.1\r\n")
+            );
+            assert!(
+                !message_request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+            );
+            let message = serde_json::from_slice::<serde_json::Value>(&message_request.body)
+                .expect("legacy message POST must contain JSON-RPC");
+            assert_eq!(message["method"], "ping");
+            assert!(message["params"].get("_meta").is_none());
+            write_response(&mut message_post, 202, "application/json", b"");
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    "http://127.0.0.1:9/mcp",
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::LegacyOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("legacy-only opens the exact configured SSE route");
+        assert_eq!(connection.selected_protocol_era(), ProtocolEra::Legacy2024);
+
+        let response = runtime_block_on(connection.request(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(2),
+        ))
+        .expect("legacy request posts then waits for its exact SSE response");
+        let ClientHttpResponse::Legacy(message) = response else {
+            panic!("legacy-only must not issue a final stateless POST");
+        };
+        let fastmcp_protocol::JsonRpcMessage::Response(response) = message else {
+            panic!("legacy SSE must return a JSON-RPC response");
+        };
+        assert_eq!(response.id, Some(RequestId::Number(2)));
+        server.join().expect("local legacy server must join");
+    }
+
+    #[test]
+    fn public_http_connection_auto_rejects_only_a_contradictory_legacy_endpoint() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind local contradictory peer listener");
+        let address = listener
+            .local_addr()
+            .expect("read local contradictory peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let contradictory_target = format!("http://{address}/other-message");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept disposable modern probe");
+            let probe_request = read_request(&mut probe);
+            assert!(probe_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            write_response(&mut probe, 404, "text/plain", b"");
+
+            let (mut sse, _) = listener.accept().expect("accept authorized legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            let sse_body = format!("event: endpoint\ndata: {contradictory_target}\n\n");
+            write_response(&mut sse, 200, "text/event-stream", sse_body.as_bytes());
+        });
+
+        let cx = Cx::for_request();
+        let error = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    &modern_target,
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::Auto,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .err()
+        .expect("only the advertised POST target differs from the configured legacy plan");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::Modern(ModernHttpClientError::LegacySse(
+                LegacySseHttpClientError::AdvertisedMessagePostTargetMismatch { .. }
+            ))
+        ));
+        server.join().expect("contradictory peer server must join");
     }
 }

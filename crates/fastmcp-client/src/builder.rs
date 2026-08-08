@@ -37,10 +37,11 @@ use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::{StdioTransport, Transport};
 
 use crate::{
-    ChildGuard, ChildOwnership, Client, ClientHttpNegotiation, ClientHttpNegotiationError,
-    ClientProtocolPlan, ClientProtocolPlanError, ClientSession, ProcessGroupAnchor,
-    RequestTimeoutPolicy, combine_cleanup_results, combine_operation_with_cleanup,
-    is_cleanup_unverified, resolve_stdio_command, transport_error_to_mcp,
+    ChildGuard, ChildOwnership, Client, ClientHttpConnection, ClientHttpConnectionError,
+    ClientHttpNegotiation, ClientHttpNegotiationError, ClientProtocolPlan, ClientProtocolPlanError,
+    ClientSession, ProcessGroupAnchor, RequestTimeoutPolicy, combine_cleanup_results,
+    combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
+    transport_error_to_mcp,
 };
 
 fn protocol_plan_error_to_mcp(error: ClientProtocolPlanError) -> McpError {
@@ -310,6 +311,30 @@ impl ClientBuilder {
     /// configured endpoint bundle rather than to an HTTP origin.
     pub fn http_negotiation(&self) -> Result<ClientHttpNegotiation, ClientHttpNegotiationError> {
         ClientHttpNegotiation::from_protocol_plan(&self.protocol_plan)
+    }
+
+    /// Connects the configured HTTP plan using the current capability context.
+    ///
+    /// `Auto` selects the admitted final stateless route or exact legacy
+    /// SSE route internally; callers receive one ready connection.
+    pub fn connect_http(self) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
+        block_on(async {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.connect_http_with_cx(&cx).await
+        })
+    }
+
+    /// Connects the configured HTTP plan with an explicit cancellation context.
+    ///
+    /// The connection consumes at most one disposable modern probe before
+    /// `Auto` may open its exact legacy SSE fallback. It never leaves protocol
+    /// classification to the caller.
+    pub async fn connect_http_with_cx(
+        self,
+        cx: &Cx,
+    ) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
+        ClientHttpConnection::connect(cx, self.protocol_plan, self.client_info, self.capabilities)
+            .await
     }
 
     /// Connects to a server via stdio subprocess.

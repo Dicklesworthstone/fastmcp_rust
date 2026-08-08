@@ -61,7 +61,11 @@ pub use fastmcp_protocol::protocol_policy::{
 pub use fastmcp_protocol::{
     CoreResult, FinalCompletionArgument as CompletionArgument,
     FinalCompletionContext as CompletionContext, FinalCompletionReference as CompletionReference,
-    FinalCoreResult, LegacyCoreResult, LoggingLevel,
+    FinalCoreResult, LegacyCoreResult, LoggingLevel, SubscriptionFilter,
+};
+pub use http_executor::{
+    ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, LegacySseHttpClient,
+    LegacySseHttpClientError, ModernHttpClient, ModernHttpClientError, ModernHttpResponseStream,
 };
 pub use mcp_config::claude_desktop_config_path;
 pub use negotiation::{
@@ -140,10 +144,10 @@ impl CompletionParams {
         }
 
         let reference = match self.reference {
-            CompletionReference::Prompt { name, title: None } => {
+            CompletionReference::Prompt { name } => {
                 fastmcp_protocol::LegacyCompletionReference::Prompt { name }
             }
-            CompletionReference::Prompt { title: Some(_), .. } => {
+            CompletionReference::PromptWithTitle { .. } => {
                 return Err(McpError::invalid_params(
                     "MCP 2024-11-05 completion cannot represent a prompt title",
                 ));
@@ -160,6 +164,30 @@ impl CompletionParams {
                 value: self.argument.value,
             },
         })
+    }
+}
+
+fn final_log_level(level: LogLevel) -> LoggingLevel {
+    match level {
+        LogLevel::Debug => LoggingLevel::Debug,
+        LogLevel::Info => LoggingLevel::Info,
+        LogLevel::Warning => LoggingLevel::Warning,
+        LogLevel::Error => LoggingLevel::Error,
+    }
+}
+
+fn legacy_log_level(level: LoggingLevel) -> McpResult<LogLevel> {
+    match level {
+        LoggingLevel::Debug => Ok(LogLevel::Debug),
+        LoggingLevel::Info => Ok(LogLevel::Info),
+        LoggingLevel::Warning => Ok(LogLevel::Warning),
+        LoggingLevel::Error => Ok(LogLevel::Error),
+        LoggingLevel::Notice
+        | LoggingLevel::Critical
+        | LoggingLevel::Alert
+        | LoggingLevel::Emergency => Err(McpError::invalid_params(
+            "MCP 2024-11-05 logging cannot represent the selected final severity",
+        )),
     }
 }
 
@@ -2573,6 +2601,9 @@ pub struct Client {
     /// Terminal auto-initialization failure, preventing lifecycle retries on
     /// the same subprocess connection.
     initialization_error: Option<McpError>,
+    /// Final logging configuration included in metadata of later modern
+    /// requests. Exact legacy sessions send the historical RPC instead.
+    final_log_level: Option<LoggingLevel>,
 }
 
 /// Successful client negotiation, kept in its protocol-native shape until it
@@ -2885,6 +2916,7 @@ impl Client {
             auto_initialize: false,
             initialized: AtomicBool::new(false),
             initialization_error: None,
+            final_log_level: None,
         };
 
         // Perform initialization handshake
@@ -2971,6 +3003,7 @@ impl Client {
             auto_initialize: false,
             initialized: AtomicBool::new(true), // Already initialized by builder
             initialization_error: None,
+            final_log_level: None,
         }
     }
 
@@ -3020,6 +3053,7 @@ impl Client {
             auto_initialize: true,
             initialized: AtomicBool::new(false),
             initialization_error: None,
+            final_log_level: None,
         }
     }
 
@@ -3279,6 +3313,16 @@ impl Client {
             McpError::internal_error("Modern request metadata did not serialize as an object")
         })?;
         metadata.extend(final_metadata.clone());
+        if let Some(level) = self.final_log_level {
+            metadata.insert(
+                "io.modelcontextprotocol/logLevel".to_owned(),
+                serde_json::to_value(level).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Failed to serialize modern logging configuration: {error}"
+                    ))
+                })?,
+            );
+        }
         Ok(params)
     }
 
@@ -4430,33 +4474,43 @@ impl Client {
         )
     }
 
-    /// Sets the server log level and returns its negotiated acknowledgement.
+    /// Configures the selected protocol era's log level behavior.
     ///
-    /// A modern session returns [`CoreResult::Final`] with
-    /// [`FinalCoreResult::SetLogLevel`]. An exact legacy session returns
-    /// [`CoreResult::Legacy`] with its unchanged acknowledgement shape; final
-    /// severities unavailable in 2024-11-05 are rejected before sending.
+    /// A modern MCP 2026-07-28 session stores the complete RFC 5424 level and
+    /// adds it as `io.modelcontextprotocol/logLevel` metadata to every later
+    /// request. It never sends `logging/setLevel`. An exact 2024-11-05 session
+    /// sends the historical RPC and rejects final-only severities before any
+    /// bytes are committed.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or its selected-era result
-    /// contract is contradicted. A contradictory core result terminates the
-    /// connection.
-    pub fn set_log_level_typed(&mut self, level: LoggingLevel) -> McpResult<CoreResult> {
+    /// Returns an error if an exact legacy peer cannot represent the selected
+    /// level or rejects its historical acknowledgement.
+    pub fn set_log_level_typed(&mut self, level: LoggingLevel) -> McpResult<()> {
         self.ensure_initialized()?;
-        self.send_typed_core_request("logging/setLevel", serde_json::json!({ "level": level }))
+        match self.session.selected_era() {
+            Some(ProtocolEra::Modern2026) => {
+                self.final_log_level = Some(level);
+                Ok(())
+            }
+            Some(ProtocolEra::Legacy2024) => {
+                let level = legacy_log_level(level)?;
+                let params = SetLogLevelParams { level };
+                let _: serde_json::Value = self.send_request("logging/setLevel", params)?;
+                Ok(())
+            }
+            None => Err(McpError::internal_error(
+                "Client has no negotiated protocol era for logging configuration",
+            )),
+        }
     }
 
-    /// Sets the server log level (if supported).
+    /// Configures one of the severities shared by both protocol eras.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails.
+    /// Modern sessions use later request metadata; exact legacy sessions send
+    /// `logging/setLevel` unchanged.
     pub fn set_log_level(&mut self, level: LogLevel) -> McpResult<()> {
-        self.ensure_initialized()?;
-        let params = SetLogLevelParams { level };
-        let _: serde_json::Value = self.send_request("logging/setLevel", params)?;
-        Ok(())
+        self.set_log_level_typed(final_log_level(level))
     }
 
     /// Reads a resource and returns its negotiated, method-aware core result.
@@ -4639,6 +4693,28 @@ impl Client {
                 "Client has no negotiated protocol era for completion",
             )),
         }
+    }
+
+    /// Opens a final typed subscription listener with the requested filters.
+    ///
+    /// MCP 2026-07-28 returns a [`FinalCoreResult::SubscriptionsListen`]
+    /// completion carrying the required subscription ID in result metadata.
+    /// Exact 2024-11-05 has no equivalent listener contract and is rejected
+    /// before a request ID is allocated or bytes are written.
+    pub fn listen_subscriptions_typed(
+        &mut self,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
+            return Err(McpError::invalid_params(
+                "subscriptions/listen is available only for MCP 2026-07-28",
+            ));
+        }
+        self.send_typed_core_request(
+            "subscriptions/listen",
+            serde_json::json!({ "notifications": notifications }),
+        )
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -8526,6 +8602,37 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_log_level_absence_client_script() -> String {
+        let discovery_response =
+            modern_discovery_response("logging-metadata-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r request || exit 1; \
+             case \"$request\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *io.modelcontextprotocol/logLevel*) exit 1 ;; \
+             *) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\"}}}}' ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_log_level_metadata_client_script() -> String {
+        let discovery_response =
+            modern_discovery_response("logging-metadata-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r request || exit 1; \
+             case \"$request\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"io.modelcontextprotocol/logLevel\":\"notice\"'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
     fn modern_typed_call_client_script(call_response: &str) -> String {
         let discovery_response =
             modern_discovery_response("typed-modern-server", &[MODERN_PROTOCOL_VERSION]);
@@ -8536,6 +8643,37 @@ mod tests {
              IFS= read -r second || exit 1; \
              case \"$second\" in *tools/call*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{call_response}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_progress_client_script() -> String {
+        let discovery_response =
+            modern_discovery_response("progress-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r request || exit 1; \
+             case \"$request\" in *tools/call*'\"progressToken\":2'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":2,\"progress\":0.5,\"total\":1.0,\"message\":\"modern progress\"}}}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"progress result\"}}],\"isError\":false}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_subscriptions_listen_client_script() -> String {
+        let discovery_response =
+            modern_discovery_response("subscriptions-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r request || exit 1; \
+             case \"$request\" in *subscriptions/listen*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"toolsListChanged\":true'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":\"subscription-2\"}}}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -8581,12 +8719,9 @@ mod tests {
              IFS= read -r get_prompt || exit 1; \
              case \"$get_prompt\" in *prompts/get*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"resultType\":\"complete\",\"messages\":[]}}}}' ;; *) exit 1 ;; esac; \
-             IFS= read -r logging || exit 1; \
-             case \"$logging\" in *logging/setLevel*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"level\":\"notice\"'*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r ping || exit 1; \
-             case \"$ping\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
+             case \"$ping\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"io.modelcontextprotocol/logLevel\":\"notice\"'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -8727,6 +8862,38 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn legacy_log_level_client_script() -> &'static str {
+        "IFS= read -r first || exit 1; \
+         case \"$first\" in *initialize*2024-11-05*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}' ;; *) exit 1 ;; esac; \
+         IFS= read -r lifecycle || exit 1; \
+         case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+         IFS= read -r request || exit 1; \
+         case \"$request\" in *logging/setLevel*'\"level\":\"info\"'*) ;; *) exit 1 ;; esac; \
+         case \"$request\" in *io.modelcontextprotocol/logLevel*|*io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
+         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; esac; \
+         exec sleep 2"
+    }
+
+    #[cfg(unix)]
+    fn auto_legacy_log_level_client_script() -> &'static str {
+        "IFS= read -r first || exit 1; \
+         case \"$first\" in \
+         *server/discover*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}' ;; \
+         *initialize*2024-11-05*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}'; \
+         IFS= read -r lifecycle || exit 1; \
+         case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+         IFS= read -r request || exit 1; \
+         case \"$request\" in *logging/setLevel*'\"level\":\"info\"'*) ;; *) exit 1 ;; esac; \
+         case \"$request\" in *io.modelcontextprotocol/logLevel*|*io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
+         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; esac ;; \
+         *) exit 1 ;; esac; \
+         exec sleep 2"
+    }
+
+    #[cfg(unix)]
     fn legacy_completion_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in *initialize*2024-11-05*) \
@@ -8762,7 +8929,6 @@ mod tests {
         CompletionParams {
             reference: CompletionReference::Prompt {
                 name: "deploy".to_owned(),
-                title: None,
             },
             argument: CompletionArgument {
                 name: "environment".to_owned(),
@@ -8774,9 +8940,9 @@ mod tests {
 
     fn modern_completion_params() -> CompletionParams {
         CompletionParams {
-            reference: CompletionReference::Prompt {
+            reference: CompletionReference::PromptWithTitle {
                 name: "deploy".to_owned(),
-                title: Some("Deploy".to_owned()),
+                title: "Deploy".to_owned(),
             },
             argument: CompletionArgument {
                 name: "environment".to_owned(),
@@ -8901,12 +9067,9 @@ mod tests {
                 .expect("typed prompts/get returns final result"),
             CoreResult::Final(FinalCoreResult::PromptsGet { .. })
         ));
-        assert!(matches!(
-            client
-                .set_log_level_typed(LoggingLevel::Notice)
-                .expect("typed logging/setLevel returns final result"),
-            CoreResult::Final(FinalCoreResult::SetLogLevel { .. })
-        ));
+        client
+            .set_log_level_typed(LoggingLevel::Notice)
+            .expect("modern logging configuration is retained for later request metadata");
         assert!(matches!(
             client
                 .ping_typed()
@@ -8914,6 +9077,134 @@ mod tests {
             CoreResult::Final(FinalCoreResult::Ping { .. })
         ));
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_modern_log_level_metadata_is_absent_until_configured() {
+        let script = modern_log_level_absence_client_script();
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("same modern discovery initializes the public client");
+
+        assert!(matches!(
+            client
+                .ping_typed()
+                .expect("one omitted final logging configuration remains absent on the wire"),
+            CoreResult::Final(FinalCoreResult::Ping { .. })
+        ));
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_auto_modern_log_level_uses_later_request_metadata() {
+        let script = modern_log_level_metadata_client_script();
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+            Cx::for_request(),
+        )
+        .expect("recognized final discovery selects modern under Auto");
+
+        client
+            .set_log_level_typed(LoggingLevel::Notice)
+            .expect("Auto-modern stores final configuration without a logging RPC");
+        client
+            .ping_typed()
+            .expect("the following Auto-modern request carries the final log level");
+        client.close().expect("Auto-modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_log_level_preserves_exact_legacy_rpc() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_log_level_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only initializes the exact client");
+
+        client
+            .set_log_level(LogLevel::Info)
+            .expect("legacy logging retains its exact RPC acknowledgement");
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_auto_legacy_log_level_preserves_exact_rpc() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", auto_legacy_log_level_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+            Cx::for_request(),
+        )
+        .expect("recognized final refusal selects exact legacy under Auto");
+
+        client
+            .set_log_level(LogLevel::Info)
+            .expect("Auto-legacy keeps the historical logging RPC");
+        client.close().expect("Auto-legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_subscriptions_listen_returns_typed_final_subscription_id() {
+        let script = modern_subscriptions_listen_client_script();
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the subscription client");
+
+        let result = client
+            .listen_subscriptions_typed(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect("modern subscription listener retains its typed final result");
+        let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
+            subscription_id, ..
+        }) = result
+        else {
+            panic!("modern subscriptions/listen must retain its final subscription ID");
+        };
+        assert_eq!(subscription_id, RequestId::from("subscription-2"));
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_subscriptions_listen_is_rejected_without_mutating_legacy_request_state() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_public_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only initializes the exact client");
+
+        let error = client
+            .listen_subscriptions_typed(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect_err("legacy has no final subscription listener contract");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        client
+            .ping()
+            .expect("the rejected listener leaves the exact legacy request state unchanged");
+        client.close().expect("legacy client cleanup");
     }
 
     #[cfg(unix)]
@@ -9120,9 +9411,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clt_01_progress_client_result_positive() {
-        let script = modern_typed_call_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
-        );
+        let script = modern_progress_client_script();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
             &["-c", script.as_str()],
@@ -9130,7 +9419,10 @@ mod tests {
             Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
-        let mut on_progress = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {};
+        let mut observed_progress = Vec::new();
+        let mut on_progress = |progress: f64, total: Option<f64>, message: Option<&str>| {
+            observed_progress.push((progress, total, message.map(ToOwned::to_owned)));
+        };
 
         let content = client
             .call_tool_with_progress(
@@ -9140,6 +9432,10 @@ mod tests {
             )
             .expect("progress calls admit the same negotiated complete result");
         assert_eq!(content.len(), 1);
+        assert_eq!(
+            observed_progress,
+            vec![(0.5, Some(1.0), Some("modern progress".to_owned()))]
+        );
         client.close().expect("modern client cleanup");
     }
 
@@ -9423,7 +9719,7 @@ mod tests {
         let content = client
             .call_tool_with_progress(
                 "echo",
-                serde_json::json!({"text": "legacy nonmatching progress"}),
+                serde_json::json!({"text": "legacy progress"}),
                 &mut on_progress,
             )
             .expect("a nonmatching progress token does not disturb the legacy request");
