@@ -832,8 +832,11 @@ fn e2e_cli_test_help() {
     assert!(normalized.contains(
         "This command is currently Unix-only: other platforms fail before spawning because no Job Object equivalent is implemented yet."
     ));
-    assert!(normalized
-        .contains("On Unix child stdio, the request timers bound silent and partial-frame reads;"));
+    assert!(
+        normalized.contains(
+            "On Unix child stdio, the request timers bound silent and partial-frame reads;"
+        )
+    );
     assert!(normalized.contains("blocking child-stdin writes cannot be preempted"));
 }
 
