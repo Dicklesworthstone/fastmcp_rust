@@ -355,6 +355,8 @@ pub enum ExtensionRegistryError {
     MissingOwner(&'static str),
     /// A descriptor ID was registered twice.
     DuplicateExtensionId(String),
+    /// A method was added to an extension that is not registered.
+    UnregisteredExtensionId(String),
     /// A named field already belongs to a different descriptor.
     OwnershipCollision { field: &'static str, value: String },
     /// A client-to-server method omitted its frozen era disposition.
@@ -409,6 +411,9 @@ impl fmt::Display for ExtensionRegistryError {
             }
             Self::DuplicateExtensionId(value) => {
                 write!(formatter, "duplicate extension identifier: {value}")
+            }
+            Self::UnregisteredExtensionId(value) => {
+                write!(formatter, "unregistered extension identifier: {value}")
             }
             Self::OwnershipCollision { field, value } => {
                 write!(formatter, "extension {field} ownership collision: {value}")
@@ -812,6 +817,7 @@ impl std::error::Error for ExtensionDispatchError {}
 #[derive(Clone, Debug, Default)]
 pub struct ExtensionDescriptorRegistry {
     descriptors: BTreeMap<ExtensionId, ExtensionDescriptor>,
+    additional_methods: BTreeMap<ExtensionId, BTreeMap<String, ExtensionMethodDescriptor>>,
     receipt: Option<ExtensionRegistryReceipt>,
 }
 
@@ -842,7 +848,118 @@ impl ExtensionDescriptorRegistry {
         for existing in self.descriptors.values() {
             ensure_no_cross_owner_collision(existing, &descriptor)?;
         }
+        if let Some(method) = &descriptor.method {
+            for (existing_id, methods) in &self.additional_methods {
+                if methods.contains_key(&method.name) {
+                    return Err(ExtensionRegistryError::OwnershipCollision {
+                        field: "method",
+                        value: method.name.clone(),
+                    });
+                }
+                if self
+                    .descriptors
+                    .get(existing_id)
+                    .and_then(|existing| existing.notification.as_ref())
+                    .is_some_and(|notification| notification.name == method.name)
+                {
+                    return Err(ExtensionRegistryError::OwnershipCollision {
+                        field: "method/notification",
+                        value: method.name.clone(),
+                    });
+                }
+            }
+        }
+        if let Some(notification) = &descriptor.notification {
+            for methods in self.additional_methods.values() {
+                if methods.contains_key(&notification.name) {
+                    return Err(ExtensionRegistryError::OwnershipCollision {
+                        field: "method/notification",
+                        value: notification.name.clone(),
+                    });
+                }
+            }
+        }
         self.descriptors.insert(descriptor.id.clone(), descriptor);
+        Ok(())
+    }
+
+    /// Adds another request method to an already registered extension descriptor.
+    ///
+    /// One extension can own more than one request method. The extension's
+    /// settings, resolver, notification, and result discriminator stay on the
+    /// original descriptor so every additional method shares the same negotiated
+    /// capability and frozen receipt.
+    pub fn register_method(
+        &mut self,
+        id: &ExtensionId,
+        method: ExtensionMethodDescriptor,
+    ) -> Result<(), ExtensionRegistryError> {
+        if self.receipt.is_some() {
+            return Err(ExtensionRegistryError::Frozen);
+        }
+        let Some(descriptor) = self.descriptors.get(id) else {
+            return Err(ExtensionRegistryError::UnregisteredExtensionId(
+                id.to_string(),
+            ));
+        };
+        validate_extension_method(&method)?;
+        if descriptor
+            .method
+            .as_ref()
+            .is_some_and(|registered| registered.name == method.name)
+            || self
+                .additional_methods
+                .get(id)
+                .is_some_and(|methods| methods.contains_key(&method.name))
+        {
+            return Err(ExtensionRegistryError::LocalOwnershipCollision {
+                field: "method",
+                value: method.name,
+            });
+        }
+        if descriptor
+            .notification
+            .as_ref()
+            .is_some_and(|notification| notification.name == method.name)
+        {
+            return Err(ExtensionRegistryError::LocalOwnershipCollision {
+                field: "method/notification",
+                value: method.name,
+            });
+        }
+        for (existing_id, existing) in &self.descriptors {
+            if existing_id == id {
+                continue;
+            }
+            if existing
+                .method
+                .as_ref()
+                .is_some_and(|registered| registered.name == method.name)
+                || self
+                    .additional_methods
+                    .get(existing_id)
+                    .is_some_and(|methods| methods.contains_key(&method.name))
+            {
+                return Err(ExtensionRegistryError::OwnershipCollision {
+                    field: "method",
+                    value: method.name,
+                });
+            }
+            if existing
+                .notification
+                .as_ref()
+                .is_some_and(|notification| notification.name == method.name)
+            {
+                return Err(ExtensionRegistryError::OwnershipCollision {
+                    field: "method/notification",
+                    value: method.name,
+                });
+            }
+        }
+        self.additional_methods
+            .entry(id.clone())
+            .or_default()
+            .insert(method.name.clone(), method);
         Ok(())
     }
 
@@ -873,6 +990,18 @@ impl ExtensionDescriptorRegistry {
     #[must_use]
     pub fn descriptor(&self, id: &ExtensionId) -> Option<&ExtensionDescriptor> {
         self.descriptors.get(id)
+    }
+
+    fn method(&self, id: &ExtensionId, name: &str) -> Option<&ExtensionMethodDescriptor> {
+        self.descriptors
+            .get(id)
+            .and_then(|descriptor| {
+                descriptor
+                    .method
+                    .as_ref()
+                    .filter(|method| method.name == name)
+            })
+            .or_else(|| self.additional_methods.get(id)?.get(name))
     }
 
     /// Returns the frozen descriptors in deterministic identifier order.
@@ -998,7 +1127,9 @@ impl ExtensionDescriptorRegistry {
         let rows = self
             .descriptors
             .values()
-            .map(canonical_descriptor_row)
+            .map(|descriptor| {
+                canonical_descriptor_row(descriptor, self.additional_methods.get(&descriptor.id))
+            })
             .collect::<Vec<_>>();
         let json = serde_json::to_string(&("fastmcp.ext-01.descriptor-registry.v1", rows))
             .map_err(|_| ExtensionRegistryError::DigestTooLarge)?;
@@ -1092,20 +1223,13 @@ impl NegotiatedExtensionSet {
     ) -> Result<&'a ExtensionDescriptor, ExtensionDispatchError> {
         validate_dispatch_name(name)?;
         let descriptor = self.admit_capability(registry, request_era, capability)?;
-        let Some(method) = descriptor.method.as_ref() else {
+        let Some(method) = registry.method(capability, name) else {
             return Err(ExtensionDispatchError::CapabilityDoesNotOwn {
                 capability: capability.to_string(),
                 field: "method",
                 value: name.to_owned(),
             });
         };
-        if method.name != name {
-            return Err(ExtensionDispatchError::CapabilityDoesNotOwn {
-                capability: capability.to_string(),
-                field: "method",
-                value: name.to_owned(),
-            });
-        }
         if method.direction != direction {
             return Err(ExtensionDispatchError::DirectionMismatch {
                 field: "method",
@@ -1228,32 +1352,7 @@ fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Extension
         validate_descriptor_identity(field, value)?;
     }
     if let Some(method) = &descriptor.method {
-        validate_member_name("method", &method.name)?;
-        if core_or_legacy_method(&method.name) {
-            return Err(ExtensionRegistryError::CoreMethodCollision(
-                method.name.clone(),
-            ));
-        }
-        if method.direction == ExtensionDirection::ClientToServer {
-            if method.http_era_disposition.is_none() {
-                return Err(ExtensionRegistryError::MissingHttpEraDisposition(
-                    method.name.clone(),
-                ));
-            }
-            if method.legacy_fallback {
-                return Err(ExtensionRegistryError::LegacyFallbackContradiction(
-                    method.name.clone(),
-                ));
-            }
-        } else if method.http_era_disposition.is_some() {
-            return Err(ExtensionRegistryError::MissingHttpEraDisposition(
-                method.name.clone(),
-            ));
-        } else if method.legacy_fallback {
-            return Err(ExtensionRegistryError::LegacyFallbackContradiction(
-                method.name.clone(),
-            ));
-        }
+        validate_extension_method(method)?;
     }
     if let Some(notification) = &descriptor.notification {
         validate_member_name("notification", &notification.name)?;
@@ -1340,6 +1439,38 @@ fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Extension
                 });
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_extension_method(
+    method: &ExtensionMethodDescriptor,
+) -> Result<(), ExtensionRegistryError> {
+    validate_member_name("method", &method.name)?;
+    if core_or_legacy_method(&method.name) {
+        return Err(ExtensionRegistryError::CoreMethodCollision(
+            method.name.clone(),
+        ));
+    }
+    if method.direction == ExtensionDirection::ClientToServer {
+        if method.http_era_disposition.is_none() {
+            return Err(ExtensionRegistryError::MissingHttpEraDisposition(
+                method.name.clone(),
+            ));
+        }
+        if method.legacy_fallback {
+            return Err(ExtensionRegistryError::LegacyFallbackContradiction(
+                method.name.clone(),
+            ));
+        }
+    } else if method.http_era_disposition.is_some() {
+        return Err(ExtensionRegistryError::MissingHttpEraDisposition(
+            method.name.clone(),
+        ));
+    } else if method.legacy_fallback {
+        return Err(ExtensionRegistryError::LegacyFallbackContradiction(
+            method.name.clone(),
+        ));
     }
     Ok(())
 }
@@ -1453,7 +1584,45 @@ fn core_or_legacy_method(method: &str) -> bool {
     final_2026_07_28_method(method).is_some() || legacy_2024_11_05_method(method).is_some()
 }
 
-fn canonical_descriptor_row(descriptor: &ExtensionDescriptor) -> Value {
+fn canonical_descriptor_row(
+    descriptor: &ExtensionDescriptor,
+    additional_methods: Option<&BTreeMap<String, ExtensionMethodDescriptor>>,
+) -> Value {
+    if additional_methods.is_none_or(|methods| methods.is_empty()) {
+        return serde_json::json!({
+            "id": descriptor.id.as_str(),
+            "clientSchema": descriptor.client_settings.schema_id,
+            "clientCodec": descriptor.client_settings.codec_id,
+            "serverSchema": descriptor.server_settings.schema_id,
+            "serverCodec": descriptor.server_settings.codec_id,
+            "resolver": [descriptor.resolver.id, descriptor.resolver.version, format!("{:?}", descriptor.resolver.fallback)],
+            "method": descriptor.method.as_ref().map(|m| (&m.name, format!("{:?}", m.direction), m.http_era_disposition.map(|e| format!("{:?}", e)), m.legacy_fallback)),
+            "notification": descriptor.notification.as_ref().map(|n| (&n.name, format!("{:?}", n.direction))),
+            "resultDiscriminator": descriptor.result_discriminator,
+            "routingHeaders": descriptor.routing_headers.iter().map(|h| &h.name).collect::<Vec<_>>(),
+            "stdio": descriptor.stdio_correlation.as_ref().map(|s| (&s.metadata_key, &s.methods, format!("{:?}", s.direction))),
+        });
+    }
+    let mut methods = descriptor
+        .method
+        .iter()
+        .chain(
+            additional_methods
+                .into_iter()
+                .flat_map(|methods| methods.values()),
+        )
+        .map(|method| {
+            (
+                method.name.clone(),
+                format!("{:?}", method.direction),
+                method
+                    .http_era_disposition
+                    .map(|disposition| format!("{disposition:?}")),
+                method.legacy_fallback,
+            )
+        })
+        .collect::<Vec<_>>();
+    methods.sort_by(|left, right| left.0.cmp(&right.0));
     serde_json::json!({
         "id": descriptor.id.as_str(),
         "clientSchema": descriptor.client_settings.schema_id,
@@ -1461,7 +1630,7 @@ fn canonical_descriptor_row(descriptor: &ExtensionDescriptor) -> Value {
         "serverSchema": descriptor.server_settings.schema_id,
         "serverCodec": descriptor.server_settings.codec_id,
         "resolver": [descriptor.resolver.id, descriptor.resolver.version, format!("{:?}", descriptor.resolver.fallback)],
-        "method": descriptor.method.as_ref().map(|m| (&m.name, format!("{:?}", m.direction), m.http_era_disposition.map(|e| format!("{:?}", e)), m.legacy_fallback)),
+        "methods": methods,
         "notification": descriptor.notification.as_ref().map(|n| (&n.name, format!("{:?}", n.direction))),
         "resultDiscriminator": descriptor.result_discriminator,
         "routingHeaders": descriptor.routing_headers.iter().map(|h| &h.name).collect::<Vec<_>>(),
@@ -1519,6 +1688,15 @@ mod tests {
         descriptor
     }
 
+    fn tasks_method(name: &str) -> ExtensionMethodDescriptor {
+        ExtensionMethodDescriptor {
+            name: name.to_owned(),
+            direction: ExtensionDirection::ClientToServer,
+            http_era_disposition: Some(ExtensionHttpEraDisposition::ModernExclusive),
+            legacy_fallback: false,
+        }
+    }
+
     #[test]
     fn ext_03_final_extension_identifier_wire_grammar_one_variable_negative() {
         let official = ExtensionId::parse("io.modelcontextprotocol/tasks")
@@ -1543,6 +1721,12 @@ mod tests {
         registry
             .register(tasks_descriptor(id.clone()))
             .expect("Tasks request and response members register");
+        registry
+            .register_method(&id, tasks_method("tasks/update"))
+            .expect("Tasks update method belongs to its negotiated extension");
+        registry
+            .register_method(&id, tasks_method("tasks/cancel"))
+            .expect("Tasks cancel method belongs to its negotiated extension");
         registry.freeze().expect("Tasks registry freezes");
 
         let client = ClientExtensionDiscovery {
@@ -1574,19 +1758,21 @@ mod tests {
                 &mut resolver,
             )
             .expect("current client and server capabilities negotiate Tasks");
-        assert_eq!(
-            negotiated
-                .admit_method(
-                    &registry,
-                    ProtocolEra::Modern2026,
-                    &id,
-                    "tasks/get",
-                    ExtensionDirection::ClientToServer,
-                )
-                .expect("registered Tasks request is admitted")
-                .id,
-            id
-        );
+        for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+            assert_eq!(
+                negotiated
+                    .admit_method(
+                        &registry,
+                        ProtocolEra::Modern2026,
+                        &id,
+                        method,
+                        ExtensionDirection::ClientToServer,
+                    )
+                    .expect("registered Tasks request is admitted")
+                    .id,
+                id
+            );
+        }
         assert_eq!(
             negotiated
                 .admit_notification(
@@ -1617,6 +1803,12 @@ mod tests {
         registry
             .register(tasks_descriptor(id.clone()))
             .expect("Tasks descriptor registers");
+        registry
+            .register_method(&id, tasks_method("tasks/update"))
+            .expect("Tasks update method registers");
+        registry
+            .register_method(&id, tasks_method("tasks/cancel"))
+            .expect("Tasks cancel method registers");
         let receipt = registry.freeze().expect("Tasks registry freezes");
         let declared_client = ClientExtensionDiscovery {
             extensions: BTreeMap::from([(
