@@ -820,7 +820,7 @@ where
             .transport
             .send(
                 cx,
-                &JsonRpcMessage::Response(JsonRpcResponse::success(request_id, result)),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(request_id.clone(), result)),
             )
             .map_err(|error| self.handle_send_error_locked(&mut state, error))?;
         let removed = state.pending_reverse_request_ids.remove(&request_id);
