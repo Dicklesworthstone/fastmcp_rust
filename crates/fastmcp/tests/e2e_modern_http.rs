@@ -18,9 +18,11 @@
 use std::net::SocketAddr;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
+use asupersync::runtime::reactor::create_reactor;
 use fastmcp_client::http_executor::{
     ModernHttpClient, ModernHttpResponseKind, ModernHttpResponseStream,
 };
@@ -45,22 +47,52 @@ fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
 
 /// Binds the real turnkey server on an ephemeral port and serves it from a
 /// detached acceptor thread for the remainder of the test process.
+///
+/// The server-side runtime mirrors the shipped live-HTTP harness: listener
+/// I/O needs a real reactor, dispatch needs blocking worker threads, and the
+/// serving context must be minted by that runtime. (The first execution of
+/// this suite proved a bare runtime with a detached `Cx::for_request` makes
+/// `serve` bail instantly, closing kernel-backlogged connections before any
+/// response headers.)
 fn spawn_echo_server() -> SocketAddr {
     let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
     thread::spawn(move || {
-        runtime_block_on(async move {
-            let cx = Cx::for_request();
-            let server = ServerBuilder::new("e2e-modern-http", "1.0.0")
-                .tool(EchoTool)
-                .build();
-            let bound = server
-                .bind_http(&cx, "127.0.0.1:0")
-                .await
-                .expect("turnkey server binds an ephemeral port");
-            addr_tx
-                .send(bound.local_addr().expect("bound address is known"))
-                .expect("address channel delivers");
-            let _ = bound.serve(&cx).await;
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("server reactor initializes"))
+            .blocking_threads(4, 64)
+            .build()
+            .expect("server runtime builds");
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        runtime
+            .handle()
+            .try_spawn_with_cx(move |cx| async move {
+                let server = ServerBuilder::new("e2e-modern-http", "1.0.0")
+                    .tool(EchoTool)
+                    .build();
+                let bound = server
+                    .bind_http(&cx, "127.0.0.1:0")
+                    .await
+                    .expect("turnkey server binds an ephemeral port");
+                addr_tx
+                    .send(bound.local_addr().expect("bound address is known"))
+                    .expect("address channel delivers");
+                let _ = bound.serve(&cx).await;
+                let _ = done_tx.send(());
+            })
+            .expect("server task is admitted");
+        // Drive the runtime so the accept loop and per-connection children
+        // actually poll; the thread stays parked here for the remainder of
+        // the test process.
+        runtime.block_on(async move {
+            loop {
+                match done_rx.try_recv() {
+                    Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        let cx = Cx::current().expect("server runtime installs an ambient Cx");
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                }
+            }
         });
     });
     addr_rx
