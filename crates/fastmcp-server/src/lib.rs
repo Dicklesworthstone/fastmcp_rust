@@ -1475,7 +1475,10 @@ fn mask_peer_error(error: McpError, mask_error_details: bool) -> McpError {
 }
 use fastmcp_transport::sse::SseServerTransport;
 use fastmcp_transport::websocket::WsTransport;
-use fastmcp_transport::{AsyncStdout, Codec, StdioTransport, Transport, TransportError};
+use fastmcp_transport::{
+    AsyncStdout, Codec, StdioTransport, Transport, TransportError, TransportRecvHalf,
+    TransportSendHalf,
+};
 #[cfg(test)]
 use log::Level;
 use log::LevelFilter;
@@ -4938,6 +4941,89 @@ impl Server {
         }
     }
 
+    /// Runs independently owned receive and send halves under the dual-era dispatcher.
+    ///
+    /// Modern requests receive bounded request-owned child contexts and may
+    /// progress while the receive half blocks for another frame. Exact
+    /// MCP 2024-11-05 traffic remains serialized through its lifecycle adapter.
+    /// Use this entry point for genuinely full-duplex transports; an unsplit
+    /// [`Transport`] cannot safely promise concurrent receive and response I/O.
+    pub fn run_split_transport_returning_with_cx<R, S>(
+        self,
+        cx: &Cx,
+        recv_half: R,
+        send_half: S,
+    ) -> McpResult<()>
+    where
+        R: TransportRecvHalf + Send + 'static,
+        S: TransportSendHalf + 'static,
+    {
+        self.init_rich_logging();
+        let recv_half = SharedRecvHalf::new(recv_half);
+        let send_half = SharedSendHalf::new(send_half);
+        let notification_failure = Arc::new(AtomicBool::new(false));
+        let notification_sender = create_split_transport_notification_sender(
+            send_half.clone(),
+            cx.clone(),
+            Arc::clone(&notification_failure),
+        );
+
+        let recv_for_run = recv_half.clone();
+        let send_for_run = send_half.clone();
+        let run_result = self.run_loop_returning(
+            cx,
+            move |cx, _worker_failed| recv_for_run.recv(cx),
+            move |cx, message| send_for_run.send(cx, message),
+            notification_sender,
+            Some(notification_failure),
+            "split-custom",
+        );
+        let recv_close = recv_half
+            .close()
+            .map_err(|error| transport_run_error("receive_close", &error));
+        let send_close = send_half
+            .close()
+            .map_err(|error| transport_run_error("send_close", &error));
+        combine_split_transport_results(run_result, recv_close, send_close)
+    }
+
+    fn run_split_transport_with_label<R, S>(
+        self,
+        cx: &Cx,
+        recv_half: R,
+        send_half: S,
+        transport_label: &'static str,
+    ) -> !
+    where
+        R: TransportRecvHalf + Send + 'static,
+        S: TransportSendHalf + 'static,
+    {
+        self.init_rich_logging();
+        let recv_half = SharedRecvHalf::new(recv_half);
+        let send_half = SharedSendHalf::new(send_half);
+        let connection_failure = Arc::new(AtomicBool::new(false));
+        let notification_sender = create_split_transport_notification_sender(
+            send_half.clone(),
+            cx.clone(),
+            Arc::clone(&connection_failure),
+        );
+
+        let recv_for_run = recv_half.clone();
+        let send_for_run = send_half.clone();
+        let mut exit_code = self.run_loop(
+            cx,
+            move |cx, _worker_failed| recv_for_run.recv(cx),
+            move |cx, message| send_for_run.send(cx, message),
+            notification_sender,
+            connection_failure,
+            transport_label,
+        );
+        if recv_half.close().is_err() || send_half.close().is_err() {
+            exit_code = 1;
+        }
+        std::process::exit(exit_code)
+    }
+
     /// Runs the server on a custom transport until clean closure, cancellation,
     /// or failure.
     ///
@@ -4970,10 +5056,11 @@ impl Server {
         W: Write + Send + 'static,
         R: Iterator<Item = JsonRpcRequest> + Send + 'static,
     {
-        let transport = SseServerTransport::new(writer, request_source, endpoint_url);
+        let (recv_half, send_half) =
+            SseServerTransport::new(writer, request_source, endpoint_url).into_split();
         block_on(async move {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.run_transport_with_label(&cx, transport, "sse")
+            self.run_split_transport_with_label(&cx, recv_half, send_half, "sse")
         })
     }
 
@@ -4989,8 +5076,9 @@ impl Server {
         W: Write + Send + 'static,
         R: Iterator<Item = JsonRpcRequest> + Send + 'static,
     {
-        let transport = SseServerTransport::new(writer, request_source, endpoint_url);
-        self.run_transport_with_label(cx, transport, "sse")
+        let (recv_half, send_half) =
+            SseServerTransport::new(writer, request_source, endpoint_url).into_split();
+        self.run_split_transport_with_label(cx, recv_half, send_half, "sse")
     }
 
     /// Runs the server using WebSocket transport with a testing Cx.
@@ -5845,6 +5933,7 @@ impl Server {
         let mut era_classifier = StdioEraClassifier::new(server.protocol_policy);
         let mut negotiated_era = None;
         let mut exit_code = 0;
+        let mut drain_modern_before_stop = false;
         'receive: loop {
             if worker_failed.load(Ordering::Acquire)
                 || connection_failure
@@ -5860,7 +5949,16 @@ impl Server {
 
             let message = match recv(cx, &worker_failed) {
                 Ok(message) => message,
-                Err(TransportError::Closed | TransportError::Cancelled) => break,
+                Err(TransportError::Closed) => {
+                    // A full-duplex peer may half-close ingress while the
+                    // independently owned egress remains writable. Give
+                    // already-admitted modern children a bounded opportunity
+                    // to finish their response commit before shutdown
+                    // cancellation begins.
+                    drain_modern_before_stop = true;
+                    break;
+                }
+                Err(TransportError::Cancelled) => break,
                 Err(error) => match classify_receive_error(&error) {
                     ReceiveErrorDisposition::ReplyWithParseError => {
                         if send_uncorrelated_parse_error(&send, cx).is_err() {
@@ -6404,6 +6502,11 @@ impl Server {
             }
         }
 
+        if drain_modern_before_stop
+            && !queue_state.wait_for_modern_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
+        {
+            exit_code = 1;
+        }
         queue_state.stop();
         drop(dispatch_sender);
         server.cancel_active_requests(CancelKind::Shutdown, false);
@@ -9439,6 +9542,74 @@ struct SharedTransport<T> {
     inner: Arc<Mutex<T>>,
 }
 
+struct SharedRecvHalf<R> {
+    inner: Arc<Mutex<R>>,
+}
+
+impl<R> Clone for SharedRecvHalf<R> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<R: TransportRecvHalf> SharedRecvHalf<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    fn recv(&self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        self.inner
+            .lock()
+            .map_err(|_| transport_lock_error())?
+            .recv(cx)
+    }
+
+    fn close(&self) -> Result<(), TransportError> {
+        self.inner
+            .lock()
+            .map_err(|_| transport_lock_error())?
+            .close()
+    }
+}
+
+struct SharedSendHalf<S> {
+    inner: Arc<Mutex<S>>,
+}
+
+impl<S> Clone for SharedSendHalf<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<S: TransportSendHalf> SharedSendHalf<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    fn send(&self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.inner
+            .lock()
+            .map_err(|_| transport_lock_error())?
+            .send(cx, message)
+    }
+
+    fn close(&self) -> Result<(), TransportError> {
+        self.inner
+            .lock()
+            .map_err(|_| transport_lock_error())?
+            .close()
+    }
+}
+
 impl<T> Clone for SharedTransport<T> {
     fn clone(&self) -> Self {
         Self {
@@ -9504,6 +9675,39 @@ where
             );
         }
     })
+}
+
+fn create_split_transport_notification_sender<S>(
+    transport: SharedSendHalf<S>,
+    cx: Cx,
+    failure: Arc<AtomicBool>,
+) -> NotificationSender
+where
+    S: TransportSendHalf + 'static,
+{
+    Arc::new(move |request: JsonRpcRequest| {
+        if let Err(error) = transport.send(&cx, &JsonRpcMessage::Request(request))
+            && !error.is_cancelled()
+        {
+            failure.store(true, Ordering::Release);
+        }
+    })
+}
+
+fn combine_split_transport_results(
+    run: McpResult<()>,
+    recv_close: McpResult<()>,
+    send_close: McpResult<()>,
+) -> McpResult<()> {
+    [recv_close, send_close]
+        .into_iter()
+        .fold(run, |result, close| match (result, close) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(run_error), Err(close_error)) => {
+                Err(combined_run_and_close_error(run_error, close_error))
+            }
+        })
 }
 
 /// Creates a notification sender that writes JSON-RPC notifications to stdout.
@@ -9861,6 +10065,37 @@ mod lib_unit_tests {
         runtime
             .block_on(wait_for_live_http_test_result(receiver))
             .expect("live modern pump must complete")
+    }
+
+    fn run_live_split_transport<R, S>(server: Server, recv: R, send: S) -> Result<(), String>
+    where
+        R: TransportRecvHalf + Send + 'static,
+        S: TransportSendHalf + 'static,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("live split transport reactor must initialize"))
+            .blocking_threads(4, MAX_DISPATCH_QUEUE_DEPTH)
+            .build()
+            .expect("live split transport runtime must initialize");
+        let (sender, receiver) = sync_channel(1);
+        runtime
+            .handle()
+            .try_spawn_with_cx(move |cx| async move {
+                let result = match cx.spawn_blocking(move |pump_cx| {
+                    server.run_split_transport_returning_with_cx(&pump_cx, recv, send)
+                }) {
+                    Ok(mut pump) => pump
+                        .join(&cx)
+                        .await
+                        .map_err(|error| format!("live split transport join failed: {error:?}"))
+                        .and_then(|result| result.map_err(|error| error.to_string())),
+                    Err(error) => Err(format!("live split transport admission failed: {error}")),
+                };
+                let _ = sender.send(result);
+            })
+            .expect("live split transport task must be admitted");
+
+        runtime.block_on(wait_for_live_http_test_result(receiver))
     }
 
     async fn live_http_exchange(address: SocketAddr, request: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -13412,6 +13647,65 @@ mod lib_unit_tests {
         }
     }
 
+    struct LiveModernSplitRecv {
+        phase: usize,
+        control: Arc<LiveModernControl>,
+        responses: Arc<LiveModernResponses>,
+    }
+
+    impl TransportRecvHalf for LiveModernSplitRecv {
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            let phase = self.phase;
+            self.phase = self.phase.saturating_add(1);
+            match phase {
+                0 => Ok(modern_discovery_opening_request()),
+                1 => Ok(modern_controlled_tool_request(1200)),
+                2 => {
+                    if self.control.wait_for_started(1, Duration::from_secs(2)) {
+                        Ok(modern_controlled_tool_request(1201))
+                    } else {
+                        Err(TransportError::Timeout)
+                    }
+                }
+                3 => {
+                    if !self.control.wait_for_started(2, Duration::from_secs(2)) {
+                        return Err(TransportError::Timeout);
+                    }
+                    self.control.release(1200);
+                    self.control.release(1201);
+                    if self
+                        .responses
+                        .wait_for_responses(&[1200, 1201], Duration::from_secs(2))
+                    {
+                        Err(TransportError::Closed)
+                    } else {
+                        Err(TransportError::Timeout)
+                    }
+                }
+                _ => Err(TransportError::Closed),
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct LiveModernSplitSend {
+        responses: Arc<LiveModernResponses>,
+    }
+
+    impl TransportSendHalf for LiveModernSplitSend {
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.responses.record(message.clone());
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
     struct ProtocolPolicyScriptTransport {
         inbound: std::collections::VecDeque<JsonRpcMessage>,
         sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
@@ -15098,6 +15392,78 @@ mod lib_unit_tests {
         );
         assert_eq!(responses.response_count(100), 1);
         assert_eq!(responses.response_count(101), 1);
+    }
+
+    #[test]
+    fn live_modern_split_transport_requests_overlap_and_emit_one_response_per_id() {
+        let control = Arc::new(LiveModernControl::default());
+        let responses = Arc::new(LiveModernResponses::default());
+
+        let run_result = run_live_split_transport(
+            Server::new("live-modern-split-overlap", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LiveModernControlledTool {
+                    control: Arc::clone(&control),
+                })
+                .build(),
+            LiveModernSplitRecv {
+                phase: 0,
+                control: Arc::clone(&control),
+                responses: Arc::clone(&responses),
+            },
+            LiveModernSplitSend {
+                responses: Arc::clone(&responses),
+            },
+        );
+
+        assert!(
+            control.max_active() >= 2,
+            "two split-transport modern requests must overlap before release; \
+             run_result={run_result:?}, response_1200={}, response_1201={}",
+            responses.response_count(1200),
+            responses.response_count(1201),
+        );
+        assert_eq!(
+            responses.response_count(1200),
+            1,
+            "first split-transport response count; run_result={run_result:?}"
+        );
+        assert_eq!(
+            responses.response_count(1201),
+            1,
+            "second split-transport response count; run_result={run_result:?}"
+        );
+        run_result.expect("split transport must drain both independently owned modern requests");
+    }
+
+    #[test]
+    fn live_modern_split_transport_legacy_only_policy_rejects_before_children_start() {
+        let control = Arc::new(LiveModernControl::default());
+        let responses = Arc::new(LiveModernResponses::default());
+
+        // This differs from the overlap-positive setup only in protocol policy.
+        run_live_split_transport(
+            Server::new("live-modern-split-overlap", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .tool(LiveModernControlledTool {
+                    control: Arc::clone(&control),
+                })
+                .build(),
+            LiveModernSplitRecv {
+                phase: 0,
+                control: Arc::clone(&control),
+                responses: Arc::clone(&responses),
+            },
+            LiveModernSplitSend {
+                responses: Arc::clone(&responses),
+            },
+        )
+        .expect_err("LegacyOnly must reject the identical modern split stream");
+
+        assert_eq!(control.max_active(), 0);
+        assert_eq!(responses.response_count(905), 1);
+        assert_eq!(responses.response_count(1200), 0);
+        assert_eq!(responses.response_count(1201), 0);
     }
 
     #[test]
