@@ -2927,4 +2927,149 @@ mod tests {
         assert!(!config.should_cache_tool("any_tool"));
         assert!(!config.should_cache_tool("another_tool"));
     }
+
+    #[test]
+    fn cache_01_a_positive() {
+        let middleware = ResponseCachingMiddleware::new()
+            .list_ttl_secs(120)
+            .call_ttl_secs(900);
+        let ctx = test_context();
+        let methods = [
+            ("server/discover", None, 120_000_u64),
+            ("tools/list", None, 120_000),
+            ("prompts/list", None, 120_000),
+            ("resources/list", None, 120_000),
+            (
+                "resources/read",
+                Some(serde_json::json!({"uri": "file:///catalog"})),
+                900_000,
+            ),
+            ("resources/templates/list", None, 120_000),
+        ];
+
+        for (method, params, expected_ttl_ms) in methods {
+            let request = test_request(method, params);
+            let response = middleware
+                .on_response(
+                    &ctx,
+                    &request,
+                    serde_json::json!({"resultType": "complete", "items": []}),
+                )
+                .expect("the middleware must preserve a complete result");
+
+            assert_eq!(response.get("ttlMs"), Some(&serde_json::json!(expected_ttl_ms)));
+            assert_eq!(response.get("cacheScope"), Some(&serde_json::json!("private")));
+        }
+    }
+
+    #[test]
+    fn cache_01_a_planted_negative() {
+        let middleware = ResponseCachingMiddleware::new().list_ttl_secs(120);
+        let ctx = test_context();
+        let request = test_request("tools/list", None);
+
+        // The sole forbidden dimension differs from the positive case: this
+        // is an input-required result, not a cacheable complete result.
+        let response = middleware
+            .on_response(
+                &ctx,
+                &request,
+                serde_json::json!({
+                    "resultType": "inputRequired",
+                    "ttlMs": 120_000,
+                    "cacheScope": "public",
+                    "items": []
+                }),
+            )
+            .expect("input-required results remain ordinary middleware output");
+
+        assert_eq!(response.get("resultType"), Some(&serde_json::json!("inputRequired")));
+        assert!(response.get("ttlMs").is_none());
+        assert!(response.get("cacheScope").is_none());
+        assert_eq!(middleware.stats().entries, 0);
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).expect("lookup is safe"),
+            MiddlewareDecision::Continue
+        ));
+    }
+
+    #[test]
+    fn cache_01_b_positive() {
+        let middleware = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let first_page = test_request("tools/list", Some(serde_json::json!({"cursor": "a"})));
+        let second_page = test_request("tools/list", Some(serde_json::json!({"cursor": "b"})));
+
+        for (request, tool_name) in [(&first_page, "first"), (&second_page, "second")] {
+            middleware
+                .on_response(
+                    &ctx,
+                    request,
+                    serde_json::json!({
+                        "resultType": "complete",
+                        "tools": [{"name": tool_name}]
+                    }),
+                )
+                .expect("each page is individually cacheable");
+        }
+
+        assert!(matches!(
+            middleware.on_request(&ctx, &first_page).expect("first lookup is safe"),
+            MiddlewareDecision::Respond(_)
+        ));
+        assert!(matches!(
+            middleware.on_request(&ctx, &second_page).expect("second lookup is safe"),
+            MiddlewareDecision::Respond(_)
+        ));
+
+        middleware.invalidate("tools/list", None);
+
+        assert_eq!(middleware.stats().entries, 0);
+        assert!(matches!(
+            middleware
+                .on_request(&ctx, &first_page)
+                .expect("first post-invalidation lookup is safe"),
+            MiddlewareDecision::Continue
+        ));
+        assert!(matches!(
+            middleware
+                .on_request(&ctx, &second_page)
+                .expect("second post-invalidation lookup is safe"),
+            MiddlewareDecision::Continue
+        ));
+    }
+
+    #[test]
+    fn cache_01_b_planted_negative() {
+        let middleware = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let request = test_request(
+            "tools/list",
+            Some(serde_json::json!({
+                "cursor": "a",
+                "requestState": {"opaque": "continuation"}
+            })),
+        );
+
+        // The only semantic change from the cacheable page is continuation
+        // state. It must neither read nor populate an internal cache entry.
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).expect("continuation lookup is safe"),
+            MiddlewareDecision::Continue
+        ));
+        let response = middleware
+            .on_response(
+                &ctx,
+                &request,
+                serde_json::json!({"resultType": "complete", "tools": []}),
+            )
+            .expect("the continuation result remains deliverable");
+
+        assert_eq!(response.get("cacheScope"), Some(&serde_json::json!("private")));
+        assert_eq!(middleware.stats().entries, 0);
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).expect("repeat continuation lookup is safe"),
+            MiddlewareDecision::Continue
+        ));
+    }
 }
