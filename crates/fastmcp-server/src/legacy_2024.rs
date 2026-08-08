@@ -181,11 +181,28 @@ pub trait Legacy2024Handler {
         method: &'static str,
         params: Option<&Value>,
     ) -> Result<Value, Legacy2024HandlerError>;
+
+    /// Handles one admitted request with its original exact JSON-RPC ID.
+    ///
+    /// The default preserves the transport-neutral handler contract for
+    /// adapters that do not need request-local correlation. Live runtimes
+    /// override this hook so cancellation, tracing, and dispatch authority
+    /// remain bound to the peer's actual wire request rather than a synthetic
+    /// internal identifier.
+    fn handle_legacy_2024_with_request_id(
+        &mut self,
+        _request_id: &Value,
+        method: &'static str,
+        params: Option<&Value>,
+    ) -> Result<Value, Legacy2024HandlerError> {
+        self.handle_legacy_2024(method, params)
+    }
 }
 
 /// A non-wire handler failure mapped to an exact JSON-RPC internal-error response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Legacy2024HandlerError {
+    code: i64,
     message: String,
 }
 
@@ -194,8 +211,25 @@ impl Legacy2024HandlerError {
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
+            code: -32603,
             message: message.into(),
         }
+    }
+
+    /// Creates a handler failure with a JSON-RPC error code already selected
+    /// by the live request owner.
+    #[must_use]
+    pub fn with_code(code: i64, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// Returns the JSON-RPC error code selected by the handler.
+    #[must_use]
+    pub const fn code(&self) -> i64 {
+        self.code
     }
 
     /// Returns the handler-provided diagnostic before the adapter maps it to
@@ -643,7 +677,7 @@ where
         };
         match envelope {
             Legacy2024Envelope::Request { method, id, params } => {
-                match self.receive_request(method.name, params.as_ref()) {
+                match self.receive_request(&id, method.name, params.as_ref()) {
                     Ok(result) => Ok(Legacy2024Outbound::Response(success_response(id, result))),
                     Err(error) => Ok(Legacy2024Outbound::Response(error_response(id, error))),
                 }
@@ -802,6 +836,7 @@ where
 
     fn receive_request(
         &mut self,
+        request_id: &Value,
         method: &'static str,
         params: Option<&Value>,
     ) -> Result<Value, Legacy2024AdapterError> {
@@ -817,7 +852,9 @@ where
             Legacy2024Lifecycle::AwaitInitialized => Err(Legacy2024AdapterError::invalid_request(
                 "notifications/initialized is required before operating requests",
             )),
-            Legacy2024Lifecycle::Operating => self.handle_operating_request(method, params),
+            Legacy2024Lifecycle::Operating => {
+                self.handle_operating_request(request_id, method, params)
+            }
             Legacy2024Lifecycle::Closed => Err(Legacy2024AdapterError::invalid_request(
                 "legacy adapter lifecycle is closed",
             )),
@@ -927,6 +964,7 @@ where
 
     fn handle_operating_request(
         &mut self,
+        request_id: &Value,
         method: &'static str,
         params: Option<&Value>,
     ) -> Result<Value, Legacy2024AdapterError> {
@@ -946,9 +984,9 @@ where
                 self.require_server_capability(method)?;
                 let result = self
                     .handler
-                    .handle_legacy_2024(method, params)
-                    .map_err(|_| Legacy2024AdapterError {
-                        code: -32603,
+                    .handle_legacy_2024_with_request_id(request_id, method, params)
+                    .map_err(|error| Legacy2024AdapterError {
+                        code: error.code(),
                         message: "legacy handler failed",
                     })?;
                 match method {
