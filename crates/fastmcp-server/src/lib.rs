@@ -629,6 +629,7 @@ impl SessionMutationRollback {
 #[derive(Default)]
 struct DispatchQueueState {
     inner: Mutex<DispatchQueueStateInner>,
+    drained: Condvar,
 }
 
 #[derive(Default)]
@@ -641,7 +642,15 @@ struct DispatchQueueStateInner {
     dispatching: HashSet<CorrelationKey>,
     cancelled: HashSet<CorrelationKey>,
     queued_bytes: usize,
+    modern_in_flight: usize,
     stopping: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModernDispatchStart {
+    Ready,
+    Cancelled,
+    Stopping,
 }
 
 struct QueuedDispatchRequest {
@@ -710,6 +719,44 @@ impl DispatchQueueState {
         inner.queued_bytes = inner.queued_bytes.saturating_sub(serialized_bytes);
     }
 
+    /// Reserves one bounded modern request slot before it is submitted to the
+    /// caller's runtime. The reservation persists until the request-owned
+    /// child finishes, so mailbox admission cannot turn into unbounded work.
+    fn reserve_modern_slot(&self) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.stopping || inner.modern_in_flight >= MAX_DISPATCH_QUEUE_DEPTH {
+            return false;
+        }
+        inner.modern_in_flight += 1;
+        true
+    }
+
+    fn release_modern_slot(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.modern_in_flight = inner.modern_in_flight.saturating_sub(1);
+        if inner.modern_in_flight == 0 {
+            self.drained.notify_all();
+        }
+    }
+
+    fn wait_for_modern_drain(&self, timeout: Duration) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (inner, _) = self
+            .drained
+            .wait_timeout_while(inner, timeout, |inner| inner.modern_in_flight != 0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.modern_in_flight == 0
+    }
+
     fn cancel_if_queued(&self, id: &RequestId) -> bool {
         let Ok(key) = id.correlation_key() else {
             return false;
@@ -736,6 +783,29 @@ impl DispatchQueueState {
         debug_assert!(inner.reserved.contains(&key));
         inner.dispatching.insert(key.clone());
         inner.cancelled.remove(&key) || inner.stopping
+    }
+
+    fn begin_modern_dispatch(&self, id: Option<&RequestId>) -> ModernDispatchStart {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.stopping {
+            return ModernDispatchStart::Stopping;
+        }
+        let Some(id) = id else {
+            return ModernDispatchStart::Ready;
+        };
+        let Ok(key) = id.correlation_key() else {
+            return ModernDispatchStart::Stopping;
+        };
+        debug_assert!(inner.reserved.contains(&key));
+        inner.dispatching.insert(key.clone());
+        if inner.cancelled.remove(&key) {
+            ModernDispatchStart::Cancelled
+        } else {
+            ModernDispatchStart::Ready
+        }
     }
 
     fn is_stopping(&self) -> bool {
@@ -803,6 +873,60 @@ impl Drop for DispatchWorkerCompletionSignal {
         if let Some(sender) = self.0.take() {
             let _ = sender.send(());
         }
+    }
+}
+
+/// Owns every admission-side resource for one modern stdio request until its
+/// caller-owned child task has finished. The reservation is deliberately held
+/// by the task closure itself: a runtime that rejects or cancels a task before
+/// first poll still releases its capacity without leaving an orphaned request
+/// ID or byte charge behind.
+struct ModernDispatchReservation {
+    queue: Arc<DispatchQueueState>,
+    request_id: Option<RequestId>,
+    serialized_bytes: usize,
+    failed: Arc<AtomicBool>,
+    failure_latched: bool,
+}
+
+impl ModernDispatchReservation {
+    fn new(
+        queue: Arc<DispatchQueueState>,
+        request_id: Option<RequestId>,
+        serialized_bytes: usize,
+        failed: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            queue,
+            request_id,
+            serialized_bytes,
+            failed,
+            failure_latched: false,
+        }
+    }
+
+    fn begin(&mut self) {
+        self.failure_latched = true;
+    }
+
+    fn disarm_failure(&mut self) {
+        self.failure_latched = false;
+    }
+}
+
+impl Drop for ModernDispatchReservation {
+    fn drop(&mut self) {
+        if self.failure_latched {
+            self.failed.store(true, Ordering::Release);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.queue.stop();
+            }));
+        }
+        if let Some(id) = self.request_id.as_ref() {
+            self.queue.discard(id);
+        }
+        self.queue.release_queued_bytes(self.serialized_bytes);
+        self.queue.release_modern_slot();
     }
 }
 
@@ -2497,6 +2621,15 @@ impl Server {
         inbound: &InboundRequestContext,
         request: &JsonRpcRequest,
     ) -> Option<JsonRpcResponse> {
+        self.dispatch_stateless_with_cancellation(inbound, request, None)
+    }
+
+    fn dispatch_stateless_with_cancellation(
+        &self,
+        inbound: &InboundRequestContext,
+        request: &JsonRpcRequest,
+        request_cancellation: Option<McpRequestCancellation>,
+    ) -> Option<JsonRpcResponse> {
         let method = request.method.clone();
         let response_id = request.id.clone();
         let is_notification = response_id.is_none();
@@ -2545,7 +2678,12 @@ impl Server {
             ));
         }
 
-        let request_ctx = inbound.request_context();
+        let request_ctx = match request_cancellation {
+            Some(cancellation) => inbound
+                .request_context()
+                .with_request_cancellation(cancellation),
+            None => inbound.request_context(),
+        };
         let budget = self.create_request_budget(request_ctx.cx());
         if let Some(error) = Self::request_budget_error(request_ctx.cx(), budget) {
             if let Some(stats) = &self.stats {
@@ -2839,6 +2977,16 @@ impl Server {
         inbound: &InboundRequestContext,
         request: &JsonRpcRequest,
     ) -> Option<JsonRpcResponse> {
+        self.dispatch_with_protocol_policy_and_cancellation(policy, inbound, request, None)
+    }
+
+    fn dispatch_with_protocol_policy_and_cancellation(
+        &self,
+        policy: ProtocolPolicy,
+        inbound: &InboundRequestContext,
+        request: &JsonRpcRequest,
+        request_cancellation: Option<McpRequestCancellation>,
+    ) -> Option<JsonRpcResponse> {
         if matches!(policy, ProtocolPolicy::ModernOnly)
             && request.method == "initialize"
             && request.validate().is_ok()
@@ -2855,7 +3003,7 @@ impl Server {
                 )
             });
         }
-        self.dispatch_stateless(inbound, request)
+        self.dispatch_stateless_with_cancellation(inbound, request, request_cancellation)
     }
 
     /// Maps an explicit-policy modern dispatch result onto the HTTP response
@@ -3024,14 +3172,13 @@ impl Server {
 
     /// Runs the server on stdio transport.
     ///
-    /// This is the primary way to run MCP servers as subprocesses. The current
-    /// receive pump and serialized dispatch worker run under one ambient server
-    /// context; independently owned per-request child contexts remain an
-    /// unverified runtime prerequisite.
+    /// This is the primary way to run MCP servers as subprocesses. The
+    /// blocking stdio pump runs as a caller-owned blocking child, leaving the
+    /// caller runtime free to schedule bounded, request-owned modern children.
     pub fn run_stdio(self) -> ! {
         block_on(async move {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.run_stdio_with_cx(&cx)
+            self.run_stdio_with_cx(&cx).await
         })
     }
 
@@ -3050,7 +3197,31 @@ impl Server {
     /// shutdown deadline, the process exits unsuccessfully without running the
     /// shutdown hook; running a hook concurrently with a live handler would
     /// violate the hook's quiescence contract.
-    pub fn run_stdio_with_cx(self, cx: &Cx) -> ! {
+    pub async fn run_stdio_with_cx(self, cx: &Cx) -> ! {
+        let mut pump = match cx.spawn_blocking(move |pump_cx| self.run_stdio_pump(&pump_cx)) {
+            Ok(pump) => pump,
+            Err(error) => {
+                error!(
+                    target: targets::SERVER,
+                    "Could not admit the stdio pump into the caller runtime: {error}"
+                );
+                std::process::exit(1);
+            }
+        };
+        let exit_code = match pump.join(cx).await {
+            Ok(exit_code) => exit_code,
+            Err(error) => {
+                error!(
+                    target: targets::SERVER,
+                    "Caller-owned stdio pump ended without a final status: {error:?}"
+                );
+                1
+            }
+        };
+        std::process::exit(exit_code)
+    }
+
+    fn run_stdio_pump(self, cx: &Cx) -> i32 {
         // Initialize rich logging first, before any log output
         self.init_rich_logging();
 
@@ -3786,8 +3957,9 @@ impl Server {
         }
     }
 
-    /// Runs a continuous receive pump while one bounded worker dispatches
-    /// against the connection's immutable negotiated protocol era.
+    /// Runs a continuous receive pump. Exact-2024 frames retain the one
+    /// lifecycle-preserving worker; modern frames use bounded children of the
+    /// caller context and may progress independently.
     fn run_loop<R, S>(
         self,
         cx: &Cx,
@@ -3796,12 +3968,12 @@ impl Server {
         notification_sender: NotificationSender,
         connection_failure: Arc<AtomicBool>,
         transport_label: &'static str,
-    ) -> !
+    ) -> i32
     where
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
-        let exit_code = self.run_loop_pump_with_policy(
+        self.run_loop_pump_with_policy(
             cx,
             recv,
             send,
@@ -3810,8 +3982,7 @@ impl Server {
             true,
             Some(connection_failure),
             true,
-        );
-        std::process::exit(exit_code)
+        )
     }
 
     /// Returning counterpart of [`Self::run_loop`].
@@ -4380,9 +4551,39 @@ impl Server {
                         continue;
                     }
 
+                    let modern_slot = matches!(era, ProtocolEra::Modern2026);
+                    if modern_slot && !queue_state.reserve_modern_slot() {
+                        if let Some(id) = request.id {
+                            queue_state.discard(&id);
+                            let overloaded = JsonRpcResponse::error(
+                                Some(id),
+                                JsonRpcError {
+                                    code: RESOURCE_EXHAUSTED_ERROR_CODE,
+                                    message: DISPATCH_QUEUE_CAPACITY_MESSAGE.to_string(),
+                                    data: None,
+                                },
+                            );
+                            if send
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                cx,
+                                &JsonRpcMessage::Response(overloaded),
+                            )
+                            .is_err()
+                            {
+                                exit_code = 1;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+
                     let serialized_bytes = measure_dispatch_request(&request);
                     if serialized_bytes.is_none_or(|bytes| !queue_state.reserve_queued_bytes(bytes))
                     {
+                        if modern_slot {
+                            queue_state.release_modern_slot();
+                        }
                         if let Some(id) = request.id {
                             queue_state.discard(&id);
                             let overloaded = JsonRpcResponse::error(
@@ -4409,6 +4610,184 @@ impl Server {
                     }
                     let serialized_bytes = serialized_bytes
                         .expect("a dispatch byte reservation requires a measured request");
+
+                    if modern_slot {
+                        let response_id = request.id.clone();
+                        let reservation = ModernDispatchReservation::new(
+                            Arc::clone(&queue_state),
+                            response_id.clone(),
+                            serialized_bytes,
+                            Arc::clone(&worker_failed),
+                        );
+                        let request_server = Arc::clone(&server);
+                        let request_send = Arc::clone(&send);
+                        let request_renderer = traffic_renderer.clone();
+                        let request = request;
+                        let submitted = cx.spawn_blocking(move |request_cx| {
+                            let mut reservation = reservation;
+                            reservation.begin();
+                            let dispatched = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    if let Some(renderer) = &request_renderer {
+                                        renderer.render_request(&request, &request_server.console);
+                                    }
+                                    let active_guard = match request.id.clone() {
+                                        Some(id) => match ActiveRequestGuard::try_new(
+                                            Arc::clone(&request_server.active_requests),
+                                            session_id,
+                                            id.clone(),
+                                            request_cx.clone(),
+                                        ) {
+                                            Ok(guard) => Some(guard),
+                                            Err(_) => {
+                                                let response = JsonRpcResponse::error(
+                                                    Some(id),
+                                                    JsonRpcError {
+                                                        code: McpErrorCode::InvalidRequest.into(),
+                                                        message: "Request id is already active"
+                                                            .to_string(),
+                                                        data: None,
+                                                    },
+                                                );
+                                                let mut send_guard = request_send
+                                                    .lock()
+                                                    .unwrap_or_else(
+                                                        std::sync::PoisonError::into_inner,
+                                                    );
+                                                return send_guard(
+                                                    &request_cx,
+                                                    &JsonRpcMessage::Response(response),
+                                                );
+                                            }
+                                        },
+                                        None => None,
+                                    };
+                                    let request_cancellation = active_guard
+                                        .as_ref()
+                                        .map(ActiveRequestGuard::cancellation);
+                                    match reservation
+                                        .queue
+                                        .begin_modern_dispatch(request.id.as_ref())
+                                    {
+                                        ModernDispatchStart::Stopping => Ok(()),
+                                        ModernDispatchStart::Cancelled => {
+                                            let Some(id) = request.id.clone() else {
+                                                return Ok(());
+                                            };
+                                            let response = JsonRpcResponse::error(
+                                                Some(id),
+                                                JsonRpcError {
+                                                    code: McpErrorCode::RequestCancelled.into(),
+                                                    message: "Request cancelled before dispatch"
+                                                        .to_string(),
+                                                    data: None,
+                                                },
+                                            );
+                                            let mut send_guard = request_send
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                            send_guard(
+                                                &request_cx,
+                                                &JsonRpcMessage::Response(response),
+                                            )
+                                        }
+                                        ModernDispatchStart::Ready => {
+                                            let inbound = InboundRequestContext::new(
+                                                request_cx.clone(),
+                                                request_id_to_u64(request.id.as_ref()),
+                                                InboundRequestTransport::Stdio,
+                                            );
+                                            let started = Instant::now();
+                                            let response = request_server
+                                                .dispatch_with_protocol_policy_and_cancellation(
+                                                    request_server.protocol_policy,
+                                                    &inbound,
+                                                    &request,
+                                                    request_cancellation.clone(),
+                                                );
+                                            let send_result = response.map_or(Ok(()), |mut response| {
+                                                let mut send_guard = request_send
+                                                    .lock()
+                                                    .unwrap_or_else(
+                                                        std::sync::PoisonError::into_inner,
+                                                    );
+                                                if request_cancellation
+                                                    .as_ref()
+                                                    .is_some_and(|cancellation| {
+                                                        !cancellation.begin_finalization()
+                                                    })
+                                                {
+                                                    response = JsonRpcResponse::error(
+                                                        response.id.clone(),
+                                                        JsonRpcError {
+                                                            code: McpErrorCode::RequestCancelled
+                                                                .into(),
+                                                            message: "Request cancelled before response finalization"
+                                                                .to_string(),
+                                                            data: None,
+                                                        },
+                                                    );
+                                                }
+                                                send_guard(
+                                                    &request_cx,
+                                                    &JsonRpcMessage::Response(response.clone()),
+                                                )?;
+                                                if let Some(renderer) = &request_renderer {
+                                                    renderer.render_response(
+                                                        &response,
+                                                        Some(started.elapsed()),
+                                                        &request_server.console,
+                                                    );
+                                                }
+                                                if let Some(stats) = &request_server.stats
+                                                    && let Ok(json) = serde_json::to_string(&response)
+                                                {
+                                                    stats.add_bytes_sent(json.len() as u64 + 1);
+                                                }
+                                                Ok(())
+                                            });
+                                            send_result
+                                        }
+                                    }
+                                }),
+                            );
+                            match dispatched {
+                                Ok(Ok(())) => reservation.disarm_failure(),
+                                Ok(Err(error))
+                                    if error.is_cancelled()
+                                        && reservation.queue.is_stopping() =>
+                                {
+                                    reservation.disarm_failure();
+                                }
+                                Ok(Err(_)) | Err(_) => {}
+                            }
+                        });
+                        if submitted.is_err() {
+                            if let Some(id) = response_id {
+                                let unavailable = JsonRpcResponse::error(
+                                    Some(id),
+                                    JsonRpcError {
+                                        code: McpErrorCode::InternalError.into(),
+                                        message: "Caller runtime could not admit request dispatch"
+                                            .to_string(),
+                                        data: None,
+                                    },
+                                );
+                                if send
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                    cx,
+                                    &JsonRpcMessage::Response(unavailable),
+                                )
+                                .is_err()
+                                {
+                                    exit_code = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
 
                     match dispatch_sender.try_send(QueuedDispatchMessage::Request(
                         QueuedDispatchRequest {
@@ -4480,6 +4859,21 @@ impl Server {
         drop(dispatch_sender);
         server.cancel_active_requests(CancelKind::Shutdown, false);
         pending_requests.cancel_all();
+        let modern_children_quiesced =
+            if queue_state.wait_for_modern_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT) {
+                true
+            } else {
+                error!(
+                    target: targets::SERVER,
+                    "Modern request children did not drain within the bounded shutdown deadline"
+                );
+                exit_code = 1;
+                // Modern requests are caller-owned children, not detached work.
+                // Once shutdown has cancelled their individual contexts, keep
+                // draining before lifecycle hooks can observe connection teardown.
+                while !queue_state.wait_for_modern_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT) {}
+                true
+            };
         let worker_quiesced = match worker_completion_receiver
             .recv_timeout(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
         {
@@ -4532,12 +4926,12 @@ impl Server {
         {
             exit_code = 1;
         }
-        if worker_quiesced {
+        if worker_quiesced && modern_children_quiesced {
             server.run_shutdown_hook();
         } else {
             error!(
                 target: targets::SERVER,
-                "Skipping shutdown hook because dispatch-worker quiescence was not established"
+                "Skipping shutdown hook because dispatch-child quiescence was not established"
             );
         }
         if let Some(ref stats) = server.stats {
@@ -7856,6 +8250,49 @@ mod lib_unit_tests {
         result.unwrap();
     }
 
+    fn run_live_modern_pump<R>(server: Server, recv: R, responses: Arc<LiveModernResponses>) -> i32
+    where
+        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError> + Send + 'static,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("live modern test reactor must initialize"))
+            .blocking_threads(4, MAX_DISPATCH_QUEUE_DEPTH)
+            .build()
+            .expect("live modern test runtime must initialize");
+        let (sender, receiver) = sync_channel(1);
+        runtime
+            .handle()
+            .try_spawn_with_cx(move |cx| async move {
+                let result = match cx.spawn_blocking(move |pump_cx| {
+                    server.run_loop_pump_with_policy(
+                        &pump_cx,
+                        recv,
+                        move |_send_cx, message| {
+                            responses.record(message.clone());
+                            Ok(())
+                        },
+                        Arc::new(|_| {}),
+                        "live-modern-test",
+                        false,
+                        None,
+                        true,
+                    )
+                }) {
+                    Ok(mut pump) => pump
+                        .join(&cx)
+                        .await
+                        .map_err(|error| format!("live modern pump join failed: {error:?}")),
+                    Err(error) => Err(format!("live modern pump admission failed: {error}")),
+                };
+                let _ = sender.send(result);
+            })
+            .expect("live modern test task must be admitted");
+
+        runtime
+            .block_on(wait_for_live_http_test_result(receiver))
+            .expect("live modern pump must complete")
+    }
+
     async fn live_http_exchange(address: SocketAddr, request: Vec<u8>) -> Result<Vec<u8>, String> {
         let mut stream = AsyncTcpStream::connect(address)
             .await
@@ -10313,6 +10750,200 @@ mod lib_unit_tests {
         }
     }
 
+    #[derive(Default)]
+    struct LiveModernControlState {
+        active: usize,
+        max_active: usize,
+        started: HashSet<u64>,
+        cancelled: HashSet<u64>,
+        released: HashSet<u64>,
+        release_all: bool,
+    }
+
+    #[derive(Default)]
+    struct LiveModernControl {
+        state: Mutex<LiveModernControlState>,
+        changed: Condvar,
+    }
+
+    impl LiveModernControl {
+        fn call(&self, ctx: &McpContext) -> McpResult<Vec<Content>> {
+            let request_id = ctx.request_id();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.active += 1;
+            state.max_active = state.max_active.max(state.active);
+            state.started.insert(request_id);
+            self.changed.notify_all();
+
+            loop {
+                if ctx.is_cancelled() {
+                    state.active = state.active.saturating_sub(1);
+                    state.cancelled.insert(request_id);
+                    self.changed.notify_all();
+                    return Err(McpError::request_cancelled());
+                }
+                if state.release_all || state.released.contains(&request_id) {
+                    state.active = state.active.saturating_sub(1);
+                    self.changed.notify_all();
+                    return Ok(vec![Content::text(format!("modern request {request_id}"))]);
+                }
+                let (next, _) = self
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(1))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
+            }
+        }
+
+        fn wait_for_started(&self, count: usize, timeout: Duration) -> bool {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, timeout, |state| state.started.len() < count)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.started.len() >= count
+        }
+
+        fn wait_for_cancellation(&self, request_id: u64, timeout: Duration) -> bool {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, timeout, |state| {
+                    !state.cancelled.contains(&request_id)
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.cancelled.contains(&request_id)
+        }
+
+        fn release(&self, request_id: u64) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.released.insert(request_id);
+            self.changed.notify_all();
+        }
+
+        fn release_all(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.release_all = true;
+            self.changed.notify_all();
+        }
+
+        fn max_active(&self) -> usize {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .max_active
+        }
+
+        fn was_cancelled(&self, request_id: u64) -> bool {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancelled
+                .contains(&request_id)
+        }
+    }
+
+    struct LiveModernControlledTool {
+        control: Arc<LiveModernControl>,
+    }
+
+    impl ToolHandler for LiveModernControlledTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "live_modern_controlled_tool".to_owned(),
+                description: Some("Deterministic live modern dispatcher probe".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.control.call(ctx)
+        }
+    }
+
+    #[derive(Default)]
+    struct LiveModernResponses {
+        messages: Mutex<Vec<JsonRpcMessage>>,
+        changed: Condvar,
+    }
+
+    impl LiveModernResponses {
+        fn record(&self, message: JsonRpcMessage) {
+            let mut messages = self
+                .messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            messages.push(message);
+            self.changed.notify_all();
+        }
+
+        fn response_count(&self, id: i64) -> usize {
+            self.messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|message| {
+                    matches!(message, JsonRpcMessage::Response(response) if response.id == Some(id.into()))
+                })
+                .count()
+        }
+
+        fn response(&self, id: i64) -> Option<JsonRpcResponse> {
+            self.messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find_map(|message| match message {
+                    JsonRpcMessage::Response(response) if response.id == Some(id.into()) => {
+                        Some(response.clone())
+                    }
+                    _ => None,
+                })
+        }
+
+        fn wait_for_responses(&self, ids: &[i64], timeout: Duration) -> bool {
+            let messages = self
+                .messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (messages, _) = self
+                .changed
+                .wait_timeout_while(messages, timeout, |messages| {
+                    ids.iter().any(|id| {
+                        !messages.iter().any(|message| {
+                            matches!(message, JsonRpcMessage::Response(response) if response.id == Some((*id).into()))
+                        })
+                    })
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ids.iter().all(|id| {
+                messages.iter().any(|message| {
+                    matches!(message, JsonRpcMessage::Response(response) if response.id == Some((*id).into()))
+                })
+            })
+        }
+    }
+
     struct ProtocolPolicyScriptTransport {
         inbound: std::collections::VecDeque<JsonRpcMessage>,
         sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
@@ -10328,6 +10959,20 @@ mod lib_unit_tests {
                 },
             })),
             905_i64,
+        ))
+    }
+
+    fn modern_controlled_tool_request(id: i64) -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "live_modern_controlled_tool",
+                "arguments": {},
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                },
+            })),
+            id,
         ))
     }
 
@@ -11920,6 +12565,200 @@ mod lib_unit_tests {
             cancelled.error.as_ref().map(|error| error.code),
             Some(i32::from(McpErrorCode::RequestCancelled))
         );
+    }
+
+    #[test]
+    fn live_modern_stdio_requests_overlap_and_emit_one_response_per_id() {
+        let control = Arc::new(LiveModernControl::default());
+        let responses = Arc::new(LiveModernResponses::default());
+        let control_for_receive = Arc::clone(&control);
+        let responses_for_receive = Arc::clone(&responses);
+        let phase = Arc::new(AtomicUsize::new(0));
+        let phase_for_receive = Arc::clone(&phase);
+
+        let exit_code = run_live_modern_pump(
+            Server::new("live-modern-overlap", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LiveModernControlledTool {
+                    control: Arc::clone(&control),
+                })
+                .build(),
+            move |_cx, _worker_failed| match phase_for_receive.fetch_add(1, Ordering::AcqRel) {
+                0 => Ok(modern_discovery_opening_request()),
+                1 => Ok(modern_controlled_tool_request(100)),
+                2 => {
+                    if control_for_receive.wait_for_started(1, Duration::from_secs(2)) {
+                        Ok(modern_controlled_tool_request(101))
+                    } else {
+                        Err(TransportError::Timeout)
+                    }
+                }
+                3 => {
+                    if !control_for_receive.wait_for_started(2, Duration::from_secs(2)) {
+                        return Err(TransportError::Timeout);
+                    }
+                    control_for_receive.release(100);
+                    control_for_receive.release(101);
+                    if responses_for_receive.wait_for_responses(&[100, 101], Duration::from_secs(2))
+                    {
+                        Err(TransportError::Closed)
+                    } else {
+                        Err(TransportError::Timeout)
+                    }
+                }
+                _ => Err(TransportError::Closed),
+            },
+            Arc::clone(&responses),
+        );
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            control.max_active() >= 2,
+            "two independent modern requests must be live before either is released"
+        );
+        assert_eq!(responses.response_count(100), 1);
+        assert_eq!(responses.response_count(101), 1);
+    }
+
+    #[test]
+    fn live_modern_stdio_cancellation_isolated_to_the_matching_request() {
+        let control = Arc::new(LiveModernControl::default());
+        let responses = Arc::new(LiveModernResponses::default());
+        let control_for_receive = Arc::clone(&control);
+        let responses_for_receive = Arc::clone(&responses);
+        let phase = Arc::new(AtomicUsize::new(0));
+        let phase_for_receive = Arc::clone(&phase);
+
+        let exit_code = run_live_modern_pump(
+            Server::new("live-modern-cancellation", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LiveModernControlledTool {
+                    control: Arc::clone(&control),
+                })
+                .build(),
+            move |_cx, _worker_failed| match phase_for_receive.fetch_add(1, Ordering::AcqRel) {
+                0 => Ok(modern_discovery_opening_request()),
+                1 => Ok(modern_controlled_tool_request(200)),
+                2 => {
+                    if control_for_receive.wait_for_started(1, Duration::from_secs(2)) {
+                        Ok(modern_controlled_tool_request(201))
+                    } else {
+                        Err(TransportError::Timeout)
+                    }
+                }
+                3 => {
+                    if control_for_receive.wait_for_started(2, Duration::from_secs(2)) {
+                        Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                            "notifications/cancelled",
+                            Some(serde_json::json!({ "requestId": 200 })),
+                        )))
+                    } else {
+                        Err(TransportError::Timeout)
+                    }
+                }
+                4 => {
+                    if !control_for_receive.wait_for_cancellation(200, Duration::from_secs(2)) {
+                        return Err(TransportError::Timeout);
+                    }
+                    control_for_receive.release(201);
+                    if responses_for_receive.wait_for_responses(&[200, 201], Duration::from_secs(2))
+                    {
+                        Err(TransportError::Closed)
+                    } else {
+                        Err(TransportError::Timeout)
+                    }
+                }
+                _ => Err(TransportError::Closed),
+            },
+            Arc::clone(&responses),
+        );
+
+        assert_eq!(exit_code, 0);
+        assert!(control.was_cancelled(200));
+        assert!(!control.was_cancelled(201));
+        assert_eq!(responses.response_count(200), 1);
+        assert_eq!(responses.response_count(201), 1);
+        assert_eq!(
+            responses
+                .response(200)
+                .and_then(|response| response.error)
+                .map(|error| error.code),
+            Some(i32::from(McpErrorCode::RequestCancelled))
+        );
+        assert!(
+            responses
+                .response(201)
+                .is_some_and(|response| response.error.is_none())
+        );
+    }
+
+    #[test]
+    fn live_modern_stdio_rejects_the_one_request_beyond_bounded_capacity() {
+        let control = Arc::new(LiveModernControl::default());
+        let responses = Arc::new(LiveModernResponses::default());
+        let control_for_receive = Arc::clone(&control);
+        let responses_for_receive = Arc::clone(&responses);
+        let phase = Arc::new(AtomicUsize::new(0));
+        let phase_for_receive = Arc::clone(&phase);
+
+        let exit_code = run_live_modern_pump(
+            Server::new("live-modern-backpressure", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LiveModernControlledTool {
+                    control: Arc::clone(&control),
+                })
+                .build(),
+            move |_cx, _worker_failed| {
+                let phase = phase_for_receive.fetch_add(1, Ordering::AcqRel);
+                match phase {
+                    0 => Ok(modern_discovery_opening_request()),
+                    1 => {
+                        if responses_for_receive.wait_for_responses(&[905], Duration::from_secs(2))
+                        {
+                            Ok(modern_controlled_tool_request(1001))
+                        } else {
+                            Err(TransportError::Timeout)
+                        }
+                    }
+                    2..=65 => Ok(modern_controlled_tool_request(1000 + phase as i64)),
+                    66 => {
+                        if !responses_for_receive
+                            .wait_for_responses(&[1065], Duration::from_secs(2))
+                        {
+                            return Err(TransportError::Timeout);
+                        }
+                        control_for_receive.release_all();
+                        let admitted = (1001..=1064).collect::<Vec<_>>();
+                        if responses_for_receive
+                            .wait_for_responses(&admitted, Duration::from_secs(5))
+                        {
+                            Err(TransportError::Closed)
+                        } else {
+                            Err(TransportError::Timeout)
+                        }
+                    }
+                    _ => Err(TransportError::Closed),
+                }
+            },
+            Arc::clone(&responses),
+        );
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(responses.response_count(1065), 1);
+        assert_eq!(
+            responses
+                .response(1065)
+                .and_then(|response| response.error)
+                .map(|error| error.code),
+            Some(RESOURCE_EXHAUSTED_ERROR_CODE)
+        );
+        for id in 1001..=1064 {
+            assert_eq!(
+                responses.response_count(id),
+                1,
+                "accepted id {id} must finalize once"
+            );
+        }
     }
 
     #[test]
