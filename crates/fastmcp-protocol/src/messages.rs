@@ -3893,6 +3893,60 @@ mod tests {
     }
 
     #[test]
+    fn final_cancellation_preserves_large_integer_request_ids_and_rejects_fractional_ids() {
+        let large_id = "922337203685477580812345678901234567890";
+        let accepted_wire = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":{large_id}}}}}"#
+        );
+        let accepted: JsonRpcRequest = serde_json::from_str(&accepted_wire)
+            .expect("arbitrary-precision integer cancellation ID decodes");
+        let notification = ClientNotification::decode(&accepted)
+            .expect("final cancellation retains the arbitrary-precision request ID");
+        let ClientNotification::Cancelled(params) = &notification;
+        assert_eq!(
+            params.request_id,
+            RequestId::Integer(large_id.to_owned()),
+            "the cancellation parameter preserves the numeric ID without narrowing it"
+        );
+        assert_eq!(
+            serde_json::to_string(&notification.encode().expect("cancellation re-encodes"))
+                .expect("cancellation JSON serializes"),
+            accepted_wire,
+            "the final notification returns the exact large integer lexeme to the wire"
+        );
+
+        let baseline = JsonRpcRequest::notification(
+            NOTIFICATIONS_CANCELLED,
+            Some(serde_json::json!({"requestId": 1})),
+        );
+        let admitted = ClientNotification::decode(&baseline)
+            .expect("integer cancellation request IDs remain admitted");
+        let baseline_wire = serde_json::to_value(&baseline).expect("baseline wire serializes");
+        let mut planted = baseline.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("cancellation owns object parameters")
+            .insert("requestId".to_owned(), serde_json::json!(1.5));
+        assert!(
+            matches!(
+                ClientNotification::decode(&planted),
+                Err(FinalNotificationError::InvalidParams {
+                    method: NOTIFICATIONS_CANCELLED
+                })
+            ),
+            "changing only the requestId from an integer to a fraction rejects cancellation"
+        );
+        assert_eq!(
+            serde_json::to_value(admitted.encode().expect("integer cancellation re-encodes"))
+                .expect("integer cancellation remains JSON"),
+            baseline_wire,
+            "fractional rejection cannot alter the admitted integer cancellation"
+        );
+    }
+
+    #[test]
     fn legacy_sampling_stop_reason_is_optional_and_open() {
         let absent_wire = serde_json::json!({
             "content": {"type": "text", "text": "summary"},
