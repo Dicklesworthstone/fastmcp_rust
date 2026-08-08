@@ -9,13 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_protocol::{
-    CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, Content, GetPromptParams,
+    CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, GetPromptParams,
     GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
-    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
-    ListToolsResult, PROTOCOL_VERSION, Prompt, PromptMessage, ReadResourceParams,
-    ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate, ServerCapabilities,
-    ServerInfo, Tool,
+    JsonRpcResponse, LegacyContent, LegacyPromptMessage, LegacyResourceContent, ListPromptsParams,
+    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
+    Prompt, ReadResourceParams, ReadResourceResult, RequestId, Resource, ResourceTemplate,
+    ServerCapabilities, ServerInfo, Tool,
 };
 use fastmcp_transport::Transport;
 use fastmcp_transport::memory::MemoryTransport;
@@ -210,7 +210,7 @@ impl TestClient {
         &mut self,
         name: &str,
         arguments: serde_json::Value,
-    ) -> McpResult<Vec<Content>> {
+    ) -> McpResult<Vec<LegacyContent>> {
         self.ensure_initialized()?;
         let params = CallToolParams {
             name: name.to_string(),
@@ -224,7 +224,7 @@ impl TestClient {
                 .content
                 .first()
                 .and_then(|c| match c {
-                    Content::Text { text } => Some(text.clone()),
+                    LegacyContent::Text { text, .. } => Some(text.clone()),
                     _ => None,
                 })
                 .unwrap_or_else(|| "Tool execution failed".to_string());
@@ -264,7 +264,7 @@ impl TestClient {
     /// # Errors
     ///
     /// Returns an error if the resource cannot be read.
-    pub fn read_resource(&mut self, uri: &str) -> McpResult<Vec<ResourceContent>> {
+    pub fn read_resource(&mut self, uri: &str) -> McpResult<Vec<LegacyResourceContent>> {
         self.ensure_initialized()?;
         let params = ReadResourceParams {
             uri: uri.to_string(),
@@ -295,7 +295,7 @@ impl TestClient {
         &mut self,
         name: &str,
         arguments: HashMap<String, String>,
-    ) -> McpResult<Vec<PromptMessage>> {
+    ) -> McpResult<Vec<LegacyPromptMessage>> {
         self.ensure_initialized()?;
         let params = GetPromptParams {
             name: name.to_string(),
