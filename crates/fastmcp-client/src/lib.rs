@@ -41,6 +41,7 @@
 
 mod builder;
 mod execution;
+pub mod http_executor;
 pub mod mcp_config;
 mod negotiation;
 mod session;

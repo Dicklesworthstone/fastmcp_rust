@@ -1,13 +1,6 @@
-//! Exact-name same-Bead harness for the unexported HTTP-03 executor module.
-//!
-//! The shared client owner exposes this module through the public facade in
-//! the integration wave. These tests compile the production module directly
-//! so its frozen IDs exist without editing that shared facade in this wave.
+//! Exact-name HTTP-03 harness against the shipped client executor surface.
 
-#[path = "../src/http_executor.rs"]
-mod http_executor;
-
-use http_executor::{
+use fastmcp_client::http_executor::{
     MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE,
     ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind, validate_response_head,
 };
