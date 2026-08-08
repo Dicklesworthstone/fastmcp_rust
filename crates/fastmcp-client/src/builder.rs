@@ -715,9 +715,9 @@ mod tests {
     #[cfg(unix)]
     fn modern_apps_lifecycle_script(server_advertises_apps: bool) -> String {
         let discovery_result = if server_advertises_apps {
-            r#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"builder-modern-apps","version":"1.0.0"}}}}"#
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"builder-modern-apps","version":"1.0.0"}}}}"#
         } else {
-            r#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"builder-modern-apps","version":"1.0.0"}}}}"#
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"builder-modern-apps","version":"1.0.0"}}}}"#
         };
         let ping_case = if server_advertises_apps {
             "*ping*io.modelcontextprotocol/ui*)"

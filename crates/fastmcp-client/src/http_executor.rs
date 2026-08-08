@@ -3205,9 +3205,9 @@ mod tests {
         let address = listener.local_addr().expect("read local Apps address");
         let modern_target = format!("http://{address}/mcp");
         let discovery_body = if apps_active {
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{\"extensions\":{\"io.modelcontextprotocol/ui\":{}}},\"ttlMs\":0,\"cacheScope\":\"private\"}}"
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{\"extensions\":{\"io.modelcontextprotocol/ui\":{}}},\"ttlMs\":0,\"cacheScope\":\"private\"}}"
         } else {
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{},\"ttlMs\":0,\"cacheScope\":\"private\"}}"
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{},\"ttlMs\":0,\"cacheScope\":\"private\"}}"
         }
         .to_owned();
         let server = thread::spawn(move || {
@@ -3426,7 +3426,7 @@ mod tests {
     }
 
     fn modern_discovery_body() -> &'static [u8] {
-        br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#
+        br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#
     }
 
     fn modern_tasks_discovery_body() -> Vec<u8> {
@@ -3671,12 +3671,12 @@ mod tests {
 
     #[test]
     fn modern_connect_requires_the_exact_typed_discovery_result() {
-        let exact = br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#;
+        let exact = br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#;
         let admitted = decode_modern_discovery_response(exact)
             .expect("the exact final discovery result must be retained");
         assert_eq!(admitted.supported_versions(), ["2026-07-28"]);
 
-        let planted = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let planted = br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#;
         assert!(matches!(
             decode_modern_discovery_response(planted),
             Err(ModernHttpClientError::InvalidDiscoveryResponse)
@@ -3920,7 +3920,7 @@ mod tests {
                 &mut probe,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2024-11-05"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2024-11-05"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
             );
 
             listener
