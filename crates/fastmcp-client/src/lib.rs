@@ -58,7 +58,11 @@ pub use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, HttpModernProbe, HttpProbeBody, ProtocolEra,
     ProtocolPolicy, ProtocolVersion,
 };
-pub use fastmcp_protocol::{CoreResult, FinalCoreResult, LegacyCoreResult};
+pub use fastmcp_protocol::{
+    CoreResult, FinalCoreResult, LegacyCompletionArgument as CompletionArgument,
+    LegacyCompletionParams as CompletionParams, LegacyCompletionReference as CompletionReference,
+    LegacyCoreResult,
+};
 pub use mcp_config::claude_desktop_config_path;
 pub use negotiation::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
@@ -4393,6 +4397,23 @@ impl Client {
         Ok(result.messages)
     }
 
+    /// Completes one prompt or resource-template argument in the selected era.
+    ///
+    /// Modern sessions add the final request metadata and return
+    /// [`CoreResult::Final`] with [`FinalCoreResult::Completion`]. Exact
+    /// legacy sessions retain the unmodified completion request and return
+    /// [`CoreResult::Legacy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or its completion result violates
+    /// the method-aware contract of the negotiated era. A contradictory peer
+    /// result terminates the connection.
+    pub fn complete(&mut self, params: CompletionParams) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        self.send_typed_core_request("completion/complete", params)
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Task Management (Docket/SEP-1686)
     // ═══════════════════════════════════════════════════════════════════════
@@ -8293,6 +8314,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_completion_client_script(completion_response: &str) -> String {
+        let discovery_response =
+            modern_discovery_response("completion-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r second || exit 1; \
+             case \"$second\" in *completion/complete*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{completion_response}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
     fn modern_discovery_response(server_name: &str, supported_versions: &[&str]) -> String {
         let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
             &fastmcp_protocol::ServerBehaviorRegistry::default(),
@@ -8382,6 +8418,32 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn legacy_completion_client_script() -> &'static str {
+        "IFS= read -r first || exit 1; \
+         case \"$first\" in *initialize*2024-11-05*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}' ;; *) exit 1 ;; esac; \
+         IFS= read -r lifecycle || exit 1; \
+         case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+         IFS= read -r request || exit 1; \
+         case \"$request\" in *completion/complete*) ;; *) exit 1 ;; esac; \
+         case \"$request\" in *io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
+         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"completion\":{\"values\":[\"staging\"],\"total\":1,\"hasMore\":false}}}' ;; esac; \
+         exec sleep 2"
+    }
+
+    fn completion_params() -> CompletionParams {
+        CompletionParams {
+            reference: CompletionReference::Prompt {
+                name: "deploy".to_owned(),
+            },
+            argument: CompletionArgument {
+                name: "environment".to_owned(),
+                value: "sta".to_owned(),
+            },
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn clt_01_i_positive() {
         let modern_result = modern_discovery_response("modern-server", &[MODERN_PROTOCOL_VERSION]);
@@ -8450,6 +8512,56 @@ mod tests {
         let error = client
             .call_tool_typed("echo", serde_json::json!({"text": "typed"}))
             .expect_err("an explicit null discriminator is not an omitted complete discriminator");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(!client.is_initialized());
+        assert!(client.responses.terminal_error().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_completion_client_result_positive() {
+        let script = modern_completion_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","completion":{"values":["staging"],"total":1,"hasMore":false}}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+
+        let result = client
+            .complete(completion_params())
+            .expect("modern completion returns its typed final payload");
+        let CoreResult::Final(FinalCoreResult::Completion { result, diagnostic }) = result else {
+            panic!("modern completion must not decode through the legacy result shape");
+        };
+        assert!(diagnostic.is_none());
+        assert_eq!(result.payload.completion.values, vec!["staging".to_owned()]);
+        assert_eq!(result.payload.completion.total, Some(1));
+        assert_eq!(result.payload.completion.has_more, Some(false));
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_completion_client_result_null_discriminator_rejected() {
+        // This differs from the accepted completion result only in `resultType`.
+        let script = modern_completion_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"completion":{"values":["staging"],"total":1,"hasMore":false}}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("same modern discovery initializes the public client");
+
+        let error = client
+            .complete(completion_params())
+            .expect_err("an explicit null completion discriminator is rejected");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(!client.is_initialized());
         assert!(client.responses.terminal_error().is_some());
@@ -8688,6 +8800,52 @@ mod tests {
         };
         assert!(!result.is_error);
         assert_eq!(result.content.len(), 1);
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_progress_client_result_preserves_exact_legacy_decode() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_typed_call_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
+        let mut on_progress = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {};
+
+        let content = client
+            .call_tool_with_progress(
+                "echo",
+                serde_json::json!({"text": "legacy progress"}),
+                &mut on_progress,
+            )
+            .expect("legacy progress calls do not require a final result discriminator");
+        assert_eq!(content.len(), 1);
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_completion_client_result_preserves_exact_legacy_decode() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_completion_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
+
+        let result = client
+            .complete(completion_params())
+            .expect("legacy completion retains its exact response shape");
+        let CoreResult::Legacy(LegacyCoreResult::Completion(result)) = result else {
+            panic!("legacy completion must not require a final result discriminator");
+        };
+        assert_eq!(result.completion.values, vec!["staging".to_owned()]);
+        assert_eq!(result.completion.total, Some(1));
+        assert_eq!(result.completion.has_more, Some(false));
         client.close().expect("legacy client cleanup");
     }
 
