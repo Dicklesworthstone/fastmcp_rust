@@ -8929,7 +8929,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn modern_progress_client_script() -> String {
+    fn modern_progress_client_script(call_response: &str) -> String {
         let discovery_response =
             modern_discovery_response("progress-modern-server", &[MODERN_PROTOCOL_VERSION]);
         format!(
@@ -8939,7 +8939,7 @@ mod tests {
              IFS= read -r request || exit 1; \
              case \"$request\" in *tools/call*'\"progressToken\":2'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":2,\"progress\":0.5,\"total\":1.0,\"message\":\"modern progress\"}}}}'; \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"progress result\"}}],\"isError\":false}}}}' ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{call_response}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -9753,7 +9753,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clt_01_progress_client_result_positive() {
-        let script = modern_progress_client_script();
+        let script = modern_progress_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"progress result","annotations":{"audience":["user"]}}],"isError":false}}"#,
+        );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
             &["-c", script.as_str()],
@@ -9785,8 +9787,8 @@ mod tests {
     #[test]
     fn clt_01_progress_client_result_null_discriminator_rejected() {
         // This differs from the accepted progress response only in `resultType`.
-        let script = modern_typed_call_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
+        let script = modern_progress_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"progress result","annotations":{"audience":["user"]}}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
