@@ -29,27 +29,68 @@
 //! ).await?;
 //! ```
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::future::{Future, poll_fn};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use asupersync::channel::oneshot;
 use asupersync::channel::oneshot::RecvError;
+use base64::Engine as _;
 use fastmcp_core::{
     ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender,
     McpError, McpErrorCode, McpRequestCancellation, McpResult, SamplingRequest, SamplingResponse,
-    SamplingRole, SamplingSender, SamplingStopReason,
+    SamplingRole, SamplingSender, SamplingStopReason, draw_security_identifier,
 };
 use fastmcp_protocol::{JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
+use serde::Serialize;
+use serde::ser::SerializeStruct;
 
 /// Default maximum number of concurrent server-to-client requests.
 pub const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 1_024;
 
 /// Absolute maximum accepted by [`PendingRequests::with_max_in_flight`].
 pub const HARD_MAX_IN_FLIGHT_REQUESTS: usize = 16_384;
+
+/// Default maximum rounds for a single final MRTR exchange.
+pub const DEFAULT_MAX_MRTR_ROUNDS: u8 = 8;
+
+/// Absolute maximum rounds a server-local MRTR exchange may use.
+pub const HARD_MAX_MRTR_ROUNDS: u8 = 32;
+
+/// Default maximum embedded input requests in one MRTR result.
+pub const DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND: usize = 32;
+
+/// Absolute maximum embedded input requests in one MRTR result.
+pub const HARD_MAX_MRTR_INPUT_REQUESTS_PER_ROUND: usize = 128;
+
+/// Default maximum embedded input requests across one complete MRTR exchange.
+pub const DEFAULT_MAX_MRTR_INPUT_REQUESTS_TOTAL: usize = 128;
+
+/// Absolute maximum embedded input requests across one complete MRTR exchange.
+pub const HARD_MAX_MRTR_INPUT_REQUESTS_TOTAL: usize = 512;
+
+/// Default lifetime for an MRTR request-state record.
+pub const DEFAULT_MRTR_REQUEST_STATE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Absolute maximum lifetime for an MRTR request-state record.
+pub const HARD_MAX_MRTR_REQUEST_STATE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Default number of retained, process-local MRTR request-state records.
+pub const DEFAULT_MAX_MRTR_REQUEST_STATES: usize = 4_096;
+
+/// Absolute maximum number of retained, process-local MRTR request-state records.
+pub const HARD_MAX_MRTR_REQUEST_STATES: usize = 65_536;
+
+/// Default maximum encoded request-state bytes admitted from an MRTR retry.
+pub const DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES: usize = 64 * 1024;
+
+/// Maximum encoded request-state bytes admitted from an MRTR retry.
+pub const HARD_MAX_MRTR_REQUEST_STATE_BYTES: usize = 256 * 1024;
 
 const FIRST_SERVER_REQUEST_ID: i64 = 1_000_000;
 const INVALID_LIMIT_ERROR: &str = "Invalid bidirectional request limit";
@@ -63,6 +104,12 @@ const RESPONSE_CHANNEL_ERROR: &str = "Bidirectional response channel closed";
 const RESPONSE_PAYLOAD_ERROR: &str = "Invalid bidirectional response payload";
 const REQUEST_PAYLOAD_ERROR: &str = "Failed to serialize bidirectional request payload";
 const INVALID_ELICITATION_REQUEST_ERROR: &str = "Invalid elicitation request";
+const INVALID_MRTR_LIMIT_ERROR: &str = "Invalid MRTR exchange limit";
+const MRTR_REQUEST_STATE_ERROR: &str = "Invalid or expired MRTR request state";
+const MRTR_REQUEST_STATE_UNAVAILABLE_ERROR: &str = "Unable to create MRTR request state";
+const MRTR_INPUT_MAP_ERROR: &str = "Invalid MRTR input request or response map";
+const MRTR_RESPONSE_KIND_ERROR: &str = "MRTR input response does not match its request";
+const MRTR_ROUND_LIMIT_ERROR: &str = "MRTR exchange limit reached";
 
 // ============================================================================
 // Pending Request Tracking
@@ -799,6 +846,735 @@ impl TransportRootsProvider {
 }
 
 // ============================================================================
+// Final MRTR Embedded Input Exchanges
+// ============================================================================
+
+/// The three server-to-client input kinds represented by final MRTR.
+///
+/// These are embedded descriptors inside an `inputRequests` map. They are not
+/// independent JSON-RPC requests and never receive a JSON-RPC ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MrtrInputKind {
+    /// `elicitation/create` with an [`fastmcp_protocol::ElicitResult`] response.
+    Elicitation,
+    /// `sampling/createMessage` with a [`fastmcp_protocol::CreateMessageResult`] response.
+    Sampling,
+    /// `roots/list` with a [`fastmcp_protocol::ListRootsResult`] response.
+    Roots,
+}
+
+impl MrtrInputKind {
+    /// Returns the exact embedded input request method.
+    #[must_use]
+    pub const fn method(self) -> &'static str {
+        match self {
+            Self::Elicitation => "elicitation/create",
+            Self::Sampling => "sampling/createMessage",
+            Self::Roots => "roots/list",
+        }
+    }
+}
+
+/// One final MRTR embedded input descriptor.
+///
+/// Its wire representation is exactly `{ "method": ..., "params": ... }`
+/// when it has parameters, or `{ "method": "roots/list" }` for roots. It
+/// deliberately has no JSON-RPC envelope, correlation ID, or inherited outer
+/// request metadata.
+#[derive(Debug, Clone)]
+pub struct MrtrInputRequest {
+    kind: MrtrInputKind,
+    params: Option<serde_json::Value>,
+}
+
+impl MrtrInputRequest {
+    /// Creates a final form or URL elicitation input descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error only if its protocol parameters cannot be
+    /// represented as JSON.
+    pub fn elicitation(params: fastmcp_protocol::ElicitRequestParams) -> McpResult<Self> {
+        Self::with_params(MrtrInputKind::Elicitation, params)
+    }
+
+    /// Creates a final sampling input descriptor.
+    ///
+    /// The embedded descriptor must not inherit the outer request's metadata,
+    /// so this safe constructor always omits `_meta`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error only if its protocol parameters cannot be
+    /// represented as JSON.
+    pub fn sampling(mut params: fastmcp_protocol::CreateMessageParams) -> McpResult<Self> {
+        params.meta = None;
+        Self::with_params(MrtrInputKind::Sampling, params)
+    }
+
+    /// Creates a final roots input descriptor with omitted parameters.
+    #[must_use]
+    pub const fn roots() -> Self {
+        Self {
+            kind: MrtrInputKind::Roots,
+            params: None,
+        }
+    }
+
+    /// Returns the input's exact response kind.
+    #[must_use]
+    pub const fn kind(&self) -> MrtrInputKind {
+        self.kind
+    }
+
+    fn with_params<T: Serialize>(kind: MrtrInputKind, params: T) -> McpResult<Self> {
+        let params = serde_json::to_value(params)
+            .map_err(|_| McpError::internal_error(REQUEST_PAYLOAD_ERROR))?;
+        Ok(Self {
+            kind,
+            params: Some(params),
+        })
+    }
+}
+
+impl Serialize for MrtrInputRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut descriptor = serializer.serialize_struct(
+            "MrtrInputRequest",
+            if self.params.is_some() { 2 } else { 1 },
+        )?;
+        descriptor.serialize_field("method", self.kind.method())?;
+        if let Some(params) = &self.params {
+            descriptor.serialize_field("params", params)?;
+        }
+        descriptor.end()
+    }
+}
+
+/// A typed input response whose value can be accepted only for the matching
+/// [`MrtrInputKind`] recorded at issuance time.
+#[derive(Debug, Clone)]
+pub struct MrtrInputResponse {
+    kind: MrtrInputKind,
+    value: serde_json::Value,
+}
+
+impl MrtrInputResponse {
+    /// Creates an elicitation response value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error only if its protocol value cannot be
+    /// represented as JSON.
+    pub fn elicitation(value: fastmcp_protocol::ElicitResult) -> McpResult<Self> {
+        Self::with_value(MrtrInputKind::Elicitation, value)
+    }
+
+    /// Creates a sampling response value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error only if its protocol value cannot be
+    /// represented as JSON.
+    pub fn sampling(value: fastmcp_protocol::CreateMessageResult) -> McpResult<Self> {
+        Self::with_value(MrtrInputKind::Sampling, value)
+    }
+
+    /// Creates a roots response value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error only if its protocol value cannot be
+    /// represented as JSON.
+    pub fn roots(value: fastmcp_protocol::ListRootsResult) -> McpResult<Self> {
+        Self::with_value(MrtrInputKind::Roots, value)
+    }
+
+    /// Returns the response's exact kind.
+    #[must_use]
+    pub const fn kind(&self) -> MrtrInputKind {
+        self.kind
+    }
+
+    fn with_value<T: Serialize>(kind: MrtrInputKind, value: T) -> McpResult<Self> {
+        let value = serde_json::to_value(value)
+            .map_err(|_| McpError::internal_error(RESPONSE_PAYLOAD_ERROR))?;
+        Ok(Self { kind, value })
+    }
+}
+
+impl Serialize for MrtrInputResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.value.serialize(serializer)
+    }
+}
+
+/// A unique, bounded map of final embedded MRTR input requests.
+#[derive(Debug, Clone, Default)]
+pub struct MrtrInputRequests {
+    entries: BTreeMap<String, MrtrInputRequest>,
+}
+
+impl MrtrInputRequests {
+    /// Creates a unique map of embedded input request descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` for an empty or duplicate key, or when more
+    /// than [`HARD_MAX_MRTR_INPUT_REQUESTS_PER_ROUND`] descriptors are given.
+    pub fn new(entries: impl IntoIterator<Item = (String, MrtrInputRequest)>) -> McpResult<Self> {
+        let mut result = Self::default();
+        for (key, request) in entries {
+            result.insert(key, request)?;
+        }
+        Ok(result)
+    }
+
+    /// Returns whether this map contains no embedded input descriptors.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the number of embedded input descriptors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Looks up one embedded input descriptor by its server-issued key.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&MrtrInputRequest> {
+        self.entries.get(key)
+    }
+
+    /// Iterates over server-issued input keys and their embedded descriptors.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &MrtrInputRequest)> {
+        self.entries
+            .iter()
+            .map(|(key, request)| (key.as_str(), request))
+    }
+
+    fn insert(&mut self, key: String, request: MrtrInputRequest) -> McpResult<()> {
+        if key.is_empty()
+            || self.entries.len() >= HARD_MAX_MRTR_INPUT_REQUESTS_PER_ROUND
+            || self.entries.contains_key(&key)
+        {
+            return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
+        }
+        self.entries.insert(key, request);
+        Ok(())
+    }
+
+    fn unresolved_after(&self, responses: &MrtrInputResponses) -> Self {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .filter(|(key, _)| !responses.entries.contains_key(key))
+                .map(|(key, request)| (key.clone(), request.clone()))
+                .collect(),
+        }
+    }
+}
+
+impl Serialize for MrtrInputRequests {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.entries.serialize(serializer)
+    }
+}
+
+/// A unique, bounded map of final MRTR input response values.
+#[derive(Debug, Clone, Default)]
+pub struct MrtrInputResponses {
+    entries: BTreeMap<String, MrtrInputResponse>,
+}
+
+impl MrtrInputResponses {
+    /// Creates a unique map of embedded input responses.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` for an empty or duplicate key, or when more
+    /// than [`HARD_MAX_MRTR_INPUT_REQUESTS_PER_ROUND`] response values are
+    /// given.
+    pub fn new(entries: impl IntoIterator<Item = (String, MrtrInputResponse)>) -> McpResult<Self> {
+        let mut result = Self::default();
+        for (key, response) in entries {
+            result.insert(key, response)?;
+        }
+        Ok(result)
+    }
+
+    /// Returns whether this map contains no input responses.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the number of input response values.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Looks up one response by its server-issued input key.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&MrtrInputResponse> {
+        self.entries.get(key)
+    }
+
+    /// Iterates over input-response keys and values.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &MrtrInputResponse)> {
+        self.entries
+            .iter()
+            .map(|(key, response)| (key.as_str(), response))
+    }
+
+    fn insert(&mut self, key: String, response: MrtrInputResponse) -> McpResult<()> {
+        if key.is_empty()
+            || self.entries.len() >= HARD_MAX_MRTR_INPUT_REQUESTS_PER_ROUND
+            || self.entries.contains_key(&key)
+        {
+            return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
+        }
+        self.entries.insert(key, response);
+        Ok(())
+    }
+}
+
+impl Serialize for MrtrInputResponses {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.entries.serialize(serializer)
+    }
+}
+
+/// A server-minted final MRTR request state.
+///
+/// The wire representation is opaque. Its `Debug` implementation is redacted,
+/// and only [`MrtrInputRequired`] serializes it into a server response.
+#[derive(Clone)]
+pub struct MrtrRequestState(String);
+
+impl std::fmt::Debug for MrtrRequestState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MrtrRequestState([redacted])")
+    }
+}
+
+impl Serialize for MrtrRequestState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+/// A final `input_required` result emitted by the server.
+///
+/// Safe server construction always includes a protected request state. An
+/// empty request map is emitted as a state-only result, which permits an
+/// immediate retry without manufacturing an empty input map.
+#[derive(Debug, Clone)]
+pub struct MrtrInputRequired {
+    input_requests: Option<MrtrInputRequests>,
+    request_state: MrtrRequestState,
+}
+
+impl MrtrInputRequired {
+    /// Returns the embedded request map, if this result needs client input.
+    #[must_use]
+    pub fn input_requests(&self) -> Option<&MrtrInputRequests> {
+        self.input_requests.as_ref()
+    }
+}
+
+impl Serialize for MrtrInputRequired {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut result = serializer.serialize_struct(
+            "MrtrInputRequired",
+            if self.input_requests.is_some() { 3 } else { 2 },
+        )?;
+        result.serialize_field("resultType", "input_required")?;
+        if let Some(input_requests) = &self.input_requests {
+            result.serialize_field("inputRequests", input_requests)?;
+        }
+        result.serialize_field("requestState", &self.request_state)?;
+        result.end()
+    }
+}
+
+/// The outcome of consuming one final MRTR retry.
+#[derive(Debug, Clone)]
+pub enum MrtrRetry {
+    /// More client input is needed; only unsatisfied keys are reissued with a
+    /// fresh request state.
+    InputRequired(MrtrInputRequired),
+    /// All currently requested input values were accepted and type-checked.
+    Complete(MrtrCompletedInputs),
+}
+
+/// Accumulated, type-bound responses from a completed MRTR input exchange.
+#[derive(Debug, Clone)]
+pub struct MrtrCompletedInputs {
+    responses: MrtrInputResponses,
+}
+
+impl MrtrCompletedInputs {
+    /// Returns every accepted response, including values accepted in earlier
+    /// partial retries of this logical exchange.
+    #[must_use]
+    pub fn responses(&self) -> &MrtrInputResponses {
+        &self.responses
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedInputLedger {
+    kinds: BTreeMap<String, MrtrInputKind>,
+}
+
+impl ExpectedInputLedger {
+    fn from_requests(requests: &MrtrInputRequests) -> Self {
+        Self {
+            kinds: requests
+                .entries
+                .iter()
+                .map(|(key, request)| (key.clone(), request.kind()))
+                .collect(),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<MrtrInputKind> {
+        self.kinds.get(key).copied()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MrtrExchange {
+    // Only cancellation invalidates a continuation. Normal response
+    // finalization ends the old JSON-RPC request before the client can send
+    // its new-ID retry, so treating it as cancellation would make every MRTR
+    // exchange unusable.
+    owner_cancellation: McpRequestCancellation,
+    expires_at: Instant,
+    round: u8,
+    total_input_requests: usize,
+    requests: MrtrInputRequests,
+    expected: ExpectedInputLedger,
+    responses: MrtrInputResponses,
+}
+
+#[derive(Debug, Default)]
+struct MrtrExchangeState {
+    exchanges: HashMap<String, MrtrExchange>,
+}
+
+/// Process-local, one-use final MRTR request-state storage.
+///
+/// A record owns the exact key-to-response-kind ledger for the inputs it
+/// emitted. The opaque state is random, expires, cannot be replayed after a
+/// successful retry, and is invalidated when its owning request is cancelled.
+pub struct MrtrExchangeRegistry {
+    state: Mutex<MrtrExchangeState>,
+    max_states: usize,
+    max_rounds: u8,
+    max_inputs_per_round: usize,
+    max_total_input_requests: usize,
+    request_state_ttl: Duration,
+}
+
+impl MrtrExchangeRegistry {
+    /// Creates a registry with the final protocol's default bounded policy.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(MrtrExchangeState::default()),
+            max_states: DEFAULT_MAX_MRTR_REQUEST_STATES,
+            max_rounds: DEFAULT_MAX_MRTR_ROUNDS,
+            max_inputs_per_round: DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND,
+            max_total_input_requests: DEFAULT_MAX_MRTR_INPUT_REQUESTS_TOTAL,
+            request_state_ttl: DEFAULT_MRTR_REQUEST_STATE_TTL,
+        }
+    }
+
+    /// Creates a registry with caller-selected bounded limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` when a limit is zero or exceeds the final
+    /// hard ceiling.
+    pub fn with_limits(
+        max_states: usize,
+        max_rounds: u8,
+        max_inputs_per_round: usize,
+        max_total_input_requests: usize,
+        request_state_ttl: Duration,
+    ) -> McpResult<Self> {
+        if !(1..=HARD_MAX_MRTR_REQUEST_STATES).contains(&max_states)
+            || !(1..=HARD_MAX_MRTR_ROUNDS).contains(&max_rounds)
+            || !(1..=HARD_MAX_MRTR_INPUT_REQUESTS_PER_ROUND).contains(&max_inputs_per_round)
+            || !(max_inputs_per_round..=HARD_MAX_MRTR_INPUT_REQUESTS_TOTAL)
+                .contains(&max_total_input_requests)
+            || request_state_ttl.is_zero()
+            || request_state_ttl > HARD_MAX_MRTR_REQUEST_STATE_TTL
+        {
+            return Err(McpError::invalid_params(INVALID_MRTR_LIMIT_ERROR));
+        }
+
+        Ok(Self {
+            state: Mutex::new(MrtrExchangeState::default()),
+            max_states,
+            max_rounds,
+            max_inputs_per_round,
+            max_total_input_requests,
+            request_state_ttl,
+        })
+    }
+
+    /// Issues an `input_required` result bound to the owning request.
+    ///
+    /// This never sends an independent JSON-RPC request. The returned state
+    /// retains the issued request map and exact key-to-response-kind ledger for
+    /// a later retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RequestCancelled` if the owner was already cancelled,
+    /// `InvalidParams` when the map exceeds the configured round bound, or an
+    /// internal error if secure state generation fails.
+    pub fn issue(
+        &self,
+        owner_cancellation: McpRequestCancellation,
+        input_requests: MrtrInputRequests,
+    ) -> McpResult<MrtrInputRequired> {
+        self.issue_at(owner_cancellation, input_requests, Instant::now())
+    }
+
+    /// Consumes one client retry's input-response map.
+    ///
+    /// Unknown keys are inert and ignored after bounded structural admission.
+    /// Every recognized key must carry the exact response kind recorded when
+    /// it was issued. Partial maps are accepted and yield a fresh state with
+    /// only unsatisfied descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` for unknown, expired, oversized, replayed, or
+    /// wrong-kind state/input combinations, and `RequestCancelled` if the
+    /// owning request cancellation wins before completion.
+    pub fn accept(
+        &self,
+        request_state: &str,
+        input_responses: MrtrInputResponses,
+    ) -> McpResult<MrtrRetry> {
+        self.accept_at(request_state, input_responses, Instant::now())
+    }
+
+    /// Returns the number of non-expired, non-cancelled exchanges currently
+    /// retained by this process-local registry.
+    #[must_use]
+    pub fn active_len(&self) -> usize {
+        let mut state = self.lock_state();
+        Self::purge_stale(&mut state, Instant::now());
+        state.exchanges.len()
+    }
+
+    fn issue_at(
+        &self,
+        owner_cancellation: McpRequestCancellation,
+        input_requests: MrtrInputRequests,
+        now: Instant,
+    ) -> McpResult<MrtrInputRequired> {
+        if owner_cancellation.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+        if input_requests.len() > self.max_inputs_per_round {
+            return Err(McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR));
+        }
+
+        let expires_at = now
+            .checked_add(self.request_state_ttl)
+            .ok_or_else(|| McpError::internal_error(MRTR_REQUEST_STATE_UNAVAILABLE_ERROR))?;
+        let mut state = self.lock_state();
+        Self::purge_stale(&mut state, now);
+        if state.exchanges.len() >= self.max_states {
+            return Err(McpError::internal_error(MRTR_ROUND_LIMIT_ERROR));
+        }
+
+        let request_state = Self::allocate_request_state(&state)?;
+        let expected = ExpectedInputLedger::from_requests(&input_requests);
+        let input_requests = (!input_requests.is_empty()).then_some(input_requests);
+        state.exchanges.insert(
+            request_state.0.clone(),
+            MrtrExchange {
+                owner_cancellation,
+                expires_at,
+                round: 1,
+                total_input_requests: input_requests.as_ref().map_or(0, MrtrInputRequests::len),
+                expected,
+                requests: input_requests.clone().unwrap_or_default(),
+                responses: MrtrInputResponses::default(),
+            },
+        );
+        Ok(MrtrInputRequired {
+            input_requests,
+            request_state,
+        })
+    }
+
+    fn accept_at(
+        &self,
+        request_state: &str,
+        input_responses: MrtrInputResponses,
+        now: Instant,
+    ) -> McpResult<MrtrRetry> {
+        if request_state.len() > DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES {
+            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+        }
+
+        let mut state = self.lock_state();
+        let Some(exchange) = state.exchanges.get(request_state).cloned() else {
+            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+        };
+        if now >= exchange.expires_at || exchange.owner_cancellation.is_cancel_requested() {
+            state.exchanges.remove(request_state);
+            return if exchange.owner_cancellation.is_cancel_requested() {
+                Err(McpError::request_cancelled())
+            } else {
+                Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))
+            };
+        }
+
+        let mut accepted_responses = exchange.responses.clone();
+        for (key, response) in input_responses.iter() {
+            if let Some(expected_kind) = exchange.expected.get(key) {
+                if expected_kind != response.kind() {
+                    return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
+                }
+                accepted_responses
+                    .entries
+                    .entry(key.to_owned())
+                    .or_insert_with(|| response.clone());
+            }
+        }
+
+        if exchange.owner_cancellation.is_cancel_requested() {
+            state.exchanges.remove(request_state);
+            return Err(McpError::request_cancelled());
+        }
+
+        let missing_requests = exchange.requests.unresolved_after(&accepted_responses);
+        if missing_requests.is_empty() {
+            state.exchanges.remove(request_state);
+            return Ok(MrtrRetry::Complete(MrtrCompletedInputs {
+                responses: accepted_responses,
+            }));
+        }
+
+        let next_round = exchange
+            .round
+            .checked_add(1)
+            .ok_or_else(|| McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR))?;
+        let next_total = exchange
+            .total_input_requests
+            .checked_add(missing_requests.len())
+            .ok_or_else(|| McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR))?;
+        if next_round > self.max_rounds
+            || missing_requests.len() > self.max_inputs_per_round
+            || next_total > self.max_total_input_requests
+        {
+            state.exchanges.remove(request_state);
+            return Err(McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR));
+        }
+
+        // Generate the successor before consuming the current state. An RNG
+        // failure therefore leaves the original exchange intact and does not
+        // create a state/ledger gap.
+        let next_state = Self::allocate_request_state(&state)?;
+        let successor = MrtrExchange {
+            owner_cancellation: exchange.owner_cancellation,
+            expires_at: exchange.expires_at,
+            round: next_round,
+            total_input_requests: next_total,
+            expected: ExpectedInputLedger::from_requests(&missing_requests),
+            requests: missing_requests.clone(),
+            responses: accepted_responses,
+        };
+        state.exchanges.remove(request_state);
+        state.exchanges.insert(next_state.0.clone(), successor);
+
+        Ok(MrtrRetry::InputRequired(MrtrInputRequired {
+            input_requests: Some(missing_requests),
+            request_state: next_state,
+        }))
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, MrtrExchangeState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn purge_stale(state: &mut MrtrExchangeState, now: Instant) {
+        state.exchanges.retain(|_, exchange| {
+            now < exchange.expires_at && !exchange.owner_cancellation.is_cancel_requested()
+        });
+    }
+
+    fn allocate_request_state(state: &MrtrExchangeState) -> McpResult<MrtrRequestState> {
+        for _ in 0..4 {
+            let identifier = draw_security_identifier()
+                .map_err(|_| McpError::internal_error(MRTR_REQUEST_STATE_UNAVAILABLE_ERROR))?;
+            let encoded =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(identifier.as_bytes());
+            if !state.exchanges.contains_key(&encoded) {
+                return Ok(MrtrRequestState(encoded));
+            }
+        }
+        Err(McpError::internal_error(
+            MRTR_REQUEST_STATE_UNAVAILABLE_ERROR,
+        ))
+    }
+}
+
+impl std::fmt::Debug for MrtrExchangeRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MrtrExchangeRegistry")
+            .field("active_len", &self.active_len())
+            .field("max_states", &self.max_states)
+            .field("max_rounds", &self.max_rounds)
+            .field("max_inputs_per_round", &self.max_inputs_per_round)
+            .field("max_total_input_requests", &self.max_total_input_requests)
+            .finish()
+    }
+}
+
+impl Default for MrtrExchangeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -810,6 +1586,260 @@ mod tests {
     fn receive_pending(mut receiver: ResponseReceiver) -> PendingResponse {
         let cx = Cx::for_testing();
         block_on(receiver.recv(&cx)).expect("pending response channel must remain connected")
+    }
+
+    fn mrtr_state_from_wire(result: &MrtrInputRequired) -> String {
+        serde_json::to_value(result)
+            .expect("MRTR result must serialize")
+            .get("requestState")
+            .and_then(serde_json::Value::as_str)
+            .expect("MRTR result must contain opaque request state")
+            .to_owned()
+    }
+
+    fn mrtr_roots_response() -> MrtrInputResponse {
+        MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
+            .expect("roots response must serialize")
+    }
+
+    #[test]
+    fn mrtr_embeds_exact_input_maps_and_completes_with_bound_responses() {
+        let registry = MrtrExchangeRegistry::new();
+        let owner = McpRequestCancellation::new();
+        let input_requests = MrtrInputRequests::new([
+            (
+                "elicit".to_owned(),
+                MrtrInputRequest::elicitation(fastmcp_protocol::ElicitRequestParams::form(
+                    "Continue?",
+                    serde_json::json!({"type": "object"}),
+                ))
+                .expect("elicitation request must serialize"),
+            ),
+            (
+                "sample".to_owned(),
+                MrtrInputRequest::sampling(fastmcp_protocol::CreateMessageParams::new(
+                    Vec::new(),
+                    16,
+                ))
+                .expect("sampling request must serialize"),
+            ),
+            ("roots".to_owned(), MrtrInputRequest::roots()),
+        ])
+        .expect("unique MRTR input map");
+
+        let required = registry
+            .issue(owner.clone(), input_requests)
+            .expect("MRTR input result must issue");
+        assert!(
+            owner.begin_finalization(),
+            "normal original-response finalization must not cancel MRTR state"
+        );
+        let wire = serde_json::to_value(&required).expect("MRTR result must serialize");
+        assert_eq!(wire["resultType"], "input_required");
+        assert_eq!(
+            wire["inputRequests"]["elicit"]["method"],
+            "elicitation/create"
+        );
+        assert_eq!(
+            wire["inputRequests"]["sample"]["method"],
+            "sampling/createMessage"
+        );
+        assert_eq!(
+            wire["inputRequests"]["roots"],
+            serde_json::json!({"method": "roots/list"})
+        );
+        for key in ["elicit", "sample", "roots"] {
+            assert!(wire["inputRequests"][key].get("jsonrpc").is_none());
+            assert!(wire["inputRequests"][key].get("id").is_none());
+        }
+        assert!(
+            wire["inputRequests"]["sample"]["params"]
+                .get("_meta")
+                .is_none()
+        );
+
+        let request_state = mrtr_state_from_wire(&required);
+        let partial_responses = MrtrInputResponses::new([
+            (
+                "elicit".to_owned(),
+                MrtrInputResponse::elicitation(fastmcp_protocol::ElicitResult::decline())
+                    .expect("elicitation response must serialize"),
+            ),
+            ("inert-unknown-key".to_owned(), mrtr_roots_response()),
+        ])
+        .expect("unique MRTR response map");
+        let response_wire =
+            serde_json::to_value(&partial_responses).expect("MRTR responses must serialize");
+        assert_eq!(
+            response_wire["elicit"],
+            serde_json::json!({"action": "decline"})
+        );
+
+        let retry = registry
+            .accept(&request_state, partial_responses)
+            .expect("partial MRTR response map must reissue only missing inputs");
+        let MrtrRetry::InputRequired(retry) = retry else {
+            panic!("partial MRTR response map must not complete the exchange");
+        };
+        let retry_wire = serde_json::to_value(&retry).expect("retry result must serialize");
+        assert!(retry_wire["inputRequests"].get("elicit").is_none());
+        assert_eq!(
+            retry_wire["inputRequests"]["sample"]["method"],
+            "sampling/createMessage"
+        );
+        assert_eq!(
+            retry_wire["inputRequests"]["roots"],
+            serde_json::json!({"method": "roots/list"})
+        );
+        let retry_state = mrtr_state_from_wire(&retry);
+        assert_ne!(
+            retry_state, request_state,
+            "partial retry needs fresh state"
+        );
+        let old_state_error = registry
+            .accept(&request_state, MrtrInputResponses::default())
+            .expect_err("the predecessor state must not replay after partial acceptance");
+        assert_eq!(old_state_error.code, McpErrorCode::InvalidParams);
+
+        let complete = registry
+            .accept(
+                &retry_state,
+                MrtrInputResponses::new([
+                    (
+                        "sample".to_owned(),
+                        MrtrInputResponse::sampling(fastmcp_protocol::CreateMessageResult::text(
+                            "done",
+                            "test-model",
+                        ))
+                        .expect("sampling response must serialize"),
+                    ),
+                    ("roots".to_owned(), mrtr_roots_response()),
+                ])
+                .expect("unique MRTR response map"),
+            )
+            .expect("matching remaining MRTR responses must complete");
+        let MrtrRetry::Complete(complete) = complete else {
+            panic!("all matching MRTR responses must complete the exchange");
+        };
+        assert_eq!(complete.responses().len(), 3);
+        assert_eq!(
+            complete
+                .responses()
+                .get("elicit")
+                .map(MrtrInputResponse::kind),
+            Some(MrtrInputKind::Elicitation)
+        );
+        assert_eq!(
+            complete
+                .responses()
+                .get("sample")
+                .map(MrtrInputResponse::kind),
+            Some(MrtrInputKind::Sampling)
+        );
+        assert_eq!(
+            complete
+                .responses()
+                .get("roots")
+                .map(MrtrInputResponse::kind),
+            Some(MrtrInputKind::Roots)
+        );
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn mrtr_rejects_cross_kind_before_consumption_and_rejects_replay() {
+        let registry = MrtrExchangeRegistry::new();
+        let input_requests =
+            MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())])
+                .expect("unique MRTR input map");
+        let required = registry
+            .issue(McpRequestCancellation::new(), input_requests)
+            .expect("MRTR input result must issue");
+        let request_state = mrtr_state_from_wire(&required);
+
+        let wrong_kind = MrtrInputResponses::new([(
+            "roots".to_owned(),
+            MrtrInputResponse::sampling(fastmcp_protocol::CreateMessageResult::text(
+                "not roots",
+                "test-model",
+            ))
+            .expect("sampling response must serialize"),
+        )])
+        .expect("unique MRTR response map");
+        let error = registry
+            .accept(&request_state, wrong_kind)
+            .expect_err("a sampling value cannot fulfill a roots request");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            registry.active_len(),
+            1,
+            "wrong-kind input must not consume state"
+        );
+
+        let matching = MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())])
+            .expect("unique MRTR response map");
+        assert!(matches!(
+            registry.accept(&request_state, matching),
+            Ok(MrtrRetry::Complete(_))
+        ));
+        assert_eq!(registry.active_len(), 0);
+
+        let replay = registry
+            .accept(
+                &request_state,
+                MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())])
+                    .expect("unique MRTR response map"),
+            )
+            .expect_err("a consumed MRTR request state must not replay");
+        assert_eq!(replay.code, McpErrorCode::InvalidParams);
+        assert_eq!(registry.active_len(), 0, "replay must not restore state");
+    }
+
+    #[test]
+    fn mrtr_expiry_and_owning_request_cancellation_prevent_resolution() {
+        let registry = MrtrExchangeRegistry::with_limits(
+            16,
+            DEFAULT_MAX_MRTR_ROUNDS,
+            DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND,
+            DEFAULT_MAX_MRTR_INPUT_REQUESTS_TOTAL,
+            Duration::from_millis(1),
+        )
+        .expect("bounded MRTR registry");
+        let input_requests = || {
+            MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())])
+                .expect("unique MRTR input map")
+        };
+
+        let expired = registry
+            .issue(McpRequestCancellation::new(), input_requests())
+            .expect("MRTR input result must issue");
+        let expired_state = mrtr_state_from_wire(&expired);
+        let expiry_error = registry
+            .accept_at(
+                &expired_state,
+                MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())])
+                    .expect("unique MRTR response map"),
+                Instant::now() + Duration::from_millis(1),
+            )
+            .expect_err("expired state must fail before resolution");
+        assert_eq!(expiry_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(registry.active_len(), 0, "expired state must be removed");
+
+        let owner = McpRequestCancellation::new();
+        let cancelled = registry
+            .issue(owner.clone(), input_requests())
+            .expect("MRTR input result must issue");
+        let cancelled_state = mrtr_state_from_wire(&cancelled);
+        assert!(owner.cancel());
+        let cancellation_error = registry
+            .accept(
+                &cancelled_state,
+                MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())])
+                    .expect("unique MRTR response map"),
+            )
+            .expect_err("owner cancellation must win before MRTR resolution");
+        assert_eq!(cancellation_error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(registry.active_len(), 0, "cancelled state must be removed");
     }
 
     #[test]
