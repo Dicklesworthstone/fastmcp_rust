@@ -2539,8 +2539,8 @@ mod tests {
         ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse,
         LegacySseHttpClientError, MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS,
         ModernHttpClientError, ModernHttpExecutorError, ModernHttpResponseKind,
-        ModernHttpSubscriptionListenError, decode_modern_discovery_response,
-        validate_response_head,
+        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
+        decode_modern_discovery_response, validate_response_head,
     };
     use crate::sse::SseLimits;
     use crate::{CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ProtocolEra, ProtocolPolicy};
