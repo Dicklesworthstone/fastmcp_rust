@@ -259,7 +259,7 @@ impl ModernHttpResponseStream {
                     });
                 }
                 Err(ModernHttpExecutorError::Cancelled) => {
-                    return Err(ModernHttpSubscriptionListenError::Cancelled {
+                    return Err(ModernHttpSubscriptionListenError::CallerCancelled {
                         request_id: request_id.clone(),
                     });
                 }
@@ -554,6 +554,8 @@ pub enum ModernHttpSubscriptionListenError {
         /// The request ID carried by the cancellation notification.
         actual: RequestId,
     },
+    /// The caller cancelled this request-owned listener context.
+    CallerCancelled { request_id: RequestId },
     /// The server cancelled this request-owned listener.
     Cancelled { request_id: RequestId },
     /// The SSE stream reached EOF without a complete terminal result.
@@ -630,6 +632,10 @@ impl fmt::Display for ModernHttpSubscriptionListenError {
                 formatter,
                 "subscriptions/listen cancellation ID {actual:?} did not match request {expected:?}"
             ),
+            Self::CallerCancelled { request_id } => write!(
+                formatter,
+                "subscriptions/listen request {request_id:?} was cancelled by the caller"
+            ),
             Self::Cancelled { request_id } => write!(
                 formatter,
                 "subscriptions/listen request {request_id:?} was cancelled by the server"
@@ -665,6 +671,7 @@ impl std::error::Error for ModernHttpSubscriptionListenError {
             | Self::EventBeforeAcknowledgement
             | Self::EventOutsideAcceptedFilter
             | Self::CancellationIdMismatch { .. }
+            | Self::CallerCancelled { .. }
             | Self::Cancelled { .. }
             | Self::EndOfStream { .. } => None,
         }
