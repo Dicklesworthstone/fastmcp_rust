@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration as StdDuration, Instant};
 
 #[cfg(test)]
 use asupersync::Budget;
@@ -847,6 +848,634 @@ fn notify_snapshot(
         "notifications/tasks/status",
         Some(payload),
     ));
+}
+
+// ============================================================================
+// MCP Tasks extension lifecycle (2026-07-28)
+// ============================================================================
+
+/// The only storage boundary implemented by [`OfficialTaskLifecycle`].
+///
+/// This is deliberately process-local. It makes no persistence, recovery,
+/// multi-instance, tenant-isolation, or server-capability claim. The modern
+/// router must keep the extension unadvertised until the Task wire model,
+/// authenticated durable backend, and application-owned supervisor have been
+/// installed together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskStorageKind {
+    /// Bounded process memory, lost when the process exits.
+    ProcessLocal,
+}
+
+/// Public task status for the official `io.modelcontextprotocol/tasks`
+/// extension.
+///
+/// Private execution phases such as `queued`, `claimed`, or `leased` are not
+/// represented here and therefore cannot leak into a wire task snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum OfficialTaskStatus {
+    /// Work has been accepted and may be executing.
+    #[serde(rename = "working")]
+    Working,
+    /// The task cannot proceed until all exposed input requests are answered.
+    #[serde(rename = "input_required")]
+    InputRequired,
+    /// The underlying operation produced its final result.
+    #[serde(rename = "completed")]
+    Completed,
+    /// The underlying operation ended in a JSON-RPC execution error.
+    #[serde(rename = "failed")]
+    Failed,
+    /// The task worker honored a cooperative cancellation request.
+    #[serde(rename = "cancelled")]
+    Cancelled,
+}
+
+impl OfficialTaskStatus {
+    #[must_use]
+    fn is_terminal(self) -> bool {
+        matches!(Self::Completed | Self::Failed | Self::Cancelled, self)
+    }
+}
+
+/// A task-owned embedded request that needs a response from the client.
+///
+/// The final protocol types for these descriptors are owned by TASK-01 and
+/// MRTR. Keeping the method separate from its parameters prevents an old
+/// JSON-RPC envelope from becoming execution or correlation authority here.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct OfficialTaskInputRequest {
+    /// The supported server-to-client request method.
+    pub method: OfficialTaskInputMethod,
+    /// Method parameters, to be validated by the TASK-01/MRTR integration.
+    pub params: serde_json::Value,
+}
+
+/// The only embedded request kinds admitted by the process-local lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum OfficialTaskInputMethod {
+    /// An elicitation input request.
+    #[serde(rename = "elicitation/create")]
+    ElicitationCreate,
+    /// A sampling input request.
+    #[serde(rename = "sampling/createMessage")]
+    SamplingCreateMessage,
+}
+
+/// Process-local lifecycle configuration.
+///
+/// A finite positive TTL is required because this implementation has no
+/// durable, authorized reclamation path for retained/null-TTL records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OfficialTaskLifecycleConfig {
+    ttl_ms: NonZeroU64,
+    poll_interval_ms: Option<NonZeroU64>,
+    max_tasks: NonZeroUsize,
+}
+
+impl OfficialTaskLifecycleConfig {
+    /// Creates a bounded process-local lifecycle configuration.
+    pub(crate) fn new(
+        ttl_ms: u64,
+        poll_interval_ms: Option<u64>,
+        max_tasks: usize,
+    ) -> McpResult<Self> {
+        let ttl_ms = NonZeroU64::new(ttl_ms)
+            .ok_or_else(|| McpError::invalid_params("Task TTL must be a positive integer"))?;
+        let poll_interval_ms = match poll_interval_ms {
+            Some(poll_interval_ms) => Some(NonZeroU64::new(poll_interval_ms).ok_or_else(|| {
+                McpError::invalid_params("Task poll interval must be a positive integer")
+            })?),
+            None => None,
+        };
+        let max_tasks = NonZeroUsize::new(max_tasks)
+            .ok_or_else(|| McpError::invalid_params("Task capacity must be positive"))?;
+
+        Ok(Self {
+            ttl_ms,
+            poll_interval_ms,
+            max_tasks,
+        })
+    }
+}
+
+/// The status-discriminated task shape returned to an eventual Tasks router.
+///
+/// It intentionally has no storage or owner fields. Authorization, durable
+/// retention, and wire validation are integration responsibilities; callers
+/// must not serialize this private primitive directly as a protocol response.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct OfficialTaskSnapshot {
+    /// Server-generated opaque task identifier.
+    #[serde(rename = "taskId")]
+    pub task_id: TaskId,
+    /// Official extension task status.
+    pub status: OfficialTaskStatus,
+    /// Bounded human-readable status text supplied by the application layer.
+    #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    /// Creation timestamp in canonical UTC millisecond form.
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    /// Timestamp of the latest visible state change.
+    #[serde(rename = "lastUpdatedAt")]
+    pub last_updated_at: String,
+    /// Finite local retention period; an eventual wire layer renders this as
+    /// the extension's required `ttlMs` field.
+    #[serde(rename = "ttlMs")]
+    pub ttl_ms: u64,
+    /// Suggested polling interval when configured.
+    #[serde(rename = "pollIntervalMs", skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<u64>,
+    /// Requests still awaiting client input, present only while input is
+    /// required.
+    #[serde(rename = "inputRequests", skip_serializing_if = "Option::is_none")]
+    pub input_requests: Option<BTreeMap<String, OfficialTaskInputRequest>>,
+    /// The final underlying result, present only on successful completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// The final JSON-RPC error, present only on execution failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
+}
+
+/// Outcome of accepting input responses for a known task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OfficialTaskInputUpdate {
+    /// At least one outstanding request was satisfied.
+    Applied,
+    /// Every supplied key was unknown or had already been satisfied.
+    Ignored,
+}
+
+struct OfficialTaskRecord {
+    snapshot: OfficialTaskSnapshot,
+    /// Process-local retention backstop. A durable backend owns the
+    /// authoritative time source in the eventual persistent implementation.
+    expires_at: Instant,
+    /// Monotonic local ordering when the rendered wall-clock timestamps are
+    /// equal. It is private and never a wire field.
+    update_revision: u64,
+    /// Lifetime ledger that prevents input-key reuse after satisfaction.
+    issued_input_keys: BTreeSet<String>,
+    /// Cooperative cancellation intent. A worker may complete first.
+    cancellation_requested: bool,
+}
+
+/// Bounded, process-local official Tasks lifecycle state.
+///
+/// This is a real status machine, but it deliberately does not execute
+/// handlers, create a runtime, own a task region, or persist records. Those
+/// actions require the application-owned supervisor and qualified backend
+/// defined by TASK-02. It is not a server capability and must remain
+/// unadvertised until that integration exists.
+pub(crate) struct OfficialTaskLifecycle {
+    config: OfficialTaskLifecycleConfig,
+    records: RwLock<HashMap<TaskId, OfficialTaskRecord>>,
+}
+
+impl OfficialTaskLifecycle {
+    /// Creates an empty process-local lifecycle.
+    #[must_use]
+    pub(crate) fn new(config: OfficialTaskLifecycleConfig) -> Self {
+        Self {
+            config,
+            records: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Identifies the deliberately non-durable storage boundary.
+    #[must_use]
+    pub(crate) const fn storage_kind(&self) -> TaskStorageKind {
+        TaskStorageKind::ProcessLocal
+    }
+
+    /// Creates a task in its immediately readable `working` state.
+    ///
+    /// The ID is a fresh 256-bit OS-CSPRNG draw encoded as 43 unpadded
+    /// base64url bytes. It is retried on the astronomically unlikely local
+    /// collision, and no record is overwritten.
+    pub(crate) fn create(&self, status_message: Option<String>) -> McpResult<OfficialTaskSnapshot> {
+        let expires_at = Instant::now()
+            .checked_add(StdDuration::from_millis(self.config.ttl_ms.get()))
+            .ok_or_else(|| {
+                McpError::internal_error("Task TTL exceeds process-local clock range")
+            })?;
+        let mut records = self.records.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "official task lifecycle lock poisoned in create, recovering");
+            poisoned.into_inner()
+        });
+        let now = Instant::now();
+        records.retain(|_, record| record.expires_at > now);
+        if records.len() >= self.config.max_tasks.get() {
+            return Err(McpError::internal_error(
+                "Process-local task lifecycle capacity is exhausted",
+            ));
+        }
+
+        for _ in 0..4 {
+            let task_id = generate_official_task_id()?;
+            if records.contains_key(&task_id) {
+                continue;
+            }
+
+            let now = official_task_timestamp();
+            let snapshot = OfficialTaskSnapshot {
+                task_id: task_id.clone(),
+                status: OfficialTaskStatus::Working,
+                status_message,
+                created_at: now.clone(),
+                last_updated_at: now,
+                ttl_ms: self.config.ttl_ms.get(),
+                poll_interval_ms: self.config.poll_interval_ms.map(NonZeroU64::get),
+                input_requests: None,
+                result: None,
+                error: None,
+            };
+            records.insert(
+                task_id,
+                OfficialTaskRecord {
+                    snapshot: snapshot.clone(),
+                    expires_at,
+                    update_revision: 0,
+                    issued_input_keys: BTreeSet::new(),
+                    cancellation_requested: false,
+                },
+            );
+            return Ok(snapshot);
+        }
+
+        Err(McpError::internal_error(
+            "Unable to allocate a unique task identifier after four secure draws",
+        ))
+    }
+
+    /// Returns the current snapshot for an immediately readable task.
+    pub(crate) fn get(&self, task_id: &TaskId) -> McpResult<OfficialTaskSnapshot> {
+        let mut records = self.records.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "official task lifecycle lock poisoned in get, recovering");
+            poisoned.into_inner()
+        });
+        Ok(official_task_record_mut(&mut records, task_id)?
+            .snapshot
+            .clone())
+    }
+
+    /// Places a working task into `input_required` with a complete outstanding
+    /// input map. Keys are unique over the task lifetime.
+    pub(crate) fn require_input(
+        &self,
+        task_id: &TaskId,
+        requests: BTreeMap<String, OfficialTaskInputRequest>,
+        status_message: Option<String>,
+    ) -> McpResult<OfficialTaskSnapshot> {
+        if requests.is_empty() {
+            return Err(McpError::invalid_params(
+                "input_required tasks need at least one outstanding input request",
+            ));
+        }
+        for (key, request) in &requests {
+            validate_official_task_input_request(key, request)?;
+        }
+
+        let mut records = self.records.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "official task lifecycle lock poisoned in require_input, recovering");
+            poisoned.into_inner()
+        });
+        let record = official_task_record_mut(&mut records, task_id)?;
+        if record.snapshot.status != OfficialTaskStatus::Working {
+            return Err(invalid_official_task_transition(
+                record.snapshot.status,
+                OfficialTaskStatus::InputRequired,
+            ));
+        }
+        if requests
+            .keys()
+            .any(|key| record.issued_input_keys.contains(key))
+        {
+            return Err(McpError::invalid_params(
+                "Task input request keys cannot be reused",
+            ));
+        }
+
+        advance_official_task(record, OfficialTaskStatus::InputRequired)?;
+        record.issued_input_keys.extend(requests.keys().cloned());
+        record.snapshot.status_message = status_message;
+        record.snapshot.input_requests = Some(requests);
+        record.snapshot.result = None;
+        record.snapshot.error = None;
+        Ok(record.snapshot.clone())
+    }
+
+    /// Accepts a strict subset of outstanding input responses.
+    ///
+    /// Unknown and already-satisfied keys are ignored. The task returns to
+    /// `working` only after its final outstanding input is satisfied.
+    pub(crate) fn update_input(
+        &self,
+        task_id: &TaskId,
+        responses: BTreeMap<String, serde_json::Value>,
+    ) -> McpResult<OfficialTaskInputUpdate> {
+        let mut records = self.records.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "official task lifecycle lock poisoned in update_input, recovering");
+            poisoned.into_inner()
+        });
+        let record = official_task_record_mut(&mut records, task_id)?;
+        let all_inputs_satisfied = {
+            let Some(outstanding) = record.snapshot.input_requests.as_mut() else {
+                return Ok(OfficialTaskInputUpdate::Ignored);
+            };
+
+            let matched_keys: Vec<String> = responses
+                .keys()
+                .filter(|key| outstanding.contains_key(*key))
+                .cloned()
+                .collect();
+            if matched_keys.is_empty() {
+                return Ok(OfficialTaskInputUpdate::Ignored);
+            }
+
+            for key in matched_keys {
+                outstanding.remove(&key);
+            }
+            outstanding.is_empty()
+        };
+        if all_inputs_satisfied {
+            advance_official_task(record, OfficialTaskStatus::Working)?;
+            record.snapshot.input_requests = None;
+            record.snapshot.status_message = None;
+        } else {
+            touch_official_task(record)?;
+        }
+        Ok(OfficialTaskInputUpdate::Applied)
+    }
+
+    /// Records cooperative cancellation intent without making a premature
+    /// terminal-state claim. The worker may still commit completion first.
+    pub(crate) fn request_cancellation(&self, task_id: &TaskId) -> McpResult<()> {
+        let mut records = self.records.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "official task lifecycle lock poisoned in request_cancellation, recovering");
+            poisoned.into_inner()
+        });
+        let record = official_task_record_mut(&mut records, task_id)?;
+        record.cancellation_requested = true;
+        Ok(())
+    }
+
+    /// Returns whether cancellation intent is still pending for a nonterminal
+    /// task. This is private execution state, not a wire task field.
+    #[must_use]
+    pub(crate) fn is_cancellation_requested(&self, task_id: &TaskId) -> bool {
+        let mut records = self.records.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "official task lifecycle lock poisoned in is_cancellation_requested, recovering");
+            poisoned.into_inner()
+        });
+        official_task_record_mut(&mut records, task_id).is_ok_and(|record| {
+            record.cancellation_requested && !record.snapshot.status.is_terminal()
+        })
+    }
+
+    /// Lets the supervised worker honor a cancellation request.
+    pub(crate) fn honor_cancellation(
+        &self,
+        task_id: &TaskId,
+        status_message: Option<String>,
+    ) -> McpResult<OfficialTaskSnapshot> {
+        let mut records = self.records.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "official task lifecycle lock poisoned in honour_cancellation, recovering");
+            poisoned.into_inner()
+        });
+        let record = official_task_record_mut(&mut records, task_id)?;
+        if !record.cancellation_requested {
+            return Err(McpError::invalid_params(
+                "Task cancellation has not been requested",
+            ));
+        }
+        transition_to_terminal(
+            record,
+            OfficialTaskStatus::Cancelled,
+            status_message,
+            None,
+            None,
+        )
+    }
+
+    /// Commits a validated final tool result to a working task.
+    pub(crate) fn complete(
+        &self,
+        task_id: &TaskId,
+        result: serde_json::Value,
+        status_message: Option<String>,
+    ) -> McpResult<OfficialTaskSnapshot> {
+        validate_final_tool_result(&result)?;
+        let mut records = self.records.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "official task lifecycle lock poisoned in complete, recovering");
+            poisoned.into_inner()
+        });
+        let record = official_task_record_mut(&mut records, task_id)?;
+        transition_to_terminal(
+            record,
+            OfficialTaskStatus::Completed,
+            status_message,
+            Some(result),
+            None,
+        )
+    }
+
+    /// Commits a JSON-RPC execution error to an active task.
+    pub(crate) fn fail(
+        &self,
+        task_id: &TaskId,
+        error: serde_json::Value,
+        status_message: Option<String>,
+    ) -> McpResult<OfficialTaskSnapshot> {
+        validate_json_rpc_error(&error)?;
+        let mut records = self.records.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "official task lifecycle lock poisoned in fail, recovering");
+            poisoned.into_inner()
+        });
+        let record = official_task_record_mut(&mut records, task_id)?;
+        let status_message = status_message.or_else(|| Some("Task execution failed".to_string()));
+        transition_to_terminal(
+            record,
+            OfficialTaskStatus::Failed,
+            status_message,
+            None,
+            Some(error),
+        )
+    }
+}
+
+fn generate_official_task_id() -> McpResult<TaskId> {
+    let identifier = draw_security_identifier().map_err(|error| {
+        McpError::internal_error(format!("Task identifier generation failed: {error}"))
+    })?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(identifier.as_bytes());
+    debug_assert_eq!(
+        encoded.len(),
+        43,
+        "a 256-bit task ID must be 43 base64url bytes"
+    );
+    Ok(TaskId::from_string(encoded))
+}
+
+fn official_task_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn official_task_record_mut<'a>(
+    records: &'a mut HashMap<TaskId, OfficialTaskRecord>,
+    task_id: &TaskId,
+) -> McpResult<&'a mut OfficialTaskRecord> {
+    let expired = records
+        .get(task_id)
+        .is_some_and(|record| record.expires_at <= Instant::now());
+    if expired {
+        records.remove(task_id);
+    }
+    records
+        .get_mut(task_id)
+        .ok_or_else(|| McpError::invalid_params("Task not found"))
+}
+
+fn can_transition_official_task(from: OfficialTaskStatus, to: OfficialTaskStatus) -> bool {
+    matches!(
+        (from, to),
+        (
+            OfficialTaskStatus::Working,
+            OfficialTaskStatus::InputRequired
+        ) | (OfficialTaskStatus::Working, OfficialTaskStatus::Completed)
+            | (OfficialTaskStatus::Working, OfficialTaskStatus::Failed)
+            | (OfficialTaskStatus::Working, OfficialTaskStatus::Cancelled)
+            | (
+                OfficialTaskStatus::InputRequired,
+                OfficialTaskStatus::Working
+            )
+            | (
+                OfficialTaskStatus::InputRequired,
+                OfficialTaskStatus::Failed
+            )
+            | (
+                OfficialTaskStatus::InputRequired,
+                OfficialTaskStatus::Cancelled
+            )
+    )
+}
+
+fn invalid_official_task_transition(from: OfficialTaskStatus, to: OfficialTaskStatus) -> McpError {
+    McpError::invalid_params(format!(
+        "Invalid official task transition from {from:?} to {to:?}"
+    ))
+}
+
+fn touch_official_task(record: &mut OfficialTaskRecord) -> McpResult<()> {
+    record.update_revision = record
+        .update_revision
+        .checked_add(1)
+        .ok_or_else(|| McpError::internal_error("Task update revision exhausted"))?;
+    record.snapshot.last_updated_at = official_task_timestamp();
+    Ok(())
+}
+
+fn advance_official_task(
+    record: &mut OfficialTaskRecord,
+    status: OfficialTaskStatus,
+) -> McpResult<()> {
+    if !can_transition_official_task(record.snapshot.status, status) {
+        return Err(invalid_official_task_transition(
+            record.snapshot.status,
+            status,
+        ));
+    }
+    touch_official_task(record)?;
+    record.snapshot.status = status;
+    Ok(())
+}
+
+fn transition_to_terminal(
+    record: &mut OfficialTaskRecord,
+    status: OfficialTaskStatus,
+    status_message: Option<String>,
+    result: Option<serde_json::Value>,
+    error: Option<serde_json::Value>,
+) -> McpResult<OfficialTaskSnapshot> {
+    debug_assert!(status.is_terminal());
+    advance_official_task(record, status)?;
+    record.snapshot.status_message = status_message;
+    record.snapshot.input_requests = None;
+    record.snapshot.result = result;
+    record.snapshot.error = error;
+    Ok(record.snapshot.clone())
+}
+
+fn validate_official_task_input_request(
+    key: &str,
+    request: &OfficialTaskInputRequest,
+) -> McpResult<()> {
+    if key.is_empty() || key.len() > 256 {
+        return Err(McpError::invalid_params(
+            "Task input request keys must be non-empty and at most 256 bytes",
+        ));
+    }
+    if !request.params.is_object() {
+        return Err(McpError::invalid_params(
+            "Task input request parameters must be an object",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_final_tool_result(result: &serde_json::Value) -> McpResult<()> {
+    let result = result
+        .as_object()
+        .ok_or_else(|| McpError::invalid_params("Completed task result must be an object"))?;
+    if result.get("resultType") != Some(&serde_json::Value::String("complete".to_string())) {
+        return Err(McpError::invalid_params(
+            "Completed task result must be a final complete result",
+        ));
+    }
+    if !result
+        .get("content")
+        .is_some_and(serde_json::Value::is_array)
+    {
+        return Err(McpError::invalid_params(
+            "Completed task result must contain tool content",
+        ));
+    }
+    if result
+        .get("isError")
+        .is_some_and(|is_error| !is_error.is_boolean())
+    {
+        return Err(McpError::invalid_params(
+            "Completed task isError must be a boolean when present",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
+    let error = error
+        .as_object()
+        .ok_or_else(|| McpError::invalid_params("Failed task error must be an object"))?;
+    let Some(code) = error.get("code") else {
+        return Err(McpError::invalid_params(
+            "Failed task error must include a JSON-RPC code",
+        ));
+    };
+    if !code.is_i64() {
+        return Err(McpError::invalid_params(
+            "Failed task error code must be an integer",
+        ));
+    }
+    if !error
+        .get("message")
+        .is_some_and(serde_json::Value::is_string)
+    {
+        return Err(McpError::invalid_params(
+            "Failed task error must include a message",
+        ));
+    }
+    Ok(())
 }
 
 impl Default for TaskManager {
@@ -2307,5 +2936,202 @@ mod tests {
         manager.update_progress(&id, 0.5, None);
         manager.complete_task(&id, serde_json::json!({}));
         assert_eq!(manager.get_info(&id).unwrap().status, TaskStatus::Completed);
+    }
+
+    fn official_task_lifecycle() -> OfficialTaskLifecycle {
+        OfficialTaskLifecycle::new(
+            OfficialTaskLifecycleConfig::new(60_000, Some(5_000), 8)
+                .expect("valid bounded lifecycle configuration"),
+        )
+    }
+
+    fn task_input_request() -> OfficialTaskInputRequest {
+        OfficialTaskInputRequest {
+            method: OfficialTaskInputMethod::ElicitationCreate,
+            params: serde_json::json!({"message": "Approve the operation?"}),
+        }
+    }
+
+    fn final_tool_result() -> serde_json::Value {
+        serde_json::json!({
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "done"}],
+        })
+    }
+
+    #[test]
+    fn task_02_a_positive() {
+        let lifecycle = official_task_lifecycle();
+        assert_eq!(lifecycle.storage_kind(), TaskStorageKind::ProcessLocal);
+
+        let created = lifecycle
+            .create(None)
+            .expect("create immediately readable task");
+        assert_eq!(created.status, OfficialTaskStatus::Working);
+        assert_eq!(created.ttl_ms, 60_000);
+        assert_eq!(created.poll_interval_ms, Some(5_000));
+        assert_eq!(created.task_id.as_str().len(), 43);
+        assert!(
+            created
+                .task_id
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "local task IDs must use canonical unpadded base64url"
+        );
+        assert_eq!(
+            lifecycle
+                .get(&created.task_id)
+                .expect("created task lookup"),
+            created
+        );
+
+        let mut requests = BTreeMap::new();
+        requests.insert("approval".to_string(), task_input_request());
+        requests.insert("details".to_string(), task_input_request());
+        let waiting = lifecycle
+            .require_input(&created.task_id, requests, None)
+            .expect("working task enters input_required");
+        assert_eq!(waiting.status, OfficialTaskStatus::InputRequired);
+        assert_eq!(waiting.input_requests.as_ref().map(BTreeMap::len), Some(2));
+
+        let mut first_response = BTreeMap::new();
+        first_response.insert(
+            "approval".to_string(),
+            serde_json::json!({"approved": true}),
+        );
+        assert_eq!(
+            lifecycle
+                .update_input(&created.task_id, first_response)
+                .expect("partial update"),
+            OfficialTaskInputUpdate::Applied
+        );
+        let partially_satisfied = lifecycle.get(&created.task_id).expect("task lookup");
+        assert_eq!(
+            partially_satisfied.status,
+            OfficialTaskStatus::InputRequired
+        );
+        assert_eq!(
+            partially_satisfied
+                .input_requests
+                .as_ref()
+                .map(BTreeMap::len),
+            Some(1)
+        );
+
+        let mut final_response = BTreeMap::new();
+        final_response.insert("details".to_string(), serde_json::json!({"accepted": true}));
+        assert_eq!(
+            lifecycle
+                .update_input(&created.task_id, final_response)
+                .expect("final input update"),
+            OfficialTaskInputUpdate::Applied
+        );
+        assert_eq!(
+            lifecycle
+                .get(&created.task_id)
+                .expect("resumed task")
+                .status,
+            OfficialTaskStatus::Working
+        );
+
+        let completed = lifecycle
+            .complete(
+                &created.task_id,
+                final_tool_result(),
+                Some("Completed".to_string()),
+            )
+            .expect("complete after all input is satisfied");
+        assert_eq!(completed.status, OfficialTaskStatus::Completed);
+        assert_eq!(completed.result, Some(final_tool_result()));
+        assert!(completed.input_requests.is_none());
+        assert!(completed.error.is_none());
+
+        let failed = lifecycle.create(None).expect("create task to fail");
+        let failed = lifecycle
+            .fail(
+                &failed.task_id,
+                serde_json::json!({"code": -32603, "message": "Execution failed"}),
+                None,
+            )
+            .expect("working task records a JSON-RPC failure");
+        assert_eq!(failed.status, OfficialTaskStatus::Failed);
+        assert_eq!(
+            failed.status_message.as_deref(),
+            Some("Task execution failed"),
+            "the safe failure message is not copied from raw error data"
+        );
+        assert!(failed.result.is_none());
+        assert!(failed.error.is_some());
+
+        let cancelled = lifecycle.create(None).expect("create task to cancel");
+        lifecycle
+            .request_cancellation(&cancelled.task_id)
+            .expect("cooperative cancellation acknowledgement");
+        assert!(lifecycle.is_cancellation_requested(&cancelled.task_id));
+        let cancelled = lifecycle
+            .honor_cancellation(&cancelled.task_id, Some("Cancelled".to_string()))
+            .expect("supervised worker honors cancellation");
+        assert_eq!(cancelled.status, OfficialTaskStatus::Cancelled);
+        assert!(
+            lifecycle
+                .complete(&cancelled.task_id, final_tool_result(), None)
+                .is_err(),
+            "terminal task states are immutable"
+        );
+        assert_eq!(
+            lifecycle
+                .get(&cancelled.task_id)
+                .expect("cancelled task lookup")
+                .status,
+            OfficialTaskStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn task_02_a_planted_negative() {
+        let lifecycle = official_task_lifecycle();
+        let created = lifecycle.create(None).expect("create task");
+        let mut requests = BTreeMap::new();
+        requests.insert("approval".to_string(), task_input_request());
+        requests.insert("details".to_string(), task_input_request());
+        lifecycle
+            .require_input(&created.task_id, requests, None)
+            .expect("task awaits the same inputs as the positive case");
+        let before = serde_json::to_vec(
+            &lifecycle
+                .get(&created.task_id)
+                .expect("task snapshot before planted input"),
+        )
+        .expect("serialize stable snapshot");
+
+        // The only changed dimension from the accepted update is the request
+        // key: this key was never issued and must be a no-op.
+        let mut planted_unknown_response = BTreeMap::new();
+        planted_unknown_response.insert(
+            "not-approval".to_string(),
+            serde_json::json!({"approved": true}),
+        );
+        assert_eq!(
+            lifecycle
+                .update_input(&created.task_id, planted_unknown_response)
+                .expect("known task ignores an unknown input key"),
+            OfficialTaskInputUpdate::Ignored
+        );
+        let after = serde_json::to_vec(
+            &lifecycle
+                .get(&created.task_id)
+                .expect("task snapshot after planted input"),
+        )
+        .expect("serialize stable snapshot");
+
+        assert_eq!(after, before, "unknown input must not mutate task state");
+        assert_eq!(
+            lifecycle
+                .get(&created.task_id)
+                .expect("task remains readable")
+                .status,
+            OfficialTaskStatus::InputRequired
+        );
     }
 }
