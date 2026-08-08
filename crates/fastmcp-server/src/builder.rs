@@ -7,7 +7,7 @@ use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
 use fastmcp_core::McpResult;
 use fastmcp_protocol::{
-    LoggingCapability, PromptsCapability, ResourceTemplate, ResourcesCapability,
+    LoggingCapability, PromptsCapability, ProtocolPolicy, ResourceTemplate, ResourcesCapability,
     ServerCapabilities, ServerInfo, ToolsCapability,
 };
 use log::{Level, LevelFilter};
@@ -55,6 +55,8 @@ pub struct ServerBuilder {
     strict_input_validation: bool,
     /// Per-connection ceiling for concurrent server-to-client requests.
     max_bidirectional_requests_per_connection: usize,
+    /// Immutable protocol-era admission policy for live stdio/runtime connections.
+    protocol_policy: ProtocolPolicy,
     /// Reserved HTTP configuration for the future qualified listener.
     http_config: HttpServerConfig,
 }
@@ -96,6 +98,7 @@ impl ServerBuilder {
             strict_input_validation: false,
             max_bidirectional_requests_per_connection:
                 crate::bidirectional::DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+            protocol_policy: ProtocolPolicy::Auto,
             http_config: HttpServerConfig::default(),
         }
     }
@@ -287,6 +290,17 @@ impl ServerBuilder {
     #[must_use]
     pub fn is_strict_input_validation_enabled(&self) -> bool {
         self.strict_input_validation
+    }
+
+    /// Selects the immutable MCP protocol-era policy for live stdio and runtime connections.
+    ///
+    /// The default [`ProtocolPolicy::Auto`] classifies the first accepted opening frame and then
+    /// pins that connection to its selected era. `ModernOnly` and `LegacyOnly` reject an opening
+    /// frame from the other exact supported era before it can enter request dispatch.
+    #[must_use]
+    pub fn protocol_policy(mut self, policy: ProtocolPolicy) -> Self {
+        self.protocol_policy = policy;
+        self
     }
 
     /// Sets configuration reserved for the future qualified HTTP path.
@@ -1147,6 +1161,7 @@ impl ServerBuilder {
             task_manager: self.task_manager,
             max_bidirectional_requests_per_connection: self
                 .max_bidirectional_requests_per_connection,
+            protocol_policy: self.protocol_policy,
             http_config: self.http_config,
         }
     }
@@ -1477,6 +1492,13 @@ mod tests {
     fn builder_default_strict_validation_disabled() {
         let builder = ServerBuilder::new("srv", "1.0");
         assert!(!builder.is_strict_input_validation_enabled());
+    }
+
+    #[test]
+    fn builder_protocol_policy_defaults_to_auto() {
+        let server = ServerBuilder::new("srv", "1.0").build();
+
+        assert_eq!(server.protocol_policy(), ProtocolPolicy::Auto);
     }
 
     // ── Fluent API setters ───────────────────────────────────────────

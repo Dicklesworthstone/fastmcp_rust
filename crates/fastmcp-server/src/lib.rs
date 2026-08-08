@@ -1080,6 +1080,8 @@ pub struct Server {
     task_manager: Option<SharedTaskManager>,
     /// Per-connection ceiling for pending server-to-client requests.
     max_bidirectional_requests_per_connection: usize,
+    /// Immutable protocol-era admission policy selected by [`ServerBuilder`].
+    protocol_policy: ProtocolPolicy,
     /// Reserved HTTP configuration; public `run_http*` paths currently reject.
     http_config: HttpServerConfig,
 }
@@ -1111,6 +1113,12 @@ impl Server {
     #[must_use]
     pub fn capabilities(&self) -> &ServerCapabilities {
         &self.capabilities
+    }
+
+    /// Returns the immutable protocol-era policy selected by the builder.
+    #[must_use]
+    pub const fn protocol_policy(&self) -> ProtocolPolicy {
+        self.protocol_policy
     }
 
     /// Returns the final discovery result for this constructed server.
@@ -2664,7 +2672,7 @@ impl Server {
                         InboundRequestTransport::Stdio,
                     );
                     let response = worker_server.dispatch_with_protocol_policy(
-                        ProtocolPolicy::ModernOnly,
+                        worker_server.protocol_policy,
                         &inbound,
                         &request,
                     );
@@ -2743,7 +2751,7 @@ impl Server {
             }
         });
 
-        let mut era_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let mut era_classifier = StdioEraClassifier::new(server.protocol_policy);
         let mut negotiated_era = None;
         let mut exit_code = 0;
         'receive: loop {
@@ -3119,7 +3127,7 @@ impl Server {
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let mut session = Session::new(self.info.clone(), self.capabilities.clone());
-        let mut era_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let mut era_classifier = StdioEraClassifier::new(self.protocol_policy);
         let mut negotiated_era = None;
 
         // Wrap send in Arc<Mutex> for shared access from bidirectional requests
@@ -3308,12 +3316,8 @@ impl Server {
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                         );
-                        self.dispatch_with_protocol_policy(
-                            ProtocolPolicy::ModernOnly,
-                            &inbound,
-                            &request,
-                        )
-                        .map(HandledRequest::untracked)
+                        self.dispatch_with_protocol_policy(self.protocol_policy, &inbound, &request)
+                            .map(HandledRequest::untracked)
                     } else {
                         self.handle_request_internal(
                             cx,
@@ -3409,7 +3413,7 @@ impl Server {
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let mut session = Session::new(self.info.clone(), self.capabilities.clone());
-        let mut era_classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let mut era_classifier = StdioEraClassifier::new(self.protocol_policy);
         let mut negotiated_era = None;
 
         // Wrap send in Arc<Mutex> for shared access from bidirectional requests
@@ -3638,12 +3642,8 @@ impl Server {
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                         );
-                        self.dispatch_with_protocol_policy(
-                            ProtocolPolicy::ModernOnly,
-                            &inbound,
-                            &request,
-                        )
-                        .map(HandledRequest::untracked)
+                        self.dispatch_with_protocol_policy(self.protocol_policy, &inbound, &request)
+                            .map(HandledRequest::untracked)
                     } else {
                         self.handle_request_internal(
                             cx,
@@ -8545,6 +8545,24 @@ mod lib_unit_tests {
         close_calls: Arc<AtomicUsize>,
     }
 
+    struct ProtocolPolicyProbeTransport {
+        next: Option<JsonRpcMessage>,
+        sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
+        receive_calls: Arc<AtomicUsize>,
+    }
+
+    fn modern_discovery_opening_request() -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(serde_json::json!({
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                },
+            })),
+            905_i64,
+        ))
+    }
+
     struct CancelledNotificationTransport;
 
     impl Transport for CancelledNotificationTransport {
@@ -8745,6 +8763,103 @@ mod lib_unit_tests {
                 Ok(())
             }
         }
+    }
+
+    impl Transport for ProtocolPolicyProbeTransport {
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.sent
+                .lock()
+                .expect("protocol-policy test sent-message mutex must not be poisoned")
+                .push(message.clone());
+            Ok(())
+        }
+
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            self.receive_calls.fetch_add(1, Ordering::AcqRel);
+            self.next.take().ok_or(TransportError::Closed)
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn server_builder_policy_admits_selected_modern_runtime_era() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+        let server = Server::new("selected-modern-runtime-policy", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .build();
+
+        assert_eq!(server.protocol_policy(), ProtocolPolicy::ModernOnly);
+        server
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyProbeTransport {
+                    next: Some(modern_discovery_opening_request()),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::clone(&receive_calls),
+                },
+            )
+            .expect("the selected modern policy must admit a modern discovery opener");
+
+        assert_eq!(receive_calls.load(Ordering::Acquire), 2);
+        let sent = sent
+            .lock()
+            .expect("protocol-policy test sent-message mutex must not be poisoned");
+        let [JsonRpcMessage::Response(response)] = sent.as_slice() else {
+            panic!("admitted modern discovery must emit exactly one response");
+        };
+        assert_eq!(response.id, Some(905_i64.into()));
+        assert!(response.error.is_none());
+        assert!(response.result.is_some());
+    }
+
+    #[test]
+    fn server_builder_policy_rejects_same_modern_runtime_era_when_legacy_only() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+        let server = Server::new("selected-modern-runtime-policy", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .build();
+
+        assert_eq!(server.protocol_policy(), ProtocolPolicy::LegacyOnly);
+        let error = server
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyProbeTransport {
+                    next: Some(modern_discovery_opening_request()),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::clone(&receive_calls),
+                },
+            )
+            .expect_err("changing only the policy must reject the modern opener");
+
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["stage"].as_str()),
+            Some("protocol")
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["kind"].as_str()),
+            Some("era_admission")
+        );
+        assert_eq!(receive_calls.load(Ordering::Acquire), 1);
+        let sent = sent
+            .lock()
+            .expect("protocol-policy test sent-message mutex must not be poisoned");
+        let [JsonRpcMessage::Response(response)] = sent.as_slice() else {
+            panic!("rejected modern discovery must emit exactly one refusal");
+        };
+        assert_eq!(response.id, Some(905_i64.into()));
+        assert!(response.result.is_none());
+        assert_eq!(
+            response
+                .error
+                .as_ref()
+                .map(|response_error| response_error.code),
+            Some(-32600)
+        );
     }
 
     #[test]
