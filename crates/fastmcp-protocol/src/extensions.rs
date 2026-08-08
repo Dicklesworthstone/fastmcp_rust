@@ -139,7 +139,8 @@ fn validate_settings_map(map: &Map<String, Value>) -> Result<(), ExtensionRegist
             return Err(ExtensionRegistryError::SettingsKeyTooLong);
         }
         validate_settings_value(value, 0)?;
-        let encoded = serde_json::to_vec(value).map_err(|_| ExtensionRegistryError::SettingsTooLarge)?;
+        let encoded =
+            serde_json::to_vec(value).map_err(|_| ExtensionRegistryError::SettingsTooLarge)?;
         if encoded.len() > MAX_EXTENSION_SETTINGS_VALUE_BYTES {
             return Err(ExtensionRegistryError::SettingsTooLarge);
         }
@@ -451,6 +452,295 @@ impl fmt::Display for ExtensionRegistryError {
 
 impl std::error::Error for ExtensionRegistryError {}
 
+/// Local feature and runtime opt-in state for the registered descriptors.
+///
+/// The default is deliberately empty: registering an extension does not enable
+/// it for any request.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExtensionLocalEnablement {
+    compiled: BTreeSet<ExtensionId>,
+    runtime: BTreeSet<ExtensionId>,
+}
+
+impl ExtensionLocalEnablement {
+    /// Enables one descriptor at both the compile-feature and runtime layers.
+    pub fn enable(&mut self, id: ExtensionId) {
+        self.compiled.insert(id.clone());
+        self.runtime.insert(id);
+    }
+
+    /// Records whether the local build includes a descriptor's compile feature.
+    pub fn set_compiled(&mut self, id: ExtensionId, enabled: bool) {
+        set_enabled(&mut self.compiled, id, enabled);
+    }
+
+    /// Records whether the current local runtime enables a descriptor.
+    pub fn set_runtime(&mut self, id: ExtensionId, enabled: bool) {
+        set_enabled(&mut self.runtime, id, enabled);
+    }
+
+    /// Returns whether both local enablement gates are satisfied.
+    #[must_use]
+    pub fn is_enabled(&self, id: &ExtensionId) -> bool {
+        self.compiled.contains(id) && self.runtime.contains(id)
+    }
+
+    fn configured_ids(&self) -> impl Iterator<Item = &ExtensionId> {
+        self.compiled.iter().chain(self.runtime.iter())
+    }
+}
+
+fn set_enabled(set: &mut BTreeSet<ExtensionId>, id: ExtensionId, enabled: bool) {
+    if enabled {
+        set.insert(id);
+    } else {
+        set.remove(&id);
+    }
+}
+
+/// The peer side that omitted an otherwise locally enabled extension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtensionPeer {
+    /// The current message omitted client extension settings.
+    Client,
+    /// Local server discovery omitted server extension settings.
+    Server,
+}
+
+/// A non-activating extension outcome retained for diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtensionInactiveReason {
+    /// The compile-time feature or runtime opt-in is absent.
+    LocallyDisabled,
+    /// Neither peer advertised the descriptor on this current exchange.
+    NotAdvertised,
+    /// The registered fallback was selected after the client omitted support.
+    ServerInactiveFallback,
+    /// The registered fallback was selected after the server omitted support.
+    ClientInactiveFallback,
+}
+
+/// Normalized typed settings produced by a descriptor's compatibility resolver.
+///
+/// Generic registry code retains client and server settings independently and
+/// never compares their JSON objects for equality. A typed resolver receives
+/// both objects and returns this one normalized, bounded value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectiveExtensionSettings {
+    settings: ExtensionSettings,
+    fingerprint: [u8; 32],
+}
+
+impl EffectiveExtensionSettings {
+    /// Returns the typed-resolver's normalized settings object.
+    #[must_use]
+    pub const fn settings(&self) -> &ExtensionSettings {
+        &self.settings
+    }
+
+    /// Returns the stable fingerprint bound to the descriptor and effective settings.
+    #[must_use]
+    pub const fn fingerprint(&self) -> &[u8; 32] {
+        &self.fingerprint
+    }
+}
+
+/// An enabled extension after the current-message bilateral negotiation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NegotiatedExtension {
+    id: ExtensionId,
+    effective_settings: EffectiveExtensionSettings,
+}
+
+impl NegotiatedExtension {
+    /// Returns the registered descriptor identifier.
+    #[must_use]
+    pub const fn id(&self) -> &ExtensionId {
+        &self.id
+    }
+
+    /// Returns the compatibility resolver's normalized effective settings.
+    #[must_use]
+    pub const fn effective_settings(&self) -> &EffectiveExtensionSettings {
+        &self.effective_settings
+    }
+}
+
+/// Frozen per-request extension state derived from both peers' current settings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NegotiatedExtensionSet {
+    registry_receipt: ExtensionRegistryReceipt,
+    active: BTreeMap<ExtensionId, NegotiatedExtension>,
+    inactive: BTreeMap<ExtensionId, ExtensionInactiveReason>,
+    unknown_client: BTreeMap<ExtensionId, ExtensionSettings>,
+    unknown_server: BTreeMap<ExtensionId, ExtensionSettings>,
+}
+
+impl NegotiatedExtensionSet {
+    /// Returns the registry receipt that this set is bound to.
+    #[must_use]
+    pub const fn registry_receipt(&self) -> &ExtensionRegistryReceipt {
+        &self.registry_receipt
+    }
+
+    /// Returns a negotiated extension when it is active for this exchange.
+    #[must_use]
+    pub fn active(&self, id: &ExtensionId) -> Option<&NegotiatedExtension> {
+        self.active.get(id)
+    }
+
+    /// Returns the recorded non-activating outcome for a registered descriptor.
+    #[must_use]
+    pub fn inactive_reason(&self, id: &ExtensionId) -> Option<ExtensionInactiveReason> {
+        self.inactive.get(id).copied()
+    }
+
+    /// Returns enabled descriptors in deterministic identifier order.
+    #[must_use]
+    pub fn active_extensions(&self) -> impl ExactSizeIterator<Item = &NegotiatedExtension> {
+        self.active.values()
+    }
+
+    /// Returns unknown current-message client settings preserved only for diagnostics.
+    #[must_use]
+    pub const fn unknown_client_extensions(&self) -> &BTreeMap<ExtensionId, ExtensionSettings> {
+        &self.unknown_client
+    }
+
+    /// Returns unknown server discovery settings preserved only for diagnostics.
+    #[must_use]
+    pub const fn unknown_server_extensions(&self) -> &BTreeMap<ExtensionId, ExtensionSettings> {
+        &self.unknown_server
+    }
+}
+
+/// Error returned while deriving a per-request bilateral extension set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExtensionNegotiationError {
+    /// Descriptor registration must be frozen before negotiation.
+    RegistryNotFrozen,
+    /// A local feature/runtime configuration referenced an unregistered descriptor.
+    UnregisteredLocalEnablement(String),
+    /// A discovery map exceeded the generic retained-entry limit.
+    DiscoveryTooManyExtensions(ExtensionPeer),
+    /// Only one peer advertised a locally enabled descriptor without its matching fallback.
+    OneSidedSupport { id: String, missing: ExtensionPeer },
+    /// The selected typed resolver rejected both independently decoded settings objects.
+    SettingsCompatibilityRejected(String),
+    /// The normalized settings object could not be fingerprinted within its bound.
+    EffectiveSettingsTooLarge(String),
+}
+
+impl fmt::Display for ExtensionNegotiationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RegistryNotFrozen => {
+                formatter.write_str("extension descriptor registry is not frozen")
+            }
+            Self::UnregisteredLocalEnablement(id) => {
+                write!(formatter, "local extension enablement has no descriptor: {id}")
+            }
+            Self::DiscoveryTooManyExtensions(peer) => {
+                write!(formatter, "{peer:?} extension discovery exceeds its entry limit")
+            }
+            Self::OneSidedSupport { id, missing } => {
+                write!(formatter, "extension {id} is missing {missing:?} support")
+            }
+            Self::SettingsCompatibilityRejected(id) => {
+                write!(formatter, "extension settings are incompatible: {id}")
+            }
+            Self::EffectiveSettingsTooLarge(id) => {
+                write!(formatter, "effective extension settings exceed their bound: {id}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExtensionNegotiationError {}
+
+/// A typed compatibility resolver selected by a frozen descriptor ID/version.
+///
+/// This protocol-only seam deliberately accepts no server or client runtime
+/// object. Implementations decode the two settings objects independently,
+/// check compatibility, and return a normalized effective object.
+pub trait ExtensionSettingsCompatibilityResolver {
+    /// Resolves both current settings objects into normalized effective settings.
+    fn resolve(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettings, ExtensionNegotiationError>;
+}
+
+impl<F> ExtensionSettingsCompatibilityResolver for F
+where
+    F: FnMut(
+        &ExtensionDescriptor,
+        &ExtensionSettings,
+        &ExtensionSettings,
+    ) -> Result<ExtensionSettings, ExtensionNegotiationError>,
+{
+    fn resolve(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettings, ExtensionNegotiationError> {
+        self(descriptor, client, server)
+    }
+}
+
+/// Direction-sensitive extension dispatch failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExtensionDispatchError {
+    /// Dispatch used a registry other than the frozen registry that negotiated the set.
+    RegistryReceiptMismatch,
+    /// The caller supplied an unbounded member name.
+    NameTooLong(String),
+    /// No active extension owns the requested member in this direction.
+    NoActiveOwner { field: &'static str, value: String },
+    /// An owner exists but is declared in the opposite direction.
+    DirectionMismatch {
+        field: &'static str,
+        value: String,
+        expected: ExtensionDirection,
+        actual: ExtensionDirection,
+    },
+    /// A registry invariant was violated by more than one active owner.
+    AmbiguousActiveOwner { field: &'static str, value: String },
+}
+
+impl fmt::Display for ExtensionDispatchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RegistryReceiptMismatch => {
+                formatter.write_str("extension dispatch registry does not match negotiation")
+            }
+            Self::NameTooLong(value) => {
+                write!(formatter, "extension dispatch name exceeds its byte limit: {value}")
+            }
+            Self::NoActiveOwner { field, value } => {
+                write!(formatter, "no active extension owns {field}: {value}")
+            }
+            Self::DirectionMismatch {
+                field,
+                value,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "extension {field} has direction {actual:?}, not {expected:?}: {value}"
+            ),
+            Self::AmbiguousActiveOwner { field, value } => {
+                write!(formatter, "multiple active extensions own {field}: {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExtensionDispatchError {}
+
 /// Acyclic protocol-only descriptor registry.
 #[derive(Clone, Debug, Default)]
 pub struct ExtensionDescriptorRegistry {
@@ -535,6 +825,101 @@ impl ExtensionDescriptorRegistry {
             .collect()
     }
 
+    /// Derives one frozen, bilateral extension set for the current exchange.
+    ///
+    /// The typed resolver is called only for descriptors enabled by both
+    /// local gates and advertised by both peers on this exchange. The generic
+    /// registry preserves the peer objects independently; it never treats
+    /// JSON-object equality as compatibility.
+    pub fn negotiate<R>(
+        &self,
+        local: &ExtensionLocalEnablement,
+        client: &ClientExtensionDiscovery,
+        server: &ServerExtensionDiscovery,
+        resolver: &mut R,
+    ) -> Result<NegotiatedExtensionSet, ExtensionNegotiationError>
+    where
+        R: ExtensionSettingsCompatibilityResolver,
+    {
+        let Some(receipt) = self.receipt.clone() else {
+            return Err(ExtensionNegotiationError::RegistryNotFrozen);
+        };
+        validate_discovery(&client.extensions, ExtensionPeer::Client)?;
+        validate_discovery(&server.extensions, ExtensionPeer::Server)?;
+        for id in local.configured_ids() {
+            if !self.descriptors.contains_key(id) {
+                return Err(ExtensionNegotiationError::UnregisteredLocalEnablement(
+                    id.to_string(),
+                ));
+            }
+        }
+
+        let unknown_client = self.preserve_unknown_peer_extensions(client.extensions.clone());
+        let unknown_server = self.preserve_unknown_peer_extensions(server.extensions.clone());
+        let mut active = BTreeMap::new();
+        let mut inactive = BTreeMap::new();
+
+        for descriptor in self.descriptors.values() {
+            let id = &descriptor.id;
+            if !local.is_enabled(id) {
+                inactive.insert(id.clone(), ExtensionInactiveReason::LocallyDisabled);
+                continue;
+            }
+
+            match (client.extensions.get(id), server.extensions.get(id)) {
+                (Some(client), Some(server)) => {
+                    let effective = resolver.resolve(descriptor, client, server)?;
+                    let fingerprint = effective_settings_fingerprint(descriptor, &effective)?;
+                    active.insert(
+                        id.clone(),
+                        NegotiatedExtension {
+                            id: id.clone(),
+                            effective_settings: EffectiveExtensionSettings {
+                                settings: effective,
+                                fingerprint,
+                            },
+                        },
+                    );
+                }
+                (None, None) => {
+                    inactive.insert(id.clone(), ExtensionInactiveReason::NotAdvertised);
+                }
+                (None, Some(_)) => match descriptor.resolver.fallback {
+                    ExtensionFallbackPolicy::ServerInactiveFallback => {
+                        inactive.insert(id.clone(), ExtensionInactiveReason::ServerInactiveFallback);
+                    }
+                    ExtensionFallbackPolicy::RejectOneSided
+                    | ExtensionFallbackPolicy::ClientInactiveFallback => {
+                        return Err(ExtensionNegotiationError::OneSidedSupport {
+                            id: id.to_string(),
+                            missing: ExtensionPeer::Client,
+                        });
+                    }
+                },
+                (Some(_), None) => match descriptor.resolver.fallback {
+                    ExtensionFallbackPolicy::ClientInactiveFallback => {
+                        inactive.insert(id.clone(), ExtensionInactiveReason::ClientInactiveFallback);
+                    }
+                    ExtensionFallbackPolicy::RejectOneSided
+                    | ExtensionFallbackPolicy::ServerInactiveFallback => {
+                        return Err(ExtensionNegotiationError::OneSidedSupport {
+                            id: id.to_string(),
+                            missing: ExtensionPeer::Server,
+                        });
+                    }
+                },
+            }
+        }
+
+        Ok(NegotiatedExtensionSet {
+            registry_receipt: receipt,
+            active,
+            inactive,
+            unknown_client,
+            unknown_server,
+        })
+    }
+
     fn canonical_subject(&self) -> Result<String, ExtensionRegistryError> {
         let rows = self
             .descriptors
@@ -551,6 +936,203 @@ impl ExtensionDescriptorRegistry {
             return Err(ExtensionRegistryError::DigestTooLarge);
         }
         Ok(subject)
+    }
+}
+
+fn validate_discovery(
+    extensions: &BTreeMap<ExtensionId, ExtensionSettings>,
+    peer: ExtensionPeer,
+) -> Result<(), ExtensionNegotiationError> {
+    if extensions.len() > MAX_EXTENSION_DESCRIPTORS {
+        return Err(ExtensionNegotiationError::DiscoveryTooManyExtensions(peer));
+    }
+    Ok(())
+}
+
+fn effective_settings_fingerprint(
+    descriptor: &ExtensionDescriptor,
+    effective: &ExtensionSettings,
+) -> Result<[u8; 32], ExtensionNegotiationError> {
+    let subject = serde_json::to_vec(&serde_json::json!({
+        "domain": "fastmcp.ext-01.effective-settings.v1",
+        "id": descriptor.id.as_str(),
+        "resolver": [descriptor.resolver.id, descriptor.resolver.version],
+        "clientSchema": descriptor.client_settings.schema_id,
+        "serverSchema": descriptor.server_settings.schema_id,
+        "effective": canonicalize_value(&Value::Object(effective.as_object().clone())),
+    }))
+    .map_err(|_| {
+        ExtensionNegotiationError::EffectiveSettingsTooLarge(descriptor.id.to_string())
+    })?;
+    if subject.len() > MAX_EXTENSION_REGISTRY_CANONICAL_BYTES {
+        return Err(ExtensionNegotiationError::EffectiveSettingsTooLarge(
+            descriptor.id.to_string(),
+        ));
+    }
+    sha256_bounded(&subject, MAX_EXTENSION_REGISTRY_CANONICAL_BYTES)
+        .map(|digest| digest.into_bytes())
+        .map_err(|_| {
+            ExtensionNegotiationError::EffectiveSettingsTooLarge(descriptor.id.to_string())
+        })
+}
+
+fn canonicalize_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonicalize_value).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), canonicalize_value(value)))
+                .collect(),
+        ),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
+    }
+}
+
+impl NegotiatedExtensionSet {
+    /// Resolves an active extension request method in its declared direction.
+    pub fn dispatch_method<'a>(
+        &self,
+        registry: &'a ExtensionDescriptorRegistry,
+        name: &str,
+        direction: ExtensionDirection,
+    ) -> Result<&'a ExtensionDescriptor, ExtensionDispatchError> {
+        self.ensure_registry(registry)?;
+        validate_dispatch_name(name)?;
+        let owners = registry
+            .descriptors
+            .values()
+            .filter(|descriptor| {
+                self.active.contains_key(&descriptor.id)
+                    && descriptor
+                        .method
+                        .as_ref()
+                        .is_some_and(|method| method.name == name)
+            })
+            .collect::<Vec<_>>();
+        resolve_directional_dispatch(owners, name, direction, "method", |descriptor| {
+            descriptor.method.as_ref().map(|method| method.direction)
+        })
+    }
+
+    /// Resolves an active extension notification in its declared direction.
+    pub fn dispatch_notification<'a>(
+        &self,
+        registry: &'a ExtensionDescriptorRegistry,
+        name: &str,
+        direction: ExtensionDirection,
+    ) -> Result<&'a ExtensionDescriptor, ExtensionDispatchError> {
+        self.ensure_registry(registry)?;
+        validate_dispatch_name(name)?;
+        let owners = registry
+            .descriptors
+            .values()
+            .filter(|descriptor| {
+                self.active.contains_key(&descriptor.id)
+                    && descriptor
+                        .notification
+                        .as_ref()
+                        .is_some_and(|notification| notification.name == name)
+            })
+            .collect::<Vec<_>>();
+        resolve_directional_dispatch(owners, name, direction, "notification", |descriptor| {
+            descriptor
+                .notification
+                .as_ref()
+                .map(|notification| notification.direction)
+        })
+    }
+
+    /// Resolves an active extension result discriminator without a core fallback.
+    pub fn dispatch_result<'a>(
+        &self,
+        registry: &'a ExtensionDescriptorRegistry,
+        discriminator: &str,
+    ) -> Result<&'a ExtensionDescriptor, ExtensionDispatchError> {
+        self.ensure_registry(registry)?;
+        validate_dispatch_name(discriminator)?;
+        let owners = registry
+            .descriptors
+            .values()
+            .filter(|descriptor| {
+                self.active.contains_key(&descriptor.id)
+                    && descriptor.result_discriminator.as_deref() == Some(discriminator)
+            })
+            .collect::<Vec<_>>();
+        match owners.as_slice() {
+            [] => Err(ExtensionDispatchError::NoActiveOwner {
+                field: "result discriminator",
+                value: discriminator.to_owned(),
+            }),
+            [descriptor] => Ok(descriptor),
+            _ => Err(ExtensionDispatchError::AmbiguousActiveOwner {
+                field: "result discriminator",
+                value: discriminator.to_owned(),
+            }),
+        }
+    }
+
+    fn ensure_registry(
+        &self,
+        registry: &ExtensionDescriptorRegistry,
+    ) -> Result<(), ExtensionDispatchError> {
+        if registry.receipt() == Some(&self.registry_receipt) {
+            Ok(())
+        } else {
+            Err(ExtensionDispatchError::RegistryReceiptMismatch)
+        }
+    }
+}
+
+fn validate_dispatch_name(name: &str) -> Result<(), ExtensionDispatchError> {
+    if name.len() > MAX_EXTENSION_MEMBER_NAME_BYTES {
+        return Err(ExtensionDispatchError::NameTooLong(name.to_owned()));
+    }
+    Ok(())
+}
+
+fn resolve_directional_dispatch<'a>(
+    owners: Vec<&'a ExtensionDescriptor>,
+    value: &str,
+    expected: ExtensionDirection,
+    field: &'static str,
+    direction: impl Fn(&ExtensionDescriptor) -> Option<ExtensionDirection>,
+) -> Result<&'a ExtensionDescriptor, ExtensionDispatchError> {
+    let matching = owners
+        .iter()
+        .copied()
+        .filter(|descriptor| direction(descriptor) == Some(expected))
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [descriptor] => Ok(descriptor),
+        [] => match owners.as_slice() {
+            [descriptor] => {
+                let Some(actual) = direction(descriptor) else {
+                    return Err(ExtensionDispatchError::NoActiveOwner {
+                        field,
+                        value: value.to_owned(),
+                    });
+                };
+                Err(ExtensionDispatchError::DirectionMismatch {
+                    field,
+                    value: value.to_owned(),
+                    expected,
+                    actual,
+                })
+            }
+            [] => Err(ExtensionDispatchError::NoActiveOwner {
+                field,
+                value: value.to_owned(),
+            }),
+            _ => Err(ExtensionDispatchError::AmbiguousActiveOwner {
+                field,
+                value: value.to_owned(),
+            }),
+        },
+        _ => Err(ExtensionDispatchError::AmbiguousActiveOwner {
+            field,
+            value: value.to_owned(),
+        }),
     }
 }
 
@@ -574,14 +1156,10 @@ fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Extension
         ),
         ("resolver", descriptor.resolver.id.as_str()),
     ] {
-        if value.is_empty() {
-            return Err(ExtensionRegistryError::MissingOwner(field));
-        }
+        validate_descriptor_identity(field, value)?;
     }
     if let Some(method) = &descriptor.method {
-        if method.name.is_empty() {
-            return Err(ExtensionRegistryError::MissingOwner("method"));
-        }
+        validate_member_name("method", &method.name)?;
         if core_or_legacy_method(&method.name) {
             return Err(ExtensionRegistryError::CoreMethodCollision(
                 method.name.clone(),
@@ -603,35 +1181,121 @@ fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Extension
             return Err(ExtensionRegistryError::MissingHttpEraDisposition(
                 method.name.clone(),
             ));
+        } else if method.legacy_fallback {
+            return Err(ExtensionRegistryError::LegacyFallbackContradiction(
+                method.name.clone(),
+            ));
         }
     }
-    if descriptor
-        .notification
-        .as_ref()
-        .is_some_and(|item| item.name.is_empty())
-    {
-        return Err(ExtensionRegistryError::MissingOwner("notification"));
+    if let Some(notification) = &descriptor.notification {
+        validate_member_name("notification", &notification.name)?;
+        if core_or_legacy_method(&notification.name) {
+            return Err(ExtensionRegistryError::CoreNotificationCollision(
+                notification.name.clone(),
+            ));
+        }
+        if descriptor
+            .method
+            .as_ref()
+            .is_some_and(|method| method.name == notification.name)
+        {
+            return Err(ExtensionRegistryError::LocalOwnershipCollision {
+                field: "method/notification",
+                value: notification.name.clone(),
+            });
+        }
     }
-    if descriptor
-        .result_discriminator
-        .as_ref()
-        .is_some_and(String::is_empty)
-    {
-        return Err(ExtensionRegistryError::MissingOwner("result discriminator"));
+    if let Some(discriminator) = &descriptor.result_discriminator {
+        validate_member_name("result discriminator", discriminator)?;
+        if matches!(discriminator.as_str(), "complete" | "input_required") {
+            return Err(ExtensionRegistryError::CoreResultDiscriminatorCollision(
+                discriminator.clone(),
+            ));
+        }
     }
-    if descriptor
-        .routing_headers
-        .iter()
-        .any(|header| header.name.is_empty())
-    {
-        return Err(ExtensionRegistryError::MissingOwner("routing header"));
+    if descriptor.routing_headers.len() > MAX_EXTENSION_ROUTING_HEADERS {
+        return Err(ExtensionRegistryError::LocalOwnershipCollision {
+            field: "routing headers",
+            value: descriptor.id.to_string(),
+        });
     }
-    if descriptor.stdio_correlation.as_ref().is_some_and(|item| {
-        item.metadata_key.is_empty()
-            || item.methods.is_empty()
-            || item.methods.iter().any(String::is_empty)
-    }) {
-        return Err(ExtensionRegistryError::MissingOwner("stdio correlation"));
+    for (index, header) in descriptor.routing_headers.iter().enumerate() {
+        if header.name.is_empty() {
+            return Err(ExtensionRegistryError::MissingOwner("routing header"));
+        }
+        if header.name.len() > MAX_EXTENSION_ROUTING_HEADER_BYTES {
+            return Err(ExtensionRegistryError::MemberNameTooLong {
+                field: "routing header",
+                value: header.name.clone(),
+            });
+        }
+        if descriptor.routing_headers[..index]
+            .iter()
+            .any(|prior| prior.name.eq_ignore_ascii_case(&header.name))
+        {
+            return Err(ExtensionRegistryError::LocalOwnershipCollision {
+                field: "routing header",
+                value: header.name.clone(),
+            });
+        }
+    }
+    if let Some(correlation) = &descriptor.stdio_correlation {
+        if correlation.metadata_key.is_empty() {
+            return Err(ExtensionRegistryError::MissingOwner("stdio correlation"));
+        }
+        ExtensionId::parse(correlation.metadata_key.clone())?;
+        if correlation.methods.is_empty() || correlation.methods.len() > MAX_STDIO_CORRELATION_METHODS {
+            return Err(ExtensionRegistryError::MissingOwner("stdio correlation"));
+        }
+        let Some(notification) = &descriptor.notification else {
+            return Err(ExtensionRegistryError::MissingOwner("stdio notification"));
+        };
+        if notification.direction != correlation.direction
+            || !correlation.methods.iter().any(|method| method == &notification.name)
+        {
+            return Err(ExtensionRegistryError::LocalOwnershipCollision {
+                field: "stdio correlation notification",
+                value: correlation.metadata_key.clone(),
+            });
+        }
+        for (index, method) in correlation.methods.iter().enumerate() {
+            validate_member_name("stdio correlation method", method)?;
+            if correlation.methods[..index].contains(method) {
+                return Err(ExtensionRegistryError::LocalOwnershipCollision {
+                    field: "stdio correlation method",
+                    value: method.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_descriptor_identity(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ExtensionRegistryError> {
+    if value.is_empty() {
+        return Err(ExtensionRegistryError::MissingOwner(field));
+    }
+    if value.len() > MAX_EXTENSION_MEMBER_NAME_BYTES {
+        return Err(ExtensionRegistryError::MemberNameTooLong {
+            field,
+            value: value.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_member_name(field: &'static str, value: &str) -> Result<(), ExtensionRegistryError> {
+    if value.is_empty() {
+        return Err(ExtensionRegistryError::MissingOwner(field));
+    }
+    if value.len() > MAX_EXTENSION_MEMBER_NAME_BYTES {
+        return Err(ExtensionRegistryError::MemberNameTooLong {
+            field,
+            value: value.to_owned(),
+        });
     }
     Ok(())
 }
@@ -659,6 +1323,20 @@ fn ensure_no_cross_owner_collision(
         "notification",
         left.notification.as_ref().map(|n| n.name.as_str()),
         right.notification.as_ref().map(|n| n.name.as_str()),
+    ) {
+        return Err(error);
+    }
+    if let Some(error) = collision(
+        "method/notification",
+        left.method.as_ref().map(|m| m.name.as_str()),
+        right.notification.as_ref().map(|n| n.name.as_str()),
+    ) {
+        return Err(error);
+    }
+    if let Some(error) = collision(
+        "method/notification",
+        left.notification.as_ref().map(|n| n.name.as_str()),
+        right.method.as_ref().map(|m| m.name.as_str()),
     ) {
         return Err(error);
     }
@@ -742,4 +1420,228 @@ fn canonical_descriptor_row(descriptor: &ExtensionDescriptor) -> Value {
         "routingHeaders": descriptor.routing_headers.iter().map(|h| &h.name).collect::<Vec<_>>(),
         "stdio": descriptor.stdio_correlation.as_ref().map(|s| (&s.metadata_key, &s.methods, format!("{:?}", s.direction))),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn descriptor(
+        id: ExtensionId,
+        method: &str,
+        notification: &str,
+        result_discriminator: &str,
+    ) -> ExtensionDescriptor {
+        ExtensionDescriptor {
+            id,
+            client_settings: ExtensionSettingsSchema {
+                schema_id: "client-weather-v1".to_owned(),
+                codec_id: "client-weather-codec-v1".to_owned(),
+            },
+            server_settings: ExtensionSettingsSchema {
+                schema_id: "server-weather-v1".to_owned(),
+                codec_id: "server-weather-codec-v1".to_owned(),
+            },
+            resolver: ExtensionNegotiationResolver {
+                id: "weather-compatibility-v1".to_owned(),
+                version: 1,
+                fallback: ExtensionFallbackPolicy::RejectOneSided,
+            },
+            method: Some(ExtensionMethodDescriptor {
+                name: method.to_owned(),
+                direction: ExtensionDirection::ClientToServer,
+                http_era_disposition: Some(ExtensionHttpEraDisposition::ModernExclusive),
+                legacy_fallback: false,
+            }),
+            notification: Some(ExtensionNotificationDescriptor {
+                name: notification.to_owned(),
+                direction: ExtensionDirection::ServerToClient,
+            }),
+            result_discriminator: Some(result_discriminator.to_owned()),
+            routing_headers: vec![ExtensionRoutingHeaderDescriptor {
+                name: "Mcp-Weather".to_owned(),
+            }],
+            stdio_correlation: None,
+        }
+    }
+
+    #[test]
+    fn ext_01_unit_bilateral_negotiation_and_directional_dispatch_positive() {
+        let id = ExtensionId::parse("com.example/weather").expect("valid extension ID");
+        let mut registry = ExtensionDescriptorRegistry::new();
+        registry
+            .register(descriptor(
+                id.clone(),
+                "com.example/weather",
+                "com.example/weather_changed",
+                "com.example/weather_result",
+            ))
+            .expect("descriptor registers");
+        registry.freeze().expect("registry freezes before negotiation");
+
+        let client_settings = ExtensionSettings::new(json!({
+            "unit": "celsius",
+            "preserved": [null, 1.5, {"nested": true}],
+        }))
+        .expect("current-message client settings are bounded JSON");
+        let server_settings = ExtensionSettings::new(json!({"maxCities": 4}))
+            .expect("server discovery settings are bounded JSON");
+        let unknown_id = ExtensionId::parse("org.example/diagnostic")
+            .expect("unknown but structurally valid ID");
+
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([
+                (id.clone(), client_settings),
+                (
+                    unknown_id.clone(),
+                    ExtensionSettings::new(json!({"opaque": null}))
+                        .expect("bounded unknown settings"),
+                ),
+            ]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([(id.clone(), server_settings)]),
+        };
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(id.clone());
+        let mut resolver = |
+            descriptor: &ExtensionDescriptor,
+            client: &ExtensionSettings,
+            server: &ExtensionSettings,
+        | {
+            assert_eq!(descriptor.resolver.id, "weather-compatibility-v1");
+            ExtensionSettings::new(json!({
+                "unit": client.as_object()["unit"].clone(),
+                "maxCities": server.as_object()["maxCities"].clone(),
+            }))
+            .map_err(|_| ExtensionNegotiationError::SettingsCompatibilityRejected(
+                descriptor.id.to_string(),
+            ))
+        };
+        let negotiated = registry
+            .negotiate(&local, &client, &server, &mut resolver)
+            .expect("bilateral current-message settings negotiate");
+
+        assert_eq!(negotiated.active_extensions().len(), 1);
+        assert_eq!(
+            negotiated
+                .active(&id)
+                .expect("registered bilateral extension is active")
+                .effective_settings()
+                .settings()
+                .as_object()["unit"],
+            json!("celsius")
+        );
+        assert_eq!(
+            negotiated.unknown_client_extensions()[&unknown_id].as_object()["opaque"],
+            Value::Null,
+            "unknown peer data remains diagnostic and cannot activate dispatch"
+        );
+        assert_eq!(
+            negotiated
+                .dispatch_method(
+                    &registry,
+                    "com.example/weather",
+                    ExtensionDirection::ClientToServer,
+                )
+                .expect("active method dispatch")
+                .id,
+            id
+        );
+        assert_eq!(
+            negotiated
+                .dispatch_notification(
+                    &registry,
+                    "com.example/weather_changed",
+                    ExtensionDirection::ServerToClient,
+                )
+                .expect("active notification dispatch")
+                .id,
+            id
+        );
+        assert_eq!(
+            negotiated
+                .dispatch_result(&registry, "com.example/weather_result")
+                .expect("active result discriminator dispatch")
+                .id,
+            id
+        );
+        assert_eq!(
+            negotiated.dispatch_notification(
+                &registry,
+                "com.example/weather_changed",
+                ExtensionDirection::ClientToServer,
+            ),
+            Err(ExtensionDispatchError::DirectionMismatch {
+                field: "notification",
+                value: "com.example/weather_changed".to_owned(),
+                expected: ExtensionDirection::ClientToServer,
+                actual: ExtensionDirection::ServerToClient,
+            }),
+            "only the requested direction changes; the same active descriptor must not dispatch"
+        );
+    }
+
+    #[test]
+    fn ext_01_unit_one_variable_collision_negative() {
+        let first_id = ExtensionId::parse("com.example/first").expect("first ID");
+        let second_id = ExtensionId::parse("com.example/second").expect("second ID");
+        let first = descriptor(
+            first_id,
+            "com.example/first",
+            "com.example/first_changed",
+            "com.example/first_result",
+        );
+        let candidate = descriptor(
+            second_id,
+            "com.example/second",
+            "com.example/second_changed",
+            "com.example/second_result",
+        );
+        let mut registry = ExtensionDescriptorRegistry::new();
+        registry.register(first).expect("baseline owner registers");
+        let baseline_count = registry.descriptors().len();
+
+        let mut planted = candidate.clone();
+        planted.result_discriminator = Some("com.example/first_result".to_owned());
+        assert_eq!(
+            registry.register(planted),
+            Err(ExtensionRegistryError::OwnershipCollision {
+                field: "result discriminator",
+                value: "com.example/first_result".to_owned(),
+            }),
+            "the otherwise valid candidate differs in only the colliding discriminator"
+        );
+        assert_eq!(
+            registry.descriptors().len(),
+            baseline_count,
+            "rejected registration cannot mutate the frozen dispatch owner set"
+        );
+        registry
+            .register(candidate)
+            .expect("the unmodified one-variable baseline remains registrable");
+    }
+
+    #[test]
+    fn ext_01_unit_one_level_over_settings_bound_is_rejected() {
+        let mut accepted_value = Value::Null;
+        for _ in 0..MAX_EXTENSION_SETTINGS_NESTING {
+            accepted_value = Value::Array(vec![accepted_value]);
+        }
+        let accepted = ExtensionSettings::new(json!({"nested": accepted_value.clone()}))
+            .expect("the exact nesting bound is admitted");
+
+        let planted = Value::Array(vec![accepted_value]);
+        assert_eq!(
+            ExtensionSettings::new(json!({"nested": planted})),
+            Err(ExtensionRegistryError::SettingsTooDeep),
+            "only one additional nesting level changes the accepted settings object"
+        );
+        assert_eq!(
+            accepted.as_object()["nested"],
+            json!(accepted_value),
+            "rejected settings cannot mutate the previously admitted object"
+        );
+    }
 }
