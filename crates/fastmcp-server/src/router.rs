@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::task::Poll;
 use std::time::Duration;
 
 #[cfg(test)]
@@ -377,6 +378,59 @@ fn run_handler<'a, T>(
                 Ok(outcome)
             }
         }
+    }
+}
+
+/// Drives one handler future without entering the legacy blocking dispatcher.
+///
+/// The future stays inside its request-owned child task: timeout drops the
+/// pending future, and dropping the parent task's join cancels the child before
+/// the parent can complete. This helper deliberately receives the child Cx
+/// separately from the framework context so modern handlers can propagate that
+/// structured capability to their own nested work.
+async fn run_handler_in_request<'a, T>(
+    ctx: &'a McpContext,
+    request_cx: &'a Cx,
+    budget: Budget,
+    handler_class: &'static str,
+    make_future: impl FnOnce(&'a Cx) -> BoxFuture<'a, McpOutcome<T>>,
+) -> McpResult<McpOutcome<T>> {
+    if request_cx.is_cancel_requested() || budget_error(ctx).is_some() {
+        return Err(McpError::request_cancelled());
+    }
+
+    let future = crate::catch_extension_unwind(|| make_future(request_cx))
+        .map_err(|_payload| sanitized_handler_panic(ctx.cx(), handler_class))?;
+    let mut future = future;
+    let poll_handler = std::future::poll_fn(|task_cx| {
+        match crate::catch_extension_unwind(|| future.as_mut().poll(task_cx)) {
+            Ok(Poll::Ready(outcome)) => Poll::Ready(Ok(outcome)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_payload) => Poll::Ready(Err(())),
+        }
+    });
+
+    let outcome = match budget.deadline {
+        Some(deadline) => match asupersync::time::timeout_at(deadline, poll_handler).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(())) => return Err(sanitized_handler_panic(ctx.cx(), handler_class)),
+            Err(_elapsed) => {
+                return Err(McpError::new(
+                    McpErrorCode::RequestCancelled,
+                    "Request timeout exceeded",
+                ));
+            }
+        },
+        None => match poll_handler.await {
+            Ok(outcome) => outcome,
+            Err(()) => return Err(sanitized_handler_panic(ctx.cx(), handler_class)),
+        },
+    };
+
+    if request_cx.is_cancel_requested() || budget_error(ctx).is_some() {
+        Err(McpError::request_cancelled())
+    } else {
+        Ok(outcome)
     }
 }
 
@@ -1120,6 +1174,60 @@ impl Router {
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
     ) -> McpResult<serde_json::Value> {
+        // The connection-oriented server adapter remains synchronous today.
+        // Keep its ordered compatibility semantics here; modern runtime entry
+        // points must use `dispatch_stateless_owned` below instead of sharing
+        // this blocking bridge.
+        block_on(self.dispatch_stateless_in_request(request_ctx, request_ctx.cx(), request))
+    }
+
+    /// Dispatches one modern request in a request-owned structured child task.
+    ///
+    /// The caller owns the returned future. It owns exactly one child task,
+    /// waits for that task to finish, and cancellation of that wait aborts the
+    /// child through `TaskHandle::join` before control returns. No task is
+    /// detached: a result is produced only after the handler task has reached a
+    /// terminal state. The child Cx is propagated to the modern handler hooks
+    /// so their nested work remains in the same request lifetime.
+    pub(crate) async fn dispatch_stateless_owned(
+        self: Arc<Self>,
+        request_ctx: McpContext,
+        request: JsonRpcRequest,
+    ) -> McpResult<serde_json::Value> {
+        if let Some(error) = budget_error(&request_ctx) {
+            return Err(error);
+        }
+
+        let join_cx = request_ctx.cx().clone();
+        let dispatch_ctx = request_ctx.clone();
+        let mut task = request_ctx
+            .cx()
+            .spawn(move |child_cx| async move {
+                self.dispatch_stateless_in_request(&dispatch_ctx, &child_cx, &request)
+                    .await
+            })
+            .map_err(|_error| {
+                McpError::internal_error("request-owned modern dispatch could not be scheduled")
+            })?;
+
+        match task.join(&join_cx).await {
+            Ok(result) => result,
+            Err(asupersync::runtime::JoinError::Panicked(_payload)) => {
+                Err(sanitized_handler_panic(&join_cx, "modern_dispatch"))
+            }
+            Err(_error) => Err(McpError::request_cancelled()),
+        }
+    }
+
+    async fn dispatch_stateless_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        request: &JsonRpcRequest,
+    ) -> McpResult<serde_json::Value> {
+        if request_cx.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
@@ -1133,13 +1241,17 @@ impl Router {
             }
             "tools/call" => {
                 let params = parse_stateless_params(params)?;
-                encode_stateless_handler_result(self.handle_tools_call(
-                    request_ctx,
-                    params,
-                    SessionState::new(),
-                    None,
-                    None,
-                ))?
+                encode_stateless_handler_result(
+                    self.handle_tools_call_in_request(
+                        request_ctx,
+                        request_cx,
+                        params,
+                        SessionState::new(),
+                        None,
+                        None,
+                    )
+                    .await,
+                )?
             }
             "resources/list" => {
                 let params = parse_stateless_params_or_default(params)?;
@@ -1159,13 +1271,17 @@ impl Router {
             }
             "resources/read" => {
                 let params = parse_stateless_params(params)?;
-                encode_stateless_handler_result(self.handle_resources_read(
-                    request_ctx,
-                    &params,
-                    SessionState::new(),
-                    None,
-                    None,
-                ))?
+                encode_stateless_handler_result(
+                    self.handle_resources_read_in_request(
+                        request_ctx,
+                        request_cx,
+                        &params,
+                        SessionState::new(),
+                        None,
+                        None,
+                    )
+                    .await,
+                )?
             }
             "prompts/list" => {
                 let params = parse_stateless_params_or_default(params)?;
@@ -1177,17 +1293,24 @@ impl Router {
             }
             "prompts/get" => {
                 let params = parse_stateless_params(params)?;
-                encode_stateless_handler_result(self.handle_prompts_get(
-                    request_ctx,
-                    params,
-                    SessionState::new(),
-                    None,
-                    None,
-                ))?
+                encode_stateless_handler_result(
+                    self.handle_prompts_get_in_request(
+                        request_ctx,
+                        request_cx,
+                        params,
+                        SessionState::new(),
+                        None,
+                        None,
+                    )
+                    .await,
+                )?
             }
             _ => return Err(McpError::method_not_found(&request.method)),
         };
 
+        if request_cx.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
@@ -1356,6 +1479,103 @@ impl Router {
                 // Cancelled requests are reported as JSON-RPC errors
                 Err(McpError::request_cancelled())
             }
+            Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "tool")),
+        }
+    }
+
+    async fn handle_tools_call_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: CallToolParams,
+        session_state: SessionState,
+        notification_sender: Option<&NotificationSender>,
+        bidirectional_senders: Option<&BidirectionalSenders>,
+    ) -> McpResult<CallToolResult> {
+        debug!(
+            target: targets::HANDLER,
+            "calling modern tool; tool_key={}; arguments_present={}",
+            safe_log_label(&params.name),
+            params.arguments.is_some()
+        );
+
+        let dispatch_started_at = request_ctx.cx().now();
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_tool_enabled(&params.name) {
+            return Err(McpError::new(
+                McpErrorCode::MethodNotFound,
+                format!("Tool '{}' is disabled for this session", params.name),
+            ));
+        }
+
+        let handler = self
+            .tools
+            .get(&params.name)
+            .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", params.name)))?;
+        let arguments = params.arguments.unwrap_or_else(|| serde_json::json!({}));
+        let tool_def = crate::catch_extension_unwind(|| handler.definition())
+            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
+        let validation_result = if self.strict_input_validation {
+            validate_strict(&tool_def.input_schema, &arguments)
+        } else {
+            validate(&tool_def.input_schema, &arguments)
+        };
+        if let Err(validation_errors) = validation_result {
+            let error_messages: Vec<String> = validation_errors
+                .iter()
+                .map(|error| format!("{}: {}", error.path, error.message))
+                .collect();
+            return Err(McpError::invalid_params(format!(
+                "Input validation failed: {}",
+                error_messages.join("; ")
+            )));
+        }
+
+        let progress_marker = params
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.progress_marker.clone());
+        let ctx = derive_handler_context(
+            request_ctx,
+            progress_marker,
+            notification_sender,
+            bidirectional_senders,
+        );
+        let handler_timeout =
+            read_handler_timeout(request_ctx.cx(), "tool_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            request_ctx.cx().budget(),
+            request_ctx.budget(),
+            handler_timeout,
+            dispatch_started_at,
+        );
+        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
+        let outcome =
+            run_handler_in_request(&ctx, request_cx, effective_budget, "tool", |child_cx| {
+                handler.call_async_in_request(&ctx, child_cx, arguments)
+            })
+            .await?;
+
+        match outcome {
+            Outcome::Ok(content) => Ok(CallToolResult {
+                content,
+                is_error: false,
+            }),
+            Outcome::Err(error) => {
+                let error = sanitize_handler_error(request_ctx.cx(), "tool", error);
+                if is_framework_terminal_tool_error(error.code) {
+                    return Err(error);
+                }
+                Ok(CallToolResult {
+                    content: vec![Content::Text {
+                        text: error.message,
+                    }],
+                    is_error: true,
+                })
+            }
+            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "tool")),
         }
     }
@@ -1533,6 +1753,80 @@ impl Router {
         Ok(ReadResourceResult { contents })
     }
 
+    async fn handle_resources_read_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: &ReadResourceParams,
+        session_state: SessionState,
+        notification_sender: Option<&NotificationSender>,
+        bidirectional_senders: Option<&BidirectionalSenders>,
+    ) -> McpResult<ReadResourceResult> {
+        debug!(
+            target: targets::HANDLER,
+            "reading modern resource; resource_key={}",
+            safe_log_label(&params.uri)
+        );
+
+        let dispatch_started_at = request_ctx.cx().now();
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_resource_enabled(&params.uri) {
+            return Err(McpError::new(
+                McpErrorCode::ResourceNotFound,
+                format!("Resource '{}' is disabled for this session", params.uri),
+            ));
+        }
+
+        let resolved = self
+            .resolve_resource(&params.uri)
+            .ok_or_else(|| McpError::resource_not_found(&params.uri))?;
+        let progress_marker = params
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.progress_marker.clone());
+        let ctx = derive_handler_context(
+            request_ctx,
+            progress_marker,
+            notification_sender,
+            bidirectional_senders,
+        );
+        let handler_timeout = read_handler_timeout(request_ctx.cx(), "resource_timeout", || {
+            resolved.handler.timeout()
+        })?;
+        let effective_budget = compose_handler_budget(
+            request_ctx.cx().budget(),
+            request_ctx.budget(),
+            handler_timeout,
+            dispatch_started_at,
+        );
+        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
+        let outcome =
+            run_handler_in_request(&ctx, request_cx, effective_budget, "resource", |child_cx| {
+                resolved.handler.read_async_with_uri_in_request(
+                    &ctx,
+                    child_cx,
+                    &params.uri,
+                    &resolved.params,
+                )
+            })
+            .await?;
+
+        let contents = match outcome {
+            Outcome::Ok(contents) => contents,
+            Outcome::Err(error) => {
+                return Err(sanitize_handler_error(request_ctx.cx(), "resource", error));
+            }
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => {
+                return Err(sanitized_handler_panic(request_ctx.cx(), "resource"));
+            }
+        };
+
+        Ok(ReadResourceResult { contents })
+    }
+
     /// Handles the prompts/list request.
     ///
     /// If session_state is provided, disabled prompts will be filtered out.
@@ -1656,6 +1950,84 @@ impl Router {
         })?;
 
         // Convert 4-valued Outcome to McpResult for JSON-RPC response
+        let messages = match outcome {
+            Outcome::Ok(messages) => messages,
+            Outcome::Err(error) => {
+                return Err(sanitize_handler_error(request_ctx.cx(), "prompt", error));
+            }
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => {
+                return Err(sanitized_handler_panic(request_ctx.cx(), "prompt"));
+            }
+        };
+
+        Ok(GetPromptResult {
+            description,
+            messages,
+        })
+    }
+
+    async fn handle_prompts_get_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: GetPromptParams,
+        session_state: SessionState,
+        notification_sender: Option<&NotificationSender>,
+        bidirectional_senders: Option<&BidirectionalSenders>,
+    ) -> McpResult<GetPromptResult> {
+        debug!(
+            target: targets::HANDLER,
+            "getting modern prompt; prompt_key={}; arguments_present={}",
+            safe_log_label(&params.name),
+            params.arguments.is_some()
+        );
+
+        let dispatch_started_at = request_ctx.cx().now();
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_prompt_enabled(&params.name) {
+            return Err(McpError::new(
+                McpErrorCode::PromptNotFound,
+                format!("Prompt '{}' is disabled for this session", params.name),
+            ));
+        }
+
+        let handler = self.prompts.get(&params.name).ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::PromptNotFound,
+                format!("Prompt not found: {}", params.name),
+            )
+        })?;
+        let description = crate::catch_extension_unwind(|| handler.definition().description)
+            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "prompt_definition"))?;
+        let progress_marker = params
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.progress_marker.clone());
+        let ctx = derive_handler_context(
+            request_ctx,
+            progress_marker,
+            notification_sender,
+            bidirectional_senders,
+        );
+        let handler_timeout =
+            read_handler_timeout(request_ctx.cx(), "prompt_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            request_ctx.cx().budget(),
+            request_ctx.budget(),
+            handler_timeout,
+            dispatch_started_at,
+        );
+        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
+        let arguments = params.arguments.unwrap_or_default();
+        let outcome =
+            run_handler_in_request(&ctx, request_cx, effective_budget, "prompt", |child_cx| {
+                handler.get_async_in_request(&ctx, child_cx, arguments)
+            })
+            .await?;
+
         let messages = match outcome {
             Outcome::Ok(messages) => messages,
             Outcome::Err(error) => {
@@ -3992,10 +4364,15 @@ mod tag_filter_tests {
 mod router_tests {
     use super::*;
     use crate::handler::{PromptHandler, ResourceHandler, ToolHandler};
+    use asupersync::channel::oneshot;
+    use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
+    use asupersync::types::CancelKind;
     use fastmcp_core::{McpContext, McpResult, SessionState};
     use fastmcp_protocol::{Content, Prompt, PromptMessage, Resource, ResourceContent, Tool};
     use std::fmt;
-    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+    use std::task::Poll;
 
     fn request_context(
         cx: &Cx,
@@ -4004,6 +4381,55 @@ mod router_tests {
         state: &SessionState,
     ) -> McpContext {
         McpContext::with_state(cx.clone(), request_id, state.clone()).with_budget_ceiling(budget)
+    }
+
+    async fn yield_once() {
+        let mut yielded = false;
+        std::future::poll_fn(|task_cx| {
+            if std::mem::replace(&mut yielded, true) {
+                Poll::Ready(())
+            } else {
+                task_cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+
+    fn spawn_owned_modern_request(
+        runtime: &RuntimeHandle,
+        router: Arc<Router>,
+        request_context_id: u64,
+        wire_id: &'static str,
+        label: &'static str,
+        control_sender: Option<oneshot::Sender<Cx>>,
+    ) -> oneshot::Receiver<McpResult<serde_json::Value>> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        runtime
+            .try_spawn_with_cx(move |request_cx| {
+                if let Some(control_sender) = control_sender {
+                    control_sender
+                        .send_blocking(request_cx.clone())
+                        .expect("the cancellation controller remains available");
+                }
+                let request_ctx = McpContext::new(request_cx, request_context_id);
+                let request = JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "concurrent-modern-tool",
+                        "arguments": {"request": label},
+                    })),
+                    wire_id,
+                );
+                async move {
+                    let result = router.dispatch_stateless_owned(request_ctx, request).await;
+                    response_sender
+                        .send_blocking(result)
+                        .expect("the modern dispatch observer remains available");
+                }
+            })
+            .expect("the runtime admits the request owner");
+        response_receiver
     }
 
     // ── Stub handlers ──────────────────────────────────────────────────
@@ -4043,6 +4469,89 @@ mod router_tests {
         }
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
             Ok(vec![Content::text(format!("called {}", self.name))])
+        }
+    }
+
+    struct ConcurrentModernTool {
+        started: Arc<AtomicUsize>,
+        completed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ConcurrentModernTool {
+        fn new(started: Arc<AtomicUsize>, completed: Arc<Mutex<Vec<String>>>) -> Self {
+            Self { started, completed }
+        }
+    }
+
+    impl ToolHandler for ConcurrentModernTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "concurrent-modern-tool".to_string(),
+                description: Some("deterministic modern dispatch probe".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["request"],
+                    "properties": {"request": {"type": "string"}},
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Err(McpError::internal_error(
+                "concurrent modern dispatch requires the async request hook",
+            ))
+        }
+
+        fn call_async_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            request_cx: &'a Cx,
+            arguments: serde_json::Value,
+        ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+            Box::pin(async move {
+                let label = arguments
+                    .get("request")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("missing")
+                    .to_string();
+                self.started.fetch_add(1, Ordering::SeqCst);
+
+                while self.started.load(Ordering::SeqCst) < 2 {
+                    if ctx.checkpoint().is_err() || request_cx.is_cancel_requested() {
+                        return Outcome::Cancelled(asupersync::CancelReason::user(
+                            "request cancelled before concurrent admission",
+                        ));
+                    }
+                    yield_once().await;
+                }
+
+                if label == "cancelled" {
+                    loop {
+                        if ctx.checkpoint().is_err() || request_cx.is_cancel_requested() {
+                            return Outcome::Cancelled(asupersync::CancelReason::user(
+                                "request cancellation observed by child Cx",
+                            ));
+                        }
+                        yield_once().await;
+                    }
+                }
+
+                if ctx.checkpoint().is_err() || request_cx.is_cancel_requested() {
+                    return Outcome::Cancelled(asupersync::CancelReason::user(
+                        "request cancelled before completion",
+                    ));
+                }
+                self.completed
+                    .lock()
+                    .expect("completion probe lock is not poisoned")
+                    .push(label.clone());
+                Outcome::Ok(vec![Content::text(label)])
+            })
         }
     }
 
@@ -8027,6 +8536,133 @@ mod router_tests {
             serde_json::to_vec(&router.tools()).expect("catalog serializes"),
             catalog_before,
             "typed refusal cannot mutate the installed handler catalog"
+        );
+    }
+
+    #[test]
+    fn srv_04_modern_owned_dispatch_runs_requests_concurrently() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let mut router = Router::new();
+        router.add_tool(ConcurrentModernTool::new(
+            Arc::clone(&started),
+            Arc::clone(&completed),
+        ));
+        let router = Arc::new(router);
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("the test runtime is available");
+        let runtime_handle = runtime.handle();
+        let mut first = spawn_owned_modern_request(
+            &runtime_handle,
+            Arc::clone(&router),
+            401,
+            "modern-one",
+            "one",
+            None,
+        );
+        let mut second =
+            spawn_owned_modern_request(&runtime_handle, router, 402, "modern-two", "two", None);
+
+        let (first, second) = runtime.block_on(async {
+            let cx = Cx::current().expect("block_on installs an observer context");
+            let first = first
+                .recv(&cx)
+                .await
+                .expect("the first owner reports a terminal result");
+            let second = second
+                .recv(&cx)
+                .await
+                .expect("the second owner reports a terminal result");
+            (first, second)
+        });
+        let first = first.expect("the first modern request completes");
+        let second = second.expect("the second modern request completes");
+
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            first.get("resultType"),
+            Some(&serde_json::json!("complete"))
+        );
+        assert_eq!(
+            second.get("resultType"),
+            Some(&serde_json::json!("complete"))
+        );
+        let mut completed = completed
+            .lock()
+            .expect("completion probe lock is not poisoned")
+            .clone();
+        completed.sort();
+        assert_eq!(completed, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    #[test]
+    fn srv_04_modern_owned_cancellation_does_not_change_sibling() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let mut router = Router::new();
+        router.add_tool(ConcurrentModernTool::new(
+            Arc::clone(&started),
+            Arc::clone(&completed),
+        ));
+        let router = Arc::new(router);
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("the test runtime is available");
+        let runtime_handle = runtime.handle();
+        let (cancel_control_sender, mut cancel_control) = oneshot::channel();
+        let mut cancelled = spawn_owned_modern_request(
+            &runtime_handle,
+            Arc::clone(&router),
+            403,
+            "modern-cancelled",
+            "cancelled",
+            Some(cancel_control_sender),
+        );
+        let mut sibling = spawn_owned_modern_request(
+            &runtime_handle,
+            router,
+            404,
+            "modern-sibling",
+            "sibling",
+            None,
+        );
+
+        let (cancelled, sibling) = runtime.block_on(async {
+            let observer_cx = Cx::current().expect("block_on installs an observer context");
+            let cancelled_cx = cancel_control
+                .recv(&observer_cx)
+                .await
+                .expect("the request owner exposes its cancellation context");
+            while started.load(Ordering::SeqCst) < 2 {
+                yield_once().await;
+            }
+            cancelled_cx.cancel_with(CancelKind::User, Some("test single-request cancellation"));
+            let cancelled = cancelled
+                .recv(&observer_cx)
+                .await
+                .expect("the cancelled owner reports a terminal result");
+            let sibling = sibling
+                .recv(&observer_cx)
+                .await
+                .expect("the sibling owner reports a terminal result");
+            (cancelled, sibling)
+        });
+
+        let cancelled = cancelled.expect_err("only the selected request is cancelled");
+        assert_eq!(cancelled.code, McpErrorCode::RequestCancelled);
+        let sibling = sibling.expect("the sibling completes despite peer cancellation");
+        assert_eq!(
+            sibling.get("resultType"),
+            Some(&serde_json::json!("complete"))
+        );
+        assert_eq!(
+            completed
+                .lock()
+                .expect("completion probe lock is not poisoned")
+                .as_slice(),
+            ["sibling"],
+            "cancelling one request cannot add, remove, or alter sibling completion"
         );
     }
 

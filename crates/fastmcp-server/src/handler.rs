@@ -15,6 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use asupersync::Cx;
 use fastmcp_core::{
     McpContext, McpError, McpOutcome, McpResult, NotificationSender, Outcome, ProgressReporter,
     SessionState,
@@ -384,6 +385,22 @@ pub trait ToolHandler: Send + Sync {
             }
         })
     }
+
+    /// Calls the tool from a request-owned structured child.
+    ///
+    /// Modern router dispatch supplies the child [`Cx`] that owns this handler
+    /// invocation. Implementations that spawn or otherwise coordinate nested
+    /// work must use this context so cancellation and completion remain within
+    /// the request's structured lifetime. Existing handlers keep their exact
+    /// behavior through the default delegation to [`Self::call_async`].
+    fn call_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        self.call_async(ctx, arguments)
+    }
 }
 
 /// Handler for a resource.
@@ -503,6 +520,22 @@ pub trait ResourceHandler: Send + Sync {
             }
         })
     }
+
+    /// Reads the resource from a request-owned structured child.
+    ///
+    /// Modern router dispatch supplies the child [`Cx`] that owns this read.
+    /// Implementations with nested asynchronous work must retain this context
+    /// rather than creating detached work. Existing handlers preserve their
+    /// exact behavior through the default delegation.
+    fn read_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+        self.read_async_with_uri(ctx, uri, params)
+    }
 }
 
 /// Handler for a prompt.
@@ -588,6 +621,20 @@ pub trait PromptHandler: Send + Sync {
             }
         })
     }
+
+    /// Gets the prompt from a request-owned structured child.
+    ///
+    /// Modern router dispatch supplies the child [`Cx`] that owns this prompt
+    /// evaluation. Existing handlers preserve their exact behavior through the
+    /// default delegation to [`Self::get_async`].
+    fn get_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
+        self.get_async(ctx, arguments)
+    }
 }
 
 /// A boxed tool handler.
@@ -662,6 +709,15 @@ impl ToolHandler for MountedToolHandler {
         arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
         self.inner.call_async(ctx, arguments)
+    }
+
+    fn call_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        self.inner.call_async_in_request(ctx, request_cx, arguments)
     }
 }
 
@@ -818,6 +874,25 @@ impl ResourceHandler for MountedResourceHandler {
                 .map(|contents| self.translate_outgoing_contents(contents))
         })
     }
+
+    fn read_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+        Box::pin(async move {
+            let source_uri = match self.translate_incoming_uri(uri) {
+                Ok(source_uri) => source_uri,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.inner
+                .read_async_with_uri_in_request(ctx, request_cx, &source_uri, params)
+                .await
+                .map(|contents| self.translate_outgoing_contents(contents))
+        })
+    }
 }
 
 /// A wrapper for a prompt handler that overrides its name.
@@ -875,6 +950,15 @@ impl PromptHandler for MountedPromptHandler {
         arguments: std::collections::HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
         self.inner.get_async(ctx, arguments)
+    }
+
+    fn get_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
+        self.inner.get_async_in_request(ctx, request_cx, arguments)
     }
 }
 
