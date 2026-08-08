@@ -1,6 +1,11 @@
 //! Client session state.
 
 use fastmcp_core::CanonicalHttpUrl;
+use fastmcp_protocol::extensions::{
+    ExtensionSettings, ExtensionSettingsResolution, McpAppsClientSettings,
+    official_mcp_apps_descriptor, official_mcp_apps_extension_id,
+    resolve_official_mcp_apps_settings,
+};
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
     ProtocolVersionError,
@@ -159,6 +164,10 @@ pub struct ClientSession {
     /// the typed result keeps those final-only fields available without
     /// projecting them onto the legacy capability shape.
     server_discovery: Option<ServerDiscoverResult>,
+    /// Local MCP Apps settings selected before connection.
+    mcp_apps_settings: Option<McpAppsClientSettings>,
+    /// Whether the final server discovery admitted an active MCP Apps bridge.
+    mcp_apps_active: bool,
     /// Negotiated protocol version.
     protocol_version: String,
     /// Immutable era selected from the successful handshake.
@@ -222,6 +231,8 @@ impl ClientSession {
             server_info,
             server_capabilities,
             server_discovery: None,
+            mcp_apps_settings: None,
+            mcp_apps_active: false,
             selected_era,
             protocol_version,
             // A peer-selected era must never rewrite the pre-connect policy.
@@ -256,6 +267,28 @@ impl ClientSession {
     pub(crate) fn with_server_discovery(mut self, server_discovery: ServerDiscoverResult) -> Self {
         self.server_discovery = Some(server_discovery);
         self
+    }
+
+    pub(crate) fn with_mcp_apps_settings(
+        mut self,
+        settings: Option<McpAppsClientSettings>,
+    ) -> Self {
+        self.mcp_apps_settings = settings;
+        self
+    }
+
+    pub(crate) fn set_mcp_apps_active(&mut self, active: bool) {
+        self.mcp_apps_active = active;
+    }
+
+    pub(crate) fn mcp_apps_settings(&self) -> Option<&McpAppsClientSettings> {
+        self.mcp_apps_settings.as_ref()
+    }
+
+    /// Returns whether MCP Apps was bilaterally activated during final discovery.
+    #[must_use]
+    pub const fn mcp_apps_active(&self) -> bool {
+        self.mcp_apps_active
     }
 
     pub(crate) fn set_protocol_plan(&mut self, protocol_plan: ClientProtocolPlan) {
@@ -336,9 +369,78 @@ impl ClientSession {
     }
 }
 
+/// Resolves the official Apps settings from a final discovery reply.
+///
+/// Absent or incompatible peer settings deliberately leave Apps inactive. The
+/// public protocol decoder has already bounded the discovery capability shape;
+/// this helper only interprets the registered official descriptor.
+pub(crate) fn resolve_mcp_apps_activation(
+    client_settings: Option<&McpAppsClientSettings>,
+    discovery: &ServerDiscoverResult,
+) -> bool {
+    let Some(client_settings) = client_settings else {
+        return false;
+    };
+    let Ok(capabilities) = serde_json::to_value(discovery.capabilities()) else {
+        return false;
+    };
+    let Some(server_settings) = capabilities
+        .get("extensions")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|extensions| extensions.get(official_mcp_apps_extension_id().as_str()))
+        .cloned()
+    else {
+        return false;
+    };
+    let Ok(server_settings) = ExtensionSettings::new(server_settings) else {
+        return false;
+    };
+    matches!(
+        resolve_official_mcp_apps_settings(
+            &official_mcp_apps_descriptor(),
+            &client_settings.to_extension_settings(),
+            &server_settings,
+        ),
+        Ok(ExtensionSettingsResolution::Active(_))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn apps_discovery(server_settings: serde_json::Value) -> ServerDiscoverResult {
+        serde_json::from_value(serde_json::json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {
+                "extensions": {
+                    "io.modelcontextprotocol/ui": server_settings
+                }
+            },
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {"name": "apps-server", "version": "1.0"}
+            },
+            "ttlMs": 0,
+            "cacheScope": "private"
+        }))
+        .expect("valid final Apps discovery reply")
+    }
+
+    #[test]
+    fn mcp_apps_activation_requires_html_mime_with_the_same_server_marker() {
+        let discovery = apps_discovery(serde_json::json!({}));
+        let active = McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+            .expect("valid Apps MIME settings");
+        let inactive = McpAppsClientSettings::new(vec!["text/html".to_owned()])
+            .expect("valid non-Apps MIME settings");
+
+        assert!(resolve_mcp_apps_activation(Some(&active), &discovery));
+        assert!(
+            !resolve_mcp_apps_activation(Some(&inactive), &discovery),
+            "only the advertised Apps HTML MIME differs"
+        );
+    }
     use fastmcp_protocol::protocol_policy::{LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION};
     use fastmcp_protocol::{PromptsCapability, ResourcesCapability, ToolsCapability};
 

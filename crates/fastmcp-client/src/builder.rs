@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult, block_on};
+use fastmcp_protocol::extensions::McpAppsClientSettings;
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::StdioTransport;
@@ -66,6 +67,8 @@ pub struct ClientBuilder {
     inherit_env: bool,
     /// Client capabilities to advertise.
     capabilities: ClientCapabilities,
+    /// Optional official MCP Apps client settings for final discovery.
+    mcp_apps_settings: Option<McpAppsClientSettings>,
     /// Whether to defer initialization until first use.
     auto_initialize: bool,
     /// Whether the subprocess must be isolated in an owned Unix process group.
@@ -89,6 +92,7 @@ impl std::fmt::Debug for ClientBuilder {
                 &self.capabilities.elicitation.is_some(),
             )
             .field("roots_capability", &self.capabilities.roots.is_some())
+            .field("mcp_apps_configured", &self.mcp_apps_settings.is_some())
             .field("auto_initialize", &self.auto_initialize)
             .field("owned_process_group", &self.owned_process_group)
             .finish()
@@ -122,6 +126,7 @@ impl ClientBuilder {
             env_vars: HashMap::new(),
             inherit_env: true,
             capabilities: ClientCapabilities::default(),
+            mcp_apps_settings: None,
             auto_initialize: false,
             owned_process_group: false,
             protocol_plan: ClientProtocolPlan::stdio(
@@ -231,6 +236,17 @@ impl ClientBuilder {
         self
     }
 
+    /// Configures the official MCP Apps MIME types advertised during final discovery.
+    ///
+    /// Apps can activate only on a final MCP connection when the server also
+    /// advertises its exact empty Apps marker. Exact legacy routes neither
+    /// advertise nor activate these settings.
+    #[must_use]
+    pub fn mcp_apps(mut self, settings: McpAppsClientSettings) -> Self {
+        self.mcp_apps_settings = Some(settings);
+        self
+    }
+
     /// Enables auto-initialization mode.
     ///
     /// When enabled, the client defers the MCP initialization handshake until
@@ -330,8 +346,14 @@ impl ClientBuilder {
         self,
         cx: &Cx,
     ) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
-        ClientHttpConnection::connect(cx, self.protocol_plan, self.client_info, self.capabilities)
-            .await
+        ClientHttpConnection::connect_with_mcp_apps(
+            cx,
+            self.protocol_plan,
+            self.client_info,
+            self.capabilities,
+            self.mcp_apps_settings,
+        )
+        .await
     }
 
     /// Connects a ready high-level HTTP client using the current capability context.
@@ -351,7 +373,14 @@ impl ClientBuilder {
     /// are ready only after `initialize` and `notifications/initialized` have
     /// both completed on the admitted legacy routes.
     pub async fn connect_http_client_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
-        HttpClient::connect(cx, self.protocol_plan, self.client_info, self.capabilities).await
+        HttpClient::connect_with_mcp_apps(
+            cx,
+            self.protocol_plan,
+            self.client_info,
+            self.capabilities,
+            self.mcp_apps_settings,
+        )
+        .await
     }
 
     /// Connects to a server via stdio subprocess.
@@ -614,6 +643,7 @@ impl ClientBuilder {
             },
             fastmcp_protocol::ServerCapabilities::default(),
         )
+        .with_mcp_apps_settings(self.mcp_apps_settings.clone())
         .with_protocol_plan(protocol_plan);
 
         Client::from_parts_uninitialized_with_ownership(
@@ -664,6 +694,45 @@ mod tests {
     use super::*;
     use fastmcp_core::McpErrorCode;
 
+    #[cfg(unix)]
+    fn auto_legacy_lifecycle_script(discovery_error_code: i32) -> String {
+        format!(
+            "IFS= read -r first || exit 1; \\
+             case \"$first\" in \\
+             *server/discover*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":{discovery_error_code},\"message\":\"final discovery unavailable\"}}}}' ;; \\
+             *initialize*2024-11-05*) \\
+             case \"$first\" in *io.modelcontextprotocol/ui*|*_meta*) exit 1 ;; esac; \\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"builder-auto-legacy\",\"version\":\"1.0.0\"}}}}}}'; \\
+             IFS= read -r lifecycle || exit 1; \\
+             case \"$lifecycle\" in *notifications/initialized*) case \"$lifecycle\" in *io.modelcontextprotocol/ui*|*_meta*) exit 1 ;; esac ;; *) exit 1 ;; esac; \\
+             IFS= read -r request || exit 1; \\
+             case \"$request\" in *ping*) case \"$request\" in *io.modelcontextprotocol/ui*|*_meta*) exit 1 ;; esac; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac ;; \\
+             *) exit 1 ;; esac; \\
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_apps_lifecycle_script(server_advertises_apps: bool) -> String {
+        let discovery_result = if server_advertises_apps {
+            r#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"builder-modern-apps","version":"1.0.0"}}}}"#
+        } else {
+            r#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"builder-modern-apps","version":"1.0.0"}}}}"#
+        };
+        let ping_case = if server_advertises_apps {
+            "*ping*io.modelcontextprotocol/ui*)"
+        } else {
+            "*ping*io.modelcontextprotocol/ui*) exit 1 ;; *ping*)"
+        };
+        format!(
+            "IFS= read -r discover || exit 1; \\
+             case \"$discover\" in *server/discover*io.modelcontextprotocol/ui*) printf '%s\\n' '{discovery_result}' ;; *) exit 1 ;; esac; \\
+             IFS= read -r ping || exit 1; \\
+             case \"$ping\" in {ping_case} printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \\
+             exec sleep 2"
+        )
+    }
+
     #[test]
     fn test_builder_defaults() {
         let builder = ClientBuilder::new();
@@ -676,6 +745,14 @@ mod tests {
         assert!(builder.env_vars.is_empty());
         assert!(!builder.auto_initialize);
         assert!(!builder.owned_process_group);
+    }
+
+    #[test]
+    fn builder_retains_public_mcp_apps_configuration() {
+        let settings = McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+            .expect("valid Apps MIME settings");
+        let builder = ClientBuilder::new().mcp_apps(settings.clone());
+        assert_eq!(builder.mcp_apps_settings, Some(settings));
     }
 
     #[test]
@@ -913,6 +990,96 @@ mod tests {
             Some(serde_json::json!({"timeoutSource": "idle"}))
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_builder_auto_with_configured_apps_falls_back_without_legacy_metadata_leak() {
+        let script = auto_legacy_lifecycle_script(-32601);
+        let mut client = ClientBuilder::new()
+            .mcp_apps(
+                McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                    .expect("valid Apps MIME settings"),
+            )
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::Auto))
+            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
+            .expect("recognized discovery refusal starts a fresh exact legacy client");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        );
+        client
+            .ping()
+            .expect("the public builder returns a usable Auto-selected legacy client");
+        client.close().expect("Auto-selected legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_builder_auto_with_configured_apps_rejects_only_an_unsupported_final_discovery_error()
+    {
+        let script = auto_legacy_lifecycle_script(-32022);
+        let builder = ClientBuilder::new()
+            .mcp_apps(
+                McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                    .expect("valid Apps MIME settings"),
+            )
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::Auto));
+        let state_before_connect = builder.selected_protocol_plan().clone();
+
+        let error = match builder.clone().connect_stdio_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            &Cx::for_request(),
+        ) {
+            Ok(_) => panic!("changing only the discovery error must not authorize legacy fallback"),
+            Err(error) => error,
+        };
+
+        assert!(error.message.contains("final discovery unavailable"));
+        assert_eq!(builder.selected_protocol_plan(), &state_before_connect);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_builder_advertises_configured_apps_after_active_modern_discovery() {
+        let script = modern_apps_lifecycle_script(true);
+        let mut client = ClientBuilder::new()
+            .mcp_apps(
+                McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                    .expect("valid Apps MIME settings"),
+            )
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
+            .expect("active modern discovery initializes the public Apps client");
+
+        assert!(client.mcp_apps_active());
+        client
+            .ping()
+            .expect("active Apps negotiation advertises Apps on the public request path");
+        client.close().expect("active Apps client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_builder_omits_configured_apps_after_one_field_inactive_modern_discovery() {
+        let script = modern_apps_lifecycle_script(false);
+        let mut client = ClientBuilder::new()
+            .mcp_apps(
+                McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                    .expect("valid Apps MIME settings"),
+            )
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
+            .expect("one missing server Apps declaration initializes modern inactive Apps state");
+
+        assert!(!client.mcp_apps_active());
+        client
+            .ping()
+            .expect("inactive Apps negotiation omits Apps on the public request path");
+        client.close().expect("inactive Apps client cleanup");
     }
 
     #[test]

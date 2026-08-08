@@ -56,6 +56,7 @@ pub use execution::{
 };
 pub use fastmcp_core::CanonicalHttpUrl;
 pub use fastmcp_protocol::common_types::LoggingLevel;
+pub use fastmcp_protocol::extensions::McpAppsClientSettings;
 pub use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, HttpModernProbe, HttpProbeBody, ProtocolEra,
     ProtocolPolicy, ProtocolVersion,
@@ -140,6 +141,8 @@ use fastmcp_protocol::{
     ServerExtensionDiscovery,
 };
 use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
+
+use crate::session::resolve_mcp_apps_activation;
 
 /// Callback for receiving progress notifications during tool execution.
 ///
@@ -3597,11 +3600,22 @@ impl HttpClient {
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
     ) -> Result<Self, HttpClientError> {
-        let mut connection = ClientHttpConnection::connect(
+        Self::connect_with_mcp_apps(cx, protocol_plan, client_info, client_capabilities, None).await
+    }
+
+    pub(crate) async fn connect_with_mcp_apps(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        mcp_apps_settings: Option<McpAppsClientSettings>,
+    ) -> Result<Self, HttpClientError> {
+        let mut connection = ClientHttpConnection::connect_with_mcp_apps(
             cx,
             protocol_plan,
             client_info.clone(),
             client_capabilities.clone(),
+            mcp_apps_settings,
         )
         .await
         .map_err(HttpClientError::Connection)?;
@@ -3670,6 +3684,12 @@ impl HttpClient {
     #[must_use]
     pub const fn selected_protocol_era(&self) -> ProtocolEra {
         self.connection.selected_protocol_era()
+    }
+
+    /// Returns whether final discovery activated the official MCP Apps extension.
+    #[must_use]
+    pub fn mcp_apps_active(&self) -> bool {
+        self.connection.mcp_apps_active()
     }
 
     /// Returns the immutable policy and endpoints used to create this client.
@@ -4470,6 +4490,12 @@ impl Client {
         self.session.server_info()
     }
 
+    /// Returns whether final discovery activated the official MCP Apps extension.
+    #[must_use]
+    pub const fn mcp_apps_active(&self) -> bool {
+        self.session.mcp_apps_active()
+    }
+
     /// Returns the server capabilities after initialization.
     #[must_use]
     pub fn server_capabilities(&self) -> &ServerCapabilities {
@@ -4619,7 +4645,30 @@ impl Client {
         let final_metadata = final_metadata.as_object().ok_or_else(|| {
             McpError::internal_error("Modern request metadata did not serialize as an object")
         })?;
-        metadata.extend(final_metadata.clone());
+        let mut final_metadata = final_metadata.clone();
+        let advertise_mcp_apps =
+            self.session.server_discovery().is_none() || self.session.mcp_apps_active();
+        if let Some(settings) = advertise_mcp_apps
+            .then_some(self.session.mcp_apps_settings())
+            .flatten()
+        {
+            let capabilities = final_metadata
+                .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| {
+                    McpError::internal_error("Modern request metadata omitted client capabilities")
+                })?;
+            let mut extensions = serde_json::Map::new();
+            extensions.insert(
+                fastmcp_protocol::extensions::OFFICIAL_MCP_APPS_EXTENSION_ID.to_owned(),
+                settings.to_extension_settings().into_value(),
+            );
+            capabilities.insert(
+                "extensions".to_owned(),
+                serde_json::Value::Object(extensions),
+            );
+        }
+        metadata.extend(final_metadata);
         if let Some(level) = self.final_log_level {
             metadata.insert(
                 "io.modelcontextprotocol/logLevel".to_owned(),
@@ -4681,12 +4730,16 @@ impl Client {
                     "Modern Tasks request metadata omitted final client capabilities",
                 )
             })?;
-        capabilities.insert(
-            "extensions".to_owned(),
-            serde_json::Value::Object(serde_json::Map::from_iter([(
-                fastmcp_protocol::TASKS_EXTENSION.to_owned(),
-                serde_json::json!({}),
-            )])),
+        let extensions = capabilities
+            .entry("extensions")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                McpError::internal_error("Modern Tasks client extensions must be an object")
+            })?;
+        extensions.insert(
+            fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+            serde_json::json!({}),
         );
         Ok(params)
     }
@@ -5640,8 +5693,9 @@ impl Client {
     ) -> McpResult<()> {
         let client_info = self.session.client_info().clone();
         let client_capabilities = self.session.client_capabilities().clone();
+        let mcp_apps_settings = self.session.mcp_apps_settings().cloned();
         let protocol_plan = self.session.protocol_plan().clone();
-        let session = match initialization {
+        let mut session = match initialization {
             ClientInitialization::Legacy(result) => ClientSession::try_new(
                 client_info,
                 client_capabilities,
@@ -5663,6 +5717,11 @@ impl Client {
             .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?
             .with_server_discovery(discovery),
         };
+        session = session.with_mcp_apps_settings(mcp_apps_settings);
+        let apps_active = session.server_discovery().is_some_and(|discovery| {
+            resolve_mcp_apps_activation(session.mcp_apps_settings(), discovery)
+        });
+        session.set_mcp_apps_active(apps_active);
         self.session = session.try_with_protocol_plan(protocol_plan).map_err(|_| {
             McpError::internal_error("Configured protocol policy rejects the negotiated era")
         })?;

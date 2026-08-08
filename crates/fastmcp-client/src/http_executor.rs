@@ -16,7 +16,9 @@ use asupersync::http::h1::http_client::ClientIo;
 use asupersync::http::h1::{
     ClientError, ClientStreamingResponse, HttpClient, Method, RedirectPolicy, RetryPolicy,
 };
-use fastmcp_protocol::extensions::OFFICIAL_TASKS_RESULT_DISCRIMINATOR;
+use fastmcp_protocol::extensions::{
+    McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID, OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+};
 use fastmcp_protocol::methods::{
     Final2026Direction, Final2026EnvelopeKind, PROMPTS_GET, RESOURCES_READ, SUBSCRIPTIONS_LISTEN,
     TOOLS_CALL, final_2026_07_28_method,
@@ -37,6 +39,7 @@ use fastmcp_protocol::{
     decode_strict_jsonrpc_message, task_subscription_ids,
 };
 
+use crate::session::resolve_mcp_apps_activation;
 use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError};
 use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
@@ -63,6 +66,20 @@ const MAX_LEGACY_SSE_KEEPALIVE_LINES: usize = 64;
 
 /// Maximum JSON-RPC bytes accepted from one legacy `message` SSE event.
 const MAX_LEGACY_SSE_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Maximum server notifications retained while one legacy request waits for
+/// its correlated terminal response.
+const MAX_QUEUED_LEGACY_NOTIFICATIONS: usize = 64;
+
+/// Final-only metadata keys that exact 2024-11-05 public requests must reject
+/// before opening their legacy message POST.
+const FINAL_ONLY_LEGACY_REQUEST_METADATA_KEYS: [&str; 5] = [
+    "io.modelcontextprotocol/protocolVersion",
+    "io.modelcontextprotocol/clientCapabilities",
+    "io.modelcontextprotocol/clientInfo",
+    "io.modelcontextprotocol/serverInfo",
+    "io.modelcontextprotocol/subscriptionId",
+];
 
 /// LIMIT-01's default cap for ignored RFC 9110 list elements in one
 /// `Content-Encoding` field value.
@@ -1154,6 +1171,8 @@ pub struct ModernHttpClient {
     modern_post_target: String,
     client_info: ClientInfo,
     client_capabilities: ClientCapabilities,
+    mcp_apps_settings: Option<McpAppsClientSettings>,
+    mcp_apps_active: bool,
     server_discovery: ServerDiscoverResult,
     executor: ModernHttpExecutor,
 }
@@ -1236,6 +1255,10 @@ pub enum ClientHttpConnectionError {
         expected: RequestId,
         actual: Option<RequestId>,
     },
+    /// A public legacy request attempted to carry final-only metadata.
+    LegacyFinalMetadata { member: &'static str },
+    /// Too many interleaved legacy notifications accumulated before a response.
+    LegacyNotificationQueueFull,
     /// A convenience request expected a finite JSON response but received a
     /// different admitted modern body lane.
     ExpectedJsonResponse { actual: ModernHttpResponseKind },
@@ -1287,6 +1310,13 @@ impl fmt::Display for ClientHttpConnectionError {
                     "legacy SSE response ID {actual:?} did not match request {expected:?}"
                 )
             }
+            Self::LegacyFinalMetadata { member } => write!(
+                formatter,
+                "exact legacy request cannot carry final-only metadata member {member}"
+            ),
+            Self::LegacyNotificationQueueFull => formatter.write_str(
+                "legacy request received too many interleaved notifications before its response",
+            ),
             Self::ExpectedJsonResponse { actual } => write!(
                 formatter,
                 "HTTP request expected a JSON response but received {actual:?}"
@@ -1329,6 +1359,8 @@ impl std::error::Error for ClientHttpConnectionError {
             Self::LegacyResponseStreamEnded { .. }
             | Self::LegacyUnexpectedMessage { .. }
             | Self::LegacyResponseIdMismatch { .. }
+            | Self::LegacyFinalMetadata { .. }
+            | Self::LegacyNotificationQueueFull
             | Self::ExpectedJsonResponse { .. }
             | Self::UnexpectedResponseMessage { .. }
             | Self::ResponseIdMismatch { .. }
@@ -1351,9 +1383,25 @@ impl ClientHttpConnection {
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
     ) -> Result<Self, ClientHttpConnectionError> {
-        match ModernHttpClient::connect(cx, protocol_plan, client_info, client_capabilities)
-            .await
-            .map_err(ClientHttpConnectionError::Modern)?
+        Self::connect_with_mcp_apps(cx, protocol_plan, client_info, client_capabilities, None).await
+    }
+
+    pub(crate) async fn connect_with_mcp_apps(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        mcp_apps_settings: Option<McpAppsClientSettings>,
+    ) -> Result<Self, ClientHttpConnectionError> {
+        match ModernHttpClient::connect_with_mcp_apps(
+            cx,
+            protocol_plan,
+            client_info,
+            client_capabilities,
+            mcp_apps_settings,
+        )
+        .await
+        .map_err(ClientHttpConnectionError::Modern)?
         {
             ModernHttpConnectOutcome::Modern(client) => Ok(Self::Modern(client)),
             ModernHttpConnectOutcome::LegacySse(client) => Ok(Self::LegacySse(client)),
@@ -1390,11 +1438,31 @@ impl ClientHttpConnection {
         }
     }
 
+    /// Returns whether final discovery activated the official MCP Apps extension.
+    #[must_use]
+    pub fn mcp_apps_active(&self) -> bool {
+        match self {
+            Self::Modern(client) => client.mcp_apps_active(),
+            Self::LegacySse(_) => false,
+        }
+    }
+
+    /// Pops the oldest server notification interleaved before a legacy request response.
+    ///
+    /// Modern stateless HTTP bodies do not share this legacy SSE queue.
+    #[must_use]
+    pub fn take_legacy_notification(&mut self) -> Option<JsonRpcRequest> {
+        match self {
+            Self::Modern(_) => None,
+            Self::LegacySse(client) => client.take_notification(),
+        }
+    }
+
     /// Sends one active client request through the selected transport.
     ///
     /// Modern requests execute as one stateless final POST. Exact legacy
-    /// requests are posted to the pinned endpoint and then require the next
-    /// SSE envelope to be the response with this exact request ID.
+    /// requests are posted to the pinned endpoint, queue interleaved server
+    /// notifications, and await the response with this exact request ID.
     pub async fn request(
         &mut self,
         cx: &Cx,
@@ -1410,30 +1478,46 @@ impl ClientHttpConnection {
                 .map(ClientHttpResponse::Modern)
                 .map_err(ClientHttpConnectionError::Modern),
             Self::LegacySse(client) => {
+                reject_final_only_legacy_request_metadata(&parameters)?;
                 let request = JsonRpcRequest::new(method, Some(parameters), request_id.clone());
                 client
                     .send(cx, &JsonRpcMessage::Request(request))
                     .await
                     .map_err(ClientHttpConnectionError::Legacy)?;
-                let message = client
-                    .next_message(cx)
-                    .await
-                    .map_err(ClientHttpConnectionError::Legacy)?;
-                let message = message.ok_or_else(|| {
-                    ClientHttpConnectionError::LegacyResponseStreamEnded {
-                        request_id: request_id.clone(),
+                loop {
+                    let message = client
+                        .next_message(cx)
+                        .await
+                        .map_err(ClientHttpConnectionError::Legacy)?;
+                    let message = message.ok_or_else(|| {
+                        ClientHttpConnectionError::LegacyResponseStreamEnded {
+                            request_id: request_id.clone(),
+                        }
+                    })?;
+                    match message {
+                        JsonRpcMessage::Request(notification) if notification.is_notification() => {
+                            client.queue_notification(notification).map_err(|_| {
+                                ClientHttpConnectionError::LegacyNotificationQueueFull
+                            })?;
+                        }
+                        JsonRpcMessage::Request(_) => {
+                            return Err(ClientHttpConnectionError::LegacyUnexpectedMessage {
+                                request_id,
+                            });
+                        }
+                        JsonRpcMessage::Response(response) => {
+                            if response.id.as_ref() != Some(&request_id) {
+                                return Err(ClientHttpConnectionError::LegacyResponseIdMismatch {
+                                    expected: request_id,
+                                    actual: response.id,
+                                });
+                            }
+                            return Ok(ClientHttpResponse::Legacy(JsonRpcMessage::Response(
+                                response,
+                            )));
+                        }
                     }
-                })?;
-                let JsonRpcMessage::Response(response) = &message else {
-                    return Err(ClientHttpConnectionError::LegacyUnexpectedMessage { request_id });
-                };
-                if response.id.as_ref() != Some(&request_id) {
-                    return Err(ClientHttpConnectionError::LegacyResponseIdMismatch {
-                        expected: request_id,
-                        actual: response.id.clone(),
-                    });
                 }
-                Ok(ClientHttpResponse::Legacy(message))
             }
         }
     }
@@ -1585,6 +1669,26 @@ impl ClientHttpConnection {
                 .map_err(ClientHttpConnectionError::Legacy),
         }
     }
+}
+
+fn reject_final_only_legacy_request_metadata(
+    parameters: &serde_json::Value,
+) -> Result<(), ClientHttpConnectionError> {
+    let Some(metadata) = parameters
+        .as_object()
+        .and_then(|parameters| parameters.get("_meta"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(());
+    };
+    let Some(member) = FINAL_ONLY_LEGACY_REQUEST_METADATA_KEYS
+        .iter()
+        .copied()
+        .find(|member| metadata.contains_key(*member))
+    else {
+        return Ok(());
+    };
+    Err(ClientHttpConnectionError::LegacyFinalMetadata { member })
 }
 
 /// Errors raised while connecting or issuing a policy-bound modern HTTP request.
@@ -1761,6 +1865,16 @@ impl ModernHttpClient {
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
     ) -> Result<ModernHttpConnectOutcome, ModernHttpClientError> {
+        Self::connect_with_mcp_apps(cx, protocol_plan, client_info, client_capabilities, None).await
+    }
+
+    pub(crate) async fn connect_with_mcp_apps(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        mcp_apps_settings: Option<McpAppsClientSettings>,
+    ) -> Result<ModernHttpConnectOutcome, ModernHttpClientError> {
         if cx.checkpoint().is_err() {
             return Err(ModernHttpClientError::Executor(
                 ModernHttpExecutorError::Cancelled,
@@ -1779,13 +1893,15 @@ impl ModernHttpClient {
             .to_owned();
         let mut negotiation = ClientHttpNegotiation::from_protocol_plan(&protocol_plan)
             .map_err(ModernHttpClientError::Negotiation)?;
-        let probe_request = build_modern_request(
+        let client_extensions = mcp_apps_client_extensions(mcp_apps_settings.as_ref());
+        let probe_request = build_modern_request_with_extensions(
             &modern_post_target,
             &client_info,
             &client_capabilities,
             SERVER_DISCOVER,
             serde_json::json!({}),
             Some(RequestId::Number(1)),
+            client_extensions.as_ref(),
         )?;
 
         let probe_response = ModernHttpExecutor::new()
@@ -1808,11 +1924,15 @@ impl ModernHttpClient {
         {
             ClientHttpNegotiationDecision::ModernSelected => {
                 let server_discovery = decode_modern_discovery_response(&probe_body)?;
+                let mcp_apps_active =
+                    resolve_mcp_apps_activation(mcp_apps_settings.as_ref(), &server_discovery);
                 Ok(ModernHttpConnectOutcome::Modern(Self {
                     protocol_plan,
                     modern_post_target,
                     client_info,
                     client_capabilities,
+                    mcp_apps_settings,
+                    mcp_apps_active,
                     server_discovery,
                     executor: ModernHttpExecutor::new(),
                 }))
@@ -1844,6 +1964,18 @@ impl ModernHttpClient {
         &self.server_discovery
     }
 
+    /// Returns whether final discovery activated the official MCP Apps extension.
+    #[must_use]
+    pub const fn mcp_apps_active(&self) -> bool {
+        self.mcp_apps_active
+    }
+
+    fn active_mcp_apps_settings(&self) -> Option<&McpAppsClientSettings> {
+        self.mcp_apps_active
+            .then_some(self.mcp_apps_settings.as_ref())
+            .flatten()
+    }
+
     /// Issues one modern JSON-RPC request through the native HTTP executor.
     ///
     /// The runtime overwrites the final metadata keys in `_meta` from its
@@ -1857,13 +1989,15 @@ impl ModernHttpClient {
         parameters: serde_json::Value,
         request_id: Option<RequestId>,
     ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
-        let request = build_modern_request(
+        let client_extensions = merge_client_extensions(self.active_mcp_apps_settings(), None);
+        let request = build_modern_request_with_extensions(
             &self.modern_post_target,
             &self.client_info,
             &self.client_capabilities,
             method.as_ref(),
             parameters,
             request_id,
+            client_extensions.as_ref(),
         )?;
         self.executor
             .execute(cx, &request)
@@ -1904,6 +2038,8 @@ impl ModernHttpClient {
         } else {
             None
         };
+        let client_extensions =
+            merge_client_extensions(self.active_mcp_apps_settings(), client_extensions.as_ref());
         let request = build_modern_request_with_extensions(
             &self.modern_post_target,
             &self.client_info,
@@ -1950,10 +2086,12 @@ impl ModernHttpClient {
         let core_request =
             CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&parameters))
                 .map_err(ModernHttpClientError::TypedResult)?;
-        let client_extensions = BTreeMap::from([(
+        let task_extensions = BTreeMap::from([(
             fastmcp_protocol::TASKS_EXTENSION.to_owned(),
             serde_json::json!({}),
         )]);
+        let client_extensions =
+            merge_client_extensions(self.active_mcp_apps_settings(), Some(&task_extensions));
         let request = build_modern_request_with_extensions(
             &self.modern_post_target,
             &self.client_info,
@@ -1961,7 +2099,7 @@ impl ModernHttpClient {
             TOOLS_CALL,
             parameters,
             Some(request_id.clone()),
-            Some(&client_extensions),
+            client_extensions.as_ref(),
         )?;
         let response = self
             .executor
@@ -2015,6 +2153,7 @@ pub struct LegacySseHttpClient {
     advertised_message_post_target: String,
     post_client: HttpClient,
     stream: LegacySseResponseStream,
+    notifications: VecDeque<JsonRpcRequest>,
 }
 
 /// Admits an advertised legacy message endpoint against the configured one.
@@ -2163,6 +2302,7 @@ impl LegacySseHttpClient {
             advertised_message_post_target,
             post_client: native_http_client(),
             stream,
+            notifications: VecDeque::new(),
         })
     }
 
@@ -2182,6 +2322,21 @@ impl LegacySseHttpClient {
     #[must_use]
     pub fn advertised_message_post_target(&self) -> &str {
         &self.advertised_message_post_target
+    }
+
+    /// Pops the oldest notification received while an owning request awaited
+    /// its correlated response.
+    #[must_use]
+    pub fn take_notification(&mut self) -> Option<JsonRpcRequest> {
+        self.notifications.pop_front()
+    }
+
+    fn queue_notification(&mut self, notification: JsonRpcRequest) -> Result<(), ()> {
+        if self.notifications.len() >= MAX_QUEUED_LEGACY_NOTIFICATIONS {
+            return Err(());
+        }
+        self.notifications.push_back(notification);
+        Ok(())
     }
 
     /// Sends one legacy JSON-RPC envelope to the validated advertised POST URL.
@@ -2671,6 +2826,32 @@ fn build_modern_request(
     )
 }
 
+fn mcp_apps_client_extensions(
+    settings: Option<&McpAppsClientSettings>,
+) -> Option<BTreeMap<String, serde_json::Value>> {
+    settings.map(|settings| {
+        BTreeMap::from([(
+            OFFICIAL_MCP_APPS_EXTENSION_ID.to_owned(),
+            settings.to_extension_settings().into_value(),
+        )])
+    })
+}
+
+fn merge_client_extensions(
+    mcp_apps_settings: Option<&McpAppsClientSettings>,
+    per_call_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+) -> Option<BTreeMap<String, serde_json::Value>> {
+    let mut merged = mcp_apps_client_extensions(mcp_apps_settings).unwrap_or_default();
+    if let Some(per_call_extensions) = per_call_extensions {
+        for (extension_id, settings) in per_call_extensions {
+            merged
+                .entry(extension_id.clone())
+                .or_insert_with(|| settings.clone());
+        }
+    }
+    (!merged.is_empty()).then_some(merged)
+}
+
 fn build_modern_request_with_extensions(
     target: &str,
     client_info: &ClientInfo,
@@ -2944,6 +3125,7 @@ mod tests {
 
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
+    use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
     use fastmcp_protocol::{
         ClientCapabilities, ClientInfo, RequestId, ServerNotification, SubscriptionFilter,
     };
@@ -2953,7 +3135,7 @@ mod tests {
         MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpClientError,
         ModernHttpExecutorError, ModernHttpResponseKind, ModernHttpSubscriptionListenCollector,
         ModernHttpSubscriptionListenError, decode_modern_discovery_response,
-        validate_response_head,
+        merge_client_extensions, validate_response_head,
     };
     use crate::sse::SseLimits;
     use crate::{
@@ -2972,6 +3154,147 @@ mod tests {
             .build()
             .expect("native HTTP test runtime must build")
             .block_on(future)
+    }
+
+    #[test]
+    fn modern_http_merges_configured_apps_and_per_call_tasks_extensions() {
+        let apps = McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+            .expect("valid Apps MIME settings");
+        let tasks = BTreeMap::from([(
+            fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+            serde_json::json!({}),
+        )]);
+
+        let merged = merge_client_extensions(Some(&apps), Some(&tasks))
+            .expect("Apps and Tasks produce one extension map");
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged.get(fastmcp_protocol::extensions::OFFICIAL_MCP_APPS_EXTENSION_ID),
+            Some(&serde_json::json!({
+                "mimeTypes": ["text/html;profile=mcp-app"]
+            }))
+        );
+        assert_eq!(
+            merged.get(fastmcp_protocol::TASKS_EXTENSION),
+            Some(&serde_json::json!({}))
+        );
+    }
+
+    #[test]
+    fn modern_http_configured_apps_settings_win_over_a_one_field_per_call_collision() {
+        let apps = McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+            .expect("valid Apps MIME settings");
+        let conflicting_apps = BTreeMap::from([(
+            OFFICIAL_MCP_APPS_EXTENSION_ID.to_owned(),
+            serde_json::json!({"mimeTypes": ["text/plain"]}),
+        )]);
+
+        let merged = merge_client_extensions(Some(&apps), Some(&conflicting_apps))
+            .expect("configured Apps settings produce one extension map");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged.get(OFFICIAL_MCP_APPS_EXTENSION_ID),
+            Some(&serde_json::json!({
+                "mimeTypes": ["text/html;profile=mcp-app"]
+            }))
+        );
+    }
+
+    fn assert_public_http_apps_advertisement_after_discovery(apps_active: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local Apps listener");
+        let address = listener.local_addr().expect("read local Apps address");
+        let modern_target = format!("http://{address}/mcp");
+        let discovery_body = if apps_active {
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{\"extensions\":{\"io.modelcontextprotocol/ui\":{}}},\"ttlMs\":0,\"cacheScope\":\"private\"}}"
+        } else {
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{},\"ttlMs\":0,\"cacheScope\":\"private\"}}"
+        }
+        .to_owned();
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept Apps discovery request");
+            let probe_request = read_request(&mut probe);
+            let probe_message = serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                .expect("Apps discovery request must be JSON-RPC");
+            assert_eq!(probe_message["method"], "server/discover");
+            assert_eq!(
+                probe_message["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    [OFFICIAL_MCP_APPS_EXTENSION_ID],
+                serde_json::json!({"mimeTypes": ["text/html;profile=mcp-app"]})
+            );
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                discovery_body.as_bytes(),
+            );
+
+            let (mut ping_stream, _) = listener.accept().expect("accept Apps ping request");
+            let ping_request = read_request(&mut ping_stream);
+            let ping = serde_json::from_slice::<serde_json::Value>(&ping_request.body)
+                .expect("Apps ping request must be JSON-RPC");
+            assert_eq!(ping["id"], 2);
+            assert_eq!(ping["method"], "ping");
+            let advertised_apps =
+                ping["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    .get(OFFICIAL_MCP_APPS_EXTENSION_ID);
+            if apps_active {
+                assert_eq!(
+                    advertised_apps,
+                    Some(&serde_json::json!({
+                        "mimeTypes": ["text/html;profile=mcp-app"]
+                    }))
+                );
+            } else {
+                assert!(
+                    advertised_apps.is_none(),
+                    "inactive Apps negotiation must not advertise an extension on ordinary requests"
+                );
+            }
+            write_response(
+                &mut ping_stream,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .mcp_apps(
+                    McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                        .expect("valid Apps MIME settings"),
+                )
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("public client completes final discovery");
+        assert_eq!(connection.mcp_apps_active(), apps_active);
+        let response = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(2),
+            4_096,
+        ))
+        .expect("public client sends the negotiated Apps request");
+        assert_eq!(response.id, Some(RequestId::Number(2)));
+        server.join().expect("Apps negotiation server must join");
+    }
+
+    #[test]
+    fn public_http_connection_advertises_configured_apps_after_active_discovery() {
+        assert_public_http_apps_advertisement_after_discovery(true);
+    }
+
+    #[test]
+    fn public_http_connection_omits_configured_apps_after_one_field_inactive_discovery() {
+        assert_public_http_apps_advertisement_after_discovery(false);
     }
 
     fn plan(
@@ -4053,7 +4376,7 @@ mod tests {
             write_response(&mut initialize_post, 202, "application/json", b"");
             write_chunked_sse_event(
                 &mut sse,
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}\n\n",
             );
             finish_chunked_sse(&mut sse);
 
@@ -4093,6 +4416,119 @@ mod tests {
         assert!(client.legacy_server_capabilities().is_some());
         assert!(client.server_discovery().is_none());
         server.join().expect("Auto fallback server must join");
+    }
+
+    #[test]
+    fn public_http_client_legacy_only_completes_exact_legacy_lifecycle() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local legacy listener");
+        let address = listener
+            .local_addr()
+            .expect("read local legacy listener address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            assert!(
+                !sse_request.head.contains("MCP-Protocol-Version:"),
+                "exact legacy SSE GET must not carry final headers"
+            );
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            let (mut initialize_post, _) = listener
+                .accept()
+                .expect("accept exact legacy initialize POST");
+            let initialize_request = read_request(&mut initialize_post);
+            let initialize = serde_json::from_slice::<serde_json::Value>(&initialize_request.body)
+                .expect("legacy initialize POST must be JSON-RPC");
+            assert_eq!(initialize["id"], 1);
+            assert_eq!(initialize["method"], "initialize");
+            assert_eq!(initialize["params"]["protocolVersion"], "2024-11-05");
+            assert!(initialize["params"].get("_meta").is_none());
+            write_response(&mut initialize_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-only-server\",\"version\":\"1.0.0\"}}}\n\n",
+            );
+
+            let (mut initialized_post, _) = listener
+                .accept()
+                .expect("accept exact legacy initialized notification");
+            let initialized_request = read_request(&mut initialized_post);
+            let initialized =
+                serde_json::from_slice::<serde_json::Value>(&initialized_request.body)
+                    .expect("legacy initialized notification must be JSON-RPC");
+            assert_eq!(initialized["method"], "notifications/initialized");
+            assert!(initialized.get("id").is_none());
+            assert!(initialized.get("params").is_none());
+            write_response(&mut initialized_post, 202, "application/json", b"");
+
+            let (mut ping_post, _) = listener
+                .accept()
+                .expect("accept exact legacy post-lifecycle ping POST");
+            let ping_request = read_request(&mut ping_post);
+            assert!(
+                ping_request
+                    .head
+                    .starts_with("POST /legacy-message HTTP/1.1\r\n")
+            );
+            assert!(
+                !ping_request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n"),
+                "exact legacy request must not carry final headers"
+            );
+            let ping = serde_json::from_slice::<serde_json::Value>(&ping_request.body)
+                .expect("legacy post-lifecycle ping must be JSON-RPC");
+            assert_eq!(ping["id"], 2);
+            assert_eq!(ping["method"], "ping");
+            assert!(ping["params"].get("_meta").is_none());
+            write_response(&mut ping_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n\n",
+            );
+            finish_chunked_sse(&mut sse);
+        });
+
+        let cx = Cx::for_request();
+        let mut client = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .mcp_apps(
+                    McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                        .expect("valid Apps MIME settings"),
+                )
+                .protocol_plan(plan(
+                    "http://127.0.0.1:9/mcp",
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::LegacyOnly,
+                ))
+                .connect_http_client_with_cx(&cx),
+        )
+        .expect("legacy-only public client completes the exact lifecycle");
+        assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
+        assert_eq!(client.server_info().name, "legacy-only-server");
+        assert!(client.legacy_server_capabilities().is_some());
+        assert!(client.server_discovery().is_none());
+        assert!(!client.mcp_apps_active());
+        let response = runtime_block_on(client.connection_mut().request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(2),
+            4_096,
+        ))
+        .expect("configured Apps must not leak into a post-lifecycle legacy request");
+        assert_eq!(response.id, Some(RequestId::Number(2)));
+        server.join().expect("legacy-only server must join");
     }
 
     #[test]
@@ -4196,5 +4632,147 @@ mod tests {
             ))
         ));
         server.join().expect("contradictory peer server must join");
+    }
+
+    #[test]
+    fn public_legacy_request_queues_interleaved_notification_until_its_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local legacy listener");
+        let address = listener
+            .local_addr()
+            .expect("read local legacy listener address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            let (mut request_post, _) = listener.accept().expect("accept exact legacy POST");
+            let request = read_request(&mut request_post);
+            let request = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("legacy POST remains JSON-RPC");
+            assert_eq!(request["id"], 41);
+            assert_eq!(request["method"], "ping");
+            assert!(request["params"].get("_meta").is_none());
+            write_response(&mut request_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":1}}\n\n",
+            );
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":41,\"result\":{\"ok\":true}}\n\n",
+            );
+            finish_chunked_sse(&mut sse);
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    "http://127.0.0.1:9/mcp",
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::LegacyOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("public connection opens the exact legacy lane");
+        let response = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(41),
+            4_096,
+        ))
+        .expect("interleaved notification does not replace the correlated response");
+        assert_eq!(response.id, Some(RequestId::Number(41)));
+        let notification = connection
+            .take_legacy_notification()
+            .expect("interleaved legacy notification is retained for the caller");
+        assert!(notification.is_notification());
+        assert_eq!(notification.method, "notifications/progress");
+        assert!(connection.take_legacy_notification().is_none());
+        server.join().expect("legacy request server must join");
+    }
+
+    #[test]
+    fn public_legacy_request_rejects_only_final_metadata_without_sending_or_mutating() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local legacy listener");
+        let address = listener
+            .local_addr()
+            .expect("read local legacy listener address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            // The negative request must not create a POST. The first and only
+            // POST is the otherwise identical request after rejection.
+            let (mut request_post, _) = listener.accept().expect("accept unchanged legacy POST");
+            let request = read_request(&mut request_post);
+            let request = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("recovered legacy POST remains JSON-RPC");
+            assert_eq!(request["id"], 42);
+            assert_eq!(request["method"], "ping");
+            assert!(request["params"].get("_meta").is_none());
+            write_response(&mut request_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"ok\":true}}\n\n",
+            );
+            finish_chunked_sse(&mut sse);
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    "http://127.0.0.1:9/mcp",
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::LegacyOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("public connection opens the exact legacy lane");
+        let rejected = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({
+                "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
+            }),
+            RequestId::Number(42),
+            4_096,
+        ));
+        assert!(matches!(
+            rejected,
+            Err(ClientHttpConnectionError::LegacyFinalMetadata {
+                member: "io.modelcontextprotocol/protocolVersion"
+            })
+        ));
+
+        let response = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(42),
+            4_096,
+        ))
+        .expect("changing only final metadata leaves the legacy connection usable");
+        assert_eq!(response.id, Some(RequestId::Number(42)));
+        server.join().expect("legacy negative server must join");
     }
 }
