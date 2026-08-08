@@ -3689,23 +3689,10 @@ impl Client {
                 ))
             })
             .and_then(|params| self.with_modern_request_metadata(params))?;
-        let result: serde_json::Value = self.send_request(SERVER_DISCOVER_METHOD, params)?;
-        serde_json::from_value::<ServerDiscoverResult>(result.clone()).map_err(|_| {
-            McpError::internal_error("Invalid modern server/discover response payload")
+        let result: ServerDiscoverResult = self.send_request(SERVER_DISCOVER_METHOD, params)?;
+        let server_info = result.server_info().cloned().ok_or_else(|| {
+            McpError::internal_error("Modern server/discover response has no _meta server info")
         })?;
-        let server_info = result
-            .get("serverInfo")
-            .cloned()
-            .ok_or_else(|| {
-                McpError::internal_error("Modern server/discover response has no serverInfo")
-            })
-            .and_then(|value| {
-                serde_json::from_value(value).map_err(|_| {
-                    McpError::internal_error(
-                        "Modern server/discover response has invalid serverInfo",
-                    )
-                })
-            })?;
         Ok(InitializeResult {
             protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
             capabilities: ServerCapabilities::default(),
@@ -8156,6 +8143,32 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_discovery_response(server_name: &str, supported_versions: &[&str]) -> String {
+        let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+            &fastmcp_protocol::ServerBehaviorRegistry::default(),
+            std::collections::BTreeMap::new(),
+        )
+        .expect("an empty installed behavior registry is discoverable");
+        let result = ServerDiscoverResult::new(
+            capabilities,
+            ServerInfo {
+                name: server_name.to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let mut response = serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": 1,
+            "result": result,
+        });
+        response["result"]["supportedVersions"] = serde_json::json!(supported_versions);
+        serde_json::to_string(&response)
+            .expect("typed modern discovery response serializes deterministically")
+    }
+
+    #[cfg(unix)]
     fn legacy_public_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in *initialize*2024-11-05*) \
@@ -8171,8 +8184,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clt_01_i_positive() {
-        let modern_result = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2026-07-28\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"modern-server\",\"version\":\"1.0.0\"}}}";
-        let script = modern_public_client_script(modern_result);
+        let modern_result = modern_discovery_response("modern-server", &[MODERN_PROTOCOL_VERSION]);
+        let script = modern_public_client_script(&modern_result);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
             &["-c", script.as_str()],
@@ -8199,8 +8212,8 @@ mod tests {
         // Only the discovery result's advertised version differs from the
         // accepted modern path. A malformed modern success may not turn into
         // legacy initialization or a second execution path.
-        let legacy_advertisement = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2024-11-05\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"modern-server\",\"version\":\"1.0.0\"}}}";
-        let script = modern_public_client_script(legacy_advertisement);
+        let legacy_advertisement = modern_discovery_response("modern-server", &[PROTOCOL_VERSION]);
+        let script = modern_public_client_script(&legacy_advertisement);
         let error = Client::stdio_with_protocol_plan_with_cx(
             "sh",
             &["-c", script.as_str()],
@@ -8216,8 +8229,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clt_02_i_positive() {
-        let modern_result = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2026-07-28\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"auto-modern-server\",\"version\":\"1.0.0\"}}}";
-        let script = modern_public_client_script(modern_result);
+        let modern_result =
+            modern_discovery_response("auto-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        let script = modern_public_client_script(&modern_result);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
             &["-c", script.as_str()],
@@ -8242,8 +8256,9 @@ mod tests {
     fn clt_02_i_planted_negative() {
         // Only the discovery result's version differs from the Auto positive.
         // An invalid modern success is not an authorized fallback signal.
-        let legacy_advertisement = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2024-11-05\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"auto-modern-server\",\"version\":\"1.0.0\"}}}";
-        let script = modern_public_client_script(legacy_advertisement);
+        let legacy_advertisement =
+            modern_discovery_response("auto-modern-server", &[PROTOCOL_VERSION]);
+        let script = modern_public_client_script(&legacy_advertisement);
         let error = Client::stdio_with_protocol_plan_with_cx(
             "sh",
             &["-c", script.as_str()],
