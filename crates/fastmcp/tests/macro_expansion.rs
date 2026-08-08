@@ -23,9 +23,10 @@
 
 use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
 use fastmcp_rust::{
-    Content, Cx, JsonSchema, LabConfig, LabRuntime, McpContext, McpOutcome, McpResult, Outcome,
-    PromptHandler, PromptMessage, ResourceContent, ResourceHandler, Role, ToolHandler, prompt,
-    resource, tool,
+    CompleteResult, Content, Cx, GetPromptResult, JsonSchema, LabConfig, LabRuntime, McpContext,
+    McpError, McpOutcome, McpResult, Outcome, PromptHandler, PromptMessage, ReadResourceResult,
+    ResourceContent, ResourceHandler, ResultMeta, Role, ServerInfo, ToolHandler, prompt, resource,
+    tool,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -1110,6 +1111,63 @@ fn resource_result_ok() {
     assert_eq!(result[0].text, Some("ok".to_string()));
 }
 
+// --- Final complete resource result projection ---
+
+fn final_result_meta() -> ResultMeta {
+    ResultMeta::server_generated(ServerInfo {
+        name: "macro-expansion-test".to_string(),
+        version: "1.0.0".to_string(),
+    })
+}
+
+fn final_resource_payload(text: &str) -> CompleteResult<ReadResourceResult> {
+    CompleteResult::new(
+        ReadResourceResult {
+            contents: vec![ResourceContent {
+                uri: "final://resource/content".to_string(),
+                mime_type: Some("application/json".to_string()),
+                text: Some(text.to_string()),
+                blob: None,
+            }],
+        },
+        final_result_meta(),
+    )
+}
+
+#[resource(uri = "final://resource/direct")]
+fn final_complete_resource_direct() -> CompleteResult<ReadResourceResult> {
+    final_resource_payload("direct")
+}
+
+#[resource(uri = "final://resource/result")]
+fn final_complete_resource_result() -> Result<CompleteResult<ReadResourceResult>, McpError> {
+    Ok(final_resource_payload("result"))
+}
+
+#[resource(uri = "final://resource/mcp-result")]
+fn final_complete_resource_mcp_result() -> McpResult<CompleteResult<ReadResourceResult>> {
+    Ok(final_resource_payload("mcp-result"))
+}
+
+#[test]
+fn resource_final_complete_results_project_exact_legacy_contents() {
+    let ctx = test_ctx();
+    let handlers: [Box<dyn ResourceHandler>; 3] = [
+        Box::new(FinalCompleteResourceDirectResource),
+        Box::new(FinalCompleteResourceResultResource),
+        Box::new(FinalCompleteResourceMcpResultResource),
+    ];
+
+    for (handler, expected_text) in handlers.into_iter().zip(["direct", "result", "mcp-result"]) {
+        let contents = handler.read(&ctx).expect("final complete result projects");
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].uri, "final://resource/content");
+        assert_eq!(contents[0].mime_type.as_deref(), Some("application/json"));
+        assert_eq!(contents[0].text.as_deref(), Some(expected_text));
+        assert!(contents[0].blob.is_none());
+    }
+}
+
 // --- Resource default trait methods ---
 
 #[test]
@@ -1746,6 +1804,57 @@ fn prompt_result_err() {
         .get(&ctx, args)
         .expect_err("prompt should return an error");
     assert_eq!(err.code, fastmcp_rust::McpErrorCode::InvalidParams);
+}
+
+// --- Final complete prompt result projection ---
+
+fn final_prompt_payload(text: &str) -> CompleteResult<GetPromptResult> {
+    CompleteResult::new(
+        GetPromptResult {
+            description: Some("final prompt metadata is projected by the modern layer".to_string()),
+            messages: vec![PromptMessage {
+                role: Role::Assistant,
+                content: Content::Text {
+                    text: text.to_string(),
+                },
+            }],
+        },
+        final_result_meta(),
+    )
+}
+
+#[prompt]
+fn final_complete_prompt_direct() -> CompleteResult<GetPromptResult> {
+    final_prompt_payload("direct")
+}
+
+#[prompt]
+fn final_complete_prompt_result() -> Result<CompleteResult<GetPromptResult>, McpError> {
+    Ok(final_prompt_payload("result"))
+}
+
+#[prompt]
+fn final_complete_prompt_mcp_result() -> McpResult<CompleteResult<GetPromptResult>> {
+    Ok(final_prompt_payload("mcp-result"))
+}
+
+#[test]
+fn prompt_final_complete_results_project_exact_legacy_messages() {
+    let ctx = test_ctx();
+    let handlers: [Box<dyn PromptHandler>; 3] = [
+        Box::new(FinalCompletePromptDirectPrompt),
+        Box::new(FinalCompletePromptResultPrompt),
+        Box::new(FinalCompletePromptMcpResultPrompt),
+    ];
+
+    for (handler, expected_text) in handlers.into_iter().zip(["direct", "result", "mcp-result"]) {
+        let messages = handler
+            .get(&ctx, HashMap::new())
+            .expect("final complete result projects");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::Assistant);
+        assert_eq!(expect_text(&messages[0].content), expected_text);
+    }
 }
 
 // --- Async prompt with context ---

@@ -799,8 +799,141 @@ fn generate_tool_execution_methods(
 // Prompt Return Type Analysis
 // ============================================================================
 
+/// The explicit final complete-result forms which can be projected through a
+/// legacy handler trait without discarding method payload content.
+#[derive(Clone, Copy)]
+enum FinalCompleteReturnKind {
+    Direct,
+    Result,
+    McpResult,
+}
+
+fn return_type_value(output: &syn::ReturnType) -> Option<&Type> {
+    match output {
+        syn::ReturnType::Default => None,
+        syn::ReturnType::Type(_, value) => Some(value),
+    }
+}
+
+fn type_last_segment(ty: &Type) -> Option<&syn::PathSegment> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    if type_path.qself.is_some() {
+        return None;
+    }
+    type_path.path.segments.last()
+}
+
+fn type_has_last_ident(ty: &Type, expected: &str) -> bool {
+    type_last_segment(ty).is_some_and(|segment| segment.ident == expected)
+}
+
+fn first_type_argument(ty: &Type) -> Option<&Type> {
+    let segment = type_last_segment(ty)?;
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return None;
+    };
+    arguments.args.iter().find_map(|argument| match argument {
+        syn::GenericArgument::Type(value) => Some(value),
+        _ => None,
+    })
+}
+
+fn is_complete_result_for(ty: &Type, payload: &str) -> bool {
+    type_has_last_ident(ty, "CompleteResult")
+        && first_type_argument(ty).is_some_and(|value| type_has_last_ident(value, payload))
+}
+
+fn final_complete_return_kind(
+    output: &syn::ReturnType,
+    payload: &str,
+) -> Option<FinalCompleteReturnKind> {
+    let value = return_type_value(output)?;
+    if is_complete_result_for(value, payload) {
+        return Some(FinalCompleteReturnKind::Direct);
+    }
+
+    let success = first_type_argument(value)?;
+    if !is_complete_result_for(success, payload) {
+        return None;
+    }
+    if type_has_last_ident(value, "McpResult") {
+        Some(FinalCompleteReturnKind::McpResult)
+    } else if type_has_last_ident(value, "Result") {
+        Some(FinalCompleteReturnKind::Result)
+    } else {
+        None
+    }
+}
+
+fn type_contains_final_result_term(ty: &Type) -> bool {
+    const FINAL_RESULT_TERMS: &[&str] = &[
+        "CompleteResult",
+        "InputRequiredResult",
+        "CacheableResult",
+        "PaginatedResult",
+        "ReadResourceResult",
+        "GetPromptResult",
+    ];
+
+    match ty {
+        Type::Path(type_path) => type_path.path.segments.iter().any(|segment| {
+            FINAL_RESULT_TERMS.iter().any(|term| segment.ident == *term)
+                || match &segment.arguments {
+                    syn::PathArguments::AngleBracketed(arguments) => arguments
+                        .args
+                        .iter()
+                        .filter_map(|argument| match argument {
+                            syn::GenericArgument::Type(value) => Some(value),
+                            _ => None,
+                        })
+                        .any(type_contains_final_result_term),
+                    _ => false,
+                }
+        }),
+        Type::Array(array) => type_contains_final_result_term(&array.elem),
+        Type::Group(group) => type_contains_final_result_term(&group.elem),
+        Type::Paren(paren) => type_contains_final_result_term(&paren.elem),
+        Type::Ptr(pointer) => type_contains_final_result_term(&pointer.elem),
+        Type::Reference(reference) => type_contains_final_result_term(&reference.elem),
+        Type::Slice(slice) => type_contains_final_result_term(&slice.elem),
+        Type::Tuple(tuple) => tuple.elems.iter().any(type_contains_final_result_term),
+        _ => false,
+    }
+}
+
+fn validate_final_handler_return(
+    output: &syn::ReturnType,
+    handler: &str,
+    payload: &str,
+    legacy_output: &str,
+) -> syn::Result<()> {
+    let Some(value) = return_type_value(output) else {
+        return Ok(());
+    };
+    if final_complete_return_kind(output, payload).is_some()
+        || !type_contains_final_result_term(value)
+    {
+        return Ok(());
+    }
+
+    Err(syn::Error::new_spanned(
+        output,
+        format!(
+            "ambiguous or cross-era final #[{handler}] return; use CompleteResult<{payload}>, Result<CompleteResult<{payload}>, E>, or McpResult<CompleteResult<{payload}>> so the legacy handler can project {legacy_output}",
+        ),
+    ))
+}
+
 /// Represents return type strategies for prompt handlers.
 enum PromptReturnTypeKind {
+    /// Returns a final CompleteResult<GetPromptResult> directly.
+    FinalComplete,
+    /// Returns Result<CompleteResult<GetPromptResult>, E>.
+    ResultFinalComplete,
+    /// Returns McpResult<CompleteResult<GetPromptResult>>.
+    McpResultFinalComplete,
     /// Returns Vec<PromptMessage> directly
     VecPromptMessage,
     /// Returns Result<Vec<PromptMessage>, E>
@@ -813,6 +946,16 @@ enum PromptReturnTypeKind {
 
 /// Analyzes a prompt function's return type.
 fn analyze_prompt_return_type(output: &syn::ReturnType) -> PromptReturnTypeKind {
+    match final_complete_return_kind(output, "GetPromptResult") {
+        Some(FinalCompleteReturnKind::Direct) => return PromptReturnTypeKind::FinalComplete,
+        Some(FinalCompleteReturnKind::Result) => {
+            return PromptReturnTypeKind::ResultFinalComplete;
+        }
+        Some(FinalCompleteReturnKind::McpResult) => {
+            return PromptReturnTypeKind::McpResultFinalComplete;
+        }
+        None => {}
+    }
     match output {
         syn::ReturnType::Default => PromptReturnTypeKind::Other, // () not valid for prompts
         syn::ReturnType::Type(_, ty) => analyze_prompt_type(ty),
@@ -873,6 +1016,17 @@ fn generate_prompt_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
     let kind = analyze_prompt_return_type(output);
 
     match kind {
+        PromptReturnTypeKind::FinalComplete => quote! {
+            Ok(result.payload.messages)
+        },
+        PromptReturnTypeKind::ResultFinalComplete => quote! {
+            result
+                .map(|complete| complete.payload.messages)
+                .map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))
+        },
+        PromptReturnTypeKind::McpResultFinalComplete => quote! {
+            Ok(result?.payload.messages)
+        },
         PromptReturnTypeKind::VecPromptMessage => quote! {
             Ok(result)
         },
@@ -966,6 +1120,12 @@ fn generate_prompt_execution_methods(
 
 /// Represents return type strategies for resource handlers.
 enum ResourceReturnTypeKind {
+    /// Returns a final CompleteResult<ReadResourceResult> directly.
+    FinalComplete,
+    /// Returns Result<CompleteResult<ReadResourceResult>, E>.
+    ResultFinalComplete,
+    /// Returns McpResult<CompleteResult<ReadResourceResult>>.
+    McpResultFinalComplete,
     /// Returns String directly
     String,
     /// Returns Vec<ResourceContent> directly
@@ -984,6 +1144,16 @@ enum ResourceReturnTypeKind {
 
 /// Analyzes a resource function's return type.
 fn analyze_resource_return_type(output: &syn::ReturnType) -> ResourceReturnTypeKind {
+    match final_complete_return_kind(output, "ReadResourceResult") {
+        Some(FinalCompleteReturnKind::Direct) => return ResourceReturnTypeKind::FinalComplete,
+        Some(FinalCompleteReturnKind::Result) => {
+            return ResourceReturnTypeKind::ResultFinalComplete;
+        }
+        Some(FinalCompleteReturnKind::McpResult) => {
+            return ResourceReturnTypeKind::McpResultFinalComplete;
+        }
+        None => {}
+    }
     match output {
         syn::ReturnType::Default => ResourceReturnTypeKind::Other, // () not typical for resources
         syn::ReturnType::Type(_, ty) => analyze_resource_type(ty),
@@ -1060,6 +1230,17 @@ fn generate_resource_result_conversion(output: &syn::ReturnType, mime_type: &str
     let kind = analyze_resource_return_type(output);
 
     match kind {
+        ResourceReturnTypeKind::FinalComplete => quote! {
+            Ok(result.payload.contents)
+        },
+        ResourceReturnTypeKind::ResultFinalComplete => quote! {
+            result
+                .map(|complete| complete.payload.contents)
+                .map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))
+        },
+        ResourceReturnTypeKind::McpResultFinalComplete => quote! {
+            Ok(result?.payload.contents)
+        },
         ResourceReturnTypeKind::String => quote! {
             let text = result;
             Ok(vec![fastmcp_protocol::ResourceContent {
@@ -2211,6 +2392,17 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(error) => return error.to_compile_error().into(),
     };
 
+    if let Err(error) = validate_final_handler_return(
+        &input_fn.sig.output,
+        "resource",
+        "ReadResourceResult",
+        "Vec<ResourceContent>",
+    ) {
+        return syn::Error::new_spanned(&input_fn.sig.ident, error.to_string())
+            .to_compile_error()
+            .into();
+    }
+
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
 
@@ -2577,6 +2769,17 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(paths) => paths,
         Err(error) => return error.to_compile_error().into(),
     };
+
+    if let Err(error) = validate_final_handler_return(
+        &input_fn.sig.output,
+        "prompt",
+        "GetPromptResult",
+        "Vec<PromptMessage>",
+    ) {
+        return syn::Error::new_spanned(&input_fn.sig.ident, error.to_string())
+            .to_compile_error()
+            .into();
+    }
 
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();

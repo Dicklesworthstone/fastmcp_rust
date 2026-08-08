@@ -1,0 +1,5 @@
+error: ambiguous or cross-era final #[prompt] return; use CompleteResult<GetPromptResult>, Result<CompleteResult<GetPromptResult>, E>, or McpResult<CompleteResult<GetPromptResult>> so the legacy handler can project Vec<PromptMessage>
+ --> tests/trybuild/prompt_typed_return.rs:6:4
+  |
+6 | fn final_prompt() -> fastmcp_rust::CompleteResult<fastmcp_rust::ReadResourceResult> {
+  |    ^^^^^^^^^^^^
