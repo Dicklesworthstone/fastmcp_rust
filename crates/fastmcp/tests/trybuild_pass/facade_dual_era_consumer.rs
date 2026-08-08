@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use fastmcp_rust::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, CompletionContext,
-    CompletionHandler, CompletionParams, CompletionReference, SubscriptionFilter, legacy_2024,
-    modern,
+    CompletionHandler, CompletionParams, CompletionReference, SubscriptionFilter, auto,
+    legacy_2024, modern,
 };
 
 struct DownstreamCompletionHandler;
@@ -132,6 +132,103 @@ mod prelude_client_http_and_subscription_reachability {
             ..SubscriptionFilter::default()
         };
         let _ = filter;
+    }
+}
+
+fn assert_final_typed_client_and_dual_era_http_surface() {
+    let _: fn(
+        &mut fastmcp_rust::Client,
+        &str,
+        fastmcp_rust::JsonValue,
+    ) -> fastmcp_rust::McpResult<fastmcp_rust::FinalCallToolResult> =
+        fastmcp_rust::Client::call_tool_final;
+    let _: fn(
+        &mut fastmcp_rust::Client,
+        &str,
+    ) -> fastmcp_rust::McpResult<fastmcp_rust::FinalReadResourceResult> =
+        fastmcp_rust::Client::read_resource_final;
+    let _: fn(
+        &mut fastmcp_rust::Client,
+        &str,
+        std::collections::HashMap<String, String>,
+    ) -> fastmcp_rust::McpResult<fastmcp_rust::FinalGetPromptResult> =
+        fastmcp_rust::Client::get_prompt_final;
+    let _: fn(
+        &mut fastmcp_rust::Client,
+        modern::SubscriptionFilter,
+    ) -> fastmcp_rust::McpResult<modern::SubscriptionListenCollector> =
+        fastmcp_rust::Client::listen_subscriptions_typed;
+    let _: fn(
+        &mut auto::Client,
+        &str,
+        auto::JsonValue,
+    ) -> auto::McpResult<auto::FinalCallToolResult> = auto::Client::call_tool_final;
+    let _: fn(
+        &mut modern::Client,
+        &str,
+        modern::JsonValue,
+    ) -> modern::McpResult<modern::FinalReadResourceResult> = modern::Client::read_resource_final;
+
+    let auto_builder = auto::client_builder();
+    assert_eq!(
+        auto_builder.selected_protocol_plan().policy(),
+        auto::ProtocolPolicy::Auto
+    );
+    let legacy_builder = legacy_2024::client_builder();
+    assert_eq!(
+        legacy_builder.selected_protocol_plan().policy(),
+        legacy_2024::ProtocolPolicy::LegacyOnly
+    );
+    let _: fn(&str, &[&str]) -> fastmcp_rust::McpResult<legacy_2024::Client> =
+        legacy_2024::Client::stdio;
+
+    let _: Option<fastmcp_rust::ModernHttpSubscriptionListenCollector> = None;
+    let _: Option<fastmcp_rust::ModernHttpSubscriptionListenError> = None;
+    let _: Option<fastmcp_rust::ServerHttpEndpoint> = None;
+    let _: Option<fastmcp_rust::ServerHttpSession> = None;
+    let _: Option<fastmcp_rust::ServerHttpEndpointResponse> = None;
+    let _: Option<fastmcp_rust::BoundHttpServer> = None;
+    let _: Option<fastmcp_rust::DualEraHttpEndpoint> = None;
+    let _: Option<fastmcp_rust::DualEraHttpEndpointConfig> = None;
+    let _: Option<fastmcp_rust::DualEraHttpEndpointError> = None;
+    let _: Option<auto::ClientHttpConnection> = None;
+    let _: Option<auto::ModernHttpSubscriptionListenCollector> = None;
+    let _: Option<auto::SseLimits> = None;
+    let _: Option<modern::ModernHttpClient> = None;
+    let _: Option<modern::ServerHttpEndpoint> = None;
+}
+
+mod prelude_final_typed_and_http_reachability {
+    use std::collections::HashMap;
+
+    use fastmcp_rust::prelude::*;
+
+    pub(super) fn assert_reachable() {
+        let _: fn(&mut Client, &str, JsonValue) -> McpResult<FinalCallToolResult> =
+            Client::call_tool_final;
+        let _: fn(&mut Client, &str) -> McpResult<FinalReadResourceResult> =
+            Client::read_resource_final;
+        let _: fn(&mut Client, &str, HashMap<String, String>) -> McpResult<FinalGetPromptResult> =
+            Client::get_prompt_final;
+        let _: Option<FinalCallToolResult> = None;
+        let _: Option<FinalReadResourceResult> = None;
+        let _: Option<FinalGetPromptResult> = None;
+        let _: Option<SubscriptionListenCollector> = None;
+        let _: Option<ModernHttpSubscriptionListenCollector> = None;
+        let _: Option<ModernHttpSubscriptionListenError> = None;
+        let _: Option<ModernHttpClient> = None;
+        let _: Option<ServerHttpEndpoint> = None;
+        let _: Option<ServerHttpSession> = None;
+        let _: Option<ServerHttpEndpointResponse> = None;
+        let _: Option<BoundHttpServer> = None;
+        let _: Option<DualEraHttpEndpoint> = None;
+        let _: Option<DualEraHttpEndpointConfig> = None;
+        let _: Option<DualEraHttpEndpointError> = None;
+        let _: Option<SseLimits> = None;
+        assert_eq!(
+            auto::client_builder().selected_protocol_plan().policy(),
+            auto::ProtocolPolicy::Auto
+        );
     }
 }
 
@@ -406,6 +503,8 @@ fn main() {
     prelude_client_completion_input_reachability::assert_reachable();
     let _ = assert_client_http_and_subscription_exports;
     prelude_client_http_and_subscription_reachability::assert_reachable();
+    assert_final_typed_client_and_dual_era_http_surface();
+    prelude_final_typed_and_http_reachability::assert_reachable();
     assert_dual_era_completion_exports();
     assert_root_directional_notification_exports();
     assert_modern_directional_notification_exports();

@@ -273,7 +273,17 @@ pub use fastmcp_protocol::protocol_policy::{
 };
 
 // Re-export transport types
-pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError};
+pub use fastmcp_transport::http::{
+    DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
+    DualEraHttpEndpointResponse, DualEraHttpJsonResponse, DualEraHttpLegacySseResponse,
+    DualEraHttpSession, DualEraHttpSseResponse,
+};
+pub use fastmcp_transport::{
+    Codec, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
+    HttpResponseRepresentation, HttpStatus, ModernHttpRequestAdmission, StdioTransport,
+    StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
+    StreamableHttpResponseStream, StreamableHttpTransport, Transport, TransportError,
+};
 
 // Re-export transport modules
 pub use fastmcp_transport::{event_store, http, memory};
@@ -281,15 +291,15 @@ pub use fastmcp_transport::{event_store, http, memory};
 // Re-export server types
 // FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
 pub use fastmcp_server::{
-    AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders, BoxFuture,
-    CompletionHandler, ConsoleConfig, HttpServerConfig, InboundRequestContext,
-    InboundRequestTransport, Middleware, MiddlewareDecision, MountResult, NotificationSender,
-    PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog,
-    ProxyClient, RequestSender, ResourceHandler, Router, Server, ServerBuilder, ServerStats,
-    Session, StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
-    ToolHandler, TrafficVerbosity, TransportElicitationSender, TransportRootsProvider,
-    TransportSamplingSender, create_context_with_progress,
-    create_context_with_progress_and_senders,
+    AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
+    BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, HttpServerConfig,
+    InboundRequestContext, InboundRequestTransport, Middleware, MiddlewareDecision, MountResult,
+    NotificationSender, PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend,
+    ProxyCatalog, ProxyClient, RequestSender, ResourceHandler, Router, Server, ServerBuilder,
+    ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, ServerStats, Session,
+    StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolHandler,
+    TrafficVerbosity, TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    create_context_with_progress, create_context_with_progress_and_senders,
 };
 
 // Re-export bidirectional module for namespaced access (e.g. bidirectional::RequestSender)
@@ -317,7 +327,7 @@ pub use fastmcp_client::{
     CompletionReference, ExecutionTerminalReason, ExecutionTerminalRecord, ExecutionTerminalState,
     ListPageLimits, OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback,
     Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
-    SubscriptionFilter,
+    SubscriptionFilter, SubscriptionListenCollector,
 };
 
 // Public client HTTP execution and configuration surfaces.
@@ -326,12 +336,15 @@ pub use fastmcp_client::http_executor::{
     MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, ModernHttpClient,
     ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpExecutor, ModernHttpExecutorError,
     ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseMetadata,
-    ModernHttpResponseStream, ModernHttpSseResponseStream, validate_response_head,
+    ModernHttpResponseStream, ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
+    ModernHttpSubscriptionListenError, validate_response_head,
 };
 pub use fastmcp_client::mcp_config::{
     ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
     ServerConfig, claude_desktop_config_path, default_config_paths,
 };
+pub use fastmcp_client::sse;
+pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
 pub use fastmcp_client::{http_executor, mcp_config};
 
 // Re-export macros
@@ -343,10 +356,25 @@ pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 /// subprocess or HTTP side effect. The caller may replace that immutable plan
 /// with an explicit plan before connecting.
 pub mod auto {
-    pub use fastmcp_client::{ClientBuilder, ClientProtocolPlan};
+    pub use fastmcp_client::http_executor::{
+        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
+    };
+    pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
+    pub use fastmcp_client::{
+        Client, ClientBuilder, ClientHttpConnection, ClientHttpConnectionError,
+        ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
+        ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
+        ClientProtocolPlanError, ClientSession, SubscriptionFilter, SubscriptionListenCollector,
+    };
+    pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::protocol_policy::{
         HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
     };
+    pub use fastmcp_protocol::{
+        ClientCapabilities, ClientInfo, FinalCallToolResult, FinalGetPromptResult,
+        FinalReadResourceResult, RequestId,
+    };
+    pub use serde_json::{Map as JsonMap, Value as JsonValue};
 
     /// Creates the public client builder with its immutable Auto stdio plan.
     #[must_use]
@@ -368,20 +396,25 @@ pub mod modern {
         MODERN_MCP_CONTENT_TYPE, ModernHttpClient, ModernHttpClientError, ModernHttpConnectOutcome,
         ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
         ModernHttpResponseMetadata, ModernHttpResponseStream, ModernHttpSseResponseStream,
+        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
         validate_response_head,
     };
     pub use fastmcp_client::mcp_config::{
         ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
         ServerConfig, claude_desktop_config_path, default_config_paths,
     };
+    pub use fastmcp_client::sse;
+    pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
     pub use fastmcp_client::{
-        CancellationRequested, Client, ClientBuilder, ClientHttpConnection,
+        BoundedListPage, CancellationRequested, Client, ClientBuilder, ClientHttpConnection,
         ClientHttpConnectionError, ClientHttpNegotiation, ClientHttpNegotiationDecision,
         ClientHttpNegotiationError, ClientHttpNegotiationState, ClientHttpResponse,
         ClientProtocolPlan, ClientProtocolPlanError, ClientSession, CompletionContext,
         CompletionParams, CompletionReference, ExecutionTerminalReason, ExecutionTerminalRecord,
-        ExecutionTerminalState, OpaquePagination, PaginationBounds, PendingRequestRecord,
-        ProgressCallback, Request, RequestExecution, RequestExecutor, SubscriptionFilter,
+        ExecutionTerminalState, ListPageLimits, OpaquePagination, PaginationBounds,
+        PendingRequestRecord, ProgressCallback, Request, RequestExecution, RequestExecutor,
+        RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionFilter,
+        SubscriptionListenCollector,
     };
     pub use fastmcp_client::{http_executor, mcp_config};
     pub use fastmcp_core::{
@@ -476,13 +509,25 @@ pub mod modern {
         MrtrInputRequired, MrtrInputResponse, MrtrInputResponses, MrtrRequestState, MrtrRetry,
     };
     pub use fastmcp_server::{
-        AuthProvider, AuthRequest, BidirectionalSenders, BoxFuture, CompletionHandler,
-        HttpServerConfig, InboundRequestContext, InboundRequestTransport, Middleware,
-        MiddlewareDecision, MountResult, ProgressNotificationSender, PromptHandler,
-        ResourceHandler, Router, Server, ServerBuilder, TagFilters, ToolHandler,
+        AuthProvider, AuthRequest, BidirectionalSenders, BoundHttpServer, BoxFuture,
+        CompletionHandler, HttpServerConfig, InboundRequestContext, InboundRequestTransport,
+        Middleware, MiddlewareDecision, MountResult, ProgressNotificationSender, PromptHandler,
+        ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint,
+        ServerHttpEndpointResponse, ServerHttpSession, TagFilters, ToolHandler,
         create_context_with_progress, create_context_with_progress_and_senders,
     };
-    pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError, http, memory};
+    pub use fastmcp_transport::http::{
+        DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
+        DualEraHttpEndpointResponse, DualEraHttpJsonResponse, DualEraHttpLegacySseResponse,
+        DualEraHttpSession, DualEraHttpSseResponse,
+    };
+    pub use fastmcp_transport::{
+        Codec, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
+        HttpResponse, HttpResponseRepresentation, HttpStatus, ModernHttpRequestAdmission,
+        StdioTransport, StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
+        StreamableHttpResponseStream, StreamableHttpTransport, Transport, TransportError, http,
+        memory,
+    };
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
 
     /// Creates a client builder pinned to the ModernOnly stdio plan.
@@ -500,8 +545,11 @@ pub mod modern {
 /// negotiation layer.
 pub mod legacy_2024 {
     pub use fastmcp_client::http_executor::{LegacySseHttpClient, LegacySseHttpClientError};
-    pub use fastmcp_client::{ClientProtocolPlan, Request, RequestExecution, RequestExecutor};
-    pub use fastmcp_core::Cx;
+    pub use fastmcp_client::{
+        Client, ClientBuilder, ClientProtocolPlan, ClientProtocolPlanError, ClientSession, Request,
+        RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
+    };
+    pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::methods;
     pub use fastmcp_protocol::protocol_policy::{
         LEGACY_PROTOCOL_VERSION, LegacyAdapterReceiptIssuer, LegacyClientAdapterInstalledReceipt,
@@ -536,6 +584,15 @@ pub mod legacy_2024 {
         LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink, LegacySseServerTransport,
     };
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
+
+    /// Creates a client builder pinned to the exact MCP 2024-11-05 stdio plan.
+    ///
+    /// The historical root [`Client::stdio`] behavior remains unchanged; this
+    /// names the same explicit legacy selection in the dual-era facade.
+    #[must_use]
+    pub fn client_builder() -> ClientBuilder {
+        ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+    }
 }
 
 // REL-QUAR-00 release-quarantine evidence surface
@@ -554,10 +611,13 @@ pub mod prelude {
         // Context and errors
         AccessToken,
         AuthContext,
+        BoundHttpServer,
         // Client
         BoundedListPage,
+        CanonicalHttpUrl,
         Client,
         ClientBuilder,
+        ClientCapabilities,
         ClientHttpConnection,
         ClientHttpConnectionError,
         ClientHttpNegotiation,
@@ -565,8 +625,10 @@ pub mod prelude {
         ClientHttpNegotiationError,
         ClientHttpNegotiationState,
         ClientHttpResponse,
+        ClientInfo,
         ClientNotification,
         ClientProtocolPlan,
+        ClientProtocolPlanError,
         ClientSession,
         CompleteResult,
         CompletionContext,
@@ -578,26 +640,45 @@ pub mod prelude {
         // Protocol types
         Content,
         ContentBlock,
+        Cx,
         DecodedResult,
+        DualEraHttpEndpoint,
+        DualEraHttpEndpointConfig,
+        DualEraHttpEndpointError,
         ExtensionDescriptor,
         ExtensionDescriptorRegistry,
         FINAL_PROTOCOL_VERSION,
         Final2026Peer,
         FinalAbsoluteUri,
+        FinalCallToolResult,
         FinalCancelledNotificationParams,
         FinalEmptyNotificationParams,
+        FinalGetPromptResult,
         FinalLogMessageParams,
         FinalNotificationError,
         FinalProgressNotificationParams,
         FinalProtocolVersion,
+        FinalReadResourceResult,
         FinalResourceUpdatedNotificationParams,
         FinalSubscriptionsAcknowledgedNotificationParams,
+        HttpEndpointBundle,
+        HttpEndpointBundleError,
         HttpEndpointConfig,
         HttpEndpointConfigError,
+        HttpError,
+        HttpHandlerConfig,
+        HttpMethod,
+        HttpRequest,
+        HttpRequestHandler,
+        HttpResponse,
+        HttpServerConfig,
+        HttpStatus,
         // Server
         InboundRequestContext,
         InboundRequestTransport,
+        JsonMap,
         JsonSchema,
+        JsonValue,
         ListPageLimits,
         McpConfig,
         McpContext,
@@ -606,9 +687,14 @@ pub mod prelude {
         McpResult,
         Middleware,
         MiddlewareDecision,
+        ModernHttpClient,
+        ModernHttpClientError,
+        ModernHttpConnectOutcome,
         ModernHttpExecutor,
         ModernHttpExecutorError,
         ModernHttpRequest,
+        ModernHttpSubscriptionListenCollector,
+        ModernHttpSubscriptionListenError,
         NegotiatedExtensionSet,
         // Outcome types (4-valued result)
         Outcome,
@@ -624,6 +710,7 @@ pub mod prelude {
         ProxyCatalog,
         ProxyClient,
         RequestAdmissionError,
+        RequestId,
         RequestTimeoutPolicy,
         RequestTimeoutSource,
         Resource,
@@ -636,12 +723,20 @@ pub mod prelude {
         ServerConfig,
         ServerDiscoverRequest,
         ServerDiscoverResult,
+        ServerHttpEndpoint,
+        ServerHttpEndpointResponse,
+        ServerHttpSession,
         ServerNotification,
+        SseEndOfStream,
+        SseLimits,
+        SseParseError,
         StaticTokenVerifier,
         SubscriptionFilter,
+        SubscriptionListenCollector,
         TokenAuthProvider,
         TokenVerifier,
         Tool,
+        auto,
         cancelled,
         err,
         legacy_2024,
@@ -917,6 +1012,102 @@ mod tests {
         let _: Option<FinalResourceUpdatedNotificationParams> = None;
         let _: Option<FinalEmptyNotificationParams> = None;
         let _: Option<FinalSubscriptionsAcknowledgedNotificationParams> = None;
+    }
+
+    #[test]
+    fn facade_exposes_dual_era_http_and_final_typed_client_contracts() {
+        use std::collections::HashMap;
+
+        use super::{Client, FinalCallToolResult, FinalGetPromptResult, FinalReadResourceResult};
+        use super::{JsonValue, McpResult, auto, legacy_2024, modern};
+
+        let _: fn(&mut Client, &str, JsonValue) -> McpResult<FinalCallToolResult> =
+            Client::call_tool_final;
+        let _: fn(&mut Client, &str) -> McpResult<FinalReadResourceResult> =
+            Client::read_resource_final;
+        let _: fn(&mut Client, &str, HashMap<String, String>) -> McpResult<FinalGetPromptResult> =
+            Client::get_prompt_final;
+        let _: fn(
+            &mut Client,
+            modern::SubscriptionFilter,
+        ) -> McpResult<modern::SubscriptionListenCollector> = Client::listen_subscriptions_typed;
+        let _: fn(
+            &mut auto::Client,
+            &str,
+            auto::JsonValue,
+        ) -> auto::McpResult<auto::FinalCallToolResult> = auto::Client::call_tool_final;
+        let _: fn(
+            &mut modern::Client,
+            &str,
+            modern::JsonValue,
+        ) -> modern::McpResult<modern::FinalReadResourceResult> =
+            modern::Client::read_resource_final;
+
+        let auto_builder = auto::client_builder();
+        assert_eq!(
+            auto_builder.selected_protocol_plan().policy(),
+            auto::ProtocolPolicy::Auto
+        );
+        let legacy_builder = legacy_2024::client_builder();
+        assert_eq!(
+            legacy_builder.selected_protocol_plan().policy(),
+            legacy_2024::ProtocolPolicy::LegacyOnly
+        );
+        let _: fn(&str, &[&str]) -> McpResult<legacy_2024::Client> = legacy_2024::Client::stdio;
+
+        let _: Option<auto::ClientHttpConnection> = None;
+        let _: Option<auto::ModernHttpSubscriptionListenCollector> = None;
+        let _: Option<auto::ModernHttpSubscriptionListenError> = None;
+        let _: Option<auto::SseLimits> = None;
+        let _: Option<modern::ServerHttpEndpoint> = None;
+        let _: Option<modern::ServerHttpSession> = None;
+        let _: Option<modern::ServerHttpEndpointResponse> = None;
+        let _: Option<modern::BoundHttpServer> = None;
+        let _: Option<modern::DualEraHttpEndpoint> = None;
+        let _: Option<modern::DualEraHttpEndpointConfig> = None;
+        let _: Option<modern::DualEraHttpEndpointError> = None;
+    }
+
+    #[test]
+    fn prelude_reexports_final_typed_and_http_endpoints() {
+        use std::collections::HashMap;
+
+        use super::prelude::{
+            BoundHttpServer, Client, DualEraHttpEndpoint, DualEraHttpEndpointConfig,
+            DualEraHttpEndpointError, FinalCallToolResult, FinalGetPromptResult,
+            FinalReadResourceResult, JsonValue, McpResult, ModernHttpClient, ModernHttpClientError,
+            ModernHttpConnectOutcome, ModernHttpSubscriptionListenCollector,
+            ModernHttpSubscriptionListenError, ServerHttpEndpoint, ServerHttpEndpointResponse,
+            ServerHttpSession, SseLimits, SubscriptionListenCollector, auto,
+        };
+
+        let _: fn(&mut Client, &str, JsonValue) -> McpResult<FinalCallToolResult> =
+            Client::call_tool_final;
+        let _: fn(&mut Client, &str) -> McpResult<FinalReadResourceResult> =
+            Client::read_resource_final;
+        let _: fn(&mut Client, &str, HashMap<String, String>) -> McpResult<FinalGetPromptResult> =
+            Client::get_prompt_final;
+        let _: Option<FinalCallToolResult> = None;
+        let _: Option<FinalReadResourceResult> = None;
+        let _: Option<FinalGetPromptResult> = None;
+        let _: Option<SubscriptionListenCollector> = None;
+        let _: Option<ModernHttpSubscriptionListenCollector> = None;
+        let _: Option<ModernHttpSubscriptionListenError> = None;
+        let _: Option<SseLimits> = None;
+        let _: Option<ModernHttpClient> = None;
+        let _: Option<ModernHttpClientError> = None;
+        let _: Option<ModernHttpConnectOutcome> = None;
+        let _: Option<ServerHttpEndpoint> = None;
+        let _: Option<ServerHttpSession> = None;
+        let _: Option<ServerHttpEndpointResponse> = None;
+        let _: Option<BoundHttpServer> = None;
+        let _: Option<DualEraHttpEndpoint> = None;
+        let _: Option<DualEraHttpEndpointConfig> = None;
+        let _: Option<DualEraHttpEndpointError> = None;
+        assert_eq!(
+            auto::client_builder().selected_protocol_plan().policy(),
+            auto::ProtocolPolicy::Auto
+        );
     }
 
     #[test]
