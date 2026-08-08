@@ -1785,7 +1785,7 @@ impl Clone for StreamableHttpResponseStream {
     fn clone(&self) -> Self {
         self.endpoint_count.fetch_add(1, Ordering::Relaxed);
         Self {
-            codec: self.codec.clone(),
+            codec: response_stream_codec(&self.codec),
             mailbox: Arc::clone(&self.mailbox),
             request_states: Arc::clone(&self.request_states),
             pending_count: Arc::clone(&self.pending_count),
@@ -1802,6 +1802,18 @@ impl Clone for StreamableHttpResponseStream {
             entered_empty_waits: Arc::clone(&self.entered_empty_waits),
         }
     }
+}
+
+/// Builds the encoding-only codec held by an external response stream.
+///
+/// `Codec` deliberately does not implement `Clone`: its decode buffer is
+/// mutable per direction. Response streams only encode, so they retain the
+/// originating transport's exact message-size admission limit while starting
+/// with an independent, empty decode buffer.
+fn response_stream_codec(codec: &Codec) -> Codec {
+    let mut response_codec = Codec::new();
+    response_codec.set_max_message_size(codec.max_message_size());
+    response_codec
 }
 
 impl Drop for StreamableHttpResponseStream {
@@ -2931,7 +2943,7 @@ impl StreamableHttpTransport {
         self.response_externalized = true;
         self.response_endpoint_count.store(1, Ordering::Release);
         Ok(StreamableHttpResponseStream {
-            codec: self.codec.clone(),
+            codec: response_stream_codec(&self.codec),
             mailbox: Arc::clone(&self.response_mailbox),
             request_states: Arc::clone(&self.request_response_states),
             pending_count: Arc::clone(&self.response_pending_count),
