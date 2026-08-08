@@ -433,6 +433,116 @@ impl OpaqueCursor {
     }
 }
 
+/// A JSON integer retained without an implementation-width bound.
+///
+/// The final schema uses JSON Schema's `integer` type, which is not limited to
+/// Rust's fixed-width integer types. The workspace enables serde_json's
+/// arbitrary-precision feature, so retaining the original [`serde_json::Number`]
+/// preserves both large positive and negative integer spellings on re-encode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsonInteger(serde_json::Number);
+
+impl JsonInteger {
+    /// Admits one JSON number only when it is a mathematical integer.
+    pub fn try_from_number(value: serde_json::Number) -> Result<Self, CommonTypeError> {
+        if valid_json_integer(value.as_str()) {
+            Ok(Self(value))
+        } else {
+            Err(CommonTypeError::Invalid("JSON integer"))
+        }
+    }
+
+    /// Returns the exact retained JSON integer spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl From<i64> for JsonInteger {
+    fn from(value: i64) -> Self {
+        Self(serde_json::Number::from(value))
+    }
+}
+
+impl From<u64> for JsonInteger {
+    fn from(value: u64) -> Self {
+        Self(serde_json::Number::from(value))
+    }
+}
+
+impl Serialize for JsonInteger {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonInteger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Number::deserialize(deserializer)?;
+        Self::try_from_number(value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn valid_json_integer(value: &str) -> bool {
+    let (mantissa, exponent) = match value.find(|character| matches!(character, 'e' | 'E')) {
+        Some(index) => (&value[..index], parse_json_exponent(&value[index + 1..])),
+        None => (value, Some(0)),
+    };
+    let Some(exponent) = exponent else {
+        return false;
+    };
+    let mantissa = mantissa.strip_prefix('-').unwrap_or(mantissa);
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let digits = [whole, fraction].concat();
+    if digits.bytes().all(|byte| byte == b'0') {
+        return true;
+    }
+    let Some(scale) = (fraction.len() as isize).checked_sub(exponent) else {
+        return false;
+    };
+    scale <= 0
+        || digits
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'0')
+            .count()
+            >= usize::try_from(scale).unwrap_or(usize::MAX)
+}
+
+fn parse_json_exponent(value: &str) -> Option<isize> {
+    let (negative, digits) = match value.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, value.strip_prefix('+').unwrap_or(value)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude = digits.bytes().try_fold(0_isize, |value, byte| {
+        value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(isize::from(byte - b'0')))
+    });
+    match (negative, magnitude) {
+        (false, Some(value)) => Some(value),
+        (true, Some(value)) => value.checked_neg(),
+        (false, None) => Some(isize::MAX),
+        (true, None) => Some(isize::MIN),
+    }
+}
+
 /// Final implementation identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -659,7 +769,7 @@ impl OpenMetadata {
         let _ = self.log_level()?;
         if let Some(value) = self.0.get("io.modelcontextprotocol/subscriptionId") {
             let valid = matches!(value, Value::String(_))
-                || matches!(value, Value::Number(number) if number.as_i64().is_some());
+                || matches!(value, Value::Number(number) if JsonInteger::try_from_number(number.clone()).is_ok());
             if !valid {
                 return Err(CommonTypeError::Invalid("subscription ID metadata"));
             }
@@ -719,19 +829,6 @@ fn reject_explicit_null_fields(value: &Value, fields: &[&str]) -> Result<(), Com
         .any(|field| object.get(*field).is_some_and(Value::is_null))
     {
         return Err(CommonTypeError::Invalid("optional non-null field"));
-    }
-    Ok(())
-}
-
-fn reject_unknown_fields(value: &Value, allowed: &[&str]) -> Result<(), CommonTypeError> {
-    let object = value
-        .as_object()
-        .ok_or(CommonTypeError::Invalid("wire object"))?;
-    if object
-        .keys()
-        .any(|field| !allowed.iter().any(|known| field == known))
-    {
-        return Err(CommonTypeError::Invalid("unknown wire field"));
     }
     Ok(())
 }
@@ -826,6 +923,8 @@ pub enum CancellationRequestId {
     String(String),
     /// Mathematical integer JSON-RPC identifier.
     Integer(i64),
+    /// Mathematical JSON-RPC integer outside the signed 64-bit range.
+    IntegerExact(JsonInteger),
 }
 
 /// A bounded peer-provided cancellation reason that deliberately has no raw string accessor,
@@ -891,6 +990,9 @@ pub struct RawIcon {
     /// Optional theme without serialization defaults.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<IconTheme>,
+    /// Schema-allowed members retained without assigning them display semantics.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional: BTreeMap<String, Value>,
 }
 
 impl RawIcon {
@@ -901,6 +1003,7 @@ impl RawIcon {
             mime_type: None,
             sizes: None,
             theme: None,
+            additional: BTreeMap::new(),
         })
     }
 
@@ -922,6 +1025,7 @@ impl RawIcon {
             mime_type,
             sizes,
             theme,
+            additional: BTreeMap::new(),
         })
     }
 
@@ -942,6 +1046,8 @@ struct RawIconWire {
     sizes: Option<Vec<String>>,
     #[serde(default)]
     theme: Option<IconTheme>,
+    #[serde(flatten, default)]
+    additional: BTreeMap<String, Value>,
 }
 
 impl<'de> Deserialize<'de> for RawIcon {
@@ -950,13 +1056,14 @@ impl<'de> Deserialize<'de> for RawIcon {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        reject_unknown_fields(&value, &["src", "mimeType", "sizes", "theme"])
-            .map_err(serde::de::Error::custom)?;
         reject_explicit_null_fields(&value, &["mimeType", "sizes", "theme"])
             .map_err(serde::de::Error::custom)?;
         let wire: RawIconWire = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-        Self::try_with_details(wire.src.as_str(), wire.mime_type, wire.sizes, wire.theme)
-            .map_err(serde::de::Error::custom)
+        let mut icon =
+            Self::try_with_details(wire.src.as_str(), wire.mime_type, wire.sizes, wire.theme)
+                .map_err(serde::de::Error::custom)?;
+        icon.additional = wire.additional;
+        Ok(icon)
     }
 }
 
@@ -983,6 +1090,9 @@ pub struct Annotations {
     /// Peer timestamp string preserved without inventing a schema rejection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<String>,
+    /// Schema-allowed members retained without assigning them annotation semantics.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional: BTreeMap<String, Value>,
 }
 
 impl Annotations {
@@ -1007,6 +1117,8 @@ struct AnnotationsWire {
     priority: Option<f64>,
     #[serde(default)]
     last_modified: Option<String>,
+    #[serde(flatten, default)]
+    additional: BTreeMap<String, Value>,
 }
 
 impl<'de> Deserialize<'de> for Annotations {
@@ -1015,8 +1127,6 @@ impl<'de> Deserialize<'de> for Annotations {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        reject_unknown_fields(&value, &["audience", "priority", "lastModified"])
-            .map_err(serde::de::Error::custom)?;
         reject_explicit_null_fields(&value, &["audience", "priority", "lastModified"])
             .map_err(serde::de::Error::custom)?;
         let wire: AnnotationsWire =
@@ -1028,6 +1138,7 @@ impl<'de> Deserialize<'de> for Annotations {
             audience: wire.audience,
             priority: wire.priority,
             last_modified: wire.last_modified,
+            additional: wire.additional,
         })
     }
 }
@@ -1050,7 +1161,7 @@ pub struct ResourceLink {
     /// Optional link annotations.
     pub annotations: Option<Annotations>,
     /// Optional raw size of the resource in bytes.
-    pub size: Option<i64>,
+    pub size: Option<JsonInteger>,
     /// Preserved open metadata.
     pub meta: Option<OpenMetadata>,
     /// Schema-allowed members retained without assigning them protocol meaning.
@@ -1090,8 +1201,8 @@ impl Serialize for ResourceLink {
         if let Some(annotations) = &self.annotations {
             state.serialize_entry("annotations", annotations)?;
         }
-        if let Some(size) = self.size {
-            state.serialize_entry("size", &size)?;
+        if let Some(size) = &self.size {
+            state.serialize_entry("size", size)?;
         }
         if let Some(meta) = &self.meta {
             state.serialize_entry("_meta", meta)?;
@@ -1121,7 +1232,7 @@ struct ResourceLinkWire {
     #[serde(default)]
     annotations: Option<Annotations>,
     #[serde(default)]
-    size: Option<i64>,
+    size: Option<JsonInteger>,
     #[serde(rename = "_meta", default)]
     meta: Option<OpenMetadata>,
     #[serde(flatten, default)]
@@ -1182,6 +1293,10 @@ pub enum EmbeddedResourceContents {
         text: String,
         #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
+        #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<OpenMetadata>,
+        #[serde(flatten)]
+        additional: BTreeMap<String, Value>,
     },
     /// Blob resource contents.
     Blob {
@@ -1189,6 +1304,10 @@ pub enum EmbeddedResourceContents {
         blob: String,
         #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
+        #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<OpenMetadata>,
+        #[serde(flatten)]
+        additional: BTreeMap<String, Value>,
     },
 }
 
@@ -1201,12 +1320,20 @@ enum EmbeddedResourceContentsWire {
         text: String,
         #[serde(rename = "mimeType", default)]
         mime_type: Option<String>,
+        #[serde(rename = "_meta", default)]
+        meta: Option<OpenMetadata>,
+        #[serde(flatten, default)]
+        additional: BTreeMap<String, Value>,
     },
     Blob {
         uri: AbsoluteUri,
         blob: String,
         #[serde(rename = "mimeType", default)]
         mime_type: Option<String>,
+        #[serde(rename = "_meta", default)]
+        meta: Option<OpenMetadata>,
+        #[serde(flatten, default)]
+        additional: BTreeMap<String, Value>,
     },
 }
 
@@ -1226,16 +1353,8 @@ impl<'de> Deserialize<'de> for EmbeddedResourceContents {
                 "embedded resource requires exactly one of text or blob",
             ));
         }
-        reject_unknown_fields(
-            &value,
-            if has_text {
-                &["uri", "text", "mimeType"]
-            } else {
-                &["uri", "blob", "mimeType"]
-            },
-        )
-        .map_err(serde::de::Error::custom)?;
-        reject_explicit_null_fields(&value, &["mimeType"]).map_err(serde::de::Error::custom)?;
+        reject_explicit_null_fields(&value, &["mimeType", "_meta"])
+            .map_err(serde::de::Error::custom)?;
         let wire: EmbeddedResourceContentsWire =
             serde_json::from_value(value).map_err(serde::de::Error::custom)?;
         let resource = match wire {
@@ -1243,19 +1362,27 @@ impl<'de> Deserialize<'de> for EmbeddedResourceContents {
                 uri,
                 text,
                 mime_type,
+                meta,
+                additional,
             } => Self::Text {
                 uri,
                 text,
                 mime_type,
+                meta,
+                additional,
             },
             EmbeddedResourceContentsWire::Blob {
                 uri,
                 blob,
                 mime_type,
+                meta,
+                additional,
             } => Self::Blob {
                 uri,
                 blob,
                 mime_type,
+                meta,
+                additional,
             },
         };
         validate_embedded_resource(&resource).map_err(serde::de::Error::custom)?;
@@ -1316,7 +1443,7 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<Annotations>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        size: Option<i64>,
+        size: Option<JsonInteger>,
         #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
         #[serde(flatten)]
@@ -1382,7 +1509,7 @@ enum ContentBlockWire {
         #[serde(default)]
         annotations: Option<Annotations>,
         #[serde(default)]
-        size: Option<i64>,
+        size: Option<JsonInteger>,
         #[serde(rename = "_meta", default)]
         meta: Option<OpenMetadata>,
         #[serde(flatten, default)]
@@ -1603,6 +1730,8 @@ impl ContentBlock {
                 uri: AbsoluteUri::parse(uri)?,
                 text: text.into(),
                 mime_type,
+                meta: None,
+                additional: BTreeMap::new(),
             },
             annotations: None,
             meta: None,
@@ -1618,7 +1747,7 @@ impl ContentBlock {
 /// bodies, in turn, use the general content union and therefore cannot nest
 /// further tool-use/result blocks.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum SamplingContentBlock {
     /// Text sampling content.
     Text {
@@ -1627,6 +1756,8 @@ pub enum SamplingContentBlock {
         annotations: Option<Annotations>,
         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, Value>,
     },
     /// Image sampling content.
     Image {
@@ -1637,6 +1768,8 @@ pub enum SamplingContentBlock {
         annotations: Option<Annotations>,
         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, Value>,
     },
     /// Audio sampling content.
     Audio {
@@ -1647,6 +1780,8 @@ pub enum SamplingContentBlock {
         annotations: Option<Annotations>,
         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, Value>,
     },
     /// A requested assistant tool call.
     ToolUse {
@@ -1655,6 +1790,8 @@ pub enum SamplingContentBlock {
         input: serde_json::Map<String, Value>,
         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, Value>,
     },
     /// A result for a preceding tool call.
     ToolResult {
@@ -1672,6 +1809,8 @@ pub enum SamplingContentBlock {
         structured_content: Option<Value>,
         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, Value>,
     },
 }
 
@@ -1845,7 +1984,8 @@ impl FinalCommonTypesSchema {
             icon.mime_type.clone(),
             icon.sizes.clone(),
             icon.theme,
-        )
+        )?;
+        Ok(icon)
     }
 
     /// Produces the deterministic JSON form used by frozen golden-wire records.
@@ -1967,8 +2107,13 @@ impl FinalCommonTypesSchema {
             .ok_or(CommonTypeError::Invalid("cancellation request ID"))?;
         let request_id = match request_id {
             Value::String(value) => CancellationRequestId::String(value.clone()),
-            Value::Number(value) if value.as_i64().is_some() => {
-                CancellationRequestId::Integer(value.as_i64().expect("checked integer"))
+            Value::Number(value) => {
+                let integer = JsonInteger::try_from_number(value.clone())
+                    .map_err(|_| CommonTypeError::Invalid("cancellation request ID"))?;
+                match integer.as_str().parse::<i64>() {
+                    Ok(value) => CancellationRequestId::Integer(value),
+                    Err(_) => CancellationRequestId::IntegerExact(integer),
+                }
             }
             _ => return Err(CommonTypeError::Invalid("cancellation request ID")),
         };
@@ -2134,6 +2279,7 @@ mod tests {
             ]),
             priority: Some(0.75),
             last_modified: Some("2026-07-28T15:00:58Z".to_owned()),
+            additional: BTreeMap::new(),
         };
         let metadata = OpenMetadata::try_from_entries([(
             "com.example/renderHint".to_owned(),
@@ -2148,7 +2294,7 @@ mod tests {
             description: Some("Raw quarterly figures".to_owned()),
             mime_type: Some("text/markdown".to_owned()),
             annotations: Some(annotations.clone()),
-            size: Some(4096),
+            size: Some(JsonInteger::from(4096_i64)),
             meta: Some(metadata.clone()),
             additional: BTreeMap::new(),
         };
@@ -2183,7 +2329,7 @@ mod tests {
             description: Some("Raw quarterly figures".to_owned()),
             mime_type: Some("text/markdown".to_owned()),
             annotations: Some(annotations),
-            size: Some(4096),
+            size: Some(JsonInteger::from(4096_i64)),
             meta: Some(metadata),
             additional: BTreeMap::new(),
         };
@@ -2240,25 +2386,41 @@ mod tests {
 
     #[test]
     fn final_resource_link_size_is_an_optional_integer() {
-        let accepted = json!({
-            "type": "resource_link",
-            "name": "report",
-            "uri": "https://example.test/reports/q3",
-            "size": 4096
-        });
+        let accepted: Value = serde_json::from_str(
+            r#"{
+                "type":"resource_link",
+                "name":"report",
+                "uri":"https://example.test/reports/q3",
+                "size":922337203685477580812345678901234567890
+            }"#,
+        )
+        .expect("large integer wire parses");
         let resource_link: ResourceLink = serde_json::from_value(accepted.clone())
             .expect("integer resource-link size is admitted");
-        assert_eq!(resource_link.size, Some(4096));
+        assert_eq!(
+            resource_link.size.as_ref().map(JsonInteger::as_str),
+            Some("922337203685477580812345678901234567890")
+        );
         assert_eq!(
             serde_json::to_value(&resource_link).expect("integer resource-link size encodes"),
             accepted
         );
 
-        let mut negative = accepted.clone();
-        negative["size"] = json!(-4096);
+        let negative: Value = serde_json::from_str(
+            r#"{
+                "type":"resource_link",
+                "name":"report",
+                "uri":"https://example.test/reports/q3",
+                "size":-922337203685477580812345678901234567890
+            }"#,
+        )
+        .expect("large negative integer wire parses");
         let negative_link: ResourceLink = serde_json::from_value(negative.clone())
             .expect("a schema-integer resource-link size may be negative");
-        assert_eq!(negative_link.size, Some(-4096));
+        assert_eq!(
+            negative_link.size.as_ref().map(JsonInteger::as_str),
+            Some("-922337203685477580812345678901234567890")
+        );
         assert_eq!(
             serde_json::to_value(&negative_link)
                 .expect("negative integer resource-link size encodes"),
@@ -2367,6 +2529,99 @@ mod tests {
             &serde_json::to_value(&content).expect("content validation wire"),
         )
         .expect("schema-allowed content property remains valid");
+    }
+
+    #[test]
+    fn final_common_nested_open_fields_and_subscription_integer_round_trip() {
+        let resource_link = json!({
+            "type": "resource_link",
+            "icons": [{
+                "src": "https://example.test/icons/report.svg",
+                "com.example/icon": {"retained": true}
+            }],
+            "name": "report",
+            "uri": "https://example.test/reports/q3",
+            "annotations": {
+                "com.example/annotation": ["retained"]
+            }
+        });
+        let resource_link: ResourceLink = serde_json::from_value(resource_link.clone())
+            .expect("schema-open icon and annotation fields decode");
+        assert_eq!(
+            serde_json::to_value(&resource_link).expect("nested extensions re-encode"),
+            json!({
+                "type": "resource_link",
+                "icons": [{
+                    "src": "https://example.test/icons/report.svg",
+                    "com.example/icon": {"retained": true}
+                }],
+                "name": "report",
+                "uri": "https://example.test/reports/q3",
+                "annotations": {
+                    "com.example/annotation": ["retained"]
+                }
+            })
+        );
+
+        let embedded = json!({
+            "type": "resource",
+            "resource": {
+                "uri": "https://example.test/resources/report",
+                "text": "ready",
+                "_meta": {"com.example/source": "cache"},
+                "com.example/resource": {"retained": true}
+            }
+        });
+        let embedded_content: ContentBlock = serde_json::from_value(embedded.clone())
+            .expect("embedded resource metadata and open fields decode");
+        assert_eq!(
+            serde_json::to_value(&embedded_content).expect("embedded resource re-encodes"),
+            embedded
+        );
+
+        let sampling = json!({
+            "type": "tool_result",
+            "toolUseId": "call-7",
+            "content": [{"type": "text", "text": "done"}],
+            "com.example/sampling": {"retained": true}
+        });
+        let sampling_content: SamplingContentBlock =
+            serde_json::from_value(sampling.clone()).expect("sampling extension decodes");
+        assert_eq!(
+            serde_json::to_value(&sampling_content).expect("sampling extension re-encodes"),
+            sampling
+        );
+
+        let subscription: Value = serde_json::from_str(
+            r#"{
+                "io.modelcontextprotocol/subscriptionId":922337203685477580812345678901234567890
+            }"#,
+        )
+        .expect("large subscription ID wire parses");
+        let metadata: OpenMetadata = serde_json::from_value(subscription.clone())
+            .expect("arbitrary-precision subscription ID decodes");
+        assert_eq!(
+            serde_json::to_value(metadata).expect("subscription ID re-encodes"),
+            subscription
+        );
+
+        let cancellation: Value = serde_json::from_str(
+            r#"{
+                "method":"notifications/cancelled",
+                "params":{"requestId":922337203685477580812345678901234567890}
+            }"#,
+        )
+        .expect("large cancellation ID wire parses");
+        FinalCommonTypesSchema::validate(CommonWireDirection::Notification, &cancellation)
+            .expect("arbitrary-precision cancellation ID is admitted");
+        assert!(matches!(
+            serde_json::from_value::<CancellationRequestId>(
+                cancellation["params"]["requestId"].clone()
+            )
+            .expect("large cancellation ID decodes"),
+            CancellationRequestId::IntegerExact(value)
+                if value.as_str() == "922337203685477580812345678901234567890"
+        ));
     }
 
     #[test]
