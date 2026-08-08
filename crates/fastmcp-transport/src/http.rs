@@ -3389,23 +3389,39 @@ impl DualEraHttpSession {
             )));
         }
 
-        let replay = self
-            .legacy_events
-            .replay_bounded(&self.legacy_stream_id, request.header("last-event-id"))?;
-        let mut initial_events = VecDeque::with_capacity(replay.events().len() + 1);
+        let mut after_id = request.header("last-event-id").map(str::to_owned);
+        let mut initial_events = VecDeque::new();
         initial_events.push_back(SseEvent::endpoint(&self.legacy_message_endpoint));
-        for event in replay.events() {
-            let data = event
-                .data
-                .as_ref()
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "legacy SSE retention contained a non-string message payload",
-                    )))
-                })?;
-            initial_events.push_back(SseEvent::message(data).with_id(&event.id));
+        loop {
+            let replay = self
+                .legacy_events
+                .replay_bounded(&self.legacy_stream_id, after_id.as_deref())?;
+            let complete = replay.is_complete();
+            let next_after_id = replay.next_after_id().map(str::to_owned);
+            for event in replay.events() {
+                let data = event
+                    .data
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        DualEraHttpEndpointError::Transport(TransportError::Io(
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "legacy SSE retention contained a non-string message payload",
+                            ),
+                        ))
+                    })?;
+                initial_events.push_back(SseEvent::message(data).with_id(&event.id));
+            }
+            if complete {
+                break;
+            }
+            after_id = Some(next_after_id.ok_or_else(|| {
+                DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "partial legacy SSE replay omitted its continuation cursor",
+                )))
+            })?);
         }
         if self
             .legacy_live_active
@@ -3566,10 +3582,18 @@ impl DualEraHttpSession {
             )))
         })?;
         let reserves_live_delivery = self.reserve_legacy_live_delivery()?;
-        let event_id = self.legacy_events.store_event(
+        let event_id = match self.legacy_events.store_event(
             &self.legacy_stream_id,
             Some(serde_json::Value::String(data.clone())),
-        )?;
+        ) {
+            Ok(event_id) => event_id,
+            Err(error) => {
+                if reserves_live_delivery {
+                    self.release_legacy_live_delivery();
+                }
+                return Err(error.into());
+            }
+        };
         if reserves_live_delivery {
             let Some(sender) = self.legacy_live_sender.as_ref() else {
                 self.release_legacy_live_delivery();
@@ -7305,6 +7329,125 @@ X-Checksum: abc123\r\n\
                 .expect("live legacy response stays JSON-RPC"),
             JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(71))
         ));
+    }
+
+    #[test]
+    fn dual_era_endpoint_delivers_all_replay_pages_before_live_messages() {
+        let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
+            base_path: "/mcp".to_string(),
+            ..HttpHandlerConfig::default()
+        });
+        let mut config =
+            DualEraHttpEndpointConfig::new("/legacy/sse", "/legacy/messages", "http://legacy.test");
+        config.event_store = EventStoreConfig::no_expiry().max_replay_events(1);
+        let endpoint =
+            DualEraHttpEndpoint::new(handler, config).expect("single-event replay pages are valid");
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let cx = Cx::for_testing();
+
+        let replay_ids = [81, 82, 83]
+            .into_iter()
+            .map(|id| {
+                session
+                    .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                        RequestId::Number(id),
+                        serde_json::json!({"phase": "replay", "id": id}),
+                    )))
+                    .expect("retained replay message is admitted")
+            })
+            .collect::<Vec<_>>();
+        let legacy_sse = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/legacy/sse"))
+            .expect("legacy SSE GET is admitted");
+        let DualEraHttpEndpointResponse::LegacySse(mut legacy_sse) = legacy_sse else {
+            panic!("legacy GET creates a live SSE response body");
+        };
+        assert_eq!(
+            legacy_sse
+                .recv_event(&cx)
+                .expect("endpoint event is available before replay")
+                .data,
+            session.legacy_message_endpoint()
+        );
+
+        let live_id = session
+            .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(84),
+                serde_json::json!({"phase": "live"}),
+            )))
+            .expect("live message is admitted after replay capture");
+        let delivered_ids = (0..4)
+            .map(|_| {
+                legacy_sse
+                    .recv_event(&cx)
+                    .expect("replay or live event is delivered")
+                    .id
+                    .expect("all retained and live messages have an event ID")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(delivered_ids, [replay_ids, vec![live_id]].concat());
+    }
+
+    #[test]
+    fn dual_era_endpoint_recovers_live_capacity_after_retention_rejection() {
+        let codec = Codec::new();
+        let recovered_response =
+            JsonRpcResponse::success(RequestId::Number(85), serde_json::json!({"ok": true}));
+        let mut encoded = codec
+            .encode_response(&recovered_response)
+            .expect("recovery response serializes");
+        assert_eq!(encoded.pop(), Some(b'\n'));
+        let recovery_payload_bytes = serde_json::to_vec(&serde_json::Value::String(
+            String::from_utf8(encoded).expect("JSON-RPC output is UTF-8"),
+        ))
+        .expect("retained payload measures")
+        .len();
+
+        let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
+            base_path: "/mcp".to_string(),
+            ..HttpHandlerConfig::default()
+        });
+        let mut config =
+            DualEraHttpEndpointConfig::new("/legacy/sse", "/legacy/messages", "http://legacy.test");
+        config.legacy_request_capacity = 1;
+        config.event_store = EventStoreConfig::no_expiry()
+            .max_event_payload_bytes(recovery_payload_bytes)
+            .max_replay_events(1);
+        let endpoint = DualEraHttpEndpoint::new(handler, config)
+            .expect("capacity-one live stream configuration is valid");
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let cx = Cx::for_testing();
+        let legacy_sse = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/legacy/sse"))
+            .expect("legacy SSE GET is admitted");
+        let DualEraHttpEndpointResponse::LegacySse(mut legacy_sse) = legacy_sse else {
+            panic!("legacy GET creates a live SSE response body");
+        };
+        let _endpoint = legacy_sse
+            .recv_event(&cx)
+            .expect("endpoint event is available before live messages");
+
+        let rejected = session
+            .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(86),
+                serde_json::json!({"oversize": "x".repeat(recovery_payload_bytes)}),
+            )))
+            .expect_err("oversize retained message is rejected before enqueue");
+        assert!(matches!(
+            rejected,
+            DualEraHttpEndpointError::EventStore(EventStoreError::EventPayloadTooLarge {
+                max_bytes
+            }) if max_bytes == recovery_payload_bytes
+        ));
+        assert_eq!(session.retained_legacy_event_count(), 0);
+
+        let recovered_id = session
+            .publish_legacy_message(&JsonRpcMessage::Response(recovered_response))
+            .expect("retention rejection releases the capacity-one live reservation");
+        let recovered_event = legacy_sse
+            .recv_event(&cx)
+            .expect("recovered message reaches the live stream");
+        assert_eq!(recovered_event.id.as_deref(), Some(recovered_id.as_str()));
     }
 
     #[test]
