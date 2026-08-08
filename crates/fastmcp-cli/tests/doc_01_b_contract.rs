@@ -212,16 +212,28 @@ fn doc_01_b_public_binary_positive() {
         normalized_stdout(&long_help),
         normalized_stdout(&short_help)
     );
-    assert_eq!(
-        validate_public_root_help_bytes(
-            format!("Usage: fastmcp {PROVISIONAL_PUBLIC_STATUS_STANZA}").as_bytes()
-        ),
-        Err(PublicHelpRefusal::MissingBaseFrame)
+    let missing_heading_help = format!(
+        "{}{}",
+        PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX
+            .strip_prefix("CLI tooling for FastMCP - run, inspect, and install MCP servers ")
+            .expect("the independent root-help contract must begin with its heading"),
+        PROVISIONAL_PUBLIC_STATUS_STANZA
     );
     assert_eq!(
-        validate_public_root_help_bytes(
-            b"CLI tooling for FastMCP - run, inspect, and install MCP servers Protocol status: altered"
-        ),
+        validate_public_root_help_bytes(missing_heading_help.as_bytes()),
+        Err(PublicHelpRefusal::MissingBaseFrame)
+    );
+    let altered_status_help = format!(
+        "{}{}",
+        PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX,
+        PROVISIONAL_PUBLIC_STATUS_STANZA.replacen(
+            "Public PROTOCOL_VERSION remains 2024-11-05",
+            "Public PROTOCOL_VERSION remains 2025-11-25",
+            1
+        )
+    );
+    assert_eq!(
+        validate_public_root_help_bytes(altered_status_help.as_bytes()),
         Err(PublicHelpRefusal::AlteredStatusStanza)
     );
 
