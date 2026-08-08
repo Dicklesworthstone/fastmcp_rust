@@ -5,17 +5,18 @@
 use std::collections::BTreeMap;
 
 use serde::de::{DeserializeOwned, Visitor};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::common_types::{
     AbsoluteUri, ContentBlock, EmbeddedResourceContents, LoggingLevel, OpenMetadata,
 };
-use crate::jsonrpc::RequestId;
+use crate::jsonrpc::{JsonRpcResponse, RequestId};
 use crate::methods::{
     COMPLETION_COMPLETE, INITIALIZE, LOGGING_SET_LEVEL, PING, PROMPTS_GET, PROMPTS_LIST,
-    RESOURCES_LIST, RESOURCES_READ, RESOURCES_TEMPLATES_LIST, SUBSCRIPTIONS_LISTEN, TOOLS_CALL,
-    TOOLS_LIST,
+    RESOURCES_LIST, RESOURCES_READ, RESOURCES_TEMPLATES_LIST, SAMPLING_CREATE_MESSAGE,
+    SUBSCRIPTIONS_LISTEN, TOOLS_CALL, TOOLS_LIST,
 };
 use crate::protocol_policy::ProtocolEra;
 use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
@@ -191,8 +192,26 @@ pub struct FinalCallToolParams {
     /// Name of the selected tool.
     pub name: String,
     /// Optional method-owned tool arguments.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_json_object"
+    )]
     pub arguments: Option<Value>,
+    /// Optional replies to embedded final input requests.
+    #[serde(
+        rename = "inputResponses",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub input_responses: Option<BTreeMap<String, Value>>,
+    /// Opaque retry state supplied with embedded input responses.
+    #[serde(
+        rename = "requestState",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_state: Option<String>,
 }
 
 /// Final `resources/read` request parameters.
@@ -204,6 +223,20 @@ pub struct FinalReadResourceParams {
     pub meta: OpenMetadata,
     /// Structurally admitted resource URI.
     pub uri: AbsoluteUri,
+    /// Optional replies to embedded final input requests.
+    #[serde(
+        rename = "inputResponses",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub input_responses: Option<BTreeMap<String, Value>>,
+    /// Opaque retry state supplied with embedded input responses.
+    #[serde(
+        rename = "requestState",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_state: Option<String>,
 }
 
 /// Final `prompts/get` request parameters.
@@ -218,6 +251,31 @@ pub struct FinalGetPromptParams {
     /// Optional prompt arguments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments: Option<BTreeMap<String, String>>,
+    /// Optional replies to embedded final input requests.
+    #[serde(
+        rename = "inputResponses",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub input_responses: Option<BTreeMap<String, Value>>,
+    /// Opaque retry state supplied with embedded input responses.
+    #[serde(
+        rename = "requestState",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_state: Option<String>,
+}
+
+fn deserialize_optional_json_object<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    if value.as_ref().is_some_and(|value| !value.is_object()) {
+        return Err(serde::de::Error::custom("arguments must be an object"));
+    }
+    Ok(value)
 }
 
 /// Exact legacy reference accepted by `completion/complete`.
@@ -367,17 +425,6 @@ pub struct FinalCompletionParams {
     pub context: Option<FinalCompletionContext>,
 }
 
-/// Final `logging/setLevel` request parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FinalSetLogLevelParams {
-    /// Required final request metadata.
-    #[serde(rename = "_meta")]
-    pub meta: OpenMetadata,
-    /// Final RFC 5424 logging level.
-    pub level: LoggingLevel,
-}
-
 /// Final empty request parameters, used by `ping`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -395,7 +442,6 @@ pub const FINAL_SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscr
 /// Every present field is an explicit opt-in. `false` and an empty resource
 /// list remain distinct from an omitted field on the wire.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SubscriptionFilter {
     /// Receive prompt catalog change notifications when true.
     #[serde(
@@ -425,6 +471,10 @@ pub struct SubscriptionFilter {
         skip_serializing_if = "Option::is_none"
     )]
     pub tools_list_changed: Option<bool>,
+    /// Future notification categories accepted by the final schema and
+    /// retained without activating any extension behavior.
+    #[serde(flatten, default)]
+    pub additional: BTreeMap<String, Value>,
 }
 
 /// Final `subscriptions/listen` request parameters.
@@ -450,14 +500,169 @@ pub struct FinalSubscriptionsAcknowledgedNotificationParams {
     pub notifications: SubscriptionFilter,
 }
 
+/// Exact final `notifications/message` parameters.
+///
+/// Final clients opt into these notifications through
+/// `io.modelcontextprotocol/logLevel` in request metadata; this notification
+/// itself remains independent of the removed final `logging/setLevel` RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalLogMessageParams {
+    /// Final RFC 5424 severity.
+    pub level: LoggingLevel,
+    /// Optional logger name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logger: Option<String>,
+    /// Arbitrary log data.
+    pub data: Value,
+    /// Optional final notification metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+/// Exact final `sampling/createMessage` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalCreateMessageParams {
+    /// Required final request metadata.
+    #[serde(rename = "_meta")]
+    pub meta: OpenMetadata,
+    /// Sampling conversation.
+    pub messages: Vec<crate::types::FinalSamplingMessage>,
+    /// Requested maximum token count.
+    #[serde(rename = "maxTokens")]
+    pub max_tokens: i64,
+    /// Optional system prompt.
+    #[serde(
+        rename = "systemPrompt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub system_prompt: Option<String>,
+    /// Optional sampling temperature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Optional stopping sequences. Presence remains distinct from an empty list.
+    #[serde(
+        rename = "stopSequences",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stop_sequences: Option<Vec<String>>,
+    /// Optional model-selection preferences.
+    #[serde(
+        rename = "modelPreferences",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_preferences: Option<crate::types::ModelPreferences>,
+    /// Optional requested MCP context inclusion.
+    #[serde(
+        rename = "includeContext",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub include_context: Option<IncludeContext>,
+    /// Optional provider-specific metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, Value>>,
+    /// Optional tools the model may call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<crate::types::FinalTool>>,
+    /// Optional tool-selection controls.
+    #[serde(
+        rename = "toolChoice",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tool_choice: Option<crate::types::FinalToolChoice>,
+}
+
+/// Exact final `sampling/createMessage` complete payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalCreateMessageResult {
+    /// Generated final sampling content.
+    pub content: crate::types::FinalSamplingMessageContent,
+    /// Model name selected by the client.
+    pub model: String,
+    /// Generated message role.
+    pub role: crate::types::Role,
+    /// Optional open sampling stop reason.
+    #[serde(
+        rename = "stopReason",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stop_reason: Option<String>,
+}
+
+/// Exact final `sampling/createMessage` input-required result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalCreateMessageInputRequiredResult {
+    /// Mandatory final discriminator, fixed to `input_required`.
+    #[serde(rename = "resultType")]
+    pub result_type: FinalInputRequiredResultType,
+    /// Optional final result metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+    /// Server-initiated requests that must be fulfilled before retrying.
+    #[serde(
+        rename = "inputRequests",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub input_requests: Option<BTreeMap<String, Value>>,
+    /// Opaque state retained for the retry.
+    #[serde(
+        rename = "requestState",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_state: Option<String>,
+}
+
+impl FinalCreateMessageInputRequiredResult {
+    /// Validates the final input-required presence invariant.
+    pub fn validate(&self) -> Result<(), CoreDispatchError> {
+        if self.input_requests.is_some() || self.request_state.is_some() {
+            Ok(())
+        } else {
+            Err(CoreDispatchError::InvalidResult {
+                era: ProtocolEra::Modern2026,
+                method: SAMPLING_CREATE_MESSAGE,
+            })
+        }
+    }
+}
+
+/// Final input-required discriminator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FinalInputRequiredResultType {
+    /// Additional input is required before retrying the original request.
+    #[serde(rename = "input_required")]
+    InputRequired,
+}
+
 /// Final `tools/list` result payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalListToolsResult {
     /// Catalog tools in their selected order.
-    pub tools: Vec<Tool>,
+    pub tools: Vec<crate::types::FinalTool>,
     /// Opaque next cursor, if another page is available.
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Required final cache lifetime in milliseconds.
+    #[serde(rename = "ttlMs")]
+    pub ttl_ms: u64,
+    /// Required final cache sharing scope.
+    #[serde(
+        rename = "cacheScope",
+        serialize_with = "serialize_cache_scope",
+        deserialize_with = "deserialize_cache_scope"
+    )]
+    pub cache_scope: crate::result::CacheScope,
 }
 
 /// Final `tools/call` result payload using final common content blocks.
@@ -472,16 +677,33 @@ pub struct FinalCallToolResult {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub is_error: bool,
+    /// Optional structured tool output, validated by the advertised output schema.
+    #[serde(
+        rename = "structuredContent",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub structured_content: Option<Value>,
 }
 
 /// Final `resources/list` result payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalListResourcesResult {
     /// Catalog resources in their selected order.
-    pub resources: Vec<Resource>,
+    pub resources: Vec<crate::types::FinalResource>,
     /// Opaque next cursor, if another page is available.
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Required final cache lifetime in milliseconds.
+    #[serde(rename = "ttlMs")]
+    pub ttl_ms: u64,
+    /// Required final cache sharing scope.
+    #[serde(
+        rename = "cacheScope",
+        serialize_with = "serialize_cache_scope",
+        deserialize_with = "deserialize_cache_scope"
+    )]
+    pub cache_scope: crate::result::CacheScope,
 }
 
 /// Final `resources/templates/list` result payload.
@@ -489,10 +711,20 @@ pub struct FinalListResourcesResult {
 pub struct FinalListResourceTemplatesResult {
     /// Catalog templates in their selected order.
     #[serde(rename = "resourceTemplates")]
-    pub resource_templates: Vec<ResourceTemplate>,
+    pub resource_templates: Vec<crate::types::FinalResourceTemplate>,
     /// Opaque next cursor, if another page is available.
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Required final cache lifetime in milliseconds.
+    #[serde(rename = "ttlMs")]
+    pub ttl_ms: u64,
+    /// Required final cache sharing scope.
+    #[serde(
+        rename = "cacheScope",
+        serialize_with = "serialize_cache_scope",
+        deserialize_with = "deserialize_cache_scope"
+    )]
+    pub cache_scope: crate::result::CacheScope,
 }
 
 /// Final `resources/read` result payload using final common resource content.
@@ -500,16 +732,62 @@ pub struct FinalListResourceTemplatesResult {
 pub struct FinalReadResourceResult {
     /// Read resource contents.
     pub contents: Vec<EmbeddedResourceContents>,
+    /// Required final cache lifetime in milliseconds.
+    #[serde(rename = "ttlMs")]
+    pub ttl_ms: u64,
+    /// Required final cache sharing scope.
+    #[serde(
+        rename = "cacheScope",
+        serialize_with = "serialize_cache_scope",
+        deserialize_with = "deserialize_cache_scope"
+    )]
+    pub cache_scope: crate::result::CacheScope,
 }
 
 /// Final `prompts/list` result payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalListPromptsResult {
     /// Catalog prompts in their selected order.
-    pub prompts: Vec<Prompt>,
+    pub prompts: Vec<crate::types::FinalPrompt>,
     /// Opaque next cursor, if another page is available.
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Required final cache lifetime in milliseconds.
+    #[serde(rename = "ttlMs")]
+    pub ttl_ms: u64,
+    /// Required final cache sharing scope.
+    #[serde(
+        rename = "cacheScope",
+        serialize_with = "serialize_cache_scope",
+        deserialize_with = "deserialize_cache_scope"
+    )]
+    pub cache_scope: crate::result::CacheScope,
+}
+
+fn serialize_cache_scope<S>(
+    scope: &crate::result::CacheScope,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(match scope {
+        crate::result::CacheScope::Public => "public",
+        crate::result::CacheScope::Private => "private",
+    })
+}
+
+fn deserialize_cache_scope<'de, D>(deserializer: D) -> Result<crate::result::CacheScope, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match String::deserialize(deserializer)?.as_str() {
+        "public" => Ok(crate::result::CacheScope::Public),
+        "private" => Ok(crate::result::CacheScope::Private),
+        _ => Err(serde::de::Error::custom(
+            "cacheScope must be `public` or `private`",
+        )),
+    }
 }
 
 /// One final prompt message using a final common content block.
@@ -583,7 +861,80 @@ pub struct LegacyCompletionResult {
     pub completion: CompletionValues,
     /// Opaque legacy response metadata retained without interpretation.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
-    pub meta: Option<serde_json::Map<String, Value>>,
+    pub meta: Option<LegacyOpaqueMetadata>,
+}
+
+/// Ordered opaque legacy metadata.
+///
+/// `serde_json::Map` uses a key-sorted representation in this workspace. The
+/// Legacy result wires promise the received `_meta` member order remains
+/// observable on replay, so this narrow wrapper retains object-member order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LegacyOpaqueMetadata {
+    entries: Vec<(String, Value)>,
+}
+
+impl LegacyOpaqueMetadata {
+    /// Looks up one retained metadata value.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.entries
+            .iter()
+            .find(|(entry_key, _)| entry_key == key)
+            .map(|(_, value)| value)
+    }
+
+    /// Returns metadata entries in their original wire order.
+    #[must_use]
+    pub fn entries(&self) -> &[(String, Value)] {
+        &self.entries
+    }
+}
+
+impl Serialize for LegacyOpaqueMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.entries.len()))?;
+        for (key, value) in &self.entries {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for LegacyOpaqueMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct MetadataVisitor;
+
+        impl<'de> Visitor<'de> for MetadataVisitor {
+            type Value = LegacyOpaqueMetadata;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an object of legacy metadata")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                    if entries.iter().any(|(existing, _)| existing == &key) {
+                        return Err(serde::de::Error::custom("duplicate legacy metadata member"));
+                    }
+                    entries.push((key, value));
+                }
+                Ok(LegacyOpaqueMetadata { entries })
+            }
+        }
+
+        deserializer.deserialize_map(MetadataVisitor)
+    }
 }
 
 /// Final `completion/complete` result payload.
@@ -619,6 +970,8 @@ pub enum LegacyCoreRequest {
     Initialize(InitializeParams),
     /// `completion/complete`.
     Completion(LegacyCompletionParams),
+    /// `sampling/createMessage`.
+    SamplingCreateMessage(CreateMessageParams),
     /// `tools/list`.
     ToolsList(ListToolsParams),
     /// `tools/call`.
@@ -658,8 +1011,6 @@ pub enum FinalCoreRequest {
     PromptsList(FinalListParams),
     /// `prompts/get`.
     PromptsGet(FinalGetPromptParams),
-    /// `logging/setLevel`.
-    SetLogLevel(FinalSetLogLevelParams),
     /// `subscriptions/listen`.
     SubscriptionsListen(FinalSubscriptionsListenParams),
     /// `ping`.
@@ -682,6 +1033,8 @@ pub enum LegacyCoreResult {
     Initialize(InitializeResult),
     /// `completion/complete`.
     Completion(LegacyCompletionResult),
+    /// `sampling/createMessage`.
+    SamplingCreateMessage(CreateMessageResult),
     /// `tools/list`.
     ToolsList(ListToolsResult),
     /// `tools/call`.
@@ -749,11 +1102,6 @@ pub enum FinalCoreResult {
         result: CompleteResult<FinalGetPromptResult>,
         diagnostic: Option<ResultPeerDiagnostic>,
     },
-    /// `logging/setLevel` acknowledgement.
-    SetLogLevel {
-        result: CompleteResult<FinalEmptyResult>,
-        diagnostic: Option<ResultPeerDiagnostic>,
-    },
     /// `subscriptions/listen` graceful termination.
     SubscriptionsListen {
         result: CompleteResult<FinalSubscriptionsListenResult>,
@@ -800,6 +1148,8 @@ pub enum CoreDispatchError {
     },
     /// A final result used another core discriminator.
     UnexpectedFinalResultType { method: &'static str },
+    /// A final subscriptions/listen result did not correlate to its JSON-RPC response ID.
+    SubscriptionIdMismatch,
     /// The bounded final result codec rejected the wire value.
     ResultCodec(ResultDecodeError),
 }
@@ -827,6 +1177,9 @@ impl std::fmt::Display for CoreDispatchError {
             }
             Self::UnexpectedFinalResultType { method } => {
                 write!(formatter, "final {method} requires a complete result")
+            }
+            Self::SubscriptionIdMismatch => {
+                formatter.write_str("subscription result metadata does not match response id")
             }
             Self::ResultCodec(error) => error.fmt(formatter),
         }
@@ -888,7 +1241,41 @@ impl CoreRequest {
     pub fn decode_result(&self, input: &str) -> Result<CoreResult, CoreDispatchError> {
         match self {
             Self::Legacy(request) => request.decode_result(input).map(CoreResult::Legacy),
-            Self::Final(request) => request.decode_result(input).map(CoreResult::Final),
+            Self::Final(request) => request.decode_result(input, None).map(CoreResult::Final),
+        }
+    }
+
+    /// Decodes a successful JSON-RPC response selected by this request.
+    ///
+    /// This form preserves the response correlation context required by final
+    /// `subscriptions/listen`: its result metadata subscription ID must equal
+    /// the enclosing JSON-RPC response ID.
+    pub fn decode_response(
+        &self,
+        response: &JsonRpcResponse,
+    ) -> Result<CoreResult, CoreDispatchError> {
+        let Some(response_id) = response.id.as_ref() else {
+            return Err(CoreDispatchError::InvalidResult {
+                era: self.era(),
+                method: self.method(),
+            });
+        };
+        let Some(result) = response.result.as_ref() else {
+            return Err(CoreDispatchError::InvalidResult {
+                era: self.era(),
+                method: self.method(),
+            });
+        };
+        let input =
+            serde_json::to_string(result).map_err(|_| CoreDispatchError::InvalidResult {
+                era: self.era(),
+                method: self.method(),
+            })?;
+        match self {
+            Self::Legacy(request) => request.decode_result(&input).map(CoreResult::Legacy),
+            Self::Final(request) => request
+                .decode_result(&input, Some(response_id))
+                .map(CoreResult::Final),
         }
     }
 
@@ -903,6 +1290,11 @@ impl CoreRequest {
                 COMPLETION_COMPLETE => LegacyCoreRequest::Completion(decode_params(
                     ProtocolEra::Legacy2024,
                     COMPLETION_COMPLETE,
+                    params,
+                )?),
+                SAMPLING_CREATE_MESSAGE => LegacyCoreRequest::SamplingCreateMessage(decode_params(
+                    ProtocolEra::Legacy2024,
+                    SAMPLING_CREATE_MESSAGE,
                     params,
                 )?),
                 TOOLS_LIST => LegacyCoreRequest::ToolsList(decode_params(
@@ -990,9 +1382,6 @@ impl CoreRequest {
                 FinalCoreRequest::PromptsList(decode_final_params(PROMPTS_LIST, params)?)
             }
             PROMPTS_GET => FinalCoreRequest::PromptsGet(decode_final_params(PROMPTS_GET, params)?),
-            LOGGING_SET_LEVEL => {
-                FinalCoreRequest::SetLogLevel(decode_final_params(LOGGING_SET_LEVEL, params)?)
-            }
             SUBSCRIPTIONS_LISTEN => FinalCoreRequest::SubscriptionsListen(decode_final_params(
                 SUBSCRIPTIONS_LISTEN,
                 params,
@@ -1035,6 +1424,9 @@ impl LegacyCoreRequest {
             Self::Completion(params) => {
                 encode_params(ProtocolEra::Legacy2024, COMPLETION_COMPLETE, params)
             }
+            Self::SamplingCreateMessage(params) => {
+                encode_params(ProtocolEra::Legacy2024, SAMPLING_CREATE_MESSAGE, params)
+            }
             Self::ToolsList(params) => encode_params(ProtocolEra::Legacy2024, TOOLS_LIST, params),
             Self::ToolsCall(params) => encode_params(ProtocolEra::Legacy2024, TOOLS_CALL, params),
             Self::ResourcesList(params) => {
@@ -1065,6 +1457,8 @@ impl LegacyCoreRequest {
             Self::Completion(_) => {
                 decode_legacy_result(COMPLETION_COMPLETE, input).map(LegacyCoreResult::Completion)
             }
+            Self::SamplingCreateMessage(_) => decode_legacy_result(SAMPLING_CREATE_MESSAGE, input)
+                .map(LegacyCoreResult::SamplingCreateMessage),
             Self::ToolsList(_) => {
                 decode_legacy_result(TOOLS_LIST, input).map(LegacyCoreResult::ToolsList)
             }
@@ -1106,7 +1500,6 @@ impl FinalCoreRequest {
             Self::ResourcesRead(_) => RESOURCES_READ,
             Self::PromptsList(_) => PROMPTS_LIST,
             Self::PromptsGet(_) => PROMPTS_GET,
-            Self::SetLogLevel(_) => LOGGING_SET_LEVEL,
             Self::SubscriptionsListen(_) => SUBSCRIPTIONS_LISTEN,
             Self::Ping(_) => PING,
         }
@@ -1122,7 +1515,6 @@ impl FinalCoreRequest {
             Self::ToolsCall(params) => &params.meta,
             Self::ResourcesRead(params) => &params.meta,
             Self::PromptsGet(params) => &params.meta,
-            Self::SetLogLevel(params) => &params.meta,
             Self::SubscriptionsListen(params) => &params.meta,
             Self::Ping(params) => &params.meta,
         };
@@ -1159,9 +1551,6 @@ impl FinalCoreRequest {
                 encode_params(ProtocolEra::Modern2026, PROMPTS_LIST, params)
             }
             Self::PromptsGet(params) => encode_params(ProtocolEra::Modern2026, PROMPTS_GET, params),
-            Self::SetLogLevel(params) => {
-                encode_params(ProtocolEra::Modern2026, LOGGING_SET_LEVEL, params)
-            }
             Self::SubscriptionsListen(params) => {
                 encode_params(ProtocolEra::Modern2026, SUBSCRIPTIONS_LISTEN, params)
             }
@@ -1169,48 +1558,67 @@ impl FinalCoreRequest {
         }
     }
 
-    fn decode_result(&self, input: &str) -> Result<FinalCoreResult, CoreDispatchError> {
+    fn decode_result(
+        &self,
+        input: &str,
+        response_id: Option<&RequestId>,
+    ) -> Result<FinalCoreResult, CoreDispatchError> {
         match self {
             Self::Completion(_) => {
                 decode_final_complete(COMPLETION_COMPLETE, input, &["completion"])
                     .map(|(result, diagnostic)| FinalCoreResult::Completion { result, diagnostic })
             }
-            Self::ToolsList(_) => {
-                decode_final_complete(TOOLS_LIST, input, &["tools", "nextCursor"])
-                    .map(|(result, diagnostic)| FinalCoreResult::ToolsList { result, diagnostic })
-            }
-            Self::ToolsCall(_) => decode_final_complete(TOOLS_CALL, input, &["content", "isError"])
-                .map(|(result, diagnostic)| FinalCoreResult::ToolsCall { result, diagnostic }),
-            Self::ResourcesList(_) => {
-                decode_final_complete(RESOURCES_LIST, input, &["resources", "nextCursor"]).map(
-                    |(result, diagnostic)| FinalCoreResult::ResourcesList { result, diagnostic },
-                )
-            }
+            Self::ToolsList(_) => decode_final_complete(
+                TOOLS_LIST,
+                input,
+                &["tools", "nextCursor", "ttlMs", "cacheScope"],
+            )
+            .map(|(result, diagnostic)| FinalCoreResult::ToolsList { result, diagnostic }),
+            Self::ToolsCall(_) => decode_final_complete(
+                TOOLS_CALL,
+                input,
+                &["content", "isError", "structuredContent"],
+            )
+            .map(|(result, diagnostic)| FinalCoreResult::ToolsCall { result, diagnostic }),
+            Self::ResourcesList(_) => decode_final_complete(
+                RESOURCES_LIST,
+                input,
+                &["resources", "nextCursor", "ttlMs", "cacheScope"],
+            )
+            .map(|(result, diagnostic)| FinalCoreResult::ResourcesList { result, diagnostic }),
             Self::ResourceTemplatesList(_) => {
                 decode_final_complete(
                     RESOURCES_TEMPLATES_LIST,
                     input,
-                    &["resourceTemplates", "nextCursor"],
+                    &["resourceTemplates", "nextCursor", "ttlMs", "cacheScope"],
                 )
                 .map(|(result, diagnostic)| {
                     FinalCoreResult::ResourceTemplatesList { result, diagnostic }
                 })
             }
-            Self::ResourcesRead(_) => decode_final_complete(RESOURCES_READ, input, &["contents"])
-                .map(|(result, diagnostic)| FinalCoreResult::ResourcesRead { result, diagnostic }),
-            Self::PromptsList(_) => {
-                decode_final_complete(PROMPTS_LIST, input, &["prompts", "nextCursor"])
-                    .map(|(result, diagnostic)| FinalCoreResult::PromptsList { result, diagnostic })
+            Self::ResourcesRead(_) => {
+                decode_final_complete(RESOURCES_READ, input, &["contents", "ttlMs", "cacheScope"])
+                    .map(|(result, diagnostic)| FinalCoreResult::ResourcesRead {
+                        result,
+                        diagnostic,
+                    })
             }
+            Self::PromptsList(_) => decode_final_complete(
+                PROMPTS_LIST,
+                input,
+                &["prompts", "nextCursor", "ttlMs", "cacheScope"],
+            )
+            .map(|(result, diagnostic)| FinalCoreResult::PromptsList { result, diagnostic }),
             Self::PromptsGet(_) => {
                 decode_final_complete(PROMPTS_GET, input, &["description", "messages"])
                     .map(|(result, diagnostic)| FinalCoreResult::PromptsGet { result, diagnostic })
             }
-            Self::SetLogLevel(_) => decode_final_complete(LOGGING_SET_LEVEL, input, &[])
-                .map(|(result, diagnostic)| FinalCoreResult::SetLogLevel { result, diagnostic }),
             Self::SubscriptionsListen(_) => {
                 let (result, diagnostic) = decode_final_complete(SUBSCRIPTIONS_LISTEN, input, &[])?;
                 let subscription_id = subscription_id_from_result(&result)?;
+                if response_id.is_some_and(|response_id| response_id != &subscription_id) {
+                    return Err(CoreDispatchError::SubscriptionIdMismatch);
+                }
                 Ok(FinalCoreResult::SubscriptionsListen {
                     result,
                     subscription_id,
@@ -1258,6 +1666,7 @@ impl LegacyCoreResult {
         match self {
             Self::Initialize(_) => INITIALIZE,
             Self::Completion(_) => COMPLETION_COMPLETE,
+            Self::SamplingCreateMessage(_) => SAMPLING_CREATE_MESSAGE,
             Self::ToolsList(_) => TOOLS_LIST,
             Self::ToolsCall(_) => TOOLS_CALL,
             Self::ResourcesList(_) => RESOURCES_LIST,
@@ -1274,6 +1683,9 @@ impl LegacyCoreResult {
         match self {
             Self::Initialize(result) => encode_legacy_result(INITIALIZE, result),
             Self::Completion(result) => encode_legacy_result(COMPLETION_COMPLETE, result),
+            Self::SamplingCreateMessage(result) => {
+                encode_legacy_result(SAMPLING_CREATE_MESSAGE, result)
+            }
             Self::ToolsList(result) => encode_legacy_result(TOOLS_LIST, result),
             Self::ToolsCall(result) => encode_legacy_result(TOOLS_CALL, result),
             Self::ResourcesList(result) => encode_legacy_result(RESOURCES_LIST, result),
@@ -1302,7 +1714,6 @@ impl FinalCoreResult {
             Self::ResourcesRead { .. } => RESOURCES_READ,
             Self::PromptsList { .. } => PROMPTS_LIST,
             Self::PromptsGet { .. } => PROMPTS_GET,
-            Self::SetLogLevel { .. } => LOGGING_SET_LEVEL,
             Self::SubscriptionsListen { .. } => SUBSCRIPTIONS_LISTEN,
             Self::Ping { .. } => PING,
         }
@@ -1313,32 +1724,38 @@ impl FinalCoreResult {
             Self::Completion { result, .. } => {
                 encode_final_complete(COMPLETION_COMPLETE, result, &["completion"])
             }
-            Self::ToolsList { result, .. } => {
-                encode_final_complete(TOOLS_LIST, result, &["tools", "nextCursor"])
-            }
-            Self::ToolsCall { result, .. } => {
-                encode_final_complete(TOOLS_CALL, result, &["content", "isError"])
-            }
-            Self::ResourcesList { result, .. } => {
-                encode_final_complete(RESOURCES_LIST, result, &["resources", "nextCursor"])
-            }
+            Self::ToolsList { result, .. } => encode_final_complete(
+                TOOLS_LIST,
+                result,
+                &["tools", "nextCursor", "ttlMs", "cacheScope"],
+            ),
+            Self::ToolsCall { result, .. } => encode_final_complete(
+                TOOLS_CALL,
+                result,
+                &["content", "isError", "structuredContent"],
+            ),
+            Self::ResourcesList { result, .. } => encode_final_complete(
+                RESOURCES_LIST,
+                result,
+                &["resources", "nextCursor", "ttlMs", "cacheScope"],
+            ),
             Self::ResourceTemplatesList { result, .. } => encode_final_complete(
                 RESOURCES_TEMPLATES_LIST,
                 result,
-                &["resourceTemplates", "nextCursor"],
+                &["resourceTemplates", "nextCursor", "ttlMs", "cacheScope"],
             ),
             Self::ResourcesRead { result, .. } => {
-                encode_final_complete(RESOURCES_READ, result, &["contents"])
+                encode_final_complete(RESOURCES_READ, result, &["contents", "ttlMs", "cacheScope"])
             }
-            Self::PromptsList { result, .. } => {
-                encode_final_complete(PROMPTS_LIST, result, &["prompts", "nextCursor"])
-            }
+            Self::PromptsList { result, .. } => encode_final_complete(
+                PROMPTS_LIST,
+                result,
+                &["prompts", "nextCursor", "ttlMs", "cacheScope"],
+            ),
             Self::PromptsGet { result, .. } => {
                 encode_final_complete(PROMPTS_GET, result, &["description", "messages"])
             }
-            Self::SetLogLevel { result, .. } | Self::Ping { result, .. } => {
-                encode_final_complete(self.method(), result, &[])
-            }
+            Self::Ping { result, .. } => encode_final_complete(self.method(), result, &[]),
             Self::SubscriptionsListen {
                 result,
                 subscription_id,
@@ -1455,6 +1872,20 @@ fn decode_final_complete<T: DeserializeOwned>(
     input: &str,
     known_names: &[&str],
 ) -> Result<(CompleteResult<T>, Option<ResultPeerDiagnostic>), CoreDispatchError> {
+    let wire: Value =
+        serde_json::from_str(input).map_err(|_| CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method,
+        })?;
+    if wire
+        .as_object()
+        .is_some_and(|object| object.contains_key("serverInfo"))
+    {
+        return Err(CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method,
+        });
+    }
     let (decoded, diagnostic) = decode_peer_result_for_era(
         input,
         ProtocolEra::Modern2026,
@@ -1512,6 +1943,18 @@ fn encode_final_complete<T: Serialize>(
     result: &CompleteResult<T>,
     known_names: &[&str],
 ) -> Result<String, CoreDispatchError> {
+    if result.meta.server_info.is_some()
+        || result
+            .extras
+            .members()
+            .iter()
+            .any(|member| member.name == "serverInfo")
+    {
+        return Err(CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method,
+        });
+    }
     let Value::Object(payload) =
         serde_json::to_value(&result.payload).map_err(|_| CoreDispatchError::InvalidResult {
             era: ProtocolEra::Modern2026,
@@ -2148,6 +2591,9 @@ pub struct CreateMessageParams {
     /// Include context from MCP servers.
     #[serde(rename = "includeContext", skip_serializing_if = "Option::is_none")]
     pub include_context: Option<IncludeContext>,
+    /// Optional provider-specific metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, Value>>,
     /// Request metadata.
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<RequestMeta>,
@@ -2165,6 +2611,7 @@ impl CreateMessageParams {
             stop_sequences: Vec::new(),
             model_preferences: None,
             include_context: None,
+            metadata: None,
             meta: None,
         }
     }
@@ -2217,6 +2664,9 @@ pub struct CreateMessageResult {
     /// Reason generation stopped.
     #[serde(rename = "stopReason")]
     pub stop_reason: StopReason,
+    /// Opaque legacy result metadata preserved in its received key order.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<LegacyOpaqueMetadata>,
 }
 
 impl CreateMessageResult {
@@ -2228,6 +2678,7 @@ impl CreateMessageResult {
             role: crate::types::Role::Assistant,
             model: model.into(),
             stop_reason: StopReason::EndTurn,
+            meta: None,
         }
     }
 
@@ -2745,6 +3196,384 @@ mod tests {
     }
 
     #[test]
+    fn legacy_sampling_core_and_final_mrtr_sampling_wires_remain_disjoint() {
+        let legacy_params = serde_json::json!({
+            "messages": [{"role": "user", "content": {"type": "text", "text": "summarize"}}],
+            "maxTokens": 32,
+            "metadata": {"provider": "legacy"}
+        });
+        let legacy = CoreRequest::decode(
+            ProtocolEra::Legacy2024,
+            SAMPLING_CREATE_MESSAGE,
+            Some(&legacy_params),
+        )
+        .expect("legacy sampling is a direct reverse RPC");
+        assert_eq!(legacy.method(), SAMPLING_CREATE_MESSAGE);
+        assert_eq!(
+            legacy
+                .encode_params()
+                .expect("legacy sampling parameters encode")
+                .expect("legacy sampling owns parameters"),
+            legacy_params
+        );
+        let legacy_result_wire = r#"{"content":{"type":"text","text":"summary"},"role":"assistant","model":"legacy-model","stopReason":"endTurn","_meta":{"trace":"legacy"}}"#;
+        let legacy_result = legacy
+            .decode_result(legacy_result_wire)
+            .expect("legacy sampling result is typed");
+        assert!(matches!(
+            legacy_result,
+            CoreResult::Legacy(LegacyCoreResult::SamplingCreateMessage(_))
+        ));
+        assert_eq!(
+            legacy_result
+                .encode()
+                .expect("legacy sampling result encodes"),
+            legacy_result_wire
+        );
+
+        let final_params_wire = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "messages": [{
+                "role": "assistant",
+                "content": {"type": "tool_use", "id": "call-1", "name": "weather", "input": {"city": "Boston"}}
+            }],
+            "maxTokens": 32,
+            "toolChoice": {"mode": "required"}
+        });
+        let final_params: FinalCreateMessageParams =
+            serde_json::from_value(final_params_wire.clone())
+                .expect("final sampling is reusable as an MRTR input request");
+        assert_eq!(
+            serde_json::to_value(&final_params).expect("final sampling parameters encode"),
+            final_params_wire
+        );
+        let final_result_wire = serde_json::json!({
+            "content": {"type": "tool_result", "toolUseId": "call-1", "content": [{"type": "text", "text": "sunny"}]},
+            "model": "final-model",
+            "role": "assistant",
+            "stopReason": "toolUse"
+        });
+        let final_result: FinalCreateMessageResult =
+            serde_json::from_value(final_result_wire.clone())
+                .expect("final sampling complete payload is typed");
+        assert_eq!(
+            serde_json::to_value(&final_result).expect("final sampling complete encodes"),
+            final_result_wire
+        );
+        let input_required_wire = serde_json::json!({
+            "resultType": "input_required",
+            "inputRequests": {},
+            "requestState": "retry-1"
+        });
+        let input_required: FinalCreateMessageInputRequiredResult =
+            serde_json::from_value(input_required_wire.clone())
+                .expect("final input-required discriminator is exact");
+        input_required
+            .validate()
+            .expect("input-required retains at least one retry input dimension");
+        assert_eq!(
+            serde_json::to_value(input_required).expect("input-required encodes"),
+            input_required_wire
+        );
+
+        assert!(matches!(
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                SAMPLING_CREATE_MESSAGE,
+                Some(&final_params_wire)
+            ),
+            Err(CoreDispatchError::UnsupportedMethod {
+                era: ProtocolEra::Modern2026,
+                method,
+            }) if method == SAMPLING_CREATE_MESSAGE
+        ));
+    }
+
+    #[test]
+    fn legacy_sampling_rejects_one_final_result_field_without_mutating_its_baseline() {
+        let request = CoreRequest::decode(
+            ProtocolEra::Legacy2024,
+            SAMPLING_CREATE_MESSAGE,
+            Some(&serde_json::json!({
+                "messages": [{"role": "user", "content": {"type": "text", "text": "hello"}}],
+                "maxTokens": 8
+            })),
+        )
+        .expect("legacy sampling baseline request");
+        let accepted = r#"{"content":{"type":"text","text":"hello"},"role":"assistant","model":"legacy","stopReason":"endTurn"}"#;
+        let baseline = request
+            .decode_result(accepted)
+            .expect("legacy sampling baseline result");
+        let planted = r#"{"content":{"type":"text","text":"hello"},"role":"assistant","model":"legacy","stopReason":"endTurn","resultType":"complete"}"#;
+        assert!(
+            matches!(
+                request.decode_result(planted),
+                Err(CoreDispatchError::CrossEraResultType {
+                    method: SAMPLING_CREATE_MESSAGE
+                })
+            ),
+            "only the final resultType field changes the accepted legacy sampling result"
+        );
+        assert_eq!(
+            request
+                .decode_result(accepted)
+                .expect("legacy baseline remains admitted")
+                .encode()
+                .expect("legacy baseline encodes"),
+            baseline.encode().expect("baseline encodes"),
+            "the cross-era rejection leaves legacy sampling state unchanged"
+        );
+    }
+
+    #[test]
+    fn final_catalog_results_require_typed_cache_hints() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        let cases = [
+            (
+                TOOLS_LIST,
+                r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#,
+            ),
+            (
+                RESOURCES_LIST,
+                r#"{"resultType":"complete","resources":[],"ttlMs":1,"cacheScope":"public"}"#,
+            ),
+            (
+                RESOURCES_TEMPLATES_LIST,
+                r#"{"resultType":"complete","resourceTemplates":[],"ttlMs":2,"cacheScope":"private"}"#,
+            ),
+            (
+                PROMPTS_LIST,
+                r#"{"resultType":"complete","prompts":[],"ttlMs":3,"cacheScope":"public"}"#,
+            ),
+            (
+                RESOURCES_READ,
+                r#"{"resultType":"complete","contents":[],"ttlMs":4,"cacheScope":"private"}"#,
+            ),
+        ];
+        for (method, wire) in cases {
+            let request_params = if method == RESOURCES_READ {
+                serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    },
+                    "uri": "file:///workspace/status"
+                })
+            } else {
+                params.clone()
+            };
+            let request =
+                CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&request_params))
+                    .expect("final catalog/read request");
+            let result = request
+                .decode_result(wire)
+                .expect("required final cache fields decode");
+            assert_eq!(
+                result.encode().expect("final cached result encodes"),
+                wire,
+                "{method} preserves its exact final cache result"
+            );
+        }
+
+        let tools_request = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_LIST, Some(&params))
+            .expect("tools/list request");
+        assert!(
+            matches!(
+                tools_request.decode_result(
+                    r#"{"resultType":"complete","tools":[],"cacheScope":"private"}"#
+                ),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_LIST,
+                })
+            ),
+            "missing only ttlMs rejects a final cacheable catalog result"
+        );
+        assert!(
+            matches!(
+                tools_request.decode_result(
+                    r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"shared"}"#
+                ),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_LIST,
+                })
+            ),
+            "only an invalid cacheScope changes the otherwise valid final catalog result"
+        );
+    }
+
+    #[test]
+    fn final_retry_parameters_preserve_input_state_and_require_object_arguments() {
+        let call_params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "name": "weather",
+            "arguments": {"city": "Boston"},
+            "inputResponses": {"request-1": {"approved": true}},
+            "requestState": "retry-1"
+        });
+        let baseline = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&call_params))
+            .expect("final call admits retry state and object arguments");
+        assert_eq!(
+            baseline
+                .encode_params()
+                .expect("call parameters encode")
+                .expect("call owns parameters"),
+            call_params
+        );
+
+        let mut planted = call_params.clone();
+        planted["arguments"] = serde_json::json!(["Boston"]);
+        assert!(
+            matches!(
+                CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&planted)),
+                Err(CoreDispatchError::InvalidParams {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_CALL,
+                })
+            ),
+            "only a non-object arguments value changes the accepted final call"
+        );
+
+        let read_params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "uri": "file:///workspace/status",
+            "inputResponses": {"request-1": {"approved": true}},
+            "requestState": "retry-1"
+        });
+        let get_params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "name": "status",
+            "inputResponses": {"request-1": {"approved": true}},
+            "requestState": "retry-1"
+        });
+        for (method, params) in [(RESOURCES_READ, read_params), (PROMPTS_GET, get_params)] {
+            let request = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params))
+                .expect("final retry parameters decode");
+            assert_eq!(
+                request
+                    .encode_params()
+                    .expect("retry parameters encode")
+                    .expect("retry-owning request has parameters"),
+                params,
+                "{method} retains retry input responses and request state"
+            );
+        }
+    }
+
+    #[test]
+    fn final_server_info_is_admitted_only_in_result_metadata() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_LIST, Some(&params))
+            .expect("final tools/list request");
+        let accepted = r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"final-server","version":"1.0.0"}}}"#;
+        let baseline = request
+            .decode_result(accepted)
+            .expect("final serverInfo is admitted in metadata");
+        assert_eq!(
+            baseline.encode().expect("metadata serverInfo encodes"),
+            accepted
+        );
+
+        let planted = r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"final-server","version":"1.0.0"}},"serverInfo":{"name":"legacy-location","version":"1.0.0"}}"#;
+        assert!(
+            matches!(
+                request.decode_result(planted),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_LIST,
+                })
+            ),
+            "only a top-level serverInfo changes the final result admission"
+        );
+        assert_eq!(
+            request
+                .decode_result(accepted)
+                .expect("baseline remains admitted")
+                .encode()
+                .expect("baseline encodes"),
+            baseline.encode().expect("original baseline encodes"),
+            "the top-level serverInfo rejection does not alter metadata server info"
+        );
+    }
+
+    #[test]
+    fn final_log_level_metadata_replaces_final_set_level_rpc() {
+        let final_params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/logLevel": "notice"
+            }
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, PING, Some(&final_params))
+            .expect("final request metadata carries log level");
+        let CoreRequest::Final(FinalCoreRequest::Ping(params)) = request else {
+            panic!("final ping request");
+        };
+        assert_eq!(
+            params.meta.log_level().expect("typed final log level"),
+            Some(LoggingLevel::Notice)
+        );
+        let notification = FinalLogMessageParams {
+            level: LoggingLevel::Notice,
+            logger: Some("final.server".to_owned()),
+            data: serde_json::json!({"message": "catalog refreshed"}),
+            meta: None,
+        };
+        assert_eq!(
+            serde_json::to_value(notification).expect("final log notification encodes"),
+            serde_json::json!({
+                "level": "notice",
+                "logger": "final.server",
+                "data": {"message": "catalog refreshed"}
+            })
+        );
+        assert!(matches!(
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                LOGGING_SET_LEVEL,
+                Some(&serde_json::json!({"level": "notice"}))
+            ),
+            Err(CoreDispatchError::UnsupportedMethod {
+                era: ProtocolEra::Modern2026,
+                method,
+            }) if method == LOGGING_SET_LEVEL
+        ));
+        assert!(
+            CoreRequest::decode(
+                ProtocolEra::Legacy2024,
+                LOGGING_SET_LEVEL,
+                Some(&serde_json::json!({"level": "warning"}))
+            )
+            .is_ok(),
+            "the legacy set-level request remains available only in its legacy era"
+        );
+    }
+
+    #[test]
     fn core_dispatch_round_trips_legacy_and_final_core_payloads() {
         let final_params = serde_json::json!({
             "_meta": {
@@ -2974,7 +3803,7 @@ mod tests {
             })),
         )
         .expect("legacy completion request");
-        let wire = r#"{"completion":{"values":["staging"]},"_meta":{"cache":"private","trace":{"attempt":1}}}"#;
+        let wire = r#"{"completion":{"values":["staging"]},"_meta":{"trace":{"attempt":1},"cache":"private"}}"#;
         let result = request
             .decode_result(wire)
             .expect("legacy completion metadata remains typed");
@@ -2989,6 +3818,15 @@ mod tests {
         assert_eq!(
             metadata.get("trace"),
             Some(&serde_json::json!({"attempt": 1}))
+        );
+        assert_eq!(
+            metadata
+                .entries()
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            ["trace", "cache"],
+            "received legacy _meta key order remains observable"
         );
         assert_eq!(
             result.encode().expect("legacy completion re-encodes"),
@@ -3008,7 +3846,8 @@ mod tests {
                 "promptsListChanged": false,
                 "resourceSubscriptions": ["file:///workspace/status"],
                 "resourcesListChanged": true,
-                "toolsListChanged": true
+                "toolsListChanged": true,
+                "com.example/extension": {"enabled": true}
             }
         });
         let request =
@@ -3023,6 +3862,10 @@ mod tests {
             Some([uri]) if uri == "file:///workspace/status"
         ));
         assert_eq!(listen.notifications.prompts_list_changed, Some(false));
+        assert_eq!(
+            listen.notifications.additional.get("com.example/extension"),
+            Some(&serde_json::json!({"enabled": true}))
+        );
         assert_eq!(
             request
                 .encode_params()
@@ -3054,8 +3897,12 @@ mod tests {
         );
 
         let result_wire = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":"subscription-7","io.modelcontextprotocol/serverInfo":{"name":"final-server","version":"1.0.0"}}}"#;
+        let response = JsonRpcResponse::success(
+            RequestId::from("subscription-7"),
+            serde_json::from_str(result_wire).expect("subscription result JSON"),
+        );
         let result = request
-            .decode_result(result_wire)
+            .decode_response(&response)
             .expect("final subscriptions/listen termination result is typed");
         let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
             result: listen_result,
@@ -3069,10 +3916,13 @@ mod tests {
         assert!(diagnostic.is_none());
         assert!(listen_result.extras.members().is_empty());
         assert_eq!(
-            result
-                .encode()
-                .expect("final subscriptions/listen re-encodes"),
-            result_wire
+            serde_json::from_str::<Value>(
+                &result
+                    .encode()
+                    .expect("final subscriptions/listen re-encodes"),
+            )
+            .expect("encoded subscription result is JSON"),
+            serde_json::from_str::<Value>(result_wire).expect("subscription result is JSON")
         );
 
         let legacy_subscribe = SubscribeResourceParams {
@@ -3089,6 +3939,40 @@ mod tests {
             serde_json::to_value(legacy_unsubscribe).expect("legacy unsubscribe serializes"),
             serde_json::json!({"uri": "file:///workspace/status"})
         );
+    }
+
+    #[test]
+    fn final_subscriptions_listen_rejects_one_field_response_id_mismatch() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "notifications": {"toolsListChanged": true}
+        });
+        let request =
+            CoreRequest::decode(ProtocolEra::Modern2026, SUBSCRIPTIONS_LISTEN, Some(&params))
+                .expect("final subscriptions/listen request");
+        let result = serde_json::json!({
+            "resultType": "complete",
+            "_meta": {"io.modelcontextprotocol/subscriptionId": "subscription-7"}
+        });
+        let accepted = JsonRpcResponse::success(RequestId::from("subscription-7"), result.clone());
+        request
+            .decode_response(&accepted)
+            .expect("matching subscription response id is admitted");
+
+        let planted = JsonRpcResponse::success(RequestId::from("subscription-8"), result);
+        assert!(
+            matches!(
+                request.decode_response(&planted),
+                Err(CoreDispatchError::SubscriptionIdMismatch)
+            ),
+            "only the response id differs from the otherwise valid subscription result"
+        );
+        request
+            .decode_response(&accepted)
+            .expect("the mismatched response cannot mutate the accepted binding");
     }
 
     #[test]
@@ -4036,6 +4920,7 @@ mod tests {
             role: crate::types::Role::Assistant,
             model: "model".to_string(),
             stop_reason: StopReason::EndTurn,
+            meta: None,
         };
         assert_eq!(result.text_content(), None);
     }

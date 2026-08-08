@@ -2,7 +2,9 @@
 //!
 //! Core types used in MCP communication.
 
+use crate::common_types::{AbsoluteUri, Annotations, OpenMetadata, RawIcon, SamplingContentBlock};
 use base64::Engine as _;
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 /// MCP protocol version.
@@ -482,6 +484,233 @@ pub struct PromptArgument {
     pub required: bool,
 }
 
+// ============================================================================
+// Final component definitions
+// ============================================================================
+
+/// Shared final component identity fields.
+///
+/// The final protocol separates a stable programmatic `name` from an optional
+/// user-facing `title`. Legacy component definitions deliberately remain
+/// separate because their icon, version, and tag members are not final wire
+/// members.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalBaseMetadata {
+    /// Programmatic component identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// Final tool annotations, including the final display-title hint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalToolAnnotations {
+    /// Optional display title, lower priority than the enclosing tool title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Whether the tool may perform destructive updates.
+    #[serde(
+        rename = "destructiveHint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub destructive: Option<bool>,
+    /// Whether repeated calls are idempotent.
+    #[serde(
+        rename = "idempotentHint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idempotent: Option<bool>,
+    /// Whether the tool is read-only.
+    #[serde(
+        rename = "readOnlyHint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub read_only: Option<bool>,
+    /// Whether the tool may interact with an open world.
+    #[serde(
+        rename = "openWorldHint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub open_world_hint: Option<bool>,
+}
+
+/// Exact final `Tool` model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalTool {
+    /// Programmatic component identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional sized icon collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<RawIcon>>,
+    /// Required JSON Schema object for tool input.
+    #[serde(
+        rename = "inputSchema",
+        deserialize_with = "deserialize_final_tool_input_schema"
+    )]
+    pub input_schema: serde_json::Value,
+    /// Optional JSON Schema object for structured tool output.
+    #[serde(
+        rename = "outputSchema",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_final_json_object"
+    )]
+    pub output_schema: Option<serde_json::Value>,
+    /// Optional behavioral and display hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<FinalToolAnnotations>,
+    /// Optional final metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+/// Exact final `Resource` model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalResource {
+    /// Exact resource URI.
+    pub uri: AbsoluteUri,
+    /// Programmatic resource identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional sized icon collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<RawIcon>>,
+    /// Optional resource MIME type.
+    #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Optional raw content size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    /// Optional client-facing annotations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
+    /// Optional final metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+/// Exact final `ResourceTemplate` model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalResourceTemplate {
+    /// RFC 6570 resource URI template.
+    #[serde(rename = "uriTemplate")]
+    pub uri_template: String,
+    /// Programmatic template identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional sized icon collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<RawIcon>>,
+    /// Optional MIME type for resources matched by the template.
+    #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Optional client-facing annotations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
+    /// Optional final metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+/// Exact final prompt-argument model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalPromptArgument {
+    /// Programmatic argument identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether an argument is required; absence remains distinct from false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+}
+
+/// Exact final `Prompt` model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalPrompt {
+    /// Programmatic prompt identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional sized icon collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<RawIcon>>,
+    /// Optional prompt arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<FinalPromptArgument>>,
+    /// Optional final metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+fn deserialize_final_tool_input_schema<'de, D>(
+    deserializer: D,
+) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(object) = value.as_object() else {
+        return Err(D::Error::custom("final tool inputSchema must be an object"));
+    };
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return Err(D::Error::custom(
+            "final tool inputSchema must declare type object",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_final_json_object<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    if value.as_ref().is_some_and(|value| !value.is_object()) {
+        return Err(D::Error::custom(
+            "final tool outputSchema must be an object",
+        ));
+    }
+    Ok(value)
+}
+
 /// Content types in MCP messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
@@ -836,6 +1065,54 @@ impl SamplingMessage {
             content: SamplingContent::Text { text: text.into() },
         }
     }
+}
+
+/// Final sampling-specific content block.
+pub type FinalSamplingMessageContentBlock = SamplingContentBlock;
+
+/// Exact final sampling-message content, preserving one block versus an array
+/// of blocks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FinalSamplingMessageContent {
+    /// One sampled content block.
+    Block(FinalSamplingMessageContentBlock),
+    /// Multiple sampled content blocks.
+    Blocks(Vec<FinalSamplingMessageContentBlock>),
+}
+
+/// A final sampling conversation message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalSamplingMessage {
+    /// Sender role.
+    pub role: Role,
+    /// Exact final sampling content shape.
+    pub content: FinalSamplingMessageContent,
+    /// Optional metadata retained on the final wire.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+/// Tool-selection mode for final sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FinalToolChoiceMode {
+    /// The model decides whether to use tools.
+    Auto,
+    /// The model must use at least one tool.
+    Required,
+    /// The model must not use tools.
+    None,
+}
+
+/// Tool-selection controls for final sampling.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalToolChoice {
+    /// Optional mode; absence keeps the wire default of `auto` distinct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<FinalToolChoiceMode>,
 }
 
 /// Model preferences for sampling requests.
@@ -2268,5 +2545,61 @@ mod tests {
             }
             _ => panic!("expected Resource content"),
         }
+    }
+
+    #[test]
+    fn final_models_and_sampling_blocks_round_trip_without_legacy_fields() {
+        let tool_wire = json!({
+            "name": "weather",
+            "title": "Weather lookup",
+            "description": "Looks up forecast data",
+            "icons": [{"src": "https://example.test/weather.png"}],
+            "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            "annotations": {"title": "Forecast", "readOnlyHint": true},
+            "_meta": {"com.example/source": "catalog"}
+        });
+        let tool: FinalTool = serde_json::from_value(tool_wire.clone())
+            .expect("final tool accepts final metadata and icons array");
+        assert_eq!(tool.title.as_deref(), Some("Weather lookup"));
+        assert_eq!(
+            serde_json::to_value(&tool).expect("final tool re-encodes"),
+            tool_wire
+        );
+
+        let sampling_wire = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "call-1", "name": "weather", "input": {"city": "Boston"}},
+                {"type": "tool_result", "toolUseId": "call-1", "content": [{"type": "text", "text": "sunny"}], "structuredContent": {"temperature": 22}}
+            ],
+            "_meta": {"com.example/turn": 4}
+        });
+        let message: FinalSamplingMessage = serde_json::from_value(sampling_wire.clone())
+            .expect("final sampling admits tool-use and tool-result blocks");
+        assert_eq!(
+            serde_json::to_value(message).expect("final sampling re-encodes"),
+            sampling_wire
+        );
+    }
+
+    #[test]
+    fn final_tool_rejects_one_legacy_icon_field_without_mutating_final_baseline() {
+        let accepted = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"}
+        });
+        let baseline: FinalTool =
+            serde_json::from_value(accepted.clone()).expect("final tool baseline");
+        let mut planted = accepted.clone();
+        planted["icon"] = json!({"src": "https://example.test/legacy.png"});
+        assert!(
+            serde_json::from_value::<FinalTool>(planted).is_err(),
+            "only the legacy singular icon field changes the final model"
+        );
+        assert_eq!(
+            serde_json::to_value(baseline).expect("baseline re-encodes"),
+            accepted,
+            "legacy-field rejection does not mutate final model state"
+        );
     }
 }

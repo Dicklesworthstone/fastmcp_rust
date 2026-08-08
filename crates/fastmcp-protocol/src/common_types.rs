@@ -1593,6 +1593,70 @@ impl ContentBlock {
     }
 }
 
+/// Final sampling-only content blocks.
+///
+/// Tool use and tool result are intentionally absent from [`ContentBlock`]:
+/// they are legal only in the final sampling message/result union. Tool result
+/// bodies, in turn, use the general content union and therefore cannot nest
+/// further tool-use/result blocks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SamplingContentBlock {
+    /// Text sampling content.
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Annotations>,
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<OpenMetadata>,
+    },
+    /// Image sampling content.
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Annotations>,
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<OpenMetadata>,
+    },
+    /// Audio sampling content.
+    Audio {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Annotations>,
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<OpenMetadata>,
+    },
+    /// A requested assistant tool call.
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Map<String, Value>,
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<OpenMetadata>,
+    },
+    /// A result for a preceding tool call.
+    ToolResult {
+        #[serde(rename = "toolUseId")]
+        tool_use_id: String,
+        content: Vec<ContentBlock>,
+        /// Presence remains distinct from the protocol default of false.
+        #[serde(rename = "isError", default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+        #[serde(
+            rename = "structuredContent",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        structured_content: Option<Value>,
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        meta: Option<OpenMetadata>,
+    },
+}
+
 fn valid_binary_content(
     data: &str,
     mime_type: &str,
@@ -2182,6 +2246,29 @@ mod tests {
         assert_eq!(
             accepted, baseline,
             "the one-key rejection cannot mutate retained wire state"
+        );
+    }
+
+    #[test]
+    fn final_sampling_tool_content_round_trips_without_widening_general_content() {
+        let wire = json!({
+            "type": "tool_result",
+            "toolUseId": "call-7",
+            "content": [{"type": "text", "text": "done"}],
+            "structuredContent": {"ok": true},
+            "_meta": {"com.example/cache": "hit"}
+        });
+        let content: SamplingContentBlock =
+            serde_json::from_value(wire.clone()).expect("final tool-result content is admitted");
+        assert!(matches!(content, SamplingContentBlock::ToolResult { .. }));
+        assert_eq!(
+            serde_json::to_value(&content).expect("tool-result re-encodes"),
+            wire
+        );
+
+        assert!(
+            serde_json::from_value::<ContentBlock>(wire).is_err(),
+            "sampling-only tool_result never widens the general content union"
         );
     }
 }
