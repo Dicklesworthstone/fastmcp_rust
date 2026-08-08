@@ -242,6 +242,20 @@ impl ExtensionHandlerRegistry {
         &self.descriptor_registry
     }
 
+    /// Returns the mutable descriptor registry before handler freeze.
+    ///
+    /// Builder-only composition must add every descriptor before typed handlers
+    /// are frozen under their shared receipt. Once frozen, neither descriptor
+    /// nor handler mutation is admitted.
+    pub(crate) fn descriptor_registry_mut(
+        &mut self,
+    ) -> Result<&mut ExtensionDescriptorRegistry, ExtensionHandlerRegistrationError> {
+        if self.frozen {
+            return Err(ExtensionHandlerRegistrationError::Frozen);
+        }
+        Ok(&mut self.descriptor_registry)
+    }
+
     /// Returns whether handler registration has been frozen.
     #[must_use]
     pub const fn is_frozen(&self) -> bool {

@@ -31,43 +31,63 @@
 //! task_manager.cancel(&task_id, Some("User requested"))?;
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::RwLock;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+#[cfg(test)]
 use std::time::{Duration as StdDuration, Instant};
 
 #[cfg(test)]
 use asupersync::Budget;
+#[cfg(test)]
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
+#[cfg(test)]
 use asupersync::{CancelKind, Cx};
 use base64::Engine as _;
+#[cfg(test)]
 use fastmcp_core::logging::{debug, info, targets, warn};
 use fastmcp_core::{McpError, McpResult, draw_security_identifier};
+use fastmcp_protocol::protocol_version::FINAL_PROTOCOL_VERSION;
 use fastmcp_protocol::{
     CreateTaskResult, FinalCancelTaskResult, FinalGetTaskResult, FinalTaskCallToolResult,
-    FinalTaskError, FinalTaskId, FinalTaskStatus, FinalTaskStatusNotificationParams,
-    JsonRpcRequest, Task as FinalTask, TaskBase as FinalTaskBase,
-    TaskDuration as FinalTaskDuration, TaskId, TaskInfo, TaskInputLedger as FinalTaskInputLedger,
-    TaskInputRequests as FinalTaskInputRequests, TaskInputResponses as FinalTaskInputResponses,
-    TaskResult, TaskStatus, TaskStatusNotification as FinalTaskStatusNotification,
-    TaskStatusNotificationParams, TaskTimestamp as FinalTaskTimestamp, UpdateTaskResult,
+    FinalTaskError, FinalTaskId, FinalTaskStatus, FinalTaskStatusNotificationParams, GetTaskParams,
+    Task as FinalTask, TaskBase as FinalTaskBase, TaskDuration as FinalTaskDuration,
+    TaskInputLedger as FinalTaskInputLedger, TaskInputRequests as FinalTaskInputRequests,
+    TaskInputResponses as FinalTaskInputResponses, TaskRequestMeta,
+    TaskStatusNotification as FinalTaskStatusNotification,
+    TaskStatusNotificationParams as FinalTaskStatusNotificationParams,
+    TaskTimestamp as FinalTaskTimestamp, UpdateTaskParams, UpdateTaskResult,
+};
+#[cfg(test)]
+use fastmcp_protocol::{
+    JsonRpcRequest, TaskId, TaskInfo, TaskResult, TaskStatus, TaskStatusNotificationParams,
 };
 
 /// Notification sender used for task status updates.
+#[cfg(test)]
 pub type TaskNotificationSender = Arc<dyn Fn(JsonRpcRequest) + Send + Sync>;
 
 /// Callback type for task execution.
 ///
 /// Task handlers receive the context and parameters, and return a result.
+#[cfg(test)]
 pub type TaskHandler = Box<dyn Fn(&Cx, serde_json::Value) -> TaskFuture + Send + Sync + 'static>;
 
 /// Future type for task execution.
+#[cfg(test)]
 pub type TaskFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = McpResult<serde_json::Value>> + Send + 'static>,
 >;
 
 /// Internal state for a running task.
+#[cfg(test)]
 struct TaskState {
     /// Task information.
     info: TaskInfo,
@@ -79,6 +99,7 @@ struct TaskState {
     cx: Cx,
 }
 
+#[cfg(test)]
 fn can_transition(from: TaskStatus, to: TaskStatus) -> bool {
     matches!(
         (from, to),
@@ -92,6 +113,7 @@ fn can_transition(from: TaskStatus, to: TaskStatus) -> bool {
     )
 }
 
+#[cfg(test)]
 fn transition_state(state: &mut TaskState, to: TaskStatus) -> bool {
     let from = state.info.status;
     if from == to {
@@ -131,6 +153,7 @@ fn transition_state(state: &mut TaskState, to: TaskStatus) -> bool {
     true
 }
 
+#[cfg(test)]
 fn mark_task_failed_snapshot(
     tasks: &Arc<RwLock<HashMap<TaskId, TaskState>>>,
     task_id: &TaskId,
@@ -161,6 +184,7 @@ fn mark_task_failed_snapshot(
     Some(TaskStatusSnapshot::from(state))
 }
 
+#[cfg(test)]
 fn build_runtime_handle() -> Option<RuntimeHandle> {
     match RuntimeBuilder::multi_thread().build() {
         Ok(runtime) => Some(runtime.handle()),
@@ -189,6 +213,7 @@ fn build_runtime_handle() -> Option<RuntimeHandle> {
 ///
 /// Manages the lifecycle of background tasks including submission, status
 /// tracking, and cancellation.
+#[cfg(test)]
 pub struct TaskManager {
     /// Active and completed tasks by ID.
     tasks: Arc<RwLock<HashMap<TaskId, TaskState>>>,
@@ -206,6 +231,7 @@ pub struct TaskManager {
     notification_sender: Arc<RwLock<Option<TaskNotificationSender>>>,
 }
 
+#[cfg(test)]
 impl TaskManager {
     /// Creates a new task manager.
     #[must_use]
@@ -799,12 +825,14 @@ impl TaskManager {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct TaskStatusSnapshot {
     info: TaskInfo,
     result: Option<TaskResult>,
 }
 
+#[cfg(test)]
 impl TaskStatusSnapshot {
     fn from(state: &TaskState) -> Self {
         Self {
@@ -814,6 +842,7 @@ impl TaskStatusSnapshot {
     }
 }
 
+#[cfg(test)]
 fn notify_snapshot(
     sender: &Arc<RwLock<Option<TaskNotificationSender>>>,
     snapshot: Option<TaskStatusSnapshot>,
@@ -867,6 +896,7 @@ fn notify_snapshot(
 /// router must keep the extension unadvertised until the Task wire model,
 /// authenticated durable backend, and application-owned supervisor have been
 /// installed together.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskStorageKind {
     /// Bounded process memory, lost when the process exits.
@@ -878,6 +908,7 @@ pub(crate) enum TaskStorageKind {
 ///
 /// Private execution phases such as `queued`, `claimed`, or `leased` are not
 /// represented here and therefore cannot leak into a wire task snapshot.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum OfficialTaskStatus {
     /// Work has been accepted and may be executing.
@@ -897,6 +928,7 @@ pub(crate) enum OfficialTaskStatus {
     Cancelled,
 }
 
+#[cfg(test)]
 impl OfficialTaskStatus {
     #[must_use]
     fn is_terminal(self) -> bool {
@@ -909,6 +941,7 @@ impl OfficialTaskStatus {
 /// The final protocol types for these descriptors are owned by TASK-01 and
 /// MRTR. Keeping the method separate from its parameters prevents an old
 /// JSON-RPC envelope from becoming execution or correlation authority here.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub(crate) struct OfficialTaskInputRequest {
     /// The supported server-to-client request method.
@@ -918,6 +951,7 @@ pub(crate) struct OfficialTaskInputRequest {
 }
 
 /// The only embedded request kinds admitted by the process-local lifecycle.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum OfficialTaskInputMethod {
     /// An elicitation input request.
@@ -932,6 +966,7 @@ pub(crate) enum OfficialTaskInputMethod {
 ///
 /// A finite positive TTL is required because this implementation has no
 /// durable, authorized reclamation path for retained/null-TTL records.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OfficialTaskLifecycleConfig {
     ttl_ms: NonZeroU64,
@@ -939,6 +974,7 @@ pub(crate) struct OfficialTaskLifecycleConfig {
     max_tasks: NonZeroUsize,
 }
 
+#[cfg(test)]
 impl OfficialTaskLifecycleConfig {
     /// Creates a bounded process-local lifecycle configuration.
     pub(crate) fn new(
@@ -970,6 +1006,7 @@ impl OfficialTaskLifecycleConfig {
 /// It intentionally has no storage or owner fields. Authorization, durable
 /// retention, and wire validation are integration responsibilities; callers
 /// must not serialize this private primitive directly as a protocol response.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub(crate) struct OfficialTaskSnapshot {
     /// Server-generated opaque task identifier.
@@ -1006,6 +1043,7 @@ pub(crate) struct OfficialTaskSnapshot {
 }
 
 /// Outcome of accepting input responses for a known task.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OfficialTaskInputUpdate {
     /// At least one outstanding request was satisfied.
@@ -1014,6 +1052,7 @@ pub(crate) enum OfficialTaskInputUpdate {
     Ignored,
 }
 
+#[cfg(test)]
 struct OfficialTaskRecord {
     snapshot: OfficialTaskSnapshot,
     /// Process-local retention backstop. A durable backend owns the
@@ -1035,11 +1074,13 @@ struct OfficialTaskRecord {
 /// actions require the application-owned supervisor and qualified backend
 /// defined by TASK-02. It is not a server capability and must remain
 /// unadvertised until that integration exists.
+#[cfg(test)]
 pub(crate) struct OfficialTaskLifecycle {
     config: OfficialTaskLifecycleConfig,
     records: RwLock<HashMap<TaskId, OfficialTaskRecord>>,
 }
 
+#[cfg(test)]
 impl OfficialTaskLifecycle {
     /// Creates an empty process-local lifecycle.
     #[must_use]
@@ -1312,6 +1353,7 @@ impl OfficialTaskLifecycle {
     }
 }
 
+#[cfg(test)]
 fn generate_official_task_id() -> McpResult<TaskId> {
     let identifier = draw_security_identifier().map_err(|error| {
         McpError::internal_error(format!("Task identifier generation failed: {error}"))
@@ -1325,10 +1367,12 @@ fn generate_official_task_id() -> McpResult<TaskId> {
     Ok(TaskId::from_string(encoded))
 }
 
+#[cfg(test)]
 fn official_task_timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+#[cfg(test)]
 fn official_task_record_mut<'a>(
     records: &'a mut HashMap<TaskId, OfficialTaskRecord>,
     task_id: &TaskId,
@@ -1344,6 +1388,7 @@ fn official_task_record_mut<'a>(
         .ok_or_else(|| McpError::invalid_params("Task not found"))
 }
 
+#[cfg(test)]
 fn can_transition_official_task(from: OfficialTaskStatus, to: OfficialTaskStatus) -> bool {
     matches!(
         (from, to),
@@ -1368,12 +1413,14 @@ fn can_transition_official_task(from: OfficialTaskStatus, to: OfficialTaskStatus
     )
 }
 
+#[cfg(test)]
 fn invalid_official_task_transition(from: OfficialTaskStatus, to: OfficialTaskStatus) -> McpError {
     McpError::invalid_params(format!(
         "Invalid official task transition from {from:?} to {to:?}"
     ))
 }
 
+#[cfg(test)]
 fn touch_official_task(record: &mut OfficialTaskRecord) -> McpResult<()> {
     record.update_revision = record
         .update_revision
@@ -1383,6 +1430,7 @@ fn touch_official_task(record: &mut OfficialTaskRecord) -> McpResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn advance_official_task(
     record: &mut OfficialTaskRecord,
     status: OfficialTaskStatus,
@@ -1398,6 +1446,7 @@ fn advance_official_task(
     Ok(())
 }
 
+#[cfg(test)]
 fn transition_to_terminal(
     record: &mut OfficialTaskRecord,
     status: OfficialTaskStatus,
@@ -1414,6 +1463,7 @@ fn transition_to_terminal(
     Ok(record.snapshot.clone())
 }
 
+#[cfg(test)]
 fn validate_official_task_input_request(
     key: &str,
     request: &OfficialTaskInputRequest,
@@ -1431,6 +1481,7 @@ fn validate_official_task_input_request(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_final_tool_result(result: &serde_json::Value) -> McpResult<()> {
     let result = result
         .as_object()
@@ -1459,6 +1510,7 @@ fn validate_final_tool_result(result: &serde_json::Value) -> McpResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
     let error = error
         .as_object()
@@ -1495,7 +1547,7 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
 /// boundary: a caller may return the `CreateTaskResult` only after this method
 /// has succeeded. Delivery is deliberately separate from persistence so a
 /// transport reconnect cannot erase an accepted task transition.
-pub(crate) trait FinalTaskStore: Send + Sync {
+pub trait FinalTaskStore: Send + Sync {
     /// Durably records a newly created task and its status notification.
     fn create_task(
         &self,
@@ -1524,19 +1576,18 @@ pub(crate) trait FinalTaskStore: Send + Sync {
 ///
 /// The store receives the same notification first, so a failed or disconnected
 /// delivery path never changes whether the task transition was durable.
-pub(crate) type FinalTaskNotificationEmitter =
-    Arc<dyn Fn(FinalTaskStatusNotification) + Send + Sync>;
+pub type FinalTaskNotificationEmitter = Arc<dyn Fn(FinalTaskStatusNotification) + Send + Sync>;
 
 /// Immutable final Tasks timing policy supplied with the durable store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FinalTaskRuntimeConfig {
+pub struct FinalTaskRuntimeConfig {
     ttl_ms: u64,
     poll_interval_ms: Option<u64>,
 }
 
 impl FinalTaskRuntimeConfig {
     /// Creates a final Tasks policy with a required finite retention duration.
-    pub(crate) fn new(ttl_ms: u64, poll_interval_ms: Option<u64>) -> McpResult<Self> {
+    pub fn new(ttl_ms: u64, poll_interval_ms: Option<u64>) -> McpResult<Self> {
         final_task_duration(ttl_ms)?;
         if let Some(interval) = poll_interval_ms {
             final_task_duration(interval)?;
@@ -1554,19 +1605,19 @@ impl FinalTaskRuntimeConfig {
 /// asupersync supervisor may invoke these synchronous durable transitions from
 /// its own children; the legacy `TaskManager` remains entirely separate.
 #[derive(Clone)]
-pub(crate) struct FinalTaskRuntime {
+pub struct FinalTaskRuntime {
     store: Arc<dyn FinalTaskStore>,
     config: FinalTaskRuntimeConfig,
-    notification_emitter: Option<FinalTaskNotificationEmitter>,
+    notification_emitter: FinalTaskNotificationEmitter,
 }
 
 impl FinalTaskRuntime {
     /// Binds final Tasks to one application-owned durable store.
     #[must_use]
-    pub(crate) fn new(
+    pub fn new(
         store: Arc<dyn FinalTaskStore>,
         config: FinalTaskRuntimeConfig,
-        notification_emitter: Option<FinalTaskNotificationEmitter>,
+        notification_emitter: FinalTaskNotificationEmitter,
     ) -> Self {
         Self {
             store,
@@ -1576,10 +1627,7 @@ impl FinalTaskRuntime {
     }
 
     /// Durably creates the initial working task before returning its wire result.
-    pub(crate) fn create_task(
-        &self,
-        status_message: Option<String>,
-    ) -> McpResult<CreateTaskResult> {
+    pub fn create_task(&self, status_message: Option<String>) -> McpResult<CreateTaskResult> {
         let task_id = generate_final_task_id()?;
         let now = final_task_timestamp()?;
         let task = FinalTask::Working(FinalTaskBase {
@@ -1604,7 +1652,7 @@ impl FinalTaskRuntime {
     }
 
     /// Returns the exact final `tasks/get` complete result.
-    pub(crate) fn get_task(&self, task_id: &FinalTaskId) -> McpResult<FinalGetTaskResult> {
+    pub fn get_task(&self, task_id: &FinalTaskId) -> McpResult<FinalGetTaskResult> {
         Ok(fastmcp_protocol::CompleteTaskResult {
             task: self.load_task(task_id)?,
             meta: None,
@@ -1613,7 +1661,7 @@ impl FinalTaskRuntime {
     }
 
     /// Enters `input_required` with typed final embedded requests.
-    pub(crate) fn require_input(
+    pub fn require_input(
         &self,
         task_id: &FinalTaskId,
         input_requests: FinalTaskInputRequests,
@@ -1641,7 +1689,7 @@ impl FinalTaskRuntime {
     }
 
     /// Applies matching typed input responses and returns the empty final acknowledgement.
-    pub(crate) fn update_task(
+    pub fn update_task(
         &self,
         task_id: &FinalTaskId,
         input_responses: &FinalTaskInputResponses,
@@ -1679,7 +1727,7 @@ impl FinalTaskRuntime {
     }
 
     /// Durably acknowledges cooperative `tasks/cancel` intent.
-    pub(crate) fn cancel_task(&self, task_id: &FinalTaskId) -> McpResult<FinalCancelTaskResult> {
+    pub fn cancel_task(&self, task_id: &FinalTaskId) -> McpResult<FinalCancelTaskResult> {
         let current = self.load_task(task_id)?;
         if matches!(
             current,
@@ -1694,12 +1742,12 @@ impl FinalTaskRuntime {
     }
 
     /// Returns durable cancellation intent for a caller-owned task worker.
-    pub(crate) fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+    pub fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
         self.store.is_cancellation_requested(task_id)
     }
 
     /// Lets a caller-owned worker record the cooperative cancellation outcome.
-    pub(crate) fn honor_cancellation(
+    pub fn honor_cancellation(
         &self,
         task_id: &FinalTaskId,
         status_message: Option<String>,
@@ -1728,7 +1776,7 @@ impl FinalTaskRuntime {
     }
 
     /// Records a typed final tools/call result for a working task.
-    pub(crate) fn complete_task(
+    pub fn complete_task(
         &self,
         task_id: &FinalTaskId,
         result: FinalTaskCallToolResult,
@@ -1751,7 +1799,7 @@ impl FinalTaskRuntime {
     }
 
     /// Records a typed final task failure for an active task.
-    pub(crate) fn fail_task(
+    pub fn fail_task(
         &self,
         task_id: &FinalTaskId,
         error: FinalTaskError,
@@ -1804,10 +1852,61 @@ impl FinalTaskRuntime {
     }
 
     fn emit(&self, notification: FinalTaskStatusNotification) {
-        if let Some(emitter) = &self.notification_emitter {
-            emitter(notification);
-        }
+        (self.notification_emitter)(notification);
     }
+}
+
+fn validate_final_task_request_meta(request: &TaskRequestMeta) -> McpResult<()> {
+    let protocol_version = request
+        .meta
+        .protocol_version()
+        .map_err(|_| McpError::invalid_params("Invalid final Tasks request metadata"))?;
+    let client_capabilities = request
+        .meta
+        .client_capabilities()
+        .map_err(|_| McpError::invalid_params("Invalid final Tasks request metadata"))?;
+    if protocol_version != Some(FINAL_PROTOCOL_VERSION) || client_capabilities.is_none() {
+        return Err(McpError::invalid_params(
+            "Invalid final Tasks request metadata",
+        ));
+    }
+    Ok(())
+}
+
+/// Decodes and serves a negotiated `tasks/get` request through the final runtime.
+pub(crate) fn dispatch_final_tasks_get(
+    runtime: &FinalTaskRuntime,
+    parameters: serde_json::Value,
+) -> McpResult<serde_json::Value> {
+    let parameters = serde_json::from_value::<GetTaskParams>(parameters)
+        .map_err(|_| McpError::invalid_params("Invalid final tasks/get parameters"))?;
+    validate_final_task_request_meta(&parameters.request)?;
+    serde_json::to_value(runtime.get_task(&parameters.task_id)?)
+        .map_err(|_| McpError::internal_error("final tasks/get response serialization failed"))
+}
+
+/// Decodes and serves a negotiated `tasks/update` request through the final runtime.
+pub(crate) fn dispatch_final_tasks_update(
+    runtime: &FinalTaskRuntime,
+    parameters: serde_json::Value,
+) -> McpResult<serde_json::Value> {
+    let parameters = serde_json::from_value::<UpdateTaskParams>(parameters)
+        .map_err(|_| McpError::invalid_params("Invalid final tasks/update parameters"))?;
+    validate_final_task_request_meta(&parameters.request)?;
+    serde_json::to_value(runtime.update_task(&parameters.task_id, &parameters.input_responses)?)
+        .map_err(|_| McpError::internal_error("final tasks/update response serialization failed"))
+}
+
+/// Decodes and serves a negotiated `tasks/cancel` request through the final runtime.
+pub(crate) fn dispatch_final_tasks_cancel(
+    runtime: &FinalTaskRuntime,
+    parameters: serde_json::Value,
+) -> McpResult<serde_json::Value> {
+    let parameters = serde_json::from_value::<GetTaskParams>(parameters)
+        .map_err(|_| McpError::invalid_params("Invalid final tasks/cancel parameters"))?;
+    validate_final_task_request_meta(&parameters.request)?;
+    serde_json::to_value(runtime.cancel_task(&parameters.task_id)?)
+        .map_err(|_| McpError::internal_error("final tasks/cancel response serialization failed"))
 }
 
 fn generate_final_task_id() -> McpResult<FinalTaskId> {
@@ -1865,12 +1964,14 @@ fn final_task_notification(task: &FinalTask) -> FinalTaskStatusNotification {
     })
 }
 
+#[cfg(test)]
 impl Default for TaskManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for TaskManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Use poison recovery to avoid panic during Debug formatting
@@ -1898,6 +1999,7 @@ impl std::fmt::Debug for TaskManager {
 }
 
 /// Thread-safe handle to a TaskManager.
+#[cfg(test)]
 pub type SharedTaskManager = Arc<TaskManager>;
 
 #[cfg(test)]
@@ -2014,11 +2116,11 @@ mod tests {
         FinalTaskRuntime::new(
             store,
             FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
-            Some(Arc::new(move |notification| {
+            Arc::new(move |notification| {
                 if store_for_emitter.contains(&notification.params.task.base().task_id) {
                     delivery_after_durable_commit.store(true, AtomicOrdering::SeqCst);
                 }
-            })),
+            }),
         )
     }
 

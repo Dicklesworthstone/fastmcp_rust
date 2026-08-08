@@ -78,7 +78,6 @@ mod proxy;
 pub mod rate_limiting;
 mod router;
 mod session;
-#[cfg(test)]
 mod tasks;
 pub mod transform;
 
@@ -113,6 +112,9 @@ use session::{
     InitializationSnapshot, MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION, SessionPrincipalBinding,
     SubscriptionAdmission, SubscriptionAdmissionError, SubscriptionRemoval,
     SubscriptionRemovalError,
+};
+pub use tasks::{
+    FinalTaskNotificationEmitter, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskStore,
 };
 #[cfg(test)]
 pub(crate) use tasks::{SharedTaskManager, TaskManager};
@@ -168,15 +170,15 @@ use fastmcp_protocol::protocol_policy::{
 };
 use fastmcp_protocol::{
     CallToolParams, CancelledParams, ClientExtensionDiscovery, CorrelationKey, DiscoveryCacheHints,
-    ExtensionDescriptor, ExtensionId, ExtensionRegistryError, ExtensionRegistryReceipt,
-    ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY, GetPromptParams, InitializeParams,
-    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
-    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
-    MAX_SERVER_INSTRUCTIONS_BYTES, ProgressMarker, Prompt, ReadResourceParams, RequestId, Resource,
-    ResourceTemplate, SERVER_DISCOVER_METHOD, ServerCapabilities, ServerDiscoverCapabilities,
-    ServerDiscoverRequest, ServerDiscoverResult, ServerExtensionDiscovery, ServerInfo,
-    ServerInstructions, SetLogLevelParams, SubscribeResourceParams, Tool,
-    UnsubscribeResourceParams,
+    ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionId, ExtensionRegistryError,
+    ExtensionRegistryReceipt, ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    GetPromptParams, InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
+    ListToolsParams, LogLevel, LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES, ProgressMarker,
+    Prompt, ReadResourceParams, RequestId, Resource, ResourceTemplate, SERVER_DISCOVER_METHOD,
+    ServerCapabilities, ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
+    ServerExtensionDiscovery, ServerInfo, ServerInstructions, SetLogLevelParams,
+    SubscribeResourceParams, Tool, UnsubscribeResourceParams,
 };
 use legacy_2024::{
     Legacy2024AdapterError, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Outbound,
@@ -207,12 +209,18 @@ static REDACTED_EXTENSION_PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Failure while installing the server-owned extension registry.
 #[derive(Debug)]
 pub enum ServerExtensionConfigurationError {
-    /// A builder accepts exactly one immutable extension registry.
+    /// A builder accepts exactly one caller-supplied extension registry.
     AlreadyInstalled,
+    /// Final Tasks was configured more than once for the same server.
+    FinalTasksAlreadyInstalled,
     /// Discovery attempted to advertise an identifier absent from the registry.
     UnregisteredAdvertisedExtension(String),
     /// The descriptor registry could not be frozen into a canonical receipt.
     Registry(ExtensionRegistryError),
+    /// The server could not bind a typed final Tasks handler.
+    Handler(ExtensionHandlerRegistrationError),
+    /// Builder-time resolver composition found a poisoned resolver lock.
+    ResolverPoisoned,
 }
 
 impl std::fmt::Display for ServerExtensionConfigurationError {
@@ -220,6 +228,9 @@ impl std::fmt::Display for ServerExtensionConfigurationError {
         match self {
             Self::AlreadyInstalled => {
                 formatter.write_str("a server extension registry is already installed")
+            }
+            Self::FinalTasksAlreadyInstalled => {
+                formatter.write_str("the final Tasks extension is already installed")
             }
             Self::UnregisteredAdvertisedExtension(id) => {
                 write!(
@@ -230,6 +241,12 @@ impl std::fmt::Display for ServerExtensionConfigurationError {
             Self::Registry(error) => {
                 write!(formatter, "server extension registry is invalid: {error}")
             }
+            Self::Handler(error) => {
+                write!(formatter, "server extension handler is invalid: {error}")
+            }
+            Self::ResolverPoisoned => {
+                formatter.write_str("the server extension resolver is unavailable")
+            }
         }
     }
 }
@@ -238,7 +255,11 @@ impl std::error::Error for ServerExtensionConfigurationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Registry(error) => Some(error),
-            Self::AlreadyInstalled | Self::UnregisteredAdvertisedExtension(_) => None,
+            Self::Handler(error) => Some(error),
+            Self::AlreadyInstalled
+            | Self::FinalTasksAlreadyInstalled
+            | Self::UnregisteredAdvertisedExtension(_)
+            | Self::ResolverPoisoned => None,
         }
     }
 }
@@ -336,6 +357,130 @@ impl ServerExtensionRuntime {
             server_discovery,
             resolver: Mutex::new(BoxedExtensionSettingsResolver(Box::new(resolver))),
         })
+    }
+
+    pub(crate) fn with_final_tasks(
+        task_runtime: &FinalTaskRuntime,
+    ) -> Result<Self, ServerExtensionConfigurationError> {
+        let handlers = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
+        let mut runtime = Self::new(
+            handlers,
+            ServerExtensionDiscovery::default(),
+            |descriptor: &ExtensionDescriptor,
+             _client: &ExtensionSettings,
+             _server: &ExtensionSettings|
+             -> Result<ExtensionSettings, ExtensionNegotiationError> {
+                Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                    descriptor.id.to_string(),
+                ))
+            },
+        )?;
+        runtime.install_final_tasks(task_runtime)?;
+        Ok(runtime)
+    }
+
+    /// Merges the official final Tasks descriptor, handlers, discovery
+    /// settings, and resolver branch into this still-mutable registry.
+    ///
+    /// The caller-supplied registry keeps ownership of every unrelated
+    /// descriptor and resolver path. A pre-existing official Tasks descriptor
+    /// is a real duplicate ownership conflict because the final runtime owns
+    /// all three Tasks request handlers as one atomic surface.
+    pub(crate) fn install_final_tasks(
+        &mut self,
+        task_runtime: &FinalTaskRuntime,
+    ) -> Result<(), ServerExtensionConfigurationError> {
+        let tasks_id = fastmcp_protocol::extensions::official_tasks_extension_id();
+        if self
+            .handlers
+            .descriptor_registry()
+            .descriptor(&tasks_id)
+            .is_some()
+        {
+            return Err(ServerExtensionConfigurationError::FinalTasksAlreadyInstalled);
+        }
+
+        fastmcp_protocol::extensions::register_official_tasks_extension(
+            self.handlers
+                .descriptor_registry_mut()
+                .map_err(ServerExtensionConfigurationError::Handler)?,
+        )
+        .map_err(ServerExtensionConfigurationError::Registry)?;
+
+        let task_settings = fastmcp_protocol::extensions::official_tasks_empty_settings();
+        if self
+            .server_discovery
+            .extensions
+            .insert(tasks_id.clone(), task_settings)
+            .is_some()
+        {
+            return Err(ServerExtensionConfigurationError::FinalTasksAlreadyInstalled);
+        }
+        self.local_enablement.enable(tasks_id.clone());
+
+        let get_runtime = task_runtime.clone();
+        self.handlers
+            .register(
+                tasks_id.clone(),
+                fastmcp_protocol::tasks_extension::TASK_GET,
+                move |_context: &McpContext, parameters: serde_json::Value| {
+                    tasks::dispatch_final_tasks_get(&get_runtime, parameters)
+                },
+            )
+            .map_err(ServerExtensionConfigurationError::Handler)?;
+
+        let update_runtime = task_runtime.clone();
+        self.handlers
+            .register(
+                tasks_id.clone(),
+                fastmcp_protocol::tasks_extension::TASK_UPDATE,
+                move |_context: &McpContext, parameters: serde_json::Value| {
+                    tasks::dispatch_final_tasks_update(&update_runtime, parameters)
+                },
+            )
+            .map_err(ServerExtensionConfigurationError::Handler)?;
+
+        let cancel_runtime = task_runtime.clone();
+        self.handlers
+            .register(
+                tasks_id.clone(),
+                fastmcp_protocol::tasks_extension::TASK_CANCEL,
+                move |_context: &McpContext, parameters: serde_json::Value| {
+                    tasks::dispatch_final_tasks_cancel(&cancel_runtime, parameters)
+                },
+            )
+            .map_err(ServerExtensionConfigurationError::Handler)?;
+
+        let resolver = self
+            .resolver
+            .get_mut()
+            .map_err(|_| ServerExtensionConfigurationError::ResolverPoisoned)?;
+        let previous = std::mem::replace(
+            resolver,
+            BoxedExtensionSettingsResolver(Box::new(
+                |descriptor: &ExtensionDescriptor,
+                 _client: &ExtensionSettings,
+                 _server: &ExtensionSettings|
+                 -> Result<ExtensionSettings, ExtensionNegotiationError> {
+                    Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                        descriptor.id.to_string(),
+                    ))
+                },
+            )),
+        );
+        *resolver = BoxedExtensionSettingsResolver(Box::new(
+            move |descriptor: &ExtensionDescriptor,
+                  client: &ExtensionSettings,
+                  server: &ExtensionSettings|
+                  -> Result<ExtensionSettings, ExtensionNegotiationError> {
+                if descriptor.id == tasks_id {
+                    Ok(fastmcp_protocol::extensions::official_tasks_empty_settings())
+                } else {
+                    previous.resolve(descriptor, client, server)
+                }
+            },
+        ));
+        Ok(())
     }
 
     pub(crate) fn freeze(&mut self) -> Result<ExtensionRegistryReceipt, ExtensionRegistryError> {
@@ -2523,7 +2668,9 @@ async fn send_modern_sse_stream(
                     writer.flush().await.map_err(|_| ())?;
                 }
                 Ok(None) if response.is_finished() => break,
-                Ok(None) => cx.sleep(Duration::from_millis(1)).await,
+                Ok(None) => {
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
                 Err(_) => return Err(()),
             }
         }
@@ -2774,6 +2921,8 @@ pub struct Server {
     http_config: HttpServerConfig,
     /// Frozen modern-only extension descriptors, handlers, and resolver.
     extension_runtime: Option<Arc<ServerExtensionRuntime>>,
+    /// Application-owned final Tasks state retained for the caller's supervisor.
+    final_task_runtime: Option<FinalTaskRuntime>,
 }
 
 impl Server {
@@ -2824,6 +2973,16 @@ impl Server {
     pub fn extension_registry_receipt(&self) -> Option<&ExtensionRegistryReceipt> {
         self.extension_handler_registry()
             .and_then(|registry| registry.descriptor_registry().receipt())
+    }
+
+    /// Returns final Tasks state when the application configured the official extension.
+    ///
+    /// The returned state machine creates no runtime and no detached task. A
+    /// caller-owned structured supervisor drives worker transitions through
+    /// this handle while the server routes only the negotiated wire methods.
+    #[must_use]
+    pub fn final_task_runtime(&self) -> Option<&FinalTaskRuntime> {
+        self.final_task_runtime.as_ref()
     }
 
     /// Negotiates currently advertised client extension settings against this server.
@@ -3445,38 +3604,54 @@ impl Server {
         }
 
         let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
-        let result: McpResult<serde_json::Value> = (|| async {
-            for middleware in self.middleware.iter() {
-                Self::enforce_request_context(&request_ctx)?;
-                entered_middleware.push(middleware.as_ref());
-                match catch_extension_unwind(|| middleware.on_request(&request_ctx, &request)) {
-                    Ok(Ok(MiddlewareDecision::Continue)) => {}
-                    Ok(Ok(MiddlewareDecision::Respond(value))) => return Ok(value),
-                    Ok(Err(error)) => return Err(error),
-                    Err(_payload) => return Err(extension_panic_error("middleware_on_request")),
+        let mut middleware_result = None;
+        for middleware in self.middleware.iter() {
+            if let Err(error) = Self::enforce_request_context(&request_ctx) {
+                middleware_result = Some(Err(error));
+                break;
+            }
+            entered_middleware.push(middleware.as_ref());
+            let decision = catch_extension_unwind(|| middleware.on_request(&request_ctx, &request))
+                .map_err(|_payload| extension_panic_error("middleware_on_request"))
+                .and_then(|result| result);
+            match decision {
+                Ok(MiddlewareDecision::Continue) => {}
+                Ok(MiddlewareDecision::Respond(value)) => {
+                    middleware_result = Some(Ok(value));
+                    break;
+                }
+                Err(error) => {
+                    middleware_result = Some(Err(error));
+                    break;
                 }
             }
-            if request.method == SERVER_DISCOVER_METHOD {
+        }
+        let result = match middleware_result {
+            Some(result) => result,
+            None if request.method == SERVER_DISCOVER_METHOD => {
                 let params = request
                     .params
                     .clone()
                     .unwrap_or_else(|| serde_json::json!({}));
-                serde_json::from_value::<ServerDiscoverRequest>(params)
-                    .map_err(|error| McpError::invalid_params(error.to_string()))?;
-                serde_json::to_value(self.server_discovery()?).map_err(McpError::from)
-            } else {
-                match Arc::clone(&self.router)
-                    .dispatch_stateless_owned(request_ctx.clone(), request.clone())
-                    .await
+                match serde_json::from_value::<ServerDiscoverRequest>(params)
+                    .map_err(|error| McpError::invalid_params(error.to_string()))
                 {
-                    Err(error) if error.code == McpErrorCode::MethodNotFound => {
-                        self.dispatch_extension_fallback(&request_ctx, &request)
-                    }
-                    result => result,
+                    Ok(_) => self
+                        .server_discovery()
+                        .and_then(|result| serde_json::to_value(result).map_err(McpError::from)),
+                    Err(error) => Err(error),
                 }
             }
-        })()
-        .await;
+            None => match Arc::clone(&self.router)
+                .dispatch_stateless_owned(request_ctx.clone(), request.clone())
+                .await
+            {
+                Err(error) if error.code == McpErrorCode::MethodNotFound => {
+                    self.dispatch_extension_fallback(&request_ctx, &request)
+                }
+                result => result,
+            },
+        };
         let result = match result {
             Ok(value) => self
                 .apply_middleware_response(&entered_middleware, &request_ctx, &request, value)
@@ -9435,6 +9610,479 @@ mod lib_unit_tests {
             .expect("legacy request must not reach the extension handler");
         assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Default)]
+    struct ServerFinalTaskStore {
+        tasks: Mutex<
+            std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, fastmcp_protocol::Task>,
+        >,
+        cancellation_requests: Mutex<std::collections::BTreeSet<fastmcp_protocol::FinalTaskId>>,
+        notifications: Mutex<Vec<fastmcp_protocol::TaskStatusNotification>>,
+    }
+
+    impl FinalTaskStore for ServerFinalTaskStore {
+        fn create_task(
+            &self,
+            task: fastmcp_protocol::Task,
+            notification: fastmcp_protocol::TaskStatusNotification,
+        ) -> McpResult<()> {
+            let task_id = task.base().task_id.clone();
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if tasks.contains_key(&task_id) {
+                return Err(McpError::invalid_params("Task already exists"));
+            }
+            tasks.insert(task_id, task);
+            self.notifications
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+            Ok(())
+        }
+
+        fn get_task(
+            &self,
+            task_id: &fastmcp_protocol::FinalTaskId,
+        ) -> McpResult<Option<fastmcp_protocol::Task>> {
+            Ok(self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(task_id)
+                .cloned())
+        }
+
+        fn replace_task(
+            &self,
+            task: fastmcp_protocol::Task,
+            notification: fastmcp_protocol::TaskStatusNotification,
+        ) -> McpResult<()> {
+            let task_id = task.base().task_id.clone();
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !tasks.contains_key(&task_id) {
+                return Err(McpError::invalid_params("Task not found"));
+            }
+            tasks.insert(task_id, task);
+            self.notifications
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+            Ok(())
+        }
+
+        fn request_cancellation(&self, task_id: &fastmcp_protocol::FinalTaskId) -> McpResult<()> {
+            if self.get_task(task_id)?.is_none() {
+                return Err(McpError::invalid_params("Task not found"));
+            }
+            self.cancellation_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(task_id.clone());
+            Ok(())
+        }
+
+        fn is_cancellation_requested(
+            &self,
+            task_id: &fastmcp_protocol::FinalTaskId,
+        ) -> McpResult<bool> {
+            if self.get_task(task_id)?.is_none() {
+                return Err(McpError::invalid_params("Task not found"));
+            }
+            Ok(self
+                .cancellation_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(task_id))
+        }
+    }
+
+    fn final_tasks_test_runtime(
+        delivered: Arc<Mutex<Vec<fastmcp_protocol::TaskStatusNotification>>>,
+    ) -> FinalTaskRuntime {
+        let store = Arc::new(ServerFinalTaskStore::default());
+        let store: Arc<dyn FinalTaskStore> = store;
+        let emitter: FinalTaskNotificationEmitter = Arc::new(move |notification| {
+            delivered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let runtime = FinalTaskRuntime::new(
+            store,
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000))
+                .expect("valid final Tasks timing policy"),
+            emitter,
+        );
+        runtime
+    }
+
+    fn final_tasks_test_server(
+        delivered: Arc<Mutex<Vec<fastmcp_protocol::TaskStatusNotification>>>,
+    ) -> Server {
+        Server::new("final-tasks-server", "1.0.0")
+            .final_tasks(final_tasks_test_runtime(delivered))
+            .expect("final Tasks must install")
+            .build()
+    }
+
+    fn unrelated_extension_registry(
+        method: &str,
+    ) -> (ExtensionHandlerRegistry, ServerExtensionDiscovery) {
+        let extension_id = fastmcp_protocol::ExtensionId::parse("com.example/echo")
+            .expect("test extension identifier must be valid");
+        let mut descriptors = ExtensionDescriptorRegistry::new();
+        descriptors
+            .register(fastmcp_protocol::ExtensionDescriptor {
+                id: extension_id.clone(),
+                client_settings: fastmcp_protocol::ExtensionSettingsSchema {
+                    schema_id: "example-client-v1".to_owned(),
+                    codec_id: "example-client-codec-v1".to_owned(),
+                },
+                server_settings: fastmcp_protocol::ExtensionSettingsSchema {
+                    schema_id: "example-server-v1".to_owned(),
+                    codec_id: "example-server-codec-v1".to_owned(),
+                },
+                resolver: fastmcp_protocol::ExtensionNegotiationResolver {
+                    id: "example-compatibility-v1".to_owned(),
+                    version: 1,
+                    fallback: fastmcp_protocol::ExtensionFallbackPolicy::RejectOneSided,
+                },
+                method: Some(fastmcp_protocol::ExtensionMethodDescriptor {
+                    name: method.to_owned(),
+                    direction: fastmcp_protocol::ExtensionDirection::ClientToServer,
+                    http_era_disposition: Some(
+                        fastmcp_protocol::ExtensionHttpEraDisposition::ModernExclusive,
+                    ),
+                    legacy_fallback: false,
+                }),
+                notification: None,
+                result_discriminator: Some("example-result".to_owned()),
+                routing_headers: Vec::new(),
+                stdio_correlation: None,
+            })
+            .expect("unrelated extension descriptor must register");
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+        handlers
+            .register(
+                extension_id.clone(),
+                method,
+                |_context: &McpContext, parameters: serde_json::Value| {
+                    Ok::<serde_json::Value, McpError>(parameters)
+                },
+            )
+            .expect("unrelated extension handler must register");
+        (
+            handlers,
+            ServerExtensionDiscovery {
+                extensions: BTreeMap::from([(
+                    extension_id,
+                    fastmcp_protocol::ExtensionSettings::new(serde_json::json!({}))
+                        .expect("empty unrelated extension settings must be valid"),
+                )]),
+            },
+        )
+    }
+
+    fn final_tasks_params(
+        task_id: &fastmcp_protocol::FinalTaskId,
+        settings: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "taskId": task_id.as_str(),
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {
+                        "io.modelcontextprotocol/tasks": settings,
+                    },
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn configured_final_tasks_route_methods_and_typed_notifications() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let server = final_tasks_test_server(Arc::clone(&delivered));
+        let runtime = server
+            .final_task_runtime()
+            .expect("configured final Tasks runtime must be retained");
+        let task_id = runtime
+            .create_task(Some("accepted".to_owned()))
+            .expect("application store must accept task before reply")
+            .task
+            .base()
+            .task_id
+            .clone();
+        let notification = delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first()
+            .cloned()
+            .expect("durable task creation must route a typed notification");
+        assert_eq!(
+            serde_json::to_value(notification).expect("notification must serialize")["method"],
+            fastmcp_protocol::TASK_STATUS_NOTIFICATION
+        );
+
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory);
+        let get = server
+            .dispatch_stateless(
+                &inbound,
+                &JsonRpcRequest::new(
+                    fastmcp_protocol::TASK_GET,
+                    Some(final_tasks_params(&task_id, serde_json::json!({}))),
+                    71_i64,
+                ),
+            )
+            .expect("tasks/get must respond");
+        assert_eq!(
+            get.result.as_ref().map(|result| &result["resultType"]),
+            Some(&serde_json::json!("complete"))
+        );
+        assert_eq!(
+            get.result.as_ref().map(|result| &result["taskId"]),
+            Some(&serde_json::json!(task_id.as_str()))
+        );
+
+        let mut requests = fastmcp_protocol::TaskInputRequests::new();
+        requests.insert(
+            "roots".to_owned(),
+            serde_json::from_value(serde_json::json!({ "method": "roots/list" }))
+                .expect("typed roots request"),
+        );
+        runtime
+            .require_input(&task_id, requests, Some("awaiting roots".to_owned()))
+            .expect("caller-owned supervisor can enter input_required");
+        let mut update_params = final_tasks_params(&task_id, serde_json::json!({}));
+        update_params
+            .as_object_mut()
+            .expect("final Tasks parameters are an object")
+            .insert(
+                "inputResponses".to_owned(),
+                serde_json::json!({ "roots": { "roots": [] } }),
+            );
+        let update = server
+            .dispatch_stateless(
+                &inbound,
+                &JsonRpcRequest::new(fastmcp_protocol::TASK_UPDATE, Some(update_params), 71_i64),
+            )
+            .expect("tasks/update must respond");
+        assert_eq!(
+            update.result,
+            Some(serde_json::json!({ "resultType": "complete" }))
+        );
+
+        let cancel = server
+            .dispatch_stateless(
+                &inbound,
+                &JsonRpcRequest::new(
+                    fastmcp_protocol::TASK_CANCEL,
+                    Some(final_tasks_params(&task_id, serde_json::json!({}))),
+                    71_i64,
+                ),
+            )
+            .expect("tasks/cancel must respond");
+        assert_eq!(
+            cancel.result,
+            Some(serde_json::json!({ "resultType": "complete" }))
+        );
+        assert!(
+            runtime
+                .is_cancellation_requested(&task_id)
+                .expect("final cancellation intent must remain in application storage")
+        );
+    }
+
+    #[test]
+    fn final_tasks_compose_with_an_existing_extension_registry_before_freeze() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let (handlers, discovery) = unrelated_extension_registry("example/echo");
+        let server = Server::new("composed-final-tasks-server", "1.0.0")
+            .extension_registry(
+                handlers,
+                discovery,
+                |_descriptor: &fastmcp_protocol::ExtensionDescriptor,
+                 client: &fastmcp_protocol::ExtensionSettings,
+                 _server: &fastmcp_protocol::ExtensionSettings|
+                 -> Result<fastmcp_protocol::ExtensionSettings, ExtensionNegotiationError> {
+                    Ok(client.clone())
+                },
+            )
+            .expect("unrelated extension registry must install")
+            .final_tasks(final_tasks_test_runtime(Arc::clone(&delivered)))
+            .expect("final Tasks must merge into the existing registry")
+            .build();
+
+        assert_eq!(
+            server
+                .extension_registry_receipt()
+                .expect("composed registry must be frozen")
+                .descriptor_count(),
+            2,
+            "the caller extension and official Tasks share one receipt"
+        );
+        let discovery = serde_json::to_value(
+            server
+                .server_discovery()
+                .expect("composed discovery must be valid"),
+        )
+        .expect("composed discovery must serialize");
+        assert_eq!(
+            discovery.pointer("/capabilities/extensions/com.example~1echo"),
+            Some(&serde_json::json!({}))
+        );
+        assert_eq!(
+            discovery.pointer("/capabilities/extensions/io.modelcontextprotocol~1tasks"),
+            Some(&serde_json::json!({}))
+        );
+
+        let runtime = server
+            .final_task_runtime()
+            .expect("composed final Tasks runtime must be retained");
+        let task_id = runtime
+            .create_task(None)
+            .expect("application-owned task store must accept task")
+            .task
+            .base()
+            .task_id
+            .clone();
+        let response = server
+            .dispatch_stateless(
+                &InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory),
+                &JsonRpcRequest::new(
+                    fastmcp_protocol::TASK_GET,
+                    Some(final_tasks_params(&task_id, serde_json::json!({}))),
+                    71_i64,
+                ),
+            )
+            .expect("merged final Tasks handler must route requests");
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn final_tasks_rejects_only_a_true_owned_method_collision() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let (handlers, discovery) = unrelated_extension_registry(fastmcp_protocol::TASK_GET);
+        let result = Server::new("conflicting-final-tasks-server", "1.0.0")
+            .extension_registry(
+                handlers,
+                discovery,
+                |_descriptor: &fastmcp_protocol::ExtensionDescriptor,
+                 client: &fastmcp_protocol::ExtensionSettings,
+                 _server: &fastmcp_protocol::ExtensionSettings|
+                 -> Result<fastmcp_protocol::ExtensionSettings, ExtensionNegotiationError> {
+                    Ok(client.clone())
+                },
+            )
+            .expect("unrelated registry must install before the conflicting method is merged")
+            .final_tasks(final_tasks_test_runtime(delivered));
+        let error = match result {
+            Ok(_) => panic!("only the duplicated tasks/get ownership must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ServerExtensionConfigurationError::Registry(
+                fastmcp_protocol::ExtensionRegistryError::OwnershipCollision {
+                    field: "method",
+                    value
+                }
+            ) if value == fastmcp_protocol::TASK_GET
+        ));
+    }
+
+    #[test]
+    fn final_tasks_reject_one_variable_incompatible_extension_settings() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let server = final_tasks_test_server(Arc::clone(&delivered));
+        let runtime = server
+            .final_task_runtime()
+            .expect("configured final Tasks runtime must be retained");
+        let task_id = runtime
+            .create_task(None)
+            .expect("task must persist")
+            .task
+            .base()
+            .task_id
+            .clone();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory);
+
+        let admitted = server
+            .dispatch_stateless(
+                &inbound,
+                &JsonRpcRequest::new(
+                    fastmcp_protocol::TASK_GET,
+                    Some(final_tasks_params(&task_id, serde_json::json!({}))),
+                    71_i64,
+                ),
+            )
+            .expect("baseline final Tasks request must respond");
+        assert!(admitted.error.is_none());
+        let notification_count = delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+
+        let mut rejected_params = final_tasks_params(&task_id, serde_json::json!({}));
+        *rejected_params
+            .pointer_mut(
+                "/_meta/io.modelcontextprotocol~1clientCapabilities/extensions/io.modelcontextprotocol~1tasks",
+            )
+            .expect("baseline request must contain Tasks settings") =
+            serde_json::json!({ "unexpected": true });
+        let rejected = server
+            .dispatch_stateless(
+                &inbound,
+                &JsonRpcRequest::new(fastmcp_protocol::TASK_GET, Some(rejected_params), 71_i64),
+            )
+            .expect("rejected final Tasks request must respond");
+        let error = rejected
+            .error
+            .expect("changing only Tasks settings must reject the request");
+        assert_eq!(error.code, i32::from(McpErrorCode::InvalidParams));
+        assert_eq!(
+            delivered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            notification_count,
+            "rejected settings must not invoke the final Tasks runtime"
+        );
+    }
+
+    #[test]
+    fn legacy_dispatch_remains_isolated_from_configured_final_tasks() {
+        let server = final_tasks_test_server(Arc::new(Mutex::new(Vec::new())));
+        let mut session = initialized_test_session(&server);
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = test_request_sender();
+
+        let response = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::new(
+                    fastmcp_protocol::TASK_GET,
+                    Some(serde_json::json!({ "taskId": "legacy-task" })),
+                    71_i64,
+                ),
+                &notification_sender,
+                &request_sender,
+            )
+            .expect("legacy request must respond");
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::MethodNotFound))
+        );
     }
 
     #[test]

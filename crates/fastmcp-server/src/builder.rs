@@ -19,9 +19,9 @@ use crate::proxy::{ProxyPromptHandler, ProxyResourceHandler, ProxyToolHandler};
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
 use crate::{
-    AuthProvider, DuplicateBehavior, ExtensionHandlerRegistry, HttpServerConfig, LifespanHooks,
-    LoggingConfig, PromptHandler, ProxyCatalog, ProxyClient, ResourceHandler, Router, Server,
-    ServerExtensionConfigurationError, ServerExtensionRuntime, ToolHandler,
+    AuthProvider, DuplicateBehavior, ExtensionHandlerRegistry, FinalTaskRuntime, HttpServerConfig,
+    LifespanHooks, LoggingConfig, PromptHandler, ProxyCatalog, ProxyClient, ResourceHandler,
+    Router, Server, ServerExtensionConfigurationError, ServerExtensionRuntime, ToolHandler,
 };
 
 /// Default request timeout in seconds.
@@ -65,6 +65,8 @@ pub struct ServerBuilder {
     http_config: HttpServerConfig,
     /// Installed extension handlers and current server discovery settings.
     extension_runtime: Option<ServerExtensionRuntime>,
+    /// Application-owned state for the configured final Tasks extension.
+    final_task_runtime: Option<FinalTaskRuntime>,
 }
 
 impl ServerBuilder {
@@ -107,6 +109,7 @@ impl ServerBuilder {
             protocol_policy: ProtocolPolicy::Auto,
             http_config: HttpServerConfig::default(),
             extension_runtime: None,
+            final_task_runtime: None,
         }
     }
 
@@ -328,11 +331,34 @@ impl ServerBuilder {
         if self.extension_runtime.is_some() {
             return Err(ServerExtensionConfigurationError::AlreadyInstalled);
         }
-        self.extension_runtime = Some(ServerExtensionRuntime::new(
-            handlers,
-            server_discovery,
-            resolver,
-        )?);
+        let mut extension_runtime =
+            ServerExtensionRuntime::new(handlers, server_discovery, resolver)?;
+        if let Some(task_runtime) = self.final_task_runtime.as_ref() {
+            extension_runtime.install_final_tasks(task_runtime)?;
+        }
+        self.extension_runtime = Some(extension_runtime);
+        Ok(self)
+    }
+
+    /// Installs the official final Tasks extension around application-owned state.
+    ///
+    /// The supplied runtime owns neither an executor nor a task region. Its
+    /// store and notification emitter remain application-owned, while a
+    /// caller-owned structured supervisor advances worker state through the
+    /// [`FinalTaskRuntime`] retained on the built [`Server`]. This builder
+    /// installs the official descriptor, its three client-to-server request
+    /// handlers, and its `notifications/tasks` delivery path together.
+    pub fn final_tasks(
+        mut self,
+        task_runtime: FinalTaskRuntime,
+    ) -> Result<Self, ServerExtensionConfigurationError> {
+        if self.final_task_runtime.is_some() {
+            return Err(ServerExtensionConfigurationError::FinalTasksAlreadyInstalled);
+        }
+        if let Some(extension_runtime) = self.extension_runtime.as_mut() {
+            extension_runtime.install_final_tasks(&task_runtime)?;
+        }
+        self.final_task_runtime = Some(task_runtime);
         Ok(self)
     }
 
@@ -1190,12 +1216,23 @@ impl ServerBuilder {
         let console = fastmcp_console::console::FastMcpConsole::with_enabled(
             self.console_config.should_use_rich(),
         );
-        let extension_runtime = self.extension_runtime.map(|mut runtime| {
-            runtime
-                .freeze()
-                .expect("validated server extension descriptors must freeze");
-            Arc::new(runtime)
-        });
+        let final_task_runtime = self.final_task_runtime.clone();
+        let extension_runtime = match self.extension_runtime {
+            Some(mut runtime) => {
+                runtime
+                    .freeze()
+                    .expect("validated server extension descriptors must freeze");
+                Some(Arc::new(runtime))
+            }
+            None => final_task_runtime.map(|task_runtime| {
+                let mut runtime = ServerExtensionRuntime::with_final_tasks(&task_runtime)
+                    .expect("final Tasks must install into an empty extension registry");
+                runtime
+                    .freeze()
+                    .expect("final Tasks extension descriptors must freeze");
+                Arc::new(runtime)
+            }),
+        };
 
         Server {
             info: self.info,
@@ -1223,6 +1260,7 @@ impl ServerBuilder {
             protocol_policy: self.protocol_policy,
             http_config: self.http_config,
             extension_runtime,
+            final_task_runtime: self.final_task_runtime,
         }
     }
 }
