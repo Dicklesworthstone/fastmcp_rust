@@ -383,6 +383,8 @@ pub use fastmcp_client::{
 };
 
 // Public client HTTP execution and configuration surfaces.
+pub use fastmcp_client::http_auth;
+pub use fastmcp_client::http_auth::{BearerBindingError, BoundBearerCredential};
 pub use fastmcp_client::http_executor::{
     LegacySseHttpClient, LegacySseHttpClientError, MAX_MODERN_HTTP_PROBE_BODY_BYTES,
     MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, ModernHttpClient,
@@ -395,8 +397,6 @@ pub use fastmcp_client::mcp_config::{
     ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
     ServerConfig, claude_desktop_config_path, default_config_paths,
 };
-pub use fastmcp_client::http_auth;
-pub use fastmcp_client::http_auth::{BearerBindingError, BoundBearerCredential};
 pub use fastmcp_client::sse;
 pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
 pub use fastmcp_client::{http_executor, mcp_config};
