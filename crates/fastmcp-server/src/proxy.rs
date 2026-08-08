@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
 use fastmcp_client::http_executor::{
-    LegacySseHttpClient, ModernHttpClient, ModernHttpConnectOutcome, ModernHttpResponseKind,
+    LegacySseHttpClient, ModernHttpClient, ModernHttpResponseKind,
 };
 use fastmcp_client::sse::SseLimits;
-use fastmcp_client::{Client, ClientProtocolPlan};
+use fastmcp_client::{Client, ClientHttpConnection, ClientProtocolPlan};
 use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpResult, block_on};
 use fastmcp_protocol::common_types::RawIcon;
 use fastmcp_protocol::methods::translate_legacy_2024_result;
@@ -681,13 +681,14 @@ struct LiveHttpBindingKey {
 
 /// One cached native HTTP upstream selected by an immutable protocol plan.
 ///
-/// The enclosed connection is either the shipped final HTTP client or the
-/// exact legacy SSE GET plus advertised-POST client. [`ProxyClient`] owns this
-/// backend behind its route-local mutex, so a legacy SSE stream cannot be
+/// The enclosed connection is the shipped automatic client facade. It owns
+/// either the final HTTP client or the exact legacy SSE GET plus
+/// advertised-POST client after real outbound selection. [`ProxyClient`] owns
+/// this backend behind its route-local mutex, so a legacy SSE stream cannot be
 /// advanced concurrently or leak into another upstream's selected era.
 pub struct ProxyHttpClient {
     binding: ProxyUpstreamBinding,
-    connection: ModernHttpConnectOutcome,
+    connection: ClientHttpConnection,
     cx: Cx,
     client_info: ClientInfo,
     client_capabilities: ClientCapabilities,
@@ -714,14 +715,14 @@ impl ProxyHttpClient {
 
     fn new(
         binding: ProxyUpstreamBinding,
-        connection: ModernHttpConnectOutcome,
+        connection: ClientHttpConnection,
         cx: Cx,
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
     ) -> Self {
-        let next_request_id = match connection.selected_era() {
-            Some(ProtocolEra::Modern2026) => 2,
-            Some(ProtocolEra::Legacy2024) | None => 1,
+        let next_request_id = match connection.selected_protocol_era() {
+            ProtocolEra::Modern2026 => 2,
+            ProtocolEra::Legacy2024 => 1,
         };
         Self {
             binding,
@@ -792,11 +793,11 @@ impl ProxyHttpClient {
             request_id.clone(),
         ));
         let response = match &mut self.connection {
-            ModernHttpConnectOutcome::LegacySse(client) => {
+            ClientHttpConnection::LegacySse(client) => {
                 block_on(client.send(&self.cx, &message)).map_err(legacy_http_error)?;
                 receive_legacy_response(client, &self.cx, &request_id)?
             }
-            ModernHttpConnectOutcome::Modern(_) => {
+            ClientHttpConnection::Modern(_) => {
                 return Err(McpError::internal_error(
                     "Modern HTTP proxy connection entered legacy initialization",
                 ));
@@ -824,10 +825,10 @@ impl ProxyHttpClient {
 
         let notification = JsonRpcMessage::Request(JsonRpcRequest::initialized_notification());
         match &mut self.connection {
-            ModernHttpConnectOutcome::LegacySse(client) => {
+            ClientHttpConnection::LegacySse(client) => {
                 block_on(client.send(&self.cx, &notification)).map_err(legacy_http_error)?;
             }
-            ModernHttpConnectOutcome::Modern(_) => {
+            ClientHttpConnection::Modern(_) => {
                 return Err(McpError::internal_error(
                     "Modern HTTP proxy connection entered legacy lifecycle acknowledgement",
                 ));
@@ -855,10 +856,10 @@ impl ProxyHttpClient {
         )?;
         let request_id = self.next_request_id()?;
         let response = match &mut self.connection {
-            ModernHttpConnectOutcome::Modern(client) => {
+            ClientHttpConnection::Modern(client) => {
                 receive_modern_response(client, &self.cx, method, parameters, &request_id)?
             }
-            ModernHttpConnectOutcome::LegacySse(client) => {
+            ClientHttpConnection::LegacySse(client) => {
                 let message = JsonRpcMessage::Request(JsonRpcRequest::new(
                     method,
                     Some(parameters),
@@ -1341,7 +1342,7 @@ impl ProxyUpstreamBindingRegistry {
             return Ok(existing.clone());
         }
 
-        let connection = block_on(ModernHttpClient::connect(
+        let connection = block_on(ClientHttpConnection::connect(
             &cx,
             protocol_plan.clone(),
             client_info.clone(),
@@ -1547,13 +1548,11 @@ fn binding_from_live_stdio_client(
 }
 
 fn binding_from_live_http_connection(
-    connection: &ModernHttpConnectOutcome,
+    connection: &ClientHttpConnection,
     policy: ProtocolPolicy,
     configuration_generation: u64,
 ) -> McpResult<ProxyUpstreamBinding> {
-    let era = connection.selected_era().ok_or_else(|| {
-        McpError::internal_error("Connected HTTP upstream did not select a supported protocol era")
-    })?;
+    let era = connection.selected_protocol_era();
     match (policy, era) {
         (ProtocolPolicy::ModernOnly, ProtocolEra::Modern2026)
         | (ProtocolPolicy::LegacyOnly, ProtocolEra::Legacy2024)
@@ -2053,12 +2052,12 @@ mod tests {
     use fastmcp_client::RequestTimeoutPolicy;
     use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan};
     use fastmcp_core::{McpContext, McpErrorCode};
+    use fastmcp_protocol::common_types::ContentBlock;
     use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
     use fastmcp_protocol::{
-        CallToolResult, ClientCapabilities, ClientInfo, CompleteResult, Content, ContentBlock,
-        CoreResult, FinalCallToolResult, FinalCoreResult, LegacyContent, LegacyCoreResult,
-        LegacyPromptMessage, LegacyResourceContent, Prompt, PromptMessage, Resource,
-        ResourceContent, Tool,
+        CallToolResult, ClientCapabilities, ClientInfo, CompleteResult, Content, CoreResult,
+        FinalCallToolResult, FinalCoreResult, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
+        LegacyResourceContent, Prompt, PromptMessage, Resource, ResourceContent, Tool,
     };
 
     use super::{
@@ -2984,6 +2983,54 @@ exec sleep 2
             initialize["params"]["clientInfo"]["name"],
             "proxy-http-test-client"
         );
+    }
+
+    #[test]
+    fn proxy_outbound_http_auto_rejects_one_field_legacy_endpoint_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read native HTTP listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let legacy_sse_target = format!("http://{address}/legacy-sse");
+        let legacy_message_target = format!("http://{address}/legacy-message?session=expected");
+        let advertised_message_target = format!("http://{address}/legacy-message?session=altered");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept disposable modern probe");
+            let probe_request = read_http_request(&mut probe);
+            write_http_response(&mut probe, 404, "text/plain", b"");
+
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_http_request(&mut sse);
+            let body = format!("event: endpoint\ndata: {advertised_message_target}\n\n");
+            write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
+            (probe_request, sse_request)
+        });
+        let mut bindings = ProxyClient::upstream_binding_registry();
+
+        let error = bindings
+            .connect_http_with_protocol_plan(
+                "legacy-endpoint-mismatch",
+                "native-h1:legacy-endpoint-mismatch",
+                16,
+                http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target),
+                proxy_http_client_info(),
+                ClientCapabilities::default(),
+                Cx::for_request(),
+            )
+            .expect_err("changing only the advertised session value must fail closed");
+
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert!(
+            bindings.live_http.is_empty(),
+            "a rejected advertised endpoint must not install a legacy cache entry"
+        );
+
+        let (probe, sse) = server.join().expect("legacy mismatch server must join");
+        assert!(probe.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+        assert!(probe.head.contains("Mcp-Method: server/discover\r\n"));
+        assert!(sse.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+        assert!(sse.head.contains("Accept: text/event-stream\r\n"));
     }
 
     #[test]
