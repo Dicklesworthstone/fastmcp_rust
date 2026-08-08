@@ -25,17 +25,17 @@ use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     CacheScope, CallToolParams, CallToolResult, CompleteResult, Content, CoreRequest, CoreResult,
     FinalCallToolParams, FinalCallToolResult, FinalCompletionParams, FinalCompletionResult,
-    FinalCoreRequest, FinalCoreResult, FinalListParams, FinalListPromptsResult,
-    FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult, FinalPrompt,
-    FinalPromptArgument, FinalReadResourceParams, FinalReadResourceResult, FinalResource,
-    FinalResourceTemplate, FinalTool, FinalToolAnnotations, GetPromptParams, GetPromptResult,
-    InitializeParams, InitializeResult, JsonRpcRequest, LegacyCompletionParams,
-    LegacyCompletionResult, LegacyContent, LegacyCoreRequest, LegacyPromptMessage,
-    LegacyResourceContent, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
-    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
-    ListToolsResult, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage, ReadResourceParams,
-    ReadResourceResult, Resource, ResourceContent, ResourceTemplate, ServerBehavior,
-    ServerBehaviorRegistry, Tool, validate, validate_strict,
+    FinalCoreRequest, FinalCoreResult, FinalGetPromptParams, FinalGetPromptResult, FinalListParams,
+    FinalListPromptsResult, FinalListResourceTemplatesResult, FinalListResourcesResult,
+    FinalListToolsResult, FinalPrompt, FinalPromptArgument, FinalReadResourceParams,
+    FinalReadResourceResult, FinalResource, FinalResourceTemplate, FinalTool, FinalToolAnnotations,
+    GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, JsonRpcRequest,
+    LegacyCompletionParams, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
+    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
+    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
+    ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker,
+    Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, Resource, ResourceContent,
+    ResourceTemplate, ServerBehavior, ServerBehaviorRegistry, Tool, validate, validate_strict,
 };
 #[cfg(test)]
 use fastmcp_protocol::{
@@ -231,6 +231,22 @@ fn encode_final_tools_call_result(
 ) -> McpResult<serde_json::Value> {
     let result = result?;
     let encoded = CoreResult::Final(FinalCoreResult::ToolsCall {
+        result,
+        diagnostic: None,
+    })
+    .encode()
+    .map_err(|error| McpError::internal_error(error.to_string()))?;
+    serde_json::from_str(&encoded).map_err(McpError::from)
+}
+
+/// Encodes a handler-authored final prompt result without reprojecting it
+/// through the legacy prompt surface. This preserves final common content and
+/// result metadata selected by the handler.
+fn encode_final_prompts_get_result(
+    result: McpResult<CompleteResult<FinalGetPromptResult>>,
+) -> McpResult<serde_json::Value> {
+    let result = result?;
+    let encoded = CoreResult::Final(FinalCoreResult::PromptsGet {
         result,
         diagnostic: None,
     })
@@ -1877,9 +1893,16 @@ impl Router {
                 )?
             }
             "prompts/get" => {
-                let params = parse_stateless_params(params)?;
-                encode_stateless_handler_result(
-                    self.handle_prompts_get_in_request(
+                let request =
+                    CoreRequest::decode(ProtocolEra::Modern2026, "prompts/get", params.as_ref())
+                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let CoreRequest::Final(FinalCoreRequest::PromptsGet(params)) = request else {
+                    return Err(McpError::internal_error(
+                        "modern prompts/get dispatch selected another core request",
+                    ));
+                };
+                encode_final_prompts_get_result(
+                    self.handle_prompts_get_final_in_request(
                         request_ctx,
                         request_cx,
                         params,
@@ -2957,6 +2980,78 @@ impl Router {
             meta: None,
             additional: BTreeMap::new(),
         })
+    }
+
+    /// Handles one final MCP 2026-07-28 `prompts/get` request.
+    ///
+    /// Legacy dispatch remains on [`Self::handle_prompts_get`], including its
+    /// exact `GetPromptResult` projection. Final dispatch calls the final
+    /// handler hook directly so handler-authored final content and complete
+    /// result metadata never pass through the legacy prompt surface.
+    async fn handle_prompts_get_final_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: FinalGetPromptParams,
+        session_state: SessionState,
+        notification_sender: Option<&NotificationSender>,
+        bidirectional_senders: Option<&BidirectionalSenders>,
+    ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+        debug!(
+            target: targets::HANDLER,
+            "getting final prompt; prompt_key={}; arguments_present={}",
+            safe_log_label(&params.name),
+            params.arguments.is_some()
+        );
+
+        let dispatch_started_at = request_ctx.cx().now();
+        if request_cx.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_prompt_enabled(&params.name) {
+            return Err(McpError::new(
+                McpErrorCode::PromptNotFound,
+                format!("Prompt '{}' is disabled for this session", params.name),
+            ));
+        }
+
+        let handler = self.prompts.get(&params.name).ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::PromptNotFound,
+                format!("Prompt not found: {}", params.name),
+            )
+        })?;
+        let ctx = derive_handler_context(
+            request_ctx,
+            None,
+            notification_sender,
+            bidirectional_senders,
+        );
+        let handler_timeout =
+            read_handler_timeout(request_ctx.cx(), "prompt_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            request_ctx.cx().budget(),
+            request_ctx.budget(),
+            handler_timeout,
+            dispatch_started_at,
+        );
+        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
+        let arguments = params.arguments.unwrap_or_default().into_iter().collect();
+        let outcome =
+            run_handler_in_request(&ctx, request_cx, effective_budget, "prompt", |child_cx| {
+                handler.get_final_async_in_request(&ctx, child_cx, arguments)
+            })
+            .await?;
+
+        match outcome {
+            Outcome::Ok(result) => Ok(result),
+            Outcome::Err(error) => Err(sanitize_handler_error(request_ctx.cx(), "prompt", error)),
+            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "prompt")),
+        }
     }
 
     // ========================================================================
@@ -5287,8 +5382,8 @@ mod router_tests {
     };
     use fastmcp_protocol::{
         CompleteResult, CompletionValues, Content, FinalCallToolResult, FinalCompletionParams,
-        LegacyCompletionParams, LegacyResourceContent, Prompt, PromptArgument, PromptMessage,
-        Resource, ResourceContent, ResourceTemplate, Tool,
+        FinalGetPromptResult, FinalPromptMessage, LegacyCompletionParams, LegacyResourceContent,
+        Prompt, PromptArgument, PromptMessage, Resource, ResourceContent, ResourceTemplate, Tool,
     };
     use std::collections::BTreeMap;
     use std::fmt;
@@ -5756,6 +5851,79 @@ mod router_tests {
         ) -> McpResult<Vec<PromptMessage>> {
             Ok(Vec::new())
         }
+    }
+
+    struct DirectFinalPrompt {
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl PromptHandler for DirectFinalPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "direct-final-prompt".to_owned(),
+                description: Some("legacy prompt definition".to_owned()),
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            Err(McpError::internal_error(
+                "legacy prompt projection must not service a final request",
+            ))
+        }
+
+        fn get_final(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            let content_meta = OpenMetadata::try_from_entries([(
+                "com.example/direct-prompt".to_owned(),
+                serde_json::json!({"source": "final-handler"}),
+            )])
+            .expect("direct prompt content metadata is valid");
+            Ok(CompleteResult::new(
+                FinalGetPromptResult {
+                    description: Some("direct final prompt description".to_owned()),
+                    messages: vec![FinalPromptMessage {
+                        role: fastmcp_protocol::Role::Assistant,
+                        content: ContentBlock::Audio {
+                            data: "aGVsbG8=".to_owned(),
+                            mime_type: "audio/mpeg".to_owned(),
+                            annotations: None,
+                            meta: Some(content_meta),
+                            additional: BTreeMap::from([(
+                                "com.example/direct-field".to_owned(),
+                                serde_json::json!(true),
+                            )]),
+                        },
+                    }],
+                },
+                empty_final_result_meta()?,
+            ))
+        }
+    }
+
+    fn direct_final_prompt_request(id: i64) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "prompts/get",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "direct-final-prompt",
+            })),
+            id,
+        )
     }
 
     struct EchoCompletion;
@@ -10069,6 +10237,135 @@ mod router_tests {
             "the one-field rejection cannot alter the accepted final result"
         );
         assert_eq!(MACRO_DUAL_ERA_TOOL_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn final_prompts_get_dispatches_direct_request_owned_handler() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_prompt(DirectFinalPrompt {
+            final_calls: Arc::clone(&final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 96, Budget::INFINITE, &state);
+        let request = direct_final_prompt_request(96);
+        let typed_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "prompts/get",
+            request.params.as_ref(),
+        )
+        .expect("final prompts/get request decodes through the public core surface");
+
+        let response = router
+            .dispatch_stateless(&request_ctx, &request)
+            .expect("final prompts/get reaches the direct final handler");
+
+        assert_eq!(
+            response.get("resultType"),
+            Some(&serde_json::json!("complete"))
+        );
+        assert_eq!(
+            response["description"],
+            serde_json::json!("direct final prompt description")
+        );
+        assert_eq!(response["messages"][0]["content"]["type"], "audio");
+        assert_eq!(
+            response["messages"][0]["content"]["_meta"]["com.example/direct-prompt"]["source"],
+            "final-handler"
+        );
+        assert_eq!(
+            response["messages"][0]["content"]["com.example/direct-field"],
+            true
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+
+        let wire = serde_json::to_string(&response).expect("final prompt response serializes");
+        let CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) = typed_request
+            .decode_result(&wire)
+            .expect("final prompts/get result decodes through the public core surface")
+        else {
+            panic!("prompts/get selects the exact final result");
+        };
+        assert_eq!(
+            result.payload.description.as_deref(),
+            Some("direct final prompt description")
+        );
+        assert!(matches!(
+            result.payload.messages.as_slice(),
+            [FinalPromptMessage {
+                content: ContentBlock::Audio { data, mime_type, .. },
+                ..
+            }] if data == "aGVsbG8=" && mime_type == "audio/mpeg"
+        ));
+    }
+
+    #[test]
+    fn final_prompts_get_rejects_one_field_incompatible_result_type() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_prompt(DirectFinalPrompt {
+            final_calls: Arc::clone(&final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 97, Budget::INFINITE, &state);
+        let request = direct_final_prompt_request(97);
+        let typed_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "prompts/get",
+            request.params.as_ref(),
+        )
+        .expect("final prompts/get request decodes through the public core surface");
+        let accepted = router
+            .dispatch_stateless(&request_ctx, &request)
+            .expect("the direct final prompt response is accepted");
+        let accepted_wire = serde_json::to_string(&accepted).expect("accepted result serializes");
+        let mut incompatible = accepted.clone();
+        incompatible["resultType"] = serde_json::json!("input_required");
+
+        let mut accepted_without_type = accepted.clone();
+        let mut incompatible_without_type = incompatible.clone();
+        let accepted_type = accepted_without_type
+            .as_object_mut()
+            .and_then(|object| object.remove("resultType"));
+        let incompatible_type = incompatible_without_type
+            .as_object_mut()
+            .and_then(|object| object.remove("resultType"));
+        assert_eq!(accepted_type, Some(serde_json::json!("complete")));
+        assert_eq!(incompatible_type, Some(serde_json::json!("input_required")));
+        assert_eq!(
+            incompatible_without_type, accepted_without_type,
+            "resultType is the sole incompatible result dimension"
+        );
+
+        let incompatible_wire =
+            serde_json::to_string(&incompatible).expect("incompatible result serializes");
+        assert!(matches!(
+            typed_request.decode_result(&incompatible_wire),
+            Err(fastmcp_protocol::CoreDispatchError::ResultCodec(_))
+        ));
+        assert_eq!(
+            serde_json::to_string(&accepted).expect("accepted result remains serializable"),
+            accepted_wire,
+            "rejecting the one-field incompatible result cannot mutate the accepted response"
+        );
+        assert_eq!(
+            final_calls.load(Ordering::SeqCst),
+            1,
+            "local result admission cannot invoke or mutate the direct prompt handler"
+        );
+        let reaccepted = typed_request
+            .decode_result(&accepted_wire)
+            .expect("the original direct final result remains accepted");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &reaccepted.encode().expect("reaccepted result encodes"),
+            )
+            .expect("reaccepted result is JSON"),
+            accepted,
+            "the incompatible result cannot alter the accepted final prompt contract"
+        );
     }
 
     #[test]
