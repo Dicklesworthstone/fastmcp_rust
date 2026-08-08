@@ -26,8 +26,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use fastmcp_core::{
-    McpContext, McpError, McpErrorCode, McpResult, SHA256_DIGEST_BYTES, Sha256Digest,
-    sha256_bounded,
+    sha256_bounded, McpContext, McpError, McpErrorCode, McpResult, Sha256Digest,
+    SHA256_DIGEST_BYTES,
 };
 use fastmcp_protocol::JsonRpcRequest;
 
@@ -59,6 +59,12 @@ const CLIENT_PARTITION_IDLE_TTL: Duration = Duration::from_secs(60);
 
 const DEFAULT_CLIENT_ID: &[u8] = b"fastmcp-default-rate-limit-partition";
 const RATE_LIMIT_EXCEEDED_MESSAGE: &str = "Rate limit exceeded";
+const RATE_LIMIT_METHOD_PARTITION_DOMAIN: &[u8] = b"fastmcp-rate-limit-method-partition-v1\0";
+const MAX_RATE_LIMIT_METHOD_BYTES: usize = 512;
+const MAX_RATE_LIMIT_PARTITION_INPUT_BYTES: usize = RATE_LIMIT_METHOD_PARTITION_DOMAIN.len()
+    + SHA256_DIGEST_BYTES
+    + std::mem::size_of::<u64>()
+    + MAX_RATE_LIMIT_METHOD_BYTES;
 
 // Token counts are stored as `f64`. Above 2^53 - 1, subtracting one can round
 // back to the original value and silently turn a configured bucket into an
@@ -66,6 +72,18 @@ const RATE_LIMIT_EXCEEDED_MESSAGE: &str = "Rate limit exceeded";
 // `usize::MAX`, where every `usize` remains exactly representable for the
 // integer operations used here.
 const MAX_EXACT_TOKEN_CAPACITY: usize = ((1_u64 << 53) - 1) as usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateLimitAdmission {
+    Allowed,
+    Rejected { retry_after_ms: u64 },
+}
+
+impl RateLimitAdmission {
+    const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
 
 fn sanitized_rate(rate: f64) -> f64 {
     if rate.is_finite() && rate > 0.0 {
@@ -96,6 +114,50 @@ fn default_client_partition() -> McpResult<Sha256Digest> {
         .map_err(|_| rate_limit_error(RATE_LIMIT_EXCEEDED_MESSAGE))
 }
 
+fn rate_limit_method_partition(
+    client_partition: Sha256Digest,
+    method: &str,
+) -> McpResult<Sha256Digest> {
+    if method.len() > MAX_RATE_LIMIT_METHOD_BYTES {
+        return Err(rate_limit_error(RATE_LIMIT_EXCEEDED_MESSAGE));
+    }
+
+    let method_len =
+        u64::try_from(method.len()).map_err(|_| rate_limit_error(RATE_LIMIT_EXCEEDED_MESSAGE))?;
+    let mut input = Vec::with_capacity(MAX_RATE_LIMIT_PARTITION_INPUT_BYTES);
+    input.extend_from_slice(RATE_LIMIT_METHOD_PARTITION_DOMAIN);
+    input.extend_from_slice(client_partition.as_bytes());
+    input.extend_from_slice(&method_len.to_be_bytes());
+    input.extend_from_slice(method.as_bytes());
+    sha256_bounded(&input, MAX_RATE_LIMIT_PARTITION_INPUT_BYTES)
+        .map_err(|_| rate_limit_error(RATE_LIMIT_EXCEEDED_MESSAGE))
+}
+
+fn retry_after_millis(deficit: f64, refill_rate: f64) -> u64 {
+    if !deficit.is_finite() || !refill_rate.is_finite() || deficit <= 0.0 || refill_rate <= 0.0 {
+        return u64::MAX;
+    }
+
+    let millis = (deficit / refill_rate) * 1_000.0;
+    if !millis.is_finite() || millis >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        (millis.ceil() as u64).max(1)
+    }
+}
+
+fn rate_limit_retry_error(request: &JsonRpcRequest, retry_after_ms: u64) -> McpError {
+    McpError::with_data(
+        McpErrorCode::Custom(RATE_LIMIT_ERROR_CODE),
+        RATE_LIMIT_EXCEEDED_MESSAGE,
+        serde_json::json!({
+            "method": request.method.clone(),
+            "requestId": request.id.clone(),
+            "retryAfterMs": retry_after_ms,
+        }),
+    )
+}
+
 #[derive(Debug)]
 struct ClientPartition<L> {
     limiter: L,
@@ -121,9 +183,9 @@ impl<L> PartitionStore<L> {
         }
     }
 
-    fn use_existing<F>(&mut self, key: Sha256Digest, operation: F) -> Option<bool>
+    fn use_existing<T, F>(&mut self, key: Sha256Digest, operation: F) -> Option<T>
     where
-        F: FnOnce(&L) -> bool,
+        F: FnOnce(&L) -> T,
     {
         let key_bytes = key.into_bytes();
         let (old_last_seen, new_last_seen, result) = {
@@ -265,6 +327,10 @@ impl TokenBucketRateLimiter {
     ///
     /// Returns `true` if tokens were available and consumed, `false` otherwise.
     pub fn try_consume(&self, tokens: usize) -> bool {
+        self.try_consume_with_retry(tokens).is_allowed()
+    }
+
+    fn try_consume_with_retry(&self, tokens: usize) -> RateLimitAdmission {
         let mut current_tokens = self
             .tokens
             .lock()
@@ -284,9 +350,14 @@ impl TokenBucketRateLimiter {
         let tokens_needed = tokens as f64;
         if *current_tokens >= tokens_needed {
             *current_tokens -= tokens_needed;
-            true
+            RateLimitAdmission::Allowed
         } else {
-            false
+            RateLimitAdmission::Rejected {
+                retry_after_ms: retry_after_millis(
+                    tokens_needed - *current_tokens,
+                    self.refill_rate,
+                ),
+            }
         }
     }
 
@@ -353,8 +424,14 @@ impl SlidingWindowRateLimiter {
     /// If allowed, records the request timestamp and returns `true`.
     /// Otherwise returns `false`.
     pub fn is_allowed(&self) -> bool {
+        self.is_allowed_with_retry().is_allowed()
+    }
+
+    fn is_allowed_with_retry(&self) -> RateLimitAdmission {
         if self.window_seconds == 0 {
-            return false;
+            return RateLimitAdmission::Rejected {
+                retry_after_ms: u64::MAX,
+            };
         }
 
         let mut requests = self
@@ -378,9 +455,20 @@ impl SlidingWindowRateLimiter {
 
         if requests.len() < self.max_requests {
             requests.push_back(now);
-            true
+            RateLimitAdmission::Allowed
         } else {
-            false
+            let retry_after_ms = requests.front().map_or(u64::MAX, |oldest| {
+                let elapsed = now.saturating_duration_since(*oldest);
+                let window = Duration::from_secs(self.window_seconds);
+                if elapsed >= window {
+                    1
+                } else {
+                    u64::try_from((window - elapsed).as_millis())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1)
+                }
+            });
+            RateLimitAdmission::Rejected { retry_after_ms }
         }
     }
 
@@ -437,7 +525,7 @@ pub struct RateLimitingMiddleware {
     max_requests_per_second: f64,
     /// Maximum burst capacity.
     burst_capacity: usize,
-    /// Function to extract client ID from context (for per-client limiting).
+    /// Function to extract client ID for method-scoped client partitions.
     get_client_id: Option<ClientIdExtractor>,
     /// If true, apply limit globally; if false, per-client.
     global_limit: bool,
@@ -515,7 +603,8 @@ impl RateLimitingMiddleware {
     /// reclaimed only after its limiter has naturally reset; otherwise new
     /// keys share one overflow partition.
     ///
-    /// If not set, all clients share a single rate-limit partition.
+    /// If not set, all clients share the default identity while each method
+    /// retains an independent rate-limit partition.
     #[must_use]
     pub fn client_id_extractor<F>(mut self, extractor: F) -> Self
     where
@@ -559,14 +648,24 @@ impl RateLimitingMiddleware {
         default_client_partition()
     }
 
-    fn get_or_create_limiter(&self, partition: Sha256Digest) -> bool {
+    fn request_partition_key(
+        &self,
+        ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<Sha256Digest> {
+        rate_limit_method_partition(self.client_partition_key(ctx, request)?, &request.method)
+    }
+
+    fn get_or_create_limiter_with_retry(&self, partition: Sha256Digest) -> RateLimitAdmission {
         let mut limiters = self
             .limiters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if let Some(allowed) = limiters.use_existing(partition, |limiter| limiter.try_consume(1)) {
-            return allowed;
+        if let Some(admission) =
+            limiters.use_existing(partition, |limiter| limiter.try_consume_with_retry(1))
+        {
+            return admission;
         }
 
         if limiters.len() >= MAX_NAMED_CLIENT_PARTITIONS
@@ -576,14 +675,19 @@ impl RateLimitingMiddleware {
                 TokenBucketRateLimiter::is_fully_refilled,
             )
         {
-            return self.overflow_limiter.try_consume(1);
+            return self.overflow_limiter.try_consume_with_retry(1);
         }
 
         let limiter =
             TokenBucketRateLimiter::new(self.burst_capacity, self.max_requests_per_second);
-        let allowed = limiter.try_consume(1);
+        let admission = limiter.try_consume_with_retry(1);
         limiters.insert(partition, limiter);
-        allowed
+        admission
+    }
+
+    fn get_or_create_limiter(&self, partition: Sha256Digest) -> bool {
+        self.get_or_create_limiter_with_retry(partition)
+            .is_allowed()
     }
 }
 
@@ -593,27 +697,34 @@ impl Middleware for RateLimitingMiddleware {
         ctx: &McpContext,
         request: &JsonRpcRequest,
     ) -> McpResult<MiddlewareDecision> {
+        ctx.ensure_live().map_err(McpError::from)?;
         if self.max_requests_per_second <= 0.0 || self.burst_capacity == 0 {
             return Err(rate_limit_error(RATE_LIMIT_EXCEEDED_MESSAGE));
         }
 
-        let allowed = if self.global_limit {
+        let admission = if self.global_limit {
             // Global rate limiting
             if let Some(ref limiter) = self.global_limiter {
-                limiter.try_consume(1)
+                limiter.try_consume_with_retry(1)
             } else {
-                false
+                RateLimitAdmission::Rejected {
+                    retry_after_ms: u64::MAX,
+                }
             }
         } else {
-            // Per-client rate limiting
-            let partition = self.client_partition_key(ctx, request)?;
-            self.get_or_create_limiter(partition)
+            // The request ID remains correlation-only. Including it in the
+            // bucket key would let a retry with a fresh JSON-RPC ID evade the
+            // method's configured admission budget.
+            let partition = self.request_partition_key(ctx, request)?;
+            self.get_or_create_limiter_with_retry(partition)
         };
 
-        if allowed {
-            Ok(MiddlewareDecision::Continue)
-        } else {
-            Err(rate_limit_error(RATE_LIMIT_EXCEEDED_MESSAGE))
+        ctx.ensure_live().map_err(McpError::from)?;
+        match admission {
+            RateLimitAdmission::Allowed => Ok(MiddlewareDecision::Continue),
+            RateLimitAdmission::Rejected { retry_after_ms } => {
+                Err(rate_limit_retry_error(request, retry_after_ms))
+            }
         }
     }
 }
@@ -636,7 +747,7 @@ pub struct SlidingWindowRateLimitingMiddleware {
     max_requests: usize,
     /// Time window in seconds.
     window_seconds: u64,
-    /// Function to extract client ID from context.
+    /// Function to extract client ID for method-scoped client partitions.
     get_client_id: Option<ClientIdExtractor>,
     /// Storage for a bounded number of fixed-width client partitions.
     limiters: Mutex<PartitionStore<SlidingWindowRateLimiter>>,
@@ -723,16 +834,24 @@ impl SlidingWindowRateLimitingMiddleware {
         default_client_partition()
     }
 
-    fn is_request_allowed(&self, partition: Sha256Digest) -> bool {
+    fn request_partition_key(
+        &self,
+        ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<Sha256Digest> {
+        rate_limit_method_partition(self.client_partition_key(ctx, request)?, &request.method)
+    }
+
+    fn is_request_allowed_with_retry(&self, partition: Sha256Digest) -> RateLimitAdmission {
         let mut limiters = self
             .limiters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if let Some(allowed) =
-            limiters.use_existing(partition, SlidingWindowRateLimiter::is_allowed)
+        if let Some(admission) =
+            limiters.use_existing(partition, |limiter| limiter.is_allowed_with_retry())
         {
-            return allowed;
+            return admission;
         }
 
         if limiters.len() >= MAX_NAMED_CLIENT_PARTITIONS
@@ -740,13 +859,17 @@ impl SlidingWindowRateLimitingMiddleware {
                 limiter.current_requests() == 0
             })
         {
-            return self.overflow_limiter.is_allowed();
+            return self.overflow_limiter.is_allowed_with_retry();
         }
 
         let limiter = SlidingWindowRateLimiter::new(self.max_requests, self.window_seconds);
-        let allowed = limiter.is_allowed();
+        let admission = limiter.is_allowed_with_retry();
         limiters.insert(partition, limiter);
-        allowed
+        admission
+    }
+
+    fn is_request_allowed(&self, partition: Sha256Digest) -> bool {
+        self.is_request_allowed_with_retry(partition).is_allowed()
     }
 }
 
@@ -756,17 +879,20 @@ impl Middleware for SlidingWindowRateLimitingMiddleware {
         ctx: &McpContext,
         request: &JsonRpcRequest,
     ) -> McpResult<MiddlewareDecision> {
+        ctx.ensure_live().map_err(McpError::from)?;
         if self.max_requests == 0 || self.window_seconds == 0 {
             return Err(rate_limit_error(RATE_LIMIT_EXCEEDED_MESSAGE));
         }
 
-        let partition = self.client_partition_key(ctx, request)?;
-        let allowed = self.is_request_allowed(partition);
+        let partition = self.request_partition_key(ctx, request)?;
+        let admission = self.is_request_allowed_with_retry(partition);
 
-        if allowed {
-            Ok(MiddlewareDecision::Continue)
-        } else {
-            Err(rate_limit_error(RATE_LIMIT_EXCEEDED_MESSAGE))
+        ctx.ensure_live().map_err(McpError::from)?;
+        match admission {
+            RateLimitAdmission::Allowed => Ok(MiddlewareDecision::Continue),
+            RateLimitAdmission::Rejected { retry_after_ms } => {
+                Err(rate_limit_retry_error(request, retry_after_ms))
+            }
         }
     }
 }
@@ -788,6 +914,14 @@ mod tests {
             params: None,
             id: Some(fastmcp_protocol::RequestId::Number(1)),
         }
+    }
+
+    fn modern_test_request(method: &str, id: &str) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            method,
+            None,
+            fastmcp_protocol::RequestId::String(id.to_string()),
+        )
     }
 
     // ========================================
@@ -1002,7 +1136,7 @@ mod tests {
     #[test]
     fn token_bucket_available_tokens_caps_at_capacity() {
         let limiter = TokenBucketRateLimiter::new(5, 1000.0); // Very high refill
-        // Even with high refill rate, wait a bit — should not exceed capacity
+                                                              // Even with high refill rate, wait a bit — should not exceed capacity
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(limiter.available_tokens() <= 5.0 + 0.1);
     }
@@ -1038,7 +1172,7 @@ mod tests {
         assert!(limiter.is_allowed());
         assert!(limiter.is_allowed());
         assert!(!limiter.is_allowed()); // denied
-        // Only 2 requests counted (not the denied one)
+                                        // Only 2 requests counted (not the denied one)
         assert_eq!(limiter.current_requests(), 2);
     }
 
@@ -1174,18 +1308,80 @@ mod tests {
     // ========================================
 
     #[test]
-    fn rate_limiting_middleware_per_client_no_extractor_all_share_global_key() {
-        // Without an extractor, per-client mode defaults all to "global"
+    fn rate_limiting_middleware_without_extractor_is_method_scoped() {
+        // Without an extractor, all clients share the default identity, but
+        // each validated method retains its own admission budget.
         let m = RateLimitingMiddleware::new(10.0).burst_capacity(2);
         let ctx = test_context();
         let req_a = test_request("method_a");
         let req_b = test_request("method_b");
 
-        // Both methods share the same "global" bucket
+        // Distinct methods use distinct partitions.
         assert!(m.on_request(&ctx, &req_a).is_ok());
         assert!(m.on_request(&ctx, &req_b).is_ok());
-        // Bucket exhausted for both
+        assert!(m.on_request(&ctx, &req_a).is_ok());
+        assert!(m.on_request(&ctx, &req_b).is_ok());
+        // Each method exhausts only its own bucket.
         assert!(m.on_request(&ctx, &req_a).is_err());
+        assert!(m.on_request(&ctx, &req_b).is_err());
+    }
+
+    #[test]
+    fn modern_rate_limit_allows_a_distinct_method_for_the_same_client() {
+        let middleware = RateLimitingMiddleware::new(1.0e-300)
+            .burst_capacity(1)
+            .client_id_extractor(|_ctx, _request| Some("modern-tenant".to_string()));
+        let first_ctx = McpContext::new(Cx::for_testing(), 41);
+        let retry_ctx = McpContext::new(Cx::for_testing(), 42);
+        let first = modern_test_request("tools/call", "first-id");
+        let distinct_method = modern_test_request("resources/read", "retry-id");
+
+        assert!(middleware.on_request(&first_ctx, &first).is_ok());
+        assert!(middleware.on_request(&retry_ctx, &distinct_method).is_ok());
+    }
+
+    #[test]
+    fn modern_rate_limit_rejects_a_new_id_retry_for_the_same_method() {
+        let middleware = RateLimitingMiddleware::new(1.0e-300)
+            .burst_capacity(1)
+            .client_id_extractor(|_ctx, _request| Some("modern-tenant".to_string()));
+        let first_ctx = McpContext::new(Cx::for_testing(), 41);
+        let retry_ctx = McpContext::new(Cx::for_testing(), 42);
+        let first = modern_test_request("tools/call", "first-id");
+        let retry = modern_test_request("tools/call", "retry-id");
+
+        assert!(middleware.on_request(&first_ctx, &first).is_ok());
+        let error = middleware
+            .on_request(&retry_ctx, &retry)
+            .expect_err("RH-5 planted negative: a fresh request ID must not reset a method limit");
+        assert_eq!(error.code, McpErrorCode::Custom(RATE_LIMIT_ERROR_CODE));
+        assert_eq!(error.message, RATE_LIMIT_EXCEEDED_MESSAGE);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "method": "tools/call",
+                "requestId": "retry-id",
+                "retryAfterMs": u64::MAX,
+            }))
+        );
+    }
+
+    #[test]
+    fn cancelled_modern_request_does_not_consume_a_method_limit() {
+        let middleware = RateLimitingMiddleware::new(1.0e-300).burst_capacity(1);
+        let cancelled_cx = Cx::for_testing();
+        cancelled_cx.set_cancel_requested(true);
+        let cancelled_ctx = McpContext::new(cancelled_cx, 41);
+        let cancelled = modern_test_request("tools/call", "cancelled-id");
+
+        let error = middleware
+            .on_request(&cancelled_ctx, &cancelled)
+            .expect_err("cancelled requests must not receive an admission token");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+
+        let live_ctx = McpContext::new(Cx::for_testing(), 42);
+        let live = modern_test_request("tools/call", "live-id");
+        assert!(middleware.on_request(&live_ctx, &live).is_ok());
     }
 
     #[test]
@@ -1485,11 +1681,9 @@ mod tests {
             .burst_capacity(inexact_capacity)
             .global();
         assert_eq!(middleware.burst_capacity, 0);
-        assert!(
-            middleware
-                .on_request(&test_context(), &test_request("tools/call"))
-                .is_err()
-        );
+        assert!(middleware
+            .on_request(&test_context(), &test_request("tools/call"))
+            .is_err());
     }
 
     #[test]
@@ -1548,11 +1742,9 @@ mod tests {
             MAX_NAMED_CLIENT_PARTITIONS
         );
 
-        assert!(
-            middleware
-                .on_request(&ctx, &test_request("overflow-client-a"))
-                .is_ok()
-        );
+        assert!(middleware
+            .on_request(&ctx, &test_request("overflow-client-a"))
+            .is_ok());
         assert!(
             middleware
                 .on_request(&ctx, &test_request("overflow-client-b"))
@@ -1588,11 +1780,9 @@ mod tests {
             MAX_NAMED_CLIENT_PARTITIONS
         );
 
-        assert!(
-            middleware
-                .on_request(&ctx, &test_request("overflow-client-a"))
-                .is_ok()
-        );
+        assert!(middleware
+            .on_request(&ctx, &test_request("overflow-client-a"))
+            .is_ok());
         assert!(
             middleware
                 .on_request(&ctx, &test_request("overflow-client-b"))
@@ -1619,20 +1809,16 @@ mod tests {
         let ctx = test_context();
         let legitimate_id = "recent-legitimate-token-client";
 
-        assert!(
-            middleware
-                .on_request(&ctx, &test_request(legitimate_id))
-                .is_ok()
-        );
+        assert!(middleware
+            .on_request(&ctx, &test_request(legitimate_id))
+            .is_ok());
         for index in 0..(MAX_NAMED_CLIENT_PARTITIONS - 1) {
-            assert!(
-                middleware
-                    .on_request(
-                        &ctx,
-                        &test_request(&format!("stale-token-attacker-{index}"))
-                    )
-                    .is_ok()
-            );
+            assert!(middleware
+                .on_request(
+                    &ctx,
+                    &test_request(&format!("stale-token-attacker-{index}"))
+                )
+                .is_ok());
         }
         assert!(
             middleware
@@ -1728,20 +1914,16 @@ mod tests {
         let ctx = test_context();
         let legitimate_id = "recent-legitimate-window-client";
 
-        assert!(
-            middleware
-                .on_request(&ctx, &test_request(legitimate_id))
-                .is_ok()
-        );
+        assert!(middleware
+            .on_request(&ctx, &test_request(legitimate_id))
+            .is_ok());
         for index in 0..(MAX_NAMED_CLIENT_PARTITIONS - 1) {
-            assert!(
-                middleware
-                    .on_request(
-                        &ctx,
-                        &test_request(&format!("stale-window-attacker-{index}"))
-                    )
-                    .is_ok()
-            );
+            assert!(middleware
+                .on_request(
+                    &ctx,
+                    &test_request(&format!("stale-window-attacker-{index}"))
+                )
+                .is_ok());
         }
         assert!(
             middleware
@@ -1862,23 +2044,19 @@ mod tests {
 
         let token_error = token.on_request(&ctx, &request).unwrap_err();
         assert_eq!(token_error.message, RATE_LIMIT_EXCEEDED_MESSAGE);
-        assert!(
-            token
-                .limiters
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
-        );
+        assert!(token
+            .limiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
 
         let sliding_error = sliding.on_request(&ctx, &request).unwrap_err();
         assert_eq!(sliding_error.message, RATE_LIMIT_EXCEEDED_MESSAGE);
-        assert!(
-            sliding
-                .limiters
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
-        );
+        assert!(sliding
+            .limiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
     }
 
     #[test]
@@ -1888,19 +2066,15 @@ mod tests {
         assert_eq!(zero_window.current_requests(), 0);
 
         let zero_window_middleware = SlidingWindowRateLimitingMiddleware::new(10, 0);
-        assert!(
-            zero_window_middleware
-                .on_request(&test_context(), &test_request("tools/call"))
-                .is_err()
-        );
+        assert!(zero_window_middleware
+            .on_request(&test_context(), &test_request("tools/call"))
+            .is_err());
 
         let overflowing_minutes = SlidingWindowRateLimitingMiddleware::per_minute(10, u64::MAX);
         assert_eq!(overflowing_minutes.window_seconds, 0);
-        assert!(
-            overflowing_minutes
-                .on_request(&test_context(), &test_request("tools/call"))
-                .is_err()
-        );
+        assert!(overflowing_minutes
+            .on_request(&test_context(), &test_request("tools/call"))
+            .is_err());
 
         let maximum_seconds = SlidingWindowRateLimiter::new(1, u64::MAX);
         assert!(maximum_seconds.is_allowed());
