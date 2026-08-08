@@ -95,7 +95,9 @@ use std::time::{Duration, Instant};
 
 use asupersync::{Cx, channel::oneshot};
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sha256_bounded};
-use fastmcp_protocol::common_types::{ContentBlock, EmbeddedResourceContents, RawIcon};
+use fastmcp_protocol::common_types::{
+    ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
+};
 use fastmcp_protocol::methods::{Final2026Peer, final_2026_07_28_method};
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::{
@@ -1824,7 +1826,7 @@ fn final_prompt_to_legacy(prompt: fastmcp_protocol::FinalPrompt) -> McpResult<Pr
 /// a declared legacy field.
 fn final_open_fields_to_legacy(
     field: &str,
-    meta: Option<fastmcp_protocol::OpenMetadata>,
+    meta: Option<OpenMetadata>,
     mut additional: std::collections::BTreeMap<String, serde_json::Value>,
     declared_members: &[&str],
 ) -> McpResult<std::collections::BTreeMap<String, serde_json::Value>> {
@@ -7455,7 +7457,7 @@ mod tests {
             logger: Some("server.audit".to_string()),
             data: serde_json::json!({"event": "tool-complete"}),
             meta: Some(
-                fastmcp_protocol::OpenMetadata::try_from_entries([(
+                OpenMetadata::try_from_entries([(
                     "com.example/trace".to_string(),
                     serde_json::json!("retained"),
                 )])
