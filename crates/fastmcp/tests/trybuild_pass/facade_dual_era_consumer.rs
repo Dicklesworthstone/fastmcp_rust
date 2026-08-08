@@ -1,5 +1,7 @@
 //! Active downstream facade probe for both HTTP protocol eras.
 
+use std::collections::BTreeMap;
+
 use fastmcp_rust::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, CompletionContext,
     CompletionHandler, CompletionParams, CompletionReference, SubscriptionFilter, legacy_2024,
@@ -176,6 +178,99 @@ fn assert_dual_era_completion_exports() {
     let _ = (modern_params, modern_result, legacy_params, legacy_result);
 }
 
+fn assert_root_directional_notification_exports() {
+    let client = fastmcp_rust::ClientNotification::Cancelled(
+        fastmcp_rust::FinalCancelledNotificationParams {
+            request_id: fastmcp_rust::RequestId::Number(41),
+            reason: None,
+            meta: None,
+            additional: BTreeMap::new(),
+        },
+    );
+    let client_wire = client
+        .encode()
+        .expect("root client notification encodes through the facade");
+    assert!(client_wire.is_notification());
+    assert_eq!(client_wire.method, "notifications/cancelled");
+
+    let server =
+        fastmcp_rust::ServerNotification::Progress(fastmcp_rust::FinalProgressNotificationParams {
+            progress_token: fastmcp_rust::ProgressMarker::Number(41),
+            progress: 1.0,
+            total: Some(1.0),
+            message: Some("complete".to_owned()),
+            meta: None,
+            additional: BTreeMap::new(),
+        });
+    let server_wire = server
+        .encode()
+        .expect("root server notification encodes through the facade");
+    assert!(server_wire.is_notification());
+    assert_eq!(server_wire.method, "notifications/progress");
+}
+
+fn assert_modern_directional_notification_exports() {
+    let client = modern::ClientNotification::Cancelled(modern::FinalCancelledNotificationParams {
+        request_id: modern::RequestId::Number(42),
+        reason: None,
+        meta: None,
+        additional: BTreeMap::new(),
+    });
+    let client_wire = client
+        .encode()
+        .expect("modern client notification encodes through the facade");
+    assert!(client_wire.is_notification());
+    assert_eq!(client_wire.method, "notifications/cancelled");
+
+    let server = modern::ServerNotification::Progress(modern::FinalProgressNotificationParams {
+        progress_token: modern::ProgressMarker::Number(42),
+        progress: 1.0,
+        total: Some(1.0),
+        message: Some("complete".to_owned()),
+        meta: None,
+        additional: BTreeMap::new(),
+    });
+    let server_wire = server
+        .encode()
+        .expect("modern server notification encodes through the facade");
+    assert!(server_wire.is_notification());
+    assert_eq!(server_wire.method, "notifications/progress");
+}
+
+mod prelude_directional_notification_reachability {
+    use std::collections::BTreeMap;
+
+    use fastmcp_rust::prelude::*;
+
+    pub(super) fn assert_reachable() {
+        let client = ClientNotification::Cancelled(FinalCancelledNotificationParams {
+            request_id: fastmcp_rust::RequestId::Number(43),
+            reason: None,
+            meta: None,
+            additional: BTreeMap::new(),
+        });
+        let client_wire = client
+            .encode()
+            .expect("prelude client notification encodes through the facade");
+        assert!(client_wire.is_notification());
+        assert_eq!(client_wire.method, "notifications/cancelled");
+
+        let server = ServerNotification::Progress(FinalProgressNotificationParams {
+            progress_token: ProgressMarker::Number(43),
+            progress: 1.0,
+            total: Some(1.0),
+            message: Some("complete".to_owned()),
+            meta: None,
+            additional: BTreeMap::new(),
+        });
+        let server_wire = server
+            .encode()
+            .expect("prelude server notification encodes through the facade");
+        assert!(server_wire.is_notification());
+        assert_eq!(server_wire.method, "notifications/progress");
+    }
+}
+
 fn main() {
     let _ = assert_legacy_sse_method_signatures;
     assert_completion_handler_reachability();
@@ -185,4 +280,7 @@ fn main() {
     let _ = assert_client_http_and_subscription_exports;
     prelude_client_http_and_subscription_reachability::assert_reachable();
     assert_dual_era_completion_exports();
+    assert_root_directional_notification_exports();
+    assert_modern_directional_notification_exports();
+    prelude_directional_notification_reachability::assert_reachable();
 }

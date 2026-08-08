@@ -149,10 +149,11 @@ pub use fastmcp_protocol::{
     CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, Content, GetPromptParams,
     GetPromptResult, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
     ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
-    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel, Prompt,
-    PromptArgument, PromptMessage, ReadResourceParams, ReadResourceResult, RequestId, Resource,
-    ResourceContent, ResourceTemplate, ResourcesCapability, Role, ServerCapabilities, ServerInfo,
-    SubscribeResourceParams, Tool, ToolAnnotations, ToolsCapability, UnsubscribeResourceParams,
+    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel,
+    ProgressMarker, Prompt, PromptArgument, PromptMessage, ReadResourceParams, ReadResourceResult,
+    RequestId, Resource, ResourceContent, ResourceTemplate, ResourcesCapability, Role,
+    ServerCapabilities, ServerInfo, SubscribeResourceParams, Tool, ToolAnnotations,
+    ToolsCapability, UnsubscribeResourceParams,
 };
 
 pub use fastmcp_protocol::common_types;
@@ -393,7 +394,7 @@ pub mod modern {
         HEADER_MISMATCH_ERROR_CODE, HeaderMismatchError, HeaderMismatchReason, InputRequiredResult,
         MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
         MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MetadataView,
-        MissingRequiredClientCapabilityError, PaginatedResult,
+        MissingRequiredClientCapabilityError, PaginatedResult, ProgressMarker,
         ProtocolVersionError as FinalProtocolVersionError, RawResultEnvelope,
         RequestAdmissionError, RequestId, RequestVersionMetadata, RequiredCapabilitiesError,
         ResultDecodeError, ResultDecodeErrorKind, ResultDiscriminatorDecision,
@@ -546,6 +547,7 @@ pub mod prelude {
         // Outcome types (4-valued result)
         Outcome,
         OutcomeExt,
+        ProgressMarker,
         Prompt,
         PromptArgument,
         PromptMessage,
