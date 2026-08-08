@@ -2524,6 +2524,7 @@ fn contains_header_control(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
@@ -2669,8 +2670,31 @@ mod tests {
         br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#
     }
 
-    fn modern_tasks_discovery_body() -> &'static [u8] {
-        br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private"}}"#
+    fn modern_tasks_discovery_body() -> Vec<u8> {
+        let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+            &fastmcp_protocol::ServerBehaviorRegistry::default(),
+            BTreeMap::from([(
+                fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+                serde_json::json!({}),
+            )]),
+        )
+        .expect("typed Tasks discovery capabilities");
+        let result = fastmcp_protocol::ServerDiscoverResult::new(
+            capabilities,
+            fastmcp_protocol::ServerInfo {
+                name: "tasks-http-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let mut response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": result,
+        });
+        response["result"]["supportedVersions"] = serde_json::json!(["2026-07-28"]);
+        serde_json::to_vec(&response).expect("typed Tasks discovery response")
     }
 
     fn subscriptions_listen_sse_events(acknowledgement_id: i64) -> [String; 4] {
@@ -2706,7 +2730,7 @@ mod tests {
                 &mut probe,
                 200,
                 "application/json",
-                modern_tasks_discovery_body(),
+                &modern_tasks_discovery_body(),
             );
 
             let (mut stream, _) = listener
