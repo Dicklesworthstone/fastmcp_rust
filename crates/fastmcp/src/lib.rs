@@ -167,19 +167,24 @@ pub use fastmcp_protocol::common_types::{
 };
 
 // Final typed core dispatch, result vocabulary, and bounded exact-JSON helpers.
+pub use fastmcp_protocol::methods::Final2026Peer;
 pub use fastmcp_protocol::{
-    CacheScope, CacheTtl, CacheableResult, CompleteResult, CompleteResultPayload,
-    CoreDispatchError, CoreRequest, CoreResult, CoreResultDiscriminatorPolicy, DecodedResult,
-    ExactJsonMember, ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
-    FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY,
-    FinalCallToolParams, FinalCallToolResult, FinalCoreRequest, FinalCoreResult, FinalEmptyParams,
-    FinalEmptyResult, FinalGetPromptParams, FinalGetPromptResult, FinalListParams,
-    FinalListPromptsResult, FinalListResourceTemplatesResult, FinalListResourcesResult,
-    FinalListToolsResult, FinalPromptMessage, FinalReadResourceParams, FinalReadResourceResult,
-    FinalRequestMeta, FinalSetLogLevelParams, InputRequiredResult, LegacyCoreRequest,
+    CacheScope, CacheTtl, CacheableResult, ClientNotification, CompleteResult,
+    CompleteResultPayload, CoreDispatchError, CoreRequest, CoreResult,
+    CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonMember, ExactJsonObject, ExactJsonValue,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
+    FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY, FinalCallToolParams,
+    FinalCallToolResult, FinalCancelledNotificationParams, FinalCoreRequest, FinalCoreResult,
+    FinalEmptyNotificationParams, FinalEmptyParams, FinalEmptyResult, FinalGetPromptParams,
+    FinalGetPromptResult, FinalListParams, FinalListPromptsResult,
+    FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult,
+    FinalLogMessageParams, FinalNotificationError, FinalProgressNotificationParams,
+    FinalPromptMessage, FinalReadResourceParams, FinalReadResourceResult, FinalRequestMeta,
+    FinalResourceUpdatedNotificationParams, FinalSetLogLevelParams,
+    FinalSubscriptionsAcknowledgedNotificationParams, InputRequiredResult, LegacyCoreRequest,
     LegacyCoreResult, LegacyEmptyResult, MetadataView, PaginatedResult, RawResultEnvelope,
     ResultDecodeError, ResultDecodeErrorKind, ResultDiscriminatorDecision,
-    ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic, ResultPeerEra,
+    ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic, ResultPeerEra, ServerNotification,
     TypedCompleteMembers, UnknownResultMembers, decode_peer_result, decode_typed_complete,
     encode_result, parse_exact_json,
 };
@@ -360,6 +365,7 @@ pub mod modern {
         ExtensionSettingsCompatibilityResolver, ExtensionSettingsSchema, NegotiatedExtension,
         NegotiatedExtensionSet, ServerExtensionDiscovery, StdioCorrelationDescriptor,
     };
+    pub use fastmcp_protocol::methods::Final2026Peer;
     pub use fastmcp_protocol::protocol_policy::{
         HttpEndpointBundle, HttpEndpointBundleError, HttpEndpointBundleKey, HttpEraCache,
         HttpEraDecision, HttpModernProbe, HttpProbeBody, HttpRouteKind, MODERN_PROTOCOL_VERSION,
@@ -368,19 +374,22 @@ pub mod modern {
         StdioEraClassifier, StdioEraDecision, StdioEraRejection, StdioEraState, StdioOpeningFrame,
     };
     pub use fastmcp_protocol::{
-        CacheScope, CacheTtl, CacheableResult, ClientCapabilities, ClientInfo, CompleteResult,
-        CompleteResultPayload, CompletionValues, CoreDispatchError, CoreRequest, CoreResult,
-        CoreResultDiscriminatorPolicy, DecodedResult, DiscoveryCacheHints, ExactJsonMember,
-        ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
+        CacheScope, CacheTtl, CacheableResult, ClientCapabilities, ClientInfo, ClientNotification,
+        CompleteResult, CompleteResultPayload, CompletionValues, CoreDispatchError, CoreRequest,
+        CoreResult, CoreResultDiscriminatorPolicy, DecodedResult, DiscoveryCacheHints,
+        ExactJsonMember, ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
         FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION as PROTOCOL_VERSION,
         FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY, FinalCallToolParams,
-        FinalCallToolResult, FinalCompletionArgument, FinalCompletionContext,
-        FinalCompletionParams, FinalCompletionReference, FinalCompletionResult, FinalCoreRequest,
-        FinalCoreResult, FinalEmptyParams, FinalEmptyResult, FinalGetPromptParams,
-        FinalGetPromptResult, FinalHttpRequestMetadata, FinalListParams, FinalListPromptsResult,
+        FinalCallToolResult, FinalCancelledNotificationParams, FinalCompletionArgument,
+        FinalCompletionContext, FinalCompletionParams, FinalCompletionReference,
+        FinalCompletionResult, FinalCoreRequest, FinalCoreResult, FinalEmptyNotificationParams,
+        FinalEmptyParams, FinalEmptyResult, FinalGetPromptParams, FinalGetPromptResult,
+        FinalHttpRequestMetadata, FinalListParams, FinalListPromptsResult,
         FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult,
+        FinalLogMessageParams, FinalNotificationError, FinalProgressNotificationParams,
         FinalPromptMessage, FinalProtocolVersion, FinalReadResourceParams, FinalReadResourceResult,
-        FinalRequestAdmission, FinalRequestMeta, FinalSetLogLevelParams,
+        FinalRequestAdmission, FinalRequestMeta, FinalResourceUpdatedNotificationParams,
+        FinalSetLogLevelParams, FinalSubscriptionsAcknowledgedNotificationParams,
         HEADER_MISMATCH_ERROR_CODE, HeaderMismatchError, HeaderMismatchReason, InputRequiredResult,
         MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
         MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MetadataView,
@@ -392,8 +401,8 @@ pub mod modern {
         SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
         SUPPORTED_FINAL_PROTOCOL_VERSIONS, ServerBehavior, ServerBehaviorRegistry,
         ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
-        ServerDiscoveryError, ServerInstructionError, ServerInstructions, TypedCompleteMembers,
-        UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnknownResultMembers,
+        ServerDiscoveryError, ServerInstructionError, ServerInstructions, ServerNotification,
+        TypedCompleteMembers, UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnknownResultMembers,
         UnsupportedProtocolVersionError, admit_final_http_request, admit_final_request,
         decode_peer_result, decode_typed_complete, encode_result, parse_exact_json,
         validate_final_protocol_version,
@@ -489,6 +498,7 @@ pub mod prelude {
         ClientHttpNegotiationError,
         ClientHttpNegotiationState,
         ClientHttpResponse,
+        ClientNotification,
         ClientProtocolPlan,
         ClientSession,
         CompleteResult,
@@ -505,8 +515,16 @@ pub mod prelude {
         ExtensionDescriptor,
         ExtensionDescriptorRegistry,
         FINAL_PROTOCOL_VERSION,
+        Final2026Peer,
         FinalAbsoluteUri,
+        FinalCancelledNotificationParams,
+        FinalEmptyNotificationParams,
+        FinalLogMessageParams,
+        FinalNotificationError,
+        FinalProgressNotificationParams,
         FinalProtocolVersion,
+        FinalResourceUpdatedNotificationParams,
+        FinalSubscriptionsAcknowledgedNotificationParams,
         HttpEndpointConfig,
         HttpEndpointConfigError,
         // Server
@@ -550,6 +568,7 @@ pub mod prelude {
         ServerConfig,
         ServerDiscoverRequest,
         ServerDiscoverResult,
+        ServerNotification,
         StaticTokenVerifier,
         SubscriptionFilter,
         TokenAuthProvider,
@@ -735,6 +754,16 @@ mod tests {
         let _: Option<modern::FinalEmptyResult> = None;
         let _: Option<modern::FinalCoreRequest> = None;
         let _: Option<modern::FinalCoreResult> = None;
+        let _: Option<modern::ClientNotification> = None;
+        let _: Option<modern::ServerNotification> = None;
+        let _: Option<modern::FinalNotificationError> = None;
+        let _: Option<modern::Final2026Peer> = None;
+        let _: Option<modern::FinalCancelledNotificationParams> = None;
+        let _: Option<modern::FinalProgressNotificationParams> = None;
+        let _: Option<modern::FinalLogMessageParams> = None;
+        let _: Option<modern::FinalResourceUpdatedNotificationParams> = None;
+        let _: Option<modern::FinalEmptyNotificationParams> = None;
+        let _: Option<modern::FinalSubscriptionsAcknowledgedNotificationParams> = None;
         let _: Option<modern::CoreRequest> = None;
         let _: Option<modern::CoreResult> = None;
         let _: Option<modern::CoreDispatchError> = None;
@@ -743,6 +772,16 @@ mod tests {
         let _: Option<modern::ModernHttpClientError> = None;
         let _: Option<modern::ModernHttpSseResponseStream> = None;
         let _: Option<super::FinalRequestMeta> = None;
+        let _: Option<super::ClientNotification> = None;
+        let _: Option<super::ServerNotification> = None;
+        let _: Option<super::FinalNotificationError> = None;
+        let _: Option<super::Final2026Peer> = None;
+        let _: Option<super::FinalCancelledNotificationParams> = None;
+        let _: Option<super::FinalProgressNotificationParams> = None;
+        let _: Option<super::FinalLogMessageParams> = None;
+        let _: Option<super::FinalResourceUpdatedNotificationParams> = None;
+        let _: Option<super::FinalEmptyNotificationParams> = None;
+        let _: Option<super::FinalSubscriptionsAcknowledgedNotificationParams> = None;
         let _: Option<super::ModernHttpClient> = None;
         let _: Option<super::MrtrExchangeRegistry> = None;
         let _: Option<super::LegacySseHttpClient> = None;
@@ -759,6 +798,27 @@ mod tests {
         );
         let _: Option<legacy_2024::Legacy2024LiveServerLifecycle<(), ()>> = None;
         let _: Option<legacy_2024::LegacySseHttpClientError> = None;
+    }
+
+    #[test]
+    fn prelude_reexports_final_directional_notification_surface() {
+        use super::prelude::{
+            ClientNotification, Final2026Peer, FinalCancelledNotificationParams,
+            FinalEmptyNotificationParams, FinalLogMessageParams, FinalNotificationError,
+            FinalProgressNotificationParams, FinalResourceUpdatedNotificationParams,
+            FinalSubscriptionsAcknowledgedNotificationParams, ServerNotification,
+        };
+
+        let _: Option<ClientNotification> = None;
+        let _: Option<ServerNotification> = None;
+        let _: Option<FinalNotificationError> = None;
+        let _: Option<Final2026Peer> = None;
+        let _: Option<FinalCancelledNotificationParams> = None;
+        let _: Option<FinalProgressNotificationParams> = None;
+        let _: Option<FinalLogMessageParams> = None;
+        let _: Option<FinalResourceUpdatedNotificationParams> = None;
+        let _: Option<FinalEmptyNotificationParams> = None;
+        let _: Option<FinalSubscriptionsAcknowledgedNotificationParams> = None;
     }
 
     #[test]
