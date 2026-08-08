@@ -1091,6 +1091,8 @@ fn type_contains_final_result_term(ty: &Type) -> bool {
         "CacheableResult",
         "PaginatedResult",
         "FinalCallToolResult",
+        "FinalReadResourceResult",
+        "FinalGetPromptResult",
         "ReadResourceResult",
         "GetPromptResult",
     ];
@@ -1125,21 +1127,35 @@ fn validate_final_handler_return(
     output: &syn::ReturnType,
     handler: &str,
     payload: &str,
+    final_payload: Option<&str>,
     legacy_output: &str,
 ) -> syn::Result<()> {
     let Some(value) = return_type_value(output) else {
         return Ok(());
     };
     if final_complete_return_kind(output, payload).is_some()
+        || final_payload
+            .is_some_and(|payload| final_complete_return_kind(output, payload).is_some())
         || !type_contains_final_result_term(value)
     {
         return Ok(());
     }
 
+    let direct_forms = final_payload.map_or_else(
+        || format!("CompleteResult<{payload}>"),
+        |final_payload| format!("CompleteResult<{payload}> or CompleteResult<{final_payload}>"),
+    );
+    let wrapped_forms = final_payload.map_or_else(
+        || format!("Result<CompleteResult<{payload}>, E>, or McpResult<CompleteResult<{payload}>>"),
+        |final_payload| format!(
+            "Result<CompleteResult<{payload}>, E>, Result<CompleteResult<{final_payload}>, E>, McpResult<CompleteResult<{payload}>>, or McpResult<CompleteResult<{final_payload}>>",
+        ),
+    );
+
     Err(syn::Error::new_spanned(
         output,
         format!(
-            "ambiguous or cross-era final #[{handler}] return; use CompleteResult<{payload}>, Result<CompleteResult<{payload}>, E>, or McpResult<CompleteResult<{payload}>> so the legacy handler can project {legacy_output}",
+            "ambiguous or cross-era final #[{handler}] return; use {direct_forms}, {wrapped_forms} so the legacy handler can project {legacy_output}",
         ),
     ))
 }
@@ -1261,6 +1277,18 @@ fn generate_prompt_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
     }
 }
 
+/// Generates the final prompt result conversion for handlers that already
+/// return the final prompt result algebra.
+fn generate_final_prompt_result_conversion(output: &syn::ReturnType) -> Option<TokenStream2> {
+    match final_complete_return_kind(output, "FinalGetPromptResult")? {
+        FinalCompleteReturnKind::Direct => Some(quote! { Ok(result) }),
+        FinalCompleteReturnKind::Result => Some(quote! {
+            result.map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))
+        }),
+        FinalCompleteReturnKind::McpResult => Some(quote! { result }),
+    }
+}
+
 fn generate_prompt_execution_methods(
     is_async: bool,
     expects_context: bool,
@@ -1268,6 +1296,7 @@ fn generate_prompt_execution_methods(
     param_names: &[Ident],
     param_extractions: &[TokenStream2],
     result_conversion: &TokenStream2,
+    final_result_conversion: Option<&TokenStream2>,
 ) -> TokenStream2 {
     let sync_invocation = if expects_context {
         quote! { #fn_name(ctx, #(#param_names),*) }
@@ -1276,6 +1305,21 @@ fn generate_prompt_execution_methods(
     };
 
     if !is_async {
+        let final_method = final_result_conversion.map_or_else(TokenStream2::new, |conversion| {
+            quote! {
+                fn get_final(
+                    &self,
+                    ctx: &fastmcp_core::McpContext,
+                    arguments: std::collections::HashMap<String, String>,
+                ) -> fastmcp_core::McpResult<
+                    fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalGetPromptResult>,
+                > {
+                    #(#param_extractions)*
+                    let result = #sync_invocation;
+                    #conversion
+                }
+            }
+        });
         return quote! {
             fn get(
                 &self,
@@ -1286,6 +1330,8 @@ fn generate_prompt_execution_methods(
                 let result = #sync_invocation;
                 #result_conversion
             }
+
+            #final_method
         };
     }
 
@@ -1294,6 +1340,36 @@ fn generate_prompt_execution_methods(
     } else {
         quote! { #fn_name(#(#param_names),*).await }
     };
+
+    let final_method = final_result_conversion.map_or_else(TokenStream2::new, |conversion| {
+        quote! {
+            fn get_final_async<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                arguments: std::collections::HashMap<String, String>,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<
+                    fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalGetPromptResult>,
+                >,
+            > {
+                Box::pin(async move {
+                    let result: fastmcp_core::McpResult<
+                        fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalGetPromptResult>,
+                    > = async move {
+                        #(#param_extractions)*
+                        let result = #async_invocation;
+                        #conversion
+                    }.await;
+
+                    match result {
+                        Ok(value) => fastmcp_core::Outcome::Ok(value),
+                        Err(error) => fastmcp_core::Outcome::Err(error),
+                    }
+                })
+            }
+        }
+    });
 
     quote! {
         fn get(
@@ -1329,6 +1405,8 @@ fn generate_prompt_execution_methods(
                 }
             })
         }
+
+        #final_method
     }
 }
 
@@ -1508,6 +1586,25 @@ fn generate_resource_result_conversion(output: &syn::ReturnType, mime_type: &str
     }
 }
 
+/// Generates the final resource result conversion for handlers that already
+/// return the final resource result algebra.
+fn generate_final_resource_result_conversion(output: &syn::ReturnType) -> Option<TokenStream2> {
+    match final_complete_return_kind(output, "FinalReadResourceResult")? {
+        FinalCompleteReturnKind::Direct => Some(quote! { Ok(result) }),
+        FinalCompleteReturnKind::Result => Some(quote! {
+            result.map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))
+        }),
+        FinalCompleteReturnKind::McpResult => Some(quote! { result }),
+    }
+}
+
+fn generate_final_legacy_rejection(handler: &str, final_hook: &str) -> TokenStream2 {
+    let message = format!("final #[{handler}] handlers must be invoked through {final_hook}");
+    quote! {
+        Err(fastmcp_core::McpError::internal_error(#message))
+    }
+}
+
 fn generate_resource_execution_methods(
     is_async: bool,
     fn_name: &Ident,
@@ -1515,8 +1612,35 @@ fn generate_resource_execution_methods(
     uri: &str,
     param_extractions: &[TokenStream2],
     result_conversion: &TokenStream2,
+    final_result_conversion: Option<&TokenStream2>,
 ) -> TokenStream2 {
     if !is_async {
+        let final_method = final_result_conversion.map_or_else(TokenStream2::new, |conversion| {
+            quote! {
+                fn read_final(
+                    &self,
+                    ctx: &fastmcp_core::McpContext,
+                ) -> fastmcp_core::McpResult<
+                    fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>,
+                > {
+                    let uri_params = std::collections::HashMap::new();
+                    self.read_final_with_uri(ctx, #uri, &uri_params)
+                }
+
+                fn read_final_with_uri(
+                    &self,
+                    ctx: &fastmcp_core::McpContext,
+                    uri: &str,
+                    uri_params: &std::collections::HashMap<String, String>,
+                ) -> fastmcp_core::McpResult<
+                    fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>,
+                > {
+                    #(#param_extractions)*
+                    let result = #fn_name(#call_args);
+                    #conversion
+                }
+            }
+        });
         return quote! {
             fn read(
                 &self,
@@ -1553,8 +1677,56 @@ fn generate_resource_execution_methods(
                     }
                 })
             }
+
+            #final_method
         };
     }
+
+    let final_method = final_result_conversion.map_or_else(TokenStream2::new, |conversion| {
+        quote! {
+            fn read_final_async_with_uri<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                uri: &'a str,
+                uri_params: &'a std::collections::HashMap<String, String>,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<
+                    fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>,
+                >,
+            > {
+                Box::pin(async move {
+                    let result: fastmcp_core::McpResult<
+                        fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>,
+                    > = async move {
+                        #(#param_extractions)*
+                        let result = #fn_name(#call_args).await;
+                        #conversion
+                    }.await;
+
+                    match result {
+                        Ok(value) => fastmcp_core::Outcome::Ok(value),
+                        Err(error) => fastmcp_core::Outcome::Err(error),
+                    }
+                })
+            }
+
+            fn read_final_async<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<
+                    fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>,
+                >,
+            > {
+                Box::pin(async move {
+                    let uri_params = std::collections::HashMap::new();
+                    self.read_final_async_with_uri(ctx, #uri, &uri_params).await
+                })
+            }
+        }
+    });
 
     quote! {
         fn read(
@@ -1603,6 +1775,8 @@ fn generate_resource_execution_methods(
                 self.read_async_with_uri(ctx, #uri, &uri_params).await
             })
         }
+
+        #final_method
     }
 }
 
@@ -1610,7 +1784,8 @@ fn generate_resource_execution_methods(
 #[allow(clippy::items_after_test_module)]
 mod async_handler_expansion_tests {
     use super::{
-        found_crate_path, generate_final_tool_payload_projection,
+        found_crate_path, generate_final_prompt_result_conversion,
+        generate_final_resource_result_conversion, generate_final_tool_payload_projection,
         generate_final_tool_result_conversion, generate_prompt_execution_methods,
         generate_resource_execution_methods, generate_tool_execution_methods,
         validate_final_handler_return,
@@ -1653,6 +1828,7 @@ mod async_handler_expansion_tests {
             "example://resource",
             &[],
             &quote! { Ok(vec![]) },
+            None,
         );
 
         assert_direct_async_expansion(tokens, "fn read_async_with_uri");
@@ -1669,6 +1845,7 @@ mod async_handler_expansion_tests {
             &[param],
             &[quote! { let value: String = String::new(); }],
             &quote! { Ok(vec![]) },
+            None,
         );
 
         assert_direct_async_expansion(tokens, "fn get_async");
@@ -1770,6 +1947,152 @@ mod async_handler_expansion_tests {
     }
 
     #[test]
+    fn final_resource_and_prompt_hooks_preserve_final_result_algebras() {
+        let resource_name = format_ident!("final_resource");
+        let resource_output: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>
+        );
+        let resource_conversion = generate_final_resource_result_conversion(&resource_output)
+            .expect("the complete final resource result selects the final hook");
+        let resource_tokens = generate_resource_execution_methods(
+            false,
+            &resource_name,
+            &quote! { ctx },
+            "example://resource",
+            &[],
+            &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
+            Some(&resource_conversion),
+        )
+        .to_string();
+        let (_, resource_final_hook) = resource_tokens
+            .split_once("fn read_final")
+            .expect("final resource expansion has a direct final hook");
+
+        assert_eq!(resource_conversion.to_string(), "Ok (result)");
+        assert!(resource_final_hook.contains("FinalReadResourceResult"));
+        assert!(resource_final_hook.contains("Ok (result)"));
+        assert!(!resource_final_hook.contains("payload"));
+        assert!(!resource_final_hook.contains("contents . into_iter"));
+
+        let resource_async_tokens = generate_resource_execution_methods(
+            true,
+            &resource_name,
+            &quote! { ctx },
+            "example://resource",
+            &[],
+            &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
+            Some(&resource_conversion),
+        );
+        assert_direct_async_expansion(
+            resource_async_tokens.clone(),
+            "fn read_final_async_with_uri",
+        );
+        let resource_async_expansion = resource_async_tokens.to_string();
+        let (_, resource_final_async_hook) = resource_async_expansion
+            .split_once("fn read_final_async_with_uri")
+            .expect("async final resource expansion has a direct final hook");
+        assert!(resource_final_async_hook.contains("Ok (result)"));
+        assert!(!resource_final_async_hook.contains("payload"));
+
+        let prompt_name = format_ident!("final_prompt");
+        let prompt_output: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalGetPromptResult>
+        );
+        let prompt_conversion = generate_final_prompt_result_conversion(&prompt_output)
+            .expect("the complete final prompt result selects the final hook");
+        let prompt_tokens = generate_prompt_execution_methods(
+            false,
+            false,
+            &prompt_name,
+            &[],
+            &[],
+            &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
+            Some(&prompt_conversion),
+        )
+        .to_string();
+        let (_, prompt_final_hook) = prompt_tokens
+            .split_once("fn get_final")
+            .expect("final prompt expansion has a direct final hook");
+
+        assert_eq!(prompt_conversion.to_string(), "Ok (result)");
+        assert!(prompt_final_hook.contains("FinalGetPromptResult"));
+        assert!(prompt_final_hook.contains("Ok (result)"));
+        assert!(!prompt_final_hook.contains("payload"));
+        assert!(!prompt_final_hook.contains("messages . into_iter"));
+
+        let prompt_async_tokens = generate_prompt_execution_methods(
+            true,
+            false,
+            &prompt_name,
+            &[],
+            &[],
+            &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
+            Some(&prompt_conversion),
+        );
+        assert_direct_async_expansion(prompt_async_tokens.clone(), "fn get_final_async");
+        let prompt_async_expansion = prompt_async_tokens.to_string();
+        let (_, prompt_final_async_hook) = prompt_async_expansion
+            .split_once("fn get_final_async")
+            .expect("async final prompt expansion has a direct final hook");
+        assert!(prompt_final_async_hook.contains("Ok (result)"));
+        assert!(!prompt_final_async_hook.contains("payload"));
+    }
+
+    #[test]
+    fn final_resource_and_prompt_signatures_reject_other_final_payload_with_one_type_change() {
+        let accepted: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>
+        );
+        let rejected: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalGetPromptResult>
+        );
+
+        assert!(
+            validate_final_handler_return(
+                &accepted,
+                "resource",
+                "ReadResourceResult",
+                Some("FinalReadResourceResult"),
+                "Vec<ResourceContent>",
+            )
+            .is_ok()
+        );
+        let error = validate_final_handler_return(
+            &rejected,
+            "resource",
+            "ReadResourceResult",
+            Some("FinalReadResourceResult"),
+            "Vec<ResourceContent>",
+        )
+        .expect_err("changing only the final payload type must fail closed");
+
+        assert!(error.to_string().contains("FinalReadResourceResult"));
+        assert!(error.to_string().contains("legacy handler"));
+
+        assert!(
+            validate_final_handler_return(
+                &rejected,
+                "prompt",
+                "GetPromptResult",
+                Some("FinalGetPromptResult"),
+                "Vec<PromptMessage>",
+            )
+            .is_ok()
+        );
+        let error = validate_final_handler_return(
+            &accepted,
+            "prompt",
+            "GetPromptResult",
+            Some("FinalGetPromptResult"),
+            "Vec<PromptMessage>",
+        )
+        .expect_err("changing only the final payload type must fail closed");
+
+        assert!(error.to_string().contains("FinalGetPromptResult"));
+        assert!(error.to_string().contains("legacy handler"));
+    }
+
+    #[test]
     fn final_tool_signature_rejects_legacy_payload_with_one_type_change() {
         let accepted: syn::ReturnType = syn::parse_quote!(
             -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>
@@ -1778,16 +2101,24 @@ mod async_handler_expansion_tests {
             -> fastmcp_protocol::CompleteResult<fastmcp_protocol::CallToolResult>
         );
 
-        assert!(validate_final_handler_return(
-            &accepted,
+        assert!(
+            validate_final_handler_return(
+                &accepted,
+                "tool",
+                "FinalCallToolResult",
+                None,
+                "Vec<Content>",
+            )
+            .is_ok()
+        );
+        let error = validate_final_handler_return(
+            &rejected,
             "tool",
             "FinalCallToolResult",
+            None,
             "Vec<Content>",
         )
-        .is_ok());
-        let error =
-            validate_final_handler_return(&rejected, "tool", "FinalCallToolResult", "Vec<Content>")
-                .expect_err("changing only result payload type must fail closed");
+        .expect_err("changing only result payload type must fail closed");
 
         assert!(error.to_string().contains("FinalCallToolResult"));
         assert!(error.to_string().contains("legacy handler"));
@@ -2290,6 +2621,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         &input_fn.sig.output,
         "tool",
         "FinalCallToolResult",
+        None,
         "Vec<Content>",
     ) {
         return syn::Error::new_spanned(&input_fn.sig.ident, error.to_string())
@@ -2744,6 +3076,7 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         &input_fn.sig.output,
         "resource",
         "ReadResourceResult",
+        Some("FinalReadResourceResult"),
         "Vec<ResourceContent>",
     ) {
         return syn::Error::new_spanned(&input_fn.sig.ident, error.to_string())
@@ -2936,7 +3269,11 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Generate result conversion based on return type (supports Result<String, E>)
     let return_type = &input_fn.sig.output;
-    let resource_result_conversion = generate_resource_result_conversion(return_type, &mime_type);
+    let final_result_conversion = generate_final_resource_result_conversion(return_type);
+    let resource_result_conversion = final_result_conversion.as_ref().map_or_else(
+        || generate_resource_result_conversion(return_type, &mime_type),
+        |_| generate_final_legacy_rejection("resource", "ResourceHandler::read_final"),
+    );
     let execution_methods = generate_resource_execution_methods(
         is_async,
         fn_name,
@@ -2944,6 +3281,7 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         &uri,
         &param_extractions,
         &resource_result_conversion,
+        final_result_conversion.as_ref(),
     );
 
     let expanded = quote! {
@@ -3122,6 +3460,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
         &input_fn.sig.output,
         "prompt",
         "GetPromptResult",
+        Some("FinalGetPromptResult"),
         "Vec<PromptMessage>",
     ) {
         return syn::Error::new_spanned(&input_fn.sig.ident, error.to_string())
@@ -3276,7 +3615,11 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Generate result conversion based on return type (supports Result<Vec<PromptMessage>, E>)
     let return_type = &input_fn.sig.output;
-    let prompt_result_conversion = generate_prompt_result_conversion(return_type);
+    let final_result_conversion = generate_final_prompt_result_conversion(return_type);
+    let prompt_result_conversion = final_result_conversion.as_ref().map_or_else(
+        || generate_prompt_result_conversion(return_type),
+        |_| generate_final_legacy_rejection("prompt", "PromptHandler::get_final"),
+    );
     let execution_methods = generate_prompt_execution_methods(
         is_async,
         expects_context,
@@ -3284,6 +3627,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
         &param_names,
         &param_extractions,
         &prompt_result_conversion,
+        final_result_conversion.as_ref(),
     );
 
     // Generate version token

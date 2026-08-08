@@ -24,8 +24,9 @@ use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
 use fastmcp_protocol::{
-    CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy, DecodedResult,
-    FinalCallToolResult, FinalCompletionParams, Icon, JsonRpcRequest, LegacyCompletionParams,
+    CacheScope, CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy,
+    DecodedResult, FinalCallToolResult, FinalCompletionParams, FinalGetPromptResult,
+    FinalPromptMessage, FinalReadResourceResult, Icon, JsonRpcRequest, LegacyCompletionParams,
     ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource, ResourceContent,
     ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations, decode_peer_result,
     encode_result,
@@ -380,6 +381,70 @@ pub(crate) fn promote_legacy_tool_content(
             content,
             is_error: false,
             structured_content: None,
+        },
+        empty_final_result_meta()?,
+    ))
+}
+
+const DEFAULT_FINAL_RESOURCE_TTL_MS: u64 = 60 * 60 * 1_000;
+
+/// Promotes legacy resource contents for a final handler default.
+///
+/// The trait default uses the same private one-hour cache policy as the
+/// router's default legacy projection. Direct final handlers can override it
+/// and author their selected cache policy without this conversion.
+fn promote_legacy_resource_contents(
+    contents: Vec<ResourceContent>,
+) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+    let contents = contents
+        .into_iter()
+        .map(|resource| {
+            let promoted = promote_legacy_tool_content(vec![Content::Resource { resource }])?;
+            let Some(ContentBlock::Resource { resource, .. }) =
+                promoted.payload.content.into_iter().next()
+            else {
+                return Err(McpError::internal_error(
+                    "legacy resource content did not promote to a final embedded resource",
+                ));
+            };
+            Ok(resource)
+        })
+        .collect::<McpResult<Vec<_>>>()?;
+
+    Ok(CompleteResult::new(
+        FinalReadResourceResult {
+            contents,
+            ttl_ms: DEFAULT_FINAL_RESOURCE_TTL_MS,
+            cache_scope: CacheScope::Private,
+        },
+        empty_final_result_meta()?,
+    ))
+}
+
+/// Promotes legacy prompt messages for a final handler default.
+///
+/// Direct final prompt handlers bypass this conversion and keep their final
+/// common content, including open fields, intact.
+fn promote_legacy_prompt_messages(
+    messages: Vec<PromptMessage>,
+) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+    let messages = messages
+        .into_iter()
+        .map(|PromptMessage { role, content }| {
+            let promoted = promote_legacy_tool_content(vec![content])?;
+            let Some(content) = promoted.payload.content.into_iter().next() else {
+                return Err(McpError::internal_error(
+                    "legacy prompt content did not promote to a final content block",
+                ));
+            };
+            Ok(FinalPromptMessage { role, content })
+        })
+        .collect::<McpResult<Vec<_>>>()?;
+
+    Ok(CompleteResult::new(
+        FinalGetPromptResult {
+            description: None,
+            messages,
         },
         empty_final_result_meta()?,
     ))
@@ -744,6 +809,62 @@ pub trait ResourceHandler: Send + Sync {
         })
     }
 
+    /// Reads the resource through the final MCP 2026-07-28 result surface.
+    ///
+    /// Legacy-only handlers retain their exact [`Self::read`] behavior and
+    /// receive the standard private one-hour final cache policy. Handlers that
+    /// author final embedded-resource metadata or a different cache policy
+    /// should override this method (or its async counterpart).
+    fn read_final(&self, ctx: &McpContext) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        promote_legacy_resource_contents(self.read(ctx)?)
+    }
+
+    /// Reads the resource through the final result surface with URI parameters.
+    fn read_final_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &UriParams,
+    ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        if params.is_empty() {
+            self.read_final(ctx)
+        } else {
+            promote_legacy_resource_contents(self.read_with_uri(ctx, uri, params)?)
+        }
+    }
+
+    /// Asynchronously reads the resource through the final result surface.
+    fn read_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            match self.read_final(ctx) {
+                Ok(value) => Outcome::Ok(value),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
+    /// Asynchronously reads the resource through the final result surface with URI parameters.
+    fn read_final_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            if params.is_empty() {
+                self.read_final_async(ctx).await
+            } else {
+                match self.read_final_with_uri(ctx, uri, params) {
+                    Ok(value) => Outcome::Ok(value),
+                    Err(error) => Outcome::Err(error),
+                }
+            }
+        })
+    }
+
     /// Reads the resource from a request-owned structured child.
     ///
     /// Modern router dispatch supplies the child [`Cx`] that owns this read.
@@ -758,6 +879,17 @@ pub trait ResourceHandler: Send + Sync {
         params: &'a UriParams,
     ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
         self.read_async_with_uri(ctx, uri, params)
+    }
+
+    /// Reads the resource's final result from a request-owned structured child.
+    fn read_final_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        self.read_final_async_with_uri(ctx, uri, params)
     }
 }
 
@@ -860,6 +992,33 @@ pub trait PromptHandler: Send + Sync {
         })
     }
 
+    /// Gets the prompt through the final MCP 2026-07-28 result surface.
+    ///
+    /// Legacy-only handlers retain their exact [`Self::get`] behavior. Direct
+    /// final handlers can override this method to keep final common content
+    /// and its open fields without a legacy projection.
+    fn get_final(
+        &self,
+        ctx: &McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+        promote_legacy_prompt_messages(self.get(ctx, arguments)?)
+    }
+
+    /// Asynchronously gets the prompt through the final result surface.
+    fn get_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
+        Box::pin(async move {
+            match self.get_final(ctx, arguments) {
+                Ok(value) => Outcome::Ok(value),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
     /// Gets the prompt from a request-owned structured child.
     ///
     /// Modern router dispatch supplies the child [`Cx`] that owns this prompt
@@ -872,6 +1031,16 @@ pub trait PromptHandler: Send + Sync {
         arguments: std::collections::HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
         self.get_async(ctx, arguments)
+    }
+
+    /// Gets the prompt's final result from a request-owned structured child.
+    fn get_final_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
+        self.get_final_async(ctx, arguments)
     }
 }
 
@@ -1153,6 +1322,82 @@ impl MountedResourceHandler {
         }
         contents
     }
+
+    fn translate_outgoing_final_uri(&self, uri: AbsoluteUri) -> McpResult<AbsoluteUri> {
+        let translated = if let Some(prefix) = &self.mount_prefix {
+            format!("{prefix}{}", uri.as_str())
+        } else if uri.as_str() == self.source_uri.as_str() {
+            self.mounted_uri.clone()
+        } else {
+            uri.as_str().to_owned()
+        };
+        AbsoluteUri::parse(translated).map_err(|error| {
+            McpError::internal_error(format!(
+                "mounted final resource URI is invalid after translation: {error}",
+            ))
+        })
+    }
+
+    fn translate_outgoing_final_contents(
+        &self,
+        contents: Vec<EmbeddedResourceContents>,
+    ) -> McpResult<Vec<EmbeddedResourceContents>> {
+        contents
+            .into_iter()
+            .map(|content| match content {
+                EmbeddedResourceContents::Text {
+                    uri,
+                    text,
+                    mime_type,
+                    meta,
+                    additional,
+                } => Ok(EmbeddedResourceContents::Text {
+                    uri: self.translate_outgoing_final_uri(uri)?,
+                    text,
+                    mime_type,
+                    meta,
+                    additional,
+                }),
+                EmbeddedResourceContents::Blob {
+                    uri,
+                    blob,
+                    mime_type,
+                    meta,
+                    additional,
+                } => Ok(EmbeddedResourceContents::Blob {
+                    uri: self.translate_outgoing_final_uri(uri)?,
+                    blob,
+                    mime_type,
+                    meta,
+                    additional,
+                }),
+            })
+            .collect()
+    }
+
+    fn translate_outgoing_final_result(
+        &self,
+        mut result: CompleteResult<FinalReadResourceResult>,
+    ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        result.payload.contents =
+            self.translate_outgoing_final_contents(result.payload.contents)?;
+        Ok(result)
+    }
+
+    fn translate_outgoing_final_outcome(
+        &self,
+        outcome: McpOutcome<CompleteResult<FinalReadResourceResult>>,
+    ) -> McpOutcome<CompleteResult<FinalReadResourceResult>> {
+        match outcome {
+            Outcome::Ok(result) => match self.translate_outgoing_final_result(result) {
+                Ok(result) => Outcome::Ok(result),
+                Err(error) => Outcome::Err(error),
+            },
+            Outcome::Err(error) => Outcome::Err(error),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        }
+    }
 }
 
 impl ResourceHandler for MountedResourceHandler {
@@ -1262,6 +1507,52 @@ impl ResourceHandler for MountedResourceHandler {
         })
     }
 
+    fn read_final(&self, ctx: &McpContext) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        self.inner
+            .read_final(ctx)
+            .and_then(|result| self.translate_outgoing_final_result(result))
+    }
+
+    fn read_final_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &UriParams,
+    ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        let source_uri = self.translate_incoming_uri(uri)?;
+        self.inner
+            .read_final_with_uri(ctx, &source_uri, params)
+            .and_then(|result| self.translate_outgoing_final_result(result))
+    }
+
+    fn read_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            self.translate_outgoing_final_outcome(self.inner.read_final_async(ctx).await)
+        })
+    }
+
+    fn read_final_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            let source_uri = match self.translate_incoming_uri(uri) {
+                Ok(source_uri) => source_uri,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.translate_outgoing_final_outcome(
+                self.inner
+                    .read_final_async_with_uri(ctx, &source_uri, params)
+                    .await,
+            )
+        })
+    }
+
     fn read_async_with_uri_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -1278,6 +1569,26 @@ impl ResourceHandler for MountedResourceHandler {
                 .read_async_with_uri_in_request(ctx, request_cx, &source_uri, params)
                 .await
                 .map(|contents| self.translate_outgoing_contents(contents))
+        })
+    }
+
+    fn read_final_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            let source_uri = match self.translate_incoming_uri(uri) {
+                Ok(source_uri) => source_uri,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.translate_outgoing_final_outcome(
+                self.inner
+                    .read_final_async_with_uri_in_request(ctx, request_cx, &source_uri, params)
+                    .await,
+            )
         })
     }
 }
@@ -1351,6 +1662,22 @@ impl PromptHandler for MountedPromptHandler {
         self.inner.get_async(ctx, arguments)
     }
 
+    fn get_final(
+        &self,
+        ctx: &McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+        self.inner.get_final(ctx, arguments)
+    }
+
+    fn get_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
+        self.inner.get_final_async(ctx, arguments)
+    }
+
     fn get_async_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -1358,6 +1685,16 @@ impl PromptHandler for MountedPromptHandler {
         arguments: std::collections::HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
         self.inner.get_async_in_request(ctx, request_cx, arguments)
+    }
+
+    fn get_final_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
+        self.inner
+            .get_final_async_in_request(ctx, request_cx, arguments)
     }
 }
 
@@ -1787,6 +2124,26 @@ mod tests {
         assert_eq!(result.len(), 1);
     }
 
+    #[test]
+    fn resource_handler_final_surface_promotes_legacy_content_without_changing_legacy_read() {
+        let resource = StubResource;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let legacy = resource.read(&ctx).expect("legacy handler result");
+        let final_result = resource
+            .read_final(&ctx)
+            .expect("legacy resource promotes into the final result algebra");
+
+        assert_eq!(legacy[0].uri, "file:///stub");
+        assert!(matches!(
+            final_result.payload.contents.as_slice(),
+            [EmbeddedResourceContents::Text { uri, text, .. }]
+                if uri.as_str() == "file:///stub" && text == "hello"
+        ));
+        assert_eq!(final_result.payload.ttl_ms, DEFAULT_FINAL_RESOURCE_TTL_MS);
+        assert_eq!(final_result.payload.cache_scope, CacheScope::Private);
+    }
+
     // ── Minimal PromptHandler impl for testing ───────────────────────
 
     struct StubPrompt;
@@ -1819,6 +2176,24 @@ mod tests {
         assert!(prompt.version().is_none());
         assert!(prompt.tags().is_empty());
         assert!(prompt.timeout().is_none());
+    }
+
+    #[test]
+    fn prompt_handler_final_surface_promotes_legacy_messages_without_changing_legacy_get() {
+        let prompt = StubPrompt;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let legacy = prompt
+            .get(&ctx, HashMap::new())
+            .expect("legacy handler result");
+        let final_result = prompt
+            .get_final(&ctx, HashMap::new())
+            .expect("legacy prompt promotes into the final result algebra");
+
+        assert!(legacy.is_empty());
+        assert!(final_result.payload.messages.is_empty());
+        assert!(final_result.payload.description.is_none());
+        assert!(final_result.meta.server_info.is_none());
     }
 
     // ── MountedToolHandler ───────────────────────────────────────────
