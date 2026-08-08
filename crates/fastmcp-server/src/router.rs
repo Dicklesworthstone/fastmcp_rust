@@ -20,6 +20,7 @@ use fastmcp_core::{
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
+use fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID;
 use fastmcp_protocol::methods::COMPLETION_COMPLETE;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
@@ -33,9 +34,10 @@ use fastmcp_protocol::{
     LegacyCompletionParams, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
     LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
     ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker,
-    Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, Resource, ResourceContent,
-    ResourceTemplate, ServerBehavior, ServerBehaviorRegistry, Tool, validate, validate_strict,
+    ListResourcesResult, ListToolsParams, ListToolsResult, MissingRequiredClientCapabilityError,
+    PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage, ReadResourceParams,
+    ReadResourceResult, Resource, ResourceContent, ResourceTemplate, ServerBehavior,
+    ServerBehaviorRegistry, Tool, validate, validate_strict,
 };
 #[cfg(test)]
 use fastmcp_protocol::{
@@ -44,12 +46,13 @@ use fastmcp_protocol::{
 };
 
 use crate::handler::{
-    BidirectionalSenders, BoxFuture, ProgressNotificationSender, UriParams,
+    BidirectionalSenders, BoxFuture, FinalToolOutcome, ProgressNotificationSender, UriParams,
     empty_final_result_meta, encode_final_complete_result,
 };
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
 
+use crate::FinalTaskRuntime;
 use crate::Session;
 use crate::handler::{
     BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
@@ -237,6 +240,44 @@ fn encode_final_tools_call_result(
     .encode()
     .map_err(|error| McpError::internal_error(error.to_string()))?;
     serde_json::from_str(&encoded).map_err(McpError::from)
+}
+
+fn encode_final_task_result(
+    result: fastmcp_protocol::tasks_extension::CreateTaskResult,
+) -> McpResult<serde_json::Value> {
+    let encoded = CoreResult::Final(FinalCoreResult::ToolsCallTask { result })
+        .encode()
+        .map_err(|error| McpError::internal_error(error.to_string()))?;
+    serde_json::from_str(&encoded).map_err(McpError::from)
+}
+
+fn require_final_tasks_capability(metadata: &OpenMetadata) -> McpResult<()> {
+    let declared = metadata
+        .client_capabilities()
+        .map_err(|_| McpError::invalid_params("invalid final client capabilities"))?
+        .and_then(|capabilities| capabilities.get("extensions"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|extensions| extensions.get(OFFICIAL_TASKS_EXTENSION_ID))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(serde_json::Map::is_empty);
+    if declared {
+        return Ok(());
+    }
+
+    let mut extensions = serde_json::Map::new();
+    extensions.insert(
+        OFFICIAL_TASKS_EXTENSION_ID.to_owned(),
+        serde_json::json!({}),
+    );
+    let missing = MissingRequiredClientCapabilityError::new(serde_json::json!({
+        "extensions": serde_json::Value::Object(extensions)
+    }))
+    .map_err(|_| McpError::internal_error("failed to encode required Tasks capability"))?;
+    Err(McpError::with_data(
+        McpErrorCode::Custom(missing.jsonrpc_error_code()),
+        "Required client capability is missing",
+        missing.canonical_error_data(),
+    ))
 }
 
 /// Encodes a handler-authored final resource result without reprojecting it
@@ -803,6 +844,9 @@ pub struct Router {
     list_page_size: Option<usize>,
     /// Cache policy emitted on exact modern catalog and resource-read results.
     final_cache_hints: FinalCacheHintPolicy,
+    /// Application-owned durable final Tasks runtime used only after the
+    /// request metadata has admitted the official extension.
+    final_task_runtime: Option<FinalTaskRuntime>,
 }
 
 impl Router {
@@ -823,7 +867,12 @@ impl Router {
             strict_input_validation: false,
             list_page_size: None,
             final_cache_hints: FinalCacheHintPolicy::default(),
+            final_task_runtime: None,
         }
+    }
+
+    pub(crate) fn set_final_task_runtime(&mut self, runtime: Option<FinalTaskRuntime>) {
+        self.final_task_runtime = runtime;
     }
 
     /// Sets the list pagination page size.
@@ -1791,8 +1840,9 @@ impl Router {
                         "modern tools/call dispatch selected another core request",
                     ));
                 };
-                encode_final_tools_call_result(
-                    self.handle_tools_call_final_in_request(
+                let request_metadata = params.meta.clone();
+                let outcome = self
+                    .handle_tools_call_final_in_request(
                         request_ctx,
                         request_cx,
                         params,
@@ -1800,8 +1850,21 @@ impl Router {
                         None,
                         None,
                     )
-                    .await,
-                )?
+                    .await?;
+                match outcome {
+                    FinalToolOutcome::Complete(result) => {
+                        encode_final_tools_call_result(Ok(result))?
+                    }
+                    FinalToolOutcome::CreateTask { status_message } => {
+                        require_final_tasks_capability(&request_metadata)?;
+                        let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
+                            McpError::internal_error(
+                                "task-capable tool requires an installed final Tasks runtime",
+                            )
+                        })?;
+                        encode_final_task_result(runtime.create_task(status_message)?)?
+                    }
+                }
             }
             "resources/list" => {
                 let request =
@@ -2436,7 +2499,7 @@ impl Router {
         session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
-    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+    ) -> McpResult<FinalToolOutcome> {
         debug!(
             target: targets::HANDLER,
             "calling final tool; tool_key={}; arguments_present={}",
@@ -2498,7 +2561,7 @@ impl Router {
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
         let outcome =
             run_handler_in_request(&ctx, request_cx, effective_budget, "tool", |child_cx| {
-                handler.call_final_async_in_request(&ctx, child_cx, arguments)
+                handler.call_final_outcome_async_in_request(&ctx, child_cx, arguments)
             })
             .await?;
 
@@ -2514,7 +2577,7 @@ impl Router {
                         text: error.message,
                     }])?;
                 result.payload.is_error = true;
-                Ok(result)
+                Ok(FinalToolOutcome::Complete(result))
             }
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "tool")),

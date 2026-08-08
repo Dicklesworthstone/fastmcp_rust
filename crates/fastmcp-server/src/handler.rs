@@ -233,6 +233,28 @@ where
 /// A boxed future for async handler results.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// One application-authored outcome of a final `tools/call` handler.
+///
+/// `CreateTask` is deliberately a request for the router to create durable
+/// state, not a pre-created task result. The router can therefore enforce the
+/// peer's negotiated Tasks capability before the application-owned store is
+/// mutated.
+pub enum FinalToolOutcome {
+    /// Complete this tool call synchronously through the final result algebra.
+    Complete(CompleteResult<FinalCallToolResult>),
+    /// Create one durable working task after negotiated capability admission.
+    CreateTask {
+        /// Optional initial status message retained by the task state machine.
+        status_message: Option<String>,
+    },
+}
+
+impl From<CompleteResult<FinalCallToolResult>> for FinalToolOutcome {
+    fn from(result: CompleteResult<FinalCallToolResult>) -> Self {
+        Self::Complete(result)
+    }
+}
+
 /// URI template parameters extracted from a matched resource URI.
 pub type UriParams = HashMap<String, String>;
 
@@ -640,6 +662,44 @@ pub trait ToolHandler: Send + Sync {
         arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
         self.call_final_async(ctx, arguments)
+    }
+
+    /// Calls the tool through the disjoint complete-or-task final surface.
+    ///
+    /// Existing handlers remain complete-only. A task-capable handler
+    /// overrides this method, or its async/request-owned counterpart, and
+    /// returns [`FinalToolOutcome::CreateTask`] without mutating task state.
+    fn call_final_outcome(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        self.call_final(ctx, arguments)
+            .map(FinalToolOutcome::Complete)
+    }
+
+    /// Asynchronously calls the disjoint complete-or-task final surface.
+    fn call_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            match self.call_final_outcome(ctx, arguments) {
+                Ok(value) => Outcome::Ok(value),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
+    /// Calls the disjoint final outcome from a request-owned structured child.
+    fn call_final_outcome_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        self.call_final_outcome_async(ctx, arguments)
     }
 }
 
@@ -1238,6 +1298,32 @@ impl ToolHandler for MountedToolHandler {
     ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
         self.inner
             .call_final_async_in_request(ctx, request_cx, arguments)
+    }
+
+    fn call_final_outcome(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        self.inner.call_final_outcome(ctx, arguments)
+    }
+
+    fn call_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        self.inner.call_final_outcome_async(ctx, arguments)
+    }
+
+    fn call_final_outcome_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        self.inner
+            .call_final_outcome_async_in_request(ctx, request_cx, arguments)
     }
 }
 

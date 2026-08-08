@@ -96,9 +96,9 @@ pub use extensions::{
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
 pub use handler::{
-    BidirectionalSenders, BoxFuture, CompletionHandler, ProgressNotificationSender, PromptHandler,
-    ResourceHandler, ToolHandler, create_context_with_progress,
-    create_context_with_progress_and_senders,
+    BidirectionalSenders, BoxFuture, CompletionHandler, FinalToolOutcome,
+    ProgressNotificationSender, PromptHandler, ResourceHandler, ToolHandler,
+    create_context_with_progress, create_context_with_progress_and_senders,
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 pub use proxy::{ProxyBackend, ProxyCatalog, ProxyClient};
@@ -179,8 +179,9 @@ use fastmcp_protocol::{
     FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, GetPromptParams,
     InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
     ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel,
-    LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES, ProgressMarker, Prompt, ReadResourceParams,
-    RequestId, Resource, ResourceTemplate, ResultMeta, SERVER_DISCOVER_METHOD, ServerCapabilities,
+    LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+    MissingRequiredClientCapabilityError, ProgressMarker, Prompt, ReadResourceParams, RequestId,
+    Resource, ResourceTemplate, ResultMeta, SERVER_DISCOVER_METHOD, ServerCapabilities,
     ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
     ServerExtensionDiscovery, ServerInfo, ServerInstructions, ServerNotification,
     SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
@@ -1444,9 +1445,25 @@ fn mask_peer_error(error: McpError, mask_error_details: bool) -> McpError {
     // public contract. Preserve it while continuing to mask arbitrary custom
     // extension errors, including attempts to reuse the same numeric code with
     // a different message or data.
-    if error.code == McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE)
-        && error.message == RESOURCE_SUBSCRIPTION_CAPACITY_MESSAGE
-        && error.data.is_none()
+    let canonical_missing_capability = error.code
+        == McpErrorCode::Custom(MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE)
+        && error.message == "Required client capability is missing"
+        && error.data.as_ref().is_some_and(|data| {
+            let Some(object) = data.as_object() else {
+                return false;
+            };
+            object.len() == 1
+                && object
+                    .get("requiredCapabilities")
+                    .cloned()
+                    .is_some_and(|required| {
+                        MissingRequiredClientCapabilityError::new(required).is_ok()
+                    })
+        });
+    if canonical_missing_capability
+        || error.code == McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE)
+            && error.message == RESOURCE_SUBSCRIPTION_CAPACITY_MESSAGE
+            && error.data.is_none()
     {
         error
     } else {
@@ -10200,6 +10217,63 @@ mod lib_unit_tests {
             .build()
     }
 
+    struct FinalTaskCreatingTool;
+
+    impl ToolHandler for FinalTaskCreatingTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "durable_final_task".to_owned(),
+                description: Some("Creates one negotiated final task".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("exact legacy completion")])
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            Ok(FinalToolOutcome::CreateTask {
+                status_message: Some("accepted by negotiated tool".to_owned()),
+            })
+        }
+    }
+
+    fn final_task_creating_tool_request(declare_tasks: bool) -> JsonRpcRequest {
+        let capabilities = if declare_tasks {
+            serde_json::json!({
+                "extensions": { "io.modelcontextprotocol/tasks": {} }
+            })
+        } else {
+            serde_json::json!({})
+        };
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": capabilities,
+                },
+                "name": "durable_final_task",
+                "arguments": {},
+            })),
+            81_i64,
+        )
+    }
+
     fn unrelated_extension_registry(
         method: &str,
     ) -> (ExtensionHandlerRegistry, ServerExtensionDiscovery) {
@@ -10388,6 +10462,107 @@ mod lib_unit_tests {
             runtime
                 .is_cancellation_requested(&task_id)
                 .expect("final cancellation intent must remain in application storage")
+        );
+    }
+
+    #[test]
+    fn final_tool_task_result_mutates_only_after_capability_admission_and_legacy_stays_exact() {
+        let store = Arc::new(ServerFinalTaskStore::default());
+        let runtime = FinalTaskRuntime::new(
+            Arc::clone(&store) as Arc<dyn FinalTaskStore>,
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000))
+                .expect("valid final Tasks timing policy"),
+            Arc::new(|_| {}),
+        );
+        let server = Server::new("final-tool-task-server", "1.0.0")
+            .tool(FinalTaskCreatingTool)
+            .mask_error_details(true)
+            .final_tasks(runtime)
+            .expect("final Tasks must install before task-capable tool dispatch")
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 81, InboundRequestTransport::Memory);
+
+        let admitted = server
+            .dispatch_stateless(&inbound, &final_task_creating_tool_request(true))
+            .expect("declared final Tasks tool request must respond");
+        assert!(admitted.error.is_none());
+        assert_eq!(
+            admitted.result.as_ref().map(|result| &result["resultType"]),
+            Some(&serde_json::json!("task"))
+        );
+        assert_eq!(
+            admitted.result.as_ref().map(|result| &result["status"]),
+            Some(&serde_json::json!("working"))
+        );
+        assert_eq!(
+            store
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "the admitted result must name a task already durable in the application store"
+        );
+
+        let rejected = server
+            .dispatch_stateless(&inbound, &final_task_creating_tool_request(false))
+            .expect("missing-capability final tool request must respond");
+        let error = rejected
+            .error
+            .expect("removing only the Tasks declaration must reject task creation");
+        assert_eq!(error.code, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "requiredCapabilities": {
+                    "extensions": { "io.modelcontextprotocol/tasks": {} }
+                }
+            }))
+        );
+        assert_eq!(
+            store
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "rejected task capability must leave durable state unchanged"
+        );
+
+        let mut legacy_session = initialized_test_session(&server);
+        let legacy = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut legacy_session,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "durable_final_task",
+                        "arguments": {},
+                    })),
+                    81_i64,
+                ),
+                &Arc::new(|_| {}),
+                &test_request_sender(),
+            )
+            .expect("exact legacy tool call must respond through its original handler surface");
+        assert!(legacy.error.is_none());
+        assert_eq!(
+            legacy
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/content/0/text")),
+            Some(&serde_json::json!("exact legacy completion"))
+        );
+        assert_eq!(
+            store
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "exact MCP 2024-11-05 must never enter the final task producer"
         );
     }
 

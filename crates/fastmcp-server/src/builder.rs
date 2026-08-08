@@ -1218,6 +1218,8 @@ impl ServerBuilder {
             self.console_config.should_use_rich(),
         );
         let final_task_runtime = self.final_task_runtime.clone();
+        self.router
+            .set_final_task_runtime(final_task_runtime.clone());
         let extension_runtime = match self.extension_runtime {
             Some(mut runtime) => {
                 runtime
