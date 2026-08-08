@@ -194,16 +194,16 @@ pub use fastmcp_protocol::{
     FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult,
     FinalLogMessageParams, FinalNotificationError, FinalProgressNotificationParams,
     FinalPromptMessage, FinalReadResourceParams, FinalReadResourceResult, FinalRequestMeta,
-    FinalResourceUpdatedNotificationParams, FinalSetLogLevelParams,
-    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
-    FinalSubscriptionsListenResult, IncludeContext, InputRequiredResult, LegacyCoreRequest,
-    LegacyCoreResult, LegacyEmptyResult, MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH,
-    MAX_RESULT_ENCODED_BYTES, MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES, MetadataView,
-    PaginatedResult, RawResultEnvelope, ResultDecodeError, ResultDecodeErrorKind,
-    ResultDiscriminatorDecision, ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic,
-    ResultPeerEra, ServerNotification, TypedCompleteMembers, UnknownResultMembers,
-    decode_peer_result, decode_peer_result_for_era, decode_typed_complete, encode_complete_result,
-    encode_result, exact_json_from_serde, exact_json_to_serde, parse_exact_json,
+    FinalResourceUpdatedNotificationParams, FinalSubscriptionsAcknowledgedNotificationParams,
+    FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, IncludeContext,
+    InputRequiredResult, LegacyCoreRequest, LegacyCoreResult, LegacyEmptyResult,
+    MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
+    MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES, MetadataView, PaginatedResult,
+    RawResultEnvelope, ResultDecodeError, ResultDecodeErrorKind, ResultDiscriminatorDecision,
+    ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic, ResultPeerEra, ServerNotification,
+    TypedCompleteMembers, UnknownResultMembers, decode_peer_result, decode_peer_result_for_era,
+    decode_typed_complete, encode_complete_result, encode_result, exact_json_from_serde,
+    exact_json_to_serde, parse_exact_json,
 };
 
 // Exact final component and sampling models. These are deliberately separate
@@ -442,14 +442,13 @@ pub mod modern {
         FinalPromptMessage, FinalProtocolVersion, FinalReadResourceParams, FinalReadResourceResult,
         FinalRequestAdmission, FinalRequestMeta, FinalResource, FinalResourceTemplate,
         FinalResourceUpdatedNotificationParams, FinalSamplingMessage, FinalSamplingMessageContent,
-        FinalSamplingMessageContentBlock, FinalSetLogLevelParams,
-        FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
-        FinalSubscriptionsListenResult, FinalTool, FinalToolAnnotations, FinalToolChoice,
-        FinalToolChoiceMode, HEADER_MISMATCH_ERROR_CODE, HeaderMismatchError, HeaderMismatchReason,
-        IncludeContext, InputRequiredResult, MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH,
-        MAX_RESULT_ENCODED_BYTES, MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES,
-        MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
-        MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MetadataView,
+        FinalSamplingMessageContentBlock, FinalSubscriptionsAcknowledgedNotificationParams,
+        FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, FinalTool,
+        FinalToolAnnotations, FinalToolChoice, FinalToolChoiceMode, HEADER_MISMATCH_ERROR_CODE,
+        HeaderMismatchError, HeaderMismatchReason, IncludeContext, InputRequiredResult,
+        MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
+        MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES, MCP_METHOD_HEADER, MCP_NAME_HEADER,
+        MCP_PROTOCOL_VERSION_HEADER, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MetadataView,
         MissingRequiredClientCapabilityError, ModelHint, ModelPreferences, PaginatedResult,
         ProgressMarker, ProtocolVersionError as FinalProtocolVersionError, RawResultEnvelope,
         RequestAdmissionError, RequestId, RequestVersionMetadata, RequiredCapabilitiesError,
@@ -811,7 +810,6 @@ mod tests {
         let _: Option<modern::FinalCallToolParams> = None;
         let _: Option<modern::FinalReadResourceParams> = None;
         let _: Option<modern::FinalGetPromptParams> = None;
-        let _: Option<modern::FinalSetLogLevelParams> = None;
         let _: Option<modern::FinalEmptyParams> = None;
         let _: Option<modern::FinalListToolsResult> = None;
         let _: Option<modern::FinalCallToolResult> = None;
