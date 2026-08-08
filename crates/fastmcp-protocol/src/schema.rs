@@ -16,6 +16,10 @@ use regex::Regex;
 use serde_json::Value;
 use std::fmt;
 
+/// The sole JSON Schema dialect accepted by the final core schema-admission
+/// boundary.
+pub const FINAL_JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
+
 /// Maximum nested schema applications on a single validation path.
 pub const MAX_SCHEMA_VALIDATION_DEPTH: usize = 64;
 
@@ -53,6 +57,452 @@ impl std::error::Error for ValidationError {}
 
 /// Result of JSON Schema validation.
 pub type ValidationResult = Result<(), Vec<ValidationError>>;
+
+/// A stable refusal emitted before an untrusted schema reaches validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaAdmissionError {
+    path: String,
+    reason: &'static str,
+}
+
+impl SchemaAdmissionError {
+    fn new(path: impl Into<String>, reason: &'static str) -> Self {
+        Self {
+            path: path.into(),
+            reason,
+        }
+    }
+
+    /// JSON path of the malformed schema member.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Stable refusal category for the malformed schema member.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+impl fmt::Display for SchemaAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.path, self.reason)
+    }
+}
+
+impl std::error::Error for SchemaAdmissionError {}
+
+/// A final-dialect schema that passed structural admission.
+///
+/// Construction is intentionally restricted to [`admit_final_schema`] so a
+/// caller cannot present malformed schema syntax as a validated schema.
+#[derive(Debug, Clone)]
+pub struct AdmittedSchema {
+    schema: Value,
+}
+
+impl AdmittedSchema {
+    /// Returns the admitted schema without altering its wire representation.
+    #[must_use]
+    pub const fn schema(&self) -> &Value {
+        &self.schema
+    }
+
+    /// Validates an instance using this admitted schema.
+    #[must_use]
+    pub fn validate(&self, value: &Value) -> ValidationResult {
+        validate(&self.schema, value)
+    }
+}
+
+/// A final core result discriminator admitted by this protocol surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalCoreResultType {
+    /// An ordinary method result.
+    Complete,
+    /// A result asking the client to supply an input before retrying.
+    InputRequired,
+}
+
+impl FinalCoreResultType {
+    /// Exact final wire spelling of the discriminator.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::InputRequired => "input_required",
+        }
+    }
+}
+
+/// Validates a final-dialect schema before any caller uses it for tool input,
+/// tool output, or another final core schema-bearing field.
+///
+/// The final wire boundary accepts only JSON Schema booleans or objects. A
+/// present `$schema` must identify the canonical Draft 2020-12 dialect, and
+/// every structural keyword consumed by this validator is checked before the
+/// schema can be retained. External references are refused rather than being
+/// interpreted as I/O authority.
+pub fn admit_final_schema(schema: Value) -> Result<AdmittedSchema, SchemaAdmissionError> {
+    validate_final_schema_node(&schema, "$", true)?;
+    Ok(AdmittedSchema { schema })
+}
+
+/// Validates a final core result against an admitted schema and its expected
+/// discriminator.
+///
+/// This is intentionally stricter than peer-result compatibility decoding:
+/// safe final emission must carry an explicit core `resultType`; absent,
+/// non-string, extension, and cross-branch values are rejected here.
+pub fn validate_final_core_result(
+    schema: &AdmittedSchema,
+    value: &Value,
+    expected_result_type: FinalCoreResultType,
+) -> ValidationResult {
+    let mut errors = Vec::new();
+    let Some(result) = value.as_object() else {
+        push_error(&mut errors, "root", "final result must be an object");
+        return Err(errors);
+    };
+
+    match result.get("resultType") {
+        Some(Value::String(result_type)) if result_type == expected_result_type.as_str() => {}
+        Some(Value::String(_)) => push_error(
+            &mut errors,
+            "root.resultType",
+            "resultType does not match the selected final core result branch",
+        ),
+        Some(_) => push_error(
+            &mut errors,
+            "root.resultType",
+            "resultType must be a final core result discriminator string",
+        ),
+        None => push_error(&mut errors, "root", "final result requires resultType"),
+    }
+
+    if let Err(schema_errors) = schema.validate(value) {
+        for error in schema_errors {
+            if errors.len() == MAX_VALIDATION_ERRORS {
+                break;
+            }
+            errors.push(error);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn validate_final_schema_node(
+    schema: &Value,
+    path: &str,
+    root: bool,
+) -> Result<(), SchemaAdmissionError> {
+    if schema.is_boolean() {
+        return Ok(());
+    }
+    let object = schema
+        .as_object()
+        .ok_or_else(|| SchemaAdmissionError::new(path, "schema must be an object or boolean"))?;
+
+    if root {
+        if let Some(dialect) = object.get("$schema") {
+            if dialect.as_str() != Some(FINAL_JSON_SCHEMA_DIALECT) {
+                return Err(SchemaAdmissionError::new(
+                    format!("{path}.$schema"),
+                    "unsupported schema dialect",
+                ));
+            }
+        }
+    }
+
+    if let Some(reference) = object.get("$ref") {
+        let reference = reference.as_str().ok_or_else(|| {
+            SchemaAdmissionError::new(format!("{path}.$ref"), "$ref must be a string")
+        })?;
+        if reference != "#" && !reference.starts_with("#/") {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.$ref"),
+                "external schema reference is not allowed",
+            ));
+        }
+    }
+
+    if let Some(type_value) = object.get("type") {
+        validate_schema_type(type_value, &format!("{path}.type"))?;
+    }
+    validate_string_array_keyword(object, "required", path)?;
+    validate_string_array_keyword(object, "dependentRequired", path)?;
+    validate_nonnegative_integer_keywords(
+        object,
+        path,
+        &[
+            "minProperties",
+            "maxProperties",
+            "minItems",
+            "maxItems",
+            "minContains",
+            "maxContains",
+            "minLength",
+            "maxLength",
+        ],
+    )?;
+    validate_number_keywords(
+        object,
+        path,
+        &[
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+        ],
+    )?;
+    if object
+        .get("multipleOf")
+        .is_some_and(|value| value.as_f64().is_none_or(|multiple| multiple <= 0.0))
+    {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.multipleOf"),
+            "multipleOf must be a positive number",
+        ));
+    }
+    validate_boolean_keywords(object, path, &["uniqueItems"])?;
+    validate_enum_keyword(object, path)?;
+    validate_pattern_keyword(object, path)?;
+
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "dependentSchemas",
+    ] {
+        if let Some(subschemas) = object.get(keyword) {
+            let subschemas = subschemas.as_object().ok_or_else(|| {
+                SchemaAdmissionError::new(
+                    format!("{path}.{keyword}"),
+                    "schema map keyword must be an object",
+                )
+            })?;
+            if keyword == "patternProperties" {
+                if subschemas.len() > MAX_PATTERN_PROPERTIES {
+                    return Err(SchemaAdmissionError::new(
+                        format!("{path}.{keyword}"),
+                        "patternProperties exceeds entry limit",
+                    ));
+                }
+                for pattern in subschemas.keys() {
+                    if pattern.len() > MAX_PATTERN_PROPERTY_BYTES {
+                        return Err(SchemaAdmissionError::new(
+                            format!("{path}.{keyword}"),
+                            "patternProperties pattern exceeds byte limit",
+                        ));
+                    }
+                    if Regex::new(pattern).is_err() {
+                        return Err(SchemaAdmissionError::new(
+                            format!("{path}.{keyword}"),
+                            "invalid patternProperties pattern",
+                        ));
+                    }
+                }
+            }
+            for (name, subschema) in subschemas {
+                validate_final_schema_node(subschema, &format!("{path}.{keyword}.{name}"), false)?;
+            }
+        }
+    }
+
+    for keyword in [
+        "additionalProperties",
+        "items",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+    ] {
+        if let Some(subschema) = object.get(keyword) {
+            validate_final_schema_node(subschema, &format!("{path}.{keyword}"), false)?;
+        }
+    }
+
+    for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+        if let Some(subschemas) = object.get(keyword) {
+            let subschemas = subschemas.as_array().ok_or_else(|| {
+                SchemaAdmissionError::new(
+                    format!("{path}.{keyword}"),
+                    "schema array keyword must be an array",
+                )
+            })?;
+            for (index, subschema) in subschemas.iter().enumerate() {
+                validate_final_schema_node(
+                    subschema,
+                    &format!("{path}.{keyword}[{index}]"),
+                    false,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_schema_type(value: &Value, path: &str) -> Result<(), SchemaAdmissionError> {
+    let valid_type = |type_name: &str| {
+        matches!(
+            type_name,
+            "array" | "boolean" | "integer" | "null" | "number" | "object" | "string"
+        )
+    };
+    match value {
+        Value::String(type_name) if valid_type(type_name) => Ok(()),
+        Value::Array(types)
+            if !types.is_empty()
+                && types
+                    .iter()
+                    .all(|type_name| type_name.as_str().is_some_and(valid_type)) =>
+        {
+            Ok(())
+        }
+        _ => Err(SchemaAdmissionError::new(
+            path,
+            "type must contain only JSON Schema primitive type names",
+        )),
+    }
+}
+
+fn validate_string_array_keyword(
+    object: &serde_json::Map<String, Value>,
+    keyword: &str,
+    path: &str,
+) -> Result<(), SchemaAdmissionError> {
+    let Some(value) = object.get(keyword) else {
+        return Ok(());
+    };
+    if keyword == "dependentRequired" {
+        let dependencies = value.as_object().ok_or_else(|| {
+            SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "dependentRequired must be an object",
+            )
+        })?;
+        if dependencies.values().all(|required| {
+            required
+                .as_array()
+                .is_some_and(|members| members.iter().all(Value::is_string))
+        }) {
+            return Ok(());
+        }
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.{keyword}"),
+            "dependentRequired values must be arrays of strings",
+        ));
+    }
+    if value
+        .as_array()
+        .is_some_and(|members| members.iter().all(Value::is_string))
+    {
+        Ok(())
+    } else {
+        Err(SchemaAdmissionError::new(
+            format!("{path}.{keyword}"),
+            "schema string-array keyword must be an array of strings",
+        ))
+    }
+}
+
+fn validate_nonnegative_integer_keywords(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+    keywords: &[&str],
+) -> Result<(), SchemaAdmissionError> {
+    for keyword in keywords {
+        if object.get(*keyword).is_some_and(|value| !value.is_u64()) {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "schema count keyword must be a nonnegative integer",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_number_keywords(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+    keywords: &[&str],
+) -> Result<(), SchemaAdmissionError> {
+    for keyword in keywords {
+        if object.get(*keyword).is_some_and(|value| !value.is_number()) {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "schema numeric keyword must be a number",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_boolean_keywords(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+    keywords: &[&str],
+) -> Result<(), SchemaAdmissionError> {
+    for keyword in keywords {
+        if object
+            .get(*keyword)
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "schema boolean keyword must be a boolean",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_enum_keyword(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<(), SchemaAdmissionError> {
+    if object
+        .get("enum")
+        .is_some_and(|value| !value.as_array().is_some_and(|values| !values.is_empty()))
+    {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.enum"),
+            "enum must be a nonempty array",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pattern_keyword(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<(), SchemaAdmissionError> {
+    let Some(pattern) = object.get("pattern") else {
+        return Ok(());
+    };
+    let pattern = pattern.as_str().ok_or_else(|| {
+        SchemaAdmissionError::new(format!("{path}.pattern"), "pattern must be a string")
+    })?;
+    if Regex::new(pattern).is_ok() {
+        Ok(())
+    } else {
+        Err(SchemaAdmissionError::new(
+            format!("{path}.pattern"),
+            "invalid schema pattern",
+        ))
+    }
+}
 
 /// Validates a JSON value against a JSON Schema.
 ///
@@ -1042,6 +1492,68 @@ mod tests {
     }
 
     #[test]
+    fn final_core_result_schema_positive() {
+        let schema = admit_final_schema(json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {
+                "resultType": {"const": "complete"},
+                "content": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["resultType", "content"],
+            "additionalProperties": false
+        }))
+        .expect("a strict final core result schema admits");
+        let result = json!({"resultType": "complete", "content": ["ready"]});
+
+        validate_final_core_result(&schema, &result, FinalCoreResultType::Complete)
+            .expect("the selected final core branch and schema both admit the result");
+        assert_eq!(schema.schema()["$schema"], FINAL_JSON_SCHEMA_DIALECT);
+        assert_eq!(FinalCoreResultType::Complete.as_str(), "complete");
+    }
+
+    #[test]
+    fn final_core_result_schema_cross_era_and_unknown_field_negatives() {
+        let schema = admit_final_schema(json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {
+                "resultType": {"const": "complete"},
+                "content": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["resultType", "content"],
+            "additionalProperties": false
+        }))
+        .expect("the final schema admits");
+        let accepted = json!({"resultType": "complete", "content": ["ready"]});
+
+        let mut cross_era = accepted.clone();
+        cross_era["resultType"] = json!("legacy_complete");
+        let cross_era_errors =
+            validate_final_core_result(&schema, &cross_era, FinalCoreResultType::Complete)
+                .expect_err("changing only resultType to a non-final branch must reject");
+        assert!(cross_era_errors.iter().any(|error| {
+            error.path == "root.resultType"
+                && error.message
+                    == "resultType does not match the selected final core result branch"
+        }));
+
+        let mut with_legacy_field = accepted.clone();
+        with_legacy_field["protocolVersion"] = json!("2024-11-05");
+        let unknown_field_errors =
+            validate_final_core_result(&schema, &with_legacy_field, FinalCoreResultType::Complete)
+                .expect_err("adding only a legacy result field must reject");
+        assert!(unknown_field_errors.iter().any(|error| {
+            error.path == "root"
+                && error.message == "additional property not allowed: protocolVersion"
+        }));
+        assert_eq!(
+            accepted,
+            json!({"resultType": "complete", "content": ["ready"]})
+        );
+    }
+
+    #[test]
     fn external_references_fail_closed_without_resolution() {
         let errors = validate(
             &json!({"$ref": "https://schemas.example.test/tool.json"}),
@@ -1371,37 +1883,31 @@ mod tests {
         });
 
         // Regular validate allows extra properties at any level
-        assert!(
-            validate(
-                &schema,
-                &json!({
-                    "person": {"name": "Alice", "age": 30}
-                })
-            )
-            .is_ok()
-        );
+        assert!(validate(
+            &schema,
+            &json!({
+                "person": {"name": "Alice", "age": 30}
+            })
+        )
+        .is_ok());
 
         // Strict validate rejects extra properties at nested level
-        assert!(
-            validate_strict(
-                &schema,
-                &json!({
-                    "person": {"name": "Alice", "age": 30}
-                })
-            )
-            .is_err()
-        );
+        assert!(validate_strict(
+            &schema,
+            &json!({
+                "person": {"name": "Alice", "age": 30}
+            })
+        )
+        .is_err());
 
         // Strict validate passes with only defined properties
-        assert!(
-            validate_strict(
-                &schema,
-                &json!({
-                    "person": {"name": "Alice"}
-                })
-            )
-            .is_ok()
-        );
+        assert!(validate_strict(
+            &schema,
+            &json!({
+                "person": {"name": "Alice"}
+            })
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1416,28 +1922,24 @@ mod tests {
         });
 
         // With explicit additionalProperties schema, strict mode should honor it
-        assert!(
-            validate_strict(
-                &schema,
-                &json!({
-                    "name": "Alice",
-                    "count": 42
-                })
-            )
-            .is_ok()
-        );
+        assert!(validate_strict(
+            &schema,
+            &json!({
+                "name": "Alice",
+                "count": 42
+            })
+        )
+        .is_ok());
 
         // But still validate the type of additional properties
-        assert!(
-            validate_strict(
-                &schema,
-                &json!({
-                    "name": "Alice",
-                    "count": "not an integer"
-                })
-            )
-            .is_err()
-        );
+        assert!(validate_strict(
+            &schema,
+            &json!({
+                "name": "Alice",
+                "count": "not an integer"
+            })
+        )
+        .is_err());
     }
 
     #[test]
@@ -1453,37 +1955,31 @@ mod tests {
         });
 
         // Regular validate allows extra properties in array items
-        assert!(
-            validate(
-                &schema,
-                &json!([
-                    {"id": 1, "extra": "value"}
-                ])
-            )
-            .is_ok()
-        );
+        assert!(validate(
+            &schema,
+            &json!([
+                {"id": 1, "extra": "value"}
+            ])
+        )
+        .is_ok());
 
         // Strict validate rejects extra properties in array items
-        assert!(
-            validate_strict(
-                &schema,
-                &json!([
-                    {"id": 1, "extra": "value"}
-                ])
-            )
-            .is_err()
-        );
+        assert!(validate_strict(
+            &schema,
+            &json!([
+                {"id": 1, "extra": "value"}
+            ])
+        )
+        .is_err());
 
         // Strict validate passes with only defined properties
-        assert!(
-            validate_strict(
-                &schema,
-                &json!([
-                    {"id": 1}
-                ])
-            )
-            .is_ok()
-        );
+        assert!(validate_strict(
+            &schema,
+            &json!([
+                {"id": 1}
+            ])
+        )
+        .is_ok());
     }
 
     #[test]

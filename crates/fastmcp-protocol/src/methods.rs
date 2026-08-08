@@ -20,6 +20,13 @@ pub const LEGACY_2024_11_05_PROTOCOL_VERSION: &str = "2024-11-05";
 /// and public protocol consumers share one source of truth.
 pub const SERVER_DISCOVER: &str = crate::server_discovery::SERVER_DISCOVER_METHOD;
 
+/// Final long-lived subscription request.
+pub const SUBSCRIPTIONS_LISTEN: &str = "subscriptions/listen";
+
+/// Final subscription-established notification.
+pub const NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED: &str =
+    "notifications/subscriptions/acknowledged";
+
 /// SHA-256 of the pinned official 2024-11-05 JSON schema.
 pub const LEGACY_2024_11_05_SCHEMA_SHA256: &str =
     "61cea2392d4f284092d09bc84b9ac488c0d5618ac2b38a56942fc5b99fd960ce";
@@ -117,6 +124,146 @@ pub const RESOURCES_SUBSCRIBE: &str = "resources/subscribe";
 
 /// Resource-unsubscription request.
 pub const RESOURCES_UNSUBSCRIBE: &str = "resources/unsubscribe";
+
+/// Direction permitted by the active MCP 2026-07-28 core message unions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Final2026Direction {
+    /// Only clients may send this method.
+    ClientToServer,
+    /// Only servers may send this method.
+    ServerToClient,
+    /// Either peer may send this method.
+    Bidirectional,
+}
+
+/// JSON-RPC envelope kind required by an active MCP 2026-07-28 core method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Final2026EnvelopeKind {
+    /// The method is a request and therefore requires a non-null request ID.
+    Request,
+    /// The method is a notification and therefore must omit its request ID.
+    Notification,
+}
+
+/// Exact direction and envelope metadata for one active MCP 2026-07-28 core
+/// method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Final2026Method {
+    /// Exact JSON-RPC method literal.
+    pub name: &'static str,
+    /// Peer direction admitted by the active final core union.
+    pub direction: Final2026Direction,
+    /// Request-versus-notification envelope constraint.
+    pub envelope: Final2026EnvelopeKind,
+}
+
+/// All and only the method literals in the active MCP 2026-07-28 core
+/// request and notification unions.
+///
+/// The pinned final schema retains types for historical reverse requests, but
+/// they are not members of its active `ClientRequest`, `ClientNotification`,
+/// or `ServerNotification` unions. They therefore do not enter this dispatch
+/// table. The exact 2024-11-05 table remains separate below.
+pub const FINAL_2026_07_28_METHODS: [Final2026Method; 18] = [
+    Final2026Method {
+        name: SERVER_DISCOVER,
+        direction: Final2026Direction::ClientToServer,
+        envelope: Final2026EnvelopeKind::Request,
+    },
+    Final2026Method {
+        name: COMPLETION_COMPLETE,
+        direction: Final2026Direction::ClientToServer,
+        envelope: Final2026EnvelopeKind::Request,
+    },
+    Final2026Method {
+        name: PROMPTS_GET,
+        direction: Final2026Direction::ClientToServer,
+        envelope: Final2026EnvelopeKind::Request,
+    },
+    Final2026Method {
+        name: PROMPTS_LIST,
+        direction: Final2026Direction::ClientToServer,
+        envelope: Final2026EnvelopeKind::Request,
+    },
+    Final2026Method {
+        name: RESOURCES_LIST,
+        direction: Final2026Direction::ClientToServer,
+        envelope: Final2026EnvelopeKind::Request,
+    },
+    Final2026Method {
+        name: RESOURCES_TEMPLATES_LIST,
+        direction: Final2026Direction::ClientToServer,
+        envelope: Final2026EnvelopeKind::Request,
+    },
+    Final2026Method {
+        name: RESOURCES_READ,
+        direction: Final2026Direction::ClientToServer,
+        envelope: Final2026EnvelopeKind::Request,
+    },
+    Final2026Method {
+        name: SUBSCRIPTIONS_LISTEN,
+        direction: Final2026Direction::ClientToServer,
+        envelope: Final2026EnvelopeKind::Request,
+    },
+    Final2026Method {
+        name: TOOLS_CALL,
+        direction: Final2026Direction::ClientToServer,
+        envelope: Final2026EnvelopeKind::Request,
+    },
+    Final2026Method {
+        name: TOOLS_LIST,
+        direction: Final2026Direction::ClientToServer,
+        envelope: Final2026EnvelopeKind::Request,
+    },
+    Final2026Method {
+        name: NOTIFICATIONS_CANCELLED,
+        direction: Final2026Direction::Bidirectional,
+        envelope: Final2026EnvelopeKind::Notification,
+    },
+    Final2026Method {
+        name: NOTIFICATIONS_PROGRESS,
+        direction: Final2026Direction::ServerToClient,
+        envelope: Final2026EnvelopeKind::Notification,
+    },
+    Final2026Method {
+        name: NOTIFICATIONS_MESSAGE,
+        direction: Final2026Direction::ServerToClient,
+        envelope: Final2026EnvelopeKind::Notification,
+    },
+    Final2026Method {
+        name: NOTIFICATIONS_RESOURCES_UPDATED,
+        direction: Final2026Direction::ServerToClient,
+        envelope: Final2026EnvelopeKind::Notification,
+    },
+    Final2026Method {
+        name: NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+        direction: Final2026Direction::ServerToClient,
+        envelope: Final2026EnvelopeKind::Notification,
+    },
+    Final2026Method {
+        name: NOTIFICATIONS_TOOLS_LIST_CHANGED,
+        direction: Final2026Direction::ServerToClient,
+        envelope: Final2026EnvelopeKind::Notification,
+    },
+    Final2026Method {
+        name: NOTIFICATIONS_PROMPTS_LIST_CHANGED,
+        direction: Final2026Direction::ServerToClient,
+        envelope: Final2026EnvelopeKind::Notification,
+    },
+    Final2026Method {
+        name: NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
+        direction: Final2026Direction::ServerToClient,
+        envelope: Final2026EnvelopeKind::Notification,
+    },
+];
+
+/// Looks up one exact active MCP 2026-07-28 core method literal.
+#[must_use]
+pub fn final_2026_07_28_method(name: &str) -> Option<&'static Final2026Method> {
+    FINAL_2026_07_28_METHODS
+        .iter()
+        .find(|method| method.name == name)
+}
 
 /// Direction permitted by the 2024-11-05 tagged union.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1335,6 +1482,69 @@ mod tests {
         assert_eq!(NOTIFICATIONS_CANCELLED, "notifications/cancelled");
         assert_eq!(NOTIFICATIONS_MESSAGE, "notifications/message");
         assert_eq!(PING, "ping");
+    }
+
+    #[test]
+    fn final_2026_method_inventory_positive() {
+        let expected = [
+            "server/discover",
+            "completion/complete",
+            "prompts/get",
+            "prompts/list",
+            "resources/list",
+            "resources/templates/list",
+            "resources/read",
+            "subscriptions/listen",
+            "tools/call",
+            "tools/list",
+            "notifications/cancelled",
+            "notifications/progress",
+            "notifications/message",
+            "notifications/resources/updated",
+            "notifications/resources/list_changed",
+            "notifications/tools/list_changed",
+            "notifications/prompts/list_changed",
+            "notifications/subscriptions/acknowledged",
+        ];
+        let actual: Vec<_> = FINAL_2026_07_28_METHODS
+            .iter()
+            .map(|method| method.name)
+            .collect();
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 18);
+        assert_eq!(
+            final_2026_07_28_method(SUBSCRIPTIONS_LISTEN),
+            Some(&Final2026Method {
+                name: SUBSCRIPTIONS_LISTEN,
+                direction: Final2026Direction::ClientToServer,
+                envelope: Final2026EnvelopeKind::Request,
+            })
+        );
+        assert_eq!(
+            final_2026_07_28_method(NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED),
+            Some(&Final2026Method {
+                name: NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
+                direction: Final2026Direction::ServerToClient,
+                envelope: Final2026EnvelopeKind::Notification,
+            })
+        );
+    }
+
+    #[test]
+    fn final_2026_method_inventory_cross_era_and_unknown_negatives() {
+        assert!(
+            final_2026_07_28_method(RESOURCES_SUBSCRIBE).is_none(),
+            "changing only the method from final subscriptions/listen to the legacy subscription RPC must reject it"
+        );
+        assert!(
+            final_2026_07_28_method("com.example/unknown").is_none(),
+            "an unregistered method must not enter the closed final core table"
+        );
+        assert!(
+            legacy_2024_11_05_method(SUBSCRIPTIONS_LISTEN).is_none(),
+            "the modern subscription method must not bleed into the exact legacy table"
+        );
     }
 
     #[test]
