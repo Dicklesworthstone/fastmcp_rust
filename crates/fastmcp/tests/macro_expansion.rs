@@ -22,8 +22,10 @@
 #![allow(dead_code)]
 
 use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
+use fastmcp_protocol::common_types::{AbsoluteUri, EmbeddedResourceContents};
 use fastmcp_protocol::{
-    FinalCallToolResult, LegacyContent, LegacyPromptMessage, LegacyResourceContent,
+    CacheScope, FinalCallToolResult, FinalGetPromptResult, FinalPromptMessage,
+    FinalReadResourceResult,
 };
 use fastmcp_rust::{
     CompleteResult, Content, ContentBlock, Cx, GetPromptResult, Implementation, JsonSchema,
@@ -1238,42 +1240,44 @@ fn final_result_meta() -> ResultMeta {
         description: None,
         website_url: None,
         icons: Vec::new(),
+        additional: BTreeMap::new(),
     })
 }
 
-fn final_resource_payload(text: &str) -> CompleteResult<ReadResourceResult> {
+fn final_resource_payload(text: &str) -> CompleteResult<FinalReadResourceResult> {
     CompleteResult::new(
-        ReadResourceResult {
-            contents: vec![LegacyResourceContent::Text {
-                uri: "final://resource/content".to_string(),
+        FinalReadResourceResult {
+            contents: vec![EmbeddedResourceContents::Text {
+                uri: AbsoluteUri::parse("final://resource/content").expect("valid final URI"),
                 text: text.to_string(),
                 mime_type: Some("application/json".to_string()),
+                meta: None,
                 additional: BTreeMap::new(),
             }],
-            meta: None,
-            additional: BTreeMap::new(),
+            ttl_ms: 0,
+            cache_scope: CacheScope::Private,
         },
         final_result_meta(),
     )
 }
 
 #[resource(uri = "final://resource/direct")]
-fn final_complete_resource_direct() -> CompleteResult<ReadResourceResult> {
+fn final_complete_resource_direct() -> CompleteResult<FinalReadResourceResult> {
     final_resource_payload("direct")
 }
 
 #[resource(uri = "final://resource/result")]
-fn final_complete_resource_result() -> Result<CompleteResult<ReadResourceResult>, McpError> {
+fn final_complete_resource_result() -> Result<CompleteResult<FinalReadResourceResult>, McpError> {
     Ok(final_resource_payload("result"))
 }
 
 #[resource(uri = "final://resource/mcp-result")]
-fn final_complete_resource_mcp_result() -> McpResult<CompleteResult<ReadResourceResult>> {
+fn final_complete_resource_mcp_result() -> McpResult<CompleteResult<FinalReadResourceResult>> {
     Ok(final_resource_payload("mcp-result"))
 }
 
 #[test]
-fn resource_final_complete_results_project_exact_legacy_contents() {
+fn resource_final_complete_results_keep_final_payloads() {
     let ctx = test_ctx();
     let handlers: [Box<dyn ResourceHandler>; 3] = [
         Box::new(FinalCompleteResourceDirectResource),
@@ -1282,12 +1286,30 @@ fn resource_final_complete_results_project_exact_legacy_contents() {
     ];
 
     for (handler, expected_text) in handlers.into_iter().zip(["direct", "result", "mcp-result"]) {
-        let contents = handler.read(&ctx).expect("final complete result projects");
-        assert_eq!(contents.len(), 1);
-        assert_eq!(contents[0].uri, "final://resource/content");
-        assert_eq!(contents[0].mime_type.as_deref(), Some("application/json"));
-        assert_eq!(contents[0].text.as_deref(), Some(expected_text));
-        assert!(contents[0].blob.is_none());
+        assert!(
+            handler.read(&ctx).is_err(),
+            "legacy hook must not project final payload"
+        );
+        let result = handler
+            .read_final(&ctx)
+            .expect("final complete result remains on the final hook");
+        let [
+            EmbeddedResourceContents::Text {
+                uri,
+                text,
+                mime_type,
+                meta,
+                additional,
+            },
+        ] = result.payload.contents.as_slice()
+        else {
+            panic!("final resource result contains one text resource");
+        };
+        assert_eq!(uri.as_str(), "final://resource/content");
+        assert_eq!(mime_type.as_deref(), Some("application/json"));
+        assert_eq!(text, expected_text);
+        assert!(meta.is_none());
+        assert!(additional.is_empty());
     }
 }
 
@@ -1931,43 +1953,41 @@ fn prompt_result_err() {
 
 // --- Final complete prompt result projection ---
 
-fn final_prompt_payload(text: &str) -> CompleteResult<GetPromptResult> {
+fn final_prompt_payload(text: &str) -> CompleteResult<FinalGetPromptResult> {
     CompleteResult::new(
-        GetPromptResult {
+        FinalGetPromptResult {
             description: Some("final prompt metadata is projected by the modern layer".to_string()),
-            messages: vec![LegacyPromptMessage {
+            messages: vec![FinalPromptMessage {
                 role: Role::Assistant,
-                content: LegacyContent::Text {
+                content: ContentBlock::Text {
                     text: text.to_string(),
                     annotations: None,
+                    meta: None,
                     additional: BTreeMap::new(),
                 },
-                additional: BTreeMap::new(),
             }],
-            meta: None,
-            additional: BTreeMap::new(),
         },
         final_result_meta(),
     )
 }
 
 #[prompt]
-fn final_complete_prompt_direct() -> CompleteResult<GetPromptResult> {
+fn final_complete_prompt_direct() -> CompleteResult<FinalGetPromptResult> {
     final_prompt_payload("direct")
 }
 
 #[prompt]
-fn final_complete_prompt_result() -> Result<CompleteResult<GetPromptResult>, McpError> {
+fn final_complete_prompt_result() -> Result<CompleteResult<FinalGetPromptResult>, McpError> {
     Ok(final_prompt_payload("result"))
 }
 
 #[prompt]
-fn final_complete_prompt_mcp_result() -> McpResult<CompleteResult<GetPromptResult>> {
+fn final_complete_prompt_mcp_result() -> McpResult<CompleteResult<FinalGetPromptResult>> {
     Ok(final_prompt_payload("mcp-result"))
 }
 
 #[test]
-fn prompt_final_complete_results_project_exact_legacy_messages() {
+fn prompt_final_complete_results_keep_final_payloads() {
     let ctx = test_ctx();
     let handlers: [Box<dyn PromptHandler>; 3] = [
         Box::new(FinalCompletePromptDirectPrompt),
@@ -1976,12 +1996,18 @@ fn prompt_final_complete_results_project_exact_legacy_messages() {
     ];
 
     for (handler, expected_text) in handlers.into_iter().zip(["direct", "result", "mcp-result"]) {
-        let messages = handler
-            .get(&ctx, HashMap::new())
-            .expect("final complete result projects");
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, Role::Assistant);
-        assert_eq!(expect_text(&messages[0].content), expected_text);
+        assert!(
+            handler.get(&ctx, HashMap::new()).is_err(),
+            "legacy hook must not project final payload"
+        );
+        let result = handler
+            .get_final(&ctx, HashMap::new())
+            .expect("final complete result remains on the final hook");
+        let [FinalPromptMessage { role, content }] = result.payload.messages.as_slice() else {
+            panic!("final prompt result contains one message");
+        };
+        assert_eq!(*role, Role::Assistant);
+        assert!(matches!(content, ContentBlock::Text { text, .. } if text == expected_text));
     }
 }
 
