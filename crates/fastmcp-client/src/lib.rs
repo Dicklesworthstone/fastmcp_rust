@@ -85,8 +85,9 @@ use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sh
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancelledParams,
     ClientCapabilities, ClientInfo, Content, CorrelationKey, GetPromptParams, GetPromptResult,
-    GetTaskParams, GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION,
-    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
+    FinalRequestMeta, GetTaskParams, GetTaskResult, InitializeParams, InitializeResult,
+    JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    ListPromptsParams,
     ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
     ListResourcesParams, ListResourcesResult, ListTasksParams, ListTasksResult, ListToolsParams,
     ListToolsResult, LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt,
@@ -94,6 +95,8 @@ use fastmcp_protocol::{
     ResourceContent, ResourceTemplate, ServerCapabilities, ServerInfo, SetLogLevelParams,
     SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo, TaskResult, TaskStatus, Tool,
 };
+use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
+use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 
 /// Callback for receiving progress notifications during tool execution.
 ///
@@ -1557,6 +1560,17 @@ fn validate_initialize_result(result: &InitializeResult) -> McpResult<()> {
     Err(McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))
 }
 
+fn auto_legacy_fallback_is_authorized(error: &McpError) -> bool {
+    // A completed JSON-RPC discovery refusal is distinguishable from malformed
+    // discovery or transport failure because the latter paths surface as
+    // InternalError. -32022 is final's recognized unsupported-version error,
+    // so it remains modern and cannot authorize a legacy attempt.
+    matches!(
+        error.code,
+        McpErrorCode::ParseError | McpErrorCode::InvalidRequest | McpErrorCode::MethodNotFound | McpErrorCode::InvalidParams
+    )
+}
+
 fn validate_timeout_duration(
     timeout: Duration,
     maximum: Duration,
@@ -2635,6 +2649,83 @@ impl Client {
 
     /// Creates a client with a provided Cx for cancellation support.
     pub fn stdio_with_cx(command: &str, args: &[&str], cx: Cx) -> McpResult<Self> {
+        // Preserve the long-standing direct convenience constructor as an
+        // explicit exact-2024 connection. Callers that need an immutable
+        // modern-only or auto-selection policy use the plan-aware entry point
+        // below, which performs policy selection before exposing a client.
+        Self::stdio_with_protocol_plan_with_cx(
+            command,
+            args,
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            cx,
+        )
+    }
+
+    /// Creates a stdio client from an immutable protocol plan.
+    ///
+    /// `ModernOnly` performs a modern `server/discover` exchange, while
+    /// `LegacyOnly` performs the exact 2024-11-05 initialization lifecycle.
+    /// `Auto` first probes a disposable modern process and starts a fresh
+    /// exact-2024 process only for a recognized discovery refusal. Transport
+    /// failures and malformed modern discovery never authorize a downgrade.
+    pub fn stdio_with_protocol_plan(
+        command: &str,
+        args: &[&str],
+        protocol_plan: ClientProtocolPlan,
+    ) -> McpResult<Self> {
+        block_on(async {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            Self::stdio_with_protocol_plan_with_cx(command, args, protocol_plan, cx)
+        })
+    }
+
+    /// Creates a plan-aware stdio client with a caller-provided cancellation
+    /// context.
+    pub fn stdio_with_protocol_plan_with_cx(
+        command: &str,
+        args: &[&str],
+        protocol_plan: ClientProtocolPlan,
+        cx: Cx,
+    ) -> McpResult<Self> {
+        match protocol_plan.policy() {
+            ProtocolPolicy::ModernOnly | ProtocolPolicy::LegacyOnly => {
+                Self::connect_stdio_with_protocol_plan_once(command, args, protocol_plan, cx)
+            }
+            ProtocolPolicy::Auto => {
+                let modern_plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
+                match Self::connect_stdio_with_protocol_plan_once(
+                    command,
+                    args,
+                    modern_plan,
+                    cx.clone(),
+                ) {
+                    Ok(mut client) => {
+                        client.set_protocol_plan_after_selection(protocol_plan);
+                        Ok(client)
+                    }
+                    Err(error) if auto_legacy_fallback_is_authorized(&error) => {
+                        let legacy_plan = ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly);
+                        let mut client = Self::connect_stdio_with_protocol_plan_once(
+                            command,
+                            args,
+                            legacy_plan,
+                            cx,
+                        )?;
+                        client.set_protocol_plan_after_selection(protocol_plan);
+                        Ok(client)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    fn connect_stdio_with_protocol_plan_once(
+        command: &str,
+        args: &[&str],
+        protocol_plan: ClientProtocolPlan,
+        cx: Cx,
+    ) -> McpResult<Self> {
         if cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
@@ -2701,7 +2792,8 @@ impl Client {
                 },
                 ServerCapabilities::default(),
                 String::new(),
-            ),
+            )
+            .with_protocol_plan(protocol_plan.clone()),
             // `initialize()` consumes ID 1 through the same monotonic
             // allocator, leaving ID 2 as the first ordinary request ID.
             next_id: AtomicU64::new(1),
@@ -2733,7 +2825,9 @@ impl Client {
         .with_protocol_plan(protocol_plan);
 
         // Send the spec-correct `notifications/initialized` lifecycle notification.
-        if let Err(error) = client.send_initialized_notification() {
+        if init_result.protocol_version == PROTOCOL_VERSION
+            && let Err(error) = client.send_initialized_notification()
+        {
             let cleanup = client.close();
             return combine_operation_and_cleanup(Err(error), cleanup);
         }
@@ -2742,6 +2836,19 @@ impl Client {
         client.initialized.store(true, Ordering::SeqCst);
 
         Ok(client)
+    }
+
+    fn set_protocol_plan_after_selection(&mut self, protocol_plan: ClientProtocolPlan) {
+        let selected_era = self.session.selected_era();
+        self.session = ClientSession::new(
+            self.session.client_info().clone(),
+            self.session.client_capabilities().clone(),
+            self.session.server_info().clone(),
+            self.session.server_capabilities().clone(),
+            self.session.protocol_version().to_owned(),
+        )
+        .with_protocol_plan(protocol_plan);
+        debug_assert!(self.session.selected_era() == selected_era);
     }
 
     /// Creates a new client builder.
@@ -2890,8 +2997,11 @@ impl Client {
         )
         .with_protocol_plan(protocol_plan);
 
-        // Send the spec-correct `notifications/initialized` lifecycle notification.
-        if let Err(error) = self.send_initialized_notification() {
+        // Exact 2024-11-05 transitions require the lifecycle acknowledgement.
+        // Modern discovery has no corresponding initialized notification.
+        if init_result.protocol_version == PROTOCOL_VERSION
+            && let Err(error) = self.send_initialized_notification()
+        {
             return Err(self.record_initialization_failure(error));
         }
 
@@ -2993,6 +3103,27 @@ impl Client {
         self.session.protocol_version()
     }
 
+    /// Returns the immutable policy selected before this client connected.
+    #[must_use]
+    pub const fn protocol_policy(&self) -> ProtocolPolicy {
+        self.session.protocol_plan().policy()
+    }
+
+    /// Returns the era selected by the successful public initialization path.
+    ///
+    /// `None` means that initialization has not completed or a connection
+    /// failed before a supported era was selected.
+    #[must_use]
+    pub const fn selected_protocol_era(&self) -> Option<ProtocolEra> {
+        self.session.selected_era()
+    }
+
+    /// Returns the immutable transport policy and endpoint configuration.
+    #[must_use]
+    pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
+        self.session.protocol_plan()
+    }
+
     /// Returns the timeout policy applied to subsequent ordinary requests.
     #[must_use]
     pub const fn request_timeout_policy(&self) -> RequestTimeoutPolicy {
@@ -3034,6 +3165,46 @@ impl Client {
             .map_err(|_| McpError::internal_error("Client request ID space exhausted"))
     }
 
+    fn with_modern_request_metadata(
+        &self,
+        mut params: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        let parameters = params.as_object_mut().ok_or_else(|| {
+            McpError::invalid_params("Modern MCP requests require object parameters")
+        })?;
+        let metadata = parameters
+            .entry("_meta")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let metadata = metadata.as_object_mut().ok_or_else(|| {
+            McpError::invalid_params("Modern MCP request metadata must be an object")
+        })?;
+        let final_metadata = FinalRequestMeta {
+            protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
+            client_capabilities: self.session.client_capabilities().clone(),
+            client_info: Some(self.session.client_info().clone()),
+            additional_metadata: Default::default(),
+        };
+        let final_metadata = serde_json::to_value(final_metadata).map_err(|error| {
+            McpError::internal_error(format!("Failed to serialize modern request metadata: {error}"))
+        })?;
+        let final_metadata = final_metadata.as_object().ok_or_else(|| {
+            McpError::internal_error("Modern request metadata did not serialize as an object")
+        })?;
+        metadata.extend(final_metadata.clone());
+        Ok(params)
+    }
+
+    fn prepare_request_parameters(
+        &self,
+        params: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        if self.session.selected_era() == Some(ProtocolEra::Modern2026) {
+            self.with_modern_request_metadata(params)
+        } else {
+            Ok(params)
+        }
+    }
+
     /// Sends a request and waits for response.
     fn send_request<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &mut self,
@@ -3044,9 +3215,10 @@ impl Client {
         // or committing any bytes to the peer.
         let timeout_policy = self.timeout_policy;
         timeout_policy.validate()?;
-        let id = self.next_request_id()?;
         let params_value = serde_json::to_value(params)
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
+        let params_value = self.prepare_request_parameters(params_value)?;
+        let id = self.next_request_id()?;
 
         let (request_id, request) = {
             let id_i64 = i64::try_from(id).expect("request ID allocator enforces the i64 bound");
@@ -3095,6 +3267,7 @@ impl Client {
     fn send_notification<P: serde::Serialize>(&mut self, method: &str, params: P) -> McpResult<()> {
         let params_value = serde_json::to_value(params)
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
+        let params_value = self.prepare_request_parameters(params_value)?;
 
         // Create a notification (request without id)
         let request = JsonRpcRequest {
@@ -3470,6 +3643,23 @@ impl Client {
         client_info: ClientInfo,
         capabilities: ClientCapabilities,
     ) -> McpResult<InitializeResult> {
+        match self.session.protocol_plan().policy() {
+            ProtocolPolicy::ModernOnly => self.initialize_modern(client_info, capabilities),
+            // The public Auto entry point performs its isolated modern probe
+            // before constructing this legacy client. Retaining this exact
+            // path here keeps deferred initialization from converting a
+            // configured legacy process into a second selection attempt.
+            ProtocolPolicy::Auto | ProtocolPolicy::LegacyOnly => {
+                self.initialize_legacy(client_info, capabilities)
+            }
+        }
+    }
+
+    fn initialize_legacy(
+        &mut self,
+        client_info: ClientInfo,
+        capabilities: ClientCapabilities,
+    ) -> McpResult<InitializeResult> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities,
@@ -3479,6 +3669,39 @@ impl Client {
         let result = self.send_request("initialize", params)?;
         validate_initialize_result(&result)?;
         Ok(result)
+    }
+
+    fn initialize_modern(
+        &mut self,
+        _client_info: ClientInfo,
+        _capabilities: ClientCapabilities,
+    ) -> McpResult<InitializeResult> {
+        let params = serde_json::to_value(ServerDiscoverRequest::default())
+            .map_err(|error| {
+                McpError::internal_error(format!(
+                    "Failed to serialize modern server/discover parameters: {error}"
+                ))
+            })
+            .and_then(|params| self.with_modern_request_metadata(params))?;
+        let result: serde_json::Value = self.send_request(SERVER_DISCOVER_METHOD, params)?;
+        serde_json::from_value::<ServerDiscoverResult>(result.clone()).map_err(|_| {
+            McpError::internal_error("Invalid modern server/discover response payload")
+        })?;
+        let server_info = result
+            .get("serverInfo")
+            .cloned()
+            .ok_or_else(|| McpError::internal_error("Modern server/discover response has no serverInfo"))
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|_| {
+                    McpError::internal_error("Modern server/discover response has invalid serverInfo")
+                })
+            })?;
+        Ok(InitializeResult {
+            protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
+            capabilities: ServerCapabilities::default(),
+            server_info,
+            instructions: None,
+        })
     }
 
     /// Lists available tools.
@@ -3648,6 +3871,7 @@ impl Client {
         timeout_policy.validate()?;
         let params_value = serde_json::to_value(params)
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
+        let params_value = self.prepare_request_parameters(params_value)?;
 
         let request_id = RequestId::Number(
             i64::try_from(request_id).expect("request ID allocator enforces the i64 bound"),
@@ -7906,6 +8130,146 @@ mod tests {
             .expect_err("cancellation must initialize the session first");
         assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
         assert!(!client.is_initialized());
+    }
+
+    #[cfg(unix)]
+    fn modern_public_client_script(discovery_response: &str) -> String {
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r second || exit 1; \
+             case \"$second\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    fn legacy_public_client_script() -> &'static str {
+        "IFS= read -r first || exit 1; \
+         case \"$first\" in *initialize*2024-11-05*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}' ;; *) exit 1 ;; esac; \
+         IFS= read -r lifecycle || exit 1; \
+         case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+         IFS= read -r request || exit 1; \
+         case \"$request\" in *ping*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac; \
+         exec sleep 2"
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_i_positive() {
+        let modern_result =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2026-07-28\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"modern-server\",\"version\":\"1.0.0\"}}}";
+        let script = modern_public_client_script(modern_result);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern-only discovery initializes the public client");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::ModernOnly);
+        assert_eq!(client.selected_protocol_era(), Some(ProtocolEra::Modern2026));
+        assert_eq!(client.protocol_version(), MODERN_PROTOCOL_VERSION);
+        client
+            .ping()
+            .expect("modern execution sends per-request metadata after discovery");
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_i_planted_negative() {
+        // Only the discovery result's advertised version differs from the
+        // accepted modern path. A malformed modern success may not turn into
+        // legacy initialization or a second execution path.
+        let legacy_advertisement =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2024-11-05\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"modern-server\",\"version\":\"1.0.0\"}}}";
+        let script = modern_public_client_script(legacy_advertisement);
+        let error = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect_err("modern-only must reject a legacy-only discovery success");
+
+        assert_eq!(error.code, McpErrorCode::InternalError);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_02_i_positive() {
+        let modern_result =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2026-07-28\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"auto-modern-server\",\"version\":\"1.0.0\"}}}";
+        let script = modern_public_client_script(modern_result);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+            Cx::for_request(),
+        )
+        .expect("auto retains a successful modern selection");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(client.selected_protocol_era(), Some(ProtocolEra::Modern2026));
+        client.ping().expect("auto-selected modern client executes normally");
+        client.close().expect("auto modern cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_02_i_planted_negative() {
+        // The policy is the only changed input. The legacy peer accepts only
+        // initialize, proving ModernOnly does not silently use the legacy
+        // execution path.
+        let error = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_public_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect_err("modern-only must not emit legacy initialize");
+
+        assert_eq!(error.code, McpErrorCode::InternalError);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_i_positive() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_public_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::LegacyOnly);
+        assert_eq!(client.selected_protocol_era(), Some(ProtocolEra::Legacy2024));
+        assert_eq!(client.protocol_version(), PROTOCOL_VERSION);
+        client.ping().expect("legacy client executes after initialized notification");
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_i_planted_negative() {
+        // Only the immutable policy differs from the accepted legacy path.
+        // The modern probe is not permitted to reuse the 2024 lifecycle.
+        let error = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_public_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect_err("modern-only must reject a legacy-only peer before initialization");
+
+        assert_eq!(error.code, McpErrorCode::InternalError);
     }
 
     // ========================================
