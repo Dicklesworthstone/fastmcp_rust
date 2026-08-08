@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use fastmcp_protocol::JsonRpcRequest;
+use fastmcp_protocol::{JsonRpcRequest, LegacyContent};
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{McpContext, McpError, McpErrorCode, McpResult};
 
@@ -316,9 +316,9 @@ fn take_events(events: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
     out
 }
 
-fn first_text(contents: &[Content]) -> Option<String> {
+fn first_text(contents: &[LegacyContent]) -> Option<String> {
     contents.first().and_then(|c| match c {
-        Content::Text { text } => Some(text.clone()),
+        LegacyContent::Text { text, .. } => Some(text.clone()),
         _ => None,
     })
 }
