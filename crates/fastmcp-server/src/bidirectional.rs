@@ -322,16 +322,57 @@ impl Default for PendingRequests {
     }
 }
 
-/// Removes a registered waiter if its request future is cancelled or dropped
-/// before a response consumes the map entry.
-struct PendingRequestGuard<'a> {
-    pending: &'a PendingRequests,
+/// Owns the local and peer-facing cleanup for one reverse request.
+///
+/// Once the outbound request has been committed to the transport, dropping its
+/// future without a routed response must both free the local slot and tell the
+/// peer to stop work. The latter is best effort because a closing transport
+/// cannot reliably deliver another frame.
+struct PendingRequestGuard {
+    pending: Arc<PendingRequests>,
+    send_fn: TransportSendFn,
     id: RequestId,
+    request_sent: bool,
+    finished: bool,
 }
 
-impl Drop for PendingRequestGuard<'_> {
+impl PendingRequestGuard {
+    fn mark_request_sent(&mut self) {
+        self.request_sent = true;
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+        self.pending.remove(&self.id);
+    }
+
+    fn cancel(&mut self) {
+        self.pending.remove(&self.id);
+        self.send_cancellation_notification();
+        self.finished = true;
+    }
+
+    fn send_cancellation_notification(&self) {
+        if !self.request_sent {
+            return;
+        }
+
+        let message = JsonRpcMessage::Request(JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({ "requestId": self.id.clone() })),
+        ));
+        // A reverse request is already terminal locally. Do not replace that
+        // outcome with a best-effort control-frame transport failure.
+        let _ = (self.send_fn)(&message);
+    }
+}
+
+impl Drop for PendingRequestGuard {
     fn drop(&mut self) {
         self.pending.remove(&self.id);
+        if !self.finished {
+            self.send_cancellation_notification();
+        }
     }
 }
 
@@ -404,9 +445,12 @@ impl RequestSender {
         let (id, mut receiver) = self
             .pending
             .register_with_cancellation(self.request_cancellation.clone())?;
-        let _guard = PendingRequestGuard {
-            pending: self.pending.as_ref(),
+        let mut guard = PendingRequestGuard {
+            pending: Arc::clone(&self.pending),
+            send_fn: Arc::clone(&self.send_fn),
             id: id.clone(),
+            request_sent: false,
+            finished: false,
         };
         if cx.checkpoint().is_err() || self.request_is_terminal() {
             return Err(McpError::request_cancelled());
@@ -419,6 +463,7 @@ impl RequestSender {
         if (self.send_fn)(&message).is_err() {
             return Err(McpError::internal_error(TRANSPORT_SEND_ERROR));
         }
+        guard.mark_request_sent();
 
         let response = if let Some(request_cancellation) = &self.request_cancellation {
             let mut receive = std::pin::pin!(receiver.recv(cx));
@@ -450,25 +495,42 @@ impl RequestSender {
                     Poll::Pending => Poll::Pending,
                 }
             })
-            .await?
+            .await
         } else {
             match receiver.recv(cx).await {
-                Ok(response) => response?,
-                Err(RecvError::Cancelled) => return Err(McpError::request_cancelled()),
+                Ok(response) => response,
+                Err(RecvError::Cancelled) => Err(McpError::request_cancelled()),
                 Err(RecvError::Closed | RecvError::PolledAfterCompletion) => {
-                    return Err(McpError::internal_error(RESPONSE_CHANNEL_ERROR));
+                    Err(McpError::internal_error(RESPONSE_CHANNEL_ERROR))
                 }
+            }
+        };
+
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if error.code == McpErrorCode::RequestCancelled
+                    && (cx.checkpoint().is_err() || self.request_is_terminal())
+                {
+                    guard.cancel();
+                } else {
+                    guard.finish();
+                }
+                return Err(error);
             }
         };
 
         // A response and cancellation may become visible together. Preserve
         // caller cancellation/budget precedence before decoding peer data.
         if cx.checkpoint().is_err() || self.request_is_terminal() {
+            guard.cancel();
             return Err(McpError::request_cancelled());
         }
 
-        serde_json::from_value(response)
-            .map_err(|_| McpError::internal_error(RESPONSE_PAYLOAD_ERROR))
+        let result = serde_json::from_value(response)
+            .map_err(|_| McpError::internal_error(RESPONSE_PAYLOAD_ERROR));
+        guard.finish();
+        result
     }
 }
 
@@ -822,10 +884,16 @@ mod tests {
         let pending = Arc::new(PendingRequests::new());
         let sent = Arc::new(AtomicBool::new(false));
         let sent_flag = Arc::clone(&sent);
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let outbound_for_send = Arc::clone(&outbound);
         let sender = RequestSender::new(
             Arc::clone(&pending),
-            Arc::new(move |_| {
+            Arc::new(move |message| {
                 sent_flag.store(true, Ordering::Release);
+                outbound_for_send
+                    .lock()
+                    .expect("test outbound mutex must not be poisoned")
+                    .push(message.clone());
                 Ok(())
             }),
         );
@@ -850,6 +918,18 @@ mod tests {
         let error = block_on(future).unwrap_err();
         assert_eq!(error.code, McpErrorCode::RequestCancelled);
         assert_eq!(pending.in_flight_len(), 0);
+        let outbound = outbound
+            .lock()
+            .expect("test outbound mutex must not be poisoned");
+        assert_eq!(outbound.len(), 2);
+        let JsonRpcMessage::Request(cancelled) = &outbound[1] else {
+            panic!("cancelled reverse request must notify the peer");
+        };
+        assert_eq!(cancelled.method, "notifications/cancelled");
+        assert_eq!(
+            cancelled.params,
+            Some(serde_json::json!({ "requestId": FIRST_SERVER_REQUEST_ID }))
+        );
     }
 
     #[test]
@@ -1253,14 +1333,20 @@ mod tests {
     // ── RequestSender send_request paths ─────────────────────────────
 
     #[test]
-    fn request_sender_success_path() {
+    fn reverse_request_routes_matching_response_without_cancellation_cleanup() {
         let pending = Arc::new(PendingRequests::new());
         let pending_clone = Arc::clone(&pending);
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let outbound_for_send = Arc::clone(&outbound);
         let send_fn: TransportSendFn = Arc::new(move |msg| {
             if let JsonRpcMessage::Request(req) = msg {
+                outbound_for_send
+                    .lock()
+                    .expect("test outbound mutex must not be poisoned")
+                    .push(msg.clone());
                 let id = req.id.clone().unwrap();
                 let response = JsonRpcResponse::success(id, serde_json::json!({"answer": 42}));
-                pending_clone.route_response(&response);
+                assert!(pending_clone.route_response(&response));
             }
             Ok(())
         });
@@ -1270,6 +1356,70 @@ mod tests {
             block_on(sender.send_request(&cx, "test/method", serde_json::json!({})));
         let value = result.unwrap();
         assert_eq!(value["answer"], 42);
+        assert_eq!(pending.in_flight_len(), 0);
+        assert_eq!(
+            outbound
+                .lock()
+                .expect("test outbound mutex must not be poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn reverse_request_mismatched_response_is_not_routed_and_drop_cleans_up() {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_clone = Arc::clone(&pending);
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let outbound_for_send = Arc::clone(&outbound);
+        let send_fn: TransportSendFn = Arc::new(move |msg| {
+            if let JsonRpcMessage::Request(req) = msg {
+                outbound_for_send
+                    .lock()
+                    .expect("test outbound mutex must not be poisoned")
+                    .push(msg.clone());
+                if let Some(RequestId::Number(id)) = req.id.as_ref() {
+                    // RH-5 planted negative: only the response correlation ID
+                    // differs from the successful reverse-request path above.
+                    let response = JsonRpcResponse::success(
+                        RequestId::Number(*id + 1),
+                        serde_json::json!({"answer": 42}),
+                    );
+                    assert!(!pending_clone.route_response(&response));
+                }
+            }
+            Ok(())
+        });
+        let sender = RequestSender::new(Arc::clone(&pending), send_fn);
+        let cx = Cx::for_testing();
+
+        {
+            let mut future = Box::pin(sender.send_request::<serde_json::Value>(
+                &cx,
+                "test/method",
+                serde_json::json!({}),
+            ));
+            let waker = std::task::Waker::noop();
+            let mut task_cx = std::task::Context::from_waker(waker);
+
+            assert!(std::future::Future::poll(future.as_mut(), &mut task_cx).is_pending());
+            assert_eq!(pending.in_flight_len(), 1);
+        }
+
+        assert_eq!(pending.in_flight_len(), 0);
+        let outbound = outbound
+            .lock()
+            .expect("test outbound mutex must not be poisoned");
+        assert_eq!(outbound.len(), 2);
+        let JsonRpcMessage::Request(cancelled) = &outbound[1] else {
+            panic!("dropped reverse request must emit a cancellation notification");
+        };
+        assert_eq!(cancelled.id, None);
+        assert_eq!(cancelled.method, "notifications/cancelled");
+        assert_eq!(
+            cancelled.params,
+            Some(serde_json::json!({ "requestId": FIRST_SERVER_REQUEST_ID }))
+        );
     }
 
     #[test]
