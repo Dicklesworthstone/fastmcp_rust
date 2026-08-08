@@ -14,7 +14,8 @@ use crate::common_types::{
 use crate::jsonrpc::RequestId;
 use crate::methods::{
     COMPLETION_COMPLETE, INITIALIZE, LOGGING_SET_LEVEL, PING, PROMPTS_GET, PROMPTS_LIST,
-    RESOURCES_LIST, RESOURCES_READ, RESOURCES_TEMPLATES_LIST, TOOLS_CALL, TOOLS_LIST,
+    RESOURCES_LIST, RESOURCES_READ, RESOURCES_TEMPLATES_LIST, SUBSCRIPTIONS_LISTEN, TOOLS_CALL,
+    TOOLS_LIST,
 };
 use crate::protocol_policy::ProtocolEra;
 use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
@@ -260,21 +261,74 @@ pub struct LegacyCompletionParams {
 }
 
 /// Final reference accepted by `completion/complete`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub enum FinalCompletionReference {
     /// Identifies one prompt or prompt template by name.
-    #[serde(rename = "ref/prompt")]
     Prompt {
         /// Prompt or prompt-template name.
         name: String,
     },
+    /// Identifies one prompt or prompt template by name and display title.
+    PromptWithTitle {
+        /// Prompt or prompt-template name.
+        name: String,
+        /// Display title supplied for the selected prompt.
+        title: String,
+    },
     /// Identifies one resource template by URI template.
-    #[serde(rename = "ref/resource")]
     Resource {
         /// Resource URI template.
         uri: String,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum FinalCompletionReferenceWire {
+    #[serde(rename = "ref/prompt")]
+    Prompt {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    #[serde(rename = "ref/resource")]
+    Resource { uri: String },
+}
+
+impl Serialize for FinalCompletionReference {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let wire = match self {
+            Self::Prompt { name } => FinalCompletionReferenceWire::Prompt {
+                name: name.clone(),
+                title: None,
+            },
+            Self::PromptWithTitle { name, title } => FinalCompletionReferenceWire::Prompt {
+                name: name.clone(),
+                title: Some(title.clone()),
+            },
+            Self::Resource { uri } => FinalCompletionReferenceWire::Resource { uri: uri.clone() },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FinalCompletionReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match FinalCompletionReferenceWire::deserialize(deserializer)? {
+            FinalCompletionReferenceWire::Prompt {
+                name,
+                title: Some(title),
+            } => Ok(Self::PromptWithTitle { name, title }),
+            FinalCompletionReferenceWire::Prompt { name, title: None } => Ok(Self::Prompt { name }),
+            FinalCompletionReferenceWire::Resource { uri } => Ok(Self::Resource { uri }),
+        }
+    }
 }
 
 /// Final completion argument selector.
@@ -331,6 +385,69 @@ pub struct FinalEmptyParams {
     /// Required final request metadata.
     #[serde(rename = "_meta")]
     pub meta: OpenMetadata,
+}
+
+/// `_meta` key correlating an event-stream subscription with its listen request.
+pub const FINAL_SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscriptionId";
+
+/// Final notification categories selected for a subscription stream.
+///
+/// Every present field is an explicit opt-in. `false` and an empty resource
+/// list remain distinct from an omitted field on the wire.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionFilter {
+    /// Receive prompt catalog change notifications when true.
+    #[serde(
+        rename = "promptsListChanged",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prompts_list_changed: Option<bool>,
+    /// Resource URIs for update notifications.
+    #[serde(
+        rename = "resourceSubscriptions",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub resource_subscriptions: Option<Vec<String>>,
+    /// Receive resource catalog change notifications when true.
+    #[serde(
+        rename = "resourcesListChanged",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub resources_list_changed: Option<bool>,
+    /// Receive tool catalog change notifications when true.
+    #[serde(
+        rename = "toolsListChanged",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tools_list_changed: Option<bool>,
+}
+
+/// Final `subscriptions/listen` request parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalSubscriptionsListenParams {
+    /// Required final request metadata.
+    #[serde(rename = "_meta")]
+    pub meta: OpenMetadata,
+    /// Notification categories the client explicitly opts into.
+    pub notifications: SubscriptionFilter,
+}
+
+/// Final `notifications/subscriptions/acknowledged` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalSubscriptionsAcknowledgedNotificationParams {
+    /// Optional notification metadata, including the subscription ID when the
+    /// acknowledgement was delivered over a subscription stream.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+    /// The subset of the requested notification categories the server accepted.
+    pub notifications: SubscriptionFilter,
 }
 
 /// Final `tools/list` result payload.
@@ -418,6 +535,10 @@ pub struct FinalGetPromptResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionValues {
     /// Completion values selected by the server.
+    #[serde(
+        serialize_with = "serialize_completion_values",
+        deserialize_with = "deserialize_completion_values"
+    )]
     pub values: Vec<String>,
     /// Total number of available values, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -427,11 +548,42 @@ pub struct CompletionValues {
     pub has_more: Option<bool>,
 }
 
+/// Maximum completion candidates allowed on the wire by either supported era.
+pub const MAX_COMPLETION_VALUES: usize = 100;
+
+fn serialize_completion_values<S>(values: &Vec<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if values.len() > MAX_COMPLETION_VALUES {
+        return Err(serde::ser::Error::custom(
+            "completion values exceed the maximum of 100 items",
+        ));
+    }
+    values.serialize(serializer)
+}
+
+fn deserialize_completion_values<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    if values.len() > MAX_COMPLETION_VALUES {
+        return Err(serde::de::Error::custom(
+            "completion values exceed the maximum of 100 items",
+        ));
+    }
+    Ok(values)
+}
+
 /// Exact legacy `completion/complete` result payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LegacyCompletionResult {
     /// Completion candidates.
     pub completion: CompletionValues,
+    /// Opaque legacy response metadata retained without interpretation.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, Value>>,
 }
 
 /// Final `completion/complete` result payload.
@@ -440,6 +592,14 @@ pub struct FinalCompletionResult {
     /// Completion candidates.
     pub completion: CompletionValues,
 }
+
+/// Empty final `subscriptions/listen` result body.
+///
+/// The required subscription-stream ID is carried in the common result
+/// metadata and exposed by [`FinalCoreResult::SubscriptionsListen`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalSubscriptionsListenResult {}
 
 /// Empty final complete-result payload used by acknowledgement methods.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -500,6 +660,8 @@ pub enum FinalCoreRequest {
     PromptsGet(FinalGetPromptParams),
     /// `logging/setLevel`.
     SetLogLevel(FinalSetLogLevelParams),
+    /// `subscriptions/listen`.
+    SubscriptionsListen(FinalSubscriptionsListenParams),
     /// `ping`.
     Ping(FinalEmptyParams),
 }
@@ -590,6 +752,13 @@ pub enum FinalCoreResult {
     /// `logging/setLevel` acknowledgement.
     SetLogLevel {
         result: CompleteResult<FinalEmptyResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+    /// `subscriptions/listen` graceful termination.
+    SubscriptionsListen {
+        result: CompleteResult<FinalSubscriptionsListenResult>,
+        /// The required subscription ID extracted from the result metadata.
+        subscription_id: RequestId,
         diagnostic: Option<ResultPeerDiagnostic>,
     },
     /// `ping` acknowledgement.
@@ -824,6 +993,10 @@ impl CoreRequest {
             LOGGING_SET_LEVEL => {
                 FinalCoreRequest::SetLogLevel(decode_final_params(LOGGING_SET_LEVEL, params)?)
             }
+            SUBSCRIPTIONS_LISTEN => FinalCoreRequest::SubscriptionsListen(decode_final_params(
+                SUBSCRIPTIONS_LISTEN,
+                params,
+            )?),
             PING => FinalCoreRequest::Ping(decode_final_params(PING, params)?),
             _ => {
                 return Err(CoreDispatchError::UnsupportedMethod {
@@ -934,6 +1107,7 @@ impl FinalCoreRequest {
             Self::PromptsList(_) => PROMPTS_LIST,
             Self::PromptsGet(_) => PROMPTS_GET,
             Self::SetLogLevel(_) => LOGGING_SET_LEVEL,
+            Self::SubscriptionsListen(_) => SUBSCRIPTIONS_LISTEN,
             Self::Ping(_) => PING,
         }
     }
@@ -949,6 +1123,7 @@ impl FinalCoreRequest {
             Self::ResourcesRead(params) => &params.meta,
             Self::PromptsGet(params) => &params.meta,
             Self::SetLogLevel(params) => &params.meta,
+            Self::SubscriptionsListen(params) => &params.meta,
             Self::Ping(params) => &params.meta,
         };
         let valid_version = metadata.protocol_version().ok().flatten()
@@ -986,6 +1161,9 @@ impl FinalCoreRequest {
             Self::PromptsGet(params) => encode_params(ProtocolEra::Modern2026, PROMPTS_GET, params),
             Self::SetLogLevel(params) => {
                 encode_params(ProtocolEra::Modern2026, LOGGING_SET_LEVEL, params)
+            }
+            Self::SubscriptionsListen(params) => {
+                encode_params(ProtocolEra::Modern2026, SUBSCRIPTIONS_LISTEN, params)
             }
             Self::Ping(params) => encode_params(ProtocolEra::Modern2026, PING, params),
         }
@@ -1030,6 +1208,15 @@ impl FinalCoreRequest {
             }
             Self::SetLogLevel(_) => decode_final_complete(LOGGING_SET_LEVEL, input, &[])
                 .map(|(result, diagnostic)| FinalCoreResult::SetLogLevel { result, diagnostic }),
+            Self::SubscriptionsListen(_) => {
+                let (result, diagnostic) = decode_final_complete(SUBSCRIPTIONS_LISTEN, input, &[])?;
+                let subscription_id = subscription_id_from_result(&result)?;
+                Ok(FinalCoreResult::SubscriptionsListen {
+                    result,
+                    subscription_id,
+                    diagnostic,
+                })
+            }
             Self::Ping(_) => decode_final_complete(PING, input, &[])
                 .map(|(result, diagnostic)| FinalCoreResult::Ping { result, diagnostic }),
         }
@@ -1116,6 +1303,7 @@ impl FinalCoreResult {
             Self::PromptsList { .. } => PROMPTS_LIST,
             Self::PromptsGet { .. } => PROMPTS_GET,
             Self::SetLogLevel { .. } => LOGGING_SET_LEVEL,
+            Self::SubscriptionsListen { .. } => SUBSCRIPTIONS_LISTEN,
             Self::Ping { .. } => PING,
         }
     }
@@ -1150,6 +1338,19 @@ impl FinalCoreResult {
             }
             Self::SetLogLevel { result, .. } | Self::Ping { result, .. } => {
                 encode_final_complete(self.method(), result, &[])
+            }
+            Self::SubscriptionsListen {
+                result,
+                subscription_id,
+                ..
+            } => {
+                if subscription_id_from_result(result)? != subscription_id.clone() {
+                    return Err(CoreDispatchError::InvalidResult {
+                        era: ProtocolEra::Modern2026,
+                        method: SUBSCRIPTIONS_LISTEN,
+                    });
+                }
+                encode_final_complete(SUBSCRIPTIONS_LISTEN, result, &[])
             }
         }
     }
@@ -1287,6 +1488,23 @@ fn decode_final_complete<T: DeserializeOwned>(
         },
         diagnostic,
     ))
+}
+
+fn subscription_id_from_result(
+    result: &CompleteResult<FinalSubscriptionsListenResult>,
+) -> Result<RequestId, CoreDispatchError> {
+    let Some(value) = result.meta.metadata().get(FINAL_SUBSCRIPTION_ID_META_KEY) else {
+        return Err(CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method: SUBSCRIPTIONS_LISTEN,
+        });
+    };
+    serde_json::from_value(exact_json_to_serde(value)?).map_err(|_| {
+        CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method: SUBSCRIPTIONS_LISTEN,
+        }
+    })
 }
 
 fn encode_final_complete<T: Serialize>(
@@ -2646,7 +2864,11 @@ mod tests {
                 "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
                 "io.modelcontextprotocol/clientCapabilities": {}
             },
-            "ref": {"type": "ref/resource", "uri": "file:///workspace/{environment}"},
+            "ref": {
+                "type": "ref/prompt",
+                "name": "deploy",
+                "title": "Deploy application"
+            },
             "argument": {"name": "environment", "value": "pro"},
             "context": {"arguments": {"region": "us-east-1"}}
         });
@@ -2658,6 +2880,13 @@ mod tests {
         .expect("final completion request is typed through final metadata");
         assert_eq!(final_request.era(), ProtocolEra::Modern2026);
         assert_eq!(final_request.method(), COMPLETION_COMPLETE);
+        let CoreRequest::Final(FinalCoreRequest::Completion(params)) = &final_request else {
+            panic!("final completion request");
+        };
+        assert!(matches!(
+            &params.reference,
+            FinalCompletionReference::PromptWithTitle { title, .. } if title == "Deploy application"
+        ));
         assert_eq!(
             final_request
                 .encode_params()
@@ -2693,6 +2922,226 @@ mod tests {
         assert_eq!(
             final_result.encode().expect("final completion re-encodes"),
             final_wire
+        );
+    }
+
+    #[test]
+    fn completion_values_enforce_the_one_hundred_value_limit() {
+        let accepted = CompletionValues {
+            values: (0..MAX_COMPLETION_VALUES)
+                .map(|index| format!("value-{index}"))
+                .collect(),
+            total: Some(MAX_COMPLETION_VALUES as i64),
+            has_more: Some(false),
+        };
+        let encoded = serde_json::to_value(&accepted).expect("one hundred values serialize");
+        assert_eq!(
+            encoded["values"].as_array().map(Vec::len),
+            Some(MAX_COMPLETION_VALUES)
+        );
+
+        let too_many = (0..=MAX_COMPLETION_VALUES)
+            .map(|index| format!("value-{index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            serde_json::from_value::<CompletionValues>(serde_json::json!({
+                "values": too_many
+            }))
+            .is_err(),
+            "a peer cannot admit 101 completion values"
+        );
+        assert!(
+            serde_json::to_value(CompletionValues {
+                values: (0..=MAX_COMPLETION_VALUES)
+                    .map(|index| format!("value-{index}"))
+                    .collect(),
+                total: None,
+                has_more: None,
+            })
+            .is_err(),
+            "locally authored results cannot emit 101 completion values"
+        );
+    }
+
+    #[test]
+    fn legacy_completion_result_retains_meta_during_round_trip() {
+        let request = CoreRequest::decode(
+            ProtocolEra::Legacy2024,
+            COMPLETION_COMPLETE,
+            Some(&serde_json::json!({
+                "ref": {"type": "ref/prompt", "name": "deploy"},
+                "argument": {"name": "environment", "value": "sta"}
+            })),
+        )
+        .expect("legacy completion request");
+        let wire = r#"{"completion":{"values":["staging"]},"_meta":{"cache":"private","trace":{"attempt":1}}}"#;
+        let result = request
+            .decode_result(wire)
+            .expect("legacy completion metadata remains typed");
+        let CoreResult::Legacy(LegacyCoreResult::Completion(completion)) = &result else {
+            panic!("legacy completion result");
+        };
+        let metadata = completion
+            .meta
+            .as_ref()
+            .expect("legacy metadata is retained");
+        assert_eq!(metadata.get("cache"), Some(&serde_json::json!("private")));
+        assert_eq!(
+            metadata.get("trace"),
+            Some(&serde_json::json!({"attempt": 1}))
+        );
+        assert_eq!(
+            result.encode().expect("legacy completion re-encodes"),
+            wire,
+            "legacy completion _meta is not discarded or rewritten"
+        );
+    }
+
+    #[test]
+    fn final_subscriptions_listen_round_trips_request_result_and_acknowledgement() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "notifications": {
+                "promptsListChanged": false,
+                "resourceSubscriptions": ["file:///workspace/status"],
+                "resourcesListChanged": true,
+                "toolsListChanged": true
+            }
+        });
+        let request =
+            CoreRequest::decode(ProtocolEra::Modern2026, SUBSCRIPTIONS_LISTEN, Some(&params))
+                .expect("final subscriptions/listen request is typed");
+        assert_eq!(request.method(), SUBSCRIPTIONS_LISTEN);
+        let CoreRequest::Final(FinalCoreRequest::SubscriptionsListen(listen)) = &request else {
+            panic!("final subscriptions/listen request");
+        };
+        assert!(matches!(
+            listen.notifications.resource_subscriptions.as_deref(),
+            Some([uri]) if uri == "file:///workspace/status"
+        ));
+        assert_eq!(listen.notifications.prompts_list_changed, Some(false));
+        assert_eq!(
+            request
+                .encode_params()
+                .expect("final subscriptions/listen re-encodes")
+                .expect("listen owns a parameter object"),
+            params
+        );
+
+        let acknowledgement_wire = serde_json::json!({
+            "_meta": {"io.modelcontextprotocol/subscriptionId": "subscription-7"},
+            "notifications": {
+                "resourceSubscriptions": ["file:///workspace/status"],
+                "toolsListChanged": true
+            }
+        });
+        let acknowledgement: FinalSubscriptionsAcknowledgedNotificationParams =
+            serde_json::from_value(acknowledgement_wire.clone())
+                .expect("acknowledgement notification is typed");
+        assert_eq!(
+            acknowledgement
+                .meta
+                .as_ref()
+                .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY)),
+            Some(&serde_json::json!("subscription-7"))
+        );
+        assert_eq!(
+            serde_json::to_value(&acknowledgement).expect("acknowledgement re-encodes"),
+            acknowledgement_wire
+        );
+
+        let result_wire = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":"subscription-7","io.modelcontextprotocol/serverInfo":{"name":"final-server","version":"1.0.0"}}}"#;
+        let result = request
+            .decode_result(result_wire)
+            .expect("final subscriptions/listen termination result is typed");
+        let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
+            result: listen_result,
+            subscription_id,
+            diagnostic,
+        }) = &result
+        else {
+            panic!("final subscriptions/listen result");
+        };
+        assert_eq!(subscription_id, &RequestId::from("subscription-7"));
+        assert!(diagnostic.is_none());
+        assert!(listen_result.extras.members().is_empty());
+        assert_eq!(
+            result
+                .encode()
+                .expect("final subscriptions/listen re-encodes"),
+            result_wire
+        );
+
+        let legacy_subscribe = SubscribeResourceParams {
+            uri: "file:///workspace/status".to_owned(),
+        };
+        let legacy_unsubscribe = UnsubscribeResourceParams {
+            uri: "file:///workspace/status".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(legacy_subscribe).expect("legacy subscribe serializes"),
+            serde_json::json!({"uri": "file:///workspace/status"})
+        );
+        assert_eq!(
+            serde_json::to_value(legacy_unsubscribe).expect("legacy unsubscribe serializes"),
+            serde_json::json!({"uri": "file:///workspace/status"})
+        );
+    }
+
+    #[test]
+    fn final_subscriptions_listen_rejects_one_legacy_subscription_field() {
+        let accepted = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "notifications": {
+                "resourceSubscriptions": ["file:///workspace/status"]
+            }
+        });
+        let baseline = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            SUBSCRIPTIONS_LISTEN,
+            Some(&accepted),
+        )
+        .expect("baseline final subscriptions/listen request");
+
+        let mut planted = accepted.clone();
+        planted["uri"] = serde_json::json!("file:///workspace/status");
+        assert!(
+            matches!(
+                CoreRequest::decode(
+                    ProtocolEra::Modern2026,
+                    SUBSCRIPTIONS_LISTEN,
+                    Some(&planted)
+                ),
+                Err(CoreDispatchError::InvalidParams {
+                    era: ProtocolEra::Modern2026,
+                    method: SUBSCRIPTIONS_LISTEN,
+                })
+            ),
+            "only the legacy resources/subscribe uri field changes the valid final listen request"
+        );
+
+        let reaccepted = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            SUBSCRIPTIONS_LISTEN,
+            Some(&accepted),
+        )
+        .expect("cross-era rejection cannot mutate final listen decoding");
+        assert_eq!(
+            baseline
+                .encode_params()
+                .expect("baseline encodes")
+                .expect("baseline parameters"),
+            reaccepted
+                .encode_params()
+                .expect("reaccepted encodes")
+                .expect("reaccepted parameters"),
+            "the one-field cross-era rejection leaves the accepted final request unchanged"
         );
     }
 
