@@ -158,7 +158,7 @@ use fastmcp_core::{
     McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
-use fastmcp_protocol::common_types::{Implementation, LoggingLevel, OpenMetadata};
+use fastmcp_protocol::common_types::{Implementation, OpenMetadata};
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, ExtensionNegotiationError, ExtensionSettingsCompatibilityResolver,
 };
@@ -3899,7 +3899,7 @@ impl Server {
         }
         let mut request_ctx = inbound
             .request_context()
-            .with_request_cancellation(request_cancellation);
+            .with_request_cancellation(request_cancellation.clone());
         if let Some(marker) = request
             .params
             .as_ref()
@@ -16689,7 +16689,7 @@ mod lib_unit_tests {
 
     #[test]
     fn final_subscription_rejects_request_scoped_message_without_delivery() {
-        use fastmcp_protocol::FinalLogMessageParams;
+        use fastmcp_protocol::{FinalLogMessageParams, common_types::LoggingLevel};
 
         let server = Server::new("final-subscription-rejection-test", "1.0.0").build();
         let registry = Arc::clone(&server.final_subscriptions);
