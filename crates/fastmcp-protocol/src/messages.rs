@@ -1877,6 +1877,10 @@ pub enum FinalCoreResult {
         result: CompleteResult<FinalCallToolResult>,
         diagnostic: Option<ResultPeerDiagnostic>,
     },
+    /// A Tasks-backed final `tools/call` result.
+    ToolsCallTask {
+        result: crate::tasks_extension::CreateTaskResult,
+    },
     /// `tools/call` requires client input before a retry.
     ToolsCallInputRequired {
         result: InputRequiredResult,
@@ -2395,19 +2399,7 @@ impl FinalCoreRequest {
                 &["tools", "nextCursor", "ttlMs", "cacheScope"],
             )
             .map(|(result, diagnostic)| FinalCoreResult::ToolsList { result, diagnostic }),
-            Self::ToolsCall(_) => decode_final_complete_or_input_required(
-                TOOLS_CALL,
-                input,
-                &["content", "isError", "structuredContent"],
-            )
-            .map(|result| match result {
-                FinalMethodResult::Complete { result, diagnostic } => {
-                    FinalCoreResult::ToolsCall { result, diagnostic }
-                }
-                FinalMethodResult::InputRequired { result, diagnostic } => {
-                    FinalCoreResult::ToolsCallInputRequired { result, diagnostic }
-                }
-            }),
+            Self::ToolsCall(_) => decode_final_tools_call(input),
             Self::ResourcesList(_) => decode_final_complete(
                 RESOURCES_LIST,
                 input,
@@ -2550,7 +2542,9 @@ impl FinalCoreResult {
             Self::Discover(_) => SERVER_DISCOVER,
             Self::Completion { .. } => COMPLETION_COMPLETE,
             Self::ToolsList { .. } => TOOLS_LIST,
-            Self::ToolsCall { .. } | Self::ToolsCallInputRequired { .. } => TOOLS_CALL,
+            Self::ToolsCall { .. }
+            | Self::ToolsCallTask { .. }
+            | Self::ToolsCallInputRequired { .. } => TOOLS_CALL,
             Self::ResourcesList { .. } => RESOURCES_LIST,
             Self::ResourceTemplatesList { .. } => RESOURCES_TEMPLATES_LIST,
             Self::ResourcesRead { .. } | Self::ResourcesReadInputRequired { .. } => RESOURCES_READ,
@@ -2581,6 +2575,7 @@ impl FinalCoreResult {
                 result,
                 &["content", "isError", "structuredContent"],
             ),
+            Self::ToolsCallTask { result } => encode_final_tools_call_task(result),
             Self::ToolsCallInputRequired { result, .. } => {
                 encode_final_input_required(TOOLS_CALL, result)
             }
@@ -2733,6 +2728,44 @@ enum FinalMethodResult<T> {
     },
 }
 
+fn decode_final_tools_call(input: &str) -> Result<FinalCoreResult, CoreDispatchError> {
+    let wire: Value =
+        serde_json::from_str(input).map_err(|_| CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method: TOOLS_CALL,
+        })?;
+    if wire
+        .as_object()
+        .is_some_and(|object| object.contains_key("serverInfo"))
+    {
+        return Err(CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method: TOOLS_CALL,
+        });
+    }
+    if wire.get("resultType").and_then(Value::as_str) == Some("task") {
+        let result =
+            serde_json::from_value(wire).map_err(|_| CoreDispatchError::InvalidResult {
+                era: ProtocolEra::Modern2026,
+                method: TOOLS_CALL,
+            })?;
+        return Ok(FinalCoreResult::ToolsCallTask { result });
+    }
+    decode_final_complete_or_input_required(
+        TOOLS_CALL,
+        input,
+        &["content", "isError", "structuredContent"],
+    )
+    .map(|result| match result {
+        FinalMethodResult::Complete { result, diagnostic } => {
+            FinalCoreResult::ToolsCall { result, diagnostic }
+        }
+        FinalMethodResult::InputRequired { result, diagnostic } => {
+            FinalCoreResult::ToolsCallInputRequired { result, diagnostic }
+        }
+    })
+}
+
 fn decode_final_complete<T: DeserializeOwned>(
     method: &'static str,
     input: &str,
@@ -2764,6 +2797,9 @@ fn decode_final_complete_or_input_required<T: DeserializeOwned>(
             era: ProtocolEra::Modern2026,
             method,
         });
+    }
+    if wire.get("resultType").and_then(Value::as_str) == Some("task") {
+        return Err(CoreDispatchError::UnexpectedFinalResultType { method });
     }
     let (decoded, diagnostic) = decode_peer_result_for_era(
         input,
@@ -2886,6 +2922,21 @@ fn encode_final_input_required(
         });
     }
     Ok(encode_result(&DecodedResult::InputRequired(result.clone())))
+}
+
+fn encode_final_tools_call_task(
+    result: &crate::tasks_extension::CreateTaskResult,
+) -> Result<String, CoreDispatchError> {
+    if result.additional.contains_key("serverInfo") {
+        return Err(CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method: TOOLS_CALL,
+        });
+    }
+    serde_json::to_string(result).map_err(|_| CoreDispatchError::InvalidResult {
+        era: ProtocolEra::Modern2026,
+        method: TOOLS_CALL,
+    })
 }
 
 // ============================================================================
@@ -5000,6 +5051,141 @@ mod tests {
         assert_eq!(
             legacy_result.encode().expect("legacy result re-encodes"),
             legacy_wire
+        );
+    }
+
+    #[test]
+    fn final_tools_call_task_result_selects_a_disjoint_typed_branch() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "name": "long-running"
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&params))
+            .expect("final tools/call request admits the task result branch");
+        let accepted = serde_json::json!({
+            "resultType": "task",
+            "taskId": "task-1",
+            "status": "working",
+            "createdAt": "2026-07-28T12:00:00.000Z",
+            "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+            "ttlMs": null,
+            "com.example/opaque": {"retained": true}
+        });
+        let wire = serde_json::to_string(&accepted).expect("task result serializes");
+
+        let decoded = request
+            .decode_result(&wire)
+            .expect("final tools/call task result decodes");
+        let CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) = &decoded else {
+            panic!("tools/call must select the task result branch");
+        };
+        assert_eq!(result.task.base().task_id.as_str(), "task-1");
+        assert_eq!(
+            result.additional.get("com.example/opaque"),
+            Some(&serde_json::json!({"retained": true}))
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&decoded.encode().expect("task result re-encodes"))
+                .expect("encoded task result is JSON"),
+            accepted,
+            "the typed task branch preserves the task result and inert siblings"
+        );
+    }
+
+    #[test]
+    fn final_tools_call_task_result_rejections_leave_decode_state_unchanged() {
+        let call_params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "name": "long-running"
+        });
+        let call = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&call_params))
+            .expect("baseline final tools/call request");
+        let accepted = serde_json::json!({
+            "resultType": "task",
+            "taskId": "task-1",
+            "status": "working",
+            "createdAt": "2026-07-28T12:00:00.000Z",
+            "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+            "ttlMs": null
+        });
+        let accepted_wire = serde_json::to_string(&accepted).expect("task result serializes");
+        let baseline = call
+            .decode_result(&accepted_wire)
+            .expect("baseline task result decodes");
+
+        let mut wrong_result = accepted.clone();
+        wrong_result["resultType"] = serde_json::json!("complete");
+        assert!(
+            matches!(
+                call.decode_result(
+                    &serde_json::to_string(&wrong_result)
+                        .expect("one-field wrong result serializes")
+                ),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_CALL,
+                })
+            ),
+            "changing only resultType cannot reinterpret a task result as a complete tools/call result"
+        );
+
+        let list_params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        let wrong_method =
+            CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_LIST, Some(&list_params))
+                .expect("final tools/list request");
+        assert!(
+            matches!(
+                wrong_method.decode_result(&accepted_wire),
+                Err(CoreDispatchError::UnexpectedFinalResultType { method: TOOLS_LIST })
+            ),
+            "the task result discriminator belongs only to final tools/call"
+        );
+
+        let reaccepted = call
+            .decode_result(&accepted_wire)
+            .expect("wrong result and method do not mutate task result decoding");
+        assert_eq!(
+            serde_json::from_str::<Value>(&baseline.encode().expect("baseline encodes"))
+                .expect("baseline is JSON"),
+            serde_json::from_str::<Value>(&reaccepted.encode().expect("reaccepted encodes"))
+                .expect("reaccepted result is JSON"),
+            "the rejected one-field resultType cannot mutate the admitted task result"
+        );
+
+        let legacy_params = serde_json::json!({"name": "long-running"});
+        let legacy = CoreRequest::decode(ProtocolEra::Legacy2024, TOOLS_CALL, Some(&legacy_params))
+            .expect("legacy tools/call request");
+        let legacy_wire = r#"{"content":[{"type":"text","text":"ready"}]}"#;
+        let legacy_baseline = legacy
+            .decode_result(legacy_wire)
+            .expect("legacy tools/call result remains admitted");
+        let legacy_planted = r#"{"resultType":"task","content":[{"type":"text","text":"ready"}]}"#;
+        assert!(
+            matches!(
+                legacy.decode_result(legacy_planted),
+                Err(CoreDispatchError::CrossEraResultType { method: TOOLS_CALL })
+            ),
+            "adding only the final task discriminator cannot alter legacy tools/call decoding"
+        );
+        assert_eq!(
+            legacy
+                .decode_result(legacy_wire)
+                .expect("legacy rejection leaves baseline decoding intact")
+                .encode()
+                .expect("legacy reaccepted result encodes"),
+            legacy_baseline.encode().expect("legacy baseline encodes"),
+            "the final task branch leaves exact legacy result decoding unchanged"
         );
     }
 
