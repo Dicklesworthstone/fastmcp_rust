@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use fastmcp_protocol::{
-    DiscoveryCacheHints, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
-    ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
-    ServerDiscoverResult, ServerInfo, ServerInstructions,
+    DiscoveryCacheHints, ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities,
+    ServerDiscoverRequest, ServerDiscoverResult, ServerInfo, ServerInstructions,
+    SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[test]
 fn srv_02_a_positive() {
@@ -34,7 +34,7 @@ fn srv_02_a_positive() {
             version: "1.0.0".to_owned(),
         },
         Some(ServerInstructions::new("Use the installed tools.").expect("bounded instructions")),
-        Some(DiscoveryCacheHints::with_max_age_seconds(60)),
+        DiscoveryCacheHints::private_ttl_ms(60_000),
     );
 
     let request = serde_json::to_value(ServerDiscoverRequest::default()).expect("request encodes");
@@ -43,8 +43,13 @@ fn srv_02_a_positive() {
     assert_eq!(SERVER_DISCOVER_METHOD, "server/discover");
     assert_eq!(request, json!({}));
     assert_eq!(
-        wire["protocolVersions"],
+        wire["supportedVersions"],
         json!(SERVER_DISCOVER_SUPPORTED_VERSIONS)
+    );
+    assert!(wire.get("protocolVersions").is_none());
+    assert_eq!(
+        wire["_meta"]["io.modelcontextprotocol/serverInfo"],
+        json!({"name": "contract-server", "version": "1.0.0"})
     );
     assert_eq!(wire["capabilities"]["tools"]["listChanged"], json!(true));
     assert_eq!(wire["capabilities"]["resources"]["subscribe"], json!(true));
@@ -54,10 +59,11 @@ fn srv_02_a_positive() {
         wire["capabilities"]["extensions"]["io.fastmcp.example"]["enabled"],
         json!(true)
     );
-    assert_eq!(wire["cacheHints"]["maxAgeSeconds"], json!(60));
+    assert_eq!(wire["ttlMs"], json!(60_000));
+    assert_eq!(wire["cacheScope"], json!("private"));
     assert_eq!(
-        DiscoveryCacheHints::with_max_age_seconds(u32::MAX).max_age_seconds(),
-        u32::MAX,
+        DiscoveryCacheHints::private_ttl_ms(u64::MAX).ttl_ms(),
+        u64::MAX,
         "the typed cache-hint field admits its complete nonnegative wire domain"
     );
 }
@@ -76,11 +82,11 @@ fn srv_02_a_planted_negative() {
             version: "1.0.0".to_owned(),
         },
         None,
-        None,
+        DiscoveryCacheHints::private_ttl_ms(0),
     );
     let unchanged_before = serde_json::to_vec(&admitted).expect("admitted state encodes");
     let mut planted: Value = serde_json::to_value(&admitted).expect("baseline result encodes");
-    planted["protocolVersions"] = json!(["2024-11-05"]);
+    planted["supportedVersions"] = json!(["2024-11-05"]);
 
     let rejection = serde_json::from_value::<ServerDiscoverResult>(planted);
 
