@@ -66,6 +66,7 @@ mod builder;
 pub mod caching;
 // FND-01: Docket/Redis is not part of the FND-01 production surface. Source bytes
 // remain on disk (no-deletion) and are package-excluded; do not re-export.
+pub mod extensions;
 mod handler;
 pub mod http_admission;
 pub mod legacy_2024;
@@ -89,6 +90,10 @@ pub use auth::{
     TokenVerifier,
 };
 pub use builder::ServerBuilder;
+pub use extensions::{
+    ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
+    ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
+};
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
 pub use handler::{
@@ -151,6 +156,9 @@ use fastmcp_core::{
     McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
+use fastmcp_protocol::extensions::{
+    ExtensionLocalEnablement, ExtensionNegotiationError, ExtensionSettingsCompatibilityResolver,
+};
 use fastmcp_protocol::methods::{
     Legacy2024ListChangedCapability, Legacy2024ResourcesCapability, Legacy2024ServerCapabilities,
 };
@@ -159,12 +167,14 @@ use fastmcp_protocol::protocol_policy::{
     ProtocolPolicy, StdioEraClassifier, StdioEraDecision, StdioOpeningFrame,
 };
 use fastmcp_protocol::{
-    CallToolParams, CancelledParams, CorrelationKey, DiscoveryCacheHints, GetPromptParams,
-    InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel,
-    LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES, Prompt, ReadResourceParams, RequestId,
-    Resource, ResourceTemplate, SERVER_DISCOVER_METHOD, ServerCapabilities,
-    ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult, ServerInfo,
+    CallToolParams, CancelledParams, ClientExtensionDiscovery, CorrelationKey, DiscoveryCacheHints,
+    ExtensionDescriptor, ExtensionId, ExtensionRegistryError, ExtensionRegistryReceipt,
+    ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY, GetPromptParams, InitializeParams,
+    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
+    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
+    MAX_SERVER_INSTRUCTIONS_BYTES, Prompt, ReadResourceParams, RequestId, Resource,
+    ResourceTemplate, SERVER_DISCOVER_METHOD, ServerCapabilities, ServerDiscoverCapabilities,
+    ServerDiscoverRequest, ServerDiscoverResult, ServerExtensionDiscovery, ServerInfo,
     ServerInstructions, SetLogLevelParams, SubscribeResourceParams, Tool,
     UnsubscribeResourceParams,
 };
@@ -193,6 +203,179 @@ const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 static INSTALL_EXTENSION_PANIC_HOOK: Once = Once::new();
 #[cfg(test)]
 static REDACTED_EXTENSION_PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Failure while installing the server-owned extension registry.
+#[derive(Debug)]
+pub enum ServerExtensionConfigurationError {
+    /// A builder accepts exactly one immutable extension registry.
+    AlreadyInstalled,
+    /// Discovery attempted to advertise an identifier absent from the registry.
+    UnregisteredAdvertisedExtension(String),
+    /// The descriptor registry could not be frozen into a canonical receipt.
+    Registry(ExtensionRegistryError),
+}
+
+impl std::fmt::Display for ServerExtensionConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyInstalled => {
+                formatter.write_str("a server extension registry is already installed")
+            }
+            Self::UnregisteredAdvertisedExtension(id) => {
+                write!(
+                    formatter,
+                    "server discovery advertises an unregistered extension: {id}"
+                )
+            }
+            Self::Registry(error) => {
+                write!(formatter, "server extension registry is invalid: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ServerExtensionConfigurationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Registry(error) => Some(error),
+            Self::AlreadyInstalled | Self::UnregisteredAdvertisedExtension(_) => None,
+        }
+    }
+}
+
+/// Failure while deriving a current-exchange extension capability set.
+#[derive(Debug)]
+pub enum ServerExtensionNegotiationError {
+    /// This server has no extension registry installed.
+    NotConfigured,
+    /// The installed resolver lock was poisoned by an earlier caller panic.
+    ResolverPoisoned,
+    /// The frozen protocol registry rejected the current peer settings.
+    Protocol(ExtensionNegotiationError),
+}
+
+impl std::fmt::Display for ServerExtensionNegotiationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConfigured => formatter.write_str("the server has no extension registry"),
+            Self::ResolverPoisoned => {
+                formatter.write_str("the server extension resolver is unavailable")
+            }
+            Self::Protocol(error) => {
+                write!(formatter, "server extension negotiation failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ServerExtensionNegotiationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol(error) => Some(error),
+            Self::NotConfigured | Self::ResolverPoisoned => None,
+        }
+    }
+}
+
+/// Sized bridge for a caller-provided dynamic extension settings resolver.
+struct BoxedExtensionSettingsResolver(Box<dyn ExtensionSettingsCompatibilityResolver + Send>);
+
+impl ExtensionSettingsCompatibilityResolver for BoxedExtensionSettingsResolver {
+    fn resolve(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettings, ExtensionNegotiationError> {
+        self.0.resolve(descriptor, client, server)
+    }
+}
+
+/// Immutable server-owned extension runtime retained after builder freeze.
+pub(crate) struct ServerExtensionRuntime {
+    handlers: ExtensionHandlerRegistry,
+    local_enablement: ExtensionLocalEnablement,
+    server_discovery: ServerExtensionDiscovery,
+    resolver: Mutex<BoxedExtensionSettingsResolver>,
+}
+
+impl ServerExtensionRuntime {
+    pub(crate) fn new<R>(
+        handlers: ExtensionHandlerRegistry,
+        server_discovery: ServerExtensionDiscovery,
+        resolver: R,
+    ) -> Result<Self, ServerExtensionConfigurationError>
+    where
+        R: ExtensionSettingsCompatibilityResolver + Send + 'static,
+    {
+        for id in server_discovery.extensions.keys() {
+            if handlers.descriptor_registry().descriptor(id).is_none() {
+                return Err(
+                    ServerExtensionConfigurationError::UnregisteredAdvertisedExtension(
+                        id.to_string(),
+                    ),
+                );
+            }
+        }
+
+        // `ServerBuilder::build` has no failure channel. Freeze a clone now so
+        // its canonical descriptor digest is known-valid before construction.
+        let mut preflight = handlers.descriptor_registry().clone();
+        preflight
+            .freeze()
+            .map_err(ServerExtensionConfigurationError::Registry)?;
+
+        let mut local_enablement = ExtensionLocalEnablement::default();
+        for id in server_discovery.extensions.keys() {
+            local_enablement.enable(id.clone());
+        }
+
+        Ok(Self {
+            handlers,
+            local_enablement,
+            server_discovery,
+            resolver: Mutex::new(BoxedExtensionSettingsResolver(Box::new(resolver))),
+        })
+    }
+
+    pub(crate) fn freeze(&mut self) -> Result<ExtensionRegistryReceipt, ExtensionRegistryError> {
+        self.handlers.freeze()
+    }
+
+    fn discovery_capabilities(&self) -> BTreeMap<String, serde_json::Value> {
+        self.server_discovery
+            .extensions
+            .iter()
+            .map(|(id, settings)| {
+                (
+                    id.as_str().to_owned(),
+                    serde_json::Value::Object(settings.as_object().clone()),
+                )
+            })
+            .collect()
+    }
+
+    fn negotiate(
+        &self,
+        client: &ClientExtensionDiscovery,
+    ) -> Result<fastmcp_protocol::extensions::NegotiatedExtensionSet, ServerExtensionNegotiationError>
+    {
+        let mut resolver = self
+            .resolver
+            .lock()
+            .map_err(|_| ServerExtensionNegotiationError::ResolverPoisoned)?;
+        self.handlers
+            .descriptor_registry()
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &self.local_enablement,
+                client,
+                &self.server_discovery,
+                &mut *resolver,
+            )
+            .map_err(ServerExtensionNegotiationError::Protocol)
+    }
+}
 
 /// Request-owned state retained until the exact legacy response reaches its
 /// stdio commit boundary.
@@ -342,6 +525,53 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
             )
         })
     }
+}
+
+fn final_client_extension_discovery(
+    request: &JsonRpcRequest,
+) -> McpResult<ClientExtensionDiscovery> {
+    let Some(params) = request.params.as_ref() else {
+        return Ok(ClientExtensionDiscovery::default());
+    };
+    let Some(parameters) = params.as_object() else {
+        return Err(McpError::invalid_params(
+            "Invalid final client extension capabilities",
+        ));
+    };
+    let Some(metadata) = parameters.get("_meta") else {
+        return Ok(ClientExtensionDiscovery::default());
+    };
+    let Some(metadata) = metadata.as_object() else {
+        return Err(McpError::invalid_params(
+            "Invalid final client extension capabilities",
+        ));
+    };
+    let Some(capabilities) = metadata.get(FINAL_CLIENT_CAPABILITIES_META_KEY) else {
+        return Ok(ClientExtensionDiscovery::default());
+    };
+    let Some(capabilities) = capabilities.as_object() else {
+        return Err(McpError::invalid_params(
+            "Invalid final client extension capabilities",
+        ));
+    };
+    let Some(extensions) = capabilities.get("extensions") else {
+        return Ok(ClientExtensionDiscovery::default());
+    };
+    let Some(extensions) = extensions.as_object() else {
+        return Err(McpError::invalid_params(
+            "Invalid final client extension capabilities",
+        ));
+    };
+
+    let mut parsed = BTreeMap::new();
+    for (raw_id, raw_settings) in extensions {
+        let id = ExtensionId::parse(raw_id.clone())
+            .map_err(|_| McpError::invalid_params("Invalid final client extension capabilities"))?;
+        let settings = ExtensionSettings::new(raw_settings.clone())
+            .map_err(|_| McpError::invalid_params("Invalid final client extension capabilities"))?;
+        parsed.insert(id, settings);
+    }
+    Ok(ClientExtensionDiscovery { extensions: parsed })
 }
 
 fn lock_http_session(session: &Mutex<Session>) -> std::sync::MutexGuard<'_, Session> {
@@ -2389,6 +2619,8 @@ pub struct Server {
     protocol_policy: ProtocolPolicy,
     /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
+    /// Frozen modern-only extension descriptors, handlers, and resolver.
+    extension_runtime: Option<Arc<ServerExtensionRuntime>>,
 }
 
 impl Server {
@@ -2424,6 +2656,39 @@ impl Server {
     #[must_use]
     pub const fn protocol_policy(&self) -> ProtocolPolicy {
         self.protocol_policy
+    }
+
+    /// Returns the installed frozen extension handler registry, if configured.
+    #[must_use]
+    pub fn extension_handler_registry(&self) -> Option<&ExtensionHandlerRegistry> {
+        self.extension_runtime
+            .as_deref()
+            .map(|runtime| &runtime.handlers)
+    }
+
+    /// Returns the canonical descriptor receipt for the installed registry.
+    #[must_use]
+    pub fn extension_registry_receipt(&self) -> Option<&ExtensionRegistryReceipt> {
+        self.extension_handler_registry()
+            .and_then(|registry| registry.descriptor_registry().receipt())
+    }
+
+    /// Negotiates currently advertised client extension settings against this server.
+    ///
+    /// The resulting set is bound to this server's frozen descriptor receipt and
+    /// can only admit modern extension calls through
+    /// [`Self::dispatch_negotiated_extension`]. Exact MCP 2024-11-05 uses no
+    /// extension registry path.
+    pub fn negotiate_extensions(
+        &self,
+        client: &ClientExtensionDiscovery,
+    ) -> Result<fastmcp_protocol::extensions::NegotiatedExtensionSet, ServerExtensionNegotiationError>
+    {
+        let runtime = self
+            .extension_runtime
+            .as_deref()
+            .ok_or(ServerExtensionNegotiationError::NotConfigured)?;
+        runtime.negotiate(client)
     }
 
     fn legacy_2024_server_config(&self) -> Legacy2024ServerConfig {
@@ -2480,8 +2745,14 @@ impl Server {
             None => None,
         };
         let registry = self.router.server_discovery_behavior_registry();
-        let capabilities = ServerDiscoverCapabilities::from_registry(&registry, BTreeMap::new())
-            .map_err(|_| McpError::internal_error("Server discovery capabilities are invalid"))?;
+        let extension_capabilities = self.extension_runtime.as_deref().map_or_else(
+            BTreeMap::new,
+            ServerExtensionRuntime::discovery_capabilities,
+        );
+        let capabilities =
+            ServerDiscoverCapabilities::from_registry(&registry, extension_capabilities).map_err(
+                |_| McpError::internal_error("Server discovery capabilities are invalid"),
+            )?;
 
         Ok(ServerDiscoverResult::new(
             capabilities,
@@ -2513,6 +2784,98 @@ impl Server {
     #[must_use]
     pub fn prompts(&self) -> Vec<Prompt> {
         self.router.prompts()
+    }
+
+    fn registered_extension_handler_id(&self, method: &str) -> McpResult<Option<&ExtensionId>> {
+        let Some(runtime) = self.extension_runtime.as_deref() else {
+            return Ok(None);
+        };
+
+        for id in runtime.server_discovery.extensions.keys() {
+            match runtime.handlers.lookup(id, method) {
+                Ok(_) => return Ok(Some(id)),
+                Err(ExtensionHandlerLookupError::HandlerNotFound(_)) => {}
+                Err(ExtensionHandlerLookupError::RegistryNotFrozen) => {
+                    return Err(McpError::internal_error(
+                        "server extension handlers were not frozen",
+                    ));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn invoke_negotiated_extension(
+        &self,
+        request_ctx: &McpContext,
+        negotiated: &fastmcp_protocol::extensions::NegotiatedExtensionSet,
+        extension_id: &ExtensionId,
+        request: &JsonRpcRequest,
+    ) -> McpResult<serde_json::Value> {
+        let runtime = self
+            .extension_runtime
+            .as_deref()
+            .ok_or_else(|| McpError::method_not_found(&request.method))?;
+        runtime
+            .handlers
+            .invoke(
+                negotiated,
+                ProtocolEra::Modern2026,
+                extension_id,
+                &request.method,
+                request_ctx,
+                request
+                    .params
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
+            .map_err(|error| match error {
+                ExtensionHandlerInvocationError::Handler(error) => error,
+                ExtensionHandlerInvocationError::RegistryNotFrozen => {
+                    McpError::internal_error("server extension handlers were not frozen")
+                }
+                ExtensionHandlerInvocationError::Protocol(_)
+                | ExtensionHandlerInvocationError::HandlerNotFound(_) => {
+                    McpError::invalid_params("Extension request is not admitted")
+                }
+            })
+    }
+
+    /// Dispatches an already-negotiated modern extension request.
+    ///
+    /// This public seam preserves the caller's request-owned context and only
+    /// invokes a handler when its descriptor is active in the supplied frozen
+    /// current-exchange capability set.
+    pub fn dispatch_negotiated_extension(
+        &self,
+        request_ctx: &McpContext,
+        negotiated: &fastmcp_protocol::extensions::NegotiatedExtensionSet,
+        request: &JsonRpcRequest,
+    ) -> McpResult<serde_json::Value> {
+        let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
+            return Err(McpError::method_not_found(&request.method));
+        };
+        if negotiated.active(extension_id).is_none() {
+            return Err(McpError::invalid_params(
+                "Extension request is not admitted",
+            ));
+        }
+        self.invoke_negotiated_extension(request_ctx, negotiated, extension_id, request)
+    }
+
+    fn dispatch_extension_fallback(
+        &self,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<serde_json::Value> {
+        let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
+            return Err(McpError::method_not_found(&request.method));
+        };
+        let client = final_client_extension_discovery(request)?;
+        let negotiated = self
+            .negotiate_extensions(&client)
+            .map_err(|_| McpError::invalid_params("Extension request negotiation was rejected"))?;
+        self.invoke_negotiated_extension(request_ctx, &negotiated, extension_id, request)
     }
 
     /// Returns the test-only legacy task manager, if configured.
@@ -2790,7 +3153,12 @@ impl Server {
                     .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 serde_json::to_value(self.server_discovery()?).map_err(McpError::from)
             } else {
-                self.router.dispatch_stateless(&request_ctx, request)
+                match self.router.dispatch_stateless(&request_ctx, request) {
+                    Err(error) if error.code == McpErrorCode::MethodNotFound => {
+                        self.dispatch_extension_fallback(&request_ctx, request)
+                    }
+                    result => result,
+                }
             }
         })();
         let result = match result {
@@ -8060,9 +8428,12 @@ mod lib_unit_tests {
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::runtime::reactor::create_reactor;
     use fastmcp_derive::tool;
+    use fastmcp_protocol::extensions::{
+        ExtensionNegotiationError, official_tasks_empty_settings, register_official_tasks_extension,
+    };
     use fastmcp_protocol::{
-        CallToolResult, CompletionValues, Content, FinalCompletionParams, LegacyCompletionParams,
-        LegacyContent,
+        CallToolResult, CompletionValues, Content, ExtensionDescriptorRegistry,
+        FinalCompletionParams, LegacyCompletionParams, LegacyContent,
     };
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -8534,6 +8905,158 @@ mod lib_unit_tests {
                 &request_sender,
             )
             .expect("test request should produce a JSON-RPC response")
+    }
+
+    fn extension_registry_test_server(calls: Arc<AtomicUsize>) -> Server {
+        let mut descriptors = ExtensionDescriptorRegistry::new();
+        let tasks_id = register_official_tasks_extension(&mut descriptors)
+            .expect("official Tasks descriptor must register");
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+        let handler_calls = Arc::clone(&calls);
+        handlers
+            .register(
+                tasks_id.clone(),
+                "tasks/get",
+                move |context: &McpContext, request: serde_json::Value| {
+                    assert_eq!(context.request_id(), 71);
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    let value = request
+                        .get("value")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| McpError::invalid_params("missing value"))?;
+                    Ok(serde_json::json!({ "next": value + 1 }))
+                },
+            )
+            .expect("official Tasks handler must register");
+
+        Server::new("extension-registry-test", "1.0.0")
+            .extension_registry(
+                handlers,
+                ServerExtensionDiscovery {
+                    extensions: std::collections::BTreeMap::from([(
+                        tasks_id,
+                        official_tasks_empty_settings(),
+                    )]),
+                },
+                |_descriptor: &fastmcp_protocol::ExtensionDescriptor,
+                 _client: &fastmcp_protocol::ExtensionSettings,
+                 _server: &fastmcp_protocol::ExtensionSettings|
+                 -> Result<fastmcp_protocol::ExtensionSettings, ExtensionNegotiationError> {
+                    Ok(official_tasks_empty_settings())
+                },
+            )
+            .expect("extension registry must install")
+            .build()
+    }
+
+    fn extension_tasks_get_request(settings: serde_json::Value) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "tasks/get",
+            Some(serde_json::json!({
+                "value": 41,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {
+                            "io.modelcontextprotocol/tasks": settings,
+                        },
+                    },
+                },
+            })),
+            71_i64,
+        )
+    }
+
+    #[test]
+    fn server_extension_registry_freezes_and_advertises_installed_extension() {
+        let server = extension_registry_test_server(Arc::new(AtomicUsize::new(0)));
+
+        assert!(
+            server
+                .extension_handler_registry()
+                .expect("installed registry must be retained")
+                .is_frozen()
+        );
+        let receipt = server
+            .extension_registry_receipt()
+            .expect("installed registry must expose its canonical receipt");
+        assert_eq!(receipt.descriptor_count(), 1);
+
+        let discovery = serde_json::to_value(
+            server
+                .server_discovery()
+                .expect("installed extension must be discoverable"),
+        )
+        .expect("server discovery must serialize");
+        assert_eq!(
+            discovery["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"],
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn modern_extension_fallback_rejects_one_variable_incompatible_settings() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = extension_registry_test_server(Arc::clone(&calls));
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory);
+
+        let admitted = server
+            .dispatch_stateless(
+                &inbound,
+                &extension_tasks_get_request(serde_json::json!({})),
+            )
+            .expect("modern extension request must have a response");
+        assert_eq!(admitted.result, Some(serde_json::json!({ "next": 42 })));
+        assert!(admitted.error.is_none());
+
+        let mut rejected = extension_tasks_get_request(serde_json::json!({}));
+        *rejected
+            .params
+            .as_mut()
+            .and_then(|value| {
+                value.pointer_mut(
+                    "/_meta/io.modelcontextprotocol~1clientCapabilities/extensions/io.modelcontextprotocol~1tasks",
+                )
+            })
+            .expect("test request must contain its extension settings") =
+            serde_json::json!({ "unexpected": true });
+        let rejected = server
+            .dispatch_stateless(&inbound, &rejected)
+            .expect("rejected extension request must have an error response");
+        let error = rejected
+            .error
+            .expect("incompatible extension settings must fail closed");
+        assert_eq!(error.code, i32::from(McpErrorCode::InvalidParams));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn legacy_dispatch_does_not_fall_through_to_extension_registry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = extension_registry_test_server(Arc::clone(&calls));
+        let mut session = initialized_test_session(&server);
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = test_request_sender();
+
+        let response = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::new(
+                    "tasks/get",
+                    Some(serde_json::json!({ "value": 41 })),
+                    71_i64,
+                ),
+                &notification_sender,
+                &request_sender,
+            )
+            .expect("legacy request must have a response");
+        let error = response
+            .error
+            .expect("legacy request must not reach the extension handler");
+        assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex};
 use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
 use fastmcp_core::McpResult;
+use fastmcp_protocol::extensions::ExtensionSettingsCompatibilityResolver;
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{
     LoggingCapability, PromptsCapability, ResourceTemplate, ResourcesCapability,
-    ServerCapabilities, ServerInfo, ToolsCapability,
+    ServerCapabilities, ServerExtensionDiscovery, ServerInfo, ToolsCapability,
 };
 use log::{Level, LevelFilter};
 
@@ -18,8 +19,9 @@ use crate::proxy::{ProxyPromptHandler, ProxyResourceHandler, ProxyToolHandler};
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
 use crate::{
-    AuthProvider, DuplicateBehavior, HttpServerConfig, LifespanHooks, LoggingConfig, PromptHandler,
-    ProxyCatalog, ProxyClient, ResourceHandler, Router, Server, ToolHandler,
+    AuthProvider, DuplicateBehavior, ExtensionHandlerRegistry, HttpServerConfig, LifespanHooks,
+    LoggingConfig, PromptHandler, ProxyCatalog, ProxyClient, ResourceHandler, Router, Server,
+    ServerExtensionConfigurationError, ServerExtensionRuntime, ToolHandler,
 };
 
 /// Default request timeout in seconds.
@@ -61,6 +63,8 @@ pub struct ServerBuilder {
     protocol_policy: ProtocolPolicy,
     /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
+    /// Installed extension handlers and current server discovery settings.
+    extension_runtime: Option<ServerExtensionRuntime>,
 }
 
 impl ServerBuilder {
@@ -102,6 +106,7 @@ impl ServerBuilder {
                 crate::bidirectional::DEFAULT_MAX_IN_FLIGHT_REQUESTS,
             protocol_policy: ProtocolPolicy::Auto,
             http_config: HttpServerConfig::default(),
+            extension_runtime: None,
         }
     }
 
@@ -303,6 +308,32 @@ impl ServerBuilder {
     pub fn protocol_policy(mut self, policy: ProtocolPolicy) -> Self {
         self.protocol_policy = policy;
         self
+    }
+
+    /// Installs the server's modern-only extension handlers and discovery settings.
+    ///
+    /// Descriptor registration remains mutable only until [`Self::build`]. The
+    /// builder validates the advertised identifiers immediately, then freezes
+    /// the handler and descriptor registries together while building the
+    /// immutable [`Server`]. Exact MCP 2024-11-05 remains outside this path.
+    pub fn extension_registry<R>(
+        mut self,
+        handlers: ExtensionHandlerRegistry,
+        server_discovery: ServerExtensionDiscovery,
+        resolver: R,
+    ) -> Result<Self, ServerExtensionConfigurationError>
+    where
+        R: ExtensionSettingsCompatibilityResolver + Send + 'static,
+    {
+        if self.extension_runtime.is_some() {
+            return Err(ServerExtensionConfigurationError::AlreadyInstalled);
+        }
+        self.extension_runtime = Some(ServerExtensionRuntime::new(
+            handlers,
+            server_discovery,
+            resolver,
+        )?);
+        Ok(self)
     }
 
     /// Sets configuration for the live dual-era HTTP endpoint.
@@ -1159,6 +1190,12 @@ impl ServerBuilder {
         let console = fastmcp_console::console::FastMcpConsole::with_enabled(
             self.console_config.should_use_rich(),
         );
+        let extension_runtime = self.extension_runtime.map(|mut runtime| {
+            runtime
+                .freeze()
+                .expect("validated server extension descriptors must freeze");
+            Arc::new(runtime)
+        });
 
         Server {
             info: self.info,
@@ -1185,6 +1222,7 @@ impl ServerBuilder {
                 .max_bidirectional_requests_per_connection,
             protocol_policy: self.protocol_policy,
             http_config: self.http_config,
+            extension_runtime,
         }
     }
 }
