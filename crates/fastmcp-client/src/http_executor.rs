@@ -17,15 +17,19 @@ use asupersync::http::h1::{
     ClientError, ClientStreamingResponse, HttpClient, Method, RedirectPolicy, RetryPolicy,
 };
 use fastmcp_protocol::methods::{
-    Final2026Direction, Final2026EnvelopeKind, PROMPTS_GET, RESOURCES_READ, TOOLS_CALL,
-    final_2026_07_28_method,
+    Final2026Direction, Final2026EnvelopeKind, PROMPTS_GET, RESOURCES_READ, SUBSCRIPTIONS_LISTEN,
+    TOOLS_CALL, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
 };
 use fastmcp_protocol::{
-    ClientCapabilities, ClientInfo, FinalRequestMeta, JsonRpcMessage, JsonRpcRequest, RequestId,
-    SERVER_DISCOVER, ServerDiscoverResult, decode_strict_jsonrpc_message,
+    ClientCapabilities, ClientInfo, CompleteResult, CoreDispatchError, CoreRequest, CoreResult,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalNotificationError, FinalRequestMeta,
+    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
+    JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
+    SERVER_DISCOVER, ServerDiscoverResult, ServerNotification, SubscriptionFilter,
+    decode_strict_jsonrpc_message,
 };
 
 use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError};
@@ -221,6 +225,112 @@ impl ModernHttpResponseStream {
         })
     }
 
+    /// Consumes a final `subscriptions/listen` SSE response until its exact
+    /// complete terminal result.
+    ///
+    /// Every dispatched SSE `data` payload must be one strictly admitted
+    /// JSON-RPC message. The listener binds both acknowledgement and terminal
+    /// result IDs to `request_id`, retains typed notifications in wire order,
+    /// and refuses EOF or cancellation in place of a complete result.
+    pub async fn collect_final_subscriptions_listen(
+        self,
+        cx: &Cx,
+        request_id: RequestId,
+        requested: SubscriptionFilter,
+        limits: SseLimits,
+    ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
+        if request_id.validate().is_err() {
+            return Err(ModernHttpSubscriptionListenError::InvalidRequestId);
+        }
+        let core_request = final_subscriptions_listen_core_request(&requested)?;
+        let maximum_jsonrpc_bytes = limits.max_event_bytes();
+        let mut stream = self
+            .into_sse_stream(limits)
+            .map_err(ModernHttpSubscriptionListenError::Executor)?;
+        let mut accepted_filter = None;
+        let mut notifications = Vec::new();
+
+        loop {
+            let event = match stream.next_event(cx).await {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    return Err(ModernHttpSubscriptionListenError::EndOfStream {
+                        framing: stream.end_of_stream(),
+                    });
+                }
+                Err(ModernHttpExecutorError::Cancelled) => {
+                    return Err(ModernHttpSubscriptionListenError::Cancelled {
+                        request_id: request_id.clone(),
+                    });
+                }
+                Err(error) => return Err(ModernHttpSubscriptionListenError::Executor(error)),
+            };
+            let message = decode_strict_jsonrpc_message(event.as_bytes(), maximum_jsonrpc_bytes)
+                .map_err(ModernHttpSubscriptionListenError::JsonRpcAdmission)?;
+
+            match message {
+                JsonRpcMessage::Response(response) => {
+                    return collect_final_subscriptions_terminal(
+                        &core_request,
+                        response,
+                        request_id,
+                        accepted_filter,
+                        notifications,
+                    );
+                }
+                JsonRpcMessage::Request(request) => {
+                    let notification = ServerNotification::decode(&request)
+                        .map_err(ModernHttpSubscriptionListenError::NotificationAdmission)?;
+                    match notification {
+                        ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
+                            if accepted_filter.is_some() {
+                                return Err(
+                                    ModernHttpSubscriptionListenError::DuplicateAcknowledgement,
+                                );
+                            }
+                            validate_http_subscription_acknowledgement(
+                                &request_id,
+                                &requested,
+                                &acknowledgement,
+                            )?;
+                            accepted_filter = Some(acknowledgement.notifications);
+                        }
+                        ServerNotification::Cancelled(cancellation) => {
+                            if cancellation.request_id != request_id {
+                                return Err(
+                                    ModernHttpSubscriptionListenError::CancellationIdMismatch {
+                                        expected: request_id,
+                                        actual: cancellation.request_id,
+                                    },
+                                );
+                            }
+                            return Err(ModernHttpSubscriptionListenError::Cancelled {
+                                request_id,
+                            });
+                        }
+                        notification @ (ServerNotification::ResourcesListChanged(_)
+                        | ServerNotification::ToolsListChanged(_)
+                        | ServerNotification::PromptsListChanged(_)
+                        | ServerNotification::ResourceUpdated(_)) => {
+                            let Some(accepted_filter) = accepted_filter.as_ref() else {
+                                return Err(
+                                    ModernHttpSubscriptionListenError::EventBeforeAcknowledgement,
+                                );
+                            };
+                            validate_http_subscription_notification_filter(
+                                &notification,
+                                accepted_filter,
+                            )?;
+                            notifications.push(notification);
+                        }
+                        notification @ (ServerNotification::Progress(_)
+                        | ServerNotification::Message(_)) => notifications.push(notification),
+                    }
+                }
+            }
+        }
+    }
+
     /// Reads a finite response body into memory under an explicit caller bound.
     ///
     /// This consumes the stream. It is appropriate for the disposable modern
@@ -350,6 +460,396 @@ impl ModernHttpSseResponseStream {
     #[must_use]
     pub const fn end_of_stream(&self) -> Option<SseEndOfStream> {
         self.end_of_stream
+    }
+}
+
+/// The terminal record collected from one final HTTP `subscriptions/listen`
+/// response stream.
+///
+/// The acknowledgement is retained separately because it establishes the
+/// accepted subscription filter. `notifications` preserves the wire order of
+/// every typed notification belonging to this request after that
+/// acknowledgement. The acknowledgement itself and a terminal cancellation
+/// are control frames, not ordinary subscription events.
+#[derive(Debug, Clone)]
+pub struct ModernHttpSubscriptionListenCollector {
+    /// The JSON-RPC request ID that owns this response stream.
+    pub subscription_id: RequestId,
+    /// The exact subset of requested notification categories accepted by the server.
+    pub accepted_filter: SubscriptionFilter,
+    /// Request-owned typed notifications in received wire order.
+    pub notifications: Vec<ServerNotification>,
+    /// The final complete result terminating the subscription stream.
+    pub terminal: CompleteResult<FinalSubscriptionsListenResult>,
+}
+
+/// Errors raised while consuming one final HTTP `subscriptions/listen` SSE
+/// response stream.
+#[derive(Debug)]
+pub enum ModernHttpSubscriptionListenError {
+    /// The supplied request ID is not a valid JSON-RPC correlation key.
+    InvalidRequestId,
+    /// Constructing or issuing the final `subscriptions/listen` request failed.
+    Request(ModernHttpClientError),
+    /// The response did not use the required SSE body lane or could not be read.
+    Executor(ModernHttpExecutorError),
+    /// An SSE event was not one strictly admitted JSON-RPC object.
+    JsonRpcAdmission(JsonRpcAdmissionError),
+    /// A server request was not one typed final server notification.
+    NotificationAdmission(FinalNotificationError),
+    /// The server emitted a response for a request other than this listener.
+    ResponseIdMismatch {
+        /// The immutable ID assigned to the outgoing listen request.
+        expected: RequestId,
+        /// The response ID observed on the SSE stream.
+        actual: Option<RequestId>,
+    },
+    /// The server terminated the listener with a JSON-RPC error.
+    RemoteError {
+        /// The remote JSON-RPC error code.
+        code: i32,
+        /// The remote JSON-RPC error message.
+        message: String,
+    },
+    /// The exact final `subscriptions/listen` terminal result was invalid.
+    TerminalResult(CoreDispatchError),
+    /// The selected core result was not a final subscriptions/listen result.
+    UnexpectedTerminalResult,
+    /// The terminal subscription ID did not bind to the outgoing request.
+    TerminalIdMismatch {
+        /// The immutable ID assigned to the outgoing listen request.
+        expected: RequestId,
+        /// The subscription ID decoded from the terminal result metadata.
+        actual: RequestId,
+    },
+    /// The stream ended successfully before its required acknowledgement.
+    TerminalBeforeAcknowledgement,
+    /// The stream delivered a duplicate subscription acknowledgement.
+    DuplicateAcknowledgement,
+    /// An acknowledgement omitted its required subscription ID metadata.
+    AcknowledgementMissingId,
+    /// An acknowledgement subscription ID could not be decoded as JSON-RPC ID.
+    AcknowledgementInvalidId,
+    /// An acknowledgement was bound to a different listener.
+    AcknowledgementIdMismatch {
+        /// The immutable ID assigned to the outgoing listen request.
+        expected: RequestId,
+        /// The subscription ID decoded from acknowledgement metadata.
+        actual: RequestId,
+    },
+    /// An acknowledgement accepted a category that the caller did not request.
+    AcknowledgementFilterNotRequested { category: &'static str },
+    /// An acknowledgement accepted an invalid resource-update URI set.
+    AcknowledgementResourceFilterNotRequested,
+    /// An acknowledgement accepted an unrequested extension filter.
+    AcknowledgementExtensionFilterNotRequested,
+    /// A subscription event arrived before acknowledgement established its filter.
+    EventBeforeAcknowledgement,
+    /// A subscription event was outside the accepted filter.
+    EventOutsideAcceptedFilter,
+    /// A final cancellation targeted another request instead of this listener.
+    CancellationIdMismatch {
+        /// The immutable ID assigned to the outgoing listen request.
+        expected: RequestId,
+        /// The request ID carried by the cancellation notification.
+        actual: RequestId,
+    },
+    /// The server cancelled this request-owned listener.
+    Cancelled { request_id: RequestId },
+    /// The SSE stream reached EOF without a complete terminal result.
+    EndOfStream {
+        /// The parser's exact report of discarded framing at EOF.
+        framing: Option<SseEndOfStream>,
+    },
+}
+
+impl fmt::Display for ModernHttpSubscriptionListenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequestId => {
+                formatter.write_str("subscriptions/listen requires a valid JSON-RPC request ID")
+            }
+            Self::Request(error) => error.fmt(formatter),
+            Self::Executor(error) => error.fmt(formatter),
+            Self::JsonRpcAdmission(error) => write!(
+                formatter,
+                "subscriptions/listen SSE event failed strict JSON-RPC admission: {error}"
+            ),
+            Self::NotificationAdmission(error) => write!(
+                formatter,
+                "subscriptions/listen SSE event was not a valid final server notification: {error}"
+            ),
+            Self::ResponseIdMismatch { expected, actual } => write!(
+                formatter,
+                "subscriptions/listen response ID {actual:?} did not match request {expected:?}"
+            ),
+            Self::RemoteError { code, message } => {
+                write!(formatter, "subscriptions/listen failed with JSON-RPC {code}: {message}")
+            }
+            Self::TerminalResult(error) => write!(
+                formatter,
+                "invalid subscriptions/listen terminal result: {error}"
+            ),
+            Self::UnexpectedTerminalResult => {
+                formatter.write_str("subscriptions/listen received a non-listen terminal result")
+            }
+            Self::TerminalIdMismatch { expected, actual } => write!(
+                formatter,
+                "subscriptions/listen terminal ID {actual:?} did not match request {expected:?}"
+            ),
+            Self::TerminalBeforeAcknowledgement => {
+                formatter.write_str("subscriptions/listen terminated before acknowledgement")
+            }
+            Self::DuplicateAcknowledgement => {
+                formatter.write_str("subscriptions/listen received a duplicate acknowledgement")
+            }
+            Self::AcknowledgementMissingId => {
+                formatter.write_str("subscriptions/listen acknowledgement is missing its subscription ID")
+            }
+            Self::AcknowledgementInvalidId => formatter
+                .write_str("subscriptions/listen acknowledgement has an invalid subscription ID"),
+            Self::AcknowledgementIdMismatch { expected, actual } => write!(
+                formatter,
+                "subscriptions/listen acknowledgement ID {actual:?} did not match request {expected:?}"
+            ),
+            Self::AcknowledgementFilterNotRequested { category } => write!(
+                formatter,
+                "subscriptions/listen acknowledgement accepted unrequested {category} notifications"
+            ),
+            Self::AcknowledgementResourceFilterNotRequested => formatter.write_str(
+                "subscriptions/listen acknowledgement accepted unrequested resource update notifications",
+            ),
+            Self::AcknowledgementExtensionFilterNotRequested => formatter.write_str(
+                "subscriptions/listen acknowledgement accepted an unrequested extension filter",
+            ),
+            Self::EventBeforeAcknowledgement => formatter
+                .write_str("subscriptions/listen received a subscription event before acknowledgement"),
+            Self::EventOutsideAcceptedFilter => formatter
+                .write_str("subscriptions/listen received an event outside its accepted filter"),
+            Self::CancellationIdMismatch { expected, actual } => write!(
+                formatter,
+                "subscriptions/listen cancellation ID {actual:?} did not match request {expected:?}"
+            ),
+            Self::Cancelled { request_id } => write!(
+                formatter,
+                "subscriptions/listen request {request_id:?} was cancelled by the server"
+            ),
+            Self::EndOfStream { .. } => formatter.write_str(
+                "subscriptions/listen SSE reached EOF before terminal complete result",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModernHttpSubscriptionListenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Request(error) => Some(error),
+            Self::Executor(error) => Some(error),
+            Self::JsonRpcAdmission(error) => Some(error),
+            Self::NotificationAdmission(error) => Some(error),
+            Self::TerminalResult(error) => Some(error),
+            Self::InvalidRequestId
+            | Self::ResponseIdMismatch { .. }
+            | Self::RemoteError { .. }
+            | Self::UnexpectedTerminalResult
+            | Self::TerminalIdMismatch { .. }
+            | Self::TerminalBeforeAcknowledgement
+            | Self::DuplicateAcknowledgement
+            | Self::AcknowledgementMissingId
+            | Self::AcknowledgementInvalidId
+            | Self::AcknowledgementIdMismatch { .. }
+            | Self::AcknowledgementFilterNotRequested { .. }
+            | Self::AcknowledgementResourceFilterNotRequested
+            | Self::AcknowledgementExtensionFilterNotRequested
+            | Self::EventBeforeAcknowledgement
+            | Self::EventOutsideAcceptedFilter
+            | Self::CancellationIdMismatch { .. }
+            | Self::Cancelled { .. }
+            | Self::EndOfStream { .. } => None,
+        }
+    }
+}
+
+fn final_subscriptions_listen_core_request(
+    requested: &SubscriptionFilter,
+) -> Result<CoreRequest, ModernHttpSubscriptionListenError> {
+    let parameters = serde_json::json!({
+        "_meta": FinalRequestMeta::new(ClientCapabilities::default()),
+        "notifications": requested,
+    });
+    CoreRequest::decode(
+        ProtocolEra::Modern2026,
+        SUBSCRIPTIONS_LISTEN,
+        Some(&parameters),
+    )
+    .map_err(ModernHttpSubscriptionListenError::TerminalResult)
+}
+
+fn collect_final_subscriptions_terminal(
+    core_request: &CoreRequest,
+    response: JsonRpcResponse,
+    expected_id: RequestId,
+    accepted_filter: Option<SubscriptionFilter>,
+    notifications: Vec<ServerNotification>,
+) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
+    if response.id.as_ref() != Some(&expected_id) {
+        return Err(ModernHttpSubscriptionListenError::ResponseIdMismatch {
+            expected: expected_id,
+            actual: response.id,
+        });
+    }
+    if let Some(error) = response.error.as_ref() {
+        return Err(ModernHttpSubscriptionListenError::RemoteError {
+            code: error.code,
+            message: error.message.clone(),
+        });
+    }
+    let result = core_request
+        .decode_response(&response)
+        .map_err(ModernHttpSubscriptionListenError::TerminalResult)?;
+    let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
+        result: terminal,
+        subscription_id,
+        ..
+    }) = result
+    else {
+        return Err(ModernHttpSubscriptionListenError::UnexpectedTerminalResult);
+    };
+    if subscription_id != expected_id {
+        return Err(ModernHttpSubscriptionListenError::TerminalIdMismatch {
+            expected: expected_id,
+            actual: subscription_id,
+        });
+    }
+    let Some(accepted_filter) = accepted_filter else {
+        return Err(ModernHttpSubscriptionListenError::TerminalBeforeAcknowledgement);
+    };
+    Ok(ModernHttpSubscriptionListenCollector {
+        subscription_id,
+        accepted_filter,
+        notifications,
+        terminal,
+    })
+}
+
+fn validate_http_subscription_acknowledgement(
+    expected_id: &RequestId,
+    requested: &SubscriptionFilter,
+    acknowledgement: &FinalSubscriptionsAcknowledgedNotificationParams,
+) -> Result<(), ModernHttpSubscriptionListenError> {
+    let subscription_id = acknowledgement
+        .meta
+        .as_ref()
+        .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+        .ok_or(ModernHttpSubscriptionListenError::AcknowledgementMissingId)
+        .and_then(|value| {
+            serde_json::from_value::<RequestId>(value.clone())
+                .map_err(|_| ModernHttpSubscriptionListenError::AcknowledgementInvalidId)
+        })?;
+    if &subscription_id != expected_id {
+        return Err(
+            ModernHttpSubscriptionListenError::AcknowledgementIdMismatch {
+                expected: expected_id.clone(),
+                actual: subscription_id,
+            },
+        );
+    }
+    validate_http_subscription_acknowledgement_filter(requested, &acknowledgement.notifications)
+}
+
+fn validate_http_subscription_acknowledgement_filter(
+    requested: &SubscriptionFilter,
+    acknowledged: &SubscriptionFilter,
+) -> Result<(), ModernHttpSubscriptionListenError> {
+    for (category, requested, acknowledged) in [
+        (
+            "prompts/list_changed",
+            requested.prompts_list_changed,
+            acknowledged.prompts_list_changed,
+        ),
+        (
+            "resources/list_changed",
+            requested.resources_list_changed,
+            acknowledged.resources_list_changed,
+        ),
+        (
+            "tools/list_changed",
+            requested.tools_list_changed,
+            acknowledged.tools_list_changed,
+        ),
+    ] {
+        match acknowledged {
+            None => {}
+            Some(true) if requested == Some(true) => {}
+            Some(_) => {
+                return Err(
+                    ModernHttpSubscriptionListenError::AcknowledgementFilterNotRequested {
+                        category,
+                    },
+                );
+            }
+        }
+    }
+
+    if let Some(acknowledged_uris) = &acknowledged.resource_subscriptions {
+        let Some(requested_uris) = &requested.resource_subscriptions else {
+            return Err(
+                ModernHttpSubscriptionListenError::AcknowledgementResourceFilterNotRequested,
+            );
+        };
+        for (index, uri) in acknowledged_uris.iter().enumerate() {
+            if !requested_uris
+                .iter()
+                .any(|requested_uri| requested_uri == uri)
+                || acknowledged_uris[..index]
+                    .iter()
+                    .any(|previous_uri| previous_uri == uri)
+            {
+                return Err(
+                    ModernHttpSubscriptionListenError::AcknowledgementResourceFilterNotRequested,
+                );
+            }
+        }
+    }
+
+    if acknowledged.additional.iter().any(|(name, value)| {
+        requested
+            .additional
+            .get(name)
+            .is_none_or(|requested_value| requested_value != value)
+    }) {
+        return Err(ModernHttpSubscriptionListenError::AcknowledgementExtensionFilterNotRequested);
+    }
+
+    Ok(())
+}
+
+fn validate_http_subscription_notification_filter(
+    notification: &ServerNotification,
+    accepted_filter: &SubscriptionFilter,
+) -> Result<(), ModernHttpSubscriptionListenError> {
+    let accepted = match notification {
+        ServerNotification::ResourcesListChanged(_) => {
+            accepted_filter.resources_list_changed == Some(true)
+        }
+        ServerNotification::ToolsListChanged(_) => accepted_filter.tools_list_changed == Some(true),
+        ServerNotification::PromptsListChanged(_) => {
+            accepted_filter.prompts_list_changed == Some(true)
+        }
+        ServerNotification::ResourceUpdated(update) => accepted_filter
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| uris.iter().any(|uri| uri == update.uri.as_str())),
+        ServerNotification::Cancelled(_)
+        | ServerNotification::Progress(_)
+        | ServerNotification::Message(_)
+        | ServerNotification::SubscriptionsAcknowledged(_) => false,
+    };
+    if accepted {
+        Ok(())
+    } else {
+        Err(ModernHttpSubscriptionListenError::EventOutsideAcceptedFilter)
     }
 }
 
@@ -587,6 +1087,10 @@ pub enum ClientHttpConnectionError {
         expected: RequestId,
         actual: Option<RequestId>,
     },
+    /// Final `subscriptions/listen` requires the modern HTTP transport.
+    SubscriptionsListenRequiresModern,
+    /// A modern subscription response stream failed typed admission or collection.
+    SubscriptionsListen(ModernHttpSubscriptionListenError),
 }
 
 impl fmt::Display for ClientHttpConnectionError {
@@ -612,6 +1116,10 @@ impl fmt::Display for ClientHttpConnectionError {
                     "legacy SSE response ID {actual:?} did not match request {expected:?}"
                 )
             }
+            Self::SubscriptionsListenRequiresModern => {
+                formatter.write_str("subscriptions/listen requires the modern HTTP transport")
+            }
+            Self::SubscriptionsListen(error) => error.fmt(formatter),
         }
     }
 }
@@ -623,7 +1131,9 @@ impl std::error::Error for ClientHttpConnectionError {
             Self::Legacy(error) => Some(error),
             Self::LegacyResponseStreamEnded { .. }
             | Self::LegacyUnexpectedMessage { .. }
-            | Self::LegacyResponseIdMismatch { .. } => None,
+            | Self::LegacyResponseIdMismatch { .. }
+            | Self::SubscriptionsListenRequiresModern => None,
+            Self::SubscriptionsListen(error) => Some(error),
         }
     }
 }
@@ -709,6 +1219,28 @@ impl ClientHttpConnection {
                 }
                 Ok(ClientHttpResponse::Legacy(message))
             }
+        }
+    }
+
+    /// Opens and consumes one typed final `subscriptions/listen` HTTP stream.
+    ///
+    /// This operation is unavailable once the immutable connection plan has
+    /// selected exact MCP 2024-11-05. Modern streams require one explicit SSE
+    /// parser bound so the caller, rather than ambient transport state, fixes
+    /// response framing limits.
+    pub async fn listen_subscriptions_typed(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        notifications: SubscriptionFilter,
+        limits: SseLimits,
+    ) -> Result<ModernHttpSubscriptionListenCollector, ClientHttpConnectionError> {
+        match self {
+            Self::Modern(client) => client
+                .listen_subscriptions_typed(cx, request_id, notifications, limits)
+                .await
+                .map_err(ClientHttpConnectionError::SubscriptionsListen),
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::SubscriptionsListenRequiresModern),
         }
     }
 
@@ -975,6 +1507,36 @@ impl ModernHttpClient {
             .execute(cx, &request)
             .await
             .map_err(ModernHttpClientError::Executor)
+    }
+
+    /// Opens and consumes one typed final `subscriptions/listen` HTTP stream.
+    ///
+    /// The request is emitted with the same immutable final metadata as every
+    /// other modern HTTP request. The returned collector contains the exact
+    /// acknowledgement filter, ordered typed notifications, and complete
+    /// terminal result only after every stream frame passes strict admission.
+    pub async fn listen_subscriptions_typed(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        notifications: SubscriptionFilter,
+        limits: SseLimits,
+    ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
+        if request_id.validate().is_err() {
+            return Err(ModernHttpSubscriptionListenError::InvalidRequestId);
+        }
+        let response = self
+            .request(
+                cx,
+                SUBSCRIPTIONS_LISTEN,
+                serde_json::json!({ "notifications": notifications.clone() }),
+                Some(request_id.clone()),
+            )
+            .await
+            .map_err(ModernHttpSubscriptionListenError::Request)?;
+        response
+            .collect_final_subscriptions_listen(cx, request_id, notifications, limits)
+            .await
     }
 }
 
@@ -1790,14 +2352,15 @@ mod tests {
 
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
-    use fastmcp_protocol::RequestId;
+    use fastmcp_protocol::{RequestId, ServerNotification, SubscriptionFilter};
 
     use super::{
         ClientHttpConnectionError, ClientHttpResponse, LegacySseHttpClientError,
         MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpClientError,
-        ModernHttpExecutorError, ModernHttpResponseKind, decode_modern_discovery_response,
-        validate_response_head,
+        ModernHttpExecutorError, ModernHttpResponseKind, ModernHttpSubscriptionListenError,
+        decode_modern_discovery_response, validate_response_head,
     };
+    use crate::sse::SseLimits;
     use crate::{CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ProtocolEra, ProtocolPolicy};
 
     #[derive(Debug)]
@@ -1922,6 +2485,17 @@ mod tests {
 
     fn modern_discovery_body() -> &'static [u8] {
         br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#
+    }
+
+    fn subscriptions_listen_sse_events(acknowledgement_id: i64) -> [String; 4] {
+        [
+            format!(
+                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":{acknowledgement_id}}},\"notifications\":{{\"toolsListChanged\":true,\"promptsListChanged\":true}}}}}}\n\n"
+            ),
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n".to_owned(),
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}\n\n".to_owned(),
+            "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2}}}\n\n".to_owned(),
+        ]
     }
 
     #[test]
@@ -2062,6 +2636,169 @@ mod tests {
             "complete"
         );
         server.join().expect("local modern server must join");
+    }
+
+    #[test]
+    fn public_http_modern_subscriptions_listen_collects_ordered_typed_notifications() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind local final subscriptions/listen listener");
+        let address = listener
+            .local_addr()
+            .expect("read local final subscriptions/listen address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept final subscriptions/listen request");
+            let request = read_request(&mut stream);
+            assert!(request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .head
+                    .contains("Mcp-Method: subscriptions/listen\r\n")
+            );
+            let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("subscriptions/listen request must be JSON-RPC");
+            assert_eq!(body["id"], 2);
+            assert_eq!(body["method"], "subscriptions/listen");
+            assert_eq!(
+                body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                "2026-07-28"
+            );
+            assert_eq!(body["params"]["notifications"]["toolsListChanged"], true);
+            assert_eq!(body["params"]["notifications"]["promptsListChanged"], true);
+
+            begin_chunked_sse(&mut stream);
+            for event in subscriptions_listen_sse_events(2) {
+                write_chunked_sse_event(&mut stream, &event);
+            }
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("modern discovery selects final HTTP subscriptions/listen");
+        let collector = runtime_block_on(connection.listen_subscriptions_typed(
+            &cx,
+            RequestId::Number(2),
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                prompts_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+            SseLimits::new(1_024, 8_192, 16).expect("explicit SSE bounds are nonzero"),
+        ))
+        .expect("typed final HTTP listener admits acknowledgement, ordered events, and terminal");
+
+        assert_eq!(collector.subscription_id, RequestId::Number(2));
+        assert_eq!(collector.accepted_filter.tools_list_changed, Some(true));
+        assert_eq!(collector.accepted_filter.prompts_list_changed, Some(true));
+        assert!(matches!(
+            collector.notifications.as_slice(),
+            [
+                ServerNotification::ToolsListChanged(None),
+                ServerNotification::PromptsListChanged(None)
+            ]
+        ));
+        assert!(matches!(
+            collector.terminal.payload,
+            fastmcp_protocol::FinalSubscriptionsListenResult {}
+        ));
+        server
+            .join()
+            .expect("final subscriptions/listen server must join");
+    }
+
+    #[test]
+    fn public_http_modern_subscriptions_listen_rejects_one_field_acknowledgement_id_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind local malformed final subscriptions/listen listener");
+        let address = listener
+            .local_addr()
+            .expect("read local malformed final subscriptions/listen address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept final subscriptions/listen request");
+            let request = read_request(&mut stream);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("subscriptions/listen request must be JSON-RPC")["method"],
+                "subscriptions/listen"
+            );
+            begin_chunked_sse(&mut stream);
+            // This differs from the admitted stream only in the acknowledgement ID.
+            for event in subscriptions_listen_sse_events(3) {
+                write_chunked_sse_event(&mut stream, &event);
+            }
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("modern discovery selects final HTTP subscriptions/listen");
+        let error = runtime_block_on(connection.listen_subscriptions_typed(
+            &cx,
+            RequestId::Number(2),
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                prompts_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+            SseLimits::new(1_024, 8_192, 16).expect("explicit SSE bounds are nonzero"),
+        ))
+        .expect_err("only the acknowledgement subscription ID differs from the admitted stream");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::SubscriptionsListen(
+                ModernHttpSubscriptionListenError::AcknowledgementIdMismatch {
+                    expected: RequestId::Number(2),
+                    actual: RequestId::Number(3),
+                }
+            )
+        ));
+        server
+            .join()
+            .expect("malformed final subscriptions/listen server must join");
     }
 
     #[test]
