@@ -52,16 +52,16 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex, TryLockError,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
-use asupersync::{channel::mpsc, Cx};
+use asupersync::{Cx, channel::mpsc};
 use fastmcp_core::draw_security_identifier;
 use fastmcp_protocol::protocol_version::{
-    admit_final_http_request, FinalHttpRequestMetadata, RequestAdmissionError,
-    RequestVersionMetadata,
+    FinalHttpRequestMetadata, RequestAdmissionError, RequestVersionMetadata,
+    admit_final_http_request,
 };
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 
@@ -2207,7 +2207,7 @@ fn release_streamable_bytes(retained_bytes: &AtomicUsize, serialized_bytes: usiz
 
 fn http_checkpoint(cx: &Cx) -> Result<(), TransportError> {
     cx.checkpoint().map_err(|error| {
-        use asupersync::{error::ErrorKind, CancelKind};
+        use asupersync::{CancelKind, error::ErrorKind};
 
         match cx.cancel_reason().map(|reason| reason.kind) {
             Some(CancelKind::Deadline | CancelKind::Timeout) => TransportError::Timeout,
@@ -5710,10 +5710,12 @@ X-Checksum: abc123\r\n\
             .retained_bytes;
         assert!(retained_before > 0);
 
-        assert!(response_stream
-            .pop_response(Some(&RequestId::Number(404)))
-            .expect("unmatched pop is not terminal")
-            .is_none());
+        assert!(
+            response_stream
+                .pop_response(Some(&RequestId::Number(404)))
+                .expect("unmatched pop is not terminal")
+                .is_none()
+        );
         assert_eq!(transport.pending_responses(), 1);
         assert_eq!(
             transport
