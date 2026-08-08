@@ -236,6 +236,21 @@ pub use fastmcp_protocol::extensions::{
     register_official_tasks_extension,
 };
 
+pub use fastmcp_protocol::tasks_extension;
+pub use fastmcp_protocol::{
+    CompleteTaskResult, CreateTaskResult, EmptyTaskResult, FinalCancelTaskParams,
+    FinalCancelTaskResult, FinalGetTaskParams, FinalGetTaskResult, FinalTask,
+    FinalTaskCallToolResult, FinalTaskError, FinalTaskId, FinalTaskInputResponses, FinalTaskStatus,
+    FinalTaskStatusNotification, FinalTaskStatusNotificationParams, FinalUpdateTaskResult,
+    MAX_TASK_ID_BYTES, MAX_TASK_INPUT_MAP_ENTRIES, MAX_TASK_SUBSCRIPTION_IDS,
+    RELATED_TASK_META_KEY, TASK_CANCEL, TASK_GET, TASK_STATUS_NOTIFICATION,
+    TASK_SUBSCRIPTION_IDS_KEY, TASK_UPDATE, TASKS_EXTENSION, TaskBase as FinalTaskBase,
+    TaskDuration as FinalTaskDuration, TaskInputLedger as FinalTaskInputLedger,
+    TaskInputRequests as FinalTaskInputRequests, TaskMethodRequest as FinalTaskMethodRequest,
+    TaskRequestMeta as FinalTaskRequestMeta, TaskTimestamp as FinalTaskTimestamp, TaskWireError,
+    UpdateTaskParams as FinalUpdateTaskParams, set_task_subscription_ids, task_subscription_ids,
+};
+
 // Final `server/discover` vocabulary.
 pub use fastmcp_protocol::{
     DiscoveryCacheHints, MAX_SERVER_INSTRUCTIONS_BYTES, SERVER_DISCOVER_METHOD,
@@ -279,29 +294,34 @@ pub use fastmcp_transport::http::{
     DualEraHttpSession, DualEraHttpSseResponse,
 };
 pub use fastmcp_transport::{
-    Codec, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
-    HttpResponseRepresentation, HttpStatus, ModernHttpRequestAdmission, StdioTransport,
-    StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
-    StreamableHttpResponseStream, StreamableHttpTransport, Transport, TransportError,
-    TransportRecvHalf, TransportSendHalf,
+    AsyncStdioTransport, Codec, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest,
+    HttpRequestHandler, HttpResponse, HttpResponseRepresentation, HttpStatus,
+    ModernHttpRequestAdmission, SendPermit, StdioTransport, StreamableHttpRequestCancellation,
+    StreamableHttpRequestResponseStream, StreamableHttpResponseStream, StreamableHttpTransport,
+    Transport, TransportError, TransportRecvHalf, TransportSendHalf, TwoPhaseTransport,
 };
 
 // Re-export transport modules
-pub use fastmcp_transport::{event_store, http, memory};
+pub use fastmcp_transport as transport;
+pub use fastmcp_transport::{event_store, http, memory, websocket};
 
 // Re-export server types
 // FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
-    BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalToolOutcome,
-    HttpServerConfig, InboundRequestContext, InboundRequestTransport, Middleware,
-    MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
-    ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog, ProxyClient,
-    RequestSender, ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint,
-    ServerHttpEndpointResponse, ServerHttpSession, ServerStats, Session, StaticTokenVerifier,
-    StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolHandler, TrafficVerbosity,
-    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalTaskNotificationEmitter,
+    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskStore, FinalToolOutcome, HttpServerConfig,
+    InboundRequestContext, InboundRequestTransport, Middleware, MiddlewareDecision, MountResult,
+    NotificationSender, PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend,
+    ProxyCatalog, ProxyClient, RequestSender, ResourceHandler, Router, Server, ServerBuilder,
+    ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, ServerStats, Session,
+    StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolHandler,
+    TrafficVerbosity, TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
     create_context_with_progress, create_context_with_progress_and_senders,
+};
+pub use fastmcp_server::{
+    ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
+    ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
 };
 
 // Re-export bidirectional module for namespaced access (e.g. bidirectional::RequestSender)
@@ -374,8 +394,9 @@ pub mod auto {
         HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
     };
     pub use fastmcp_protocol::{
-        ClientCapabilities, ClientInfo, FinalCallToolResult, FinalGetPromptResult,
-        FinalReadResourceResult, RequestId,
+        ClientCapabilities, ClientInfo, FinalCallToolResult, FinalCancelTaskResult,
+        FinalGetPromptResult, FinalGetTaskResult, FinalReadResourceResult, FinalTask, FinalTaskId,
+        FinalTaskInputResponses, FinalUpdateTaskResult, RequestId,
     };
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -461,46 +482,60 @@ pub mod modern {
     };
     pub use fastmcp_protocol::{
         CacheScope, CacheTtl, CacheableResult, ClientCapabilities, ClientInfo, ClientNotification,
-        CompleteResult, CompleteResultPayload, CompletionValues, CoreDispatchError, CoreRequest,
-        CoreResult, CoreResultDiscriminatorPolicy, DecodedResult, DiscoveryCacheHints,
-        ExactJsonMember, ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
+        CompleteResult, CompleteResultPayload, CompleteTaskResult, CompletionValues,
+        CoreDispatchError, CoreRequest, CoreResult, CoreResultDiscriminatorPolicy,
+        CreateTaskResult, DecodedResult, DiscoveryCacheHints, EmptyTaskResult, ExactJsonMember,
+        ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
         FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION as PROTOCOL_VERSION,
         FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY, FinalBaseMetadata,
-        FinalCallToolParams, FinalCallToolResult, FinalCancelledNotificationParams,
-        FinalCompletionArgument, FinalCompletionContext, FinalCompletionParams,
-        FinalCompletionReference, FinalCompletionResult, FinalCoreRequest, FinalCoreResult,
-        FinalCreateMessageInputRequiredResult, FinalCreateMessageParams, FinalCreateMessageResult,
-        FinalEmptyNotificationParams, FinalEmptyParams, FinalEmptyResult, FinalGetPromptParams,
-        FinalGetPromptResult, FinalHttpRequestMetadata, FinalInputRequiredResultType,
-        FinalListParams, FinalListPromptsResult, FinalListResourceTemplatesResult,
-        FinalListResourcesResult, FinalListToolsResult, FinalLogMessageParams,
-        FinalNotificationError, FinalProgressNotificationParams, FinalPrompt, FinalPromptArgument,
-        FinalPromptMessage, FinalProtocolVersion, FinalReadResourceParams, FinalReadResourceResult,
+        FinalCallToolParams, FinalCallToolResult, FinalCancelTaskParams, FinalCancelTaskResult,
+        FinalCancelledNotificationParams, FinalCompletionArgument, FinalCompletionContext,
+        FinalCompletionParams, FinalCompletionReference, FinalCompletionResult, FinalCoreRequest,
+        FinalCoreResult, FinalCreateMessageInputRequiredResult, FinalCreateMessageParams,
+        FinalCreateMessageResult, FinalEmptyNotificationParams, FinalEmptyParams, FinalEmptyResult,
+        FinalGetPromptParams, FinalGetPromptResult, FinalGetTaskParams, FinalGetTaskResult,
+        FinalHttpRequestMetadata, FinalInputRequiredResultType, FinalListParams,
+        FinalListPromptsResult, FinalListResourceTemplatesResult, FinalListResourcesResult,
+        FinalListToolsResult, FinalLogMessageParams, FinalNotificationError,
+        FinalProgressNotificationParams, FinalPrompt, FinalPromptArgument, FinalPromptMessage,
+        FinalProtocolVersion, FinalReadResourceParams, FinalReadResourceResult,
         FinalRequestAdmission, FinalRequestMeta, FinalResource, FinalResourceTemplate,
         FinalResourceUpdatedNotificationParams, FinalSamplingMessage, FinalSamplingMessageContent,
         FinalSamplingMessageContentBlock, FinalSubscriptionsAcknowledgedNotificationParams,
-        FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, FinalTool,
-        FinalToolAnnotations, FinalToolChoice, FinalToolChoiceMode, HEADER_MISMATCH_ERROR_CODE,
-        HeaderMismatchError, HeaderMismatchReason, IncludeContext, InputRequiredResult,
-        MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
-        MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES, MCP_METHOD_HEADER, MCP_NAME_HEADER,
-        MCP_PROTOCOL_VERSION_HEADER, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MetadataView,
+        FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, FinalTask,
+        FinalTaskCallToolResult, FinalTaskError, FinalTaskId, FinalTaskInputResponses,
+        FinalTaskStatus, FinalTaskStatusNotification, FinalTaskStatusNotificationParams, FinalTool,
+        FinalToolAnnotations, FinalToolChoice, FinalToolChoiceMode, FinalUpdateTaskResult,
+        HEADER_MISMATCH_ERROR_CODE, HeaderMismatchError, HeaderMismatchReason, IncludeContext,
+        InputRequiredResult, MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH,
+        MAX_RESULT_ENCODED_BYTES, MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES,
+        MAX_TASK_ID_BYTES, MAX_TASK_INPUT_MAP_ENTRIES, MAX_TASK_SUBSCRIPTION_IDS,
+        MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
+        MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MetadataView,
         MissingRequiredClientCapabilityError, ModelHint, ModelPreferences, PaginatedResult,
-        ProgressMarker, ProtocolVersionError as FinalProtocolVersionError, RawResultEnvelope,
-        RequestAdmissionError, RequestId, RequestVersionMetadata, RequiredCapabilitiesError,
-        ResultDecodeError, ResultDecodeErrorKind, ResultDiscriminatorDecision,
-        ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic, ResultPeerEra,
-        SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
+        ProgressMarker, ProtocolVersionError as FinalProtocolVersionError, RELATED_TASK_META_KEY,
+        RawResultEnvelope, RequestAdmissionError, RequestId, RequestVersionMetadata,
+        RequiredCapabilitiesError, ResultDecodeError, ResultDecodeErrorKind,
+        ResultDiscriminatorDecision, ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic,
+        ResultPeerEra, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
         SUPPORTED_FINAL_PROTOCOL_VERSIONS, ServerBehavior, ServerBehaviorRegistry,
         ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
         ServerDiscoveryError, ServerInstructionError, ServerInstructions, ServerNotification,
-        StopReason, TypedCompleteMembers, UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE,
-        UnknownResultMembers, UnsupportedProtocolVersionError, admit_final_http_request,
-        admit_final_request, decode_peer_result, decode_peer_result_for_era, decode_typed_complete,
-        encode_complete_result, encode_result, exact_json_from_serde, exact_json_to_serde,
-        parse_exact_json, validate_final_protocol_version,
+        StopReason, TASK_CANCEL, TASK_GET, TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY,
+        TASK_UPDATE, TASKS_EXTENSION, TaskBase as FinalTaskBase, TaskDuration as FinalTaskDuration,
+        TaskInputLedger as FinalTaskInputLedger, TaskInputRequests as FinalTaskInputRequests,
+        TaskMethodRequest as FinalTaskMethodRequest, TaskRequestMeta as FinalTaskRequestMeta,
+        TaskTimestamp as FinalTaskTimestamp, TaskWireError, TypedCompleteMembers,
+        UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnknownResultMembers,
+        UnsupportedProtocolVersionError, UpdateTaskParams as FinalUpdateTaskParams,
+        admit_final_http_request, admit_final_request, decode_peer_result,
+        decode_peer_result_for_era, decode_typed_complete, encode_complete_result, encode_result,
+        exact_json_from_serde, exact_json_to_serde, parse_exact_json, set_task_subscription_ids,
+        task_subscription_ids, validate_final_protocol_version,
     };
-    pub use fastmcp_protocol::{common_types, extensions, methods, protocol_policy};
+    pub use fastmcp_protocol::{
+        common_types, extensions, methods, protocol_policy, tasks_extension,
+    };
     pub use fastmcp_server::bidirectional::{
         DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND, DEFAULT_MAX_MRTR_INPUT_REQUESTS_TOTAL,
         DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES, DEFAULT_MAX_MRTR_REQUEST_STATES,
@@ -513,23 +548,28 @@ pub mod modern {
     };
     pub use fastmcp_server::{
         AuthProvider, AuthRequest, BidirectionalSenders, BoundHttpServer, BoxFuture,
-        CompletionHandler, FinalToolOutcome, HttpServerConfig, InboundRequestContext,
-        InboundRequestTransport, Middleware, MiddlewareDecision, MountResult,
-        ProgressNotificationSender, PromptHandler, ResourceHandler, Router, Server, ServerBuilder,
-        ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, TagFilters, ToolHandler,
+        CompletionHandler, ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
+        ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
+        FinalTaskNotificationEmitter, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskStore,
+        FinalToolOutcome, HttpServerConfig, InboundRequestContext, InboundRequestTransport,
+        Middleware, MiddlewareDecision, MountResult, ProgressNotificationSender, PromptHandler,
+        ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint,
+        ServerHttpEndpointResponse, ServerHttpSession, TagFilters, ToolHandler,
         create_context_with_progress, create_context_with_progress_and_senders,
     };
+    pub use fastmcp_transport as transport;
     pub use fastmcp_transport::http::{
         DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
         DualEraHttpEndpointResponse, DualEraHttpJsonResponse, DualEraHttpLegacySseResponse,
         DualEraHttpSession, DualEraHttpSseResponse,
     };
     pub use fastmcp_transport::{
-        Codec, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
-        HttpResponse, HttpResponseRepresentation, HttpStatus, ModernHttpRequestAdmission,
-        StdioTransport, StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
-        StreamableHttpResponseStream, StreamableHttpTransport, Transport, TransportError,
-        TransportRecvHalf, TransportSendHalf, http, memory,
+        AsyncStdioTransport, Codec, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest,
+        HttpRequestHandler, HttpResponse, HttpResponseRepresentation, HttpStatus,
+        ModernHttpRequestAdmission, SendPermit, StdioTransport, StreamableHttpRequestCancellation,
+        StreamableHttpRequestResponseStream, StreamableHttpResponseStream, StreamableHttpTransport,
+        Transport, TransportError, TransportRecvHalf, TransportSendHalf, TwoPhaseTransport, http,
+        memory, websocket,
     };
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -664,8 +704,14 @@ pub mod prelude {
         FinalReadResourceResult,
         FinalResourceUpdatedNotificationParams,
         FinalSubscriptionsAcknowledgedNotificationParams,
+        FinalTask,
+        FinalTaskCallToolResult,
+        FinalTaskId,
+        FinalTaskInputResponses,
+        FinalTaskStatusNotification,
         FinalToolCallOutcome,
         FinalToolOutcome,
+        FinalUpdateTaskResult,
         HttpEndpointBundle,
         HttpEndpointBundleError,
         HttpEndpointConfig,
@@ -743,6 +789,7 @@ pub mod prelude {
         Tool,
         TransportRecvHalf,
         TransportSendHalf,
+        TwoPhaseTransport,
         auto,
         cancelled,
         err,
@@ -1077,6 +1124,76 @@ mod tests {
         let _: Option<modern::DualEraHttpEndpoint> = None;
         let _: Option<modern::DualEraHttpEndpointConfig> = None;
         let _: Option<modern::DualEraHttpEndpointError> = None;
+    }
+
+    #[test]
+    fn api_03_facade_exposes_modern_tasks_extension_contracts() {
+        use super::{
+            Client, FinalCancelTaskResult, FinalGetTaskResult, FinalTask, FinalTaskId,
+            FinalTaskInputResponses, FinalUpdateTaskResult, McpResult, SubscriptionFilter, auto,
+            modern,
+        };
+
+        let task_id = modern::FinalTaskId::parse("task-42")
+            .expect("facade must expose final task identifier admission");
+        let mut filter = SubscriptionFilter::default();
+        modern::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
+            .expect("facade must compose the negotiated Tasks subscription fragment");
+        let selected = modern::task_subscription_ids(&filter)
+            .expect("facade must decode the negotiated Tasks subscription fragment")
+            .expect("Tasks subscription fragment must remain present");
+        assert_eq!(selected, vec![task_id]);
+
+        let _: fn(&mut Client, FinalTaskId) -> McpResult<FinalGetTaskResult> =
+            Client::get_task_final;
+        let _: fn(
+            &mut Client,
+            &FinalTask,
+            FinalTaskInputResponses,
+        ) -> McpResult<FinalUpdateTaskResult> = Client::update_task_final;
+        let _: fn(&mut Client, FinalTaskId) -> McpResult<FinalCancelTaskResult> =
+            Client::cancel_task_final;
+        let _: fn(
+            &mut auto::Client,
+            auto::FinalTaskId,
+        ) -> auto::McpResult<auto::FinalGetTaskResult> = auto::Client::get_task_final;
+        let _: Option<modern::FinalTaskRuntime> = None;
+        let _: Option<modern::ExtensionHandlerRegistry> = None;
+    }
+
+    #[test]
+    fn api_03_facade_exposes_split_transport_contracts() {
+        use std::io::Cursor;
+
+        use super::{
+            AsyncStdioTransport, StdioTransport, Transport, TransportRecvHalf, TransportSendHalf,
+            TwoPhaseTransport, modern, transport,
+        };
+
+        fn requires_two_phase_transport<T: TwoPhaseTransport>() {}
+        fn requires_split_halves<R: TransportRecvHalf, W: TransportSendHalf>() {}
+
+        requires_two_phase_transport::<StdioTransport<Cursor<Vec<u8>>, Vec<u8>>>();
+        let _: Option<AsyncStdioTransport> = None;
+        let _: Option<transport::websocket::WsFrame> = None;
+        let _: Option<modern::transport::sse::SseEvent> = None;
+        let _: Option<&dyn Transport> = None;
+        let _ = requires_split_halves::<
+            transport::websocket::WsServerRecvHalf<Cursor<Vec<u8>>, Vec<u8>>,
+            transport::websocket::WsServerSendHalf<Vec<u8>>,
+        >;
+    }
+
+    #[test]
+    fn api_03_tasks_policy_rejects_one_dimension_invalid_identifier() {
+        use super::modern;
+
+        let admitted = modern::FinalTaskId::parse("task-42")
+            .expect("baseline final task identifier must be admitted");
+        let rejected = modern::FinalTaskId::parse(format!("{}\u{0000}", admitted.as_str()))
+            .expect_err("changing only the identifier to include a control code point must reject");
+
+        assert_eq!(rejected, modern::TaskWireError::Invalid("taskId"));
     }
 
     #[test]

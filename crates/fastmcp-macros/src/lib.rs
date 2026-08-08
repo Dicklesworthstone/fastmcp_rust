@@ -882,6 +882,60 @@ fn generate_tool_execution_methods(
     result_conversion: &TokenStream2,
     final_result_conversion: Option<&TokenStream2>,
 ) -> TokenStream2 {
+    let modern_request_methods = quote! {
+        fn call_async_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            _request_cx: &'a fastmcp_core::Cx,
+            arguments: serde_json::Value,
+        ) -> fastmcp_server::BoxFuture<
+            'a,
+            fastmcp_core::McpOutcome<Vec<fastmcp_protocol::Content>>,
+        > {
+            self.call_async(ctx, arguments)
+        }
+
+        fn call_final_async_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            _request_cx: &'a fastmcp_core::Cx,
+            arguments: serde_json::Value,
+        ) -> fastmcp_server::BoxFuture<
+            'a,
+            fastmcp_core::McpOutcome<
+                fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>,
+            >,
+        > {
+            self.call_final_async(ctx, arguments)
+        }
+
+        fn call_final_outcome_async_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            request_cx: &'a fastmcp_core::Cx,
+            arguments: serde_json::Value,
+        ) -> fastmcp_server::BoxFuture<
+            'a,
+            fastmcp_core::McpOutcome<fastmcp_server::FinalToolOutcome>,
+        > {
+            Box::pin(async move {
+                match self.call_final_async_in_request(ctx, request_cx, arguments).await {
+                    fastmcp_core::Outcome::Ok(result) => {
+                        fastmcp_core::Outcome::Ok(
+                            fastmcp_server::FinalToolOutcome::Complete(result),
+                        )
+                    }
+                    fastmcp_core::Outcome::Err(error) => fastmcp_core::Outcome::Err(error),
+                    fastmcp_core::Outcome::Cancelled(reason) => {
+                        fastmcp_core::Outcome::Cancelled(reason)
+                    }
+                    fastmcp_core::Outcome::Panicked(payload) => {
+                        fastmcp_core::Outcome::Panicked(payload)
+                    }
+                }
+            })
+        }
+    };
     let sync_invocation = if expects_context {
         quote! { #fn_name(ctx, #(#param_names),*) }
     } else {
@@ -926,6 +980,8 @@ fn generate_tool_execution_methods(
             }
 
             #final_method
+
+            #modern_request_methods
         };
     }
 
@@ -1009,6 +1065,8 @@ fn generate_tool_execution_methods(
         }
 
         #final_method
+
+        #modern_request_methods
     }
 }
 
@@ -1298,6 +1356,33 @@ fn generate_prompt_execution_methods(
     result_conversion: &TokenStream2,
     final_result_conversion: Option<&TokenStream2>,
 ) -> TokenStream2 {
+    let modern_request_methods = quote! {
+        fn get_async_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            _request_cx: &'a fastmcp_core::Cx,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> fastmcp_server::BoxFuture<
+            'a,
+            fastmcp_core::McpOutcome<Vec<fastmcp_protocol::PromptMessage>>,
+        > {
+            self.get_async(ctx, arguments)
+        }
+
+        fn get_final_async_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            _request_cx: &'a fastmcp_core::Cx,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> fastmcp_server::BoxFuture<
+            'a,
+            fastmcp_core::McpOutcome<
+                fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalGetPromptResult>,
+            >,
+        > {
+            self.get_final_async(ctx, arguments)
+        }
+    };
     let sync_invocation = if expects_context {
         quote! { #fn_name(ctx, #(#param_names),*) }
     } else {
@@ -1346,6 +1431,7 @@ fn generate_prompt_execution_methods(
         return quote! {
             #legacy_methods
             #final_method
+            #modern_request_methods
         };
     }
 
@@ -1436,6 +1522,7 @@ fn generate_prompt_execution_methods(
     quote! {
         #legacy_methods
         #final_method
+        #modern_request_methods
     }
 }
 
@@ -1643,6 +1730,35 @@ fn generate_resource_execution_methods(
     result_conversion: &TokenStream2,
     final_result_conversion: Option<&TokenStream2>,
 ) -> TokenStream2 {
+    let modern_request_methods = quote! {
+        fn read_async_with_uri_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            _request_cx: &'a fastmcp_core::Cx,
+            uri: &'a str,
+            uri_params: &'a std::collections::HashMap<String, String>,
+        ) -> fastmcp_server::BoxFuture<
+            'a,
+            fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
+        > {
+            self.read_async_with_uri(ctx, uri, uri_params)
+        }
+
+        fn read_final_async_with_uri_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            _request_cx: &'a fastmcp_core::Cx,
+            uri: &'a str,
+            uri_params: &'a std::collections::HashMap<String, String>,
+        ) -> fastmcp_server::BoxFuture<
+            'a,
+            fastmcp_core::McpOutcome<
+                fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>,
+            >,
+        > {
+            self.read_final_async_with_uri(ctx, uri, uri_params)
+        }
+    };
     if !is_async {
         let final_method = final_result_conversion.map_or_else(TokenStream2::new, |conversion| {
             quote! {
@@ -1721,6 +1837,7 @@ fn generate_resource_execution_methods(
         return quote! {
             #legacy_methods
             #final_method
+            #modern_request_methods
         };
     }
 
@@ -1833,6 +1950,7 @@ fn generate_resource_execution_methods(
     quote! {
         #legacy_methods
         #final_method
+        #modern_request_methods
     }
 }
 
@@ -1922,9 +2040,119 @@ mod async_handler_expansion_tests {
         .to_string();
 
         assert!(tokens.contains("fn call"), "{tokens}");
-        assert!(!tokens.contains("fn call_async"), "{tokens}");
-        assert!(!tokens.contains("fn call_final"), "{tokens}");
-        assert!(!tokens.contains(". await"), "{tokens}");
+        assert!(!tokens.contains("fn call_async <"), "{tokens}");
+        assert!(!tokens.contains("fn call_final ("), "{tokens}");
+        assert!(tokens.contains("fn call_async_in_request"), "{tokens}");
+        assert!(
+            tokens.contains("fn call_final_outcome_async_in_request"),
+            "{tokens}"
+        );
+    }
+
+    #[test]
+    fn modern_request_contract_expands_for_tool_resource_and_prompt() {
+        let tool_name = format_ident!("modern_tool");
+        let tool_output: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>
+        );
+        let tool_conversion = generate_final_tool_result_conversion(&tool_output)
+            .expect("final tool output selects the final hook");
+        let tool = generate_tool_execution_methods(
+            true,
+            true,
+            &tool_name,
+            &[],
+            &[],
+            &quote! { Ok(vec![]) },
+            Some(&tool_conversion),
+        )
+        .to_string();
+        assert!(tool.contains("fn call_async_in_request"), "{tool}");
+        assert!(tool.contains("fn call_final_async_in_request"), "{tool}");
+        assert!(
+            tool.contains("fn call_final_outcome_async_in_request"),
+            "{tool}"
+        );
+        assert!(tool.contains("FinalToolOutcome :: Complete"), "{tool}");
+
+        let resource_name = format_ident!("modern_resource");
+        let resource_output: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>
+        );
+        let resource_conversion = generate_final_resource_result_conversion(&resource_output)
+            .expect("final resource output selects the final hook");
+        let resource = generate_resource_execution_methods(
+            true,
+            &resource_name,
+            &quote! { ctx },
+            "modern://resource",
+            &[],
+            &quote! { Ok(vec![]) },
+            Some(&resource_conversion),
+        )
+        .to_string();
+        assert!(
+            resource.contains("fn read_async_with_uri_in_request"),
+            "{resource}"
+        );
+        assert!(
+            resource.contains("fn read_final_async_with_uri_in_request"),
+            "{resource}"
+        );
+
+        let prompt_name = format_ident!("modern_prompt");
+        let prompt_output: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalGetPromptResult>
+        );
+        let prompt_conversion = generate_final_prompt_result_conversion(&prompt_output)
+            .expect("final prompt output selects the final hook");
+        let prompt = generate_prompt_execution_methods(
+            true,
+            true,
+            &prompt_name,
+            &[],
+            &[],
+            &quote! { Ok(vec![]) },
+            Some(&prompt_conversion),
+        )
+        .to_string();
+        assert!(prompt.contains("fn get_async_in_request"), "{prompt}");
+        assert!(
+            prompt.contains("fn get_final_async_in_request"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn modern_request_contract_rejects_one_dimension_cross_handler_signature() {
+        let accepted: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalGetPromptResult>
+        );
+        let rejected: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>
+        );
+
+        assert!(
+            validate_final_handler_return(
+                &accepted,
+                "prompt",
+                "GetPromptResult",
+                Some("FinalGetPromptResult"),
+                "Vec<PromptMessage>",
+            )
+            .is_ok()
+        );
+        let error = validate_final_handler_return(
+            &rejected,
+            "prompt",
+            "GetPromptResult",
+            Some("FinalGetPromptResult"),
+            "Vec<PromptMessage>",
+        )
+        .expect_err("changing only the final payload type must fail closed");
+
+        assert!(error.to_string().contains("FinalGetPromptResult"));
+        assert!(error.to_string().contains("legacy handler"));
     }
 
     #[test]
