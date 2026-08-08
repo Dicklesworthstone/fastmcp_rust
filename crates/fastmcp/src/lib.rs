@@ -13,8 +13,11 @@
 //!
 //! **MCP 2026-07-28 support is under implementation and remains unverified.**  
 //! **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**  
-//! The current public `PROTOCOL_VERSION` remains `2024-11-05`; newer in-tree
-//! types are not proof of negotiated MCP 2026-07-28 support.
+//! The primary public surface is [`modern`], which names the exact
+//! `2026-07-28` vocabulary. Exact `2024-11-05` access is explicit through
+//! [`legacy_2024`]. The root-level [`PROTOCOL_VERSION`] remains available for
+//! existing exact-2024 consumers while they move to that module; it is not the
+//! default selected by [`auto::client_builder`].
 //! Toolchain: pinned `nightly-2026-07-11` / rustc 1.99.0-nightly
 //! (`rust-version = "1.99"`). Do not assume JWT/OIDC production readiness,
 //! Redis Tasks, Apps media rendering, or aggregate release-gate evidence from
@@ -57,7 +60,10 @@
 //! This crate is the **public façade** of the workspace. It is published as
 //! `fastmcp-rust` on crates.io and imported as `fastmcp_rust`. It re-exports the
 //! pieces you need for day-to-day server and client development so that most
-//! applications can depend on a single crate and write `use fastmcp_rust::prelude::*;`.
+//! applications can depend on a single crate and write
+//! `use fastmcp_rust::prelude::*;`. New code should name its policy explicitly
+//! through [`modern`], [`auto`], or [`legacy_2024`] rather than inferring an
+//! era from the historical root re-exports.
 //!
 //! Concretely, `fastmcp_rust` glues together:
 //! - **Core runtime + context** from `fastmcp-core`
@@ -137,17 +143,27 @@ pub use fastmcp_core::{crypto, uri};
 // Re-export logging module
 pub use fastmcp_core::logging;
 
-// Re-export protocol types
+// Re-export protocol types shared by both eras. Exact legacy initialization
+// types live in `legacy_2024`; modern discovery types live in `modern`.
 pub use fastmcp_protocol::{
-    CallToolParams, CallToolResult, CancelledParams, ClientCapabilities, ClientInfo, Content,
-    GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, JsonRpcError,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams, ListPromptsResult,
-    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel, PROTOCOL_VERSION, Prompt,
-    PromptArgument, PromptMessage, ReadResourceParams, ReadResourceResult, Resource,
-    ResourceContent, ResourceTemplate, ResourcesCapability, Role, ServerCapabilities, ServerInfo,
-    SubscribeResourceParams, Tool, ToolAnnotations, ToolsCapability, UnsubscribeResourceParams,
+    CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, Content, GetPromptParams,
+    GetPromptResult, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
+    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
+    ListToolsResult, LogLevel, Prompt, PromptArgument, PromptMessage, ReadResourceParams,
+    ReadResourceResult, Resource, ResourceContent, ResourceTemplate, ResourcesCapability, Role,
+    ServerCapabilities, ServerInfo, SubscribeResourceParams, Tool, ToolAnnotations,
+    ToolsCapability, UnsubscribeResourceParams,
 };
+
+/// Historical exact-2024 protocol constant retained for existing consumers.
+///
+/// New exact-2024 code should import [`legacy_2024::PROTOCOL_VERSION`]; new
+/// modern code should import [`modern::PROTOCOL_VERSION`].
+pub use fastmcp_protocol::PROTOCOL_VERSION;
+
+/// Immutable protocol-policy primitives shared by the explicit era modules.
+pub use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy, ProtocolVersion};
 
 // Re-export transport types
 pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError};
@@ -184,6 +200,98 @@ pub use fastmcp_client::mcp_config;
 // Re-export macros
 pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 
+/// Auto-policy composition helpers.
+///
+/// The returned client builder captures [`ProtocolPolicy::Auto`] before any
+/// subprocess or HTTP side effect. The caller may replace that immutable plan
+/// with an explicit plan before connecting.
+pub mod auto {
+    pub use fastmcp_client::{ClientBuilder, ClientProtocolPlan};
+    pub use fastmcp_protocol::protocol_policy::{
+        HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
+    };
+
+    /// Creates the public client builder with its immutable Auto stdio plan.
+    #[must_use]
+    pub fn client_builder() -> ClientBuilder {
+        ClientBuilder::new()
+    }
+}
+
+/// Primary MCP 2026-07-28 public vocabulary.
+///
+/// This module deliberately names the modern discovery, extension, endpoint,
+/// and policy surfaces instead of relying on the legacy root constant. The
+/// underlying server/client implementations retain their own qualification
+/// boundaries; re-exporting a type here does not claim aggregate protocol
+/// conformance.
+pub mod modern {
+    pub use fastmcp_client::{
+        Client, ClientBuilder, ClientHttpNegotiation, ClientHttpNegotiationDecision,
+        ClientHttpNegotiationError, ClientHttpNegotiationState, ClientProtocolPlan,
+        ClientProtocolPlanError, ClientSession,
+    };
+    pub use fastmcp_core::{Cx, McpContext, McpError, McpOutcome, McpResult, Outcome};
+    pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
+    pub use fastmcp_protocol::{
+        ClientExtensionDiscovery, DiscoveryCacheHints, ExtensionDescriptor,
+        ExtensionDescriptorRegistry, ExtensionDirection, ExtensionDiscovery,
+        ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId,
+        ExtensionMethodDescriptor, ExtensionNegotiationResolver,
+        ExtensionNotificationDescriptor, ExtensionRegistryError, ExtensionRegistryReceipt,
+        ExtensionRoutingHeaderDescriptor, ExtensionSettings, ExtensionSettingsSchema,
+        SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior,
+        ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
+        ServerDiscoverResult, ServerDiscoveryError, ServerExtensionDiscovery,
+        ServerInstructionError, ServerInstructions, StdioCorrelationDescriptor,
+    };
+    pub use fastmcp_protocol::protocol_policy::{
+        HttpEndpointBundle, HttpEndpointBundleError, HttpEraCache, HttpEraDecision,
+        HttpModernProbe, HttpProbeBody, HttpRouteKind, MODERN_PROTOCOL_VERSION as PROTOCOL_VERSION,
+        ProtocolEra, ProtocolPolicy, ProtocolPolicyError, ProtocolPolicySelection,
+        ProtocolRole, ProtocolVersion, ProtocolVersionError,
+    };
+    pub use fastmcp_server::{
+        AuthProvider, AuthRequest, HttpServerConfig, PromptHandler, ResourceHandler, Router,
+        Server, ServerBuilder, ToolHandler,
+    };
+    pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError, http, memory};
+
+    /// Creates a client builder pinned to the ModernOnly stdio plan.
+    #[must_use]
+    pub fn client_builder() -> ClientBuilder {
+        ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+    }
+}
+
+/// Exact MCP 2024-11-05 public vocabulary.
+///
+/// This module keeps legacy lifecycle and transport access explicit. It is
+/// intentionally disjoint from [`modern`]; selecting between the two remains
+/// the responsibility of the immutable policy and the transport-specific
+/// negotiation layer.
+pub mod legacy_2024 {
+    pub use fastmcp_protocol::{
+        CancelledParams, InitializeParams, InitializeResult, PROTOCOL_VERSION,
+    };
+    pub use fastmcp_protocol::methods;
+    pub use fastmcp_protocol::protocol_policy::{
+        LEGACY_PROTOCOL_VERSION, LegacyClientAdapterInstalledReceipt,
+        LegacyServerAdapterInstalledReceipt, ProtocolEra, ProtocolPolicy, ProtocolVersion,
+    };
+    pub use fastmcp_server::legacy_2024::{
+        LEGACY_2024_MAX_ADAPTER_RESERVATIONS, Legacy2024AdapterError, Legacy2024Handler,
+        Legacy2024HandlerError, Legacy2024Lifecycle, Legacy2024Outbound,
+        Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo,
+        Legacy2024StateSnapshot, LegacyAuthenticatedPeerPartition, LegacyPeerBinding,
+        LegacyServerAdapterInstalledReceipt as ServerAdapterInstalledReceipt,
+    };
+    pub use fastmcp_transport::sse::{
+        LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink,
+        LegacySseServerTransport,
+    };
+}
+
 // REL-QUAR-00 release-quarantine evidence surface
 pub mod release_quarantine;
 
@@ -219,6 +327,9 @@ pub mod prelude {
         Prompt,
         PromptArgument,
         PromptMessage,
+        ProtocolEra,
+        ProtocolPolicy,
+        ProtocolVersion,
         // Server
         ProxyBackend,
         ProxyCatalog,
@@ -276,5 +387,46 @@ mod tests {
         let source: RequestTimeoutSource = RequestTimeoutSource::Idle;
         assert!(matches!(source, RequestTimeoutSource::Idle));
         let _ = std::mem::size_of::<ClientSession>();
+    }
+
+    #[test]
+    fn api_01_public_auto_and_modern_surfaces_compile() {
+        use super::{auto, modern};
+
+        let auto_builder = auto::client_builder();
+        assert_eq!(
+            auto_builder.selected_protocol_plan().policy(),
+            modern::ProtocolPolicy::Auto
+        );
+
+        let explicit_modern_builder = modern::client_builder();
+        assert_eq!(
+            explicit_modern_builder.selected_protocol_plan().policy(),
+            modern::ProtocolPolicy::ModernOnly
+        );
+
+        let _: Option<modern::ServerBuilder> = None;
+        let _: Option<modern::ServerDiscoverRequest> = None;
+        let _: Option<modern::ExtensionDescriptorRegistry> = None;
+        let _: Option<modern::Cx> = None;
+        assert_eq!(modern::PROTOCOL_VERSION, "2026-07-28");
+    }
+
+    #[test]
+    fn api_01_exact_2024_surface_remains_explicit_and_available() {
+        use super::legacy_2024;
+
+        let partition =
+            legacy_2024::LegacyAuthenticatedPeerPartition::from_authenticated_transport([
+                0_u8;
+                legacy_2024::LegacyAuthenticatedPeerPartition::BYTE_LEN
+            ]);
+        let binding = legacy_2024::LegacyPeerBinding::from_authenticated_transport(partition, 7);
+
+        assert_eq!(binding.generation(), 7);
+        assert_eq!(legacy_2024::PROTOCOL_VERSION, "2024-11-05");
+        let _: Option<legacy_2024::InitializeParams> = None;
+        let _: Option<legacy_2024::Legacy2024Lifecycle> = None;
+        let _: Option<legacy_2024::LegacySseMessagePost> = None;
     }
 }
