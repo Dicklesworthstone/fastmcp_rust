@@ -1615,7 +1615,6 @@ mod async_handler_expansion_tests {
             "example://resource",
             &[],
             &quote! { Ok(vec![]) },
-            None,
         );
 
         assert_direct_async_expansion(tokens, "fn read_async_with_uri");
@@ -1647,6 +1646,7 @@ mod async_handler_expansion_tests {
             &[],
             &[],
             &quote! { Ok(vec![]) },
+            None,
         )
         .to_string();
 
