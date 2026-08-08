@@ -60,9 +60,9 @@ pub use fastmcp_protocol::protocol_policy::{
     ProtocolPolicy, ProtocolVersion,
 };
 pub use fastmcp_protocol::{
-    CoreResult, FinalCompletionArgument as CompletionArgument,
+    CompleteResult, CoreResult, FinalCompletionArgument as CompletionArgument,
     FinalCompletionContext as CompletionContext, FinalCompletionReference as CompletionReference,
-    FinalCoreResult, LegacyCoreResult, SubscriptionFilter,
+    FinalCoreResult, FinalSubscriptionsListenResult, LegacyCoreResult, SubscriptionFilter,
 };
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, LegacySseHttpClient,
@@ -103,7 +103,8 @@ use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancelledParams,
     ClientCapabilities, ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey,
-    FinalLogMessageParams, FinalProgressNotificationParams, FinalRequestMeta, GetPromptParams,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalLogMessageParams, FinalProgressNotificationParams,
+    FinalRequestMeta, FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams,
     GetTaskParams, GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION,
     JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent,
     LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListResourceTemplatesParams,
@@ -170,6 +171,151 @@ impl CompletionParams {
                 value: self.argument.value,
             },
         })
+    }
+}
+
+/// The request-owned terminal record for a final subscription listener.
+///
+/// The acknowledgement binds the requested filter to the JSON-RPC request
+/// ID. Only notifications admitted by that accepted filter are retained here;
+/// unrelated final log and progress notifications remain on the ordinary
+/// client path.
+#[derive(Debug, Clone)]
+pub struct SubscriptionListenCollector {
+    /// The JSON-RPC request identity bound to this subscription stream.
+    pub subscription_id: RequestId,
+    /// The exact subset of requested notification categories accepted by the server.
+    pub accepted_filter: SubscriptionFilter,
+    /// Typed request-owned notifications received before graceful termination.
+    pub notifications: Vec<ServerNotification>,
+    /// The final complete result that terminated the listener.
+    pub terminal: CompleteResult<FinalSubscriptionsListenResult>,
+}
+
+fn subscription_listener_protocol_error(message: &'static str) -> McpError {
+    McpError::invalid_request(message)
+}
+
+fn validate_subscription_acknowledgement_filter(
+    requested: &SubscriptionFilter,
+    acknowledged: &SubscriptionFilter,
+) -> McpResult<()> {
+    for (requested, acknowledged) in [
+        (
+            requested.prompts_list_changed,
+            acknowledged.prompts_list_changed,
+        ),
+        (
+            requested.resources_list_changed,
+            acknowledged.resources_list_changed,
+        ),
+        (
+            requested.tools_list_changed,
+            acknowledged.tools_list_changed,
+        ),
+    ] {
+        match acknowledged {
+            None => {}
+            Some(true) if requested == Some(true) => {}
+            Some(_) => {
+                return Err(subscription_listener_protocol_error(
+                    "Subscription acknowledgement accepts a notification category that was not requested",
+                ));
+            }
+        }
+    }
+
+    if let Some(acknowledged_uris) = &acknowledged.resource_subscriptions {
+        let Some(requested_uris) = &requested.resource_subscriptions else {
+            return Err(subscription_listener_protocol_error(
+                "Subscription acknowledgement accepts resource updates that were not requested",
+            ));
+        };
+        for (index, uri) in acknowledged_uris.iter().enumerate() {
+            if !requested_uris
+                .iter()
+                .any(|requested_uri| requested_uri == uri)
+                || acknowledged_uris[..index]
+                    .iter()
+                    .any(|previous_uri| previous_uri == uri)
+            {
+                return Err(subscription_listener_protocol_error(
+                    "Subscription acknowledgement contains an invalid resource update filter",
+                ));
+            }
+        }
+    }
+
+    if acknowledged.additional.iter().any(|(name, value)| {
+        requested
+            .additional
+            .get(name)
+            .is_none_or(|requested_value| requested_value != value)
+    }) {
+        return Err(subscription_listener_protocol_error(
+            "Subscription acknowledgement accepts an unrequested extension filter",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_subscription_acknowledgement(
+    expected_id: &RequestId,
+    requested: &SubscriptionFilter,
+    acknowledgement: &FinalSubscriptionsAcknowledgedNotificationParams,
+) -> McpResult<()> {
+    let subscription_id = acknowledgement
+        .meta
+        .as_ref()
+        .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+        .ok_or_else(|| {
+            subscription_listener_protocol_error(
+                "Subscription acknowledgement is missing its subscription ID",
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_value::<RequestId>(value.clone()).map_err(|_| {
+                subscription_listener_protocol_error(
+                    "Subscription acknowledgement has an invalid subscription ID",
+                )
+            })
+        })?;
+    if &subscription_id != expected_id {
+        return Err(subscription_listener_protocol_error(
+            "Subscription acknowledgement ID does not match the listen request",
+        ));
+    }
+    validate_subscription_acknowledgement_filter(requested, &acknowledgement.notifications)
+}
+
+fn validate_subscription_notification_filter(
+    notification: &ServerNotification,
+    accepted_filter: &SubscriptionFilter,
+) -> McpResult<()> {
+    let accepted = match notification {
+        ServerNotification::ResourcesListChanged(_) => {
+            accepted_filter.resources_list_changed == Some(true)
+        }
+        ServerNotification::ToolsListChanged(_) => accepted_filter.tools_list_changed == Some(true),
+        ServerNotification::PromptsListChanged(_) => {
+            accepted_filter.prompts_list_changed == Some(true)
+        }
+        ServerNotification::ResourceUpdated(update) => accepted_filter
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| uris.iter().any(|uri| uri == update.uri.as_str())),
+        ServerNotification::Cancelled(_)
+        | ServerNotification::Progress(_)
+        | ServerNotification::Message(_)
+        | ServerNotification::SubscriptionsAcknowledged(_) => false,
+    };
+    if accepted {
+        Ok(())
+    } else {
+        Err(subscription_listener_protocol_error(
+            "Subscription stream emitted a notification outside its accepted filter",
+        ))
     }
 }
 
@@ -4378,6 +4524,222 @@ impl Client {
         }
     }
 
+    /// Collects one final `subscriptions/listen` stream until its complete
+    /// result. The listener owns only its acknowledgement, subscription
+    /// change events, and matching cancellation; ordinary final log/progress
+    /// notifications keep their existing connection-wide handling.
+    fn recv_subscription_listener(
+        &mut self,
+        mut waiter: ResponseWaiter,
+        core_request: &CoreRequest,
+        requested: &SubscriptionFilter,
+        deadlines: RequestDeadlines,
+    ) -> McpResult<SubscriptionListenCollector> {
+        let expected_id = waiter.id.clone();
+        let mut accepted_filter = None;
+        let mut notifications = Vec::new();
+
+        loop {
+            if let Some(response) = waiter.try_response()? {
+                debug_assert_eq!(response.id.as_ref(), Some(&expected_id));
+                if let Some(error) = response.error.clone() {
+                    return Err(json_rpc_error_to_mcp(error));
+                }
+                let result = core_request.decode_response(&response).map_err(|error| {
+                    self.terminate_connection(McpError::invalid_request(format!(
+                        "Invalid final subscriptions/listen termination: {error}"
+                    )))
+                })?;
+                let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
+                    result: terminal,
+                    subscription_id,
+                    ..
+                }) = result
+                else {
+                    return Err(
+                        self.terminate_connection(subscription_listener_protocol_error(
+                            "Subscription listener received a non-listen terminal result",
+                        )),
+                    );
+                };
+                if subscription_id != expected_id {
+                    return Err(
+                        self.terminate_connection(subscription_listener_protocol_error(
+                            "Subscription listener terminal ID does not match its request",
+                        )),
+                    );
+                }
+                let Some(accepted_filter) = accepted_filter else {
+                    return Err(
+                        self.terminate_connection(subscription_listener_protocol_error(
+                            "Subscription listener terminated before acknowledgement",
+                        )),
+                    );
+                };
+                return Ok(SubscriptionListenCollector {
+                    subscription_id,
+                    accepted_filter,
+                    notifications,
+                    terminal,
+                });
+            }
+
+            if let Some(kind) = deadlines.expired_at(Instant::now()) {
+                return Err(self.timeout_committed_request(&expected_id, kind));
+            }
+
+            let (message, received_at) =
+                match recv_child_transport(&mut self.transport, &self.cx, Some(deadlines.next())) {
+                    Ok(received) => received,
+                    Err(TransportError::ReceiveDeadlineExceeded) => {
+                        let kind = deadlines
+                            .expired_at(Instant::now())
+                            .unwrap_or_else(|| deadlines.next_kind());
+                        if self.transport.is_closed() {
+                            return Err(self.finish_partial_frame_timeout(&expected_id, kind));
+                        }
+                        return Err(self.timeout_committed_request(&expected_id, kind));
+                    }
+                    Err(TransportError::Timeout) if !self.transport.is_closed() => {
+                        return Err(self.finish_open_context_interruption(
+                            &expected_id,
+                            McpError::internal_error("Request timed out"),
+                        ));
+                    }
+                    Err(TransportError::Cancelled) if !self.transport.is_closed() => {
+                        return Err(self.finish_open_context_interruption(
+                            &expected_id,
+                            McpError::request_cancelled(),
+                        ));
+                    }
+                    Err(TransportError::Closed) => {
+                        return Err(self.terminate_connection(
+                            subscription_listener_protocol_error(
+                                "Subscription listener reached EOF before terminal complete result",
+                            ),
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(self.terminate_connection(transport_error_to_mcp(error)));
+                    }
+                };
+            if let Some(kind) = deadlines.expired_at(received_at) {
+                return Err(self.finish_timeout_after_complete_message(
+                    &expected_id,
+                    message,
+                    kind,
+                ));
+            }
+            if let Err(error) = validate_inbound_typed_message(&message) {
+                return Err(self.terminate_connection(error));
+            }
+
+            match message {
+                JsonRpcMessage::Response(response) => {
+                    let route = self.responses.route(response);
+                    if matches!(
+                        route,
+                        ResponseRoute::InvalidEnvelope
+                            | ResponseRoute::MissingId
+                            | ResponseRoute::ConnectionClosed
+                    ) {
+                        let error = self.responses.terminal_error().unwrap_or_else(|| {
+                            McpError::internal_error("Client response correlation failed")
+                        });
+                        return Err(self.terminate_connection(error));
+                    }
+                }
+                JsonRpcMessage::Request(request) => {
+                    if is_final_server_notification_method(&request) {
+                        let notification = match ServerNotification::decode(&request) {
+                            Ok(notification) => notification,
+                            Err(_) => {
+                                return Err(self.terminate_connection(
+                                    subscription_listener_protocol_error(
+                                        "Subscription listener received an invalid final notification",
+                                    ),
+                                ));
+                            }
+                        };
+                        match notification {
+                            ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
+                                if accepted_filter.is_some() {
+                                    return Err(self.terminate_connection(
+                                        subscription_listener_protocol_error(
+                                            "Subscription listener received a duplicate acknowledgement",
+                                        ),
+                                    ));
+                                }
+                                if let Err(error) = validate_subscription_acknowledgement(
+                                    &expected_id,
+                                    requested,
+                                    &acknowledgement,
+                                ) {
+                                    return Err(self.terminate_connection(error));
+                                }
+                                accepted_filter = Some(acknowledgement.notifications);
+                            }
+                            ServerNotification::Cancelled(cancellation) => {
+                                if cancellation.request_id != expected_id {
+                                    return Err(self.terminate_connection(
+                                        subscription_listener_protocol_error(
+                                            "Subscription cancellation ID does not match the listen request",
+                                        ),
+                                    ));
+                                }
+                                let error = McpError::request_cancelled();
+                                self.responses.fail(&expected_id, error.clone());
+                                return Err(error);
+                            }
+                            notification @ (ServerNotification::ResourcesListChanged(_)
+                            | ServerNotification::ToolsListChanged(_)
+                            | ServerNotification::PromptsListChanged(_)
+                            | ServerNotification::ResourceUpdated(_)) => {
+                                let Some(accepted_filter) = accepted_filter.as_ref() else {
+                                    return Err(self.terminate_connection(
+                                        subscription_listener_protocol_error(
+                                            "Subscription listener received an event before acknowledgement",
+                                        ),
+                                    ));
+                                };
+                                if let Err(error) = validate_subscription_notification_filter(
+                                    &notification,
+                                    accepted_filter,
+                                ) {
+                                    return Err(self.terminate_connection(error));
+                                }
+                                notifications.push(notification);
+                            }
+                            ServerNotification::Progress(_) | ServerNotification::Message(_) => {
+                                if let Err(error) = self.retain_modern_server_notification(&request)
+                                {
+                                    return Err(self.terminate_connection(error));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    if let Some(response) = server_request_response(&request) {
+                        if let Err(error) = self.send_server_response_during_receive(response) {
+                            return Err(self.terminate_connection(error));
+                        }
+                        continue;
+                    }
+
+                    if server_notification_kind(&request)
+                        == Some(ServerNotificationKind::LogMessage)
+                        && let Some(params) = request.params.as_ref()
+                        && let Ok(message) =
+                            serde_json::from_value::<LogMessageParams>(params.clone())
+                    {
+                        self.emit_log_message(message);
+                    }
+                }
+            }
+        }
+    }
+
     /// Performs the initialization handshake.
     fn initialize(
         &mut self,
@@ -5290,26 +5652,61 @@ impl Client {
         }
     }
 
-    /// Opens a final typed subscription listener with the requested filters.
+    /// Collects one final typed subscription listener until its terminal result.
     ///
-    /// MCP 2026-07-28 returns a [`FinalCoreResult::SubscriptionsListen`]
-    /// completion carrying the required subscription ID in result metadata.
-    /// Exact 2024-11-05 has no equivalent listener contract and is rejected
-    /// before a request ID is allocated or bytes are written.
+    /// The acknowledgement must bind its subscription ID to this listen
+    /// request and may accept only a subset of `notifications`. The collector
+    /// retains only acknowledged catalog/resource events, then returns the
+    /// exact terminal [`CompleteResult`]. Exact 2024-11-05 has no equivalent
+    /// listener contract and is rejected before a request ID is allocated or
+    /// bytes are written.
     pub fn listen_subscriptions_typed(
         &mut self,
         notifications: SubscriptionFilter,
-    ) -> McpResult<CoreResult> {
+    ) -> McpResult<SubscriptionListenCollector> {
         self.ensure_initialized()?;
         if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
             return Err(McpError::invalid_params(
                 "subscriptions/listen is available only for MCP 2026-07-28",
             ));
         }
-        self.send_typed_core_request(
-            "subscriptions/listen",
-            serde_json::json!({ "notifications": notifications }),
-        )
+        let timeout_policy = self.timeout_policy;
+        timeout_policy.validate()?;
+        let requested = notifications;
+        let params_value = serde_json::to_value(serde_json::json!({
+            "notifications": requested.clone(),
+        }))
+        .map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to serialize subscriptions/listen parameters: {error}"
+            ))
+        })?;
+        let params_value = self.prepare_request_parameters(params_value)?;
+        let core_request = self
+            .prepared_core_request("subscriptions/listen", &params_value)?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "subscriptions/listen is not a supported core request in the negotiated era",
+                )
+            })?;
+
+        let id = self.next_request_id()?;
+        let id_i64 = i64::try_from(id).expect("request ID allocator enforces the i64 bound");
+        let request_id = RequestId::Number(id_i64);
+        let request = JsonRpcRequest::new("subscriptions/listen", Some(params_value), id_i64);
+        let waiter = self.responses.register(request_id.clone())?;
+        if let Err(error) = self
+            .transport
+            .send(&self.cx, &JsonRpcMessage::Request(request))
+        {
+            return Err(self.record_send_failure(Some(&request_id), error));
+        }
+        let committed_at = Instant::now();
+        let deadlines = match RequestDeadlines::start_at(timeout_policy, committed_at) {
+            Ok(deadlines) => deadlines,
+            Err(error) => return Err(self.finish_committed_request_locally(&request_id, error)),
+        };
+        self.recv_subscription_listener(waiter, &core_request, &requested, deadlines)
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -9322,17 +9719,32 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn modern_subscriptions_listen_client_script() -> String {
+    fn modern_subscriptions_listen_client_script(
+        acknowledgement_subscription_id: i64,
+        stream_frames: &[&str],
+    ) -> String {
         let discovery_response =
             modern_discovery_response("subscriptions-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        let acknowledgement = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{acknowledgement_subscription_id}}},"notifications":{{"toolsListChanged":true}}}}}}"#
+        );
+        let stream_frames = stream_frames
+            .iter()
+            .map(|frame| format!("printf '%s\\n' '{frame}'"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let stream_frames = if stream_frames.is_empty() {
+            String::new()
+        } else {
+            format!("; {stream_frames}")
+        };
         format!(
             "IFS= read -r first || exit 1; \
              case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r request || exit 1; \
              case \"$request\" in *subscriptions/listen*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"toolsListChanged\":true'*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":\"subscription-2\"}}}}}}' ;; *) exit 1 ;; esac; \
-             exec sleep 2"
+             printf '%s\\n' '{acknowledgement}'{stream_frames} ;; *) exit 1 ;; esac"
         )
     }
 
@@ -9948,8 +10360,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn clt_01_subscriptions_listen_returns_typed_final_subscription_id() {
-        let script = modern_subscriptions_listen_client_script();
+    fn clt_01_subscriptions_listen_collects_typed_request_owned_notifications() {
+        let script = modern_subscriptions_listen_client_script(
+            2,
+            &[
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            ],
+        );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
             &["-c", script.as_str()],
@@ -9958,20 +10376,108 @@ mod tests {
         )
         .expect("modern discovery initializes the subscription client");
 
-        let result = client
+        let collector = client
             .listen_subscriptions_typed(SubscriptionFilter {
                 tools_list_changed: Some(true),
                 ..SubscriptionFilter::default()
             })
-            .expect("modern subscription listener retains its typed final result");
-        let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
-            subscription_id, ..
-        }) = result
-        else {
-            panic!("modern subscriptions/listen must retain its final subscription ID");
-        };
-        assert_eq!(subscription_id, RequestId::from("subscription-2"));
+            .expect("modern subscription listener collects its owned notification stream");
+        assert_eq!(collector.subscription_id, RequestId::from(2));
+        assert_eq!(collector.accepted_filter.tools_list_changed, Some(true));
+        assert!(matches!(
+            collector.notifications.as_slice(),
+            [ServerNotification::ToolsListChanged(None)]
+        ));
+        assert!(matches!(
+            collector.terminal.payload,
+            FinalSubscriptionsListenResult {}
+        ));
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_subscriptions_listen_rejects_one_field_acknowledgement_id_mismatch() {
+        // This differs from the admitted stream only in the acknowledgement subscription ID.
+        let script = modern_subscriptions_listen_client_script(
+            3,
+            &[
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            ],
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the subscription client");
+
+        let error = client
+            .listen_subscriptions_typed(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect_err("a subscription acknowledgement must bind the active listen request");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(!client.is_initialized());
+        assert!(client.responses.terminal_error().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_subscriptions_listen_matching_cancellation_is_request_owned() {
+        let script = modern_subscriptions_listen_client_script(
+            2,
+            &[r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#],
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the subscription client");
+
+        let error = client
+            .listen_subscriptions_typed(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect_err("matching final cancellation terminates only the listener");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert!(client.is_initialized());
+        assert!(client.responses.terminal_error().is_none());
+        client
+            .close()
+            .expect("cancellation leaves the client closable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_subscriptions_listen_rejects_eof_before_terminal_complete_result() {
+        let script = modern_subscriptions_listen_client_script(2, &[]);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the subscription client");
+
+        let error = client
+            .listen_subscriptions_typed(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect_err("EOF cannot replace the final complete result");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "Subscription listener reached EOF before terminal complete result"
+        );
+        assert!(!client.is_initialized());
     }
 
     #[cfg(unix)]
