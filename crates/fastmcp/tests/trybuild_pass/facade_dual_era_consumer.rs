@@ -1,6 +1,50 @@
 //! Active downstream facade probe for both HTTP protocol eras.
 
-use fastmcp_rust::{legacy_2024, modern};
+use fastmcp_rust::{CompletionHandler, legacy_2024, modern};
+
+struct DownstreamCompletionHandler;
+
+impl CompletionHandler for DownstreamCompletionHandler {
+    fn complete_legacy(
+        &self,
+        _ctx: &fastmcp_rust::McpContext,
+        _params: legacy_2024::LegacyCompletionParams,
+    ) -> fastmcp_rust::McpResult<legacy_2024::CompletionValues> {
+        Ok(legacy_2024::CompletionValues {
+            values: Vec::new(),
+            total: None,
+            has_more: None,
+        })
+    }
+
+    fn complete_final(
+        &self,
+        _ctx: &fastmcp_rust::McpContext,
+        _params: modern::FinalCompletionParams,
+    ) -> fastmcp_rust::McpResult<modern::CompletionValues> {
+        Ok(modern::CompletionValues {
+            values: Vec::new(),
+            total: None,
+            has_more: None,
+        })
+    }
+}
+
+fn assert_completion_handler_reachability() {
+    fn accepts_modern_completion_handler<T: modern::CompletionHandler>() {}
+
+    accepts_modern_completion_handler::<DownstreamCompletionHandler>();
+}
+
+mod prelude_completion_handler_reachability {
+    use fastmcp_rust::prelude::*;
+
+    fn accepts_prelude_completion_handler<T: CompletionHandler>() {}
+
+    pub(super) fn assert_reachable() {
+        accepts_prelude_completion_handler::<super::DownstreamCompletionHandler>();
+    }
+}
 
 fn assert_legacy_sse_method_signatures(
     cx: &legacy_2024::Cx,
@@ -59,5 +103,7 @@ fn assert_dual_era_completion_exports() {
 
 fn main() {
     let _ = assert_legacy_sse_method_signatures;
+    assert_completion_handler_reachability();
+    prelude_completion_handler_reachability::assert_reachable();
     assert_dual_era_completion_exports();
 }

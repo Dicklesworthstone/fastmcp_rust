@@ -243,13 +243,14 @@ pub use fastmcp_transport::{event_store, http, memory};
 // FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders, BoxFuture,
-    ConsoleConfig, HttpServerConfig, InboundRequestContext, InboundRequestTransport, Middleware,
-    MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
-    ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog, ProxyClient,
-    RequestSender, ResourceHandler, Router, Server, ServerBuilder, ServerStats, Session,
-    StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolHandler,
-    TrafficVerbosity, TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
-    create_context_with_progress, create_context_with_progress_and_senders,
+    CompletionHandler, ConsoleConfig, HttpServerConfig, InboundRequestContext,
+    InboundRequestTransport, Middleware, MiddlewareDecision, MountResult, NotificationSender,
+    PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog,
+    ProxyClient, RequestSender, ResourceHandler, Router, Server, ServerBuilder, ServerStats,
+    Session, StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
+    ToolHandler, TrafficVerbosity, TransportElicitationSender, TransportRootsProvider,
+    TransportSamplingSender, create_context_with_progress,
+    create_context_with_progress_and_senders,
 };
 
 // Re-export bidirectional module for namespaced access (e.g. bidirectional::RequestSender)
@@ -405,11 +406,11 @@ pub mod modern {
         MrtrInputRequired, MrtrInputResponse, MrtrInputResponses, MrtrRequestState, MrtrRetry,
     };
     pub use fastmcp_server::{
-        AuthProvider, AuthRequest, BidirectionalSenders, BoxFuture, HttpServerConfig,
-        InboundRequestContext, InboundRequestTransport, Middleware, MiddlewareDecision,
-        MountResult, ProgressNotificationSender, PromptHandler, ResourceHandler, Router, Server,
-        ServerBuilder, TagFilters, ToolHandler, create_context_with_progress,
-        create_context_with_progress_and_senders,
+        AuthProvider, AuthRequest, BidirectionalSenders, BoxFuture, CompletionHandler,
+        HttpServerConfig, InboundRequestContext, InboundRequestTransport, Middleware,
+        MiddlewareDecision, MountResult, ProgressNotificationSender, PromptHandler,
+        ResourceHandler, Router, Server, ServerBuilder, TagFilters, ToolHandler,
+        create_context_with_progress, create_context_with_progress_and_senders,
     };
     pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError, http, memory};
 
@@ -485,6 +486,7 @@ pub mod prelude {
         ClientProtocolPlan,
         ClientSession,
         CompleteResult,
+        CompletionHandler,
         ConfigError,
         ConfigLoader,
         // Protocol types
