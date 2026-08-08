@@ -1322,6 +1322,9 @@ pub enum ModernHttpClientError {
     DiscoveryRejected,
     /// The recognized response was not the exact typed discovery reply.
     InvalidDiscoveryResponse,
+    /// The typed final discovery reply did not advertise the final version
+    /// selected for this modern HTTP connection.
+    DiscoveryDoesNotAdvertiseModernProtocol,
     /// The configured native legacy SSE connection could not be opened or
     /// safely used after policy selected its exact endpoint bundle.
     LegacySse(LegacySseHttpClientError),
@@ -1366,6 +1369,9 @@ impl fmt::Display for ModernHttpClientError {
             Self::InvalidDiscoveryResponse => {
                 formatter.write_str("server/discover returned an invalid final response")
             }
+            Self::DiscoveryDoesNotAdvertiseModernProtocol => {
+                formatter.write_str("server/discover did not advertise MCP 2026-07-28")
+            }
             Self::LegacySse(error) => error.fmt(formatter),
         }
     }
@@ -1386,7 +1392,8 @@ impl std::error::Error for ModernHttpClientError {
             | Self::NotificationHasRequestId { .. }
             | Self::RequestEncodingFailed
             | Self::DiscoveryRejected
-            | Self::InvalidDiscoveryResponse => None,
+            | Self::InvalidDiscoveryResponse
+            | Self::DiscoveryDoesNotAdvertiseModernProtocol => None,
         }
     }
 }
@@ -2234,7 +2241,16 @@ fn decode_modern_discovery_response(
     let result = response
         .result
         .ok_or(ModernHttpClientError::InvalidDiscoveryResponse)?;
-    serde_json::from_value(result).map_err(|_| ModernHttpClientError::InvalidDiscoveryResponse)
+    let discovery = serde_json::from_value(result)
+        .map_err(|_| ModernHttpClientError::InvalidDiscoveryResponse)?;
+    if !discovery
+        .supported_versions()
+        .iter()
+        .any(|version| version == MODERN_PROTOCOL_VERSION)
+    {
+        return Err(ModernHttpClientError::DiscoveryDoesNotAdvertiseModernProtocol);
+    }
+    Ok(discovery)
 }
 
 fn map_transport_error(error: ClientError) -> ModernHttpExecutorError {
@@ -2356,16 +2372,20 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
-    use fastmcp_protocol::{RequestId, ServerNotification, SubscriptionFilter};
+    use fastmcp_protocol::{
+        ClientCapabilities, ClientInfo, RequestId, ServerNotification, SubscriptionFilter,
+    };
 
     use super::{
-        ClientHttpConnectionError, ClientHttpResponse, LegacySseHttpClientError,
-        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpClientError,
-        ModernHttpExecutorError, ModernHttpResponseKind, ModernHttpSubscriptionListenError,
-        decode_modern_discovery_response, validate_response_head,
+        ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse,
+        LegacySseHttpClientError, MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS,
+        ModernHttpClientError, ModernHttpExecutorError, ModernHttpResponseKind,
+        ModernHttpSubscriptionListenError, decode_modern_discovery_response,
+        validate_response_head,
     };
     use crate::sse::SseLimits;
     use crate::{CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ProtocolEra, ProtocolPolicy};
@@ -2643,6 +2663,83 @@ mod tests {
             "complete"
         );
         server.join().expect("local modern server must join");
+    }
+
+    #[test]
+    fn public_http_connection_auto_rejects_one_field_modern_version_mismatch_without_downgrade() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind local contradictory modern listener");
+        let address = listener
+            .local_addr()
+            .expect("read local contradictory modern address");
+        let modern_target = format!("http://{address}/mcp");
+        let legacy_sse_target = format!("http://{address}/legacy-sse");
+        let legacy_message_target = format!("http://{address}/legacy-message");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            // Only supportedVersions differs from the modern-positive reply:
+            // a final discovery response cannot select modern while omitting
+            // the final protocol version requested by this connection.
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2024-11-05"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+
+            listener
+                .set_nonblocking(true)
+                .expect("observe an unintended downgrade without blocking");
+            let deadline = Instant::now() + Duration::from_millis(100);
+            loop {
+                match listener.accept() {
+                    Ok(_) => panic!(
+                        "a contradictory modern discovery reply must not open the legacy SSE route"
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("observe unintended legacy connection: {error}"),
+                }
+            }
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                &modern_target,
+                &legacy_sse_target,
+                &legacy_message_target,
+                ProtocolPolicy::Auto,
+            ),
+            ClientInfo {
+                name: "public-http-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ));
+        let Err(error) = connection else {
+            panic!("contradictory discovery must fail rather than select either era");
+        };
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::Modern(
+                ModernHttpClientError::DiscoveryDoesNotAdvertiseModernProtocol
+            )
+        ));
+        server
+            .join()
+            .expect("contradictory modern server must join");
     }
 
     #[test]
