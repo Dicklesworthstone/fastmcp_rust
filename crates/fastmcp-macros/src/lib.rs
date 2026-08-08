@@ -629,56 +629,92 @@ fn generate_final_tool_payload_projection(value: TokenStream2) -> TokenStream2 {
             final_result
                 .content
                 .into_iter()
-                .map(|content| match content {
-                    fastmcp_protocol::common_types::ContentBlock::Text {
-                        text,
-                        annotations: None,
-                        meta: None,
-                    } => Ok(fastmcp_protocol::Content::Text { text }),
-                    fastmcp_protocol::common_types::ContentBlock::Image {
-                        data,
-                        mime_type,
-                        annotations: None,
-                        meta: None,
-                    } => Ok(fastmcp_protocol::Content::Image { data, mime_type }),
-                    fastmcp_protocol::common_types::ContentBlock::Audio {
-                        data,
-                        mime_type,
-                        annotations: None,
-                        meta: None,
-                    } => Ok(fastmcp_protocol::Content::Audio { data, mime_type }),
-                    fastmcp_protocol::common_types::ContentBlock::Resource {
-                        resource,
-                        annotations: None,
-                        meta: None,
-                    } => {
-                        let resource = match resource {
-                            fastmcp_protocol::common_types::EmbeddedResourceContents::Text {
-                                uri,
-                                text,
-                                mime_type,
-                            } => fastmcp_protocol::ResourceContent {
-                                uri: uri.as_str().to_owned(),
-                                mime_type,
-                                text: Some(text),
-                                blob: None,
-                            },
-                            fastmcp_protocol::common_types::EmbeddedResourceContents::Blob {
-                                uri,
-                                blob,
-                                mime_type,
-                            } => fastmcp_protocol::ResourceContent {
-                                uri: uri.as_str().to_owned(),
-                                mime_type,
-                                text: None,
-                                blob: Some(blob),
-                            },
-                        };
-                        Ok(fastmcp_protocol::Content::Resource { resource })
+                .map(|content| {
+                    let content_wire = serde_json::to_value(&content).map_err(|error| {
+                        fastmcp_core::McpError::internal_error(format!(
+                            "failed to inspect final tool content for exact legacy projection: {error}",
+                        ))
+                    })?;
+                    let has_only_wire_fields = |value: &serde_json::Value, allowed: &[&str]| {
+                        value
+                            .as_object()
+                            .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
+                    };
+                    match content {
+                        fastmcp_protocol::common_types::ContentBlock::Text {
+                            text,
+                            annotations: None,
+                            meta: None,
+                            ..
+                        } if has_only_wire_fields(&content_wire, &["type", "text"]) => {
+                            Ok(fastmcp_protocol::Content::Text { text })
+                        }
+                        fastmcp_protocol::common_types::ContentBlock::Image {
+                            data,
+                            mime_type,
+                            annotations: None,
+                            meta: None,
+                            ..
+                        } if has_only_wire_fields(&content_wire, &["type", "data", "mimeType"]) => {
+                            Ok(fastmcp_protocol::Content::Image { data, mime_type })
+                        }
+                        fastmcp_protocol::common_types::ContentBlock::Audio {
+                            data,
+                            mime_type,
+                            annotations: None,
+                            meta: None,
+                            ..
+                        } if has_only_wire_fields(&content_wire, &["type", "data", "mimeType"]) => {
+                            Ok(fastmcp_protocol::Content::Audio { data, mime_type })
+                        }
+                        fastmcp_protocol::common_types::ContentBlock::Resource {
+                            resource,
+                            annotations: None,
+                            meta: None,
+                            ..
+                        } if has_only_wire_fields(&content_wire, &["type", "resource"]) => {
+                            let resource_wire = serde_json::to_value(&resource).map_err(|error| {
+                                fastmcp_core::McpError::internal_error(format!(
+                                    "failed to inspect final embedded resource for exact legacy projection: {error}",
+                                ))
+                            })?;
+                            let resource = match resource {
+                                fastmcp_protocol::common_types::EmbeddedResourceContents::Text {
+                                    uri,
+                                    text,
+                                    mime_type,
+                                    ..
+                                } if has_only_wire_fields(&resource_wire, &["uri", "text", "mimeType"]) => {
+                                    Ok(fastmcp_protocol::ResourceContent {
+                                        uri: uri.as_str().to_owned(),
+                                        mime_type,
+                                        text: Some(text),
+                                        blob: None,
+                                    })
+                                }
+                                fastmcp_protocol::common_types::EmbeddedResourceContents::Blob {
+                                    uri,
+                                    blob,
+                                    mime_type,
+                                    ..
+                                } if has_only_wire_fields(&resource_wire, &["uri", "blob", "mimeType"]) => {
+                                    Ok(fastmcp_protocol::ResourceContent {
+                                        uri: uri.as_str().to_owned(),
+                                        mime_type,
+                                        text: None,
+                                        blob: Some(blob),
+                                    })
+                                }
+                                _ => Err(fastmcp_core::McpError::internal_error(
+                                    "final embedded resource cannot be projected exactly through the legacy handler",
+                                )),
+                            }?;
+                            Ok(fastmcp_protocol::Content::Resource { resource })
+                        }
+                        _ => Err(fastmcp_core::McpError::internal_error(
+                            "final tool content cannot be projected exactly through the legacy handler",
+                        )),
                     }
-                    _ => Err(fastmcp_core::McpError::internal_error(
-                        "final tool content cannot be projected exactly through the legacy handler",
-                    )),
                 })
                 .collect()
         }
@@ -1574,7 +1610,8 @@ fn generate_resource_execution_methods(
 #[allow(clippy::items_after_test_module)]
 mod async_handler_expansion_tests {
     use super::{
-        found_crate_path, generate_final_tool_result_conversion, generate_prompt_execution_methods,
+        found_crate_path, generate_final_tool_payload_projection,
+        generate_final_tool_result_conversion, generate_prompt_execution_methods,
         generate_resource_execution_methods, generate_tool_execution_methods,
     };
     use proc_macro_crate::FoundCrate;
@@ -1677,6 +1714,19 @@ mod async_handler_expansion_tests {
         assert!(tokens.contains("fn call_final"), "{tokens}");
         assert!(tokens.contains("FinalCallToolResult"), "{tokens}");
         assert!(!tokens.contains("result . payload"), "{tokens}");
+    }
+
+    #[test]
+    fn final_tool_projection_matches_open_content_without_erasing_wire_fields() {
+        let tokens = generate_final_tool_payload_projection(quote! { result.payload }).to_string();
+
+        assert!(tokens.matches("..").count() >= 6, "{tokens}");
+        assert!(tokens.contains("has_only_wire_fields"), "{tokens}");
+        assert!(
+            tokens.contains("serde_json :: to_value (& content)"),
+            "{tokens}"
+        );
+        assert!(tokens.contains("exact legacy projection"), "{tokens}");
     }
 
     #[test]
