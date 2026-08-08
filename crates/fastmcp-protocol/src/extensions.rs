@@ -46,6 +46,8 @@ pub const OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID: &str = "tasks-2026-07-28-empty
 pub const OFFICIAL_TASKS_METHODS: [&str; 3] = ["tasks/get", "tasks/update", "tasks/cancel"];
 /// Official Tasks server-to-client notification method.
 pub const OFFICIAL_TASKS_NOTIFICATION: &str = "notifications/tasks";
+/// Official Tasks `tools/call` result discriminator.
+pub const OFFICIAL_TASKS_RESULT_DISCRIMINATOR: &str = "task";
 
 /// A validated extension identifier, preserving its exact wire spelling.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -337,8 +339,9 @@ pub fn official_tasks_extension_id() -> ExtensionId {
 
 /// Returns the complete official Tasks descriptor.
 ///
-/// It owns exactly `tasks/get`, `tasks/update`, `tasks/cancel`, and
-/// `notifications/tasks`. Tasks settings are exactly the empty JSON object;
+/// It owns exactly `tasks/get`, `tasks/update`, `tasks/cancel`,
+/// `notifications/tasks`, and the `tools/call` result discriminator `task`.
+/// Tasks settings are exactly the empty JSON object;
 /// [`ExtensionDescriptorRegistry::negotiate`] enforces that invariant for the
 /// two peer advertisements and the effective settings chosen by its resolver.
 #[must_use]
@@ -363,7 +366,7 @@ pub fn official_tasks_descriptor() -> ExtensionDescriptor {
             name: OFFICIAL_TASKS_NOTIFICATION.to_owned(),
             direction: ExtensionDirection::ServerToClient,
         }),
-        result_discriminator: None,
+        result_discriminator: Some(OFFICIAL_TASKS_RESULT_DISCRIMINATOR.to_owned()),
         routing_headers: Vec::new(),
         stdio_correlation: None,
     }
@@ -371,9 +374,10 @@ pub fn official_tasks_descriptor() -> ExtensionDescriptor {
 
 /// Registers the complete official Tasks surface atomically.
 ///
-/// The resulting descriptor owns exactly the official Tasks request methods
-/// and its one server notification. Registration alone does not activate the
-/// extension; normal local enablement and bilateral negotiation still apply.
+/// The resulting descriptor owns exactly the official Tasks request methods,
+/// its one server notification, and its `tools/call` result discriminator.
+/// Registration alone does not activate the extension; normal local enablement
+/// and bilateral negotiation still apply.
 pub fn register_official_tasks_extension(
     registry: &mut ExtensionDescriptorRegistry,
 ) -> Result<ExtensionId, ExtensionRegistryError> {
@@ -1821,7 +1825,10 @@ mod tests {
                 .map(|method| method.name.as_str()),
             Some(OFFICIAL_TASKS_METHODS[0])
         );
-        assert_eq!(descriptor.result_discriminator, None);
+        assert_eq!(
+            descriptor.result_discriminator.as_deref(),
+            Some(OFFICIAL_TASKS_RESULT_DISCRIMINATOR)
+        );
         registry.freeze().expect("Tasks registry freezes");
 
         let client = ClientExtensionDiscovery {
@@ -1890,6 +1897,63 @@ mod tests {
                 .expect("registered Tasks notification is admitted")
                 .id,
             id
+        );
+        assert_eq!(
+            negotiated
+                .admit_result_discriminator(
+                    &registry,
+                    ProtocolEra::Modern2026,
+                    &id,
+                    OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+                )
+                .expect("official Tasks tools/call result discriminator is admitted")
+                .id,
+            id
+        );
+    }
+
+    #[test]
+    fn task_01_official_tasks_undeclared_result_discriminator_one_variable_negative() {
+        let mut registry = ExtensionDescriptorRegistry::new();
+        let id = register_official_tasks_extension(&mut registry)
+            .expect("the public official Tasks surface registers");
+        registry.freeze().expect("Tasks registry freezes");
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(id.clone(), official_tasks_empty_settings())]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([(id.clone(), official_tasks_empty_settings())]),
+        };
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(id.clone());
+        let mut resolver =
+            |_descriptor: &ExtensionDescriptor,
+             _client: &ExtensionSettings,
+             _server: &ExtensionSettings| { Ok(official_tasks_empty_settings()) };
+        let negotiated = registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            )
+            .expect("current client and server capabilities negotiate Tasks");
+
+        let wrong_discriminator = "task-other";
+        assert_eq!(
+            negotiated.admit_result_discriminator(
+                &registry,
+                ProtocolEra::Modern2026,
+                &id,
+                wrong_discriminator,
+            ),
+            Err(ExtensionDispatchError::CapabilityDoesNotOwn {
+                capability: id.to_string(),
+                field: "result discriminator",
+                value: wrong_discriminator.to_owned(),
+            }),
+            "only the undeclared result discriminator differs from the admitted task value"
         );
     }
 
