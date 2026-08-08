@@ -1088,13 +1088,18 @@ impl ResponseCachingMiddleware {
     /// sealed public-cache proof, so every locally emitted hint is private;
     /// an untrusted `cacheScope: "public"` value is never cache authority.
     fn apply_protocol_cache_hints(&self, method: &str, response: &mut serde_json::Value) {
-        if !method_requires_protocol_cache_hints(method) {
-            return;
-        }
         let Some(response) = response.as_object_mut() else {
             return;
         };
-        if response.get("resultType").and_then(serde_json::Value::as_str) != Some("complete") {
+        if !method_requires_protocol_cache_hints(method)
+            || response.get("resultType").and_then(serde_json::Value::as_str) != Some("complete")
+        {
+            // Cache hints are valid only on the explicitly cacheable modern
+            // complete-result branches. Do not preserve a handler- or peer-
+            // supplied lookalike on input-required, task, legacy, or
+            // non-cacheable method results.
+            response.remove("ttlMs");
+            response.remove("cacheScope");
             return;
         }
 
