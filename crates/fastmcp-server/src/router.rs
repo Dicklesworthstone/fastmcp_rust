@@ -1,6 +1,6 @@
 //! Request router for MCP servers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::Poll;
@@ -43,7 +43,8 @@ use fastmcp_protocol::{
 };
 
 use crate::handler::{
-    BidirectionalSenders, BoxFuture, ProgressNotificationSender, UriParams, empty_final_result_meta,
+    BidirectionalSenders, BoxFuture, ProgressNotificationSender, UriParams,
+    empty_final_result_meta, encode_final_complete_result,
 };
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
@@ -316,11 +317,15 @@ fn promote_resource_content(resource: ResourceContent) -> McpResult<EmbeddedReso
             uri,
             text,
             mime_type: resource.mime_type,
+            meta: None,
+            additional: BTreeMap::new(),
         }),
         (None, Some(blob)) => Ok(EmbeddedResourceContents::Blob {
             uri,
             blob,
             mime_type: resource.mime_type,
+            meta: None,
+            additional: BTreeMap::new(),
         }),
         _ => Err(McpError::internal_error(
             "legacy resource content cannot be promoted without exactly one text or blob payload",
@@ -1441,7 +1446,10 @@ impl Router {
             }
         };
 
-        Ok(LegacyCompletionResult { completion })
+        Ok(LegacyCompletionResult {
+            completion,
+            meta: None,
+        })
     }
 
     async fn handle_completion_final_in_request(
@@ -9724,11 +9732,13 @@ mod router_tests {
             audience: None,
             priority: Some(0.25),
             last_modified: Some("2026-08-08T00:00:00Z".to_owned()),
+            additional: BTreeMap::new(),
         };
         let template_annotations = Annotations {
             audience: None,
             priority: Some(0.75),
             last_modified: Some("2026-08-08T00:00:01Z".to_owned()),
+            additional: BTreeMap::new(),
         };
         let resource_icon = RawIcon::try_with_details(
             "https://example.test/resource.png",

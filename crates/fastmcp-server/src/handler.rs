@@ -9,7 +9,7 @@
 //! the sync versions. This allows gradual migration to async without breaking
 //! existing code.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -322,18 +322,21 @@ pub(crate) fn promote_legacy_tool_content(
                 text,
                 annotations: None,
                 meta: None,
+                additional: BTreeMap::new(),
             }),
             Content::Image { data, mime_type } => Ok(ContentBlock::Image {
                 data,
                 mime_type,
                 annotations: None,
                 meta: None,
+                additional: BTreeMap::new(),
             }),
             Content::Audio { data, mime_type } => Ok(ContentBlock::Audio {
                 data,
                 mime_type,
                 annotations: None,
                 meta: None,
+                additional: BTreeMap::new(),
             }),
             Content::Resource { resource } => {
                 let uri = AbsoluteUri::parse(resource.uri).map_err(|error| {
@@ -346,11 +349,15 @@ pub(crate) fn promote_legacy_tool_content(
                         uri,
                         text,
                         mime_type: resource.mime_type,
+                        meta: None,
+                        additional: BTreeMap::new(),
                     },
                     (None, Some(blob)) => EmbeddedResourceContents::Blob {
                         uri,
                         blob,
                         mime_type: resource.mime_type,
+                        meta: None,
+                        additional: BTreeMap::new(),
                     },
                     _ => {
                         return Err(McpError::internal_error(
@@ -362,6 +369,7 @@ pub(crate) fn promote_legacy_tool_content(
                     resource: embedded,
                     annotations: None,
                     meta: None,
+                    additional: BTreeMap::new(),
                 })
             }
         })
