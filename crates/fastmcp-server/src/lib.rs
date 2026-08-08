@@ -114,8 +114,9 @@ use session::{
     SubscriptionRemovalError,
 };
 pub use tasks::{
-    DEFAULT_IN_MEMORY_FINAL_TASKS, FinalTaskNotificationEmitter, FinalTaskRuntime,
-    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, InMemoryFinalTaskStore,
+    DEFAULT_IN_MEMORY_FINAL_TASKS, FinalTaskAcceptedInput, FinalTaskNotificationEmitter,
+    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
+    InMemoryFinalTaskStore,
 };
 #[cfg(test)]
 pub(crate) use tasks::{SharedTaskManager, TaskManager};
@@ -159,7 +160,9 @@ use fastmcp_core::{
     McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
-use fastmcp_protocol::common_types::{Implementation, OpenMetadata};
+#[cfg(test)]
+use fastmcp_protocol::common_types::Implementation;
+use fastmcp_protocol::common_types::OpenMetadata;
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, ExtensionNegotiationError, ExtensionSettingsCompatibilityResolver,
     ExtensionSettingsResolution, McpAppsNegotiationResolver, TasksNegotiationResolver,
@@ -176,23 +179,26 @@ use fastmcp_protocol::tasks_extension::{
     TaskStatusNotification as FinalTaskStatusNotification, set_task_subscription_ids,
 };
 use fastmcp_protocol::{
-    CallToolParams, CancelledParams, ClientExtensionDiscovery, CompleteResult, CoreRequest,
+    CallToolParams, CancelledParams, ClientExtensionDiscovery, ClientNotification, CoreRequest,
     CoreResult, CorrelationKey, DiscoveryCacheHints, ExtensionDescriptor,
     ExtensionDescriptorRegistry, ExtensionId, ExtensionRegistryError, ExtensionRegistryReceipt,
     ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SERVER_INFO_META_KEY,
     FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult,
-    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
-    FinalSubscriptionsListenResult, GetPromptParams, InitializeParams, JsonRpcError,
+    FinalCancelledNotificationParams, FinalSubscriptionsAcknowledgedNotificationParams,
+    FinalSubscriptionsListenParams,
+    GetPromptParams, InitializeParams, JsonRpcError,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
     ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
     MAX_SERVER_INSTRUCTIONS_BYTES, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
     MissingRequiredClientCapabilityError, ProgressMarker, Prompt, ReadResourceParams, RequestId,
-    Resource, ResourceTemplate, ResultMeta, SERVER_DISCOVER_METHOD, ServerCapabilities,
+    Resource, ResourceTemplate, SERVER_DISCOVER_METHOD, ServerCapabilities,
     ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
     ServerExtensionDiscovery, ServerInfo, ServerInstructions, ServerNotification,
     SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
     UnsubscribeResourceParams, task_subscription_ids,
 };
+#[cfg(test)]
+use fastmcp_protocol::{CompleteResult, FinalSubscriptionsListenResult, ResultMeta};
 use legacy_2024::{
     Legacy2024AdapterError, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Outbound,
     Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo,
@@ -2159,6 +2165,13 @@ pub enum ServerHttpEndpointResponse {
 /// request transport; this registry never creates a background runtime.
 const MAX_FINAL_SUBSCRIPTION_STREAMS: usize = 64;
 
+/// Modern Streamable HTTP has no protocol session identifier.  A listen
+/// response nevertheless owns one connection-local cancellation domain, so
+/// give its active-request entry a process-local generation rather than
+/// collapsing unrelated HTTP response streams that happen to reuse a JSON-RPC
+/// request ID.
+static NEXT_MODERN_HTTP_STREAM_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 /// A server-wide registry of request-owned final subscription streams.
 ///
 /// Stdio and modern HTTP both install the same entry after their mandatory
@@ -2174,13 +2187,20 @@ struct FinalSubscriptionRegistry {
 struct FinalSubscriptionRegistryState {
     next_key: usize,
     entries: HashMap<usize, FinalSubscriptionEntry>,
+    /// Modern Streamable HTTP has no protocol session identifier.  Its
+    /// cancellation notification can therefore target only one globally live
+    /// listen request ID; a duplicate is refused at registration instead of
+    /// allowing an ambiguous control frame to cancel an unrelated stream.
+    modern_http_request_keys: HashMap<CorrelationKey, usize>,
 }
 
 #[derive(Clone)]
 struct FinalSubscriptionEntry {
     subscription_id: RequestId,
+    modern_http_request_key: Option<CorrelationKey>,
     accepted_filter: SubscriptionFilter,
     notification_sender: NotificationSender,
+    request_cancellation: McpRequestCancellation,
     acknowledged: bool,
 }
 
@@ -2197,7 +2217,11 @@ impl Drop for FinalSubscriptionLease {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.entries.remove(&self.key);
+        if let Some(entry) = state.entries.remove(&self.key)
+            && let Some(request_key) = entry.modern_http_request_key
+        {
+            state.modern_http_request_keys.remove(&request_key);
+        }
     }
 }
 
@@ -2207,6 +2231,8 @@ impl FinalSubscriptionRegistry {
         subscription_id: RequestId,
         requested: SubscriptionFilter,
         accept_tasks: bool,
+        modern_http_request: bool,
+        request_cancellation: McpRequestCancellation,
         notification_sender: NotificationSender,
     ) -> McpResult<FinalSubscriptionLease> {
         if subscription_id.validate().is_err() {
@@ -2219,6 +2245,10 @@ impl FinalSubscriptionRegistry {
         }
 
         let accepted_filter = accepted_subscription_filter(&requested, accept_tasks)?;
+        let modern_http_request_key = modern_http_request
+            .then(|| subscription_id.correlation_key())
+            .transpose()
+            .map_err(|_| McpError::invalid_request("subscriptions/listen requires a valid JSON-RPC request id"))?;
         let acknowledgement =
             subscription_acknowledgement(subscription_id.clone(), accepted_filter.clone())?;
         let acknowledgement = acknowledgement.encode().map_err(|error| {
@@ -2241,6 +2271,13 @@ impl FinalSubscriptionRegistry {
                     "final subscription stream capacity exhausted",
                 ));
             }
+            if let Some(request_key) = modern_http_request_key.as_ref()
+                && state.modern_http_request_keys.contains_key(request_key)
+            {
+                return Err(McpError::invalid_request(
+                    "a modern HTTP subscriptions/listen request id is already active",
+                ));
+            }
             let mut key = state.next_key;
             while state.entries.contains_key(&key) {
                 key = key.checked_add(1).unwrap_or(0);
@@ -2250,12 +2287,18 @@ impl FinalSubscriptionRegistry {
                 key,
                 FinalSubscriptionEntry {
                     subscription_id,
+                    modern_http_request_key: modern_http_request_key.clone(),
                     accepted_filter,
                     notification_sender: notification_sender.clone(),
+                    request_cancellation,
                     acknowledged: false,
                 },
             );
             debug_assert!(previous.is_none());
+            if let Some(request_key) = modern_http_request_key {
+                let previous = state.modern_http_request_keys.insert(request_key, key);
+                debug_assert!(previous.is_none());
+            }
             key
         };
 
@@ -2359,11 +2402,59 @@ impl FinalSubscriptionRegistry {
 
     fn terminate(&self) -> usize {
         self.terminating.store(true, Ordering::Release);
-        self.inner
+        let targets = self
+            .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries
-            .len()
+            .values()
+            .filter(|entry| entry.acknowledged)
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in &targets {
+            // The final cancellation page requires this server-initiated
+            // teardown control while the listen request is still active.  It
+            // is deliberately not filtered as an ordinary subscription event.
+            if let Ok(notification) =
+                subscription_cancellation_notification(&entry.subscription_id)
+            {
+                entry.notification_sender(notification);
+            }
+            // This is also the single terminal winner for the request-owned
+            // dispatch.  It prevents a later JSON-RPC result from being put
+            // onto an SSE body after the cancellation control.
+            entry.request_cancellation.cancel();
+        }
+        targets.len()
+    }
+
+    /// Cancels the exact live modern HTTP listen request selected by the
+    /// client's final `notifications/cancelled` POST.  A missing or already
+    /// finished key is deliberately a no-op: notification delivery has no
+    /// response and cannot affect a different request ID.
+    fn cancel_modern_http_request(&self, request_id: &RequestId) -> bool {
+        let Ok(request_key) = request_id.correlation_key() else {
+            return false;
+        };
+        let cancellation = {
+            let state = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .modern_http_request_keys
+                .get(&request_key)
+                .and_then(|entry_key| {
+                    state
+                        .entries
+                        .get(entry_key)
+                        .map(|entry| entry.request_cancellation.clone())
+                })
+        };
+        let Some(cancellation) = cancellation else {
+            return false;
+        };
+        cancellation.cancel()
     }
 
     fn is_terminating(&self) -> bool {
@@ -2429,6 +2520,23 @@ fn subscription_acknowledgement(
             additional: BTreeMap::new(),
         },
     ))
+}
+
+fn subscription_cancellation_notification(
+    subscription_id: &RequestId,
+) -> McpResult<JsonRpcRequest> {
+    ServerNotification::Cancelled(FinalCancelledNotificationParams {
+        request_id: subscription_id.clone(),
+        reason: None,
+        meta: Some(subscription_metadata(None, subscription_id)?),
+        additional: BTreeMap::new(),
+    })
+    .encode()
+    .map_err(|error| {
+        McpError::internal_error(format!(
+            "failed to encode final subscription cancellation: {error}"
+        ))
+    })
 }
 
 fn is_final_subscription_event(notification: &ServerNotification) -> bool {
@@ -3203,6 +3311,7 @@ async fn send_modern_sse_stream(
     cx: &Cx,
     stream: AsyncTcpStream,
     server: Arc<Server>,
+    http_stream_generation: u64,
     request: JsonRpcRequest,
     response: DualEraHttpSseResponse,
 ) -> Result<(), ()> {
@@ -3231,6 +3340,33 @@ async fn send_modern_sse_stream(
                 request_id,
                 InboundRequestTransport::Http,
             );
+            let cancellation = response_sender.request_cancellation();
+            let _active_request = match request.id.clone() {
+                Some(id) => match ActiveRequestGuard::try_new_with_cancellation(
+                    Arc::clone(&server.active_requests),
+                    http_stream_generation,
+                    id.clone(),
+                    request_cx.clone(),
+                    cancellation.clone(),
+                ) {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        let _ = response_sender.send_response(
+                            &request_cx,
+                            JsonRpcResponse::error(
+                                Some(id),
+                                JsonRpcError {
+                                    code: McpErrorCode::InvalidRequest.into(),
+                                    message: "Request id is already active".to_owned(),
+                                    data: None,
+                                },
+                            ),
+                        );
+                        return;
+                    }
+                },
+                None => None,
+            };
             let notification_cx = request_cx.clone();
             let notification_cancellation = response_sender.request_cancellation();
             let notification_sender: NotificationSender = Arc::new(move |notification| {
@@ -3241,7 +3377,6 @@ async fn send_modern_sse_stream(
                     notification_cancellation.cancel();
                 }
             });
-            let cancellation = response_sender.request_cancellation();
             let response = Arc::clone(&server)
                 .dispatch_with_protocol_policy_owned(
                     policy,
@@ -3251,7 +3386,9 @@ async fn send_modern_sse_stream(
                     notification_sender,
                 )
                 .await;
-            if let Some(response) = response {
+            if let Some(response) = response
+                && !cancellation.is_cancel_requested()
+            {
                 let _ = response_sender.send_response(&request_cx, response);
             }
         })
@@ -3290,6 +3427,15 @@ async fn send_modern_sse_stream(
     let _ = peer_closed.join(cx).await;
     let _ = dispatch.join(cx).await;
     result
+}
+
+fn next_modern_http_stream_generation() -> u64 {
+    loop {
+        let generation = NEXT_MODERN_HTTP_STREAM_GENERATION.fetch_add(1, Ordering::Relaxed);
+        if generation != 0 {
+            return generation;
+        }
+    }
 }
 
 fn http_endpoint_response_to_static(cx: &Cx, response: ServerHttpEndpointResponse) -> HttpResponse {
@@ -3345,6 +3491,10 @@ fn dispatch_http_request(
         );
     }
 
+    if let Some(response) = handle_modern_http_cancelled_notification(endpoint, &request) {
+        return response;
+    }
+
     let mut session = match endpoint.open_session(cx) {
         Ok(session) => session,
         Err(_) => return HttpResponse::internal_error(),
@@ -3353,6 +3503,37 @@ fn dispatch_http_request(
         .handle(cx, request)
         .map(|response| http_endpoint_response_to_static(cx, response))
         .unwrap_or_else(|_| HttpResponse::bad_request())
+}
+
+/// Routes an exact-final cancellation notification sent on a separate public
+/// Streamable HTTP POST to its one active listen stream. Modern HTTP has no
+/// protocol session ID, so the registry admits at most one live listen for a
+/// canonical JSON-RPC request key and a wrong key is strictly a no-op.
+fn handle_modern_http_cancelled_notification(
+    endpoint: &ServerHttpEndpoint,
+    request: &HttpRequest,
+) -> Option<HttpResponse> {
+    if request.method != HttpMethod::Post
+        || request.path != endpoint.server.http_config.handler_config.base_path
+    {
+        return None;
+    }
+    let handler = HttpRequestHandler::with_config(endpoint.server.http_config.handler_config.clone());
+    let admission = handler.admit_modern_request(request).ok()?;
+    let notification = admission.request();
+    if notification.method != "notifications/cancelled" {
+        return None;
+    }
+    match ClientNotification::decode(notification) {
+        Ok(ClientNotification::Cancelled(params)) => {
+            endpoint
+                .server
+                .final_subscriptions
+                .cancel_modern_http_request(&params.request_id);
+            Some(HttpResponse::new(HttpStatus::ACCEPTED))
+        }
+        Err(_) => Some(HttpResponse::bad_request()),
+    }
 }
 
 async fn serve_http_connection(
@@ -3415,6 +3596,7 @@ async fn serve_http_connection(
                     cx,
                     stream,
                     Arc::clone(&endpoint.server),
+                    next_modern_http_stream_generation(),
                     request,
                     response,
                 )
@@ -3658,10 +3840,11 @@ impl Server {
 
     /// Begins graceful termination for all live final subscription streams.
     ///
-    /// Each request-owned stream observes this transition, emits its terminal
-    /// `CompleteResult`, and removes itself. Transport disconnect and explicit
-    /// request cancellation instead remove the stream without a terminal
-    /// response because the peer can no longer consume it.
+    /// Each request-owned stream receives one correlated final
+    /// `notifications/cancelled` control and removes itself without a later
+    /// JSON-RPC result. Transport disconnect and explicit request cancellation
+    /// instead remove the stream without a terminal control because the peer
+    /// can no longer consume it.
     #[must_use]
     pub fn terminate_subscription_streams(&self) -> usize {
         self.final_subscriptions.terminate()
@@ -4219,6 +4402,16 @@ impl Server {
             return None;
         }
 
+        // A listen stream terminates through its request-owned cancellation
+        // authority.  For both a peer-close and server-initiated teardown,
+        // the stream has no usable response channel after that terminal
+        // signal; emitting an error response would create a second terminal
+        // outcome.  Other request methods retain ordinary cancellation
+        // responses.
+        if request.method == SUBSCRIPTIONS_LISTEN && request_cancellation.is_cancel_requested() {
+            return None;
+        }
+
         let response_id = response_id.expect("non-notification requests have an id");
         Some(match result {
             Ok(value) => JsonRpcResponse::success(response_id, value),
@@ -4359,6 +4552,7 @@ impl Server {
                 self.dispatch_final_subscriptions_listen(
                     &request_ctx,
                     &request,
+                    matches!(inbound.transport(), InboundRequestTransport::Http),
                     request_cancellation.clone(),
                     notification_sender,
                 )
@@ -4432,6 +4626,7 @@ impl Server {
         self: &Arc<Self>,
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
+        modern_http_request: bool,
         request_cancellation: McpRequestCancellation,
         notification_sender: NotificationSender,
     ) -> McpResult<serde_json::Value> {
@@ -4505,6 +4700,8 @@ impl Server {
             subscription_id.clone(),
             params.notifications,
             tasks_requested,
+            modern_http_request,
+            request_cancellation.clone(),
             notification_sender,
         )?;
 
@@ -4518,10 +4715,11 @@ impl Server {
             asupersync::time::sleep(request_ctx.cx().now(), Duration::from_millis(1)).await;
         }
 
-        if request_cancellation.is_cancel_requested() || request_ctx.ensure_live().is_err() {
-            return Err(McpError::request_cancelled());
-        }
-        self.final_subscription_complete_result(&subscription_id)
+        // A server-initiated termination has already emitted its correlated
+        // cancellation control and cancelled this request authority.  Return
+        // the cancellation outcome so the outer transport suppresses a later
+        // final JSON-RPC response on this now-closed subscription stream.
+        Err(McpError::request_cancelled())
     }
 
     fn final_subscription_complete_result(
@@ -5893,6 +6091,10 @@ impl Server {
 
     /// Performs graceful shutdown: runs hook, closes stats, exits.
     fn graceful_shutdown(&self, exit_code: i32) -> ! {
+        // Subscription teardown owns a terminal control frame that must be
+        // emitted before generic active-request cancellation tears down its
+        // request-local sender.
+        let _ = self.terminate_subscription_streams();
         self.cancel_active_requests(CancelKind::Shutdown, true);
         self.run_shutdown_hook();
         if let Some(ref stats) = self.stats {
@@ -5906,6 +6108,9 @@ impl Server {
     /// This is intended for embedding/testing scenarios where the server loop is
     /// running on a thread and the caller wants to `join()` it.
     fn graceful_shutdown_returning(&self) {
+        // Preserve the same cancellation-only subscription teardown semantics
+        // for embedded servers as for the process-exiting lifecycle.
+        let _ = self.terminate_subscription_streams();
         self.cancel_active_requests(CancelKind::Shutdown, true);
         self.run_shutdown_hook();
         if let Some(ref stats) = self.stats {
@@ -16048,6 +16253,159 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn live_http_subscription_cancellation_post_targets_only_the_exact_listen_id() {
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("live-http-listen-cancellation", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("subscription cancellation HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("subscription cancellation HTTP address failed: {error}"))?;
+            let server = Arc::clone(&bound.endpoint.server);
+            let caller_cx = cx.clone();
+            let controller = thread::spawn(move || -> Result<(), String> {
+                let exchange = |request: Vec<u8>| -> Result<Vec<u8>, String> {
+                    let mut stream = std::net::TcpStream::connect(address)
+                        .map_err(|error| format!("cancellation POST connect failed: {error}"))?;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .map_err(|error| format!("cancellation POST timeout setup failed: {error}"))?;
+                    std::io::Write::write_all(&mut stream, &request)
+                        .map_err(|error| format!("cancellation POST write failed: {error}"))?;
+                    std::io::Write::flush(&mut stream)
+                        .map_err(|error| format!("cancellation POST flush failed: {error}"))?;
+                    let mut response = Vec::new();
+                    std::io::Read::read_to_end(&mut stream, &mut response)
+                        .map_err(|error| format!("cancellation POST read failed: {error}"))?;
+                    Ok(response)
+                };
+                let listen_id = RequestId::Number(871);
+                let listen = JsonRpcRequest::new(
+                    SUBSCRIPTIONS_LISTEN,
+                    Some(serde_json::json!({
+                        "_meta": {
+                            MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                        },
+                        "notifications": {"toolsListChanged": true},
+                    })),
+                    listen_id.clone(),
+                );
+                let listen_body = serde_json::to_vec(&listen)
+                    .map_err(|error| format!("listen request did not serialize: {error}"))?;
+                let listen_request = live_http_post(
+                    "/mcp",
+                    &listen_body,
+                    &[
+                        ("Accept", "text/event-stream"),
+                        ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                        ("Mcp-Method", SUBSCRIPTIONS_LISTEN),
+                    ],
+                );
+                let mut stream = std::net::TcpStream::connect(address)
+                    .map_err(|error| format!("listen SSE connect failed: {error}"))?;
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .map_err(|error| format!("listen SSE timeout setup failed: {error}"))?;
+                std::io::Write::write_all(&mut stream, &listen_request)
+                    .map_err(|error| format!("listen SSE write failed: {error}"))?;
+                std::io::Write::flush(&mut stream)
+                    .map_err(|error| format!("listen SSE flush failed: {error}"))?;
+                let mut received = Vec::new();
+                while !received
+                    .windows(b"notifications/subscriptions/acknowledged".len())
+                    .any(|window| window == b"notifications/subscriptions/acknowledged")
+                {
+                    let mut chunk = [0_u8; 2048];
+                    let count = std::io::Read::read(&mut stream, &mut chunk)
+                        .map_err(|error| format!("listen acknowledgement read failed: {error}"))?;
+                    if count == 0 {
+                        return Err("listen stream closed before acknowledgement".to_owned());
+                    }
+                    received.extend_from_slice(&chunk[..count]);
+                }
+
+                let cancellation_request = |request_id: RequestId| -> Result<Vec<u8>, String> {
+                    let cancellation = JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(serde_json::json!({
+                            "requestId": request_id,
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            },
+                        })),
+                    );
+                    let body = serde_json::to_vec(&cancellation).map_err(|error| {
+                        format!("subscription cancellation did not serialize: {error}")
+                    })?;
+                    Ok(live_http_post(
+                        "/mcp",
+                        &body,
+                        &[
+                            ("Accept", "application/json"),
+                            ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                            ("Mcp-Method", "notifications/cancelled"),
+                        ],
+                    ))
+                };
+
+                let wrong = exchange(cancellation_request(RequestId::Number(872))?)?;
+                if !wrong.starts_with(b"HTTP/1.1 202") {
+                    return Err(format!("wrong-ID cancellation POST was not accepted: {wrong:?}"));
+                }
+                if server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entries
+                    .len()
+                    != 1
+                {
+                    return Err("wrong-ID cancellation changed the active listen registry".to_owned());
+                }
+
+                let exact = exchange(cancellation_request(listen_id)?)?;
+                if !exact.starts_with(b"HTTP/1.1 202") {
+                    return Err(format!("exact cancellation POST was not accepted: {exact:?}"));
+                }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entries
+                    .is_empty()
+                {
+                    if Instant::now() >= deadline {
+                        return Err("exact cancellation did not release the active listen".to_owned());
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let mut trailing = Vec::new();
+                std::io::Read::read_to_end(&mut stream, &mut trailing)
+                    .map_err(|error| format!("cancelled listen stream did not close: {error}"))?;
+                if trailing.windows(b"\"resultType\"".len()).any(|window| window == b"\"resultType\"") {
+                    return Err("peer cancellation emitted a forbidden terminal result".to_owned());
+                }
+                caller_cx.cancel_with(CancelKind::User, Some("subscription cancellation complete"));
+                Ok(())
+            });
+
+            let serve = bound.serve(&cx).await;
+            controller
+                .join()
+                .map_err(|_| "subscription cancellation controller panicked".to_owned())??;
+            serve.map_err(|error| format!("subscription cancellation server failed: {error}"))?;
+            Ok(())
+        });
+    }
+
+    #[test]
     fn live_http_ordinary_requests_overlap_in_request_owned_blocking_children() {
         let _overlap_lock = http_overlap_lock()
             .lock()
@@ -19135,6 +19493,8 @@ mod lib_unit_tests {
                     ..SubscriptionFilter::default()
                 },
                 false,
+                false,
+                McpRequestCancellation::new(),
                 sender,
             )
             .expect("final subscription should admit a bounded stream");
@@ -19212,6 +19572,61 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn final_subscription_registry_rejects_duplicate_modern_http_request_keys() {
+        let server = Server::new("modern-http-listen-key-test", "1.0.0").build();
+        let registry = Arc::clone(&server.final_subscriptions);
+        let sender: NotificationSender = Arc::new(|_| {});
+        let first_cancellation = McpRequestCancellation::new();
+        let first = registry
+            .open(
+                RequestId::Integer("873".to_owned()),
+                SubscriptionFilter::default(),
+                false,
+                true,
+                first_cancellation.clone(),
+                Arc::clone(&sender),
+            )
+            .expect("the first canonical modern HTTP request key must admit");
+        let duplicate = registry.open(
+            RequestId::Number(873),
+            SubscriptionFilter::default(),
+            false,
+            true,
+            McpRequestCancellation::new(),
+            sender,
+        );
+        assert!(
+            matches!(duplicate, Err(error) if error.code == McpErrorCode::InvalidRequest),
+            "one numerically equivalent request key must not create an ambiguous HTTP cancellation target",
+        );
+        assert_eq!(
+            registry
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .len(),
+            1,
+            "duplicate refusal must leave the original request alone",
+        );
+        assert!(registry.cancel_modern_http_request(&RequestId::Number(873)));
+        assert!(
+            first_cancellation.is_cancel_requested(),
+            "the canonical key must retain the first request's cancellation authority",
+        );
+        drop(first);
+        assert!(
+            registry
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .modern_http_request_keys
+                .is_empty(),
+            "request completion must remove its global HTTP cancellation key",
+        );
+    }
+
+    #[test]
     fn final_tasks_runtime_publishes_only_to_acknowledged_exact_task_ids() {
         let application_notifications = Arc::new(Mutex::new(Vec::new()));
         let server = final_tasks_test_server(Arc::clone(&application_notifications));
@@ -19246,7 +19661,14 @@ mod lib_unit_tests {
         let subscription_id = RequestId::String("task-subscription-73".to_owned());
         let _lease = server
             .final_subscriptions
-            .open(subscription_id.clone(), requested, true, sender)
+            .open(
+                subscription_id.clone(),
+                requested,
+                true,
+                false,
+                McpRequestCancellation::new(),
+                sender,
+            )
             .expect("negotiated Tasks filter must open");
 
         let acknowledgement = sent
@@ -19323,6 +19745,8 @@ mod lib_unit_tests {
                     ..SubscriptionFilter::default()
                 },
                 false,
+                false,
+                McpRequestCancellation::new(),
                 sender,
             )
             .expect("selected catalog subscription should admit");
@@ -19410,7 +19834,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn final_subscription_owned_dispatch_acknowledges_before_terminal_complete_response() {
+    fn final_subscription_http_teardown_emits_correlated_cancellation_without_result() {
         let server = Arc::new(Server::new("final-listen-dispatch-test", "1.0.0").build());
         let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
         let sent_for_sender = Arc::clone(&sent);
@@ -19470,8 +19894,7 @@ mod lib_unit_tests {
             request,
             McpRequestCancellation::new(),
             notification_sender,
-        ))
-        .expect("final subscriptions/listen must produce a terminal response after shutdown");
+        ));
 
         assert!(
             terminator
@@ -19484,18 +19907,133 @@ mod lib_unit_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .first()
             .cloned()
-            .expect("listener must emit its acknowledgement before completing");
+            .expect("listener must emit its acknowledgement before terminating");
         assert!(matches!(
             ServerNotification::decode(&acknowledgement),
             Ok(ServerNotification::SubscriptionsAcknowledged(_))
         ));
-        assert_eq!(response.id, Some(subscription_id));
+        assert!(
+            response.is_none(),
+            "cancellation-only teardown must not emit a later result"
+        );
+        let terminal = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(1)
+            .cloned()
+            .expect("server teardown must emit one cancellation control after acknowledgement");
+        let ServerNotification::Cancelled(terminal) = ServerNotification::decode(&terminal)
+            .expect("terminal control must use the final server notification union")
+        else {
+            panic!("server teardown must emit notifications/cancelled");
+        };
+        assert_eq!(terminal.request_id, subscription_id);
         assert_eq!(
-            response
-                .result
+            terminal
+                .meta
                 .as_ref()
-                .and_then(|result| result.get("resultType")),
-            Some(&serde_json::json!("complete"))
+                .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY)),
+            Some(&serde_json::json!(73)),
+            "terminal metadata must correlate to exactly this listen request",
+        );
+        assert_eq!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2,
+            "acknowledgement and cancellation are the only terminal-stream frames",
+        );
+    }
+
+    #[test]
+    fn final_subscription_http_peer_cancellation_removes_without_server_terminal_control() {
+        let server = Arc::new(Server::new("final-listen-peer-cancel-test", "1.0.0").build());
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let notification_sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let subscription_id = RequestId::Number(74);
+        let metadata = OpenMetadata::try_from_entries([
+            (
+                "io.modelcontextprotocol/protocolVersion".to_owned(),
+                serde_json::json!(MODERN_PROTOCOL_VERSION),
+            ),
+            (
+                FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
+                serde_json::json!({}),
+            ),
+        ])
+        .expect("final request metadata must be valid");
+        let params = serde_json::to_value(FinalSubscriptionsListenParams {
+            meta: metadata,
+            notifications: SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+        })
+        .expect("final listen parameters must serialize");
+        let request =
+            JsonRpcRequest::new(SUBSCRIPTIONS_LISTEN, Some(params), subscription_id.clone());
+        let inbound = InboundRequestContext::new(
+            Cx::for_testing(),
+            request_id_to_u64(Some(&subscription_id)),
+            InboundRequestTransport::Http,
+        );
+        let request_cancellation = McpRequestCancellation::new();
+        let canceller = {
+            let sent = Arc::clone(&sent);
+            let request_cancellation = request_cancellation.clone();
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    if !sent
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_empty()
+                    {
+                        request_cancellation.cancel();
+                        return true;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                false
+            })
+        };
+        let response = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+            ProtocolPolicy::ModernOnly,
+            &inbound,
+            request,
+            request_cancellation,
+            notification_sender,
+        ));
+
+        assert!(
+            canceller.join().expect("peer cancellation helper must not panic"),
+            "the listener must acknowledge before the peer can close it"
+        );
+        assert!(
+            response.is_none(),
+            "a peer-closed stream must not receive a result"
+        );
+        assert_eq!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "changing only the terminal trigger to peer cancellation must not send server cancellation control",
+        );
+        assert!(
+            server
+                .final_subscriptions
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .is_empty(),
+            "peer cancellation must release exactly its request-owned registry entry",
         );
     }
 }

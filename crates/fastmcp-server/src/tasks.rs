@@ -1985,6 +1985,38 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
 /// delivery path never changes whether the task transition was durable.
 pub type FinalTaskNotificationEmitter = Arc<dyn Fn(FinalTaskStatusNotification) + Send + Sync>;
 
+/// Accepted task input made available exactly once to the task supervisor.
+///
+/// This is deliberately not part of the public task snapshot or notification:
+/// task input belongs to the task's private execution state. The caller-owned
+/// supervisor takes this value after a task returns to `working` and uses it to
+/// resume the associated operation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalTaskAcceptedInput {
+    task_id: FinalTaskId,
+    input_responses: FinalTaskInputResponses,
+}
+
+impl FinalTaskAcceptedInput {
+    /// Returns the task whose worker may now resume.
+    #[must_use]
+    pub const fn task_id(&self) -> &FinalTaskId {
+        &self.task_id
+    }
+
+    /// Returns every validated input response accumulated for this resumption.
+    #[must_use]
+    pub const fn input_responses(&self) -> &FinalTaskInputResponses {
+        &self.input_responses
+    }
+
+    /// Splits this one-shot supervisor handoff into its task ID and input map.
+    #[must_use]
+    pub fn into_parts(self) -> (FinalTaskId, FinalTaskInputResponses) {
+        (self.task_id, self.input_responses)
+    }
+}
+
 /// Immutable final Tasks timing policy supplied with the durable store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FinalTaskRuntimeConfig {
@@ -2016,6 +2048,10 @@ pub struct FinalTaskRuntime {
     store: Arc<dyn FinalTaskStore>,
     config: FinalTaskRuntimeConfig,
     notification_emitters: Arc<Mutex<Vec<FinalTaskNotificationEmitter>>>,
+    /// Validated task inputs retained until the caller-owned supervisor takes
+    /// one complete resumption handoff. Partial updates accumulate here but
+    /// cannot be observed until every outstanding input request is satisfied.
+    accepted_inputs: Arc<Mutex<BTreeMap<FinalTaskId, FinalTaskInputResponses>>>,
 }
 
 impl FinalTaskRuntime {
@@ -2030,6 +2066,7 @@ impl FinalTaskRuntime {
             store,
             config,
             notification_emitters: Arc::new(Mutex::new(vec![notification_emitter])),
+            accepted_inputs: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -2074,6 +2111,33 @@ impl FinalTaskRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(emitter);
+    }
+
+    /// Takes the validated inputs for a task that has returned to `working`.
+    ///
+    /// A task supervisor calls this after observing the task's resumed state.
+    /// Input values remain private runtime state rather than leaking through a
+    /// task snapshot or `notifications/tasks`; the returned value is removed
+    /// atomically so one worker cannot replay another worker's inputs. While a
+    /// task remains `input_required`, or if it has no accepted inputs, this
+    /// returns `None` without changing runtime state.
+    pub fn take_accepted_input(
+        &self,
+        task_id: &FinalTaskId,
+    ) -> McpResult<Option<FinalTaskAcceptedInput>> {
+        let current = self.load_task_snapshot(task_id)?;
+        if !matches!(current.task(), FinalTask::Working(_)) {
+            return Ok(None);
+        }
+        let input_responses = self
+            .accepted_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(task_id);
+        Ok(input_responses.map(|input_responses| FinalTaskAcceptedInput {
+            task_id: task_id.clone(),
+            input_responses,
+        }))
     }
 
     /// Durably creates the initial working task before returning its wire result.
@@ -2181,7 +2245,20 @@ impl FinalTaskRuntime {
                 input_requests,
             }
         };
-        self.persist_transition(&current, task)?;
+        // Hold the handoff lock across the durable transition. A polling
+        // supervisor can therefore never observe `working` and consume an
+        // empty handoff in the interval before this accepted input is stored.
+        let mut accepted_inputs = self
+            .accepted_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let notification = self.persist_transition_without_emit(&current, task)?;
+        if !input_responses.is_empty() {
+            let accumulated = accepted_inputs.entry(task_id.clone()).or_default();
+            accumulated.extend(input_responses.clone());
+        }
+        drop(accepted_inputs);
+        self.emit(notification);
         Ok(UpdateTaskResult::default())
     }
 
@@ -2235,6 +2312,7 @@ impl FinalTaskRuntime {
             status_message,
         )?);
         self.persist_transition(&current, task.clone())?;
+        self.discard_accepted_input(task_id);
         Ok(task)
     }
 
@@ -2258,6 +2336,7 @@ impl FinalTaskRuntime {
             result,
         };
         self.persist_transition(&current, task.clone())?;
+        self.discard_accepted_input(task_id);
         Ok(task)
     }
 
@@ -2284,6 +2363,7 @@ impl FinalTaskRuntime {
             error,
         };
         self.persist_transition(&current, task.clone())?;
+        self.discard_accepted_input(task_id);
         Ok(task)
     }
 
@@ -2308,6 +2388,16 @@ impl FinalTaskRuntime {
     }
 
     fn persist_transition(&self, expected: &FinalTaskSnapshot, task: FinalTask) -> McpResult<()> {
+        let notification = self.persist_transition_without_emit(expected, task)?;
+        self.emit(notification);
+        Ok(())
+    }
+
+    fn persist_transition_without_emit(
+        &self,
+        expected: &FinalTaskSnapshot,
+        task: FinalTask,
+    ) -> McpResult<FinalTaskStatusNotification> {
         let notification = final_task_notification(&task);
         if !self
             .store
@@ -2317,8 +2407,14 @@ impl FinalTaskRuntime {
                 "Task state changed before the transition could be recorded",
             ));
         }
-        self.emit(notification);
-        Ok(())
+        Ok(notification)
+    }
+
+    fn discard_accepted_input(&self, task_id: &FinalTaskId) {
+        self.accepted_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(task_id);
     }
 
     fn emit(&self, notification: FinalTaskStatusNotification) {
@@ -3099,6 +3195,141 @@ mod tests {
         assert!(
             store.latest_notification(&task_id).is_some(),
             "the bounded store retains the terminal typed notification"
+        );
+    }
+
+    #[test]
+    fn task_03_final_accepted_input_reaches_resumed_supervisor() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = runtime
+            .create_task(None)
+            .expect("create task before requesting input")
+            .task
+            .base()
+            .task_id
+            .clone();
+
+        let mut requests = final_roots_request();
+        requests.insert(
+            "workspace-roots".to_owned(),
+            serde_json::from_value(serde_json::json!({"method": "roots/list"}))
+                .expect("typed second roots input request"),
+        );
+        runtime
+            .require_input(&task_id, requests, Some("awaiting both roots responses".to_owned()))
+            .expect("working task requests two typed inputs");
+
+        let first: FinalTaskInputResponses = serde_json::from_value(serde_json::json!({
+            "roots": {"roots": [{"uri": "file:///first"}]}
+        }))
+        .expect("typed first roots response");
+        runtime
+            .update_task(&task_id, &first)
+            .expect("accept first matching input response");
+        assert!(
+            runtime
+                .take_accepted_input(&task_id)
+                .expect("read input handoff while task remains input_required")
+                .is_none(),
+            "a supervisor cannot resume until every outstanding input is satisfied"
+        );
+
+        let second: FinalTaskInputResponses = serde_json::from_value(serde_json::json!({
+            "workspace-roots": {"roots": [{"uri": "file:///second"}]}
+        }))
+        .expect("typed second roots response");
+        runtime
+            .update_task(&task_id, &second)
+            .expect("accept final matching input response");
+
+        let accepted = runtime
+            .take_accepted_input(&task_id)
+            .expect("resumed task exposes one supervisor handoff")
+            .expect("all accepted input values are retained for the resumed worker");
+        assert_eq!(accepted.task_id(), &task_id);
+        assert_eq!(accepted.input_responses().get("roots"), first.get("roots"));
+        assert_eq!(
+            accepted.input_responses().get("workspace-roots"),
+            second.get("workspace-roots")
+        );
+        assert!(matches!(
+            runtime
+                .get_task(&task_id)
+                .expect("resumed task remains readable")
+                .task,
+            FinalTask::Working(_)
+        ));
+        assert!(
+            runtime
+                .take_accepted_input(&task_id)
+                .expect("second handoff read is valid")
+                .is_none(),
+            "the supervisor handoff is one-shot and cannot replay accepted input"
+        );
+    }
+
+    #[test]
+    fn task_03_final_rejected_input_preserves_supervisor_handoff_state() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = runtime
+            .create_task(None)
+            .expect("create task before requesting input")
+            .task
+            .base()
+            .task_id
+            .clone();
+        runtime
+            .require_input(&task_id, final_roots_request(), None)
+            .expect("task awaits one roots response");
+        let before = serde_json::to_vec(
+            &runtime
+                .get_task(&task_id)
+                .expect("read input-required task before planted response")
+                .task,
+        )
+        .expect("serialize input-required task before planted response");
+        let notification_before = store
+            .latest_notification(&task_id)
+            .expect("input-required task retains its notification before planted response");
+
+        // This differs from the accepted roots response only in the embedded
+        // response kind: sampling is well-formed but cannot satisfy roots/list.
+        let wrong_kind: FinalTaskInputResponses = serde_json::from_value(serde_json::json!({
+            "roots": {
+                "role": "assistant",
+                "model": "final-model",
+                "content": {"type": "text", "text": "wrong response kind"}
+            }
+        }))
+        .expect("well-formed mismatched typed response");
+        assert!(
+            runtime.update_task(&task_id, &wrong_kind).is_err(),
+            "a mismatched response kind fails before it can reach the supervisor"
+        );
+
+        let after = serde_json::to_vec(
+            &runtime
+                .get_task(&task_id)
+                .expect("read task after rejected response")
+                .task,
+        )
+        .expect("serialize task after rejected response");
+        assert_eq!(after, before, "rejected input leaves durable task state unchanged");
+        assert_eq!(
+            serde_json::to_vec(&store.latest_notification(&task_id))
+                .expect("serialize retained notification after rejection"),
+            serde_json::to_vec(&Some(notification_before))
+                .expect("serialize baseline notification"),
+            "rejected input cannot replace the retained notification"
+        );
+        assert!(
+            runtime
+                .take_accepted_input(&task_id)
+                .expect("read unchanged supervisor handoff state")
+                .is_none(),
+            "rejected input cannot create a supervisor handoff"
         );
     }
 
