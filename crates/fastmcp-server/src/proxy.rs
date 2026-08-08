@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use fastmcp_client::Client;
+use asupersync::Cx;
+use fastmcp_client::{Client, ClientProtocolPlan};
 use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpResult};
 use fastmcp_protocol::methods::translate_legacy_2024_result;
 use fastmcp_protocol::protocol_policy::{
@@ -261,6 +262,19 @@ struct StdioBindingKey {
     configuration_generation: u64,
 }
 
+/// Cache identity for a successfully connected stdio upstream.
+///
+/// Unlike [`StdioBindingKey`], this key has no caller-supplied adapter-era
+/// receipt. The selected era is derived only after a live client completes its
+/// immutable protocol-plan handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LiveStdioBindingKey {
+    route_identity: String,
+    transport_identity: String,
+    policy: ProtocolPolicy,
+    configuration_generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HttpBindingKey {
     route_identity: String,
@@ -278,11 +292,75 @@ struct HttpBindingKey {
 #[derive(Debug, Default)]
 pub struct ProxyUpstreamBindingRegistry {
     stdio: HashMap<StdioBindingKey, ProxyUpstreamBinding>,
+    live_stdio: HashMap<LiveStdioBindingKey, ProxyUpstreamBinding>,
     http: HashMap<HttpBindingKey, ProxyUpstreamBinding>,
     http_eras: HttpEraCache,
 }
 
 impl ProxyUpstreamBindingRegistry {
+    /// Opens a real stdio upstream from an immutable client protocol plan.
+    ///
+    /// The binding is derived from the connected client's selected era, never
+    /// from caller-provided opening-frame assumptions. `Auto` therefore uses
+    /// the client's modern-first discovery and only observes the client's
+    /// narrowly authorized fallback behavior. A cache entry is inserted only
+    /// after both connection and exact selected-era admission succeed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_stdio_with_protocol_plan(
+        &mut self,
+        route_identity: &str,
+        transport_identity: &str,
+        configuration_generation: u64,
+        command: &str,
+        args: &[&str],
+        protocol_plan: ClientProtocolPlan,
+        cx: Cx,
+    ) -> McpResult<ProxyClient> {
+        if route_identity.is_empty() || transport_identity.is_empty() {
+            return Err(McpError::invalid_params(
+                "Upstream route and transport identities must be non-empty",
+            ));
+        }
+        if protocol_plan.http_endpoints().is_some() {
+            return Err(McpError::invalid_params(
+                "A stdio proxy upstream requires a stdio client protocol plan",
+            ));
+        }
+
+        let key = LiveStdioBindingKey {
+            route_identity: route_identity.to_owned(),
+            transport_identity: transport_identity.to_owned(),
+            policy: protocol_plan.policy(),
+            configuration_generation,
+        };
+        let mut client =
+            Client::stdio_with_protocol_plan_with_cx(command, args, protocol_plan, cx)?;
+        let binding = binding_from_live_stdio_client(&client, configuration_generation)?;
+
+        if let Some(existing) = self.live_stdio.get(&key)
+            && *existing != binding
+        {
+            let mismatch = McpError::invalid_request(
+                "A live upstream selected an era that conflicts with its successful cached binding",
+            );
+            return match client.close() {
+                Ok(()) => Err(mismatch),
+                Err(cleanup_error) => Err(McpError::internal_error(format!(
+                    "{mismatch}; additionally failed to close the conflicting upstream: {cleanup_error}"
+                ))),
+            };
+        }
+
+        let upstream_protocol_version = client.protocol_version().to_owned();
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            client,
+            binding,
+            &upstream_protocol_version,
+        )?;
+        self.live_stdio.insert(key, binding);
+        Ok(proxy)
+    }
+
     /// Binds one stdio upstream using the exact two-era opening classifier.
     ///
     /// `adapter_receipt_identity` is an opaque identity supplied by the
@@ -427,6 +505,40 @@ fn validate_binding_key(
         ));
     }
     Ok(())
+}
+
+fn binding_from_live_stdio_client(
+    client: &Client,
+    configuration_generation: u64,
+) -> McpResult<ProxyUpstreamBinding> {
+    let policy = client.protocol_policy();
+    let era = client.selected_protocol_era().ok_or_else(|| {
+        McpError::internal_error(
+            "Connected upstream client did not select a supported protocol era",
+        )
+    })?;
+    match (policy, era) {
+        (ProtocolPolicy::ModernOnly, ProtocolEra::Modern2026)
+        | (ProtocolPolicy::LegacyOnly, ProtocolEra::Legacy2024)
+        | (ProtocolPolicy::Auto, ProtocolEra::Modern2026 | ProtocolEra::Legacy2024) => {}
+        _ => {
+            return Err(McpError::invalid_request(
+                "Connected upstream era does not satisfy its immutable protocol policy",
+            ));
+        }
+    }
+
+    let binding = ProxyUpstreamBinding {
+        era,
+        adapter: match era {
+            ProtocolEra::Modern2026 => ProxyUpstreamAdapter::ModernStdio,
+            ProtocolEra::Legacy2024 => ProxyUpstreamAdapter::LegacyStdio,
+        },
+        policy,
+        configuration_generation,
+    };
+    binding.admit_upstream_protocol_version(client.protocol_version())?;
+    Ok(binding)
 }
 
 impl ProxyClient {
@@ -891,6 +1003,353 @@ mod tests {
         // five-second total ceiling while detecting an idle peer first.
         RequestTimeoutPolicy::new(Duration::from_secs(4), Duration::from_secs(5))
             .expect("valid scripted-peer timeout policy")
+    }
+
+    #[cfg(unix)]
+    fn modern_discovery_response_line(server_name: &str, supported_versions: &[&str]) -> String {
+        let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+            &fastmcp_protocol::ServerBehaviorRegistry::default(),
+            std::collections::BTreeMap::new(),
+        )
+        .expect("an empty installed behavior registry is discoverable");
+        let result = fastmcp_protocol::ServerDiscoverResult::new(
+            capabilities,
+            fastmcp_protocol::ServerInfo {
+                name: server_name.to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let mut result = serde_json::to_value(result).expect("serialize final discovery result");
+        result["supportedVersions"] = serde_json::json!(supported_versions);
+        scripted_response_line(1, result)
+    }
+
+    #[cfg(unix)]
+    fn legacy_initialize_response_line() -> String {
+        let initialize = fastmcp_protocol::InitializeResult {
+            protocol_version: fastmcp_protocol::PROTOCOL_VERSION.to_owned(),
+            capabilities: fastmcp_protocol::ServerCapabilities::default(),
+            server_info: fastmcp_protocol::ServerInfo {
+                name: "legacy-proxy-peer".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            instructions: None,
+        };
+        scripted_response_line(
+            1,
+            serde_json::to_value(initialize).expect("serialize legacy initialize result"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn method_not_found_response_line() -> String {
+        let message =
+            fastmcp_protocol::JsonRpcMessage::Response(fastmcp_protocol::JsonRpcResponse::error(
+                Some(fastmcp_protocol::RequestId::Number(1)),
+                fastmcp_protocol::JsonRpcError {
+                    code: -32601,
+                    message: "Method not found".to_owned(),
+                    data: None,
+                },
+            ));
+        let line = serde_json::to_string(&message).expect("serialize method-not-found response");
+        assert!(
+            !line.contains('\''),
+            "the shell fixture requires a single-quote-free JSON line"
+        );
+        line
+    }
+
+    #[cfg(unix)]
+    fn modern_proxy_peer_script(discovery: &str, tool_result: &str) -> String {
+        format!(
+            r#"
+IFS= read -r discovery || exit 90
+case "$discovery" in *"\"method\":\"server/discover\""*) ;; *) exit 91 ;; esac
+printf '%s\n' '{discovery}'
+IFS= read -r tool || exit 92
+case "$tool" in *"\"method\":\"tools/call\""*) ;; *) exit 93 ;; esac
+printf '%s\n' '{tool_result}'
+exec sleep 2
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn legacy_proxy_peer_script(initialize: &str, tool_result: &str) -> String {
+        format!(
+            r#"
+IFS= read -r initialize || exit 90
+case "$initialize" in *"\"method\":\"initialize\""*) ;; *) exit 91 ;; esac
+printf '%s\n' '{initialize}'
+IFS= read -r lifecycle || exit 92
+case "$lifecycle" in *"\"method\":\"notifications/initialized\""*) ;; *) exit 93 ;; esac
+IFS= read -r tool || exit 94
+case "$tool" in *"\"method\":\"tools/call\""*) ;; *) exit 95 ;; esac
+printf '%s\n' '{tool_result}'
+exec sleep 2
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn malformed_modern_or_legacy_peer_script(
+        malformed_discovery: &str,
+        legacy_initialize: &str,
+    ) -> String {
+        format!(
+            r#"
+IFS= read -r first || exit 90
+case "$first" in
+    *"\"method\":\"server/discover\""*)
+        printf '%s\n' '{malformed_discovery}'
+        ;;
+    *"\"method\":\"initialize\""*)
+        printf '%s\n' '{legacy_initialize}'
+        IFS= read -r lifecycle || exit 91
+        case "$lifecycle" in *"\"method\":\"notifications/initialized\""*) ;; *) exit 92 ;; esac
+        ;;
+    *) exit 93 ;;
+esac
+exec sleep 2
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn auto_legacy_proxy_peer_script(
+        discovery_refusal: &str,
+        legacy_initialize: &str,
+        tool_result: &str,
+    ) -> String {
+        format!(
+            r#"
+IFS= read -r first || exit 90
+case "$first" in
+    *"\"method\":\"server/discover\""*)
+        printf '%s\n' '{discovery_refusal}'
+        ;;
+    *"\"method\":\"initialize\""*)
+        printf '%s\n' '{legacy_initialize}'
+        IFS= read -r lifecycle || exit 91
+        case "$lifecycle" in *"\"method\":\"notifications/initialized\""*) ;; *) exit 92 ;; esac
+        IFS= read -r tool || exit 93
+        case "$tool" in *"\"method\":\"tools/call\""*) ;; *) exit 94 ;; esac
+        printf '%s\n' '{tool_result}'
+        ;;
+    *) exit 95 ;;
+esac
+exec sleep 2
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn assert_forwarded_tool(content: Vec<Content>) {
+        assert!(matches!(
+            content.as_slice(),
+            [Content::Text { text }] if text == "forwarded"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_outbound_modern_only_selects_live_client_and_forwards_tool() {
+        let discovery = modern_discovery_response_line("modern-proxy-peer", &["2026-07-28"]);
+        let tool_result = scripted_response_line(
+            2,
+            serde_json::json!({"content": [{"type": "text", "text": "forwarded"}]}),
+        );
+        let script = modern_proxy_peer_script(&discovery, &tool_result);
+        let mut bindings = ProxyClient::upstream_binding_registry();
+
+        let proxy = bindings
+            .connect_stdio_with_protocol_plan(
+                "modern-route",
+                "stdio:modern-peer",
+                1,
+                "sh",
+                &["-c", script.as_str()],
+                fastmcp_client::ClientProtocolPlan::stdio(
+                    fastmcp_protocol::ProtocolPolicy::ModernOnly,
+                ),
+                Cx::for_testing(),
+            )
+            .expect("ModernOnly connects a live modern client");
+
+        let binding = proxy.upstream_binding().expect("live binding is retained");
+        assert_eq!(binding.era(), fastmcp_protocol::ProtocolEra::Modern2026);
+        assert_eq!(binding.adapter(), super::ProxyUpstreamAdapter::ModernStdio);
+        assert_eq!(
+            binding.policy(),
+            fastmcp_protocol::ProtocolPolicy::ModernOnly
+        );
+        assert_forwarded_tool(
+            proxy
+                .call_tool(
+                    &McpContext::new(Cx::for_testing(), 100),
+                    "echo",
+                    serde_json::json!({}),
+                )
+                .expect("normal request uses the selected live client"),
+        );
+        assert_eq!(bindings.live_stdio.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_outbound_auto_selects_live_modern_client_and_forwards_tool() {
+        let discovery = modern_discovery_response_line("auto-proxy-peer", &["2026-07-28"]);
+        let tool_result = scripted_response_line(
+            2,
+            serde_json::json!({"content": [{"type": "text", "text": "forwarded"}]}),
+        );
+        let script = modern_proxy_peer_script(&discovery, &tool_result);
+        let mut bindings = ProxyClient::upstream_binding_registry();
+
+        let proxy = bindings
+            .connect_stdio_with_protocol_plan(
+                "auto-route",
+                "stdio:auto-peer",
+                2,
+                "sh",
+                &["-c", script.as_str()],
+                fastmcp_client::ClientProtocolPlan::stdio(fastmcp_protocol::ProtocolPolicy::Auto),
+                Cx::for_testing(),
+            )
+            .expect("Auto retains its live modern selection");
+
+        let binding = proxy.upstream_binding().expect("live binding is retained");
+        assert_eq!(binding.era(), fastmcp_protocol::ProtocolEra::Modern2026);
+        assert_eq!(binding.policy(), fastmcp_protocol::ProtocolPolicy::Auto);
+        assert_forwarded_tool(
+            proxy
+                .call_tool(
+                    &McpContext::new(Cx::for_testing(), 101),
+                    "echo",
+                    serde_json::json!({}),
+                )
+                .expect("Auto forwards ordinary requests through its live client"),
+        );
+        assert_eq!(bindings.live_stdio.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_outbound_auto_authorized_refusal_selects_live_legacy_client_and_forwards_tool() {
+        let discovery_refusal = method_not_found_response_line();
+        let initialize = legacy_initialize_response_line();
+        let tool_result = scripted_response_line(
+            2,
+            serde_json::json!({"content": [{"type": "text", "text": "forwarded"}]}),
+        );
+        let script = auto_legacy_proxy_peer_script(&discovery_refusal, &initialize, &tool_result);
+        let mut bindings = ProxyClient::upstream_binding_registry();
+
+        let proxy = bindings
+            .connect_stdio_with_protocol_plan(
+                "auto-legacy-route",
+                "stdio:auto-legacy-peer",
+                3,
+                "sh",
+                &["-c", script.as_str()],
+                fastmcp_client::ClientProtocolPlan::stdio(fastmcp_protocol::ProtocolPolicy::Auto),
+                Cx::for_testing(),
+            )
+            .expect("Auto selects exact legacy only after an authorized modern refusal");
+
+        let binding = proxy.upstream_binding().expect("live binding is retained");
+        assert_eq!(binding.era(), fastmcp_protocol::ProtocolEra::Legacy2024);
+        assert_eq!(binding.adapter(), super::ProxyUpstreamAdapter::LegacyStdio);
+        assert_eq!(binding.policy(), fastmcp_protocol::ProtocolPolicy::Auto);
+        assert_forwarded_tool(
+            proxy
+                .call_tool(
+                    &McpContext::new(Cx::for_testing(), 102),
+                    "echo",
+                    serde_json::json!({}),
+                )
+                .expect("Auto forwards through its selected live legacy client"),
+        );
+        assert_eq!(bindings.live_stdio.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_outbound_legacy_only_selects_live_client_and_forwards_tool() {
+        let initialize = legacy_initialize_response_line();
+        let tool_result = scripted_response_line(
+            2,
+            serde_json::json!({"content": [{"type": "text", "text": "forwarded"}]}),
+        );
+        let script = legacy_proxy_peer_script(&initialize, &tool_result);
+        let mut bindings = ProxyClient::upstream_binding_registry();
+
+        let proxy = bindings
+            .connect_stdio_with_protocol_plan(
+                "legacy-route",
+                "stdio:legacy-peer",
+                4,
+                "sh",
+                &["-c", script.as_str()],
+                fastmcp_client::ClientProtocolPlan::stdio(
+                    fastmcp_protocol::ProtocolPolicy::LegacyOnly,
+                ),
+                Cx::for_testing(),
+            )
+            .expect("LegacyOnly connects a live exact-2024 client");
+
+        let binding = proxy.upstream_binding().expect("live binding is retained");
+        assert_eq!(binding.era(), fastmcp_protocol::ProtocolEra::Legacy2024);
+        assert_eq!(binding.adapter(), super::ProxyUpstreamAdapter::LegacyStdio);
+        assert_eq!(
+            binding.policy(),
+            fastmcp_protocol::ProtocolPolicy::LegacyOnly
+        );
+        assert_forwarded_tool(
+            proxy
+                .call_tool(
+                    &McpContext::new(Cx::for_testing(), 103),
+                    "echo",
+                    serde_json::json!({}),
+                )
+                .expect("LegacyOnly forwards ordinary requests through its live client"),
+        );
+        assert_eq!(bindings.live_stdio.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_outbound_auto_malformed_modern_discovery_never_falls_back_to_legacy() {
+        let malformed_discovery = modern_discovery_response_line(
+            "auto-proxy-peer",
+            &[fastmcp_protocol::PROTOCOL_VERSION],
+        );
+        let legacy_initialize = legacy_initialize_response_line();
+        let script =
+            malformed_modern_or_legacy_peer_script(&malformed_discovery, &legacy_initialize);
+        let mut bindings = ProxyClient::upstream_binding_registry();
+
+        let error = bindings
+            .connect_stdio_with_protocol_plan(
+                "auto-malformed-route",
+                "stdio:auto-malformed-peer",
+                5,
+                "sh",
+                &["-c", script.as_str()],
+                fastmcp_client::ClientProtocolPlan::stdio(fastmcp_protocol::ProtocolPolicy::Auto),
+                Cx::for_testing(),
+            )
+            .err()
+            .expect("a malformed modern success must not start the available legacy peer");
+
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+        assert!(
+            bindings.live_stdio.is_empty(),
+            "only successful live selections are cacheable"
+        );
     }
 
     #[cfg(unix)]
