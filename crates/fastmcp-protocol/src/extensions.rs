@@ -36,6 +36,17 @@ pub const MAX_EXTENSION_ROUTING_HEADER_BYTES: usize = 256;
 /// Maximum notification method names owned by one stdio correlation descriptor.
 pub const MAX_STDIO_CORRELATION_METHODS: usize = 32;
 
+/// Official Tasks extension identifier.
+pub const OFFICIAL_TASKS_EXTENSION_ID: &str = "io.modelcontextprotocol/tasks";
+/// Official Tasks empty-settings schema identity for both peers.
+pub const OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID: &str = "tasks-2026-07-28-empty-object-v1";
+/// Official Tasks empty-settings codec identity for both peers.
+pub const OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID: &str = "tasks-2026-07-28-empty-object-v1";
+/// Official Tasks client-to-server request methods.
+pub const OFFICIAL_TASKS_METHODS: [&str; 3] = ["tasks/get", "tasks/update", "tasks/cancel"];
+/// Official Tasks server-to-client notification method.
+pub const OFFICIAL_TASKS_NOTIFICATION: &str = "notifications/tasks";
+
 /// A validated extension identifier, preserving its exact wire spelling.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ExtensionId(String);
@@ -129,6 +140,12 @@ impl ExtensionSettings {
         serde_json::from_value(Value::Object(self.0.clone()))
             .map_err(|_| ExtensionRegistryError::SettingsCodecRejected)
     }
+}
+
+/// Returns the sole settings object admitted by the official Tasks extension.
+#[must_use]
+pub fn official_tasks_empty_settings() -> ExtensionSettings {
+    ExtensionSettings(Map::new())
 }
 
 fn validate_settings_map(map: &Map<String, Value>) -> Result<(), ExtensionRegistryError> {
@@ -309,6 +326,74 @@ pub struct ExtensionDescriptor {
     pub routing_headers: Vec<ExtensionRoutingHeaderDescriptor>,
     /// Optional stdio correlation metadata descriptor.
     pub stdio_correlation: Option<StdioCorrelationDescriptor>,
+}
+
+/// Returns the validated identifier for the official Tasks extension.
+#[must_use]
+pub fn official_tasks_extension_id() -> ExtensionId {
+    ExtensionId::parse(OFFICIAL_TASKS_EXTENSION_ID)
+        .expect("the fixed official Tasks identifier satisfies the extension grammar")
+}
+
+/// Returns the complete official Tasks descriptor.
+///
+/// It owns exactly `tasks/get`, `tasks/update`, `tasks/cancel`, and
+/// `notifications/tasks`. Tasks settings are exactly the empty JSON object;
+/// [`ExtensionDescriptorRegistry::negotiate`] enforces that invariant for the
+/// two peer advertisements and the effective settings chosen by its resolver.
+#[must_use]
+pub fn official_tasks_descriptor() -> ExtensionDescriptor {
+    ExtensionDescriptor {
+        id: official_tasks_extension_id(),
+        client_settings: ExtensionSettingsSchema {
+            schema_id: OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID.to_owned(),
+            codec_id: OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID.to_owned(),
+        },
+        server_settings: ExtensionSettingsSchema {
+            schema_id: OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID.to_owned(),
+            codec_id: OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID.to_owned(),
+        },
+        resolver: ExtensionNegotiationResolver {
+            id: OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID.to_owned(),
+            version: 1,
+            fallback: ExtensionFallbackPolicy::RejectOneSided,
+        },
+        method: Some(official_tasks_method(OFFICIAL_TASKS_METHODS[0])),
+        notification: Some(ExtensionNotificationDescriptor {
+            name: OFFICIAL_TASKS_NOTIFICATION.to_owned(),
+            direction: ExtensionDirection::ServerToClient,
+        }),
+        result_discriminator: None,
+        routing_headers: Vec::new(),
+        stdio_correlation: None,
+    }
+}
+
+/// Registers the complete official Tasks surface atomically.
+///
+/// The resulting descriptor owns exactly the official Tasks request methods
+/// and its one server notification. Registration alone does not activate the
+/// extension; normal local enablement and bilateral negotiation still apply.
+pub fn register_official_tasks_extension(
+    registry: &mut ExtensionDescriptorRegistry,
+) -> Result<ExtensionId, ExtensionRegistryError> {
+    let id = official_tasks_extension_id();
+    let mut candidate = registry.clone();
+    candidate.register(official_tasks_descriptor())?;
+    for name in OFFICIAL_TASKS_METHODS.into_iter().skip(1) {
+        candidate.register_method(&id, official_tasks_method(name))?;
+    }
+    *registry = candidate;
+    Ok(id)
+}
+
+fn official_tasks_method(name: &str) -> ExtensionMethodDescriptor {
+    ExtensionMethodDescriptor {
+        name: name.to_owned(),
+        direction: ExtensionDirection::ClientToServer,
+        http_era_disposition: Some(ExtensionHttpEraDisposition::ModernExclusive),
+        legacy_fallback: false,
+    }
 }
 
 /// Immutable receipt returned by [`ExtensionDescriptorRegistry::freeze`].
@@ -1068,7 +1153,10 @@ impl ExtensionDescriptorRegistry {
 
             match (client.extensions.get(id), server.extensions.get(id)) {
                 (Some(client), Some(server)) => {
+                    enforce_official_tasks_empty_settings(id, client)?;
+                    enforce_official_tasks_empty_settings(id, server)?;
                     let effective = resolver.resolve(descriptor, client, server)?;
+                    enforce_official_tasks_empty_settings(id, &effective)?;
                     let fingerprint = effective_settings_fingerprint(descriptor, &effective)?;
                     active.insert(
                         id.clone(),
@@ -1142,6 +1230,18 @@ impl ExtensionDescriptorRegistry {
         }
         Ok(subject)
     }
+}
+
+fn enforce_official_tasks_empty_settings(
+    id: &ExtensionId,
+    settings: &ExtensionSettings,
+) -> Result<(), ExtensionNegotiationError> {
+    if id.as_str() != OFFICIAL_TASKS_EXTENSION_ID || settings.as_object().is_empty() {
+        return Ok(());
+    }
+    Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+        id.to_string(),
+    ))
 }
 
 fn validate_discovery(
@@ -1682,30 +1782,14 @@ mod tests {
         }
     }
 
-    fn tasks_descriptor(id: ExtensionId) -> ExtensionDescriptor {
-        let mut descriptor = descriptor(id, "tasks/get", "notifications/tasks", "task");
-        descriptor.routing_headers.clear();
-        descriptor
-    }
-
-    fn tasks_method(name: &str) -> ExtensionMethodDescriptor {
-        ExtensionMethodDescriptor {
-            name: name.to_owned(),
-            direction: ExtensionDirection::ClientToServer,
-            http_era_disposition: Some(ExtensionHttpEraDisposition::ModernExclusive),
-            legacy_fallback: false,
-        }
-    }
-
     #[test]
     fn ext_03_final_extension_identifier_wire_grammar_one_variable_negative() {
-        let official = ExtensionId::parse("io.modelcontextprotocol/tasks")
-            .expect("the checked-in official Tasks identifier is a valid extension key");
-        assert_eq!(official.as_str(), "io.modelcontextprotocol/tasks");
+        let official = official_tasks_extension_id();
+        assert_eq!(official.as_str(), OFFICIAL_TASKS_EXTENSION_ID);
         assert!(ExtensionId::parse("Example/tasks").is_ok());
 
         assert_eq!(
-            ExtensionId::parse("io.modelcontextprotocol/tasks_"),
+            ExtensionId::parse(format!("{OFFICIAL_TASKS_EXTENSION_ID}_")),
             Err(ExtensionRegistryError::InvalidIdentifier(
                 "io.modelcontextprotocol/tasks_".to_owned()
             )),
@@ -1714,40 +1798,44 @@ mod tests {
     }
 
     #[test]
-    fn ext_03_tasks_extension_current_request_negotiation_positive() {
-        let id = ExtensionId::parse("io.modelcontextprotocol/tasks")
-            .expect("official Tasks identifier is admitted");
+    fn task_01_official_tasks_public_registry_positive() {
         let mut registry = ExtensionDescriptorRegistry::new();
-        registry
-            .register(tasks_descriptor(id.clone()))
-            .expect("Tasks request and response members register");
-        registry
-            .register_method(&id, tasks_method("tasks/update"))
-            .expect("Tasks update method belongs to its negotiated extension");
-        registry
-            .register_method(&id, tasks_method("tasks/cancel"))
-            .expect("Tasks cancel method belongs to its negotiated extension");
+        let id = register_official_tasks_extension(&mut registry)
+            .expect("the public official Tasks surface registers atomically");
+        let descriptor = registry
+            .descriptor(&id)
+            .expect("the public Tasks registration retains its descriptor");
+        assert_eq!(descriptor.id.as_str(), OFFICIAL_TASKS_EXTENSION_ID);
+        assert_eq!(
+            descriptor.client_settings.schema_id,
+            OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID
+        );
+        assert_eq!(
+            descriptor.server_settings.schema_id,
+            OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID
+        );
+        assert_eq!(
+            descriptor
+                .method
+                .as_ref()
+                .map(|method| method.name.as_str()),
+            Some(OFFICIAL_TASKS_METHODS[0])
+        );
+        assert_eq!(descriptor.result_discriminator, None);
         registry.freeze().expect("Tasks registry freezes");
 
         let client = ClientExtensionDiscovery {
-            extensions: BTreeMap::from([(
-                id.clone(),
-                ExtensionSettings::new(json!({})).expect("empty object declares client support"),
-            )]),
+            extensions: BTreeMap::from([(id.clone(), official_tasks_empty_settings())]),
         };
         let server = ServerExtensionDiscovery {
-            extensions: BTreeMap::from([(
-                id.clone(),
-                ExtensionSettings::new(json!({})).expect("empty object declares server support"),
-            )]),
+            extensions: BTreeMap::from([(id.clone(), official_tasks_empty_settings())]),
         };
         let mut local = ExtensionLocalEnablement::default();
         local.enable(id.clone());
-        let mut resolver = |_descriptor: &ExtensionDescriptor,
-                            _client: &ExtensionSettings,
-                            _server: &ExtensionSettings| {
-            Ok(ExtensionSettings::new(json!({})).expect("empty effective Tasks settings"))
-        };
+        let mut resolver =
+            |_descriptor: &ExtensionDescriptor,
+             _client: &ExtensionSettings,
+             _server: &ExtensionSettings| { Ok(official_tasks_empty_settings()) };
 
         let negotiated = registry
             .negotiate(
@@ -1758,7 +1846,7 @@ mod tests {
                 &mut resolver,
             )
             .expect("current client and server capabilities negotiate Tasks");
-        for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+        for method in OFFICIAL_TASKS_METHODS {
             assert_eq!(
                 negotiated
                     .admit_method(
@@ -1773,54 +1861,49 @@ mod tests {
                 id
             );
         }
+        for method in ["tasks/list", "tasks/submit"] {
+            assert_eq!(
+                negotiated.admit_method(
+                    &registry,
+                    ProtocolEra::Modern2026,
+                    &id,
+                    method,
+                    ExtensionDirection::ClientToServer,
+                ),
+                Err(ExtensionDispatchError::CapabilityDoesNotOwn {
+                    capability: id.to_string(),
+                    field: "method",
+                    value: method.to_owned(),
+                }),
+                "the official Tasks registration owns no additional request methods"
+            );
+        }
         assert_eq!(
             negotiated
                 .admit_notification(
                     &registry,
                     ProtocolEra::Modern2026,
                     &id,
-                    "notifications/tasks",
+                    OFFICIAL_TASKS_NOTIFICATION,
                     ExtensionDirection::ServerToClient,
                 )
                 .expect("registered Tasks notification is admitted")
                 .id,
             id
         );
-        assert_eq!(
-            negotiated
-                .admit_result_discriminator(&registry, ProtocolEra::Modern2026, &id, "task")
-                .expect("registered Tasks result discriminator is admitted")
-                .id,
-            id
-        );
     }
 
     #[test]
-    fn ext_03_tasks_current_client_capability_one_variable_negative() {
-        let id = ExtensionId::parse("io.modelcontextprotocol/tasks")
-            .expect("official Tasks identifier is admitted");
+    fn task_01_official_tasks_nonempty_client_settings_one_variable_negative() {
         let mut registry = ExtensionDescriptorRegistry::new();
-        registry
-            .register(tasks_descriptor(id.clone()))
-            .expect("Tasks descriptor registers");
-        registry
-            .register_method(&id, tasks_method("tasks/update"))
-            .expect("Tasks update method registers");
-        registry
-            .register_method(&id, tasks_method("tasks/cancel"))
-            .expect("Tasks cancel method registers");
+        let id = register_official_tasks_extension(&mut registry)
+            .expect("the public official Tasks surface registers");
         let receipt = registry.freeze().expect("Tasks registry freezes");
-        let declared_client = ClientExtensionDiscovery {
-            extensions: BTreeMap::from([(
-                id.clone(),
-                ExtensionSettings::new(json!({})).expect("empty client support declaration"),
-            )]),
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(id.clone(), official_tasks_empty_settings())]),
         };
         let server = ServerExtensionDiscovery {
-            extensions: BTreeMap::from([(
-                id.clone(),
-                ExtensionSettings::new(json!({})).expect("empty server support declaration"),
-            )]),
+            extensions: BTreeMap::from([(id.clone(), official_tasks_empty_settings())]),
         };
         let mut local = ExtensionLocalEnablement::default();
         local.enable(id.clone());
@@ -1829,33 +1912,39 @@ mod tests {
                             _client: &ExtensionSettings,
                             _server: &ExtensionSettings| {
             resolver_calls.set(resolver_calls.get() + 1);
-            Ok(ExtensionSettings::new(json!({})).expect("empty effective Tasks settings"))
+            Ok(official_tasks_empty_settings())
         };
 
         registry
             .negotiate(
                 ProtocolEra::Modern2026,
                 &local,
-                &declared_client,
+                &client,
                 &server,
                 &mut resolver,
             )
-            .expect("the baseline current request declares Tasks");
+            .expect("the empty-settings baseline negotiates Tasks");
         assert_eq!(resolver_calls.get(), 1);
+
+        let mut planted_client = client.clone();
+        planted_client.extensions.insert(
+            id.clone(),
+            ExtensionSettings::new(json!({"unexpected": true}))
+                .expect("the one-field mutation is generic extension JSON"),
+        );
 
         assert_eq!(
             registry.negotiate(
                 ProtocolEra::Modern2026,
                 &local,
-                &ClientExtensionDiscovery::default(),
+                &planted_client,
                 &server,
                 &mut resolver,
             ),
-            Err(ExtensionNegotiationError::OneSidedSupport {
-                id: id.to_string(),
-                missing: ExtensionPeer::Client,
-            }),
-            "only removing the current request's client extension capability rejects Tasks"
+            Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                id.to_string()
+            )),
+            "only adding one client settings field rejects the exact empty Tasks settings"
         );
         assert_eq!(
             resolver_calls.get(),
