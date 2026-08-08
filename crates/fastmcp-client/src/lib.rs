@@ -59,9 +59,9 @@ pub use fastmcp_protocol::protocol_policy::{
     ProtocolPolicy, ProtocolVersion,
 };
 pub use fastmcp_protocol::{
-    CoreResult, FinalCoreResult, LegacyCompletionArgument as CompletionArgument,
-    LegacyCompletionParams as CompletionParams, LegacyCompletionReference as CompletionReference,
-    LegacyCoreResult,
+    CoreResult, FinalCompletionArgument as CompletionArgument,
+    FinalCompletionContext as CompletionContext, FinalCompletionReference as CompletionReference,
+    FinalCoreResult, LegacyCoreResult, LoggingLevel,
 };
 pub use mcp_config::claude_desktop_config_path;
 pub use negotiation::{
@@ -112,6 +112,56 @@ pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<&str>
 use fastmcp_transport::{StdioTransport, Transport, TransportError};
 
 use crate::execution::decode_core_result;
+
+/// Completion input that retains the complete 2026-07-28 request context.
+///
+/// A modern session sends this shape unchanged apart from client-owned request
+/// metadata. A legacy session accepts only the lossless subset: no prompt
+/// title and no completion context.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionParams {
+    /// Prompt or resource-template target.
+    #[serde(rename = "ref")]
+    pub reference: CompletionReference,
+    /// Argument being completed.
+    pub argument: CompletionArgument,
+    /// Previously resolved prompt or resource-template variables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<CompletionContext>,
+}
+
+impl CompletionParams {
+    fn into_legacy(self) -> McpResult<fastmcp_protocol::LegacyCompletionParams> {
+        if self.context.is_some() {
+            return Err(McpError::invalid_params(
+                "MCP 2024-11-05 completion cannot represent completion context",
+            ));
+        }
+
+        let reference = match self.reference {
+            CompletionReference::Prompt { name, title: None } => {
+                fastmcp_protocol::LegacyCompletionReference::Prompt { name }
+            }
+            CompletionReference::Prompt { title: Some(_), .. } => {
+                return Err(McpError::invalid_params(
+                    "MCP 2024-11-05 completion cannot represent a prompt title",
+                ));
+            }
+            CompletionReference::Resource { uri } => {
+                fastmcp_protocol::LegacyCompletionReference::Resource { uri }
+            }
+        };
+
+        Ok(fastmcp_protocol::LegacyCompletionParams {
+            reference,
+            argument: fastmcp_protocol::LegacyCompletionArgument {
+                name: self.argument.name,
+                value: self.argument.value,
+            },
+        })
+    }
+}
 
 const MIN_TASK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_LOCAL_TASK_POLL_INTERVAL: Duration = Duration::from_mins(5);
@@ -3174,6 +3224,22 @@ impl Client {
         Ok(())
     }
 
+    /// Sends `ping` and returns its negotiated, method-aware core result.
+    ///
+    /// A modern session returns [`CoreResult::Final`] with
+    /// [`FinalCoreResult::Ping`]. An exact legacy session returns
+    /// [`CoreResult::Legacy`] with its unchanged acknowledgement shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the result violates the
+    /// selected-era `ping` contract. A contradictory core result terminates
+    /// the connection.
+    pub fn ping_typed(&mut self) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        self.send_typed_core_request("ping", serde_json::json!({}))
+    }
+
     /// Generates the next request ID.
     fn next_request_id(&self) -> McpResult<u64> {
         self.next_id
@@ -3808,7 +3874,31 @@ impl Client {
         })
     }
 
+    /// Lists one page of tools and returns its negotiated core result.
+    ///
+    /// The caller supplies the opaque peer cursor, if any. A modern session
+    /// returns [`CoreResult::Final`] with [`FinalCoreResult::ToolsList`]; an
+    /// exact legacy session returns [`CoreResult::Legacy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or its selected-era result
+    /// contract is contradicted. A contradictory core result terminates the
+    /// connection.
+    pub fn list_tools_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let params = ListToolsParams {
+            cursor: cursor.map(ToOwned::to_owned),
+            ..ListToolsParams::default()
+        };
+        self.send_typed_core_request("tools/list", params)
+    }
+
     /// Lists available tools.
+    ///
+    /// This convenience API follows peer cursors and returns the flattened
+    /// legacy-compatible tool vector. Use [`Self::list_tools_typed`] to retain
+    /// the negotiated, single-page core result.
     ///
     /// # Errors
     ///
@@ -4195,6 +4285,26 @@ impl Client {
         log::log!(target: REMOTE_LOG_TARGET, level, "{metadata}");
     }
 
+    /// Lists one page of resources and returns its negotiated core result.
+    ///
+    /// The caller supplies the opaque peer cursor, if any. A modern session
+    /// returns [`CoreResult::Final`] with [`FinalCoreResult::ResourcesList`];
+    /// an exact legacy session returns [`CoreResult::Legacy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or its selected-era result
+    /// contract is contradicted. A contradictory core result terminates the
+    /// connection.
+    pub fn list_resources_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let params = ListResourcesParams {
+            cursor: cursor.map(ToOwned::to_owned),
+            ..ListResourcesParams::default()
+        };
+        self.send_typed_core_request("resources/list", params)
+    }
+
     /// Lists available resources.
     ///
     /// # Errors
@@ -4241,6 +4351,28 @@ impl Client {
         };
         let result: ListResourcesResult = self.send_request("resources/list", params)?;
         bounded_list_page(result.resources, cursor, result.next_cursor, limits)
+    }
+
+    /// Lists one page of resource templates and returns its negotiated core
+    /// result.
+    ///
+    /// The caller supplies the opaque peer cursor, if any. A modern session
+    /// returns [`CoreResult::Final`] with
+    /// [`FinalCoreResult::ResourceTemplatesList`]; an exact legacy session
+    /// returns [`CoreResult::Legacy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or its selected-era result
+    /// contract is contradicted. A contradictory core result terminates the
+    /// connection.
+    pub fn list_resource_templates_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let params = ListResourceTemplatesParams {
+            cursor: cursor.map(ToOwned::to_owned),
+            ..ListResourceTemplatesParams::default()
+        };
+        self.send_typed_core_request("resources/templates/list", params)
     }
 
     /// Lists available resource templates.
@@ -4298,6 +4430,23 @@ impl Client {
         )
     }
 
+    /// Sets the server log level and returns its negotiated acknowledgement.
+    ///
+    /// A modern session returns [`CoreResult::Final`] with
+    /// [`FinalCoreResult::SetLogLevel`]. An exact legacy session returns
+    /// [`CoreResult::Legacy`] with its unchanged acknowledgement shape; final
+    /// severities unavailable in 2024-11-05 are rejected before sending.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or its selected-era result
+    /// contract is contradicted. A contradictory core result terminates the
+    /// connection.
+    pub fn set_log_level_typed(&mut self, level: LoggingLevel) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        self.send_typed_core_request("logging/setLevel", serde_json::json!({ "level": level }))
+    }
+
     /// Sets the server log level (if supported).
     ///
     /// # Errors
@@ -4308,6 +4457,28 @@ impl Client {
         let params = SetLogLevelParams { level };
         let _: serde_json::Value = self.send_request("logging/setLevel", params)?;
         Ok(())
+    }
+
+    /// Reads a resource and returns its negotiated, method-aware core result.
+    ///
+    /// A modern session returns [`CoreResult::Final`] with
+    /// [`FinalCoreResult::ResourcesRead`]. An exact legacy session returns
+    /// [`CoreResult::Legacy`] with its unchanged resource result shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or its selected-era result
+    /// contract is contradicted. A contradictory core result terminates the
+    /// connection.
+    pub fn read_resource_typed(&mut self, uri: &str) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        self.send_typed_core_request(
+            "resources/read",
+            ReadResourceParams {
+                uri: uri.to_owned(),
+                meta: None,
+            },
+        )
     }
 
     /// Reads a resource by URI.
@@ -4323,6 +4494,26 @@ impl Client {
         };
         let result: ReadResourceResult = self.send_request("resources/read", params)?;
         Ok(result.contents)
+    }
+
+    /// Lists one page of prompts and returns its negotiated core result.
+    ///
+    /// The caller supplies the opaque peer cursor, if any. A modern session
+    /// returns [`CoreResult::Final`] with [`FinalCoreResult::PromptsList`]; an
+    /// exact legacy session returns [`CoreResult::Legacy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or its selected-era result
+    /// contract is contradicted. A contradictory core result terminates the
+    /// connection.
+    pub fn list_prompts_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let params = ListPromptsParams {
+            cursor: cursor.map(ToOwned::to_owned),
+            ..ListPromptsParams::default()
+        };
+        self.send_typed_core_request("prompts/list", params)
     }
 
     /// Lists available prompts.
@@ -4373,6 +4564,31 @@ impl Client {
         bounded_list_page(result.prompts, cursor, result.next_cursor, limits)
     }
 
+    /// Gets a prompt and returns its negotiated, method-aware core result.
+    ///
+    /// A modern session returns [`CoreResult::Final`] with
+    /// [`FinalCoreResult::PromptsGet`]. An exact legacy session returns
+    /// [`CoreResult::Legacy`] with its unchanged prompt result shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or its selected-era result
+    /// contract is contradicted. A contradictory core result terminates the
+    /// connection.
+    pub fn get_prompt_typed(
+        &mut self,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let params = GetPromptParams {
+            name: name.to_owned(),
+            arguments: (!arguments.is_empty()).then_some(arguments),
+            meta: None,
+        };
+        self.send_typed_core_request("prompts/get", params)
+    }
+
     /// Gets a prompt with the given arguments.
     ///
     /// # Errors
@@ -4399,19 +4615,30 @@ impl Client {
 
     /// Completes one prompt or resource-template argument in the selected era.
     ///
-    /// Modern sessions add the final request metadata and return
-    /// [`CoreResult::Final`] with [`FinalCoreResult::Completion`]. Exact
-    /// legacy sessions retain the unmodified completion request and return
-    /// [`CoreResult::Legacy`].
+    /// Modern sessions send the full [`CompletionParams`] context plus final
+    /// request metadata and return [`CoreResult::Final`] with
+    /// [`FinalCoreResult::Completion`]. Exact legacy sessions losslessly map
+    /// only title-free, context-free inputs and return [`CoreResult::Legacy`].
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or its completion result violates
-    /// the method-aware contract of the negotiated era. A contradictory peer
+    /// Returns an error if a legacy session cannot represent the requested
+    /// completion input, if the request fails, or if its result violates the
+    /// method-aware contract of the negotiated era. A contradictory peer
     /// result terminates the connection.
     pub fn complete(&mut self, params: CompletionParams) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
-        self.send_typed_core_request("completion/complete", params)
+        match self.session.selected_era() {
+            Some(ProtocolEra::Modern2026) => {
+                self.send_typed_core_request("completion/complete", params)
+            }
+            Some(ProtocolEra::Legacy2024) => {
+                self.send_typed_core_request("completion/complete", params.into_legacy()?)
+            }
+            None => Err(McpError::internal_error(
+                "Client has no negotiated protocol era for completion",
+            )),
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -8314,6 +8541,57 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_typed_list_client_script(list_response: &str) -> String {
+        let discovery_response =
+            modern_discovery_response("typed-list-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r second || exit 1; \
+             case \"$second\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{list_response}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_remaining_core_client_script() -> String {
+        let discovery_response =
+            modern_discovery_response("remaining-core-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r tools || exit 1; \
+             case \"$tools\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[]}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r resources || exit 1; \
+             case \"$resources\" in *resources/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"resources\":[]}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r templates || exit 1; \
+             case \"$templates\" in *resources/templates/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\",\"resourceTemplates\":[]}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r read_resource || exit 1; \
+             case \"$read_resource\" in *resources/read*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{{\"resultType\":\"complete\",\"contents\":[]}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r prompts || exit 1; \
+             case \"$prompts\" in *prompts/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{{\"resultType\":\"complete\",\"prompts\":[]}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r get_prompt || exit 1; \
+             case \"$get_prompt\" in *prompts/get*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"resultType\":\"complete\",\"messages\":[]}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r logging || exit 1; \
+             case \"$logging\" in *logging/setLevel*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"level\":\"notice\"'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r ping || exit 1; \
+             case \"$ping\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
     fn modern_completion_client_script(completion_response: &str) -> String {
         let discovery_response =
             modern_discovery_response("completion-modern-server", &[MODERN_PROTOCOL_VERSION]);
@@ -8322,7 +8600,7 @@ mod tests {
              case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r second || exit 1; \
-             case \"$second\" in *completion/complete*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$second\" in *completion/complete*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"title\":\"Deploy\"'*'\"context\":{{\"arguments\":{{\"region\":\"us-east-1\"}}}}'*) \
              printf '%s\\n' '{completion_response}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
@@ -8418,6 +8696,37 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn legacy_typed_list_client_script() -> &'static str {
+        "IFS= read -r first || exit 1; \
+         case \"$first\" in *initialize*2024-11-05*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}' ;; *) exit 1 ;; esac; \
+         IFS= read -r lifecycle || exit 1; \
+         case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+         IFS= read -r request || exit 1; \
+         case \"$request\" in *tools/list*) ;; *) exit 1 ;; esac; \
+         case \"$request\" in *io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
+         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}' ;; esac; \
+         exec sleep 2"
+    }
+
+    #[cfg(unix)]
+    fn legacy_progress_client_script(progress_token: i64) -> String {
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *initialize*2024-11-05*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r lifecycle || exit 1; \
+             case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+             IFS= read -r request || exit 1; \
+             case \"$request\" in *tools/call*'\"progressToken\":2'*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
+             *) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":{progress_token},\"progress\":0.5,\"total\":1.0,\"message\":\"legacy progress\"}}}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"legacy result\"}}],\"isError\":false}}}}' ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
     fn legacy_completion_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in *initialize*2024-11-05*) \
@@ -8431,16 +8740,66 @@ mod tests {
          exec sleep 2"
     }
 
+    #[cfg(unix)]
+    fn auto_legacy_completion_client_script() -> &'static str {
+        "IFS= read -r first || exit 1; \
+         case \"$first\" in \
+         *server/discover*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}' ;; \
+         *initialize*2024-11-05*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}'; \
+         IFS= read -r lifecycle || exit 1; \
+         case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+         IFS= read -r request || exit 1; \
+         case \"$request\" in *completion/complete*) ;; *) exit 1 ;; esac; \
+         case \"$request\" in *io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
+         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"completion\":{\"values\":[\"staging\"],\"total\":1,\"hasMore\":false}}}' ;; esac ;; \
+         *) exit 1 ;; esac; \
+         exec sleep 2"
+    }
+
     fn completion_params() -> CompletionParams {
         CompletionParams {
             reference: CompletionReference::Prompt {
                 name: "deploy".to_owned(),
+                title: None,
             },
             argument: CompletionArgument {
                 name: "environment".to_owned(),
                 value: "sta".to_owned(),
             },
+            context: None,
         }
+    }
+
+    fn modern_completion_params() -> CompletionParams {
+        CompletionParams {
+            reference: CompletionReference::Prompt {
+                name: "deploy".to_owned(),
+                title: Some("Deploy".to_owned()),
+            },
+            argument: CompletionArgument {
+                name: "environment".to_owned(),
+                value: "sta".to_owned(),
+            },
+            context: Some(CompletionContext {
+                arguments: Some(std::collections::BTreeMap::from([(
+                    "region".to_owned(),
+                    "us-east-1".to_owned(),
+                )])),
+            }),
+        }
+    }
+
+    fn completion_params_with_context() -> CompletionParams {
+        let mut params = completion_params();
+        params.context = Some(CompletionContext {
+            arguments: Some(std::collections::BTreeMap::from([(
+                "region".to_owned(),
+                "us-east-1".to_owned(),
+            )])),
+        });
+        params
     }
 
     #[cfg(unix)]
@@ -8496,6 +8855,116 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn clt_01_remaining_typed_core_methods_return_final_results() {
+        let script = modern_remaining_core_client_script();
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+
+        assert!(matches!(
+            client
+                .list_tools_typed(None)
+                .expect("typed tools/list returns final result"),
+            CoreResult::Final(FinalCoreResult::ToolsList { .. })
+        ));
+        assert!(matches!(
+            client
+                .list_resources_typed(None)
+                .expect("typed resources/list returns final result"),
+            CoreResult::Final(FinalCoreResult::ResourcesList { .. })
+        ));
+        assert!(matches!(
+            client
+                .list_resource_templates_typed(None)
+                .expect("typed resources/templates/list returns final result"),
+            CoreResult::Final(FinalCoreResult::ResourceTemplatesList { .. })
+        ));
+        assert!(matches!(
+            client
+                .read_resource_typed("file:///typed-core-resource")
+                .expect("typed resources/read returns final result"),
+            CoreResult::Final(FinalCoreResult::ResourcesRead { .. })
+        ));
+        assert!(matches!(
+            client
+                .list_prompts_typed(None)
+                .expect("typed prompts/list returns final result"),
+            CoreResult::Final(FinalCoreResult::PromptsList { .. })
+        ));
+        assert!(matches!(
+            client
+                .get_prompt_typed("summary", HashMap::new())
+                .expect("typed prompts/get returns final result"),
+            CoreResult::Final(FinalCoreResult::PromptsGet { .. })
+        ));
+        assert!(matches!(
+            client
+                .set_log_level_typed(LoggingLevel::Notice)
+                .expect("typed logging/setLevel returns final result"),
+            CoreResult::Final(FinalCoreResult::SetLogLevel { .. })
+        ));
+        assert!(matches!(
+            client
+                .ping_typed()
+                .expect("typed ping returns final result"),
+            CoreResult::Final(FinalCoreResult::Ping { .. })
+        ));
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_remaining_typed_list_result_positive() {
+        let script = modern_typed_list_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[]}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+
+        assert!(matches!(
+            client
+                .list_tools_typed(None)
+                .expect("typed tools/list accepts a complete final result"),
+            CoreResult::Final(FinalCoreResult::ToolsList { .. })
+        ));
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_remaining_typed_list_null_discriminator_rejected() {
+        // This differs from the accepted typed list result only in
+        // `resultType`.
+        let script = modern_typed_list_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"tools":[]}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("same modern discovery initializes the public client");
+
+        let error = client
+            .list_tools_typed(None)
+            .expect_err("an explicit null discriminator is not an omitted complete discriminator");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(!client.is_initialized());
+        assert!(client.responses.terminal_error().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clt_01_final_typed_client_result_null_discriminator_rejected() {
         // This differs from the accepted modern result only in `resultType`.
         let script = modern_typed_call_client_script(
@@ -8532,7 +9001,7 @@ mod tests {
         .expect("modern discovery initializes the public client");
 
         let result = client
-            .complete(completion_params())
+            .complete(modern_completion_params())
             .expect("modern completion returns its typed final payload");
         let CoreResult::Final(FinalCoreResult::Completion { result, diagnostic }) = result else {
             panic!("modern completion must not decode through the legacy result shape");
@@ -8560,11 +9029,92 @@ mod tests {
         .expect("same modern discovery initializes the public client");
 
         let error = client
-            .complete(completion_params())
+            .complete(modern_completion_params())
             .expect_err("an explicit null completion discriminator is rejected");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(!client.is_initialized());
         assert!(client.responses.terminal_error().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_02_auto_modern_completion_retains_full_context() {
+        let script = modern_completion_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","completion":{"values":["staging"],"total":1,"hasMore":false}}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+            Cx::for_request(),
+        )
+        .expect("Auto retains a successful modern selection");
+
+        let result = client
+            .complete(modern_completion_params())
+            .expect("Auto-modern completion transmits the full final context");
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(ProtocolEra::Modern2026)
+        );
+        assert!(matches!(
+            result,
+            CoreResult::Final(FinalCoreResult::Completion { .. })
+        ));
+        client.close().expect("auto modern cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_02_auto_legacy_completion_losslessly_maps_compatible_input() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", auto_legacy_completion_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+            Cx::for_request(),
+        )
+        .expect("recognized modern refusal authorizes one exact legacy selection");
+
+        let result = client
+            .complete(completion_params())
+            .expect("title-free, context-free completion maps to exact legacy");
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(ProtocolEra::Legacy2024)
+        );
+        assert!(matches!(
+            result,
+            CoreResult::Legacy(LegacyCoreResult::Completion(_))
+        ));
+        client.close().expect("auto legacy cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_02_auto_legacy_completion_rejects_unrepresentable_context_without_sending() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", auto_legacy_completion_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+            Cx::for_request(),
+        )
+        .expect("recognized modern refusal authorizes one exact legacy selection");
+
+        let error = client
+            .complete(completion_params_with_context())
+            .expect_err("legacy completion must not erase final-only context");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert!(client.is_initialized());
+
+        assert!(matches!(
+            client
+                .complete(completion_params())
+                .expect("rejection leaves the exact legacy request state unchanged"),
+            CoreResult::Legacy(LegacyCoreResult::Completion(_))
+        ));
+        client.close().expect("auto legacy cleanup");
     }
 
     #[cfg(unix)]
@@ -8805,15 +9355,39 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn leg_03_progress_client_result_preserves_exact_legacy_decode() {
+    fn leg_03_remaining_typed_list_preserves_exact_legacy_decode() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
-            &["-c", legacy_typed_call_client_script()],
+            &["-c", legacy_typed_list_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
             Cx::for_request(),
         )
         .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
-        let mut on_progress = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {};
+
+        assert!(matches!(
+            client
+                .list_tools_typed(None)
+                .expect("the exact legacy tools/list response remains accepted"),
+            CoreResult::Legacy(LegacyCoreResult::ToolsList(_))
+        ));
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_progress_client_result_preserves_exact_legacy_decode() {
+        let script = legacy_progress_client_script(2);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
+        let mut observed_progress = Vec::new();
+        let mut on_progress = |progress: f64, total: Option<f64>, message: Option<&str>| {
+            observed_progress.push((progress, total, message.map(ToOwned::to_owned)));
+        };
 
         let content = client
             .call_tool_with_progress(
@@ -8823,6 +9397,42 @@ mod tests {
             )
             .expect("legacy progress calls do not require a final result discriminator");
         assert_eq!(content.len(), 1);
+        assert_eq!(
+            observed_progress,
+            vec![(0.5, Some(1.0), Some("legacy progress".to_owned()))]
+        );
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_progress_nonmatching_token_leaves_callback_state_unchanged() {
+        let script = legacy_progress_client_script(3);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
+        let mut observed_progress = Vec::new();
+        let mut on_progress = |progress: f64, total: Option<f64>, message: Option<&str>| {
+            observed_progress.push((progress, total, message.map(ToOwned::to_owned)));
+        };
+
+        let content = client
+            .call_tool_with_progress(
+                "echo",
+                serde_json::json!({"text": "legacy nonmatching progress"}),
+                &mut on_progress,
+            )
+            .expect("a nonmatching progress token does not disturb the legacy request");
+        assert_eq!(content.len(), 1);
+        assert!(
+            observed_progress.is_empty(),
+            "the callback state must remain unchanged for a nonmatching token"
+        );
+        assert!(client.is_initialized());
         client.close().expect("legacy client cleanup");
     }
 
