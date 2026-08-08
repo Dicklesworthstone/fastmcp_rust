@@ -276,6 +276,12 @@ pub struct EventStoreConfig {
     pub max_event_payload_bytes: usize,
     /// Maximum compact-JSON payload bytes retained across all streams.
     pub max_total_event_payload_bytes: usize,
+    /// Maximum events returned by one modern replay page.
+    pub max_replay_events: usize,
+    /// Maximum compact-JSON payload bytes returned by one modern replay page.
+    pub max_replay_payload_bytes: usize,
+    /// Maximum UTF-8 byte length accepted for an untrusted replay cursor.
+    pub max_replay_cursor_bytes: usize,
     /// Time-to-live for events. `None` means events never expire.
     pub ttl: Option<Duration>,
 }
@@ -288,6 +294,9 @@ impl Default for EventStoreConfig {
             max_stream_id_bytes: DEFAULT_MAX_STREAM_ID_BYTES,
             max_event_payload_bytes: DEFAULT_MAX_EVENT_PAYLOAD_BYTES,
             max_total_event_payload_bytes: DEFAULT_MAX_TOTAL_EVENT_PAYLOAD_BYTES,
+            max_replay_events: DEFAULT_MAX_REPLAY_EVENTS,
+            max_replay_payload_bytes: DEFAULT_MAX_REPLAY_PAYLOAD_BYTES,
+            max_replay_cursor_bytes: DEFAULT_MAX_REPLAY_CURSOR_BYTES,
             ttl: Some(Duration::from_secs(DEFAULT_TTL_SECS)),
         }
     }
@@ -338,6 +347,27 @@ impl EventStoreConfig {
         self
     }
 
+    /// Sets the maximum events returned by one modern replay page.
+    #[must_use]
+    pub fn max_replay_events(mut self, max: usize) -> Self {
+        self.max_replay_events = max;
+        self
+    }
+
+    /// Sets the maximum compact-JSON payload bytes returned by one replay page.
+    #[must_use]
+    pub fn max_replay_payload_bytes(mut self, max: usize) -> Self {
+        self.max_replay_payload_bytes = max;
+        self
+    }
+
+    /// Sets the maximum UTF-8 byte length accepted for one replay cursor.
+    #[must_use]
+    pub fn max_replay_cursor_bytes(mut self, max: usize) -> Self {
+        self.max_replay_cursor_bytes = max;
+        self
+    }
+
     /// Sets the TTL for events.
     #[must_use]
     pub fn ttl(mut self, ttl: Duration) -> Self {
@@ -362,6 +392,9 @@ impl EventStoreConfig {
                 "max_total_event_payload_bytes",
                 self.max_total_event_payload_bytes,
             ),
+            ("max_replay_events", self.max_replay_events),
+            ("max_replay_payload_bytes", self.max_replay_payload_bytes),
+            ("max_replay_cursor_bytes", self.max_replay_cursor_bytes),
         ] {
             if limit == 0 {
                 return Err(EventStoreError::InvalidZeroLimit { field });
