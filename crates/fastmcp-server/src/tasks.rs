@@ -45,7 +45,13 @@ use base64::Engine as _;
 use fastmcp_core::logging::{debug, info, targets, warn};
 use fastmcp_core::{McpError, McpResult, draw_security_identifier};
 use fastmcp_protocol::{
-    JsonRpcRequest, TaskId, TaskInfo, TaskResult, TaskStatus, TaskStatusNotificationParams,
+    CreateTaskResult, FinalCancelTaskResult, FinalGetTaskResult, FinalTaskCallToolResult,
+    FinalTaskError, FinalTaskId, FinalTaskStatus, FinalTaskStatusNotificationParams,
+    JsonRpcRequest, Task as FinalTask, TaskBase as FinalTaskBase,
+    TaskDuration as FinalTaskDuration, TaskId, TaskInfo, TaskInputLedger as FinalTaskInputLedger,
+    TaskInputRequests as FinalTaskInputRequests, TaskInputResponses as FinalTaskInputResponses,
+    TaskResult, TaskStatus, TaskStatusNotification as FinalTaskStatusNotification,
+    TaskStatusNotificationParams, TaskTimestamp as FinalTaskTimestamp, UpdateTaskResult,
 };
 
 /// Notification sender used for task status updates.
@@ -1478,6 +1484,383 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
     Ok(())
 }
 
+// ============================================================================
+// Final MCP Tasks durable state machine (2026-07-28)
+// ============================================================================
+
+/// Application-owned durable storage for final Tasks.
+///
+/// `create_task` and `replace_task` must atomically retain the task and its
+/// typed notification before returning success. That is the create-before-reply
+/// boundary: a caller may return the `CreateTaskResult` only after this method
+/// has succeeded. Delivery is deliberately separate from persistence so a
+/// transport reconnect cannot erase an accepted task transition.
+pub(crate) trait FinalTaskStore: Send + Sync {
+    /// Durably records a newly created task and its status notification.
+    fn create_task(
+        &self,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+    ) -> McpResult<()>;
+
+    /// Loads one task by its opaque final identifier.
+    fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>>;
+
+    /// Durably replaces a task and records its status notification atomically.
+    fn replace_task(
+        &self,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+    ) -> McpResult<()>;
+
+    /// Durably records cooperative cancellation intent for a known task.
+    fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()>;
+
+    /// Returns the durable cooperative-cancellation intent for a known task.
+    fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool>;
+}
+
+/// Typed notification delivery hook installed by the application transport.
+///
+/// The store receives the same notification first, so a failed or disconnected
+/// delivery path never changes whether the task transition was durable.
+pub(crate) type FinalTaskNotificationEmitter =
+    Arc<dyn Fn(FinalTaskStatusNotification) + Send + Sync>;
+
+/// Immutable final Tasks timing policy supplied with the durable store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FinalTaskRuntimeConfig {
+    ttl_ms: u64,
+    poll_interval_ms: Option<u64>,
+}
+
+impl FinalTaskRuntimeConfig {
+    /// Creates a final Tasks policy with a required finite retention duration.
+    pub(crate) fn new(ttl_ms: u64, poll_interval_ms: Option<u64>) -> McpResult<Self> {
+        final_task_duration(ttl_ms)?;
+        if let Some(interval) = poll_interval_ms {
+            final_task_duration(interval)?;
+        }
+        Ok(Self {
+            ttl_ms,
+            poll_interval_ms,
+        })
+    }
+}
+
+/// Final Tasks state machine backed by an application-supplied durable store.
+///
+/// This type owns neither a runtime nor a task region. A caller-owned
+/// asupersync supervisor may invoke these synchronous durable transitions from
+/// its own children; the legacy `TaskManager` remains entirely separate.
+#[derive(Clone)]
+pub(crate) struct FinalTaskRuntime {
+    store: Arc<dyn FinalTaskStore>,
+    config: FinalTaskRuntimeConfig,
+    notification_emitter: Option<FinalTaskNotificationEmitter>,
+}
+
+impl FinalTaskRuntime {
+    /// Binds final Tasks to one application-owned durable store.
+    #[must_use]
+    pub(crate) fn new(
+        store: Arc<dyn FinalTaskStore>,
+        config: FinalTaskRuntimeConfig,
+        notification_emitter: Option<FinalTaskNotificationEmitter>,
+    ) -> Self {
+        Self {
+            store,
+            config,
+            notification_emitter,
+        }
+    }
+
+    /// Durably creates the initial working task before returning its wire result.
+    pub(crate) fn create_task(
+        &self,
+        status_message: Option<String>,
+    ) -> McpResult<CreateTaskResult> {
+        let task_id = generate_final_task_id()?;
+        let now = final_task_timestamp()?;
+        let task = FinalTask::Working(FinalTaskBase {
+            task_id,
+            status: FinalTaskStatus::Working,
+            status_message,
+            created_at: now.clone(),
+            last_updated_at: now,
+            ttl_ms: Some(final_task_duration(self.config.ttl_ms)?),
+            poll_interval_ms: self
+                .config
+                .poll_interval_ms
+                .map(final_task_duration)
+                .transpose()?,
+        });
+        self.persist_new(task.clone())?;
+        Ok(CreateTaskResult {
+            task,
+            meta: None,
+            additional: BTreeMap::new(),
+        })
+    }
+
+    /// Returns the exact final `tasks/get` complete result.
+    pub(crate) fn get_task(&self, task_id: &FinalTaskId) -> McpResult<FinalGetTaskResult> {
+        Ok(fastmcp_protocol::CompleteTaskResult {
+            task: self.load_task(task_id)?,
+            meta: None,
+            additional: BTreeMap::new(),
+        })
+    }
+
+    /// Enters `input_required` with typed final embedded requests.
+    pub(crate) fn require_input(
+        &self,
+        task_id: &FinalTaskId,
+        input_requests: FinalTaskInputRequests,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        if input_requests.is_empty() {
+            return Err(McpError::invalid_params(
+                "input_required tasks require at least one input request",
+            ));
+        }
+        FinalTaskInputLedger::from_requests(&input_requests)
+            .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        let current = self.load_task(task_id)?;
+        let FinalTask::Working(base) = current else {
+            return Err(McpError::invalid_params(
+                "only a working task can require client input",
+            ));
+        };
+        let task = FinalTask::InputRequired {
+            base: transition_final_task_base(base, FinalTaskStatus::InputRequired, status_message)?,
+            input_requests,
+        };
+        self.persist_replace(task.clone())?;
+        Ok(task)
+    }
+
+    /// Applies matching typed input responses and returns the empty final acknowledgement.
+    pub(crate) fn update_task(
+        &self,
+        task_id: &FinalTaskId,
+        input_responses: &FinalTaskInputResponses,
+    ) -> McpResult<UpdateTaskResult> {
+        let current = self.load_task(task_id)?;
+        let FinalTask::InputRequired {
+            base,
+            mut input_requests,
+        } = current
+        else {
+            return Ok(UpdateTaskResult::default());
+        };
+        let ledger = FinalTaskInputLedger::from_requests(&input_requests)
+            .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        ledger
+            .validate_responses(input_responses)
+            .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        for key in input_responses.keys() {
+            input_requests.remove(key);
+        }
+        let task = if input_requests.is_empty() {
+            FinalTask::Working(transition_final_task_base(
+                base,
+                FinalTaskStatus::Working,
+                None,
+            )?)
+        } else {
+            FinalTask::InputRequired {
+                base: transition_final_task_base(base, FinalTaskStatus::InputRequired, None)?,
+                input_requests,
+            }
+        };
+        self.persist_replace(task)?;
+        Ok(UpdateTaskResult::default())
+    }
+
+    /// Durably acknowledges cooperative `tasks/cancel` intent.
+    pub(crate) fn cancel_task(&self, task_id: &FinalTaskId) -> McpResult<FinalCancelTaskResult> {
+        let current = self.load_task(task_id)?;
+        if matches!(
+            current,
+            FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
+        ) {
+            return Err(McpError::invalid_params("terminal tasks cannot be cancelled"));
+        }
+        self.store.request_cancellation(task_id)?;
+        Ok(FinalCancelTaskResult::default())
+    }
+
+    /// Returns durable cancellation intent for a caller-owned task worker.
+    pub(crate) fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+        self.store.is_cancellation_requested(task_id)
+    }
+
+    /// Lets a caller-owned worker record the cooperative cancellation outcome.
+    pub(crate) fn honor_cancellation(
+        &self,
+        task_id: &FinalTaskId,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        if !self.store.is_cancellation_requested(task_id)? {
+            return Err(McpError::invalid_params(
+                "task cancellation has not been requested",
+            ));
+        }
+        let current = self.load_task(task_id)?;
+        if matches!(
+            current,
+            FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
+        ) {
+            return Err(McpError::invalid_params("terminal tasks cannot be cancelled"));
+        }
+        let task = FinalTask::Cancelled(transition_terminal_final_task_base(
+            current.base().clone(),
+            FinalTaskStatus::Cancelled,
+            status_message,
+        )?);
+        self.persist_replace(task.clone())?;
+        Ok(task)
+    }
+
+    /// Records a typed final tools/call result for a working task.
+    pub(crate) fn complete_task(
+        &self,
+        task_id: &FinalTaskId,
+        result: FinalTaskCallToolResult,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        let current = self.load_task(task_id)?;
+        let FinalTask::Working(base) = current else {
+            return Err(McpError::invalid_params("only a working task can complete"));
+        };
+        let task = FinalTask::Completed {
+            base: transition_terminal_final_task_base(
+                base,
+                FinalTaskStatus::Completed,
+                status_message,
+            )?,
+            result,
+        };
+        self.persist_replace(task.clone())?;
+        Ok(task)
+    }
+
+    /// Records a typed final task failure for an active task.
+    pub(crate) fn fail_task(
+        &self,
+        task_id: &FinalTaskId,
+        error: FinalTaskError,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        let current = self.load_task(task_id)?;
+        if matches!(
+            current,
+            FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
+        ) {
+            return Err(McpError::invalid_params("terminal tasks cannot fail"));
+        }
+        let task = FinalTask::Failed {
+            base: transition_terminal_final_task_base(
+                current.base().clone(),
+                FinalTaskStatus::Failed,
+                status_message,
+            )?,
+            error,
+        };
+        self.persist_replace(task.clone())?;
+        Ok(task)
+    }
+
+    fn load_task(&self, task_id: &FinalTaskId) -> McpResult<FinalTask> {
+        let task = self
+            .store
+            .get_task(task_id)?
+            .ok_or_else(|| McpError::invalid_params("Task not found"))?;
+        if &task.base().task_id != task_id {
+            return Err(McpError::internal_error(
+                "Final task store returned a task under the wrong identifier",
+            ));
+        }
+        Ok(task)
+    }
+
+    fn persist_new(&self, task: FinalTask) -> McpResult<()> {
+        let notification = final_task_notification(&task);
+        self.store.create_task(task, notification.clone())?;
+        self.emit(notification);
+        Ok(())
+    }
+
+    fn persist_replace(&self, task: FinalTask) -> McpResult<()> {
+        let notification = final_task_notification(&task);
+        self.store.replace_task(task, notification.clone())?;
+        self.emit(notification);
+        Ok(())
+    }
+
+    fn emit(&self, notification: FinalTaskStatusNotification) {
+        if let Some(emitter) = &self.notification_emitter {
+            emitter(notification);
+        }
+    }
+}
+
+fn generate_final_task_id() -> McpResult<FinalTaskId> {
+    let identifier = draw_security_identifier().map_err(|error| {
+        McpError::internal_error(format!("Task identifier generation failed: {error}"))
+    })?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(identifier.as_bytes());
+    FinalTaskId::parse(encoded).map_err(|error| McpError::internal_error(error.to_string()))
+}
+
+fn final_task_timestamp() -> McpResult<FinalTaskTimestamp> {
+    FinalTaskTimestamp::parse(
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
+    .map_err(|error| McpError::internal_error(error.to_string()))
+}
+
+fn final_task_duration(milliseconds: u64) -> McpResult<FinalTaskDuration> {
+    serde_json::from_value(serde_json::json!(milliseconds))
+        .map_err(|error| McpError::invalid_params(format!("invalid task duration: {error}")))
+}
+
+fn transition_final_task_base(
+    mut base: FinalTaskBase,
+    status: FinalTaskStatus,
+    status_message: Option<String>,
+) -> McpResult<FinalTaskBase> {
+    base.status = status;
+    base.status_message = status_message;
+    base.last_updated_at = final_task_timestamp()?;
+    Ok(base)
+}
+
+fn transition_terminal_final_task_base(
+    base: FinalTaskBase,
+    status: FinalTaskStatus,
+    status_message: Option<String>,
+) -> McpResult<FinalTaskBase> {
+    if !matches!(
+        status,
+        FinalTaskStatus::Completed | FinalTaskStatus::Failed | FinalTaskStatus::Cancelled
+    ) {
+        return Err(McpError::internal_error(
+            "terminal task transition requires a terminal status",
+        ));
+    }
+    transition_final_task_base(base, status, status_message)
+}
+
+fn final_task_notification(task: &FinalTask) -> FinalTaskStatusNotification {
+    FinalTaskStatusNotification::new(FinalTaskStatusNotificationParams {
+        task: task.clone(),
+        meta: None,
+        additional: BTreeMap::new(),
+    })
+}
+
 impl Default for TaskManager {
     fn default() -> Self {
         Self::new()
@@ -1516,9 +1899,284 @@ pub type SharedTaskManager = Arc<TaskManager>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::thread;
     use std::time::Duration;
+
+    #[derive(Default)]
+    struct MemoryFinalTaskStore {
+        tasks: RwLock<BTreeMap<FinalTaskId, FinalTask>>,
+        cancellation_requests: RwLock<BTreeSet<FinalTaskId>>,
+        notifications: Mutex<Vec<FinalTaskStatusNotification>>,
+    }
+
+    impl MemoryFinalTaskStore {
+        fn contains(&self, task_id: &FinalTaskId) -> bool {
+            self.tasks
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(task_id)
+        }
+
+        fn notification_count(&self) -> usize {
+            self.notifications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+        }
+    }
+
+    impl FinalTaskStore for MemoryFinalTaskStore {
+        fn create_task(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            let task_id = task.base().task_id.clone();
+            let mut tasks = self
+                .tasks
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if tasks.contains_key(&task_id) {
+                return Err(McpError::invalid_params("Task already exists"));
+            }
+            tasks.insert(task_id, task);
+            self.notifications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(notification);
+            Ok(())
+        }
+
+        fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
+            Ok(self
+                .tasks
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(task_id)
+                .cloned())
+        }
+
+        fn replace_task(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            let task_id = task.base().task_id.clone();
+            let mut tasks = self
+                .tasks
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !tasks.contains_key(&task_id) {
+                return Err(McpError::invalid_params("Task not found"));
+            }
+            tasks.insert(task_id, task);
+            self.notifications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(notification);
+            Ok(())
+        }
+
+        fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
+            if !self.contains(task_id) {
+                return Err(McpError::invalid_params("Task not found"));
+            }
+            self.cancellation_requests
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(task_id.clone());
+            Ok(())
+        }
+
+        fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+            if !self.contains(task_id) {
+                return Err(McpError::invalid_params("Task not found"));
+            }
+            Ok(self
+                .cancellation_requests
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(task_id))
+        }
+    }
+
+    fn final_task_runtime(
+        store: Arc<MemoryFinalTaskStore>,
+        delivery_after_durable_commit: Arc<AtomicBool>,
+    ) -> FinalTaskRuntime {
+        let store_for_emitter = Arc::clone(&store);
+        FinalTaskRuntime::new(
+            store,
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
+            Some(Arc::new(move |notification| {
+                if store_for_emitter.contains(&notification.params.task.base().task_id) {
+                    delivery_after_durable_commit.store(true, AtomicOrdering::SeqCst);
+                }
+            })),
+        )
+    }
+
+    fn final_roots_request() -> FinalTaskInputRequests {
+        let mut requests = FinalTaskInputRequests::new();
+        requests.insert(
+            "roots".to_owned(),
+            serde_json::from_value(serde_json::json!({"method": "roots/list"}))
+                .expect("typed roots input request"),
+        );
+        requests
+    }
+
+    #[test]
+    fn task_03_final_durable_runtime_positive() {
+        let store = Arc::new(MemoryFinalTaskStore::default());
+        let delivered_after_durable_commit = Arc::new(AtomicBool::new(false));
+        let runtime = final_task_runtime(
+            Arc::clone(&store),
+            Arc::clone(&delivered_after_durable_commit),
+        );
+
+        let created = runtime
+            .create_task(Some("accepted".to_owned()))
+            .expect("durable create before wire reply");
+        let task_id = created.task.base().task_id.clone();
+        assert!(matches!(created.task, FinalTask::Working(_)));
+        assert!(
+            store.contains(&task_id),
+            "create result names a durable task"
+        );
+        assert!(
+            delivered_after_durable_commit.load(AtomicOrdering::SeqCst),
+            "typed notification delivery runs only after the store has accepted the task"
+        );
+        let created_notification = store
+            .notifications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .first()
+            .cloned()
+            .expect("durable create records its typed notification");
+        let notification_wire =
+            serde_json::to_value(created_notification).expect("encode task notification");
+        assert_eq!(notification_wire["method"], "notifications/tasks");
+        assert_eq!(notification_wire["params"]["taskId"], task_id.as_str());
+        assert_eq!(
+            runtime
+                .get_task(&task_id)
+                .expect("get newly created task")
+                .task
+                .base()
+                .task_id,
+            task_id
+        );
+
+        runtime
+            .require_input(
+                &task_id,
+                final_roots_request(),
+                Some("awaiting roots".to_owned()),
+            )
+            .expect("working task accepts typed roots request");
+        let input_responses: FinalTaskInputResponses = serde_json::from_value(serde_json::json!({
+            "roots": {"roots": []}
+        }))
+        .expect("typed roots response");
+        let update = runtime
+            .update_task(&task_id, &input_responses)
+            .expect("matching typed input response updates task");
+        assert_eq!(
+            serde_json::to_value(update).expect("encode empty update acknowledgement")["resultType"],
+            "complete"
+        );
+        assert!(matches!(
+            runtime
+                .get_task(&task_id)
+                .expect("get task after update")
+                .task,
+            FinalTask::Working(_)
+        ));
+
+        let cancel = runtime
+            .cancel_task(&task_id)
+            .expect("durably record cancellation intent");
+        assert_eq!(
+            serde_json::to_value(cancel).expect("encode empty cancel acknowledgement")["resultType"],
+            "complete"
+        );
+        assert!(
+            runtime
+                .is_cancellation_requested(&task_id)
+                .expect("read durable cancellation intent")
+        );
+        assert!(matches!(
+            runtime
+                .honor_cancellation(&task_id, Some("cancelled".to_owned()))
+                .expect("caller-owned worker honors cancellation"),
+            FinalTask::Cancelled(_)
+        ));
+        assert_eq!(
+            store.notification_count(),
+            4,
+            "every durable state transition carries one typed notification"
+        );
+    }
+
+    #[test]
+    fn task_03_final_durable_runtime_wrong_response_kind_preserves_state() {
+        let store = Arc::new(MemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = runtime
+            .create_task(None)
+            .expect("create durable task")
+            .task
+            .base()
+            .task_id
+            .clone();
+        runtime
+            .require_input(&task_id, final_roots_request(), None)
+            .expect("task awaits a roots response");
+        let before = serde_json::to_vec(
+            &runtime
+                .get_task(&task_id)
+                .expect("snapshot task before planted response")
+                .task,
+        )
+        .expect("serialize task snapshot");
+        let notification_count = store.notification_count();
+
+        // The response key is unchanged from the accepted case; only its
+        // discriminating payload changes from a roots result to sampling.
+        let wrong_kind: FinalTaskInputResponses = serde_json::from_value(serde_json::json!({
+            "roots": {
+                "role": "assistant",
+                "model": "final-model",
+                "content": {"type": "text", "text": "wrong response kind"}
+            }
+        }))
+        .expect("well-formed but mismatched typed response");
+        assert!(
+            runtime.update_task(&task_id, &wrong_kind).is_err(),
+            "a response whose type does not match the issued request fails closed"
+        );
+
+        let after = serde_json::to_vec(
+            &runtime
+                .get_task(&task_id)
+                .expect("snapshot task after rejected response")
+                .task,
+        )
+        .expect("serialize task snapshot");
+        assert_eq!(
+            after, before,
+            "rejected input cannot mutate durable task state"
+        );
+        assert_eq!(
+            store.notification_count(),
+            notification_count,
+            "rejected input cannot emit a durable state notification"
+        );
+    }
 
     #[test]
     fn test_task_manager_creation() {
