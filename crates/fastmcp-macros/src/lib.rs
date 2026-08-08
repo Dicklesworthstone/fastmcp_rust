@@ -65,13 +65,13 @@
 use std::collections::HashMap;
 
 use proc_macro::TokenStream;
+use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use proc_macro_crate::{crate_name, FoundCrate};
 use quote::{format_ident, quote};
 use syn::spanned::Spanned as _;
 use syn::{
-    parse::Parse, parse::ParseStream, parse_macro_input, Attribute, FnArg, Ident, ItemFn, Lit,
-    LitStr, Meta, Pat, Token, Type,
+    Attribute, FnArg, Ident, ItemFn, Lit, LitStr, Meta, Pat, Token, Type, parse::Parse,
+    parse::ParseStream, parse_macro_input,
 };
 
 /// Crate paths used by handler macro expansions.
@@ -1668,8 +1668,8 @@ fn validate_output_schema_expr(schema_expr: &syn::Expr) -> syn::Result<()> {
 #[allow(clippy::items_after_test_module)]
 mod schema_bound_tool_expansion_tests {
     use super::{
-        generate_tool_result_conversion, output_schema_source, output_schema_value,
-        typed_output_schema_matches_return, validate_output_schema_expr, OutputSchemaSource,
+        OutputSchemaSource, generate_tool_result_conversion, output_schema_source,
+        output_schema_value, typed_output_schema_matches_return, validate_output_schema_expr,
     };
 
     #[test]
