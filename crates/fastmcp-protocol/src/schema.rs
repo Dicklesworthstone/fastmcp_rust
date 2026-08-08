@@ -1,19 +1,38 @@
 //! JSON Schema validation for MCP tool inputs.
 //!
-//! This module provides a simple JSON Schema validator that covers the core
-//! requirements for MCP tool input validation:
+//! This module provides a bounded JSON Schema Draft 2020-12 validator for the
+//! high-impact core keywords used by MCP tool input validation:
 //!
 //! - Type checking (string, number, integer, boolean, object, array, null)
 //! - Required field validation
 //! - Enum validation
-//! - Property validation for objects
-//! - Items validation for arrays
+//! - Property, pattern-property, dependency, and property-name validation
+//! - Items, tuple, and contains validation for arrays
+//! - Local `$defs`/`$ref`, composition, and conditional applicators
 //!
-//! This is not a full JSON Schema implementation but covers the subset used by MCP.
+//! External references are never resolved through network or filesystem I/O.
 
 use regex::Regex;
 use serde_json::Value;
 use std::fmt;
+
+/// Maximum nested schema applications on a single validation path.
+pub const MAX_SCHEMA_VALIDATION_DEPTH: usize = 64;
+
+/// Maximum local `$ref` hops on a single validation path.
+pub const MAX_LOCAL_REFERENCE_DEPTH: usize = 32;
+
+/// Maximum schemas evaluated by one composition keyword.
+pub const MAX_COMPOSITION_BRANCHES: usize = 64;
+
+/// Maximum `patternProperties` entries compiled for one object schema.
+pub const MAX_PATTERN_PROPERTIES: usize = 64;
+
+/// Maximum UTF-8 bytes in one locally compiled pattern-property expression.
+pub const MAX_PATTERN_PROPERTY_BYTES: usize = 4 * 1024;
+
+/// Maximum validation errors retained for one public `validate` call.
+pub const MAX_VALIDATION_ERRORS: usize = 64;
 
 /// Error returned when JSON Schema validation fails.
 #[derive(Debug, Clone)]
@@ -70,7 +89,13 @@ pub type ValidationResult = Result<(), Vec<ValidationError>>;
 /// ```
 pub fn validate(schema: &Value, value: &Value) -> ValidationResult {
     let mut errors = Vec::new();
-    validate_internal(schema, value, "root", &mut errors);
+    validate_internal(
+        schema,
+        value,
+        "root",
+        &mut errors,
+        ValidationContext::new(schema),
+    );
 
     if errors.is_empty() {
         Ok(())
@@ -140,34 +165,41 @@ fn make_strict_schema(schema: &Value) -> Value {
                 }
             }
 
-            // Recursively process nested schemas
-            if let Some(Value::Object(props)) = obj.get("properties") {
-                let strict_props: serde_json::Map<String, Value> = props
-                    .iter()
-                    .map(|(k, v)| (k.clone(), make_strict_schema(v)))
-                    .collect();
-                new_obj.insert("properties".to_string(), Value::Object(strict_props));
-            }
-
-            // Handle additionalProperties if it's a schema object
-            if let Some(additional) = obj.get("additionalProperties") {
-                if additional.is_object() {
-                    new_obj.insert(
-                        "additionalProperties".to_string(),
-                        make_strict_schema(additional),
-                    );
+            for keyword in [
+                "properties",
+                "patternProperties",
+                "dependentSchemas",
+                "$defs",
+            ] {
+                if let Some(Value::Object(subschemas)) = obj.get(keyword) {
+                    let strict_subschemas: serde_json::Map<String, Value> = subschemas
+                        .iter()
+                        .map(|(key, subschema)| (key.clone(), make_strict_schema(subschema)))
+                        .collect();
+                    new_obj.insert(keyword.to_owned(), Value::Object(strict_subschemas));
                 }
             }
 
-            // Handle items schema for arrays
-            if let Some(items) = obj.get("items") {
-                new_obj.insert("items".to_string(), make_strict_schema(items));
+            for keyword in [
+                "additionalProperties",
+                "items",
+                "contains",
+                "not",
+                "if",
+                "then",
+                "else",
+                "propertyNames",
+            ] {
+                if let Some(subschema) = obj.get(keyword) {
+                    new_obj.insert(keyword.to_owned(), make_strict_schema(subschema));
+                }
             }
 
-            // Handle prefixItems for tuple validation
-            if let Some(Value::Array(arr)) = obj.get("prefixItems") {
-                let strict_items: Vec<Value> = arr.iter().map(make_strict_schema).collect();
-                new_obj.insert("prefixItems".to_string(), Value::Array(strict_items));
+            for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+                if let Some(Value::Array(subschemas)) = obj.get(keyword) {
+                    let strict_subschemas = subschemas.iter().map(make_strict_schema).collect();
+                    new_obj.insert(keyword.to_owned(), Value::Array(strict_subschemas));
+                }
             }
 
             Value::Object(new_obj)
@@ -180,15 +212,70 @@ fn make_strict_schema(schema: &Value) -> Value {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ValidationContext<'a> {
+    root_schema: &'a Value,
+    schema_depth: usize,
+    reference_depth: usize,
+}
+
+impl<'a> ValidationContext<'a> {
+    const fn new(root_schema: &'a Value) -> Self {
+        Self {
+            root_schema,
+            schema_depth: 0,
+            reference_depth: 0,
+        }
+    }
+
+    const fn descend(self) -> Self {
+        Self {
+            root_schema: self.root_schema,
+            schema_depth: self.schema_depth + 1,
+            reference_depth: self.reference_depth,
+        }
+    }
+
+    const fn follow_reference(self) -> Self {
+        Self {
+            root_schema: self.root_schema,
+            schema_depth: self.schema_depth,
+            reference_depth: self.reference_depth + 1,
+        }
+    }
+}
+
+fn push_error(errors: &mut Vec<ValidationError>, path: &str, message: impl Into<String>) {
+    if errors.len() < MAX_VALIDATION_ERRORS {
+        errors.push(ValidationError {
+            path: path.to_owned(),
+            message: message.into(),
+        });
+    }
+}
+
 /// Internal recursive validation function.
-fn validate_internal(schema: &Value, value: &Value, path: &str, errors: &mut Vec<ValidationError>) {
+fn validate_internal(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: ValidationContext<'_>,
+) {
+    if context.schema_depth >= MAX_SCHEMA_VALIDATION_DEPTH {
+        push_error(
+            errors,
+            path,
+            "schema validation nesting limit exceeded",
+        );
+        return;
+    }
+    let context = context.descend();
+
     // Handle boolean schemas (true = accept all, false = reject all)
     if let Some(b) = schema.as_bool() {
         if !b {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: "schema rejects all values".to_string(),
-            });
+            push_error(errors, path, "schema rejects all values");
         }
         return;
     }
@@ -206,22 +293,23 @@ fn validate_internal(schema: &Value, value: &Value, path: &str, errors: &mut Vec
                 .map(String::from)
                 .or_else(|| type_val.as_array().map(|arr| format!("{arr:?}")))
                 .unwrap_or_else(|| "unknown".to_string());
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("expected type {expected}, got {}", json_type_name(value)),
-            });
+            push_error(
+                errors,
+                path,
+                format!("expected type {expected}, got {}", json_type_name(value)),
+            );
             return; // Type mismatch, skip further validation
         }
     }
+
+    validate_local_reference(schema_obj, value, path, errors, context);
+    validate_composition(schema_obj, value, path, errors, context);
 
     // Check enum constraint
     if let Some(enum_val) = schema_obj.get("enum") {
         if let Some(enum_arr) = enum_val.as_array() {
             if !enum_arr.contains(value) {
-                errors.push(ValidationError {
-                    path: path.to_string(),
-                    message: format!("value must be one of: {enum_arr:?}"),
-                });
+                push_error(errors, path, format!("value must be one of: {enum_arr:?}"));
             }
         }
     }
@@ -229,20 +317,17 @@ fn validate_internal(schema: &Value, value: &Value, path: &str, errors: &mut Vec
     // Check const constraint
     if let Some(const_val) = schema_obj.get("const") {
         if value != const_val {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("value must equal {const_val}"),
-            });
+            push_error(errors, path, format!("value must equal {const_val}"));
         }
     }
 
     // Type-specific validation
     match value {
         Value::Object(obj) => {
-            validate_object(schema_obj, obj, path, errors);
+            validate_object(schema_obj, obj, path, errors, context);
         }
         Value::Array(arr) => {
-            validate_array(schema_obj, arr, path, errors);
+            validate_array(schema_obj, arr, path, errors, context);
         }
         Value::String(s) => {
             validate_string(schema_obj, s, path, errors);
@@ -252,6 +337,192 @@ fn validate_internal(schema: &Value, value: &Value, path: &str, errors: &mut Vec
         }
         _ => {}
     }
+}
+
+fn validate_local_reference(
+    schema: &serde_json::Map<String, Value>,
+    value: &Value,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: ValidationContext<'_>,
+) {
+    let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
+        return;
+    };
+    if context.reference_depth >= MAX_LOCAL_REFERENCE_DEPTH {
+        push_error(errors, path, "local schema reference depth limit exceeded");
+        return;
+    }
+    match resolve_local_reference(context.root_schema, reference) {
+        Ok(target) => validate_internal(target, value, path, errors, context.follow_reference()),
+        Err(message) => push_error(errors, path, message),
+    }
+}
+
+fn resolve_local_reference<'a>(root_schema: &'a Value, reference: &str) -> Result<&'a Value, &'static str> {
+    if reference == "#" {
+        return Ok(root_schema);
+    }
+    let Some(pointer) = reference.strip_prefix("#/") else {
+        return Err("external schema reference is not allowed");
+    };
+
+    let mut target = root_schema;
+    for encoded_segment in pointer.split('/') {
+        let segment = unescape_json_pointer_segment(encoded_segment)
+            .ok_or("invalid local schema reference")?;
+        target = match target {
+            Value::Object(object) => object.get(&segment),
+            Value::Array(array) => segment
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| array.get(index)),
+            _ => None,
+        }
+        .ok_or("unresolved local schema reference")?;
+    }
+    Ok(target)
+}
+
+fn unescape_json_pointer_segment(segment: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(segment.len());
+    let mut characters = segment.chars();
+    while let Some(character) = characters.next() {
+        if character != '~' {
+            decoded.push(character);
+            continue;
+        }
+        match characters.next()? {
+            '0' => decoded.push('~'),
+            '1' => decoded.push('/'),
+            _ => return None,
+        }
+    }
+    Some(decoded)
+}
+
+fn validate_composition(
+    schema: &serde_json::Map<String, Value>,
+    value: &Value,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: ValidationContext<'_>,
+) {
+    validate_all_of(schema, value, path, errors, context);
+    validate_any_of(schema, value, path, errors, context);
+    validate_one_of(schema, value, path, errors, context);
+    validate_not(schema, value, path, errors, context);
+    validate_conditional(schema, value, path, errors, context);
+}
+
+fn bounded_subschemas<'a>(
+    schema: &'a serde_json::Map<String, Value>,
+    keyword: &str,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) -> Option<&'a [Value]> {
+    let subschemas = schema.get(keyword)?.as_array()?;
+    if subschemas.len() > MAX_COMPOSITION_BRANCHES {
+        push_error(errors, path, format!("{keyword} exceeds composition branch limit"));
+        return None;
+    }
+    Some(subschemas)
+}
+
+fn validate_all_of(
+    schema: &serde_json::Map<String, Value>,
+    value: &Value,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: ValidationContext<'_>,
+) {
+    if let Some(subschemas) = bounded_subschemas(schema, "allOf", path, errors) {
+        for subschema in subschemas {
+            validate_internal(subschema, value, path, errors, context);
+        }
+    }
+}
+
+fn validate_any_of(
+    schema: &serde_json::Map<String, Value>,
+    value: &Value,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: ValidationContext<'_>,
+) {
+    let Some(subschemas) = bounded_subschemas(schema, "anyOf", path, errors) else {
+        return;
+    };
+    if !subschemas
+        .iter()
+        .any(|subschema| branch_is_valid(subschema, value, path, context))
+    {
+        push_error(errors, path, "no subschema in anyOf matched");
+    }
+}
+
+fn validate_one_of(
+    schema: &serde_json::Map<String, Value>,
+    value: &Value,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: ValidationContext<'_>,
+) {
+    let Some(subschemas) = bounded_subschemas(schema, "oneOf", path, errors) else {
+        return;
+    };
+    let matches = subschemas
+        .iter()
+        .filter(|subschema| branch_is_valid(subschema, value, path, context))
+        .count();
+    if matches != 1 {
+        push_error(errors, path, "exactly one subschema in oneOf must match");
+    }
+}
+
+fn validate_not(
+    schema: &serde_json::Map<String, Value>,
+    value: &Value,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: ValidationContext<'_>,
+) {
+    if let Some(subschema) = schema.get("not") {
+        if branch_is_valid(subschema, value, path, context) {
+            push_error(errors, path, "value must not match the not subschema");
+        }
+    }
+}
+
+fn validate_conditional(
+    schema: &serde_json::Map<String, Value>,
+    value: &Value,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: ValidationContext<'_>,
+) {
+    let Some(condition) = schema.get("if") else {
+        return;
+    };
+    let branch_keyword = if branch_is_valid(condition, value, path, context) {
+        "then"
+    } else {
+        "else"
+    };
+    if let Some(subschema) = schema.get(branch_keyword) {
+        validate_internal(subschema, value, path, errors, context);
+    }
+}
+
+fn branch_is_valid(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    context: ValidationContext<'_>,
+) -> bool {
+    let mut branch_errors = Vec::new();
+    validate_internal(schema, value, path, &mut branch_errors, context);
+    branch_errors.is_empty()
 }
 
 /// Validates type constraint.
