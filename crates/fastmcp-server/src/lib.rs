@@ -208,10 +208,7 @@ const DISPATCH_QUEUE_CAPACITY_MESSAGE: &str = "Server request queue capacity exh
 const DISCOVERY_CACHE_MAX_AGE_SECONDS: u32 = 60;
 const MODERN_ONLY_INITIALIZE_MESSAGE: &str = "Initialization-based MCP is not enabled";
 const STDIO_OUTPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(not(test))]
 const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 static INSTALL_EXTENSION_PANIC_HOOK: Once = Once::new();
 #[cfg(test)]
 static REDACTED_EXTENSION_PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
