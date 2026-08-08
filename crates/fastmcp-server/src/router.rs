@@ -30,11 +30,12 @@ use fastmcp_protocol::{
     FinalPromptArgument, FinalReadResourceParams, FinalReadResourceResult, FinalResource,
     FinalResourceTemplate, FinalTool, FinalToolAnnotations, GetPromptParams, GetPromptResult,
     InitializeParams, InitializeResult, JsonRpcRequest, LegacyCompletionParams,
-    LegacyCompletionResult, LegacyCoreRequest, ListPromptsParams, ListPromptsResult,
-    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker,
-    Prompt, ReadResourceParams, ReadResourceResult, Resource, ResourceContent, ResourceTemplate,
-    ServerBehavior, ServerBehaviorRegistry, Tool, validate, validate_strict,
+    LegacyCompletionResult, LegacyContent, LegacyCoreRequest, LegacyPromptMessage,
+    LegacyResourceContent, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
+    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
+    ListToolsResult, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage, ReadResourceParams,
+    ReadResourceResult, Resource, ResourceContent, ResourceTemplate, ServerBehavior,
+    ServerBehaviorRegistry, Tool, validate, validate_strict,
 };
 #[cfg(test)]
 use fastmcp_protocol::{
@@ -306,31 +307,148 @@ fn project_final_resource_catalog_entry(
     })
 }
 
-fn promote_resource_content(resource: ResourceContent) -> McpResult<EmbeddedResourceContents> {
-    let uri = AbsoluteUri::parse(resource.uri).map_err(|error| {
+/// Converts handler-owned content into the exact legacy result union.
+///
+/// Audio is valid only in the broader handler surface, never in the exact
+/// 2024-11-05 content union. Refuse it rather than emitting an invalid legacy
+/// response or silently changing the content type.
+fn legacy_content_from_handler(content: Content) -> McpResult<LegacyContent> {
+    match content {
+        Content::Text { text } => Ok(LegacyContent::Text {
+            text,
+            annotations: None,
+            additional: BTreeMap::new(),
+        }),
+        Content::Image { data, mime_type } => Ok(LegacyContent::Image {
+            data,
+            mime_type,
+            annotations: None,
+            additional: BTreeMap::new(),
+        }),
+        Content::Resource { resource } => Ok(LegacyContent::Resource {
+            resource: legacy_resource_content_from_handler(resource)?,
+            annotations: None,
+            additional: BTreeMap::new(),
+        }),
+        Content::Audio { .. } => Err(McpError::internal_error(
+            "legacy 2024 result content does not support audio",
+        )),
+    }
+}
+
+fn legacy_contents_from_handler(content: Vec<Content>) -> McpResult<Vec<LegacyContent>> {
+    content
+        .into_iter()
+        .map(legacy_content_from_handler)
+        .collect()
+}
+
+/// Converts handler-owned resource content into an exact legacy result item.
+fn legacy_resource_content_from_handler(
+    resource: ResourceContent,
+) -> McpResult<LegacyResourceContent> {
+    match (resource.text, resource.blob) {
+        (Some(text), None) => Ok(LegacyResourceContent::Text {
+            uri: resource.uri,
+            text,
+            mime_type: resource.mime_type,
+            additional: BTreeMap::new(),
+        }),
+        (None, Some(blob)) => Ok(LegacyResourceContent::Blob {
+            uri: resource.uri,
+            blob,
+            mime_type: resource.mime_type,
+            additional: BTreeMap::new(),
+        }),
+        _ => Err(McpError::internal_error(
+            "legacy 2024 resource content requires exactly one text or blob payload",
+        )),
+    }
+}
+
+fn legacy_resource_contents_from_handler(
+    contents: Vec<ResourceContent>,
+) -> McpResult<Vec<LegacyResourceContent>> {
+    contents
+        .into_iter()
+        .map(legacy_resource_content_from_handler)
+        .collect()
+}
+
+fn legacy_prompt_messages_from_handler(
+    messages: Vec<PromptMessage>,
+) -> McpResult<Vec<LegacyPromptMessage>> {
+    messages
+        .into_iter()
+        .map(|PromptMessage { role, content }| {
+            Ok(LegacyPromptMessage {
+                role,
+                content: legacy_content_from_handler(content)?,
+                additional: BTreeMap::new(),
+            })
+        })
+        .collect()
+}
+
+/// Promotes exact legacy resource content into a final resource result.
+///
+/// Legacy open members remain inert but are retained verbatim. In particular,
+/// an untyped legacy `_meta` value stays in `additional` rather than acquiring
+/// final-era metadata authority during the cross-era projection.
+fn promote_legacy_resource_content(
+    resource: LegacyResourceContent,
+) -> McpResult<EmbeddedResourceContents> {
+    let (uri, content, mime_type, additional) = match resource {
+        LegacyResourceContent::Text {
+            uri,
+            text,
+            mime_type,
+            additional,
+        } => (
+            uri,
+            LegacyEmbeddedContent::Text(text),
+            mime_type,
+            additional,
+        ),
+        LegacyResourceContent::Blob {
+            uri,
+            blob,
+            mime_type,
+            additional,
+        } => (
+            uri,
+            LegacyEmbeddedContent::Blob(blob),
+            mime_type,
+            additional,
+        ),
+    };
+    let uri = AbsoluteUri::parse(uri).map_err(|error| {
         McpError::internal_error(format!(
             "legacy resource content cannot be projected into the final result: {error}",
         ))
     })?;
-    match (resource.text, resource.blob) {
-        (Some(text), None) => Ok(EmbeddedResourceContents::Text {
+
+    match content {
+        LegacyEmbeddedContent::Text(text) => Ok(EmbeddedResourceContents::Text {
             uri,
             text,
-            mime_type: resource.mime_type,
+            mime_type,
             meta: None,
-            additional: BTreeMap::new(),
+            additional,
         }),
-        (None, Some(blob)) => Ok(EmbeddedResourceContents::Blob {
+        LegacyEmbeddedContent::Blob(blob) => Ok(EmbeddedResourceContents::Blob {
             uri,
             blob,
-            mime_type: resource.mime_type,
+            mime_type,
             meta: None,
-            additional: BTreeMap::new(),
+            additional,
         }),
-        _ => Err(McpError::internal_error(
-            "legacy resource content cannot be promoted without exactly one text or blob payload",
-        )),
     }
+}
+
+enum LegacyEmbeddedContent {
+    Text(String),
+    Blob(String),
 }
 
 fn legacy_list_tools_params(params: FinalListParams) -> ListToolsParams {
@@ -2023,7 +2141,7 @@ impl Router {
         let contents = result
             .contents
             .into_iter()
-            .map(promote_resource_content)
+            .map(promote_legacy_resource_content)
             .collect::<McpResult<Vec<_>>>()?;
         Ok(FinalReadResourceResult {
             contents,
@@ -2131,8 +2249,10 @@ impl Router {
         })?;
         match outcome {
             Outcome::Ok(content) => Ok(CallToolResult {
-                content,
+                content: legacy_contents_from_handler(content)?,
                 is_error: false,
+                meta: None,
+                additional: BTreeMap::new(),
             }),
             Outcome::Err(e) => {
                 let e = sanitize_handler_error(request_ctx.cx(), "tool", e);
@@ -2142,8 +2262,14 @@ impl Router {
 
                 // Tool errors are returned as content with is_error=true
                 Ok(CallToolResult {
-                    content: vec![Content::Text { text: e.message }],
+                    content: vec![LegacyContent::Text {
+                        text: e.message,
+                        annotations: None,
+                        additional: BTreeMap::new(),
+                    }],
                     is_error: true,
+                    meta: None,
+                    additional: BTreeMap::new(),
                 })
             }
             Outcome::Cancelled(_) => {
@@ -2231,8 +2357,10 @@ impl Router {
 
         match outcome {
             Outcome::Ok(content) => Ok(CallToolResult {
-                content,
+                content: legacy_contents_from_handler(content)?,
                 is_error: false,
+                meta: None,
+                additional: BTreeMap::new(),
             }),
             Outcome::Err(error) => {
                 let error = sanitize_handler_error(request_ctx.cx(), "tool", error);
@@ -2240,10 +2368,14 @@ impl Router {
                     return Err(error);
                 }
                 Ok(CallToolResult {
-                    content: vec![Content::Text {
+                    content: vec![LegacyContent::Text {
                         text: error.message,
+                        annotations: None,
+                        additional: BTreeMap::new(),
                     }],
                     is_error: true,
+                    meta: None,
+                    additional: BTreeMap::new(),
                 })
             }
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
@@ -2520,7 +2652,11 @@ impl Router {
             }
         };
 
-        Ok(ReadResourceResult { contents })
+        Ok(ReadResourceResult {
+            contents: legacy_resource_contents_from_handler(contents)?,
+            meta: None,
+            additional: BTreeMap::new(),
+        })
     }
 
     async fn handle_resources_read_in_request(
@@ -2594,7 +2730,11 @@ impl Router {
             }
         };
 
-        Ok(ReadResourceResult { contents })
+        Ok(ReadResourceResult {
+            contents: legacy_resource_contents_from_handler(contents)?,
+            meta: None,
+            additional: BTreeMap::new(),
+        })
     }
 
     /// Handles the prompts/list request.
@@ -2733,7 +2873,9 @@ impl Router {
 
         Ok(GetPromptResult {
             description,
-            messages,
+            messages: legacy_prompt_messages_from_handler(messages)?,
+            meta: None,
+            additional: BTreeMap::new(),
         })
     }
 
@@ -2811,7 +2953,9 @@ impl Router {
 
         Ok(GetPromptResult {
             description,
-            messages,
+            messages: legacy_prompt_messages_from_handler(messages)?,
+            meta: None,
+            additional: BTreeMap::new(),
         })
     }
 
@@ -5143,9 +5287,10 @@ mod router_tests {
     };
     use fastmcp_protocol::{
         CompleteResult, CompletionValues, Content, FinalCallToolResult, FinalCompletionParams,
-        LegacyCompletionParams, Prompt, PromptArgument, PromptMessage, Resource, ResourceContent,
-        ResourceTemplate, Tool,
+        LegacyCompletionParams, LegacyResourceContent, Prompt, PromptArgument, PromptMessage,
+        Resource, ResourceContent, ResourceTemplate, Tool,
     };
+    use std::collections::BTreeMap;
     use std::fmt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -5171,6 +5316,158 @@ mod router_tests {
             }
         })
         .await;
+    }
+
+    #[test]
+    fn legacy_result_adapters_emit_exact_2024_defaults() {
+        let tool = CallToolResult {
+            content: legacy_contents_from_handler(vec![
+                Content::Text {
+                    text: "ready".to_owned(),
+                },
+                Content::Image {
+                    data: "aGVsbG8=".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                },
+                Content::Resource {
+                    resource: ResourceContent {
+                        uri: "file:///tool.txt".to_owned(),
+                        mime_type: Some("text/plain".to_owned()),
+                        text: Some("tool resource".to_owned()),
+                        blob: None,
+                    },
+                },
+            ])
+            .expect("handler content is representable by the exact legacy union"),
+            is_error: false,
+            meta: None,
+            additional: BTreeMap::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(tool).expect("legacy tool result serializes"),
+            serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "ready"},
+                    {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+                    {
+                        "type": "resource",
+                        "resource": {
+                            "uri": "file:///tool.txt",
+                            "mimeType": "text/plain",
+                            "text": "tool resource"
+                        }
+                    }
+                ]
+            })
+        );
+
+        let resource = ReadResourceResult {
+            contents: legacy_resource_contents_from_handler(vec![ResourceContent {
+                uri: "file:///report.bin".to_owned(),
+                mime_type: Some("application/octet-stream".to_owned()),
+                text: None,
+                blob: Some("AAEC".to_owned()),
+            }])
+            .expect("handler resource is representable by the exact legacy union"),
+            meta: None,
+            additional: BTreeMap::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(resource).expect("legacy resource result serializes"),
+            serde_json::json!({
+                "contents": [{
+                    "uri": "file:///report.bin",
+                    "mimeType": "application/octet-stream",
+                    "blob": "AAEC"
+                }]
+            })
+        );
+
+        let prompt = GetPromptResult {
+            description: Some("ask a question".to_owned()),
+            messages: legacy_prompt_messages_from_handler(vec![PromptMessage {
+                role: fastmcp_protocol::Role::User,
+                content: Content::Text {
+                    text: "summarize".to_owned(),
+                },
+            }])
+            .expect("handler prompt message is representable by the exact legacy union"),
+            meta: None,
+            additional: BTreeMap::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(prompt).expect("legacy prompt result serializes"),
+            serde_json::json!({
+                "description": "ask a question",
+                "messages": [{
+                    "role": "user",
+                    "content": {"type": "text", "text": "summarize"}
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_resource_adapter_preserves_open_members_when_promoted() {
+        let resource = LegacyResourceContent::Text {
+            uri: "file:///open.txt".to_owned(),
+            text: "preserve me".to_owned(),
+            mime_type: Some("text/plain".to_owned()),
+            additional: BTreeMap::from([
+                (
+                    "_meta".to_owned(),
+                    serde_json::json!({"legacy": "uninterpreted"}),
+                ),
+                (
+                    "com.example/legacy".to_owned(),
+                    serde_json::json!({"retained": true}),
+                ),
+            ]),
+        };
+
+        let promoted = promote_legacy_resource_content(resource)
+            .expect("schema-valid legacy resource is promotable");
+        assert_eq!(
+            serde_json::to_value(promoted).expect("promoted resource serializes"),
+            serde_json::json!({
+                "uri": "file:///open.txt",
+                "mimeType": "text/plain",
+                "text": "preserve me",
+                "_meta": {"legacy": "uninterpreted"},
+                "com.example/legacy": {"retained": true}
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_content_adapter_rejects_only_audio_without_mutating_baseline() {
+        let baseline = vec![Content::Image {
+            data: "aGVsbG8=".to_owned(),
+            mime_type: "image/png".to_owned(),
+        }];
+        let baseline_wire = serde_json::to_value(
+            legacy_contents_from_handler(baseline.clone())
+                .expect("baseline content is representable by the legacy adapter"),
+        )
+        .expect("baseline legacy content serializes");
+        let planted = vec![Content::Audio {
+            data: "aGVsbG8=".to_owned(),
+            mime_type: "image/png".to_owned(),
+        }];
+
+        assert!(
+            legacy_contents_from_handler(planted).is_err(),
+            "changing only the content discriminator to audio rejects the legacy adapter"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                legacy_contents_from_handler(baseline)
+                    .expect("baseline remains representable after rejection"),
+            )
+            .expect("baseline legacy content remains serializable"),
+            baseline_wire,
+            "rejected legacy conversion cannot mutate the accepted baseline"
+        );
     }
 
     fn spawn_owned_modern_request(
