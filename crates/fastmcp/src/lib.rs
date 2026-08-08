@@ -425,7 +425,9 @@ pub mod modern {
 /// the responsibility of the immutable policy and the transport-specific
 /// negotiation layer.
 pub mod legacy_2024 {
+    pub use fastmcp_client::ClientProtocolPlan;
     pub use fastmcp_client::http_executor::{LegacySseHttpClient, LegacySseHttpClientError};
+    pub use fastmcp_core::Cx;
     pub use fastmcp_protocol::methods;
     pub use fastmcp_protocol::protocol_policy::{
         LEGACY_PROTOCOL_VERSION, LegacyClientAdapterInstalledReceipt,
@@ -433,11 +435,11 @@ pub mod legacy_2024 {
     };
     pub use fastmcp_protocol::{
         CallToolParams, CallToolResult, CancelledParams, GetPromptParams, GetPromptResult,
-        InitializeParams, InitializeResult, LegacyCoreRequest, LegacyCoreResult, LegacyEmptyResult,
-        ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
-        ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
-        ListToolsResult, PROTOCOL_VERSION, ReadResourceParams, ReadResourceResult,
-        SetLogLevelParams,
+        InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest, LegacyCoreRequest,
+        LegacyCoreResult, LegacyEmptyResult, ListPromptsParams, ListPromptsResult,
+        ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
+        ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
+        ReadResourceParams, ReadResourceResult, RequestId, SetLogLevelParams,
     };
     pub use fastmcp_server::legacy_2024::{
         LEGACY_2024_MAX_ADAPTER_RESERVATIONS, Legacy2024AdapterError, Legacy2024Handler,

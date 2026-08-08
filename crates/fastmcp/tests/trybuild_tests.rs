@@ -679,6 +679,21 @@ fn assert_dual_era_facade_surface() {
     assert_eq!(ProtocolPolicy::ModernOnly, modern::ProtocolPolicy::ModernOnly);
 }
 
+fn assert_legacy_sse_method_signatures(
+    cx: &legacy_2024::Cx,
+    plan: legacy_2024::ClientProtocolPlan,
+    client: &mut legacy_2024::LegacySseHttpClient,
+) {
+    let message = legacy_2024::JsonRpcMessage::Request(legacy_2024::JsonRpcRequest::new(
+        "initialize",
+        None,
+        legacy_2024::RequestId::Number(1),
+    ));
+    let _connect = legacy_2024::LegacySseHttpClient::connect(cx, plan);
+    let _send = client.send(cx, &message);
+    let _next_message = client.next_message(cx);
+}
+
 fn assert_prelude_dual_era_surface() {
     use mcp::prelude::*;
 
@@ -691,5 +706,20 @@ fn assert_prelude_dual_era_surface() {
     let _: Option<modern::MrtrExchangeRegistry> = None;
     let _: Option<legacy_2024::CallToolParams> = None;
     let _: Option<legacy_2024::LegacySseHttpClient> = None;
+
+    fn assert_legacy_sse_method_signatures_from_prelude(
+        cx: &legacy_2024::Cx,
+        plan: legacy_2024::ClientProtocolPlan,
+        client: &mut legacy_2024::LegacySseHttpClient,
+    ) {
+        let message = legacy_2024::JsonRpcMessage::Request(legacy_2024::JsonRpcRequest::new(
+            "initialize",
+            None,
+            legacy_2024::RequestId::Number(1),
+        ));
+        let _connect = legacy_2024::LegacySseHttpClient::connect(cx, plan);
+        let _send = client.send(cx, &message);
+        let _next_message = client.next_message(cx);
+    }
 }
 "#;
