@@ -376,9 +376,10 @@ pub use fastmcp_client::{
     ClientProtocolPlanError, ClientSession, CompletionContext, CompletionParams,
     CompletionReference, ExecutionTerminalReason, ExecutionTerminalRecord, ExecutionTerminalState,
     FinalTask, FinalTaskInputResponses, FinalTaskStatusNotification, FinalToolCallOutcome,
-    FinalUpdateTaskResult, ListPageLimits, OpaquePagination, PaginationBounds,
-    PendingRequestRecord, ProgressCallback, Request, RequestExecution, RequestExecutor,
-    RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionFilter, SubscriptionListenCollector,
+    FinalUpdateTaskResult, HttpClient, HttpClientError, ListPageLimits, OpaquePagination,
+    PaginationBounds, PendingRequestRecord, ProgressCallback, Request, RequestExecution,
+    RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionFilter,
+    SubscriptionListenCollector,
 };
 
 // Public client HTTP execution and configuration surfaces.
@@ -394,6 +395,8 @@ pub use fastmcp_client::mcp_config::{
     ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
     ServerConfig, claude_desktop_config_path, default_config_paths,
 };
+pub use fastmcp_client::http_auth;
+pub use fastmcp_client::http_auth::{BearerBindingError, BoundBearerCredential};
 pub use fastmcp_client::sse;
 pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
 pub use fastmcp_client::{http_executor, mcp_config};
@@ -416,8 +419,8 @@ pub mod auto {
         ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
         ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
         ClientProtocolPlanError, ClientSession, FinalTask, FinalTaskInputResponses,
-        FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult,
-        SubscriptionFilter, SubscriptionListenCollector,
+        FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient,
+        HttpClientError, SubscriptionFilter, SubscriptionListenCollector,
     };
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::extensions::{
@@ -477,10 +480,10 @@ pub mod modern {
         ClientProtocolPlan, ClientProtocolPlanError, ClientSession, CompletionContext,
         CompletionParams, CompletionReference, ExecutionTerminalReason, ExecutionTerminalRecord,
         ExecutionTerminalState, FinalTask, FinalTaskInputResponses, FinalTaskStatusNotification,
-        FinalToolCallOutcome, FinalUpdateTaskResult, ListPageLimits, OpaquePagination,
-        PaginationBounds, PendingRequestRecord, ProgressCallback, Request, RequestExecution,
-        RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionFilter,
-        SubscriptionListenCollector,
+        FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient, HttpClientError, ListPageLimits,
+        OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback, Request,
+        RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
+        SubscriptionFilter, SubscriptionListenCollector,
     };
     pub use fastmcp_client::{http_executor, mcp_config};
     pub use fastmcp_core::{
@@ -659,7 +662,7 @@ pub mod legacy_2024 {
         CreateMessageParams as LegacyCreateMessageParams,
         CreateMessageResult as LegacyCreateMessageResult,
         ElicitRequestParams as LegacyElicitRequestParams, ElicitResult as LegacyElicitResult,
-        ElicitationRequestHandler as LegacyElicitationRequestHandler,
+        ElicitationRequestHandler as LegacyElicitationRequestHandler, HttpClient, HttpClientError,
         ListRootsParams as LegacyListRootsParams, ListRootsResult as LegacyListRootsResult,
         Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
         ReverseRequestHandlers as LegacyReverseRequestHandlers,
@@ -805,6 +808,8 @@ pub mod prelude {
         FinalToolCallOutcome,
         FinalToolOutcome,
         FinalUpdateTaskResult,
+        HttpClient,
+        HttpClientError,
         HttpEndpointBundle,
         HttpEndpointBundleError,
         HttpEndpointConfig,
@@ -932,8 +937,9 @@ mod tests {
     #[test]
     fn prelude_reexports_client_timeout_configuration_surface() {
         use super::prelude::{
-            Client, ClientBuilder, ClientHttpNegotiation, ClientSession, CompleteResult, McpConfig,
-            ModernHttpRequest, RequestTimeoutPolicy, RequestTimeoutSource, legacy_2024, modern,
+            Client, ClientBuilder, ClientHttpNegotiation, ClientSession, CompleteResult,
+            HttpClient, HttpClientError, McpConfig, ModernHttpRequest, RequestTimeoutPolicy,
+            RequestTimeoutSource, legacy_2024, modern,
         };
 
         let _: ClientBuilder = Client::builder();
@@ -969,6 +975,22 @@ mod tests {
         let _: Option<modern::MrtrExchangeRegistry> = None;
         let _: Option<legacy_2024::CallToolParams> = None;
         let _: Option<legacy_2024::LegacySseHttpClient> = None;
+        let _: Option<HttpClient> = None;
+        let _: Option<HttpClientError> = None;
+    }
+
+    #[test]
+    fn facade_exports_lifecycle_owning_http_client_types_in_every_client_surface() {
+        use super::{HttpClient, HttpClientError, auto, legacy_2024, modern};
+
+        let _: Option<HttpClient> = None;
+        let _: Option<HttpClientError> = None;
+        let _: Option<auto::HttpClient> = None;
+        let _: Option<auto::HttpClientError> = None;
+        let _: Option<modern::HttpClient> = None;
+        let _: Option<modern::HttpClientError> = None;
+        let _: Option<legacy_2024::HttpClient> = None;
+        let _: Option<legacy_2024::HttpClientError> = None;
     }
 
     #[test]
