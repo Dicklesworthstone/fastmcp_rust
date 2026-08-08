@@ -16,6 +16,7 @@ use asupersync::http::h1::http_client::ClientIo;
 use asupersync::http::h1::{
     ClientError, ClientStreamingResponse, HttpClient, Method, RedirectPolicy, RetryPolicy,
 };
+use fastmcp_protocol::extensions::OFFICIAL_TASKS_RESULT_DISCRIMINATOR;
 use fastmcp_protocol::methods::{
     Final2026Direction, Final2026EnvelopeKind, PROMPTS_GET, RESOURCES_READ, SUBSCRIPTIONS_LISTEN,
     TOOLS_CALL, final_2026_07_28_method,
@@ -39,7 +40,8 @@ use fastmcp_protocol::{
 use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError};
 use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
-    ClientProtocolPlan, admit_final_tasks_discovery_surface,
+    ClientProtocolPlan, FinalToolCallOutcome, admit_final_tasks_discovery_surface,
+    admit_final_tasks_result_discriminator,
 };
 
 /// Exact request headers required for a modern MCP JSON-RPC POST.
@@ -1199,6 +1201,8 @@ pub enum ClientHttpConnectionError {
     SubscriptionsListenRequiresModern,
     /// A modern subscription response stream failed typed admission or collection.
     SubscriptionsListen(ModernHttpSubscriptionListenError),
+    /// Final Tasks-backed `tools/call` requires the modern HTTP transport.
+    FinalToolCallRequiresModern,
 }
 
 impl fmt::Display for ClientHttpConnectionError {
@@ -1228,6 +1232,8 @@ impl fmt::Display for ClientHttpConnectionError {
                 formatter.write_str("subscriptions/listen requires the modern HTTP transport")
             }
             Self::SubscriptionsListen(error) => error.fmt(formatter),
+            Self::FinalToolCallRequiresModern => formatter
+                .write_str("final Tasks-backed tools/call requires the modern HTTP transport"),
         }
     }
 }
@@ -1240,7 +1246,8 @@ impl std::error::Error for ClientHttpConnectionError {
             Self::LegacyResponseStreamEnded { .. }
             | Self::LegacyUnexpectedMessage { .. }
             | Self::LegacyResponseIdMismatch { .. }
-            | Self::SubscriptionsListenRequiresModern => None,
+            | Self::SubscriptionsListenRequiresModern
+            | Self::FinalToolCallRequiresModern => None,
             Self::SubscriptionsListen(error) => Some(error),
         }
     }
@@ -1352,6 +1359,29 @@ impl ClientHttpConnection {
         }
     }
 
+    /// Calls one tool without projecting away the final result algebra.
+    ///
+    /// An exact legacy-selected connection rejects this operation before any
+    /// request is sent. A modern connection requires bilateral discovery of
+    /// the official Tasks result discriminator and returns the exact complete,
+    /// task, or input-required branch.
+    pub async fn call_tool_final_outcome(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        name: &str,
+        arguments: serde_json::Value,
+        maximum_response_bytes: usize,
+    ) -> Result<FinalToolCallOutcome, ClientHttpConnectionError> {
+        match self {
+            Self::Modern(client) => client
+                .call_tool_final_outcome(cx, request_id, name, arguments, maximum_response_bytes)
+                .await
+                .map_err(ClientHttpConnectionError::Modern),
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalToolCallRequiresModern),
+        }
+    }
+
     /// Sends one client notification through the selected transport.
     ///
     /// Exact legacy notifications are posted to the pinned message endpoint
@@ -1429,6 +1459,26 @@ pub enum ModernHttpClientError {
     /// The configured native legacy SSE connection could not be opened or
     /// safely used after policy selected its exact endpoint bundle.
     LegacySse(LegacySseHttpClientError),
+    /// The supplied request ID is not a valid JSON-RPC correlation key.
+    InvalidRequestId,
+    /// The retained discovery response did not admit the official Tasks
+    /// result discriminator with exact bilateral empty settings.
+    TasksNegotiation,
+    /// The finite response body was not one strictly admitted JSON-RPC message.
+    InvalidJsonRpcResponse(JsonRpcAdmissionError),
+    /// The server returned a response for a different request.
+    ResponseIdMismatch {
+        /// The immutable outgoing request ID.
+        expected: RequestId,
+        /// The response ID observed on the wire.
+        actual: Option<RequestId>,
+    },
+    /// The server returned a JSON-RPC error for the tool call.
+    RemoteError { code: i32, message: String },
+    /// The response contradicted the final typed core result contract.
+    TypedResult(CoreDispatchError),
+    /// The decoded response was not one final `tools/call` result branch.
+    UnexpectedToolCallResult,
 }
 
 impl fmt::Display for ModernHttpClientError {
@@ -1474,6 +1524,33 @@ impl fmt::Display for ModernHttpClientError {
                 formatter.write_str("server/discover did not advertise MCP 2026-07-28")
             }
             Self::LegacySse(error) => error.fmt(formatter),
+            Self::InvalidRequestId => {
+                formatter.write_str("final HTTP tools/call requires a valid JSON-RPC request ID")
+            }
+            Self::TasksNegotiation => formatter
+                .write_str("final HTTP tools/call Tasks result was not bilaterally negotiated"),
+            Self::InvalidJsonRpcResponse(error) => {
+                write!(
+                    formatter,
+                    "final HTTP tools/call response failed JSON-RPC admission: {error}"
+                )
+            }
+            Self::ResponseIdMismatch { expected, actual } => write!(
+                formatter,
+                "final HTTP tools/call response ID {actual:?} did not match request {expected:?}"
+            ),
+            Self::RemoteError { code, message } => {
+                write!(
+                    formatter,
+                    "final HTTP tools/call failed with JSON-RPC {code}: {message}"
+                )
+            }
+            Self::TypedResult(error) => {
+                write!(formatter, "invalid final HTTP tools/call result: {error}")
+            }
+            Self::UnexpectedToolCallResult => {
+                formatter.write_str("final HTTP tools/call decoded to an unrelated core result")
+            }
         }
     }
 }
@@ -1484,6 +1561,8 @@ impl std::error::Error for ModernHttpClientError {
             Self::Executor(error) => Some(error),
             Self::Negotiation(error) => Some(error),
             Self::LegacySse(error) => Some(error),
+            Self::InvalidJsonRpcResponse(error) => Some(error),
+            Self::TypedResult(error) => Some(error),
             Self::MissingModernPostTarget
             | Self::RequestParametersMustBeObject
             | Self::MissingRequestName { .. }
@@ -1494,7 +1573,12 @@ impl std::error::Error for ModernHttpClientError {
             | Self::RequestEncodingFailed
             | Self::DiscoveryRejected
             | Self::InvalidDiscoveryResponse
-            | Self::DiscoveryDoesNotAdvertiseModernProtocol => None,
+            | Self::DiscoveryDoesNotAdvertiseModernProtocol
+            | Self::InvalidRequestId
+            | Self::TasksNegotiation
+            | Self::ResponseIdMismatch { .. }
+            | Self::RemoteError { .. }
+            | Self::UnexpectedToolCallResult => None,
         }
     }
 }
@@ -1675,6 +1759,88 @@ impl ModernHttpClient {
         response
             .collect_final_subscriptions_listen(cx, request_id, notifications, limits)
             .await
+    }
+
+    /// Calls one final tool through native HTTP and retains its exact result branch.
+    pub async fn call_tool_final_outcome(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        name: &str,
+        arguments: serde_json::Value,
+        maximum_response_bytes: usize,
+    ) -> Result<FinalToolCallOutcome, ModernHttpClientError> {
+        if request_id.validate().is_err() {
+            return Err(ModernHttpClientError::InvalidRequestId);
+        }
+        admit_final_tasks_result_discriminator(
+            &self.server_discovery,
+            OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+        )
+        .map_err(|_| ModernHttpClientError::TasksNegotiation)?;
+
+        let parameters = serde_json::json!({
+            "_meta": FinalRequestMeta::new(self.client_capabilities.clone()),
+            "name": name,
+            "arguments": arguments,
+        });
+        let core_request =
+            CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&parameters))
+                .map_err(ModernHttpClientError::TypedResult)?;
+        let client_extensions = BTreeMap::from([(
+            fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+            serde_json::json!({}),
+        )]);
+        let request = build_modern_request_with_extensions(
+            &self.modern_post_target,
+            &self.client_info,
+            &self.client_capabilities,
+            TOOLS_CALL,
+            parameters,
+            Some(request_id.clone()),
+            Some(&client_extensions),
+        )?;
+        let response = self
+            .executor
+            .execute(cx, &request)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        let body = response
+            .read_to_end(cx, maximum_response_bytes)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        let message = decode_strict_jsonrpc_message(&body, maximum_response_bytes)
+            .map_err(ModernHttpClientError::InvalidJsonRpcResponse)?;
+        let JsonRpcMessage::Response(response) = message else {
+            return Err(ModernHttpClientError::UnexpectedToolCallResult);
+        };
+        if response.id.as_ref() != Some(&request_id) {
+            return Err(ModernHttpClientError::ResponseIdMismatch {
+                expected: request_id,
+                actual: response.id,
+            });
+        }
+        if let Some(error) = response.error.as_ref() {
+            return Err(ModernHttpClientError::RemoteError {
+                code: error.code,
+                message: error.message.clone(),
+            });
+        }
+        match core_request
+            .decode_response(&response)
+            .map_err(ModernHttpClientError::TypedResult)?
+        {
+            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                Ok(FinalToolCallOutcome::Complete(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
+                Ok(FinalToolCallOutcome::Task(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
+                Ok(FinalToolCallOutcome::InputRequired(result))
+            }
+            _ => Err(ModernHttpClientError::UnexpectedToolCallResult),
+        }
     }
 }
 
@@ -2544,7 +2710,10 @@ mod tests {
         decode_modern_discovery_response, validate_response_head,
     };
     use crate::sse::SseLimits;
-    use crate::{CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ProtocolEra, ProtocolPolicy};
+    use crate::{
+        CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, FinalToolCallOutcome, ProtocolEra,
+        ProtocolPolicy,
+    };
 
     #[derive(Debug)]
     struct CapturedHttpRequest {
@@ -2789,6 +2958,77 @@ mod tests {
             SseLimits::new(2_048, 16_384, 16).expect("explicit SSE bounds are nonzero"),
         ));
         server.join().expect("Tasks HTTP server must join");
+        result
+    }
+
+    fn run_public_http_tasks_tool_outcome(
+        result_type: &str,
+    ) -> Result<FinalToolCallOutcome, ClientHttpConnectionError> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind local Tasks tools/call listener");
+        let address = listener
+            .local_addr()
+            .expect("read local Tasks tools/call address");
+        let modern_target = format!("http://{address}/mcp");
+        let result_type = result_type.to_owned();
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept Tasks modern probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("Tasks modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                &modern_tasks_discovery_body(),
+            );
+
+            let (mut stream, _) = listener.accept().expect("accept Tasks tools/call request");
+            let request = read_request(&mut stream);
+            assert!(request.head.contains("Mcp-Method: tools/call\r\n"));
+            assert!(request.head.contains("Mcp-Name: durable-tool\r\n"));
+            let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("Tasks tools/call request must be JSON-RPC");
+            assert_eq!(body["id"], 2);
+            assert_eq!(body["method"], "tools/call");
+            assert_eq!(body["params"]["name"], "durable-tool");
+            assert_eq!(body["params"]["arguments"]["work"], 73);
+            assert_eq!(
+                body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    ["io.modelcontextprotocol/tasks"],
+                serde_json::json!({})
+            );
+            let response = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"{result_type}\",\"taskId\":\"task-73\",\"status\":\"working\",\"createdAt\":\"2026-07-28T12:00:00.000Z\",\"lastUpdatedAt\":\"2026-07-28T12:00:00.000Z\",\"ttlMs\":null}}}}"
+            );
+            write_response(&mut stream, 200, "application/json", response.as_bytes());
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("Tasks discovery selects final HTTP tools/call");
+        let result = runtime_block_on(connection.call_tool_final_outcome(
+            &cx,
+            RequestId::Number(2),
+            "durable-tool",
+            serde_json::json!({"work": 73}),
+            4_096,
+        ));
+        assert_eq!(connection.selected_protocol_era(), ProtocolEra::Modern2026);
+        server.join().expect("Tasks HTTP tool server must join");
         result
     }
 
@@ -3126,6 +3366,27 @@ mod tests {
             ClientHttpConnectionError::SubscriptionsListen(
                 ModernHttpSubscriptionListenError::TaskEventOutsideAcceptedFilter
             )
+        ));
+    }
+
+    #[test]
+    fn public_http_tasks_tool_outcome_retains_exact_created_task() {
+        let outcome = run_public_http_tasks_tool_outcome("task")
+            .expect("HTTP tools/call must retain the negotiated Tasks branch");
+        let FinalToolCallOutcome::Task(result) = outcome else {
+            panic!("Tasks-backed HTTP tools/call must not project into complete content");
+        };
+        assert_eq!(result.task.base().task_id.as_str(), "task-73");
+    }
+
+    #[test]
+    fn public_http_tasks_tool_outcome_rejects_one_field_result_type_change() {
+        // The response differs from the admitted positive only in resultType.
+        let error = run_public_http_tasks_tool_outcome("complete")
+            .expect_err("one changed discriminator must fail typed HTTP result admission");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::Modern(ModernHttpClientError::TypedResult(_))
         ));
     }
 
