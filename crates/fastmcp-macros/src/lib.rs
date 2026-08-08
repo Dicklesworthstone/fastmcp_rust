@@ -635,6 +635,81 @@ fn generate_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
     }
 }
 
+/// Generates the JSON-text content used by the legacy handler surface for a
+/// schema-bound result. The current handler trait returns `Vec<Content>`, so
+/// the protocol/server layer is responsible for promoting this JSON value to a
+/// structured tool result when that surface is available.
+fn generate_schema_bound_content(value: TokenStream2) -> TokenStream2 {
+    quote! {
+        let result_value = serde_json::to_value(&(#value)).map_err(|error| {
+            fastmcp_core::McpError::internal_error(format!(
+                "failed to serialize schema-bound tool result: {error}",
+            ))
+        })?;
+        Ok(vec![fastmcp_protocol::Content::Text {
+            text: result_value.to_string(),
+        }])
+    }
+}
+
+/// Generates conversion for a tool that opts into a typed output schema.
+///
+/// This intentionally leaves the legacy conversion path untouched. Typed
+/// schemas make the generated handler serialize the returned value as JSON,
+/// which both checks the result's `Serialize` contract at compile time and
+/// keeps the content representation aligned with its advertised schema.
+fn generate_schema_bound_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
+    let wrapped_result = match output {
+        syn::ReturnType::Type(_, Type::Path(type_path)) => type_path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident == "Result" || segment.ident == "McpResult")
+            .unwrap_or(false),
+        _ => false,
+    };
+
+    if !wrapped_result {
+        return generate_schema_bound_content(quote! { result });
+    }
+
+    let is_mcp_result = match output {
+        syn::ReturnType::Type(_, Type::Path(type_path)) => type_path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "McpResult"),
+        _ => false,
+    };
+
+    if is_mcp_result {
+        let content = generate_schema_bound_content(quote! { result_value });
+        quote! {
+            let result_value = result?;
+            #content
+        }
+    } else {
+        let content = generate_schema_bound_content(quote! { result_value });
+        quote! {
+            let result_value = result
+                .map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))?;
+            #content
+        }
+    }
+}
+
+/// Chooses the conversion policy for a tool result.
+fn generate_tool_result_conversion(
+    output: &syn::ReturnType,
+    typed_output_schema: bool,
+) -> TokenStream2 {
+    if typed_output_schema {
+        generate_schema_bound_result_conversion(output)
+    } else {
+        generate_result_conversion(output)
+    }
+}
+
 fn generate_tool_execution_methods(
     is_async: bool,
     expects_context: bool,
@@ -1484,6 +1559,164 @@ fn parse_annotation_bool(input: ParseStream<'_>) -> syn::Result<bool> {
     }
 }
 
+/// The two supported sources for a tool output schema.
+///
+/// An inline expression retains the exact legacy behavior. A bare type path
+/// becomes the typed form only when it matches the tool's success return type;
+/// this lets legacy schema constants continue to work unchanged.
+#[derive(Clone, Copy)]
+enum OutputSchemaSource<'a> {
+    Inline(&'a syn::Expr),
+    Type(&'a syn::Path),
+}
+
+fn output_schema_source<'a>(
+    schema_expr: &'a syn::Expr,
+    output: &syn::ReturnType,
+) -> OutputSchemaSource<'a> {
+    match schema_expr {
+        syn::Expr::Path(path)
+            if path.qself.is_none()
+                && typed_output_schema_matches_return(&path.path, output) =>
+        {
+            OutputSchemaSource::Type(&path.path)
+        }
+        _ => OutputSchemaSource::Inline(schema_expr),
+    }
+}
+
+fn output_schema_value(source: OutputSchemaSource<'_>) -> TokenStream2 {
+    match source {
+        OutputSchemaSource::Inline(schema_expr) => quote! { #schema_expr },
+        OutputSchemaSource::Type(schema_type) => quote! { <#schema_type>::json_schema() },
+    }
+}
+
+/// Returns the success value type from a direct return or `Result`-style
+/// return. This lets the typed output-schema form prove that the advertised
+/// schema and the handler result name the same type.
+fn tool_success_type(output: &syn::ReturnType) -> Option<&Type> {
+    let syn::ReturnType::Type(_, output_type) = output else {
+        return None;
+    };
+    let Type::Path(type_path) = output_type.as_ref() else {
+        return Some(output_type.as_ref());
+    };
+    let Some(segment) = type_path.path.segments.last() else {
+        return Some(output_type.as_ref());
+    };
+
+    if segment.ident != "Result" && segment.ident != "McpResult" {
+        return Some(output_type.as_ref());
+    }
+
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return None;
+    };
+
+    arguments.args.first().and_then(|argument| match argument {
+        syn::GenericArgument::Type(success_type) => Some(success_type),
+        _ => None,
+    })
+}
+
+fn typed_output_schema_matches_return(
+    schema_type: &syn::Path,
+    output: &syn::ReturnType,
+) -> bool {
+    tool_success_type(output).is_some_and(|success_type| {
+        quote! { #schema_type }.to_string() == quote! { #success_type }.to_string()
+    })
+}
+
+/// Rejects the boolean-schema form before emitting a tool definition.
+///
+/// MCP tool `outputSchema` must be a JSON object. Arbitrary expressions still
+/// preserve legacy ergonomics and are checked by the schema admission layer;
+/// the macro can prove and reject only literal boolean schemas here.
+fn validate_output_schema_expr(schema_expr: &syn::Expr) -> syn::Result<()> {
+    let is_boolean_schema = match schema_expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: Lit::Bool(_), ..
+        }) => true,
+        syn::Expr::Macro(expr_macro)
+            if expr_macro
+                .mac
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "json") =>
+        {
+            syn::parse2::<syn::LitBool>(expr_macro.mac.tokens.clone()).is_ok()
+        }
+        _ => false,
+    };
+
+    if is_boolean_schema {
+        return Err(syn::Error::new_spanned(
+            schema_expr,
+            "output_schema must be a JSON object; boolean schemas are not supported",
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod schema_bound_tool_expansion_tests {
+    use super::{
+        OutputSchemaSource, generate_tool_result_conversion, output_schema_source,
+        output_schema_value, typed_output_schema_matches_return, validate_output_schema_expr,
+    };
+
+    #[test]
+    fn sch_02_a_positive() {
+        let inline_schema: syn::Expr =
+            syn::parse_quote!(serde_json::json!({ "type": "object" }));
+        validate_output_schema_expr(&inline_schema).expect("object schemas are accepted");
+
+        let output_type: syn::Expr = syn::parse_quote!(FinalToolResult);
+        let return_type: syn::ReturnType = syn::parse_quote!(-> McpResult<FinalToolResult>);
+        let OutputSchemaSource::Type(_) = output_schema_source(&output_type, &return_type) else {
+            panic!("a bare output type must generate its final schema");
+        };
+        let schema = output_schema_value(output_schema_source(&output_type, &return_type))
+            .to_string();
+        assert!(schema.contains("FinalToolResult"), "{schema}");
+        assert!(schema.contains("json_schema"), "{schema}");
+
+        let legacy_schema: syn::Expr = syn::parse_quote!(LEGACY_SCHEMA);
+        let legacy_return: syn::ReturnType = syn::parse_quote!(-> String);
+        assert!(matches!(
+            output_schema_source(&legacy_schema, &legacy_return),
+            OutputSchemaSource::Inline(_),
+        ));
+
+        let OutputSchemaSource::Type(schema_type) =
+            output_schema_source(&output_type, &return_type)
+        else {
+            unreachable!("the schema source was checked above");
+        };
+        assert!(typed_output_schema_matches_return(schema_type, &return_type));
+        let conversion = generate_tool_result_conversion(&return_type, true).to_string();
+        assert!(conversion.contains("serde_json :: to_value"), "{conversion}");
+        assert!(conversion.contains("result ?"), "{conversion}");
+    }
+
+    #[test]
+    fn sch_02_a_planted_negative() {
+        let inline_schema: syn::Expr = syn::parse_quote!(serde_json::json!(true));
+        let error = validate_output_schema_expr(&inline_schema)
+            .expect_err("the paired boolean schema must fail macro expansion");
+
+        assert_eq!(
+            error.to_string(),
+            "output_schema must be a JSON object; boolean schemas are not supported",
+        );
+    }
+}
+
 /// Defines a tool handler.
 ///
 /// The function signature should be:
@@ -1496,6 +1729,8 @@ fn parse_annotation_bool(input: ParseStream<'_>) -> syn::Result<bool> {
 /// - `name` - Override the tool name (default: function name)
 /// - `description` - Tool description (default: doc comment)
 /// - `tags` - List of tool tags for filtering (`tags = ["api", "read"]`)
+/// - `output_schema` - An inline JSON object (legacy form), or a bare return
+///   type path with `json_schema()` (typed result form)
 ///
 /// # Parameter Defaults
 ///
@@ -1526,6 +1761,19 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     } = match tool_crate_paths() {
         Ok(paths) => paths,
         Err(error) => return error.to_compile_error().into(),
+    };
+
+    let typed_output_schema = if let Some(schema_expr) = attrs.output_schema.as_ref() {
+        if let Err(error) = validate_output_schema_expr(schema_expr) {
+            return error.to_compile_error().into();
+        }
+
+        match output_schema_source(schema_expr, &input_fn.sig.output) {
+            OutputSchemaSource::Type(_) => true,
+            OutputSchemaSource::Inline(_) => false,
+        }
+    } else {
+        false
     };
 
     let fn_name = &input_fn.sig.ident;
@@ -1573,11 +1821,15 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse output_schema attribute
     let (output_schema_field, output_schema_method) =
         if let Some(ref schema_expr) = attrs.output_schema {
+            let definition_schema =
+                output_schema_value(output_schema_source(schema_expr, &input_fn.sig.output));
+            let handler_schema =
+                output_schema_value(output_schema_source(schema_expr, &input_fn.sig.output));
             (
-                quote! { Some(#schema_expr) },
+                quote! { Some(#definition_schema) },
                 quote! {
                     fn output_schema(&self) -> Option<serde_json::Value> {
-                        Some(#schema_expr)
+                        Some(#handler_schema)
                     }
                 },
             )
@@ -1768,7 +2020,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Analyze return type to determine conversion strategy
     let return_type = &input_fn.sig.output;
-    let result_conversion = generate_result_conversion(return_type);
+    let result_conversion = generate_tool_result_conversion(return_type, typed_output_schema);
 
     let execution_methods = generate_tool_execution_methods(
         is_async,
@@ -1808,6 +2060,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                         name: #tool_name.to_string(),
                         description: #description_tokens,
                         input_schema: serde_json::json!({
+                            "$schema": "https://json-schema.org/draft/2020-12/schema",
                             "type": "object",
                             "properties": properties,
                             "required": required,
