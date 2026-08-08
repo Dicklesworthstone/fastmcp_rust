@@ -263,11 +263,7 @@ fn validate_internal(
     context: ValidationContext<'_>,
 ) {
     if context.schema_depth >= MAX_SCHEMA_VALIDATION_DEPTH {
-        push_error(
-            errors,
-            path,
-            "schema validation nesting limit exceeded",
-        );
+        push_error(errors, path, "schema validation nesting limit exceeded");
         return;
     }
     let context = context.descend();
@@ -324,7 +320,7 @@ fn validate_internal(
     // Type-specific validation
     match value {
         Value::Object(obj) => {
-            validate_object(schema_obj, obj, path, errors, context);
+            validate_object(schema_obj, value, obj, path, errors, context);
         }
         Value::Array(arr) => {
             validate_array(schema_obj, arr, path, errors, context);
@@ -359,7 +355,10 @@ fn validate_local_reference(
     }
 }
 
-fn resolve_local_reference<'a>(root_schema: &'a Value, reference: &str) -> Result<&'a Value, &'static str> {
+fn resolve_local_reference<'a>(
+    root_schema: &'a Value,
+    reference: &str,
+) -> Result<&'a Value, &'static str> {
     if reference == "#" {
         return Ok(root_schema);
     }
@@ -423,7 +422,11 @@ fn bounded_subschemas<'a>(
 ) -> Option<&'a [Value]> {
     let subschemas = schema.get(keyword)?.as_array()?;
     if subschemas.len() > MAX_COMPOSITION_BRANCHES {
-        push_error(errors, path, format!("{keyword} exceeds composition branch limit"));
+        push_error(
+            errors,
+            path,
+            format!("{keyword} exceeds composition branch limit"),
+        );
         return None;
     }
     Some(subschemas)
@@ -572,6 +575,7 @@ fn json_type_name(value: &Value) -> &'static str {
 /// Validates object-specific constraints.
 fn validate_object(
     schema: &serde_json::Map<String, Value>,
+    value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
@@ -616,17 +620,22 @@ fn validate_object(
         }
     }
 
-    validate_dependencies(schema, obj, path, errors, context);
+    validate_dependencies(schema, value, obj, path, errors, context);
 
     // Check additionalProperties after applying both named and pattern properties.
     if let Some(additional) = schema.get("additionalProperties") {
         for (key, value) in obj {
-            let is_defined_property = properties.is_some_and(|properties| properties.contains_key(key))
+            let is_defined_property = properties
+                .is_some_and(|properties| properties.contains_key(key))
                 || patterns.iter().any(|(pattern, _)| pattern.is_match(key));
             if !is_defined_property {
                 match additional {
                     Value::Bool(false) => {
-                        push_error(errors, path, format!("additional property not allowed: {key}"));
+                        push_error(
+                            errors,
+                            path,
+                            format!("additional property not allowed: {key}"),
+                        );
                     }
                     Value::Object(_) => {
                         let prop_path = format!("{path}.{key}");
@@ -695,13 +704,13 @@ fn compile_pattern_properties<'a>(
 
 fn validate_dependencies(
     schema: &serde_json::Map<String, Value>,
+    value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
     context: ValidationContext<'_>,
 ) {
-    if let Some(dependent_required) = schema.get("dependentRequired").and_then(Value::as_object)
-    {
+    if let Some(dependent_required) = schema.get("dependentRequired").and_then(Value::as_object) {
         for (trigger, required) in dependent_required {
             if !obj.contains_key(trigger) {
                 continue;
@@ -713,9 +722,7 @@ fn validate_dependencies(
                             push_error(
                                 errors,
                                 path,
-                                format!(
-                                    "property {trigger} requires property {required_property}"
-                                ),
+                                format!("property {trigger} requires property {required_property}"),
                             );
                         }
                     }
@@ -727,13 +734,7 @@ fn validate_dependencies(
     if let Some(dependent_schemas) = schema.get("dependentSchemas").and_then(Value::as_object) {
         for (trigger, dependent_schema) in dependent_schemas {
             if obj.contains_key(trigger) {
-                validate_internal(
-                    dependent_schema,
-                    &Value::Object(obj.clone()),
-                    path,
-                    errors,
-                    context,
-                );
+                validate_internal(dependent_schema, value, path, errors, context);
             }
         }
     }
@@ -745,6 +746,7 @@ fn validate_array(
     arr: &[Value],
     path: &str,
     errors: &mut Vec<ValidationError>,
+    context: ValidationContext<'_>,
 ) {
     // Validate prefixItems (tuple validation)
     let mut prefix_len = 0;
@@ -753,7 +755,7 @@ fn validate_array(
         for (i, item_schema) in prefix_items.iter().enumerate() {
             if let Some(item) = arr.get(i) {
                 let item_path = format!("{path}[{i}]");
-                validate_internal(item_schema, item, &item_path, errors);
+                validate_internal(item_schema, item, &item_path, errors, context);
             }
         }
     }
@@ -766,7 +768,7 @@ fn validate_array(
                 for (i, item_schema) in items_arr.iter().enumerate() {
                     if let Some(item) = arr.get(i) {
                         let item_path = format!("{path}[{i}]");
-                        validate_internal(item_schema, item, &item_path, errors);
+                        validate_internal(item_schema, item, &item_path, errors, context);
                     }
                 }
                 // In older drafts, 'additionalItems' controls the rest. We skip that for simplicity unless needed.
@@ -775,7 +777,7 @@ fn validate_array(
             // Validate items starting from where prefixItems left off
             for (i, item) in arr.iter().enumerate().skip(prefix_len) {
                 let item_path = format!("{path}[{i}]");
-                validate_internal(items_schema, item, &item_path, errors);
+                validate_internal(items_schema, item, &item_path, errors, context);
             }
         }
     }
@@ -783,18 +785,16 @@ fn validate_array(
     // Check minItems/maxItems
     if let Some(min) = schema.get("minItems").and_then(serde_json::Value::as_u64) {
         if (arr.len() as u64) < min {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("array must have at least {min} items"),
-            });
+            push_error(
+                errors,
+                path,
+                format!("array must have at least {min} items"),
+            );
         }
     }
     if let Some(max) = schema.get("maxItems").and_then(serde_json::Value::as_u64) {
         if (arr.len() as u64) > max {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("array must have at most {max} items"),
-            });
+            push_error(errors, path, format!("array must have at most {max} items"));
         }
     }
 
@@ -812,10 +812,35 @@ fn validate_array(
             // serde_json produces consistent output for equal values
             let key = serde_json::to_string(item).unwrap_or_default();
             if !seen.insert(key) {
-                errors.push(ValidationError {
-                    path: format!("{path}[{i}]"),
-                    message: "duplicate item in array".to_string(),
-                });
+                push_error(errors, &format!("{path}[{i}]"), "duplicate item in array");
+            }
+        }
+    }
+
+    if let Some(contains) = schema.get("contains") {
+        let matches = arr
+            .iter()
+            .filter(|item| branch_is_valid(contains, item, path, context))
+            .count();
+        let minimum = schema
+            .get("minContains")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        let maximum = schema.get("maxContains").and_then(Value::as_u64);
+        if (matches as u64) < minimum {
+            push_error(
+                errors,
+                path,
+                format!("array must contain at least {minimum} matching items"),
+            );
+        }
+        if let Some(maximum) = maximum {
+            if (matches as u64) > maximum {
+                push_error(
+                    errors,
+                    path,
+                    format!("array must contain at most {maximum} matching items"),
+                );
             }
         }
     }
@@ -832,18 +857,20 @@ fn validate_string(
     let len = s.chars().count();
     if let Some(min) = schema.get("minLength").and_then(serde_json::Value::as_u64) {
         if (len as u64) < min {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("string must be at least {min} characters"),
-            });
+            push_error(
+                errors,
+                path,
+                format!("string must be at least {min} characters"),
+            );
         }
     }
     if let Some(max) = schema.get("maxLength").and_then(serde_json::Value::as_u64) {
         if (len as u64) > max {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("string must be at most {max} characters"),
-            });
+            push_error(
+                errors,
+                path,
+                format!("string must be at most {max} characters"),
+            );
         }
     }
 
@@ -852,18 +879,20 @@ fn validate_string(
         match Regex::new(pattern) {
             Ok(re) => {
                 if !re.is_match(s) {
-                    errors.push(ValidationError {
-                        path: path.to_string(),
-                        message: format!("string does not match pattern {pattern:?}"),
-                    });
+                    push_error(
+                        errors,
+                        path,
+                        format!("string does not match pattern {pattern:?}"),
+                    );
                 }
             }
             Err(e) => {
                 // Invalid schema: treat as a validation error rather than silently skipping.
-                errors.push(ValidationError {
-                    path: path.to_string(),
-                    message: format!("invalid schema pattern {pattern:?}: {e}"),
-                });
+                push_error(
+                    errors,
+                    path,
+                    format!("invalid schema pattern {pattern:?}: {e}"),
+                );
             }
         }
     }
@@ -881,18 +910,12 @@ fn validate_number(
     // Check minimum/maximum
     if let Some(min) = schema.get("minimum").and_then(serde_json::Value::as_f64) {
         if val < min {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("value must be >= {min}"),
-            });
+            push_error(errors, path, format!("value must be >= {min}"));
         }
     }
     if let Some(max) = schema.get("maximum").and_then(serde_json::Value::as_f64) {
         if val > max {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("value must be <= {max}"),
-            });
+            push_error(errors, path, format!("value must be <= {max}"));
         }
     }
 
@@ -902,10 +925,7 @@ fn validate_number(
         .and_then(serde_json::Value::as_f64)
     {
         if val <= min {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("value must be > {min}"),
-            });
+            push_error(errors, path, format!("value must be > {min}"));
         }
     }
     if let Some(max) = schema
@@ -913,20 +933,18 @@ fn validate_number(
         .and_then(serde_json::Value::as_f64)
     {
         if val >= max {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("value must be < {max}"),
-            });
+            push_error(errors, path, format!("value must be < {max}"));
         }
     }
 
     // Check multipleOf
     if let Some(multiple) = schema.get("multipleOf").and_then(serde_json::Value::as_f64) {
         if multiple != 0.0 && (val % multiple).abs() > f64::EPSILON {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("value must be a multiple of {multiple}"),
-            });
+            push_error(
+                errors,
+                path,
+                format!("value must be a multiple of {multiple}"),
+            );
         }
     }
 }
@@ -935,6 +953,109 @@ fn validate_number(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn sch_01_a_schema() -> Value {
+        json!({
+            "$defs": {
+                "positive-id": {"type": "integer", "minimum": 1}
+            },
+            "type": "object",
+            "properties": {
+                "id": {"$ref": "#/$defs/positive-id"},
+                "mode": {"enum": ["fast", "safe"]},
+                "items": {
+                    "type": "array",
+                    "contains": {"type": "integer", "multipleOf": 2},
+                    "minContains": 2,
+                    "maxContains": 2
+                }
+            },
+            "required": ["id", "mode", "items"],
+            "patternProperties": {
+                "^x-": {"type": "string"}
+            },
+            "propertyNames": {"pattern": "^[A-Za-z-]+$"},
+            "dependentRequired": {
+                "creditCard": ["billingAddress"]
+            },
+            "dependentSchemas": {
+                "creditCard": {"required": ["billingAddress"]}
+            },
+            "allOf": [{"required": ["id"]}],
+            "anyOf": [
+                {"properties": {"mode": {"const": "fast"}}, "required": ["mode"]},
+                {"properties": {"mode": {"const": "safe"}}, "required": ["mode"]}
+            ],
+            "oneOf": [
+                {"properties": {"mode": {"const": "fast"}}, "required": ["mode"]},
+                {"properties": {"mode": {"const": "safe"}}, "required": ["mode"]}
+            ],
+            "not": {
+                "properties": {"mode": {"const": "disabled"}},
+                "required": ["mode"]
+            },
+            "if": {
+                "properties": {"mode": {"const": "fast"}},
+                "required": ["mode"]
+            },
+            "then": {"required": ["fastConfig"]},
+            "else": {"required": ["safeConfig"]}
+        })
+    }
+
+    fn sch_01_a_valid_instance() -> Value {
+        json!({
+            "id": 7,
+            "mode": "fast",
+            "fastConfig": true,
+            "items": [2, 4, 5],
+            "x-label": "bounded",
+            "creditCard": "4111",
+            "billingAddress": "42 Schema Street"
+        })
+    }
+
+    #[test]
+    fn sch_01_a_positive() {
+        let schema = sch_01_a_schema();
+        let instance = sch_01_a_valid_instance();
+
+        assert!(validate(&schema, &instance).is_ok());
+    }
+
+    #[test]
+    fn sch_01_a_planted_negative() {
+        let schema = sch_01_a_schema();
+        let schema_before = schema.clone();
+        let mut instance = sch_01_a_valid_instance();
+        instance["items"][1] = json!(3);
+
+        let errors = validate(&schema, &instance)
+            .expect_err("changing only one array item must violate minContains");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "root.items");
+        assert_eq!(
+            errors[0].message,
+            "array must contain at least 2 matching items"
+        );
+        assert_eq!(schema, schema_before);
+    }
+
+    #[test]
+    fn external_references_fail_closed_without_resolution() {
+        let errors = validate(
+            &json!({"$ref": "https://schemas.example.test/tool.json"}),
+            &json!({"input": "value"}),
+        )
+        .expect_err("external references must not acquire network or filesystem authority");
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "root");
+        assert_eq!(
+            errors[0].message,
+            "external schema reference is not allowed"
+        );
+    }
 
     #[test]
     fn test_type_validation_string() {
