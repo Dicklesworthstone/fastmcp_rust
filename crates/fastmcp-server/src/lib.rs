@@ -455,7 +455,7 @@ impl ServerExtensionRuntime {
             .resolver
             .get_mut()
             .map_err(|_| ServerExtensionConfigurationError::ResolverPoisoned)?;
-        let previous = std::mem::replace(
+        let mut previous = std::mem::replace(
             resolver,
             BoxedExtensionSettingsResolver(Box::new(
                 |descriptor: &ExtensionDescriptor,
@@ -2627,6 +2627,7 @@ async fn send_modern_sse_stream(
         .map_err(|_| ())?;
 
     let response_sender = sender.clone();
+    let notification_response_sender = response_sender.clone();
     let mut dispatch = cx
         .spawn(move |request_cx| async move {
             let inbound = InboundRequestContext::new(
@@ -2636,7 +2637,8 @@ async fn send_modern_sse_stream(
             );
             let notification_cx = request_cx.clone();
             let notification_sender: NotificationSender = Arc::new(move |notification| {
-                let _ = response_sender.send_notification(&notification_cx, notification);
+                let _ =
+                    notification_response_sender.send_notification(&notification_cx, notification);
             });
             let cancellation = response_sender.request_cancellation();
             let response = Arc::clone(&server)
@@ -9806,6 +9808,23 @@ mod lib_unit_tests {
         })
     }
 
+    fn final_tasks_get_params(
+        task_id: &fastmcp_protocol::FinalTaskId,
+        settings: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": task_id.as_str(),
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {
+                        "io.modelcontextprotocol/tasks": settings,
+                    },
+                },
+            },
+        })
+    }
+
     #[test]
     fn configured_final_tasks_route_methods_and_typed_notifications() {
         let delivered = Arc::new(Mutex::new(Vec::new()));
@@ -9838,7 +9857,7 @@ mod lib_unit_tests {
                 &inbound,
                 &JsonRpcRequest::new(
                     fastmcp_protocol::TASK_GET,
-                    Some(final_tasks_params(&task_id, serde_json::json!({}))),
+                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
                     71_i64,
                 ),
             )
@@ -9872,7 +9891,11 @@ mod lib_unit_tests {
         let update = server
             .dispatch_stateless(
                 &inbound,
-                &JsonRpcRequest::new(fastmcp_protocol::TASK_UPDATE, Some(update_params), 71_i64),
+                &JsonRpcRequest::new(
+                    fastmcp_protocol::tasks_extension::TASK_UPDATE,
+                    Some(update_params),
+                    71_i64,
+                ),
             )
             .expect("tasks/update must respond");
         assert_eq!(
@@ -9885,7 +9908,7 @@ mod lib_unit_tests {
                 &inbound,
                 &JsonRpcRequest::new(
                     fastmcp_protocol::TASK_CANCEL,
-                    Some(final_tasks_params(&task_id, serde_json::json!({}))),
+                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
                     71_i64,
                 ),
             )
@@ -9959,7 +9982,7 @@ mod lib_unit_tests {
                 &InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory),
                 &JsonRpcRequest::new(
                     fastmcp_protocol::TASK_GET,
-                    Some(final_tasks_params(&task_id, serde_json::json!({}))),
+                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
                     71_i64,
                 ),
             )
@@ -10021,7 +10044,7 @@ mod lib_unit_tests {
                 &inbound,
                 &JsonRpcRequest::new(
                     fastmcp_protocol::TASK_GET,
-                    Some(final_tasks_params(&task_id, serde_json::json!({}))),
+                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
                     71_i64,
                 ),
             )
@@ -10032,7 +10055,7 @@ mod lib_unit_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len();
 
-        let mut rejected_params = final_tasks_params(&task_id, serde_json::json!({}));
+        let mut rejected_params = final_tasks_get_params(&task_id, serde_json::json!({}));
         *rejected_params
             .pointer_mut(
                 "/_meta/io.modelcontextprotocol~1clientCapabilities/extensions/io.modelcontextprotocol~1tasks",

@@ -54,13 +54,12 @@ use base64::Engine as _;
 #[cfg(test)]
 use fastmcp_core::logging::{debug, info, targets, warn};
 use fastmcp_core::{McpError, McpResult, draw_security_identifier};
-use fastmcp_protocol::protocol_version::FINAL_PROTOCOL_VERSION;
 use fastmcp_protocol::{
     CreateTaskResult, FinalCancelTaskResult, FinalGetTaskResult, FinalTaskCallToolResult,
-    FinalTaskError, FinalTaskId, FinalTaskStatus, FinalTaskStatusNotificationParams, GetTaskParams,
-    Task as FinalTask, TaskBase as FinalTaskBase, TaskDuration as FinalTaskDuration,
+    FinalTaskError, FinalTaskId, FinalTaskStatus, GetTaskParams, Task as FinalTask,
+    TaskBase as FinalTaskBase, TaskDuration as FinalTaskDuration,
     TaskInputLedger as FinalTaskInputLedger, TaskInputRequests as FinalTaskInputRequests,
-    TaskInputResponses as FinalTaskInputResponses, TaskRequestMeta,
+    TaskInputResponses as FinalTaskInputResponses,
     TaskStatusNotification as FinalTaskStatusNotification,
     TaskStatusNotificationParams as FinalTaskStatusNotificationParams,
     TaskTimestamp as FinalTaskTimestamp, UpdateTaskParams, UpdateTaskResult,
@@ -1856,23 +1855,6 @@ impl FinalTaskRuntime {
     }
 }
 
-fn validate_final_task_request_meta(request: &TaskRequestMeta) -> McpResult<()> {
-    let protocol_version = request
-        .meta
-        .protocol_version()
-        .map_err(|_| McpError::invalid_params("Invalid final Tasks request metadata"))?;
-    let client_capabilities = request
-        .meta
-        .client_capabilities()
-        .map_err(|_| McpError::invalid_params("Invalid final Tasks request metadata"))?;
-    if protocol_version != Some(FINAL_PROTOCOL_VERSION) || client_capabilities.is_none() {
-        return Err(McpError::invalid_params(
-            "Invalid final Tasks request metadata",
-        ));
-    }
-    Ok(())
-}
-
 /// Decodes and serves a negotiated `tasks/get` request through the final runtime.
 pub(crate) fn dispatch_final_tasks_get(
     runtime: &FinalTaskRuntime,
@@ -1880,8 +1862,9 @@ pub(crate) fn dispatch_final_tasks_get(
 ) -> McpResult<serde_json::Value> {
     let parameters = serde_json::from_value::<GetTaskParams>(parameters)
         .map_err(|_| McpError::invalid_params("Invalid final tasks/get parameters"))?;
-    validate_final_task_request_meta(&parameters.request)?;
-    serde_json::to_value(runtime.get_task(&parameters.task_id)?)
+    let task_id = FinalTaskId::parse(parameters.id.as_str())
+        .map_err(|_| McpError::invalid_params("Invalid final tasks/get parameters"))?;
+    serde_json::to_value(runtime.get_task(&task_id)?)
         .map_err(|_| McpError::internal_error("final tasks/get response serialization failed"))
 }
 
@@ -1892,7 +1875,6 @@ pub(crate) fn dispatch_final_tasks_update(
 ) -> McpResult<serde_json::Value> {
     let parameters = serde_json::from_value::<UpdateTaskParams>(parameters)
         .map_err(|_| McpError::invalid_params("Invalid final tasks/update parameters"))?;
-    validate_final_task_request_meta(&parameters.request)?;
     serde_json::to_value(runtime.update_task(&parameters.task_id, &parameters.input_responses)?)
         .map_err(|_| McpError::internal_error("final tasks/update response serialization failed"))
 }
@@ -1904,8 +1886,9 @@ pub(crate) fn dispatch_final_tasks_cancel(
 ) -> McpResult<serde_json::Value> {
     let parameters = serde_json::from_value::<GetTaskParams>(parameters)
         .map_err(|_| McpError::invalid_params("Invalid final tasks/cancel parameters"))?;
-    validate_final_task_request_meta(&parameters.request)?;
-    serde_json::to_value(runtime.cancel_task(&parameters.task_id)?)
+    let task_id = FinalTaskId::parse(parameters.id.as_str())
+        .map_err(|_| McpError::invalid_params("Invalid final tasks/cancel parameters"))?;
+    serde_json::to_value(runtime.cancel_task(&task_id)?)
         .map_err(|_| McpError::internal_error("final tasks/cancel response serialization failed"))
 }
 
