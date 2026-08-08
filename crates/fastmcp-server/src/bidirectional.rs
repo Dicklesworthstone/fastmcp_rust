@@ -609,14 +609,14 @@ impl TransportSamplingSender {
     }
 }
 
-fn canonical_legacy_sampling_stop_reason(
-    stop_reason: Option<&str>,
-) -> McpResult<SamplingStopReason> {
+/// Projects an open wire-level stop reason onto the historical closed core
+/// result enum. Exact-2024 reverse RPC uses [`DualEraServerToClient`] instead,
+/// which returns `CreateMessageResult` directly and retains this field exactly.
+fn core_sampling_stop_reason(stop_reason: Option<&str>) -> SamplingStopReason {
     match stop_reason {
-        None | Some("endTurn") => Ok(SamplingStopReason::EndTurn),
-        Some("stopSequence") => Ok(SamplingStopReason::StopSequence),
-        Some("maxTokens") => Ok(SamplingStopReason::MaxTokens),
-        Some(_) => Err(McpError::internal_error(RESPONSE_PAYLOAD_ERROR)),
+        Some("stopSequence") => SamplingStopReason::StopSequence,
+        Some("maxTokens") => SamplingStopReason::MaxTokens,
+        _ => SamplingStopReason::EndTurn,
     }
 }
 
@@ -684,7 +684,7 @@ impl SamplingSender for TransportSamplingSender {
                     }
                 },
                 model: result.model,
-                stop_reason: canonical_legacy_sampling_stop_reason(result.stop_reason.as_deref())?,
+                stop_reason: core_sampling_stop_reason(result.stop_reason.as_deref()),
             })
         })
     }
@@ -2140,6 +2140,91 @@ mod tests {
         );
     }
 
+    fn legacy_sampling_boundary_with_result(
+        sampling_result: serde_json::Value,
+    ) -> DualEraServerToClient {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_for_send = Arc::clone(&pending);
+        let send_fn: TransportSendFn = Arc::new(move |message| {
+            let JsonRpcMessage::Request(request) = message else {
+                panic!("the legacy sampling boundary may only emit requests");
+            };
+            assert_eq!(request.method, "sampling/createMessage");
+            let id = request
+                .id
+                .clone()
+                .expect("legacy reverse sampling must retain its JSON-RPC ID");
+            assert!(
+                pending_for_send
+                    .route_response(&JsonRpcResponse::success(id, sampling_result.clone())),
+                "legacy sampling response must reach its registered waiter"
+            );
+            Ok(())
+        });
+        DualEraServerToClient::new(
+            ProtocolEra::Legacy2024,
+            RequestSender::new(pending, send_fn),
+            Arc::new(MrtrExchangeRegistry::new()),
+        )
+    }
+
+    #[test]
+    fn dual_era_legacy_sampling_round_trips_an_absent_stop_reason() {
+        let expected = serde_json::json!({
+            "content": {"type": "text", "text": "legacy completion"},
+            "role": "assistant",
+            "model": "legacy-model"
+        });
+        let boundary = legacy_sampling_boundary_with_result(expected.clone());
+        let cx = Cx::for_testing();
+
+        let result = block_on(boundary.sampling_create_message(
+            &cx,
+            McpRequestCancellation::new(),
+            "sample",
+            fastmcp_protocol::CreateMessageParams::new(Vec::new(), 16),
+        ))
+        .expect("legacy sampling must preserve an absent stopReason");
+        let DualEraServerToClientResult::Legacy(result) = result else {
+            panic!("legacy sampling must not create an MRTR retry");
+        };
+
+        assert_eq!(result.stop_reason, None);
+        assert_eq!(
+            serde_json::to_value(result).expect("legacy sampling result must re-encode"),
+            expected
+        );
+    }
+
+    #[test]
+    fn dual_era_legacy_sampling_round_trips_an_open_provider_stop_reason() {
+        let expected = serde_json::json!({
+            "content": {"type": "text", "text": "legacy completion"},
+            "role": "assistant",
+            "model": "legacy-model",
+            "stopReason": "provider_safety_limit"
+        });
+        let boundary = legacy_sampling_boundary_with_result(expected.clone());
+        let cx = Cx::for_testing();
+
+        let result = block_on(boundary.sampling_create_message(
+            &cx,
+            McpRequestCancellation::new(),
+            "sample",
+            fastmcp_protocol::CreateMessageParams::new(Vec::new(), 16),
+        ))
+        .expect("legacy sampling must preserve an open provider stopReason");
+        let DualEraServerToClientResult::Legacy(result) = result else {
+            panic!("legacy sampling must not create an MRTR retry");
+        };
+
+        assert_eq!(result.stop_reason.as_deref(), Some("provider_safety_limit"));
+        assert_eq!(
+            serde_json::to_value(result).expect("legacy sampling result must re-encode"),
+            expected
+        );
+    }
+
     #[test]
     fn dual_era_boundary_modern_uses_input_required_retry_flow() {
         let sent_methods = Arc::new(Mutex::new(Vec::new()));
@@ -3094,47 +3179,6 @@ mod tests {
         assert_eq!(result.text, "Hello world");
         assert_eq!(result.model, "test-model");
         assert!(matches!(result.stop_reason, SamplingStopReason::EndTurn));
-    }
-
-    #[test]
-    fn transport_sampling_sender_defaults_an_absent_legacy_stop_reason_to_end_turn() {
-        let sender = make_sender_with_responder(|_| {
-            serde_json::json!({
-                "content": {"type": "text", "text": "legacy completion"},
-                "role": "assistant",
-                "model": "legacy-model"
-            })
-        });
-        let sampling = TransportSamplingSender::new(sender);
-
-        let result = fastmcp_core::block_on(SamplingSender::create_message(
-            &sampling,
-            SamplingRequest::prompt("Hi", 10),
-        ))
-        .expect("an exact legacy response may omit stopReason");
-
-        assert_eq!(result.stop_reason, SamplingStopReason::EndTurn);
-    }
-
-    #[test]
-    fn transport_sampling_sender_rejects_an_open_legacy_stop_reason() {
-        let sender = make_sender_with_responder(|_| {
-            serde_json::json!({
-                "content": {"type": "text", "text": "legacy completion"},
-                "role": "assistant",
-                "model": "legacy-model",
-                "stopReason": "provider_safety_limit"
-            })
-        });
-        let sampling = TransportSamplingSender::new(sender);
-
-        let error = fastmcp_core::block_on(SamplingSender::create_message(
-            &sampling,
-            SamplingRequest::prompt("Hi", 10),
-        ))
-        .expect_err("an open stopReason cannot be represented by the core result enum");
-
-        assert_eq!(error.message, RESPONSE_PAYLOAD_ERROR);
     }
 
     #[test]
