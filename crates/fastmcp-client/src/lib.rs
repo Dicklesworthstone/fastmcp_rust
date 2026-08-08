@@ -62,6 +62,7 @@ pub use fastmcp_protocol::protocol_policy::{
 pub use fastmcp_protocol::tasks_extension::{
     CancelTaskResult as FinalCancelTaskResult, GetTaskResult as FinalGetTaskResult,
     Task as FinalTask, TaskId as FinalTaskId, TaskInputResponses as FinalTaskInputResponses,
+    TaskStatusNotification as FinalTaskStatusNotification,
     UpdateTaskResult as FinalUpdateTaskResult,
 };
 pub use fastmcp_protocol::{
@@ -112,8 +113,8 @@ use fastmcp_protocol::methods::{Final2026Peer, final_2026_07_28_method};
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::tasks_extension::{
     CancelTaskParams as FinalCancelTaskParams, GetTaskParams as FinalGetTaskParams, TASK_CANCEL,
-    TASK_GET, TASK_UPDATE, TaskInputLedger, TaskRequestMeta,
-    UpdateTaskParams as FinalUpdateTaskParams,
+    TASK_GET, TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY, TASK_UPDATE, TaskInputLedger,
+    TaskRequestMeta, UpdateTaskParams as FinalUpdateTaskParams,
 };
 use fastmcp_protocol::{
     CallToolParams, CancelTaskParams, CancelTaskResult, CancelledParams, ClientCapabilities,
@@ -127,7 +128,7 @@ use fastmcp_protocol::{
     LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, ReadResourceParams,
     RequestId, RequestMeta, Resource, ResourceTemplate, ServerCapabilities, ServerInfo,
     ServerNotification, SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo,
-    TaskResult, TaskStatus, Tool, ToolAnnotations,
+    TaskResult, TaskStatus, Tool, ToolAnnotations, task_subscription_ids,
 };
 use fastmcp_protocol::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionDirection, ExtensionSettings,
@@ -207,6 +208,8 @@ pub struct SubscriptionListenCollector {
     pub accepted_filter: SubscriptionFilter,
     /// Typed request-owned notifications received before graceful termination.
     pub notifications: Vec<ServerNotification>,
+    /// Typed Tasks events admitted by the acknowledged exact `taskIds` set.
+    pub task_notifications: Vec<FinalTaskStatusNotification>,
     /// The final complete result that terminated the listener.
     pub terminal: CompleteResult<FinalSubscriptionsListenResult>,
 }
@@ -265,11 +268,42 @@ fn validate_subscription_acknowledgement_filter(
         }
     }
 
+    let requested_task_ids = task_subscription_ids(requested).map_err(|_| {
+        subscription_listener_protocol_error("Requested Tasks subscription filter is invalid")
+    })?;
+    let acknowledged_task_ids = task_subscription_ids(acknowledged).map_err(|_| {
+        subscription_listener_protocol_error(
+            "Subscription acknowledgement has an invalid Tasks filter",
+        )
+    })?;
+    match (requested_task_ids.as_ref(), acknowledged_task_ids.as_ref()) {
+        (None, Some(_)) => {
+            return Err(subscription_listener_protocol_error(
+                "Subscription acknowledgement accepts unrequested Tasks notifications",
+            ));
+        }
+        (Some(requested), Some(acknowledged)) => {
+            for (index, task_id) in acknowledged.iter().enumerate() {
+                if !requested.iter().any(|requested| requested == task_id)
+                    || acknowledged[..index]
+                        .iter()
+                        .any(|previous| previous == task_id)
+                {
+                    return Err(subscription_listener_protocol_error(
+                        "Subscription acknowledgement contains an invalid Tasks filter",
+                    ));
+                }
+            }
+        }
+        (Some(_), None) | (None, None) => {}
+    }
+
     if acknowledged.additional.iter().any(|(name, value)| {
-        requested
-            .additional
-            .get(name)
-            .is_none_or(|requested_value| requested_value != value)
+        name != TASK_SUBSCRIPTION_IDS_KEY
+            && requested
+                .additional
+                .get(name)
+                .is_none_or(|requested_value| requested_value != value)
     }) {
         return Err(subscription_listener_protocol_error(
             "Subscription acknowledgement accepts an unrequested extension filter",
@@ -4035,10 +4069,26 @@ impl Client {
     /// identity, and any selected final logging preference without broadening
     /// the Tasks parameter shape.
     fn final_task_request_meta(&self) -> McpResult<TaskRequestMeta> {
-        let params = self.with_modern_request_metadata(serde_json::json!({}))?;
-        let mut metadata = params
+        let params = self.with_final_tasks_client_capability(serde_json::json!({}))?;
+        let metadata = params
             .get("_meta")
             .cloned()
+            .ok_or_else(|| McpError::internal_error("Modern Tasks request metadata was omitted"))?;
+        let meta = serde_json::from_value(metadata).map_err(|error| {
+            McpError::internal_error(format!(
+                "Modern Tasks request metadata did not retain its final shape: {error}"
+            ))
+        })?;
+        Ok(TaskRequestMeta { meta })
+    }
+
+    fn with_final_tasks_client_capability(
+        &self,
+        params: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        let mut params = self.with_modern_request_metadata(params)?;
+        let mut metadata = params
+            .get_mut("_meta")
             .ok_or_else(|| McpError::internal_error("Modern Tasks request metadata was omitted"))?;
         let capabilities = metadata
             .as_object_mut()
@@ -4056,17 +4106,20 @@ impl Client {
                 serde_json::json!({}),
             )])),
         );
-        let meta = serde_json::from_value(metadata).map_err(|error| {
-            McpError::internal_error(format!(
-                "Modern Tasks request metadata did not retain its final shape: {error}"
-            ))
-        })?;
-        Ok(TaskRequestMeta { meta })
+        Ok(params)
     }
 
     /// Admits one official final Tasks method through bilateral empty-settings
     /// negotiation before allocating a request ID or writing to the peer.
     fn admit_final_tasks_method(&mut self, method: &str) -> McpResult<()> {
+        self.admit_final_tasks_direction(method, ExtensionDirection::ClientToServer)
+    }
+
+    fn admit_final_tasks_direction(
+        &mut self,
+        method: &str,
+        direction: ExtensionDirection,
+    ) -> McpResult<()> {
         self.ensure_initialized()?;
         if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
             return Err(McpError::invalid_params(
@@ -4143,7 +4196,7 @@ impl Client {
                 ProtocolEra::Modern2026,
                 &task_extension,
                 method,
-                ExtensionDirection::ClientToServer,
+                direction,
             )
             .map_err(|_| {
                 McpError::invalid_params(
@@ -4749,6 +4802,7 @@ impl Client {
         let expected_id = waiter.id.clone();
         let mut accepted_filter = None;
         let mut notifications = Vec::new();
+        let mut task_notifications = Vec::new();
 
         loop {
             if let Some(response) = waiter.try_response()? {
@@ -4791,6 +4845,7 @@ impl Client {
                     subscription_id,
                     accepted_filter,
                     notifications,
+                    task_notifications,
                     terminal,
                 });
             }
@@ -4861,6 +4916,74 @@ impl Client {
                     }
                 }
                 JsonRpcMessage::Request(request) => {
+                    if request.id.is_none() && request.method == TASK_STATUS_NOTIFICATION {
+                        let Some(accepted_filter) = accepted_filter.as_ref() else {
+                            return Err(self.terminate_connection(
+                                subscription_listener_protocol_error(
+                                    "Subscription listener received a Tasks event before acknowledgement",
+                                ),
+                            ));
+                        };
+                        let accepted_task_ids = match task_subscription_ids(accepted_filter) {
+                            Ok(Some(task_ids)) => task_ids,
+                            _ => {
+                                return Err(self.terminate_connection(
+                                    subscription_listener_protocol_error(
+                                        "Subscription listener received a Tasks event without an acknowledged Tasks filter",
+                                    ),
+                                ));
+                            }
+                        };
+                        let notification: FinalTaskStatusNotification = match serde_json::from_value(
+                            serde_json::to_value(&request).map_err(|error| {
+                                McpError::internal_error(format!(
+                                    "Failed to inspect Tasks subscription event: {error}"
+                                ))
+                            })?,
+                        ) {
+                            Ok(notification) => notification,
+                            Err(_) => {
+                                return Err(self.terminate_connection(
+                                    subscription_listener_protocol_error(
+                                        "Subscription listener received an invalid Tasks event",
+                                    ),
+                                ));
+                            }
+                        };
+                        let subscription_id = notification
+                            .params
+                            .meta
+                            .as_ref()
+                            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                            .and_then(|value| {
+                                serde_json::from_value::<RequestId>(value.clone()).ok()
+                            });
+                        if subscription_id.as_ref() != Some(&expected_id) {
+                            return Err(self.terminate_connection(
+                                subscription_listener_protocol_error(
+                                    "Tasks event subscription ID does not match the listen request",
+                                ),
+                            ));
+                        }
+                        if !accepted_task_ids
+                            .iter()
+                            .any(|task_id| task_id == &notification.params.task.base().task_id)
+                        {
+                            return Err(self.terminate_connection(
+                                subscription_listener_protocol_error(
+                                    "Tasks event taskId is outside the acknowledged filter",
+                                ),
+                            ));
+                        }
+                        if task_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+                            return Err(self.terminate_connection(McpError::invalid_request(
+                                FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+                            )));
+                        }
+                        task_notifications.push(notification);
+                        continue;
+                    }
+
                     if is_final_server_notification_method(&request) {
                         let notification = match ServerNotification::decode(&request) {
                             Ok(notification) => notification,
@@ -6040,6 +6163,15 @@ impl Client {
         let timeout_policy = self.timeout_policy;
         timeout_policy.validate()?;
         let requested = notifications;
+        let tasks_requested = task_subscription_ids(&requested)
+            .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+            .is_some();
+        if tasks_requested {
+            self.admit_final_tasks_direction(
+                TASK_STATUS_NOTIFICATION,
+                ExtensionDirection::ServerToClient,
+            )?;
+        }
         let params_value = serde_json::to_value(serde_json::json!({
             "notifications": requested.clone(),
         }))
@@ -6048,7 +6180,11 @@ impl Client {
                 "Failed to serialize subscriptions/listen parameters: {error}"
             ))
         })?;
-        let params_value = self.prepare_request_parameters(params_value)?;
+        let params_value = if tasks_requested {
+            self.with_final_tasks_client_capability(params_value)?
+        } else {
+            self.prepare_request_parameters(params_value)?
+        };
         let core_request = self
             .prepared_core_request("subscriptions/listen", &params_value)?
             .ok_or_else(|| {
@@ -10220,6 +10356,33 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_tasks_subscriptions_listen_client_script(
+        task_id: &str,
+        notification_task_id: &str,
+    ) -> String {
+        let discovery_response = modern_tasks_discovery_response(
+            "tasks-subscriptions-modern-server",
+            serde_json::json!({}),
+        );
+        let acknowledgement = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":2}},"notifications":{{"toolsListChanged":true,"taskIds":["{task_id}"]}}}}}}"#
+        );
+        let task_notification = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":2}},"taskId":"{notification_task_id}","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}}}"#
+        );
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r request || exit 1; \
+             case \"$request\" in *subscriptions/listen*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"toolsListChanged\":true'*'\"taskIds\":[\"{task_id}\"]'*'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
+             printf '%s\\n' '{acknowledgement}'; \
+             printf '%s\\n' '{task_notification}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}' ;; *) exit 1 ;; esac"
+        )
+    }
+
+    #[cfg(unix)]
     fn modern_subscription_cancellation_late_terminal_client_script() -> String {
         let discovery_response = modern_discovery_response(
             "subscriptions-cancellation-modern-server",
@@ -11232,6 +11395,71 @@ mod tests {
             FinalSubscriptionsListenResult {}
         ));
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_tasks_subscription_collects_only_acknowledged_exact_task_ids() {
+        let task_id = FinalTaskId::parse("task-73").expect("bounded task id");
+        let script =
+            modern_tasks_subscriptions_listen_client_script(task_id.as_str(), task_id.as_str());
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern Tasks discovery initializes the subscription client");
+        let mut filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
+            .expect("compose Tasks beside a core subscription filter");
+
+        let collector = client
+            .listen_subscriptions_typed(filter)
+            .expect("negotiated Tasks event remains request-owned and typed");
+        assert_eq!(collector.accepted_filter.tools_list_changed, Some(true));
+        assert!(collector.notifications.is_empty());
+        assert_eq!(collector.task_notifications.len(), 1);
+        assert_eq!(
+            collector.task_notifications[0].params.task.base().task_id,
+            task_id
+        );
+        client.close().expect("modern Tasks client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_tasks_subscription_rejects_one_field_unacknowledged_task_id() {
+        let requested = FinalTaskId::parse("task-73").expect("bounded requested task id");
+        let foreign = FinalTaskId::parse("task-74").expect("bounded foreign task id");
+        let script =
+            modern_tasks_subscriptions_listen_client_script(requested.as_str(), foreign.as_str());
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern Tasks discovery initializes the subscription client");
+        let mut filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![requested])
+            .expect("compose one exact Tasks filter");
+
+        let error = client
+            .listen_subscriptions_typed(filter)
+            .expect_err("one changed taskId must fail the acknowledged stream closed");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "Tasks event taskId is outside the acknowledged filter"
+        );
+        assert!(!client.is_initialized());
     }
 
     #[cfg(unix)]
