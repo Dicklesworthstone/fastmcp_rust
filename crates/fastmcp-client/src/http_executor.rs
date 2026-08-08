@@ -711,6 +711,47 @@ impl ClientHttpConnection {
             }
         }
     }
+
+    /// Sends one client notification through the selected transport.
+    ///
+    /// Exact legacy notifications are posted to the pinned message endpoint
+    /// without an ID. Modern notifications retain their stateless final POST
+    /// contract and consume their finite HTTP acknowledgement before returning.
+    pub async fn notify(
+        &mut self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: Option<serde_json::Value>,
+    ) -> Result<(), ClientHttpConnectionError> {
+        let method = method.as_ref();
+        match self {
+            Self::Modern(client) => {
+                let response = client
+                    .request(
+                        cx,
+                        method,
+                        parameters.unwrap_or_else(|| serde_json::json!({})),
+                        None,
+                    )
+                    .await
+                    .map_err(ClientHttpConnectionError::Modern)?;
+                response
+                    .read_to_end(cx, MAX_MODERN_HTTP_PROBE_BODY_BYTES)
+                    .await
+                    .map_err(|error| {
+                        ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error))
+                    })?;
+                Ok(())
+            }
+            Self::LegacySse(client) => client
+                .send(
+                    cx,
+                    &JsonRpcMessage::Request(JsonRpcRequest::notification(method, parameters)),
+                )
+                .await
+                .map_err(ClientHttpConnectionError::Legacy),
+        }
+    }
 }
 
 /// Errors raised while connecting or issuing a policy-bound modern HTTP request.
@@ -1854,6 +1895,31 @@ mod tests {
         stream.flush().expect("flush native HTTP response");
     }
 
+    fn begin_chunked_sse(stream: &mut TcpStream) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+        )
+        .expect("write chunked legacy SSE response head");
+        stream
+            .flush()
+            .expect("flush chunked legacy SSE response head");
+    }
+
+    fn write_chunked_sse_event(stream: &mut TcpStream, event: &str) {
+        write!(stream, "{:X}\r\n{event}\r\n", event.len()).expect("write chunked legacy SSE event");
+        stream.flush().expect("flush chunked legacy SSE event");
+    }
+
+    fn finish_chunked_sse(stream: &mut TcpStream) {
+        stream
+            .write_all(b"0\r\n\r\n")
+            .expect("finish chunked legacy SSE response");
+        stream
+            .flush()
+            .expect("flush finished chunked legacy SSE response");
+    }
+
     fn modern_discovery_body() -> &'static [u8] {
         br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#
     }
@@ -2062,6 +2128,126 @@ mod tests {
         };
         assert_eq!(response.id, Some(RequestId::Number(2)));
         server.join().expect("local legacy server must join");
+    }
+
+    #[test]
+    fn public_http_connection_auto_falls_back_to_fresh_exact_legacy_lifecycle() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local Auto fallback listener");
+        let address = listener
+            .local_addr()
+            .expect("read local Auto fallback address");
+        let modern_target = format!("http://{address}/mcp");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept disposable modern probe");
+            let probe_request = read_request(&mut probe);
+            assert!(probe_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert!(
+                probe_request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+            );
+            write_response(&mut probe, 404, "text/plain", b"");
+
+            let (mut sse, _) = listener.accept().expect("accept fresh legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            assert!(
+                !sse_request.head.contains("MCP-Protocol-Version:"),
+                "the fresh exact legacy SSE GET must not retain final headers"
+            );
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            let (mut initialize_post, _) = listener
+                .accept()
+                .expect("accept exact legacy initialize POST");
+            let initialize_request = read_request(&mut initialize_post);
+            assert!(
+                initialize_request
+                    .head
+                    .starts_with("POST /legacy-message HTTP/1.1\r\n")
+            );
+            assert!(
+                !initialize_request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+            );
+            let initialize = serde_json::from_slice::<serde_json::Value>(&initialize_request.body)
+                .expect("legacy initialize POST must be JSON-RPC");
+            assert_eq!(initialize["id"], 2);
+            assert_eq!(initialize["method"], "initialize");
+            assert_eq!(initialize["params"]["protocolVersion"], "2024-11-05");
+            assert!(initialize["params"].get("_meta").is_none());
+            write_response(&mut initialize_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}\n\n",
+            );
+            finish_chunked_sse(&mut sse);
+
+            let (mut initialized_post, _) = listener
+                .accept()
+                .expect("accept exact legacy initialized notification");
+            let initialized_request = read_request(&mut initialized_post);
+            let initialized =
+                serde_json::from_slice::<serde_json::Value>(&initialized_request.body)
+                    .expect("legacy initialized notification must be JSON-RPC");
+            assert_eq!(initialized["method"], "notifications/initialized");
+            assert!(initialized.get("id").is_none());
+            assert!(initialized.get("params").is_none());
+            assert!(
+                !initialized_request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+            );
+            write_response(&mut initialized_post, 202, "application/json", b"");
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::Auto,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("the recognized modern refusal opens the exact fresh legacy transport");
+        assert_eq!(connection.selected_protocol_era(), ProtocolEra::Legacy2024);
+
+        let response = runtime_block_on(connection.request(
+            &cx,
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "public-http-client", "version": "1.0.0" },
+            }),
+            RequestId::Number(2),
+        ))
+        .expect(
+            "Auto fallback posts exact legacy initialize then awaits its correlated SSE response",
+        );
+        let ClientHttpResponse::Legacy(message) = response else {
+            panic!("recognized modern refusal must keep the public connection on legacy SSE");
+        };
+        let fastmcp_protocol::JsonRpcMessage::Response(response) = message else {
+            panic!("the buffered exact legacy lifecycle reply must be JSON-RPC");
+        };
+        assert_eq!(response.id, Some(RequestId::Number(2)));
+
+        runtime_block_on(connection.notify(&cx, "notifications/initialized", None))
+            .expect("the public fallback path sends the exact id-free lifecycle notification");
+        server.join().expect("Auto fallback server must join");
     }
 
     #[test]
