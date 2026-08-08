@@ -10,6 +10,18 @@ use fastmcp_rust::{
 
 struct DownstreamCompletionHandler;
 
+struct DownstreamLegacyAdapterHandler;
+
+impl legacy_2024::Legacy2024Handler for DownstreamLegacyAdapterHandler {
+    fn handle_legacy_2024(
+        &mut self,
+        _method: &'static str,
+        _params: Option<&legacy_2024::JsonValue>,
+    ) -> Result<legacy_2024::JsonValue, legacy_2024::Legacy2024HandlerError> {
+        Ok(legacy_2024::JsonValue::Object(Default::default()))
+    }
+}
+
 impl CompletionHandler for DownstreamCompletionHandler {
     fn complete_legacy(
         &self,
@@ -237,6 +249,121 @@ fn assert_modern_directional_notification_exports() {
     assert_eq!(server_wire.method, "notifications/progress");
 }
 
+fn assert_lossless_dual_era_product_paths() {
+    let policy = modern::ProtocolPolicy::ModernOnly;
+    let plan = modern::ClientProtocolPlan::stdio(policy);
+    assert_eq!(plan.policy(), policy);
+    assert_eq!(modern::PROTOCOL_VERSION, "2026-07-28");
+    assert_eq!(
+        modern::ProtocolVersion::parse(modern::PROTOCOL_VERSION)
+            .expect("modern version must parse")
+            .era(),
+        modern::ProtocolEra::Modern2026
+    );
+
+    let discovery = modern::ServerDiscoverRequest::default();
+    assert!(
+        discovery
+            .metadata()
+            .entries()
+            .contains_key(modern::FINAL_PROTOCOL_VERSION_META_KEY)
+    );
+    let cache_hints = modern::DiscoveryCacheHints::private_ttl_ms(250);
+    assert_eq!(cache_hints.ttl_ms(), 250);
+
+    let exact_result = modern::parse_exact_json(r#"{"resultType":"complete","answer":7}"#)
+        .expect("facade result codec must parse exact JSON");
+    let result_value = modern::exact_json_to_serde(&exact_result)
+        .expect("facade result codec must convert exact JSON");
+    assert_eq!(result_value["answer"], 7);
+
+    let tasks_extension = modern::official_tasks_extension_id();
+    assert_eq!(
+        tasks_extension.as_str(),
+        modern::OFFICIAL_TASKS_EXTENSION_ID
+    );
+    let mut extensions = modern::ExtensionDescriptorRegistry::new();
+    extensions
+        .register(modern::official_tasks_descriptor())
+        .expect("facade extension registry must accept the official descriptor");
+
+    let notifications = modern::SubscriptionFilter {
+        resources_list_changed: Some(true),
+        ..modern::SubscriptionFilter::default()
+    };
+    let listen = modern::FinalSubscriptionsListenParams {
+        meta: modern::OpenMetadata::default(),
+        notifications: notifications.clone(),
+    };
+    assert_eq!(listen.notifications.resources_list_changed, Some(true));
+
+    let final_tool = modern::FinalTool {
+        name: "downstream-tool".to_owned(),
+        title: Some("Downstream Tool".to_owned()),
+        description: None,
+        icons: None,
+        input_schema: Default::default(),
+        output_schema: None,
+        annotations: None,
+        meta: None,
+    };
+    let create_message = modern::FinalCreateMessageParams {
+        meta: modern::OpenMetadata::default(),
+        messages: Vec::new(),
+        max_tokens: 128,
+        system_prompt: None,
+        temperature: None,
+        stop_sequences: None,
+        model_preferences: Some(modern::ModelPreferences::default()),
+        include_context: None,
+        metadata: None,
+        tools: Some(vec![final_tool]),
+        tool_choice: Some(modern::FinalToolChoice::default()),
+    };
+    assert_eq!(create_message.max_tokens, 128);
+    let input_required = modern::FinalCreateMessageInputRequiredResult {
+        result_type: modern::FinalInputRequiredResultType::InputRequired,
+        meta: None,
+        input_requests: None,
+        request_state: Some("downstream-state".to_owned()),
+    };
+    input_required
+        .validate()
+        .expect("facade final input-required result must validate");
+
+    let (client_transport, _server_transport) =
+        fastmcp_rust::memory::create_memory_transport_pair();
+    let executor = modern::RequestExecutor::with_result_peer_era(
+        client_transport,
+        modern::ResultPeerEra::Modern,
+    );
+    let _ = executor;
+
+    let partition = legacy_2024::LegacyAuthenticatedPeerPartition::from_authenticated_transport(
+        [9_u8; legacy_2024::LegacyAuthenticatedPeerPartition::BYTE_LEN],
+    );
+    let binding = legacy_2024::LegacyPeerBinding::from_authenticated_transport(partition, 17);
+    let legacy_config = legacy_2024::Legacy2024ServerConfig {
+        capabilities: legacy_2024::methods::Legacy2024ServerCapabilities::default(),
+        server_info: legacy_2024::Legacy2024ServerInfo {
+            name: "downstream-legacy".to_owned(),
+            version: "1.0.0".to_owned(),
+        },
+        instructions: None,
+    };
+    let legacy_adapter = legacy_2024::Legacy2024ServerAdapter::install(
+        binding,
+        legacy_config,
+        DownstreamLegacyAdapterHandler,
+    )
+    .expect("facade legacy adapter must install for an authenticated binding");
+    assert_eq!(
+        legacy_adapter.lifecycle(),
+        legacy_2024::Legacy2024Lifecycle::AwaitInitialize
+    );
+    assert!(legacy_adapter.installed_receipt().matches_binding(binding));
+}
+
 mod prelude_directional_notification_reachability {
     use std::collections::BTreeMap;
 
@@ -282,5 +409,6 @@ fn main() {
     assert_dual_era_completion_exports();
     assert_root_directional_notification_exports();
     assert_modern_directional_notification_exports();
+    assert_lossless_dual_era_product_paths();
     prelude_directional_notification_reachability::assert_reachable();
 }
