@@ -13,6 +13,7 @@ use fastmcp_protocol::{
 };
 use log::{Level, LevelFilter};
 
+use crate::handler::CompletionHandler;
 use crate::proxy::{ProxyPromptHandler, ProxyResourceHandler, ProxyToolHandler};
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
@@ -417,6 +418,18 @@ impl ServerBuilder {
         } else {
             self.capabilities.prompts = Some(PromptsCapability::default());
         }
+        self
+    }
+
+    /// Registers the server-wide `completion/complete` handler.
+    ///
+    /// The handler receives disjoint exact-legacy and final request parameter
+    /// types. Building with a handler installs the real router dispatch target,
+    /// which is the sole condition that enables final discovery's
+    /// `capabilities.completions` claim.
+    #[must_use]
+    pub fn completion_handler<H: CompletionHandler + 'static>(mut self, handler: H) -> Self {
+        self.router.add_completion_handler(handler);
         self
     }
 
@@ -1239,6 +1252,64 @@ mod tests {
         }
     }
 
+    struct TestCompletion;
+
+    impl crate::handler::CompletionHandler for TestCompletion {
+        fn complete_legacy(
+            &self,
+            _ctx: &McpContext,
+            _params: fastmcp_protocol::LegacyCompletionParams,
+        ) -> McpResult<fastmcp_protocol::CompletionValues> {
+            Ok(fastmcp_protocol::CompletionValues {
+                values: vec!["staging".to_string()],
+                total: Some(1),
+                has_more: Some(false),
+            })
+        }
+
+        fn complete_final(
+            &self,
+            _ctx: &McpContext,
+            _params: fastmcp_protocol::FinalCompletionParams,
+        ) -> McpResult<fastmcp_protocol::CompletionValues> {
+            Ok(fastmcp_protocol::CompletionValues {
+                values: vec!["staging".to_string()],
+                total: Some(1),
+                has_more: Some(false),
+            })
+        }
+    }
+
+    struct CountingCompletion(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl crate::handler::CompletionHandler for CountingCompletion {
+        fn complete_legacy(
+            &self,
+            _ctx: &McpContext,
+            _params: fastmcp_protocol::LegacyCompletionParams,
+        ) -> McpResult<fastmcp_protocol::CompletionValues> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(fastmcp_protocol::CompletionValues {
+                values: vec!["staging".to_string()],
+                total: Some(1),
+                has_more: Some(false),
+            })
+        }
+
+        fn complete_final(
+            &self,
+            _ctx: &McpContext,
+            _params: fastmcp_protocol::FinalCompletionParams,
+        ) -> McpResult<fastmcp_protocol::CompletionValues> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(fastmcp_protocol::CompletionValues {
+                values: vec!["staging".to_string()],
+                total: Some(1),
+                has_more: Some(false),
+            })
+        }
+    }
+
     struct MarkedTool(&'static str);
 
     impl crate::ToolHandler for MarkedTool {
@@ -1439,6 +1510,102 @@ mod tests {
         assert!(server.capabilities().tools.is_none());
         assert!(server.capabilities().resources.is_none());
         assert!(server.capabilities().prompts.is_none());
+    }
+
+    #[test]
+    fn builder_completion_handler_activates_exact_discovery_capability() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .completion_handler(TestCompletion)
+            .build();
+        let discovery = server
+            .server_discovery()
+            .expect("installed completion handler produces discovery");
+        let wire = serde_json::to_value(discovery).expect("discovery serializes");
+
+        assert_eq!(wire["capabilities"]["completions"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn builder_without_completion_handler_omits_discovery_capability() {
+        let server = ServerBuilder::new("srv", "1.0").build();
+        let discovery = server
+            .server_discovery()
+            .expect("server without completion handler still discovers");
+        let wire = serde_json::to_value(discovery).expect("discovery serializes");
+
+        assert!(
+            wire["capabilities"].get("completions").is_none(),
+            "absence of the handler must not advertise completion"
+        );
+    }
+
+    #[test]
+    fn builder_completion_handler_rejects_final_metadata_before_handler_state_changes() {
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = ServerBuilder::new("srv", "1.0")
+            .completion_handler(CountingCompletion(std::sync::Arc::clone(&invocations)))
+            .build();
+        let request_ctx = McpContext::new(asupersync::Cx::for_testing(), 93);
+        let baseline = fastmcp_protocol::JsonRpcRequest::new(
+            "completion/complete",
+            Some(serde_json::json!({
+                "ref": {"type": "ref/prompt", "name": "deploy"},
+                "argument": {"name": "environment", "value": "sta"},
+            })),
+            93_i64,
+        );
+        let mut planted = baseline.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion parameters are an object")
+            .insert(
+                "_meta".to_string(),
+                serde_json::json!({
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                }),
+            );
+
+        let baseline_result = server
+            .router
+            .dispatch_legacy_completion(&request_ctx, &baseline)
+            .expect("baseline legacy completion reaches the builder-installed handler");
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the accepted request invokes the installed handler once"
+        );
+        let planted_before = serde_json::to_vec(&planted).expect("planted request serializes");
+
+        let error = server
+            .router
+            .dispatch_legacy_completion(&request_ctx, &planted)
+            .expect_err("the sole final metadata field is refused in the exact legacy route");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cross-era rejection occurs before handler-owned state can change"
+        );
+        assert_eq!(
+            serde_json::to_vec(&planted).expect("rejected request serializes"),
+            planted_before,
+            "the rejected request remains caller-owned and unchanged"
+        );
+        assert_eq!(
+            server
+                .router
+                .dispatch_legacy_completion(&request_ctx, &baseline)
+                .expect("baseline remains dispatchable after the rejection"),
+            baseline_result,
+            "the rejected one-field variant cannot alter the accepted completion result"
+        );
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "only accepted requests mutate handler-owned state"
+        );
     }
 
     #[test]
