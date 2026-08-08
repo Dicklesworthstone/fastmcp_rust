@@ -36,11 +36,11 @@ use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap};
 #[cfg(test)]
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::RwLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::time::{Duration as StdDuration, Instant};
 
