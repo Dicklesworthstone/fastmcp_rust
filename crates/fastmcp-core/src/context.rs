@@ -329,7 +329,7 @@ impl SamplingResponse {
 }
 
 /// Stop reason for sampling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SamplingStopReason {
     /// End of natural turn.
     #[default]
@@ -338,6 +338,40 @@ pub enum SamplingStopReason {
     StopSequence,
     /// Hit max tokens limit.
     MaxTokens,
+    /// The peer omitted the optional wire-level stop reason.
+    Unspecified,
+    /// An open provider-defined wire-level stop reason.
+    Other(String),
+}
+
+impl SamplingStopReason {
+    /// Converts an optional wire-level stop reason without narrowing an open
+    /// provider value.
+    #[must_use]
+    pub fn from_wire_value(value: Option<String>) -> Self {
+        match value {
+            Some(value) => match value.as_str() {
+                "endTurn" => Self::EndTurn,
+                "stopSequence" => Self::StopSequence,
+                "maxTokens" => Self::MaxTokens,
+                _ => Self::Other(value),
+            },
+            None => Self::Unspecified,
+        }
+    }
+
+    /// Returns the optional wire-level value without changing an open provider
+    /// value.
+    #[must_use]
+    pub fn as_wire_value(&self) -> Option<&str> {
+        match self {
+            Self::EndTurn => Some("endTurn"),
+            Self::StopSequence => Some("stopSequence"),
+            Self::MaxTokens => Some("maxTokens"),
+            Self::Unspecified => None,
+            Self::Other(value) => Some(value),
+        }
+    }
 }
 
 /// A no-op sampling sender that always returns an error.
@@ -4879,6 +4913,21 @@ mod tests {
         assert_eq!(resp.model, "model-1");
         assert_eq!(resp.stop_reason, SamplingStopReason::EndTurn);
         assert_eq!(SamplingStopReason::default(), SamplingStopReason::EndTurn);
+    }
+
+    #[test]
+    fn sampling_stop_reason_round_trips_optional_open_wire_values() {
+        let absent = SamplingStopReason::from_wire_value(None);
+        assert_eq!(absent, SamplingStopReason::Unspecified);
+        assert_eq!(absent.as_wire_value(), None);
+
+        let provider =
+            SamplingStopReason::from_wire_value(Some("provider_safety_limit".to_owned()));
+        assert_eq!(
+            provider,
+            SamplingStopReason::Other("provider_safety_limit".to_owned())
+        );
+        assert_eq!(provider.as_wire_value(), Some("provider_safety_limit"));
     }
 
     #[test]

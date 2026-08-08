@@ -609,17 +609,6 @@ impl TransportSamplingSender {
     }
 }
 
-/// Projects an open wire-level stop reason onto the historical closed core
-/// result enum. Exact-2024 reverse RPC uses [`DualEraServerToClient`] instead,
-/// which returns `CreateMessageResult` directly and retains this field exactly.
-fn core_sampling_stop_reason(stop_reason: Option<&str>) -> SamplingStopReason {
-    match stop_reason {
-        Some("stopSequence") => SamplingStopReason::StopSequence,
-        Some("maxTokens") => SamplingStopReason::MaxTokens,
-        _ => SamplingStopReason::EndTurn,
-    }
-}
-
 impl SamplingSender for TransportSamplingSender {
     fn create_message(
         &self,
@@ -684,7 +673,7 @@ impl SamplingSender for TransportSamplingSender {
                     }
                 },
                 model: result.model,
-                stop_reason: core_sampling_stop_reason(result.stop_reason.as_deref()),
+                stop_reason: SamplingStopReason::from_wire_value(result.stop_reason),
             })
         })
     }
@@ -3179,6 +3168,49 @@ mod tests {
         assert_eq!(result.text, "Hello world");
         assert_eq!(result.model, "test-model");
         assert!(matches!(result.stop_reason, SamplingStopReason::EndTurn));
+    }
+
+    #[test]
+    fn transport_sampling_sender_round_trips_open_legacy_stop_reason_through_callback() {
+        let expected = serde_json::json!({
+            "content": {"type": "text", "text": "legacy completion"},
+            "role": "assistant",
+            "model": "legacy-model",
+            "stopReason": "provider_safety_limit"
+        });
+        let reply = expected.clone();
+        let sender = make_sender_with_responder(move |request| {
+            assert_eq!(request.method, "sampling/createMessage");
+            reply.clone()
+        });
+        let sampling = TransportSamplingSender::new(sender);
+
+        let callback_response = fastmcp_core::block_on(SamplingSender::create_message(
+            &sampling,
+            SamplingRequest::prompt("Hi", 10),
+        ))
+        .expect("legacy sampling callback must retain an open stopReason");
+        assert_eq!(
+            callback_response.stop_reason,
+            SamplingStopReason::Other("provider_safety_limit".to_owned())
+        );
+
+        let emitted = fastmcp_protocol::CreateMessageResult {
+            content: fastmcp_protocol::SamplingContent::Text {
+                text: callback_response.text,
+            },
+            role: fastmcp_protocol::Role::Assistant,
+            model: callback_response.model,
+            stop_reason: callback_response
+                .stop_reason
+                .as_wire_value()
+                .map(str::to_owned),
+            meta: None,
+        };
+        let emitted = serde_json::to_value(emitted)
+            .expect("legacy sampling callback response must serialize");
+        assert_eq!(emitted, expected);
+        assert!(emitted.get("resultType").is_none());
     }
 
     #[test]
