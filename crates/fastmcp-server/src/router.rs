@@ -17,13 +17,17 @@ use fastmcp_core::{
     McpContext, McpError, McpErrorCode, McpOutcome, McpResult, SessionState, block_on,
     sha256_bounded,
 };
+use fastmcp_protocol::methods::COMPLETION_COMPLETE;
+use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
-    CallToolParams, CallToolResult, Content, GetPromptParams, GetPromptResult, InitializeParams,
-    InitializeResult, JsonRpcRequest, ListPromptsParams, ListPromptsResult,
-    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker,
-    Prompt, ReadResourceParams, ReadResourceResult, Resource, ResourceTemplate, ServerBehavior,
-    ServerBehaviorRegistry, Tool, validate, validate_strict,
+    CallToolParams, CallToolResult, Content, CoreRequest, FinalCompletionParams,
+    FinalCompletionResult, FinalCoreRequest, GetPromptParams, GetPromptResult, InitializeParams,
+    InitializeResult, JsonRpcRequest, LegacyCompletionParams, LegacyCompletionResult,
+    LegacyCoreRequest, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
+    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
+    ListToolsResult, PROTOCOL_VERSION, ProgressMarker, Prompt, ReadResourceParams,
+    ReadResourceResult, Resource, ResourceTemplate, ServerBehavior, ServerBehaviorRegistry, Tool,
+    validate, validate_strict,
 };
 #[cfg(test)]
 use fastmcp_protocol::{
@@ -40,8 +44,8 @@ use crate::tasks::SharedTaskManager;
 
 use crate::Session;
 use crate::handler::{
-    BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler, PromptHandler, ResourceHandler,
-    ToolHandler,
+    BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
+    CompletionHandler, PromptHandler, ResourceHandler, ToolHandler,
 };
 
 /// Type alias for a notification sender callback.
@@ -472,6 +476,7 @@ fn derive_handler_context(
 pub struct Router {
     tools: HashMap<String, BoxedToolHandler>,
     tool_order: Vec<String>,
+    completion_handler: Option<BoxedCompletionHandler>,
     resources: HashMap<String, BoxedResourceHandler>,
     resource_order: Vec<String>,
     prompts: HashMap<String, BoxedPromptHandler>,
@@ -497,6 +502,7 @@ impl Router {
         Self {
             tools: HashMap::new(),
             tool_order: Vec::new(),
+            completion_handler: None,
             resources: HashMap::new(),
             resource_order: Vec::new(),
             prompts: HashMap::new(),
@@ -611,6 +617,21 @@ impl Router {
             self.tool_order.push(def.name);
         }
         Ok(())
+    }
+
+    /// Registers the handler for `completion/complete`.
+    ///
+    /// Completion has one server-wide dispatch target rather than a catalog
+    /// entry. Re-registering replaces the prior target, matching the ordinary
+    /// component registration semantics.
+    pub fn add_completion_handler<H: CompletionHandler + 'static>(&mut self, handler: H) {
+        self.completion_handler = Some(Box::new(handler));
+    }
+
+    /// Returns whether a `completion/complete` handler is installed.
+    #[must_use]
+    pub fn has_completion_handler(&self) -> bool {
+        self.completion_handler.is_some()
     }
 
     /// Adds a resource handler.
@@ -1051,12 +1072,15 @@ impl Router {
     ///
     /// This records only APIs backed by this router's installed catalog. The
     /// modern stateless dispatcher has no logging-request emitter,
-    /// completion handler, list-change producer, subscription listener, or
-    /// resource-update delivery path, so none of those behaviors can be
-    /// advertised merely because adjacent legacy code compiled.
+    /// list-change producer, subscription listener, or resource-update
+    /// delivery path, so none of those behaviors can be advertised merely
+    /// because adjacent legacy code compiled.
     #[must_use]
     pub(crate) fn server_discovery_behavior_registry(&self) -> ServerBehaviorRegistry {
-        let mut behaviors = Vec::with_capacity(3);
+        let mut behaviors = Vec::with_capacity(4);
+        if self.completion_handler.is_some() {
+            behaviors.push(ServerBehavior::CompletionComplete);
+        }
         if !self.tool_order.is_empty() {
             behaviors.push(ServerBehavior::ToolsList);
         }
@@ -1160,6 +1184,139 @@ impl Router {
         })
     }
 
+    /// Dispatches one exact legacy `completion/complete` request.
+    ///
+    /// This route decodes through the dual-era core contract before invoking
+    /// the installed handler. In particular, a final `_meta` object remains a
+    /// cross-era error even though the legacy parameter shape is otherwise
+    /// intentionally open.
+    pub(crate) fn dispatch_legacy_completion(
+        &self,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<serde_json::Value> {
+        if request.method != COMPLETION_COMPLETE {
+            return Err(McpError::method_not_found(&request.method));
+        }
+
+        let request = CoreRequest::decode(
+            ProtocolEra::Legacy2024,
+            COMPLETION_COMPLETE,
+            request.params.as_ref(),
+        )
+        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        let CoreRequest::Legacy(LegacyCoreRequest::Completion(params)) = request else {
+            return Err(McpError::internal_error(
+                "legacy completion dispatch selected another core request",
+            ));
+        };
+
+        serde_json::to_value(self.handle_completion_legacy(request_ctx, params)?)
+            .map_err(McpError::from)
+    }
+
+    /// Handles one exact MCP 2024-11-05 completion request.
+    pub fn handle_completion_legacy(
+        &self,
+        request_ctx: &McpContext,
+        params: LegacyCompletionParams,
+    ) -> McpResult<LegacyCompletionResult> {
+        let dispatch_started_at = request_ctx.cx().now();
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
+        let handler = self
+            .completion_handler
+            .as_ref()
+            .ok_or_else(|| McpError::method_not_found(COMPLETION_COMPLETE))?;
+        let handler_ctx = derive_handler_context(request_ctx, None, None, None);
+        let handler_timeout =
+            read_handler_timeout(request_ctx.cx(), "completion_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            request_ctx.cx().budget(),
+            request_ctx.budget(),
+            handler_timeout,
+            dispatch_started_at,
+        );
+        let handler_ctx = handler_ctx.with_operation_deadline(effective_budget.deadline);
+        let outcome = run_handler(&handler_ctx, effective_budget, "completion", || {
+            handler.complete_legacy_async(&handler_ctx, params)
+        })?;
+
+        let completion = match outcome {
+            Outcome::Ok(completion) => completion,
+            Outcome::Err(error) => {
+                return Err(sanitize_handler_error(
+                    request_ctx.cx(),
+                    "completion",
+                    error,
+                ));
+            }
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => {
+                return Err(sanitized_handler_panic(request_ctx.cx(), "completion"));
+            }
+        };
+
+        Ok(LegacyCompletionResult { completion })
+    }
+
+    async fn handle_completion_final_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: FinalCompletionParams,
+    ) -> McpResult<FinalCompletionResult> {
+        let dispatch_started_at = request_ctx.cx().now();
+        if request_cx.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
+        let handler = self
+            .completion_handler
+            .as_ref()
+            .ok_or_else(|| McpError::method_not_found(COMPLETION_COMPLETE))?;
+        let handler_ctx = derive_handler_context(request_ctx, None, None, None);
+        let handler_timeout =
+            read_handler_timeout(request_ctx.cx(), "completion_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            request_ctx.cx().budget(),
+            request_ctx.budget(),
+            handler_timeout,
+            dispatch_started_at,
+        );
+        let handler_ctx = handler_ctx.with_operation_deadline(effective_budget.deadline);
+        let outcome = run_handler_in_request(
+            &handler_ctx,
+            request_cx,
+            effective_budget,
+            "completion",
+            |child_cx| handler.complete_final_async_in_request(&handler_ctx, child_cx, params),
+        )
+        .await?;
+
+        let completion = match outcome {
+            Outcome::Ok(completion) => completion,
+            Outcome::Err(error) => {
+                return Err(sanitize_handler_error(
+                    request_ctx.cx(),
+                    "completion",
+                    error,
+                ));
+            }
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => {
+                return Err(sanitized_handler_panic(request_ctx.cx(), "completion"));
+            }
+        };
+
+        Ok(FinalCompletionResult { completion })
+    }
+
     /// Dispatches a request without connection or session state.
     ///
     /// This is the modern server-side routing seam. It deliberately has no
@@ -1235,6 +1392,23 @@ impl Router {
         let params = request.params.clone();
         let result = match request.method.as_str() {
             "ping" => encode_stateless_handler_result(Ok(serde_json::json!({})))?,
+            COMPLETION_COMPLETE => {
+                let request = CoreRequest::decode(
+                    ProtocolEra::Modern2026,
+                    COMPLETION_COMPLETE,
+                    params.as_ref(),
+                )
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let CoreRequest::Final(FinalCoreRequest::Completion(params)) = request else {
+                    return Err(McpError::internal_error(
+                        "modern completion dispatch selected another core request",
+                    ));
+                };
+                encode_stateless_handler_result(
+                    self.handle_completion_final_in_request(request_ctx, request_cx, params)
+                        .await,
+                )?
+            }
             "tools/list" => {
                 let params = parse_stateless_params_or_default(params)?;
                 encode_stateless_handler_result(self.handle_tools_list(request_ctx, params, None))?
@@ -4363,12 +4537,15 @@ mod tag_filter_tests {
 #[cfg(test)]
 mod router_tests {
     use super::*;
-    use crate::handler::{PromptHandler, ResourceHandler, ToolHandler};
+    use crate::handler::{CompletionHandler, PromptHandler, ResourceHandler, ToolHandler};
     use asupersync::channel::oneshot;
     use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
     use asupersync::types::CancelKind;
     use fastmcp_core::{McpContext, McpResult, SessionState};
-    use fastmcp_protocol::{Content, Prompt, PromptMessage, Resource, ResourceContent, Tool};
+    use fastmcp_protocol::{
+        CompletionValues, Content, FinalCompletionParams, LegacyCompletionParams, Prompt,
+        PromptMessage, Resource, ResourceContent, Tool,
+    };
     use std::fmt;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
@@ -4469,6 +4646,34 @@ mod router_tests {
         }
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
             Ok(vec![Content::text(format!("called {}", self.name))])
+        }
+    }
+
+    struct EchoCompletion;
+
+    impl CompletionHandler for EchoCompletion {
+        fn complete_legacy(
+            &self,
+            _ctx: &McpContext,
+            params: LegacyCompletionParams,
+        ) -> McpResult<CompletionValues> {
+            Ok(CompletionValues {
+                values: vec![format!("{}ging", params.argument.value)],
+                total: Some(1),
+                has_more: Some(false),
+            })
+        }
+
+        fn complete_final(
+            &self,
+            _ctx: &McpContext,
+            params: FinalCompletionParams,
+        ) -> McpResult<CompletionValues> {
+            Ok(CompletionValues {
+                values: vec![format!("{}ging", params.argument.value)],
+                total: Some(1),
+                has_more: Some(false),
+            })
         }
     }
 
@@ -8422,6 +8627,133 @@ mod router_tests {
             .handle_tasks_get(&request_ctx, params, Some(&shared))
             .unwrap_err();
         assert!(err.message.contains("not found"));
+    }
+
+    #[test]
+    fn completion_handler_dispatches_exact_legacy_and_final_contracts() {
+        let mut router = Router::new();
+        assert!(!router.has_completion_handler());
+        router.add_completion_handler(EchoCompletion);
+        assert!(router.has_completion_handler());
+        assert!(
+            router
+                .server_discovery_behavior_registry()
+                .contains(ServerBehavior::CompletionComplete),
+            "discovery advertises completion only after the handler is installed"
+        );
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 87, Budget::INFINITE, &state);
+        let legacy_request = JsonRpcRequest::new(
+            COMPLETION_COMPLETE,
+            Some(serde_json::json!({
+                "ref": {"type": "ref/prompt", "name": "deploy"},
+                "argument": {"name": "environment", "value": "sta"},
+            })),
+            87_i64,
+        );
+        let legacy = router
+            .dispatch_legacy_completion(&request_ctx, &legacy_request)
+            .expect("the exact legacy request reaches the registered completion handler");
+        assert!(
+            legacy.get("resultType").is_none(),
+            "the exact legacy completion result remains discriminator-free"
+        );
+        assert_eq!(
+            legacy["completion"]["values"],
+            serde_json::json!(["staging"])
+        );
+
+        let modern = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    COMPLETION_COMPLETE,
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                        "ref": {"type": "ref/prompt", "name": "deploy"},
+                        "argument": {"name": "environment", "value": "sta"},
+                    })),
+                    88_i64,
+                ),
+            )
+            .expect("the final request reaches the same registered completion handler");
+        assert_eq!(
+            modern.get("resultType"),
+            Some(&serde_json::json!("complete"))
+        );
+        assert_eq!(modern.get("completion"), legacy.get("completion"));
+    }
+
+    #[test]
+    fn completion_handler_rejects_one_field_final_metadata_in_legacy_request() {
+        let mut router = Router::new();
+        router.add_completion_handler(EchoCompletion);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 89, Budget::INFINITE, &state);
+        let baseline = JsonRpcRequest::new(
+            COMPLETION_COMPLETE,
+            Some(serde_json::json!({
+                "ref": {"type": "ref/prompt", "name": "deploy"},
+                "argument": {"name": "environment", "value": "sta"},
+            })),
+            89_i64,
+        );
+        let mut planted = baseline.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion parameters are an object")
+            .insert(
+                "_meta".to_string(),
+                serde_json::json!({
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                }),
+            );
+
+        assert_eq!(baseline.method, planted.method);
+        assert_eq!(baseline.id, planted.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("ref")),
+            planted.params.as_ref().and_then(|params| params.get("ref")),
+            "the final metadata object is the sole planted dimension"
+        );
+        let catalog_before = router.has_completion_handler();
+        let planted_before = serde_json::to_vec(&planted).expect("planted request serializes");
+
+        let baseline_result = router
+            .dispatch_legacy_completion(&request_ctx, &baseline)
+            .expect("the baseline legacy completion request is accepted");
+        let error = router
+            .dispatch_legacy_completion(&request_ctx, &planted)
+            .expect_err("only final metadata is refused in the exact legacy request");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            serde_json::to_vec(&planted).expect("rejected request serializes"),
+            planted_before,
+            "cross-era rejection cannot mutate caller-owned completion parameters"
+        );
+        assert_eq!(
+            router.has_completion_handler(),
+            catalog_before,
+            "cross-era rejection cannot alter the installed completion handler"
+        );
+        assert_eq!(
+            router
+                .dispatch_legacy_completion(&request_ctx, &baseline)
+                .expect("the baseline remains accepted after the planted rejection"),
+            baseline_result,
+            "the one-field rejection cannot alter the accepted legacy completion result"
+        );
     }
 
     #[test]

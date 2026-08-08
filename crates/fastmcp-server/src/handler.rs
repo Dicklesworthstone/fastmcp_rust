@@ -21,9 +21,10 @@ use fastmcp_core::{
     SessionState,
 };
 use fastmcp_protocol::{
-    Content, CoreResultDiscriminatorPolicy, DecodedResult, Icon, JsonRpcRequest, ProgressMarker,
-    ProgressParams, Prompt, PromptMessage, Resource, ResourceContent, ResourceTemplate,
-    ResultPeerEra, Tool, ToolAnnotations, decode_peer_result, encode_result,
+    CompletionValues, Content, CoreResultDiscriminatorPolicy, DecodedResult, FinalCompletionParams,
+    Icon, JsonRpcRequest, LegacyCompletionParams, ProgressMarker, ProgressParams, Prompt,
+    PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultPeerEra, Tool,
+    ToolAnnotations, decode_peer_result, encode_result,
 };
 
 // ============================================================================
@@ -637,6 +638,82 @@ pub trait PromptHandler: Send + Sync {
     }
 }
 
+/// Handler for `completion/complete` in both supported protocol eras.
+///
+/// The two request parameter types deliberately remain distinct: the final
+/// form carries required request metadata and optional completion context,
+/// while the exact legacy form does not. Both callbacks return the shared
+/// completion value payload; the router selects the era-specific result
+/// envelope and final `resultType` contract.
+pub trait CompletionHandler: Send + Sync {
+    /// Returns an optional handler-specific timeout.
+    ///
+    /// A non-zero timeout tightens the request budget and cannot relax an
+    /// existing deadline. Zero is treated as no handler-specific timeout.
+    fn timeout(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Completes one exact MCP 2024-11-05 request.
+    fn complete_legacy(
+        &self,
+        ctx: &McpContext,
+        params: LegacyCompletionParams,
+    ) -> McpResult<CompletionValues>;
+
+    /// Completes one final MCP 2026-07-28 request.
+    fn complete_final(
+        &self,
+        ctx: &McpContext,
+        params: FinalCompletionParams,
+    ) -> McpResult<CompletionValues>;
+
+    /// Asynchronously completes one exact legacy request.
+    ///
+    /// The default delegates to [`Self::complete_legacy`].
+    fn complete_legacy_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        params: LegacyCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompletionValues>> {
+        Box::pin(async move {
+            match self.complete_legacy(ctx, params) {
+                Ok(values) => Outcome::Ok(values),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
+    /// Asynchronously completes one final request.
+    ///
+    /// The default delegates to [`Self::complete_final`].
+    fn complete_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        params: FinalCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompletionValues>> {
+        Box::pin(async move {
+            match self.complete_final(ctx, params) {
+                Ok(values) => Outcome::Ok(values),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
+    /// Completes one final request from its request-owned structured child.
+    ///
+    /// Implementations with nested asynchronous work must use `request_cx`
+    /// so cancellation remains owned by the originating modern request.
+    fn complete_final_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        params: FinalCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompletionValues>> {
+        self.complete_final_async(ctx, params)
+    }
+}
+
 /// A boxed tool handler.
 pub type BoxedToolHandler = Box<dyn ToolHandler>;
 
@@ -645,6 +722,9 @@ pub type BoxedResourceHandler = Box<dyn ResourceHandler>;
 
 /// A boxed prompt handler.
 pub type BoxedPromptHandler = Box<dyn PromptHandler>;
+
+/// A boxed completion handler.
+pub type BoxedCompletionHandler = Box<dyn CompletionHandler>;
 
 // ============================================================================
 // Mounted Handler Wrappers
