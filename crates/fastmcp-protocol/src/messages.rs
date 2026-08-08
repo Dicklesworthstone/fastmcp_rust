@@ -13,8 +13,8 @@ use crate::common_types::{
 };
 use crate::jsonrpc::RequestId;
 use crate::methods::{
-    INITIALIZE, LOGGING_SET_LEVEL, PING, PROMPTS_GET, PROMPTS_LIST, RESOURCES_LIST, RESOURCES_READ,
-    RESOURCES_TEMPLATES_LIST, TOOLS_CALL, TOOLS_LIST,
+    COMPLETION_COMPLETE, INITIALIZE, LOGGING_SET_LEVEL, PING, PROMPTS_GET, PROMPTS_LIST,
+    RESOURCES_LIST, RESOURCES_READ, RESOURCES_TEMPLATES_LIST, TOOLS_CALL, TOOLS_LIST,
 };
 use crate::protocol_policy::ProtocolEra;
 use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
@@ -219,6 +219,100 @@ pub struct FinalGetPromptParams {
     pub arguments: Option<BTreeMap<String, String>>,
 }
 
+/// Exact legacy reference accepted by `completion/complete`.
+///
+/// Legacy completion parameter objects remain open, as they are in the
+/// 2024-11-05 schema. The selected prompt/resource members are still typed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum LegacyCompletionReference {
+    /// Identifies one prompt or prompt template by name.
+    #[serde(rename = "ref/prompt")]
+    Prompt {
+        /// Prompt or prompt-template name.
+        name: String,
+    },
+    /// Identifies one resource or resource template by URI template.
+    #[serde(rename = "ref/resource")]
+    Resource {
+        /// Resource URI or URI template.
+        uri: String,
+    },
+}
+
+/// Exact legacy completion argument selector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyCompletionArgument {
+    /// Argument name.
+    pub name: String,
+    /// Prefix used for completion matching.
+    pub value: String,
+}
+
+/// Exact 2024-11-05 `completion/complete` request parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyCompletionParams {
+    /// Prompt or resource-template target.
+    #[serde(rename = "ref")]
+    pub reference: LegacyCompletionReference,
+    /// Argument being completed.
+    pub argument: LegacyCompletionArgument,
+}
+
+/// Final reference accepted by `completion/complete`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum FinalCompletionReference {
+    /// Identifies one prompt or prompt template by name.
+    #[serde(rename = "ref/prompt")]
+    Prompt {
+        /// Prompt or prompt-template name.
+        name: String,
+    },
+    /// Identifies one resource template by URI template.
+    #[serde(rename = "ref/resource")]
+    Resource {
+        /// Resource URI template.
+        uri: String,
+    },
+}
+
+/// Final completion argument selector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalCompletionArgument {
+    /// Argument name.
+    pub name: String,
+    /// Prefix used for completion matching.
+    pub value: String,
+}
+
+/// Optional final completion context.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalCompletionContext {
+    /// Previously resolved prompt or URI-template variables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<BTreeMap<String, String>>,
+}
+
+/// Final `completion/complete` request parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalCompletionParams {
+    /// Required final request metadata.
+    #[serde(rename = "_meta")]
+    pub meta: OpenMetadata,
+    /// Prompt or resource-template target.
+    #[serde(rename = "ref")]
+    pub reference: FinalCompletionReference,
+    /// Argument being completed.
+    pub argument: FinalCompletionArgument,
+    /// Previously resolved prompt or URI-template variables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<FinalCompletionContext>,
+}
+
 /// Final `logging/setLevel` request parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -320,6 +414,33 @@ pub struct FinalGetPromptResult {
     pub messages: Vec<FinalPromptMessage>,
 }
 
+/// Completion candidates returned by either protocol era.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionValues {
+    /// Completion values selected by the server.
+    pub values: Vec<String>,
+    /// Total number of available values, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<i64>,
+    /// Whether further completion values are available.
+    #[serde(rename = "hasMore", default, skip_serializing_if = "Option::is_none")]
+    pub has_more: Option<bool>,
+}
+
+/// Exact legacy `completion/complete` result payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyCompletionResult {
+    /// Completion candidates.
+    pub completion: CompletionValues,
+}
+
+/// Final `completion/complete` result payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalCompletionResult {
+    /// Completion candidates.
+    pub completion: CompletionValues,
+}
+
 /// Empty final complete-result payload used by acknowledgement methods.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -336,6 +457,8 @@ pub struct LegacyEmptyResult {}
 pub enum LegacyCoreRequest {
     /// `initialize` is unique to the legacy initialize-handshake era.
     Initialize(InitializeParams),
+    /// `completion/complete`.
+    Completion(LegacyCompletionParams),
     /// `tools/list`.
     ToolsList(ListToolsParams),
     /// `tools/call`.
@@ -359,6 +482,8 @@ pub enum LegacyCoreRequest {
 /// Final core requests use final metadata and common vocabulary throughout.
 #[derive(Debug, Clone)]
 pub enum FinalCoreRequest {
+    /// `completion/complete`.
+    Completion(FinalCompletionParams),
     /// `tools/list`.
     ToolsList(FinalListParams),
     /// `tools/call`.
@@ -393,6 +518,8 @@ pub enum CoreRequest {
 pub enum LegacyCoreResult {
     /// `initialize`.
     Initialize(InitializeResult),
+    /// `completion/complete`.
+    Completion(LegacyCompletionResult),
     /// `tools/list`.
     ToolsList(ListToolsResult),
     /// `tools/call`.
@@ -420,6 +547,11 @@ pub enum LegacyCoreResult {
 /// peer conformance.
 #[derive(Debug, Clone)]
 pub enum FinalCoreResult {
+    /// `completion/complete`.
+    Completion {
+        result: CompleteResult<FinalCompletionResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
     /// `tools/list`.
     ToolsList {
         result: CompleteResult<FinalListToolsResult>,
@@ -599,6 +731,11 @@ impl CoreRequest {
                     INITIALIZE,
                     params,
                 )?),
+                COMPLETION_COMPLETE => LegacyCoreRequest::Completion(decode_params(
+                    ProtocolEra::Legacy2024,
+                    COMPLETION_COMPLETE,
+                    params,
+                )?),
                 TOOLS_LIST => LegacyCoreRequest::ToolsList(decode_params(
                     ProtocolEra::Legacy2024,
                     TOOLS_LIST,
@@ -666,6 +803,9 @@ impl CoreRequest {
 
     fn decode_final(method: &str, params: Option<&Value>) -> Result<Self, CoreDispatchError> {
         let request = match method {
+            COMPLETION_COMPLETE => {
+                FinalCoreRequest::Completion(decode_final_params(COMPLETION_COMPLETE, params)?)
+            }
             TOOLS_LIST => FinalCoreRequest::ToolsList(decode_final_params(TOOLS_LIST, params)?),
             TOOLS_CALL => FinalCoreRequest::ToolsCall(decode_final_params(TOOLS_CALL, params)?),
             RESOURCES_LIST => {
@@ -703,6 +843,7 @@ impl LegacyCoreRequest {
     pub const fn method(&self) -> &'static str {
         match self {
             Self::Initialize(_) => INITIALIZE,
+            Self::Completion(_) => COMPLETION_COMPLETE,
             Self::ToolsList(_) => TOOLS_LIST,
             Self::ToolsCall(_) => TOOLS_CALL,
             Self::ResourcesList(_) => RESOURCES_LIST,
@@ -718,6 +859,9 @@ impl LegacyCoreRequest {
     fn encode_params(&self) -> Result<Option<Value>, CoreDispatchError> {
         match self {
             Self::Initialize(params) => encode_params(ProtocolEra::Legacy2024, INITIALIZE, params),
+            Self::Completion(params) => {
+                encode_params(ProtocolEra::Legacy2024, COMPLETION_COMPLETE, params)
+            }
             Self::ToolsList(params) => encode_params(ProtocolEra::Legacy2024, TOOLS_LIST, params),
             Self::ToolsCall(params) => encode_params(ProtocolEra::Legacy2024, TOOLS_CALL, params),
             Self::ResourcesList(params) => {
@@ -744,6 +888,9 @@ impl LegacyCoreRequest {
         match self {
             Self::Initialize(_) => {
                 decode_legacy_result(INITIALIZE, input).map(LegacyCoreResult::Initialize)
+            }
+            Self::Completion(_) => {
+                decode_legacy_result(COMPLETION_COMPLETE, input).map(LegacyCoreResult::Completion)
             }
             Self::ToolsList(_) => {
                 decode_legacy_result(TOOLS_LIST, input).map(LegacyCoreResult::ToolsList)
@@ -778,6 +925,7 @@ impl FinalCoreRequest {
     #[must_use]
     pub const fn method(&self) -> &'static str {
         match self {
+            Self::Completion(_) => COMPLETION_COMPLETE,
             Self::ToolsList(_) => TOOLS_LIST,
             Self::ToolsCall(_) => TOOLS_CALL,
             Self::ResourcesList(_) => RESOURCES_LIST,
@@ -792,6 +940,7 @@ impl FinalCoreRequest {
 
     fn validate_metadata(&self) -> Result<(), CoreDispatchError> {
         let metadata = match self {
+            Self::Completion(params) => &params.meta,
             Self::ToolsList(params)
             | Self::ResourcesList(params)
             | Self::ResourceTemplatesList(params)
@@ -817,6 +966,9 @@ impl FinalCoreRequest {
     fn encode_params(&self) -> Result<Option<Value>, CoreDispatchError> {
         self.validate_metadata()?;
         match self {
+            Self::Completion(params) => {
+                encode_params(ProtocolEra::Modern2026, COMPLETION_COMPLETE, params)
+            }
             Self::ToolsList(params) => encode_params(ProtocolEra::Modern2026, TOOLS_LIST, params),
             Self::ToolsCall(params) => encode_params(ProtocolEra::Modern2026, TOOLS_CALL, params),
             Self::ResourcesList(params) => {
@@ -841,6 +993,10 @@ impl FinalCoreRequest {
 
     fn decode_result(&self, input: &str) -> Result<FinalCoreResult, CoreDispatchError> {
         match self {
+            Self::Completion(_) => {
+                decode_final_complete(COMPLETION_COMPLETE, input, &["completion"])
+                    .map(|(result, diagnostic)| FinalCoreResult::Completion { result, diagnostic })
+            }
             Self::ToolsList(_) => {
                 decode_final_complete(TOOLS_LIST, input, &["tools", "nextCursor"])
                     .map(|(result, diagnostic)| FinalCoreResult::ToolsList { result, diagnostic })
@@ -914,6 +1070,7 @@ impl LegacyCoreResult {
     pub const fn method(&self) -> &'static str {
         match self {
             Self::Initialize(_) => INITIALIZE,
+            Self::Completion(_) => COMPLETION_COMPLETE,
             Self::ToolsList(_) => TOOLS_LIST,
             Self::ToolsCall(_) => TOOLS_CALL,
             Self::ResourcesList(_) => RESOURCES_LIST,
@@ -929,6 +1086,7 @@ impl LegacyCoreResult {
     fn encode(&self) -> Result<String, CoreDispatchError> {
         match self {
             Self::Initialize(result) => encode_legacy_result(INITIALIZE, result),
+            Self::Completion(result) => encode_legacy_result(COMPLETION_COMPLETE, result),
             Self::ToolsList(result) => encode_legacy_result(TOOLS_LIST, result),
             Self::ToolsCall(result) => encode_legacy_result(TOOLS_CALL, result),
             Self::ResourcesList(result) => encode_legacy_result(RESOURCES_LIST, result),
@@ -949,6 +1107,7 @@ impl FinalCoreResult {
     #[must_use]
     pub const fn method(&self) -> &'static str {
         match self {
+            Self::Completion { .. } => COMPLETION_COMPLETE,
             Self::ToolsList { .. } => TOOLS_LIST,
             Self::ToolsCall { .. } => TOOLS_CALL,
             Self::ResourcesList { .. } => RESOURCES_LIST,
@@ -963,6 +1122,9 @@ impl FinalCoreResult {
 
     fn encode(&self) -> Result<String, CoreDispatchError> {
         match self {
+            Self::Completion { result, .. } => {
+                encode_final_complete(COMPLETION_COMPLETE, result, &["completion"])
+            }
             Self::ToolsList { result, .. } => {
                 encode_final_complete(TOOLS_LIST, result, &["tools", "nextCursor"])
             }
@@ -2437,6 +2599,146 @@ mod tests {
         assert_eq!(
             legacy_result.encode().expect("legacy result re-encodes"),
             legacy_wire
+        );
+    }
+
+    #[test]
+    fn core_completion_round_trips_exact_legacy_and_final_payloads() {
+        let legacy_params = serde_json::json!({
+            "ref": {"type": "ref/prompt", "name": "deploy"},
+            "argument": {"name": "environment", "value": "sta"}
+        });
+        let legacy_request = CoreRequest::decode(
+            ProtocolEra::Legacy2024,
+            COMPLETION_COMPLETE,
+            Some(&legacy_params),
+        )
+        .expect("exact legacy completion request is typed");
+        assert_eq!(legacy_request.era(), ProtocolEra::Legacy2024);
+        assert_eq!(legacy_request.method(), COMPLETION_COMPLETE);
+        assert_eq!(
+            legacy_request
+                .encode_params()
+                .expect("legacy completion request re-encodes")
+                .expect("completion owns an object parameter"),
+            legacy_params
+        );
+
+        let legacy_wire = r#"{"completion":{"values":["staging"],"total":1,"hasMore":false}}"#;
+        let legacy_result = legacy_request
+            .decode_result(legacy_wire)
+            .expect("exact legacy completion result is typed");
+        let CoreResult::Legacy(LegacyCoreResult::Completion(result)) = &legacy_result else {
+            panic!("legacy completion result");
+        };
+        assert_eq!(result.completion.values, vec!["staging".to_owned()]);
+        assert_eq!(result.completion.total, Some(1));
+        assert_eq!(result.completion.has_more, Some(false));
+        assert_eq!(
+            legacy_result
+                .encode()
+                .expect("legacy completion re-encodes"),
+            legacy_wire
+        );
+
+        let final_params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "ref": {"type": "ref/resource", "uri": "file:///workspace/{environment}"},
+            "argument": {"name": "environment", "value": "pro"},
+            "context": {"arguments": {"region": "us-east-1"}}
+        });
+        let final_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            COMPLETION_COMPLETE,
+            Some(&final_params),
+        )
+        .expect("final completion request is typed through final metadata");
+        assert_eq!(final_request.era(), ProtocolEra::Modern2026);
+        assert_eq!(final_request.method(), COMPLETION_COMPLETE);
+        assert_eq!(
+            final_request
+                .encode_params()
+                .expect("final completion request re-encodes")
+                .expect("completion owns an object parameter"),
+            final_params
+        );
+
+        let final_wire = r#"{"resultType":"complete","completion":{"values":["production"],"total":1,"hasMore":false},"extension":{"opaque":true}}"#;
+        let final_result = final_request
+            .decode_result(final_wire)
+            .expect("final complete result selects the completion payload");
+        let CoreResult::Final(FinalCoreResult::Completion { result, diagnostic }) = &final_result
+        else {
+            panic!("final completion result");
+        };
+        assert_eq!(diagnostic, &None);
+        assert_eq!(
+            result.payload.completion.values,
+            vec!["production".to_owned()]
+        );
+        assert_eq!(result.payload.completion.total, Some(1));
+        assert_eq!(result.payload.completion.has_more, Some(false));
+        assert_eq!(
+            result
+                .extras
+                .members()
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            ["extension"]
+        );
+        assert_eq!(
+            final_result.encode().expect("final completion re-encodes"),
+            final_wire
+        );
+    }
+
+    #[test]
+    fn core_completion_rejects_one_field_cross_era_metadata() {
+        let accepted = serde_json::json!({
+            "ref": {"type": "ref/prompt", "name": "deploy"},
+            "argument": {"name": "environment", "value": "sta"}
+        });
+        let baseline = CoreRequest::decode(
+            ProtocolEra::Legacy2024,
+            COMPLETION_COMPLETE,
+            Some(&accepted),
+        )
+        .expect("baseline legacy completion request");
+
+        let mut planted = accepted.clone();
+        planted["_meta"] = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION
+        });
+        assert!(
+            matches!(
+                CoreRequest::decode(ProtocolEra::Legacy2024, COMPLETION_COMPLETE, Some(&planted)),
+                Err(CoreDispatchError::CrossEraRequestMetadata {
+                    method: COMPLETION_COMPLETE
+                })
+            ),
+            "only the final _meta field changes the otherwise valid legacy completion request"
+        );
+
+        let reaccepted = CoreRequest::decode(
+            ProtocolEra::Legacy2024,
+            COMPLETION_COMPLETE,
+            Some(&accepted),
+        )
+        .expect("cross-era rejection cannot mutate completion request decoding");
+        assert_eq!(
+            baseline
+                .encode_params()
+                .expect("baseline encodes")
+                .expect("baseline parameters"),
+            reaccepted
+                .encode_params()
+                .expect("reaccepted encodes")
+                .expect("reaccepted parameters"),
+            "the one-field cross-era rejection leaves the accepted legacy request unchanged"
         );
     }
 
