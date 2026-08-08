@@ -10,6 +10,7 @@ use std::fmt;
 use fastmcp_core::sha256_bounded;
 use serde_json::{Map, Value};
 
+use crate::methods::{final_2026_07_28_method, legacy_2024_11_05_method};
 use crate::protocol_policy::ProtocolEra;
 
 /// Maximum descriptors retained by one registry.
@@ -52,13 +53,6 @@ impl ExtensionId {
         if value.matches('/').count() != 1 || !valid_prefix(prefix) || !valid_name(name) {
             return Err(ExtensionRegistryError::InvalidIdentifier(value));
         }
-        if prefix
-            .split('.')
-            .nth(1)
-            .is_some_and(|label| matches!(label, "modelcontextprotocol" | "mcp"))
-        {
-            return Err(ExtensionRegistryError::ReservedNamespace(value));
-        }
         Ok(Self(value))
     }
 
@@ -76,25 +70,29 @@ impl fmt::Display for ExtensionId {
 }
 
 fn valid_prefix(prefix: &str) -> bool {
-    let labels = prefix.split('.').collect::<Vec<_>>();
-    labels.len() >= 2
-        && labels.iter().all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label.as_bytes()[0].is_ascii_lowercase()
-                && label
-                    .as_bytes()
-                    .last()
-                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        })
+    prefix.split('.').all(|label| {
+        !label.is_empty()
+            && label.as_bytes()[0].is_ascii_alphabetic()
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphabetic() || byte.is_ascii_digit() || byte == b'-')
+    })
 }
 
 fn valid_name(name: &str) -> bool {
-    name.bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    name.is_empty()
+        || (name.as_bytes()[0].is_ascii_alphanumeric()
+            && name
+                .as_bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
 }
 
 /// One extension's generic JSON-object settings.
@@ -1452,33 +1450,7 @@ fn ensure_no_cross_owner_collision(
 }
 
 fn core_or_legacy_method(method: &str) -> bool {
-    matches!(
-        method,
-        "initialize"
-            | "ping"
-            | "tools/list"
-            | "tools/call"
-            | "resources/list"
-            | "resources/templates/list"
-            | "resources/read"
-            | "prompts/list"
-            | "prompts/get"
-            | "logging/setLevel"
-            | "completion/complete"
-            | "sampling/createMessage"
-            | "roots/list"
-            | "resources/subscribe"
-            | "resources/unsubscribe"
-            | "notifications/initialized"
-            | "notifications/cancelled"
-            | "notifications/message"
-            | "notifications/progress"
-            | "notifications/prompts/list_changed"
-            | "notifications/resources/list_changed"
-            | "notifications/resources/updated"
-            | "notifications/roots/list_changed"
-            | "notifications/tools/list_changed"
-    )
+    final_2026_07_28_method(method).is_some() || legacy_2024_11_05_method(method).is_some()
 }
 
 fn canonical_descriptor_row(descriptor: &ExtensionDescriptor) -> Value {
@@ -1539,6 +1511,191 @@ mod tests {
             }],
             stdio_correlation: None,
         }
+    }
+
+    fn tasks_descriptor(id: ExtensionId) -> ExtensionDescriptor {
+        let mut descriptor = descriptor(id, "tasks/get", "notifications/tasks", "task");
+        descriptor.routing_headers.clear();
+        descriptor
+    }
+
+    #[test]
+    fn ext_03_final_extension_identifier_wire_grammar_one_variable_negative() {
+        let official = ExtensionId::parse("io.modelcontextprotocol/tasks")
+            .expect("the checked-in official Tasks identifier is a valid extension key");
+        assert_eq!(official.as_str(), "io.modelcontextprotocol/tasks");
+        assert!(ExtensionId::parse("Example/tasks").is_ok());
+
+        assert_eq!(
+            ExtensionId::parse("io.modelcontextprotocol/tasks_"),
+            Err(ExtensionRegistryError::InvalidIdentifier(
+                "io.modelcontextprotocol/tasks_".to_owned()
+            )),
+            "only the terminal non-alphanumeric name byte changes from the admitted official key"
+        );
+    }
+
+    #[test]
+    fn ext_03_tasks_extension_current_request_negotiation_positive() {
+        let id = ExtensionId::parse("io.modelcontextprotocol/tasks")
+            .expect("official Tasks identifier is admitted");
+        let mut registry = ExtensionDescriptorRegistry::new();
+        registry
+            .register(tasks_descriptor(id.clone()))
+            .expect("Tasks request and response members register");
+        registry.freeze().expect("Tasks registry freezes");
+
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(
+                id.clone(),
+                ExtensionSettings::new(json!({})).expect("empty object declares client support"),
+            )]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([(
+                id.clone(),
+                ExtensionSettings::new(json!({})).expect("empty object declares server support"),
+            )]),
+        };
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(id.clone());
+        let mut resolver = |_descriptor: &ExtensionDescriptor,
+                            _client: &ExtensionSettings,
+                            _server: &ExtensionSettings| {
+            Ok(ExtensionSettings::new(json!({})).expect("empty effective Tasks settings"))
+        };
+
+        let negotiated = registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            )
+            .expect("current client and server capabilities negotiate Tasks");
+        assert_eq!(
+            negotiated
+                .admit_method(
+                    &registry,
+                    ProtocolEra::Modern2026,
+                    &id,
+                    "tasks/get",
+                    ExtensionDirection::ClientToServer,
+                )
+                .expect("registered Tasks request is admitted")
+                .id,
+            id
+        );
+        assert_eq!(
+            negotiated
+                .admit_notification(
+                    &registry,
+                    ProtocolEra::Modern2026,
+                    &id,
+                    "notifications/tasks",
+                    ExtensionDirection::ServerToClient,
+                )
+                .expect("registered Tasks notification is admitted")
+                .id,
+            id
+        );
+        assert_eq!(
+            negotiated
+                .admit_result_discriminator(&registry, ProtocolEra::Modern2026, &id, "task")
+                .expect("registered Tasks result discriminator is admitted")
+                .id,
+            id
+        );
+    }
+
+    #[test]
+    fn ext_03_tasks_current_client_capability_one_variable_negative() {
+        let id = ExtensionId::parse("io.modelcontextprotocol/tasks")
+            .expect("official Tasks identifier is admitted");
+        let mut registry = ExtensionDescriptorRegistry::new();
+        registry
+            .register(tasks_descriptor(id.clone()))
+            .expect("Tasks descriptor registers");
+        let receipt = registry.freeze().expect("Tasks registry freezes");
+        let declared_client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(
+                id.clone(),
+                ExtensionSettings::new(json!({})).expect("empty client support declaration"),
+            )]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([(
+                id.clone(),
+                ExtensionSettings::new(json!({})).expect("empty server support declaration"),
+            )]),
+        };
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(id.clone());
+        let resolver_calls = std::cell::Cell::new(0);
+        let mut resolver = |_descriptor: &ExtensionDescriptor,
+                            _client: &ExtensionSettings,
+                            _server: &ExtensionSettings| {
+            resolver_calls.set(resolver_calls.get() + 1);
+            Ok(ExtensionSettings::new(json!({})).expect("empty effective Tasks settings"))
+        };
+
+        registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &declared_client,
+                &server,
+                &mut resolver,
+            )
+            .expect("the baseline current request declares Tasks");
+        assert_eq!(resolver_calls.get(), 1);
+
+        assert_eq!(
+            registry.negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &ClientExtensionDiscovery::default(),
+                &server,
+                &mut resolver,
+            ),
+            Err(ExtensionNegotiationError::OneSidedSupport {
+                id: id.to_string(),
+                missing: ExtensionPeer::Client,
+            }),
+            "only removing the current request's client extension capability rejects Tasks"
+        );
+        assert_eq!(
+            resolver_calls.get(),
+            1,
+            "rejected admission cannot invoke the resolver"
+        );
+        assert_eq!(registry.receipt(), Some(&receipt));
+    }
+
+    #[test]
+    fn ext_03_final_core_method_collision_one_variable_negative() {
+        let baseline = descriptor(
+            ExtensionId::parse("com.example/discover").expect("valid extension ID"),
+            "com.example/discover",
+            "com.example/discover_changed",
+            "com.example/discover_result",
+        );
+        assert!(validate_descriptor(&baseline).is_ok());
+
+        let mut planted = baseline.clone();
+        planted
+            .method
+            .as_mut()
+            .expect("baseline owns an extension method")
+            .name = crate::methods::SERVER_DISCOVER.to_owned();
+        assert_eq!(
+            validate_descriptor(&planted),
+            Err(ExtensionRegistryError::CoreMethodCollision(
+                crate::methods::SERVER_DISCOVER.to_owned()
+            )),
+            "only replacing the extension method with final server/discover makes it invalid"
+        );
     }
 
     #[test]
