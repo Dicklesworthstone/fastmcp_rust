@@ -184,6 +184,9 @@ pub use fastmcp_client::mcp_config;
 // Re-export macros
 pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 
+// REL-QUAR-00 release-quarantine evidence surface
+pub mod release_quarantine;
+
 // Testing module
 pub mod testing;
 
