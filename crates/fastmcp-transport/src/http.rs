@@ -288,7 +288,9 @@ impl ModernHttpSseCollector {
     /// otherwise clean. An unfinished final SSE event is reported in the EOF
     /// error instead of being synthesized into a JSON-RPC message.
     pub fn finish(&mut self, cx: &Cx) -> Result<JsonRpcResponse, ModernHttpSseCollectorError> {
-        Self::checkpoint(cx)?;
+        if let Err(error) = Self::checkpoint(cx) {
+            return Err(self.refuse(error));
+        }
         let decoder = self
             .decoder
             .take()
@@ -8936,6 +8938,56 @@ X-Checksum: abc123\r\n\
                 .expect("EOF returns the one correlated terminal response"),
             response
         );
+    }
+
+    #[test]
+    fn modern_http_sse_collector_finish_returns_one_complete_terminal_response() {
+        let request_id = RequestId::Number(4_208);
+        let response = JsonRpcResponse::success(request_id.clone(), serde_json::json!(true));
+        let response_json = serde_json::to_string(&response).expect("response encodes");
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let mut collector =
+            ModernHttpSseCollector::new(request_id, limits).expect("valid request ID");
+        let cx = Cx::for_testing();
+
+        collector
+            .push(&cx, format!("data: {response_json}\n\n").as_bytes(), |_| {
+                Ok(())
+            })
+            .expect("complete terminal event is admitted before EOF");
+        assert_eq!(
+            collector
+                .finish(&cx)
+                .expect("uncancelled EOF releases the terminal response"),
+            response
+        );
+        assert_collector_is_closed(&mut collector, &cx);
+    }
+
+    #[test]
+    fn modern_http_sse_collector_finish_cancellation_cannot_be_reused() {
+        let request_id = RequestId::Number(4_209);
+        let response = JsonRpcResponse::success(request_id.clone(), serde_json::json!(true));
+        let response_json = serde_json::to_string(&response).expect("response encodes");
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let mut collector =
+            ModernHttpSseCollector::new(request_id, limits).expect("valid request ID");
+        let fresh_cx = Cx::for_testing();
+        let cancelled_cx = Cx::for_testing();
+
+        collector
+            .push(
+                &fresh_cx,
+                format!("data: {response_json}\n\n").as_bytes(),
+                |_| Ok(()),
+            )
+            .expect("terminal response is retained before cancelled EOF");
+        cancelled_cx.set_cancel_requested(true);
+        assert!(matches!(
+            collector.finish(&cancelled_cx),
+            Err(ModernHttpSseCollectorError::Cancelled)
+        ));
+        assert_collector_is_closed(&mut collector, &fresh_cx);
     }
 
     #[test]
