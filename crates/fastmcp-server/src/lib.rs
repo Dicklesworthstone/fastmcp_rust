@@ -1140,9 +1140,7 @@ impl Server {
             capabilities,
             self.info.clone(),
             instructions,
-            Some(DiscoveryCacheHints::with_max_age_seconds(
-                DISCOVERY_CACHE_MAX_AGE_SECONDS,
-            )),
+            DiscoveryCacheHints::private_ttl_ms(u64::from(DISCOVERY_CACHE_MAX_AGE_SECONDS) * 1_000),
         ))
     }
 
