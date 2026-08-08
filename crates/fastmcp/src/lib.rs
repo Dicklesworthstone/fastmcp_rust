@@ -1036,11 +1036,7 @@ mod tests {
             &str,
             auto::JsonValue,
         ) -> auto::McpResult<auto::FinalCallToolResult> = auto::Client::call_tool_final;
-        let _: fn(
-            &mut modern::Client,
-            &str,
-            modern::JsonValue,
-        ) -> modern::McpResult<modern::FinalReadResourceResult> =
+        let _: fn(&mut modern::Client, &str) -> modern::McpResult<modern::FinalReadResourceResult> =
             modern::Client::read_resource_final;
 
         let auto_builder = auto::client_builder();
