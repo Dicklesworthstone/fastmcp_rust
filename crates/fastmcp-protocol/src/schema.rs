@@ -12,6 +12,7 @@
 //!
 //! External references are never resolved through network or filesystem I/O.
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use regex::Regex;
 use serde_json::Value;
 use std::fmt;
@@ -314,6 +315,7 @@ fn validate_final_schema_node(
     validate_boolean_keywords(object, path, &["uniqueItems"])?;
     validate_enum_keyword(object, path)?;
     validate_pattern_keyword(object, path)?;
+    validate_format_keyword(object, path)?;
 
     for keyword in [
         "properties",
@@ -557,6 +559,23 @@ fn validate_pattern_keyword(
             format!("{path}.pattern"),
             "invalid schema pattern",
         ))
+    }
+}
+
+fn validate_format_keyword(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<(), SchemaAdmissionError> {
+    if object
+        .get("format")
+        .is_some_and(|value| !value.is_string())
+    {
+        Err(SchemaAdmissionError::new(
+            format!("{path}.format"),
+            "format must be a string",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1509,6 +1528,194 @@ fn validate_string(
             }
         }
     }
+
+    validate_format(schema, s, path, errors);
+}
+
+fn validate_format(
+    schema: &serde_json::Map<String, Value>,
+    value: &str,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(format) = schema.get("format").and_then(Value::as_str) else {
+        return;
+    };
+
+    let valid = match format {
+        "byte" => BASE64_STANDARD.decode(value).is_ok(),
+        "uri" => is_valid_uri(value),
+        "uri-template" => is_valid_uri_template(value),
+        // Draft 2020-12 permits custom format names. Only the formats pinned
+        // by the final MCP schemas are assertions at this boundary.
+        _ => true,
+    };
+    if !valid {
+        push_error(errors, path, format!("string does not match format {format:?}"));
+    }
+}
+
+fn is_valid_uri(value: &str) -> bool {
+    let Some((scheme, remainder)) = value.split_once(':') else {
+        return false;
+    };
+    is_valid_uri_scheme(scheme) && is_valid_uri_reference_segment(remainder)
+}
+
+fn is_valid_uri_template(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    let mut literal_start = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => {
+                if !is_valid_uri_reference_segment(&value[literal_start..index]) {
+                    return false;
+                }
+                let expression_start = index + 1;
+                let Some(relative_end) = bytes[expression_start..]
+                    .iter()
+                    .position(|byte| *byte == b'}')
+                else {
+                    return false;
+                };
+                let expression_end = expression_start + relative_end;
+                if !is_valid_uri_template_expression(&bytes[expression_start..expression_end]) {
+                    return false;
+                }
+                index = expression_end + 1;
+                literal_start = index;
+            }
+            b'}' => return false,
+            _ => index += 1,
+        }
+    }
+
+    is_valid_uri_reference_segment(&value[literal_start..])
+}
+
+fn is_valid_uri_template_expression(expression: &[u8]) -> bool {
+    let Some((&first, variables)) = expression.split_first() else {
+        return false;
+    };
+    let variables = if matches!(first, b'+' | b'#' | b'.' | b'/' | b';' | b'?' | b'&') {
+        variables
+    } else {
+        expression
+    };
+
+    !variables.is_empty()
+        && variables
+            .split(|byte| *byte == b',')
+            .all(is_valid_uri_template_variable)
+}
+
+fn is_valid_uri_template_variable(variable: &[u8]) -> bool {
+    if let Some(name) = variable.strip_suffix(b"*") {
+        return !name.contains(&b':') && is_valid_uri_template_variable_name(name);
+    }
+    if let Some((name, prefix)) = split_once_byte(variable, b':') {
+        return !prefix.is_empty()
+            && prefix.iter().all(u8::is_ascii_digit)
+            && prefix != b"0"
+            && is_valid_uri_template_variable_name(name);
+    }
+    is_valid_uri_template_variable_name(variable)
+}
+
+fn is_valid_uri_template_variable_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name
+            .split(|byte| *byte == b'.')
+            .all(is_valid_uri_template_variable_name_segment)
+}
+
+fn is_valid_uri_template_variable_name_segment(segment: &[u8]) -> bool {
+    if segment.is_empty() {
+        return false;
+    }
+
+    let mut index = 0;
+    while index < segment.len() {
+        if segment[index] == b'%' {
+            if index + 2 >= segment.len()
+                || !segment[index + 1].is_ascii_hexdigit()
+                || !segment[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else if segment[index].is_ascii_alphanumeric() || segment[index] == b'_' {
+            index += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn split_once_byte(bytes: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
+    let index = bytes.iter().position(|byte| *byte == delimiter)?;
+    Some((&bytes[..index], &bytes[index + 1..]))
+}
+
+fn is_valid_uri_scheme(scheme: &str) -> bool {
+    let bytes = scheme.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes.iter().skip(1).all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'-' | b'.')
+        })
+}
+
+fn is_valid_uri_reference_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else if is_valid_uri_reference_byte(bytes[index]) {
+            index += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_valid_uri_reference_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b':'
+                | b'/'
+                | b'?'
+                | b'#'
+                | b'['
+                | b']'
+                | b'@'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b'%'
+        )
 }
 
 /// Validates number-specific constraints.
@@ -1803,6 +2010,52 @@ mod tests {
                 ]
             })
         );
+    }
+
+    fn final_schema_format_schema() -> AdmittedSchema {
+        admit_final_schema(json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {
+                "data": {"type": "string", "format": "byte"},
+                "uri": {"type": "string", "format": "uri"},
+                "template": {"type": "string", "format": "uri-template"}
+            },
+            "required": ["data", "uri", "template"],
+            "additionalProperties": false
+        }))
+        .expect("the pinned final format family admits")
+    }
+
+    fn final_schema_format_instance() -> Value {
+        json!({
+            "data": "cGlubmVkIGZpbmFs",
+            "uri": "https://example.test/resources?id=1#ready",
+            "template": "mcp://resources/{id}{?cursor}"
+        })
+    }
+
+    #[test]
+    fn final_schema_format_positive() {
+        final_schema_format_schema()
+            .validate(&final_schema_format_instance())
+            .expect("the pinned byte, uri, and uri-template formats validate");
+    }
+
+    #[test]
+    fn final_schema_format_planted_negative() {
+        let schema = final_schema_format_schema();
+        let accepted = final_schema_format_instance();
+        let mut planted = accepted.clone();
+        planted["uri"] = json!("not a uri");
+
+        let errors = schema
+            .validate(&planted)
+            .expect_err("changing only the uri field to a non-URI must reject");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "root.uri");
+        assert_eq!(errors[0].message, "string does not match format \"uri\"");
+        assert_eq!(accepted, final_schema_format_instance());
     }
 
     #[test]
