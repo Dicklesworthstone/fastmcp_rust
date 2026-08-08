@@ -51,13 +51,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use asupersync::Cx;
-use fastmcp_core::{McpError, McpResult, block_on};
+use fastmcp_core::{CanonicalHttpUrl, McpError, McpResult, block_on};
 use fastmcp_transport::StdioTransport;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::{
     ChildGuard, Client, ClientSession, RequestTimeoutPolicy, combine_cleanup_results,
     combine_operation_with_cleanup, resolve_stdio_command, transport_error_to_mcp,
+};
+use fastmcp_protocol::protocol_policy::{
+    HttpEndpointBundle, HttpEndpointBundleError, HttpRouteKind, ProtocolPolicy,
 };
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 
@@ -114,6 +117,13 @@ pub struct ServerConfig {
     /// Whether the server is disabled.
     #[serde(default)]
     pub disabled: bool,
+
+    /// Optional immutable HTTP route configuration for this server.
+    ///
+    /// This config is separate from the stdio command surface. It never
+    /// derives a route from a peer, discovery response, redirect, or origin.
+    #[serde(default)]
+    http: Option<HttpEndpointConfig>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -124,6 +134,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("env_var_count", &self.env.len())
             .field("cwd_set", &self.cwd.is_some())
             .field("disabled", &self.disabled)
+            .field("http_configured", &self.http.is_some())
             .finish()
     }
 }
@@ -138,6 +149,7 @@ impl ServerConfig {
             env: HashMap::new(),
             cwd: None,
             disabled: false,
+            http: None,
         }
     }
 
@@ -167,6 +179,329 @@ impl ServerConfig {
     pub fn disabled(mut self) -> Self {
         self.disabled = true;
         self
+    }
+
+    /// Attaches an already validated, immutable HTTP endpoint configuration.
+    #[must_use]
+    pub fn with_http_endpoint_config(mut self, http: HttpEndpointConfig) -> Self {
+        self.http = Some(http);
+        self
+    }
+
+    /// Returns this server's immutable HTTP endpoint configuration, if any.
+    #[must_use]
+    pub const fn http_endpoint_config(&self) -> Option<&HttpEndpointConfig> {
+        self.http.as_ref()
+    }
+}
+
+/// Typed refusal while parsing configured HTTP endpoint routes.
+///
+/// The error deliberately retains route roles rather than raw endpoint text,
+/// so configuration diagnostics do not disclose query values or userinfo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpEndpointConfigError {
+    /// A configured target is not a canonical HTTP(S) URL.
+    InvalidTarget {
+        /// The configured route whose URL was rejected.
+        route: HttpRouteKind,
+    },
+    /// HTTP endpoint URLs cannot carry credentials in their authority.
+    UserinfoNotAllowed {
+        /// The configured route whose URL carried userinfo.
+        route: HttpRouteKind,
+    },
+    /// The policy required a modern POST route that was not configured.
+    MissingModernPostTarget {
+        /// The explicit policy being validated.
+        policy: ProtocolPolicy,
+    },
+    /// The policy required a legacy SSE GET route that was not configured.
+    MissingLegacySseTarget {
+        /// The explicit policy being validated.
+        policy: ProtocolPolicy,
+    },
+    /// The policy required a legacy message POST route that was not configured.
+    MissingLegacyMessagePostTarget {
+        /// The explicit policy being validated.
+        policy: ProtocolPolicy,
+    },
+    /// A configured route included an HTTP fragment.
+    FragmentNotAllowed {
+        /// The configured route whose fragment was rejected.
+        route: HttpRouteKind,
+    },
+    /// Two configured routes collide on the same method and canonical target.
+    RouteCollision {
+        /// The first colliding configured route.
+        first: HttpRouteKind,
+        /// The second colliding configured route.
+        second: HttpRouteKind,
+    },
+}
+
+impl std::fmt::Display for HttpEndpointConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTarget { route } => {
+                write!(
+                    formatter,
+                    "configured {route} target is not a valid HTTP(S) URL"
+                )
+            }
+            Self::UserinfoNotAllowed { route } => {
+                write!(
+                    formatter,
+                    "configured {route} target must not contain userinfo"
+                )
+            }
+            Self::MissingModernPostTarget { policy } => write!(
+                formatter,
+                "{policy:?} requires an explicit modern MCP POST target"
+            ),
+            Self::MissingLegacySseTarget { policy } => write!(
+                formatter,
+                "{policy:?} requires an explicit legacy SSE GET target"
+            ),
+            Self::MissingLegacyMessagePostTarget { policy } => write!(
+                formatter,
+                "{policy:?} requires an explicit legacy message POST target"
+            ),
+            Self::FragmentNotAllowed { route } => {
+                write!(
+                    formatter,
+                    "configured {route} target must not contain a fragment"
+                )
+            }
+            Self::RouteCollision { first, second } => {
+                write!(formatter, "configured {first} and {second} routes collide")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HttpEndpointConfigError {}
+
+impl From<HttpEndpointBundleError> for HttpEndpointConfigError {
+    fn from(error: HttpEndpointBundleError) -> Self {
+        match error {
+            HttpEndpointBundleError::MissingModernPostTarget { policy } => {
+                Self::MissingModernPostTarget { policy }
+            }
+            HttpEndpointBundleError::MissingLegacySseTarget { policy } => {
+                Self::MissingLegacySseTarget { policy }
+            }
+            HttpEndpointBundleError::MissingLegacyMessagePostTarget { policy } => {
+                Self::MissingLegacyMessagePostTarget { policy }
+            }
+            HttpEndpointBundleError::FragmentNotAllowed { route } => {
+                Self::FragmentNotAllowed { route }
+            }
+            HttpEndpointBundleError::RouteCollision { first, second, .. } => {
+                Self::RouteCollision { first, second }
+            }
+        }
+    }
+}
+
+/// Immutable HTTP endpoint configuration constructed from trusted local input.
+///
+/// The serialized form is a nested `http` object on a server configuration:
+///
+/// ```json
+/// {
+///   "policy": "Auto",
+///   "modernPost": "https://mcp.example.test/mcp",
+///   "legacySse": "https://mcp.example.test/sse",
+///   "legacyMessagePost": "https://mcp.example.test/messages",
+///   "credentialPartition": "credential-v1",
+///   "securityPartition": "security-v1",
+///   "transportProfile": "http-sse-v2",
+///   "policyGeneration": 1,
+///   "configurationGeneration": 1,
+///   "legacyReceiptGeneration": 1
+/// }
+/// ```
+///
+/// `policy` is intentionally required. `Auto`, `ModernOnly`, and
+/// `LegacyOnly` are distinct immutable selections, not strings that may be
+/// changed after a peer response or a failed request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HttpEndpointConfig {
+    policy: ProtocolPolicy,
+    modern_post: Option<CanonicalHttpUrl>,
+    legacy_sse: Option<CanonicalHttpUrl>,
+    legacy_message_post: Option<CanonicalHttpUrl>,
+    credential_partition: String,
+    security_partition: String,
+    transport_profile: String,
+    policy_generation: u64,
+    configuration_generation: u64,
+    legacy_receipt_generation: u64,
+    bundle: HttpEndpointBundle,
+}
+
+impl std::fmt::Debug for HttpEndpointConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpEndpointConfig")
+            .field("policy", &self.policy)
+            .field("modern_post_configured", &self.modern_post.is_some())
+            .field("legacy_sse_configured", &self.legacy_sse.is_some())
+            .field(
+                "legacy_message_post_configured",
+                &self.legacy_message_post.is_some(),
+            )
+            .field("policy_generation", &self.policy_generation)
+            .field("configuration_generation", &self.configuration_generation)
+            .field("legacy_receipt_generation", &self.legacy_receipt_generation)
+            .finish()
+    }
+}
+
+impl HttpEndpointConfig {
+    /// Validates trusted endpoint configuration and freezes its bundle key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        policy: ProtocolPolicy,
+        modern_post: Option<String>,
+        legacy_sse: Option<String>,
+        legacy_message_post: Option<String>,
+        credential_partition: String,
+        security_partition: String,
+        transport_profile: String,
+        policy_generation: u64,
+        configuration_generation: u64,
+        legacy_receipt_generation: u64,
+    ) -> Result<Self, HttpEndpointConfigError> {
+        let modern_post = parse_configured_target(modern_post, HttpRouteKind::ModernMcpPost)?;
+        let legacy_sse = parse_configured_target(legacy_sse, HttpRouteKind::LegacySseGet)?;
+        let legacy_message_post =
+            parse_configured_target(legacy_message_post, HttpRouteKind::LegacyMessagePost)?;
+        let bundle = HttpEndpointBundle::new(
+            policy,
+            modern_post.clone(),
+            legacy_sse.clone(),
+            legacy_message_post.clone(),
+            credential_partition.clone(),
+            security_partition.clone(),
+            transport_profile.clone(),
+            policy_generation,
+            configuration_generation,
+            legacy_receipt_generation,
+        )
+        .map_err(HttpEndpointConfigError::from)?;
+
+        Ok(Self {
+            policy,
+            modern_post,
+            legacy_sse,
+            legacy_message_post,
+            credential_partition,
+            security_partition,
+            transport_profile,
+            policy_generation,
+            configuration_generation,
+            legacy_receipt_generation,
+            bundle,
+        })
+    }
+
+    /// Returns the explicitly configured, immutable protocol policy.
+    #[must_use]
+    pub const fn policy(&self) -> ProtocolPolicy {
+        self.policy
+    }
+
+    /// Returns the validated immutable HTTP endpoint bundle.
+    #[must_use]
+    pub const fn endpoint_bundle(&self) -> &HttpEndpointBundle {
+        &self.bundle
+    }
+}
+
+fn parse_configured_target(
+    target: Option<String>,
+    route: HttpRouteKind,
+) -> Result<Option<CanonicalHttpUrl>, HttpEndpointConfigError> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let target = CanonicalHttpUrl::parse(&target)
+        .map_err(|_| HttpEndpointConfigError::InvalidTarget { route })?;
+    if target.has_userinfo() {
+        return Err(HttpEndpointConfigError::UserinfoNotAllowed { route });
+    }
+    Ok(Some(target))
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HttpEndpointConfigWire {
+    policy: ProtocolPolicy,
+    #[serde(default)]
+    modern_post: Option<String>,
+    #[serde(default)]
+    legacy_sse: Option<String>,
+    #[serde(default)]
+    legacy_message_post: Option<String>,
+    credential_partition: String,
+    security_partition: String,
+    transport_profile: String,
+    policy_generation: u64,
+    configuration_generation: u64,
+    legacy_receipt_generation: u64,
+}
+
+impl<'de> Deserialize<'de> for HttpEndpointConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = HttpEndpointConfigWire::deserialize(deserializer)?;
+        Self::new(
+            wire.policy,
+            wire.modern_post,
+            wire.legacy_sse,
+            wire.legacy_message_post,
+            wire.credential_partition,
+            wire.security_partition,
+            wire.transport_profile,
+            wire.policy_generation,
+            wire.configuration_generation,
+            wire.legacy_receipt_generation,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+impl Serialize for HttpEndpointConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        HttpEndpointConfigWire {
+            policy: self.policy,
+            modern_post: self
+                .modern_post
+                .as_ref()
+                .map(|target| target.as_str().to_owned()),
+            legacy_sse: self
+                .legacy_sse
+                .as_ref()
+                .map(|target| target.as_str().to_owned()),
+            legacy_message_post: self
+                .legacy_message_post
+                .as_ref()
+                .map(|target| target.as_str().to_owned()),
+            credential_partition: self.credential_partition.clone(),
+            security_partition: self.security_partition.clone(),
+            transport_profile: self.transport_profile.clone(),
+            policy_generation: self.policy_generation,
+            configuration_generation: self.configuration_generation,
+            legacy_receipt_generation: self.legacy_receipt_generation,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -775,6 +1110,150 @@ mod tests {
         let config = McpConfig::new();
         assert!(config.mcp_servers.is_empty());
         assert!(config.server_names().is_empty());
+    }
+
+    #[test]
+    fn explicit_http_policies_parse_to_immutable_endpoint_bundles() {
+        let config = McpConfig::from_json(
+            r#"{
+                "mcpServers": {
+                    "modern": {
+                        "command": "unused",
+                        "http": {
+                            "policy": "ModernOnly",
+                            "modernPost": "https://modern.example.test/mcp",
+                            "credentialPartition": "credential-a",
+                            "securityPartition": "security-a",
+                            "transportProfile": "http-sse-v2",
+                            "policyGeneration": 3,
+                            "configurationGeneration": 5,
+                            "legacyReceiptGeneration": 7
+                        }
+                    },
+                    "legacy": {
+                        "command": "unused",
+                        "http": {
+                            "policy": "LegacyOnly",
+                            "legacySse": "https://legacy.example.test/sse",
+                            "legacyMessagePost": "https://legacy.example.test/messages",
+                            "credentialPartition": "credential-b",
+                            "securityPartition": "security-b",
+                            "transportProfile": "http-sse-v2",
+                            "policyGeneration": 3,
+                            "configurationGeneration": 5,
+                            "legacyReceiptGeneration": 7
+                        }
+                    },
+                    "auto": {
+                        "command": "unused",
+                        "http": {
+                            "policy": "Auto",
+                            "modernPost": "https://auto.example.test/mcp",
+                            "legacySse": "https://auto.example.test/sse",
+                            "legacyMessagePost": "https://auto.example.test/messages",
+                            "credentialPartition": "credential-c",
+                            "securityPartition": "security-c",
+                            "transportProfile": "http-sse-v2",
+                            "policyGeneration": 3,
+                            "configurationGeneration": 5,
+                            "legacyReceiptGeneration": 7
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("every explicit policy with its required routes is valid");
+
+        let modern = config
+            .get_server("modern")
+            .and_then(ServerConfig::http_endpoint_config)
+            .expect("modern config must retain its immutable bundle");
+        let legacy = config
+            .get_server("legacy")
+            .and_then(ServerConfig::http_endpoint_config)
+            .expect("legacy config must retain its immutable bundle");
+        let auto = config
+            .get_server("auto")
+            .and_then(ServerConfig::http_endpoint_config)
+            .expect("auto config must retain its immutable bundle");
+
+        assert_eq!(modern.policy(), ProtocolPolicy::ModernOnly);
+        assert_eq!(legacy.policy(), ProtocolPolicy::LegacyOnly);
+        assert_eq!(auto.policy(), ProtocolPolicy::Auto);
+
+        let original_auto_key = auto.endpoint_bundle().key();
+        let serialized = config.to_json();
+        let reparsed = McpConfig::from_json(&serialized)
+            .expect("canonical endpoint configuration must round-trip");
+        let reparsed_auto = reparsed
+            .get_server("auto")
+            .and_then(ServerConfig::http_endpoint_config)
+            .expect("round-tripped auto config must retain its immutable bundle");
+        assert_eq!(reparsed_auto.endpoint_bundle().key(), original_auto_key);
+    }
+
+    #[test]
+    fn auto_endpoint_bundle_rejects_only_a_missing_legacy_message_post() {
+        let accepted = HttpEndpointConfig::new(
+            ProtocolPolicy::Auto,
+            Some("https://auto.example.test/mcp".to_owned()),
+            Some("https://auto.example.test/sse".to_owned()),
+            Some("https://auto.example.test/messages".to_owned()),
+            "credential-c".to_owned(),
+            "security-c".to_owned(),
+            "http-sse-v2".to_owned(),
+            3,
+            5,
+            7,
+        )
+        .expect("the accepted auto bundle has every required route");
+        let accepted_key = accepted.endpoint_bundle().key();
+
+        // The only changed input is the missing legacy message POST target.
+        // The accepted bundle is immutable, so this failed construction cannot
+        // mutate its endpoint key or make it share a cache identity.
+        let refusal = HttpEndpointConfig::new(
+            ProtocolPolicy::Auto,
+            Some("https://auto.example.test/mcp".to_owned()),
+            Some("https://auto.example.test/sse".to_owned()),
+            None,
+            "credential-c".to_owned(),
+            "security-c".to_owned(),
+            "http-sse-v2".to_owned(),
+            3,
+            5,
+            7,
+        )
+        .expect_err("Auto must reject a missing explicit legacy message POST target");
+        assert_eq!(
+            refusal,
+            HttpEndpointConfigError::MissingLegacyMessagePostTarget {
+                policy: ProtocolPolicy::Auto,
+            }
+        );
+        let parse_error = McpConfig::from_json(
+            r#"{
+                "mcpServers": {
+                    "auto": {
+                        "command": "unused",
+                        "http": {
+                            "policy": "Auto",
+                            "modernPost": "https://auto.example.test/mcp",
+                            "legacySse": "https://auto.example.test/sse",
+                            "credentialPartition": "credential-c",
+                            "securityPartition": "security-c",
+                            "transportProfile": "http-sse-v2",
+                            "policyGeneration": 3,
+                            "configurationGeneration": 5,
+                            "legacyReceiptGeneration": 7
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect_err("config parsing must run endpoint-bundle validation");
+        assert!(matches!(parse_error, ConfigError::ParseError(_)));
+        assert_eq!(accepted.endpoint_bundle().key(), accepted_key);
     }
 
     #[test]
