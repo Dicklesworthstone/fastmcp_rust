@@ -1946,6 +1946,21 @@ exec sleep 2
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum HttpProxyPublicPath {
+        Catalog,
+        Handler,
+    }
+
+    impl HttpProxyPublicPath {
+        const fn name(self) -> &'static str {
+            match self {
+                Self::Catalog => "catalog",
+                Self::Handler => "handler",
+            }
+        }
+    }
+
     #[test]
     fn proxy_outbound_http_auto_modern_catalog_and_handler_use_negotiated_backend() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
@@ -2328,6 +2343,295 @@ exec sleep 2
                 .expect("second modern probe JSON")["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"],
             serde_json::json!({"roots": {"listChanged": true}})
         );
+    }
+
+    #[test]
+    fn proxy_http_modern_response_id_mismatch_rejects_public_catalog_and_handler() {
+        for path in [HttpProxyPublicPath::Catalog, HttpProxyPublicPath::Handler] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
+            let address = listener
+                .local_addr()
+                .expect("read native HTTP listener address");
+            let modern_target = format!("http://{address}/mcp");
+            let legacy_sse_target = format!("http://{address}/legacy-sse");
+            let legacy_message_target = format!("http://{address}/legacy-message");
+            let responses = match path {
+                HttpProxyPublicPath::Catalog => vec![br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[{"name":"echo","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}"#.to_vec()],
+                HttpProxyPublicPath::Handler => vec![
+                    br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"echo","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}"#.to_vec(),
+                    br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","resources":[],"ttlMs":0,"cacheScope":"private"}}"#.to_vec(),
+                    br#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","resourceTemplates":[],"ttlMs":0,"cacheScope":"private"}}"#.to_vec(),
+                    br#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","prompts":[],"ttlMs":0,"cacheScope":"private"}}"#.to_vec(),
+                    br#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","content":[{"type":"text","text":"forwarded"}]}}"#.to_vec(),
+                ],
+            };
+            let expected_methods: Vec<&str> = match path {
+                HttpProxyPublicPath::Catalog => vec!["tools/list"],
+                HttpProxyPublicPath::Handler => vec![
+                    "tools/list",
+                    "resources/list",
+                    "resources/templates/list",
+                    "prompts/list",
+                    "tools/call",
+                ],
+            };
+            let server = thread::spawn(move || {
+                let (mut probe, _) = listener.accept().expect("accept modern probe");
+                let probe_request = read_http_request(&mut probe);
+                write_http_response(
+                    &mut probe,
+                    200,
+                    "application/json",
+                    br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+                );
+
+                let mut requests = Vec::new();
+                for response in responses {
+                    let (mut request, _) = listener.accept().expect("accept public proxy request");
+                    let request = read_http_request(&mut request);
+                    write_http_response(&mut request, 200, "application/json", &response);
+                    requests.push(request);
+                }
+                (probe_request, requests)
+            });
+            let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
+            let mut bindings = ProxyClient::upstream_binding_registry();
+            let route = format!("modern-id-mismatch-{}", path.name());
+            let transport = format!("native-h1:{route}");
+            let proxy = bindings
+                .connect_http_with_protocol_plan(
+                    &route,
+                    &transport,
+                    14,
+                    plan.clone(),
+                    proxy_http_client_info(),
+                    ClientCapabilities::default(),
+                    Cx::for_request(),
+                )
+                .expect("modern discovery opens the public proxy backend");
+            let binding = proxy.upstream_binding().expect("live binding is retained");
+
+            let error = match path {
+                HttpProxyPublicPath::Catalog => proxy
+                    .catalog()
+                    .expect_err("changing only the catalog response ID must fail closed"),
+                HttpProxyPublicPath::Handler => {
+                    let catalog = proxy
+                        .catalog()
+                        .expect("only the later handler response ID is mismatched");
+                    ProxyToolHandler::new(
+                        catalog
+                            .tools
+                            .first()
+                            .expect("catalog returns the remote tool before the mismatch")
+                            .clone(),
+                        proxy.clone(),
+                    )
+                    .call(
+                        &McpContext::new(Cx::for_testing(), 710),
+                        serde_json::json!({}),
+                    )
+                    .expect_err("changing only the handler response ID must fail closed")
+                }
+            };
+
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(bindings.live_http.len(), 1);
+            let cached = bindings
+                .connect_http_with_protocol_plan(
+                    &route,
+                    &transport,
+                    14,
+                    plan,
+                    proxy_http_client_info(),
+                    ClientCapabilities::default(),
+                    Cx::for_request(),
+                )
+                .expect("a response-ID refusal must not alter the selected cache binding");
+            assert_eq!(cached.upstream_binding(), Some(binding));
+            assert_eq!(bindings.live_http.len(), 1);
+
+            let (probe, requests) = server.join().expect("modern ID-mismatch server must join");
+            assert!(probe.head.contains("Mcp-Method: server/discover\r\n"));
+            assert_eq!(requests.len(), expected_methods.len());
+            for (index, (request, method)) in requests.iter().zip(expected_methods).enumerate() {
+                assert!(request.head.contains(&format!("Mcp-Method: {method}\r\n")));
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&request.body)
+                        .expect("modern public proxy request JSON")["id"],
+                    serde_json::json!(index as i64 + 2)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_http_legacy_response_id_mismatch_rejects_public_catalog_and_handler() {
+        for path in [HttpProxyPublicPath::Catalog, HttpProxyPublicPath::Handler] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
+            let address = listener
+                .local_addr()
+                .expect("read native HTTP listener address");
+            let modern_target = format!("http://{address}/mcp");
+            let legacy_sse_target = format!("http://{address}/legacy-sse");
+            let legacy_message_target = format!("http://{address}/legacy-message?session=proof");
+            let expected_message_target = legacy_message_target.clone();
+            let initialize_result = serde_json::to_value(fastmcp_protocol::InitializeResult {
+                protocol_version: fastmcp_protocol::PROTOCOL_VERSION.to_owned(),
+                capabilities: fastmcp_protocol::ServerCapabilities::default(),
+                server_info: fastmcp_protocol::ServerInfo {
+                    name: "legacy-id-mismatch-peer".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                instructions: None,
+            })
+            .expect("serialize legacy initialize result");
+            let tools_result = serde_json::json!({
+                "tools": [{"name": "echo", "inputSchema": {}}]
+            });
+            let messages = match path {
+                HttpProxyPublicPath::Catalog => vec![(1, initialize_result), (3, tools_result)],
+                HttpProxyPublicPath::Handler => vec![
+                    (1, initialize_result),
+                    (2, tools_result),
+                    (3, serde_json::json!({"resources": []})),
+                    (4, serde_json::json!({"resourceTemplates": []})),
+                    (5, serde_json::json!({"prompts": []})),
+                    (
+                        7,
+                        serde_json::json!({"content": [{"type": "text", "text": "forwarded"}]}),
+                    ),
+                ],
+            };
+            let expected_methods: Vec<&str> = match path {
+                HttpProxyPublicPath::Catalog => {
+                    vec!["initialize", "notifications/initialized", "tools/list"]
+                }
+                HttpProxyPublicPath::Handler => vec![
+                    "initialize",
+                    "notifications/initialized",
+                    "tools/list",
+                    "resources/list",
+                    "resources/templates/list",
+                    "prompts/list",
+                    "tools/call",
+                ],
+            };
+            let expected_post_count = expected_methods.len();
+            let expected_request_ids: Vec<Option<i64>> = match path {
+                HttpProxyPublicPath::Catalog => vec![Some(1), None, Some(2)],
+                HttpProxyPublicPath::Handler => {
+                    vec![Some(1), None, Some(2), Some(3), Some(4), Some(5), Some(6)]
+                }
+            };
+            let server = thread::spawn(move || {
+                let (mut probe, _) = listener.accept().expect("accept disposable modern probe");
+                let probe_request = read_http_request(&mut probe);
+                write_http_response(&mut probe, 404, "text/plain", b"");
+
+                let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+                let sse_request = read_http_request(&mut sse);
+                let mut body = format!("event: endpoint\ndata: {expected_message_target}\n\n");
+                for (id, result) in messages {
+                    let message = fastmcp_protocol::JsonRpcMessage::Response(
+                        fastmcp_protocol::JsonRpcResponse::success(
+                            fastmcp_protocol::RequestId::Number(id),
+                            result,
+                        ),
+                    );
+                    body.push_str("event: message\ndata: ");
+                    body.push_str(&serde_json::to_string(&message).expect("serialize SSE message"));
+                    body.push_str("\n\n");
+                }
+                write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
+
+                let mut posts = Vec::new();
+                for _ in 0..expected_post_count {
+                    let (mut post, _) = listener.accept().expect("accept advertised legacy POST");
+                    let request = read_http_request(&mut post);
+                    write_http_response(&mut post, 202, "application/json", b"");
+                    posts.push(request);
+                }
+                (probe_request, sse_request, posts)
+            });
+            let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
+            let mut bindings = ProxyClient::upstream_binding_registry();
+            let route = format!("legacy-id-mismatch-{}", path.name());
+            let transport = format!("native-h1:{route}");
+            let proxy = bindings
+                .connect_http_with_protocol_plan(
+                    &route,
+                    &transport,
+                    15,
+                    plan.clone(),
+                    proxy_http_client_info(),
+                    ClientCapabilities::default(),
+                    Cx::for_request(),
+                )
+                .expect("authorized modern refusal opens the public legacy proxy backend");
+            let binding = proxy.upstream_binding().expect("live binding is retained");
+
+            let error = match path {
+                HttpProxyPublicPath::Catalog => proxy
+                    .catalog()
+                    .expect_err("changing only the legacy catalog response ID must fail closed"),
+                HttpProxyPublicPath::Handler => {
+                    let catalog = proxy
+                        .catalog()
+                        .expect("only the later legacy handler response ID is mismatched");
+                    ProxyToolHandler::new(
+                        catalog
+                            .tools
+                            .first()
+                            .expect("catalog returns the remote tool before the mismatch")
+                            .clone(),
+                        proxy.clone(),
+                    )
+                    .call(
+                        &McpContext::new(Cx::for_testing(), 711),
+                        serde_json::json!({}),
+                    )
+                    .expect_err("changing only the legacy handler response ID must fail closed")
+                }
+            };
+
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(bindings.live_http.len(), 1);
+            let cached = bindings
+                .connect_http_with_protocol_plan(
+                    &route,
+                    &transport,
+                    15,
+                    plan,
+                    proxy_http_client_info(),
+                    ClientCapabilities::default(),
+                    Cx::for_request(),
+                )
+                .expect("a legacy response-ID refusal must not alter the selected cache binding");
+            assert_eq!(cached.upstream_binding(), Some(binding));
+            assert_eq!(bindings.live_http.len(), 1);
+
+            let (probe, sse, posts) = server.join().expect("legacy ID-mismatch server must join");
+            assert!(probe.head.contains("Mcp-Method: server/discover\r\n"));
+            assert!(sse.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            assert_eq!(posts.len(), expected_methods.len());
+            for ((request, method), expected_id) in
+                posts.iter().zip(expected_methods).zip(expected_request_ids)
+            {
+                assert!(
+                    request
+                        .head
+                        .starts_with("POST /legacy-message?session=proof HTTP/1.1\r\n")
+                );
+                let message = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("legacy public proxy request JSON");
+                assert_eq!(message["method"], method);
+                match expected_id {
+                    Some(expected_id) => assert_eq!(message["id"], serde_json::json!(expected_id)),
+                    None => assert!(message.get("id").is_none()),
+                }
+            }
+        }
     }
 
     #[test]
