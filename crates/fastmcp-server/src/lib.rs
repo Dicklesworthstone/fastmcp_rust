@@ -641,6 +641,8 @@ struct DispatchQueueStateInner {
     /// Reserved requests that a worker has begun dispatching.
     dispatching: HashSet<CorrelationKey>,
     cancelled: HashSet<CorrelationKey>,
+    modern_cancellations: HashMap<u64, McpRequestCancellation>,
+    next_modern_cancellation_id: u64,
     queued_bytes: usize,
     modern_in_flight: usize,
     stopping: bool,
@@ -717,6 +719,36 @@ impl DispatchQueueState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.queued_bytes = inner.queued_bytes.saturating_sub(serialized_bytes);
+    }
+
+    /// Registers the request-local cancellation domain retained by a modern
+    /// child. This covers notifications as well as correlated requests: the
+    /// latter are also indexed by `Server::active_requests`, while a
+    /// notification has no wire id to index there.
+    fn register_modern_cancellation(&self, cancellation: McpRequestCancellation) -> u64 {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cancellation_id = inner.next_modern_cancellation_id;
+        inner.next_modern_cancellation_id = inner.next_modern_cancellation_id.wrapping_add(1);
+        if inner.stopping {
+            cancellation.cancel();
+        } else {
+            let previous = inner
+                .modern_cancellations
+                .insert(cancellation_id, cancellation);
+            debug_assert!(previous.is_none());
+        }
+        cancellation_id
+    }
+
+    fn unregister_modern_cancellation(&self, cancellation_id: u64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.modern_cancellations.remove(&cancellation_id);
     }
 
     /// Reserves one bounded modern request slot before it is submitted to the
@@ -816,17 +848,27 @@ impl DispatchQueueState {
     }
 
     fn stop(&self) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.stopping = true;
-        let queued = inner
-            .reserved
-            .difference(&inner.dispatching)
-            .cloned()
-            .collect::<Vec<_>>();
-        inner.cancelled.extend(queued);
+        let cancellations = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.stopping = true;
+            let queued = inner
+                .reserved
+                .difference(&inner.dispatching)
+                .cloned()
+                .collect::<Vec<_>>();
+            inner.cancelled.extend(queued);
+            inner
+                .modern_cancellations
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
     }
 }
 
@@ -885,6 +927,8 @@ struct ModernDispatchReservation {
     queue: Arc<DispatchQueueState>,
     request_id: Option<RequestId>,
     serialized_bytes: usize,
+    cancellation: McpRequestCancellation,
+    cancellation_id: u64,
     failed: Arc<AtomicBool>,
     failure_latched: bool,
 }
@@ -896,10 +940,14 @@ impl ModernDispatchReservation {
         serialized_bytes: usize,
         failed: Arc<AtomicBool>,
     ) -> Self {
+        let cancellation = McpRequestCancellation::new();
+        let cancellation_id = queue.register_modern_cancellation(cancellation.clone());
         Self {
             queue,
             request_id,
             serialized_bytes,
+            cancellation,
+            cancellation_id,
             failed,
             failure_latched: false,
         }
@@ -911,6 +959,10 @@ impl ModernDispatchReservation {
 
     fn disarm_failure(&mut self) {
         self.failure_latched = false;
+    }
+
+    fn cancellation(&self) -> McpRequestCancellation {
+        self.cancellation.clone()
     }
 }
 
@@ -925,6 +977,8 @@ impl Drop for ModernDispatchReservation {
         if let Some(id) = self.request_id.as_ref() {
             self.queue.discard(id);
         }
+        self.queue
+            .unregister_modern_cancellation(self.cancellation_id);
         self.queue.release_queued_bytes(self.serialized_bytes);
         self.queue.release_modern_slot();
     }
@@ -4631,12 +4685,14 @@ impl Server {
                                     if let Some(renderer) = &request_renderer {
                                         renderer.render_request(&request, &request_server.console);
                                     }
-                                    let active_guard = match request.id.clone() {
-                                        Some(id) => match ActiveRequestGuard::try_new(
+                                    let request_cancellation = reservation.cancellation();
+                                    let _active_guard = match request.id.clone() {
+                                        Some(id) => match ActiveRequestGuard::try_new_with_cancellation(
                                             Arc::clone(&request_server.active_requests),
                                             session_id,
                                             id.clone(),
                                             request_cx.clone(),
+                                            request_cancellation.clone(),
                                         ) {
                                             Ok(guard) => Some(guard),
                                             Err(_) => {
@@ -4662,9 +4718,6 @@ impl Server {
                                         },
                                         None => None,
                                     };
-                                    let request_cancellation = active_guard
-                                        .as_ref()
-                                        .map(ActiveRequestGuard::cancellation);
                                     match reservation
                                         .queue
                                         .begin_modern_dispatch(request.id.as_ref())
@@ -4703,7 +4756,7 @@ impl Server {
                                                     request_server.protocol_policy,
                                                     &inbound,
                                                     &request,
-                                                    request_cancellation.clone(),
+                                                    Some(request_cancellation.clone()),
                                                 );
                                             let send_result = response.map_or(Ok(()), |mut response| {
                                                 let mut send_guard = request_send
@@ -4711,12 +4764,7 @@ impl Server {
                                                     .unwrap_or_else(
                                                         std::sync::PoisonError::into_inner,
                                                     );
-                                                if request_cancellation
-                                                    .as_ref()
-                                                    .is_some_and(|cancellation| {
-                                                        !cancellation.begin_finalization()
-                                                    })
-                                                {
+                                                if !request_cancellation.begin_finalization() {
                                                     response = JsonRpcResponse::error(
                                                         response.id.clone(),
                                                         JsonRpcError {
@@ -7494,10 +7542,18 @@ impl ActiveRequestKey {
 
 impl ActiveRequest {
     fn new(cx: Cx, completion: Arc<RequestCompletion>) -> Self {
+        Self::with_cancellation(cx, completion, McpRequestCancellation::new())
+    }
+
+    fn with_cancellation(
+        cx: Cx,
+        completion: Arc<RequestCompletion>,
+        cancellation: McpRequestCancellation,
+    ) -> Self {
         let region_id = cx.region_id();
         Self {
             cx,
-            cancellation: McpRequestCancellation::new(),
+            cancellation,
             region_id,
             completion,
         }
@@ -7518,9 +7574,18 @@ impl ActiveRequestGuard {
         id: RequestId,
         cx: Cx,
     ) -> Result<Self, RequestId> {
+        Self::try_new_with_cancellation(map, session_id, id, cx, McpRequestCancellation::new())
+    }
+
+    fn try_new_with_cancellation(
+        map: Arc<Mutex<HashMap<ActiveRequestKey, ActiveRequest>>>,
+        session_id: u64,
+        id: RequestId,
+        cx: Cx,
+        cancellation: McpRequestCancellation,
+    ) -> Result<Self, RequestId> {
         let completion = Arc::new(RequestCompletion::new());
-        let entry = ActiveRequest::new(cx, completion.clone());
-        let cancellation = entry.cancellation.clone();
+        let entry = ActiveRequest::with_cancellation(cx, completion.clone(), cancellation.clone());
         let mut guard = map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -10882,6 +10947,67 @@ mod lib_unit_tests {
     }
 
     #[derive(Default)]
+    struct LiveModernNotificationControl {
+        started: Mutex<bool>,
+        cancelled: AtomicBool,
+        changed: Condvar,
+    }
+
+    impl LiveModernNotificationControl {
+        fn wait_for_started(&self, timeout: Duration) -> bool {
+            let started = self
+                .started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (started, _) = self
+                .changed
+                .wait_timeout_while(started, timeout, |started| !*started)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *started
+        }
+
+        fn was_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+    }
+
+    struct LiveModernBlockingNotificationMiddleware {
+        control: Arc<LiveModernNotificationControl>,
+    }
+
+    impl Middleware for LiveModernBlockingNotificationMiddleware {
+        fn on_request(
+            &self,
+            ctx: &McpContext,
+            request: &JsonRpcRequest,
+        ) -> McpResult<MiddlewareDecision> {
+            if request.method != "notifications/initialized" {
+                return Ok(MiddlewareDecision::Continue);
+            }
+            {
+                let mut started = self
+                    .control
+                    .started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *started = true;
+                self.control.changed.notify_all();
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !ctx.is_cancelled() && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            if ctx.is_cancelled() {
+                self.control.cancelled.store(true, Ordering::Release);
+                return Err(McpError::request_cancelled());
+            }
+            Err(McpError::internal_error(
+                "modern notification did not receive shutdown cancellation",
+            ))
+        }
+    }
+
+    #[derive(Default)]
     struct LiveModernResponses {
         messages: Mutex<Vec<JsonRpcMessage>>,
         changed: Condvar,
@@ -10973,6 +11099,17 @@ mod lib_unit_tests {
                 },
             })),
             id,
+        ))
+    }
+
+    fn modern_initialized_notification() -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::notification(
+            "notifications/initialized",
+            Some(serde_json::json!({
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                },
+            })),
         ))
     }
 
@@ -12689,6 +12826,42 @@ mod lib_unit_tests {
             responses
                 .response(201)
                 .is_some_and(|response| response.error.is_none())
+        );
+    }
+
+    #[test]
+    fn live_modern_stdio_shutdown_cancels_an_in_flight_notification() {
+        let control = Arc::new(LiveModernNotificationControl::default());
+        let control_for_receive = Arc::clone(&control);
+        let phase = Arc::new(AtomicUsize::new(0));
+        let phase_for_receive = Arc::clone(&phase);
+
+        let exit_code = run_live_modern_pump(
+            Server::new("live-modern-notification-shutdown", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .middleware(LiveModernBlockingNotificationMiddleware {
+                    control: Arc::clone(&control),
+                })
+                .build(),
+            move |_cx, _worker_failed| match phase_for_receive.fetch_add(1, Ordering::AcqRel) {
+                0 => Ok(modern_discovery_opening_request()),
+                1 => Ok(modern_initialized_notification()),
+                2 => {
+                    if control_for_receive.wait_for_started(Duration::from_secs(2)) {
+                        Err(TransportError::Closed)
+                    } else {
+                        Err(TransportError::Timeout)
+                    }
+                }
+                _ => Err(TransportError::Closed),
+            },
+            Arc::new(LiveModernResponses::default()),
+        );
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            control.was_cancelled(),
+            "stdio shutdown must cancel a modern notification without a request id"
         );
     }
 
