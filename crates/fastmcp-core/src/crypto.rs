@@ -1019,7 +1019,7 @@ mod tests {
     ) -> Result<Option<usize>, RandomDrawApiDenyError> {
         let bytes = source.as_bytes();
         let prefix_width = match bytes.get(index..index + 2) {
-            Some(b"br") | Some(b"cr") => 2,
+            Some(b"br" | b"cr") => 2,
             _ if bytes.get(index) == Some(&b'r') => 1,
             _ => return Ok(None),
         };
@@ -1116,7 +1116,7 @@ mod tests {
                 index = skip_quoted_literal(source, index)?;
                 continue;
             }
-            if matches!(bytes.get(index..index + 2), Some(b"b\"") | Some(b"c\"")) {
+            if matches!(bytes.get(index..index + 2), Some(b"b\"" | b"c\"")) {
                 index = skip_quoted_literal(source, index + 1)?;
                 continue;
             }
@@ -1126,7 +1126,7 @@ mod tests {
                     continue;
                 }
             }
-            if matches!(bytes.get(index..index + 2), Some(b"b'") | Some(b"c'")) {
+            if matches!(bytes.get(index..index + 2), Some(b"b'" | b"c'")) {
                 if let Some(end) = skip_char_literal(source, index + 1) {
                     index = end;
                     continue;
@@ -1153,8 +1153,10 @@ mod tests {
                 index += match bytes.get(index..index + 3) {
                     Some(b"..=") => 3,
                     _ => match bytes.get(index..index + 2) {
-                        Some(b"::") | Some(b"->") | Some(b"=>") | Some(b"..") | Some(b"==")
-                        | Some(b"!=") | Some(b"<=") | Some(b">=") | Some(b"&&") | Some(b"||") => 2,
+                        Some(
+                            b"::" | b"->" | b"=>" | b".." | b"==" | b"!=" | b"<=" | b">=" | b"&&"
+                            | b"||",
+                        ) => 2,
                         _ => source[index..]
                             .chars()
                             .next()
@@ -1182,7 +1184,7 @@ mod tests {
                 "}" => {
                     brace_depth = brace_depth.checked_sub(1).ok_or(
                         RandomDrawApiDenyError::MalformedSource("unbalanced module braces"),
-                    )?
+                    )?;
                 }
                 "#" if brace_depth == 0 => {
                     if tokens
@@ -1319,10 +1321,8 @@ mod tests {
             let no_space_before = matches!(
                 token.as_str(),
                 "(" | ")" | "]" | "," | ";" | ":" | ">" | "<" | "::"
-            ) || matches!(
-                previous,
-                Some("(") | Some("[") | Some("<") | Some("::") | Some("&")
-            ) || (token == "[" && previous != Some("->"));
+            ) || matches!(previous, Some("(" | "[" | "<" | "::" | "&"))
+                || (token == "[" && previous != Some("->"));
             if !rendered.is_empty() && !no_space_before {
                 rendered.push(' ');
             }
@@ -1343,8 +1343,8 @@ mod tests {
         let mut angle = 0_usize;
         let mut paren = 0_usize;
         let mut square = 0_usize;
-        for index in fn_index + 1..tokens.len() {
-            match tokens[index].text {
+        for (index, token) in tokens.iter().enumerate().skip(fn_index + 1) {
+            match token.text {
                 "<" => angle = angle.saturating_add(1),
                 ">" => angle = angle.saturating_sub(1),
                 "(" => paren = paren.saturating_add(1),
@@ -1653,8 +1653,8 @@ mod tests {
         let mut angle = 0_usize;
         let mut paren = 0_usize;
         let mut square = 0_usize;
-        for index in start..tokens.len() {
-            match tokens[index].text {
+        for (index, token) in tokens.iter().enumerate().skip(start) {
+            match token.text {
                 "<" => angle = angle.saturating_add(1),
                 ">" => angle = angle.saturating_sub(1),
                 "(" => paren = paren.saturating_add(1),
@@ -1835,8 +1835,8 @@ mod tests {
                     }
                 }
             }
-            if !is_identifier_token(tokens[index].text)
-                || !tokens.get(index + 1).is_some_and(|token| token.text == "!")
+            if !(is_identifier_token(tokens[index].text)
+                && tokens.get(index + 1).is_some_and(|token| token.text == "!"))
             {
                 continue;
             }
@@ -2167,10 +2167,10 @@ mod tests {
             }
             let end = use_statement_end(tokens, index);
             for trait_index in index + 1..end {
-                if bare_identifier(tokens[trait_index].text) != "RandomSource"
-                    || !tokens
+                if !(bare_identifier(tokens[trait_index].text) == "RandomSource"
+                    && tokens
                         .get(trait_index + 1)
-                        .is_some_and(|token| token.text == "as")
+                        .is_some_and(|token| token.text == "as"))
                 {
                     continue;
                 }
@@ -2197,7 +2197,7 @@ mod tests {
                     && is_invoked_after(tokens, index + 3);
                 let qualified_ufcs = tokens[*index].text == "<"
                     && (index + 1..tokens.len())
-                        .find_map(|candidate| (tokens[candidate].text == ">").then_some(candidate))
+                        .find(|&candidate| tokens[candidate].text == ">")
                         .is_some_and(|closing| {
                             tokens[index + 1..closing].iter().any(|token| {
                                 bare_identifier(token.text) == "RandomSource"
