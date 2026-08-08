@@ -1217,7 +1217,19 @@ impl ServerBuilder {
         let console = fastmcp_console::console::FastMcpConsole::with_enabled(
             self.console_config.should_use_rich(),
         );
+        let final_subscriptions = Arc::new(FinalSubscriptionRegistry::default());
         let final_task_runtime = self.final_task_runtime.clone();
+        if let Some(task_runtime) = final_task_runtime.as_ref() {
+            let subscriptions = Arc::clone(&final_subscriptions);
+            task_runtime.add_notification_emitter(Arc::new(move |notification| {
+                if subscriptions.publish_task(notification).is_err() {
+                    log::error!(
+                        target: "fastmcp_rust::server",
+                        "Failed to publish a typed final Task notification"
+                    );
+                }
+            }));
+        }
         self.router
             .set_final_task_runtime(final_task_runtime.clone());
         let extension_runtime = match self.extension_runtime {
@@ -1264,7 +1276,7 @@ impl ServerBuilder {
             http_config: self.http_config,
             extension_runtime,
             final_task_runtime: self.final_task_runtime,
-            final_subscriptions: Arc::new(FinalSubscriptionRegistry::default()),
+            final_subscriptions,
         }
     }
 }

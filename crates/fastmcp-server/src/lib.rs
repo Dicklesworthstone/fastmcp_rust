@@ -170,6 +170,9 @@ use fastmcp_protocol::protocol_policy::{
     LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION, ModernVersionSupport, ProtocolEra,
     ProtocolPolicy, StdioEraClassifier, StdioEraDecision, StdioOpeningFrame,
 };
+use fastmcp_protocol::tasks_extension::{
+    TaskStatusNotification as FinalTaskStatusNotification, set_task_subscription_ids,
+};
 use fastmcp_protocol::{
     CallToolParams, CancelledParams, ClientExtensionDiscovery, CompleteResult, CoreResult,
     CorrelationKey, DiscoveryCacheHints, ExtensionDescriptor, ExtensionDescriptorRegistry,
@@ -185,7 +188,7 @@ use fastmcp_protocol::{
     ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
     ServerExtensionDiscovery, ServerInfo, ServerInstructions, ServerNotification,
     SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
-    UnsubscribeResourceParams,
+    UnsubscribeResourceParams, task_subscription_ids,
 };
 use legacy_2024::{
     Legacy2024AdapterError, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Outbound,
@@ -1990,6 +1993,7 @@ impl FinalSubscriptionRegistry {
         self: &Arc<Self>,
         subscription_id: RequestId,
         requested: SubscriptionFilter,
+        accept_tasks: bool,
         notification_sender: NotificationSender,
     ) -> McpResult<FinalSubscriptionLease> {
         if subscription_id.validate().is_err() {
@@ -2001,7 +2005,7 @@ impl FinalSubscriptionRegistry {
             return Err(McpError::request_cancelled());
         }
 
-        let accepted_filter = accepted_subscription_filter(&requested);
+        let accepted_filter = accepted_subscription_filter(&requested, accept_tasks)?;
         let acknowledgement =
             subscription_acknowledgement(subscription_id.clone(), accepted_filter.clone())?;
         let acknowledgement = acknowledgement.encode().map_err(|error| {
@@ -2103,6 +2107,43 @@ impl FinalSubscriptionRegistry {
         Ok(count)
     }
 
+    fn publish_task(&self, notification: FinalTaskStatusNotification) -> McpResult<usize> {
+        let task_id = notification.params.task.base().task_id.as_str();
+        let targets = {
+            let state = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .entries
+                .values()
+                .filter(|entry| {
+                    entry.acknowledged
+                        && task_subscription_ids(&entry.accepted_filter)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|task_ids| {
+                                task_ids
+                                    .iter()
+                                    .any(|candidate| candidate.as_str() == task_id)
+                            })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let mut deliveries = Vec::with_capacity(targets.len());
+        for entry in targets {
+            let event = tag_task_subscription_notification(&notification, &entry.subscription_id)?;
+            deliveries.push((entry.notification_sender, event));
+        }
+        let count = deliveries.len();
+        for (sender, notification) in deliveries {
+            sender(notification);
+        }
+        Ok(count)
+    }
+
     fn terminate(&self) -> usize {
         self.terminating.store(true, Ordering::Release);
         self.inner
@@ -2117,8 +2158,11 @@ impl FinalSubscriptionRegistry {
     }
 }
 
-fn accepted_subscription_filter(requested: &SubscriptionFilter) -> SubscriptionFilter {
-    SubscriptionFilter {
+fn accepted_subscription_filter(
+    requested: &SubscriptionFilter,
+    accept_tasks: bool,
+) -> McpResult<SubscriptionFilter> {
+    let mut accepted = SubscriptionFilter {
         prompts_list_changed: requested.prompts_list_changed.filter(|accepted| *accepted),
         resource_subscriptions: requested.resource_subscriptions.clone(),
         resources_list_changed: requested
@@ -2128,7 +2172,24 @@ fn accepted_subscription_filter(requested: &SubscriptionFilter) -> SubscriptionF
         // Unknown extension filter keys remain schema-open but are never
         // activated by the core server execution path.
         additional: BTreeMap::new(),
+    };
+    if let Some(task_ids) = task_subscription_ids(requested)
+        .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+    {
+        if !accept_tasks {
+            return Err(McpError::invalid_params(
+                "Tasks subscription filter was not negotiated",
+            ));
+        }
+        let mut seen = HashSet::new();
+        let canonical = task_ids
+            .into_iter()
+            .filter(|task_id| seen.insert(task_id.clone()))
+            .collect();
+        set_task_subscription_ids(&mut accepted, canonical)
+            .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?;
     }
+    Ok(accepted)
 }
 
 fn subscription_metadata(
@@ -2218,6 +2279,19 @@ fn tag_subscription_notification(
             "notification does not belong on a final subscription stream",
         )),
     }
+}
+
+fn tag_task_subscription_notification(
+    notification: &FinalTaskStatusNotification,
+    subscription_id: &RequestId,
+) -> McpResult<JsonRpcRequest> {
+    let mut notification = notification.clone();
+    notification.params.meta = Some(subscription_metadata(
+        notification.params.meta,
+        subscription_id,
+    )?);
+    serde_json::from_value(serde_json::to_value(notification).map_err(McpError::from)?)
+        .map_err(McpError::from)
 }
 
 /// Cancellation authority deliberately kept outside the session mutex.
@@ -3320,6 +3394,18 @@ impl Server {
         self.final_subscriptions.publish(notification)
     }
 
+    /// Publishes one typed final Tasks status notification to matching streams.
+    ///
+    /// Only subscriptions whose acknowledged `taskIds` set contains the
+    /// notification's exact opaque task identifier receive it. The server adds
+    /// the request's subscription ID without changing Task state.
+    pub fn publish_task_status_notification(
+        &self,
+        notification: FinalTaskStatusNotification,
+    ) -> McpResult<usize> {
+        self.final_subscriptions.publish_task(notification)
+    }
+
     /// Begins graceful termination for all live final subscription streams.
     ///
     /// Each request-owned stream observes this transition, emits its terminal
@@ -4078,10 +4164,49 @@ impl Server {
         let client_capabilities = params.meta.client_capabilities().map_err(|_| {
             McpError::invalid_params("subscriptions/listen has invalid client capabilities")
         })?;
-        if protocol_version != Some(MODERN_PROTOCOL_VERSION) || client_capabilities.is_none() {
+        let Some(client_capabilities) = client_capabilities else {
             return Err(McpError::invalid_params(
                 "subscriptions/listen requires exact final request metadata",
             ));
+        };
+        if protocol_version != Some(MODERN_PROTOCOL_VERSION) {
+            return Err(McpError::invalid_params(
+                "subscriptions/listen requires exact final request metadata",
+            ));
+        }
+        let tasks_requested = task_subscription_ids(&params.notifications)
+            .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+            .is_some();
+        if tasks_requested {
+            if self.final_task_runtime.is_none() {
+                return Err(McpError::invalid_params(
+                    "Tasks subscription filter is unavailable on this server",
+                ));
+            }
+            let tasks_declared = client_capabilities
+                .get("extensions")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|extensions| extensions.get(fastmcp_protocol::TASKS_EXTENSION))
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(serde_json::Map::is_empty);
+            if !tasks_declared {
+                let mut extensions = serde_json::Map::new();
+                extensions.insert(
+                    fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+                    serde_json::json!({}),
+                );
+                let missing = MissingRequiredClientCapabilityError::new(serde_json::json!({
+                    "extensions": serde_json::Value::Object(extensions)
+                }))
+                .map_err(|_| {
+                    McpError::internal_error("failed to encode required Tasks capability")
+                })?;
+                return Err(McpError::with_data(
+                    McpErrorCode::Custom(missing.jsonrpc_error_code()),
+                    "Required client capability is missing",
+                    missing.canonical_error_data(),
+                ));
+            }
         }
 
         if request_cancellation.is_cancel_requested() || request_ctx.ensure_live().is_err() {
@@ -4091,6 +4216,7 @@ impl Server {
         let _lease = self.final_subscriptions.open(
             subscription_id.clone(),
             params.notifications,
+            tasks_requested,
             notification_sender,
         )?;
 
@@ -16787,6 +16913,7 @@ mod lib_unit_tests {
                     resources_list_changed: Some(false),
                     ..SubscriptionFilter::default()
                 },
+                false,
                 sender,
             )
             .expect("final subscription should admit a bounded stream");
@@ -16864,6 +16991,96 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn final_tasks_runtime_publishes_only_to_acknowledged_exact_task_ids() {
+        let application_notifications = Arc::new(Mutex::new(Vec::new()));
+        let server = final_tasks_test_server(Arc::clone(&application_notifications));
+        let runtime = server
+            .final_task_runtime()
+            .expect("final Tasks runtime must remain public")
+            .clone();
+        let created = runtime
+            .create_task(Some("queued".to_owned()))
+            .expect("task must be durable before subscription");
+        let task_id = created.task.base().task_id.clone();
+        let foreign_id =
+            fastmcp_protocol::FinalTaskId::parse("foreign-task").expect("bounded foreign task id");
+
+        let mut requested = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        set_task_subscription_ids(
+            &mut requested,
+            vec![task_id.clone(), foreign_id.clone(), task_id.clone()],
+        )
+        .expect("compose task IDs beside the core filter");
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let subscription_id = RequestId::String("task-subscription-73".to_owned());
+        let _lease = server
+            .final_subscriptions
+            .open(subscription_id.clone(), requested, true, sender)
+            .expect("negotiated Tasks filter must open");
+
+        let acknowledgement = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first()
+            .cloned()
+            .expect("acknowledgement must precede task events");
+        let ServerNotification::SubscriptionsAcknowledged(acknowledgement) =
+            ServerNotification::decode(&acknowledgement).expect("typed acknowledgement")
+        else {
+            panic!("first Tasks stream frame must be the core acknowledgement");
+        };
+        let accepted = task_subscription_ids(&acknowledgement.notifications)
+            .expect("acknowledged Tasks fragment must validate")
+            .expect("acknowledgement must retain taskIds");
+        assert_eq!(accepted, [task_id.clone(), foreign_id]);
+        assert_eq!(acknowledgement.notifications.tools_list_changed, Some(true));
+
+        runtime
+            .cancel_task(&task_id)
+            .expect("cooperative cancellation intent");
+        runtime
+            .honor_cancellation(&task_id, Some("cancelled".to_owned()))
+            .expect("task worker terminal transition");
+
+        let delivered = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(1)
+            .cloned()
+            .expect("matching task transition must follow acknowledgement");
+        let delivered: FinalTaskStatusNotification = serde_json::from_value(
+            serde_json::to_value(delivered).expect("notification request must serialize"),
+        )
+        .expect("notification must retain the exact Tasks wire type");
+        assert_eq!(delivered.params.task.base().task_id, task_id);
+        assert_eq!(
+            delivered
+                .params
+                .meta
+                .as_ref()
+                .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY)),
+            Some(&serde_json::to_value(subscription_id).expect("subscription id"))
+        );
+        assert_eq!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2,
+            "one acknowledged stream receives exactly one matching task event"
+        );
+    }
+
+    #[test]
     fn final_subscription_rejects_request_scoped_message_without_delivery() {
         use fastmcp_protocol::{FinalLogMessageParams, common_types::LoggingLevel};
 
@@ -16884,6 +17101,7 @@ mod lib_unit_tests {
                     tools_list_changed: Some(true),
                     ..SubscriptionFilter::default()
                 },
+                false,
                 sender,
             )
             .expect("selected catalog subscription should admit");

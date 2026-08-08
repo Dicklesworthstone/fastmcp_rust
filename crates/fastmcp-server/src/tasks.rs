@@ -1607,7 +1607,7 @@ impl FinalTaskRuntimeConfig {
 pub struct FinalTaskRuntime {
     store: Arc<dyn FinalTaskStore>,
     config: FinalTaskRuntimeConfig,
-    notification_emitter: FinalTaskNotificationEmitter,
+    notification_emitters: Arc<Mutex<Vec<FinalTaskNotificationEmitter>>>,
 }
 
 impl FinalTaskRuntime {
@@ -1621,8 +1621,21 @@ impl FinalTaskRuntime {
         Self {
             store,
             config,
-            notification_emitter,
+            notification_emitters: Arc::new(Mutex::new(vec![notification_emitter])),
         }
+    }
+
+    /// Adds one framework-owned observer to the shared notification fanout.
+    ///
+    /// Runtime clones share this registry, so a server builder can attach its
+    /// subscription publisher after extension handlers have retained their
+    /// runtime clone. Application-owned delivery remains installed alongside
+    /// the framework observer.
+    pub(crate) fn add_notification_emitter(&self, emitter: FinalTaskNotificationEmitter) {
+        self.notification_emitters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(emitter);
     }
 
     /// Durably creates the initial working task before returning its wire result.
@@ -1851,7 +1864,14 @@ impl FinalTaskRuntime {
     }
 
     fn emit(&self, notification: FinalTaskStatusNotification) {
-        (self.notification_emitter)(notification);
+        let emitters = self
+            .notification_emitters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for emitter in emitters {
+            emitter(notification.clone());
+        }
     }
 }
 
