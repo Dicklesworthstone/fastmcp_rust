@@ -74,16 +74,16 @@ const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = concat!(
 /// documentation boundary: support claims may appear only in the exact
 /// provisional status stanza, never in a free-form prefix.
 const EXPECTED_CLI_ROOT_HELP_PREFIX: &str = concat!(
-    "FastMCP CLI - Run, inspect, and install MCP servers. ",
+    "CLI tooling for FastMCP - run, inspect, and install MCP servers ",
     "Usage: fastmcp <COMMAND> ",
     "Commands: ",
-    "run Run an MCP server binary. ",
-    "inspect Inspect an MCP server's capabilities. ",
-    "install Install server configuration into Claude Desktop or other clients. ",
-    "list List configured MCP servers. ",
-    "test Test MCP server connectivity. ",
-    "dev Run server in development mode with hot reloading. ",
-    "tasks Inspect legacy background-task RPCs (quarantined by FastMCP servers). ",
+    "run Run an MCP server binary ",
+    "inspect Inspect an MCP server's capabilities ",
+    "install Install server configuration into Claude Desktop or other clients ",
+    "list List configured MCP servers ",
+    "test Test MCP server connectivity ",
+    "dev Run server in development mode with hot reloading ",
+    "tasks Inspect legacy background-task RPCs (quarantined by FastMCP servers) ",
     "help Print this message or the help of the given subcommand(s) ",
     "Options: -h, --help Print help -V, --version Print version "
 );
@@ -184,7 +184,7 @@ struct ConsumerVisibleCliHelp {
     accepted: Option<CliHelpCandidate>,
 }
 
-/// FastMCP CLI - Run, inspect, and install MCP servers.
+/// CLI tooling for FastMCP - run, inspect, and install MCP servers.
 #[derive(Parser)]
 #[command(name = "fastmcp")]
 #[command(version, about, long_about = None)]

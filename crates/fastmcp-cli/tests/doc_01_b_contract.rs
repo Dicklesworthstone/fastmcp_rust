@@ -44,16 +44,16 @@ const PROVISIONAL_PUBLIC_STATUS_STANZA: &str = concat!(
 /// positive contract rejects any free-form prefix claim instead of attempting
 /// to enumerate paraphrases of unsupported aggregate support.
 const PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX: &str = concat!(
-    "FastMCP CLI - Run, inspect, and install MCP servers. ",
+    "CLI tooling for FastMCP - run, inspect, and install MCP servers ",
     "Usage: fastmcp <COMMAND> ",
     "Commands: ",
-    "run Run an MCP server binary. ",
-    "inspect Inspect an MCP server's capabilities. ",
-    "install Install server configuration into Claude Desktop or other clients. ",
-    "list List configured MCP servers. ",
-    "test Test MCP server connectivity. ",
-    "dev Run server in development mode with hot reloading. ",
-    "tasks Inspect legacy background-task RPCs (quarantined by FastMCP servers). ",
+    "run Run an MCP server binary ",
+    "inspect Inspect an MCP server's capabilities ",
+    "install Install server configuration into Claude Desktop or other clients ",
+    "list List configured MCP servers ",
+    "test Test MCP server connectivity ",
+    "dev Run server in development mode with hot reloading ",
+    "tasks Inspect legacy background-task RPCs (quarantined by FastMCP servers) ",
     "help Print this message or the help of the given subcommand(s) ",
     "Options: -h, --help Print help -V, --version Print version "
 );
@@ -152,7 +152,7 @@ fn validate_public_root_help_bytes(bytes: &[u8]) -> Result<(), PublicHelpRefusal
         return Err(PublicHelpRefusal::MissingStatusStanza);
     };
     let (root_help, status_stanza) = stdout.split_at(status_start);
-    if !root_help.contains("FastMCP CLI - Run, inspect, and install MCP servers.") {
+    if !root_help.contains("CLI tooling for FastMCP - run, inspect, and install MCP servers") {
         return Err(PublicHelpRefusal::MissingBaseFrame);
     }
     if status_stanza != PROVISIONAL_PUBLIC_STATUS_STANZA {
