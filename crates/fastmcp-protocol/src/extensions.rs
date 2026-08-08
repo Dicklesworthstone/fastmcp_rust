@@ -1,13 +1,16 @@
-//! Frozen, runtime-neutral extension descriptor registry.
+//! Frozen, runtime-neutral extension negotiation and request admission.
 //!
-//! This module admits extension metadata and settings only.  It deliberately
-//! owns no handler, transport, authorization, or client/server runtime state.
+//! This module owns no handler, transport, authorization, or client/server
+//! runtime state. It does bind a developer's explicit local opt-in and both
+//! peers' current settings to bounded, modern-only request admission.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use fastmcp_core::sha256_bounded;
 use serde_json::{Map, Value};
+
+use crate::protocol_policy::ProtocolEra;
 
 /// Maximum descriptors retained by one registry.
 pub const MAX_EXTENSION_DESCRIPTORS: usize = 128;
@@ -255,7 +258,8 @@ pub struct ExtensionMethodDescriptor {
     pub direction: ExtensionDirection,
     /// Required only for client-to-server HTTP methods.
     pub http_era_disposition: Option<ExtensionHttpEraDisposition>,
-    /// Whether exact legacy fallback is declared.
+    /// Whether exact legacy fallback is declared; exact legacy excludes extensions, so this must
+    /// remain false.
     pub legacy_fallback: bool,
 }
 
@@ -567,6 +571,7 @@ impl NegotiatedExtension {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NegotiatedExtensionSet {
     registry_receipt: ExtensionRegistryReceipt,
+    protocol_era: ProtocolEra,
     active: BTreeMap<ExtensionId, NegotiatedExtension>,
     inactive: BTreeMap<ExtensionId, ExtensionInactiveReason>,
     unknown_client: BTreeMap<ExtensionId, ExtensionSettings>,
@@ -578,6 +583,12 @@ impl NegotiatedExtensionSet {
     #[must_use]
     pub const fn registry_receipt(&self) -> &ExtensionRegistryReceipt {
         &self.registry_receipt
+    }
+
+    /// Returns the exact modern protocol era that produced this request state.
+    #[must_use]
+    pub const fn protocol_era(&self) -> ProtocolEra {
+        self.protocol_era
     }
 
     /// Returns a negotiated extension when it is active for this exchange.
@@ -614,6 +625,8 @@ impl NegotiatedExtensionSet {
 /// Error returned while deriving a per-request bilateral extension set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExtensionNegotiationError {
+    /// Extensions are excluded from exact MCP 2024-11-05 negotiation.
+    LegacyProtocolExcluded,
     /// Descriptor registration must be frozen before negotiation.
     RegistryNotFrozen,
     /// A local feature/runtime configuration referenced an unregistered descriptor.
@@ -631,6 +644,9 @@ pub enum ExtensionNegotiationError {
 impl fmt::Display for ExtensionNegotiationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LegacyProtocolExcluded => {
+                formatter.write_str("extensions are excluded from exact MCP 2024-11-05")
+            }
             Self::RegistryNotFrozen => {
                 formatter.write_str("extension descriptor registry is not frozen")
             }
@@ -700,8 +716,28 @@ where
 /// Direction-sensitive extension dispatch failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExtensionDispatchError {
+    /// Extensions are excluded from an exact MCP 2024-11-05 request.
+    LegacyProtocolExcluded,
+    /// The request era does not match the immutable era that negotiated this set.
+    ProtocolEraMismatch {
+        /// The exact era that created this set.
+        negotiated: ProtocolEra,
+        /// The exact era attached to the request being admitted.
+        request: ProtocolEra,
+    },
     /// Dispatch used a registry other than the frozen registry that negotiated the set.
     RegistryReceiptMismatch,
+    /// The named extension was not activated by developer opt-in and bilateral negotiation.
+    InactiveCapability(String),
+    /// The active capability does not own the named request member.
+    CapabilityDoesNotOwn {
+        /// Active extension capability identifier.
+        capability: String,
+        /// Registered member category.
+        field: &'static str,
+        /// Request-supplied member spelling.
+        value: String,
+    },
     /// The caller supplied an unbounded member name.
     NameTooLong(String),
     /// No active extension owns the requested member in this direction.
@@ -720,9 +756,33 @@ pub enum ExtensionDispatchError {
 impl fmt::Display for ExtensionDispatchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LegacyProtocolExcluded => {
+                formatter.write_str("extensions are excluded from exact MCP 2024-11-05")
+            }
+            Self::ProtocolEraMismatch {
+                negotiated,
+                request,
+            } => write!(
+                formatter,
+                "extension request era {request:?} does not match negotiated era {negotiated:?}"
+            ),
             Self::RegistryReceiptMismatch => {
                 formatter.write_str("extension dispatch registry does not match negotiation")
             }
+            Self::InactiveCapability(capability) => {
+                write!(
+                    formatter,
+                    "extension capability is not active: {capability}"
+                )
+            }
+            Self::CapabilityDoesNotOwn {
+                capability,
+                field,
+                value,
+            } => write!(
+                formatter,
+                "extension capability {capability} does not own {field}: {value}"
+            ),
             Self::NameTooLong(value) => {
                 write!(
                     formatter,
@@ -842,6 +902,7 @@ impl ExtensionDescriptorRegistry {
     /// JSON-object equality as compatibility.
     pub fn negotiate<R>(
         &self,
+        protocol_era: ProtocolEra,
         local: &ExtensionLocalEnablement,
         client: &ClientExtensionDiscovery,
         server: &ServerExtensionDiscovery,
@@ -850,6 +911,9 @@ impl ExtensionDescriptorRegistry {
     where
         R: ExtensionSettingsCompatibilityResolver,
     {
+        if matches!(protocol_era, ProtocolEra::Legacy2024) {
+            return Err(ExtensionNegotiationError::LegacyProtocolExcluded);
+        }
         let Some(receipt) = self.receipt.clone() else {
             return Err(ExtensionNegotiationError::RegistryNotFrozen);
         };
@@ -924,6 +988,7 @@ impl ExtensionDescriptorRegistry {
 
         Ok(NegotiatedExtensionSet {
             registry_receipt: receipt,
+            protocol_era,
             active,
             inactive,
             unknown_client,
@@ -999,86 +1064,115 @@ fn canonicalize_value(value: &Value) -> Value {
 }
 
 impl NegotiatedExtensionSet {
-    /// Resolves an active extension request method in its declared direction.
-    pub fn dispatch_method<'a>(
+    /// Admits an active extension capability for one modern request.
+    pub fn admit_capability<'a>(
         &self,
         registry: &'a ExtensionDescriptorRegistry,
+        request_era: ProtocolEra,
+        capability: &ExtensionId,
+    ) -> Result<&'a ExtensionDescriptor, ExtensionDispatchError> {
+        self.ensure_request_era(request_era)?;
+        self.ensure_registry(registry)?;
+        if !self.active.contains_key(capability) {
+            return Err(ExtensionDispatchError::InactiveCapability(
+                capability.to_string(),
+            ));
+        }
+        registry
+            .descriptor(capability)
+            .ok_or(ExtensionDispatchError::RegistryReceiptMismatch)
+    }
+
+    /// Admits a method owned by an active capability for one modern request.
+    pub fn admit_method<'a>(
+        &self,
+        registry: &'a ExtensionDescriptorRegistry,
+        request_era: ProtocolEra,
+        capability: &ExtensionId,
         name: &str,
         direction: ExtensionDirection,
     ) -> Result<&'a ExtensionDescriptor, ExtensionDispatchError> {
-        self.ensure_registry(registry)?;
         validate_dispatch_name(name)?;
-        let owners = registry
-            .descriptors
-            .values()
-            .filter(|descriptor| {
-                self.active.contains_key(&descriptor.id)
-                    && descriptor
-                        .method
-                        .as_ref()
-                        .is_some_and(|method| method.name == name)
-            })
-            .collect::<Vec<_>>();
-        resolve_directional_dispatch(owners, name, direction, "method", |descriptor| {
-            descriptor.method.as_ref().map(|method| method.direction)
-        })
+        let descriptor = self.admit_capability(registry, request_era, capability)?;
+        let Some(method) = descriptor.method.as_ref() else {
+            return Err(ExtensionDispatchError::CapabilityDoesNotOwn {
+                capability: capability.to_string(),
+                field: "method",
+                value: name.to_owned(),
+            });
+        };
+        if method.name != name {
+            return Err(ExtensionDispatchError::CapabilityDoesNotOwn {
+                capability: capability.to_string(),
+                field: "method",
+                value: name.to_owned(),
+            });
+        }
+        if method.direction != direction {
+            return Err(ExtensionDispatchError::DirectionMismatch {
+                field: "method",
+                value: name.to_owned(),
+                expected: direction,
+                actual: method.direction,
+            });
+        }
+        Ok(descriptor)
     }
 
-    /// Resolves an active extension notification in its declared direction.
-    pub fn dispatch_notification<'a>(
+    /// Admits a notification owned by an active capability for one modern request.
+    pub fn admit_notification<'a>(
         &self,
         registry: &'a ExtensionDescriptorRegistry,
+        request_era: ProtocolEra,
+        capability: &ExtensionId,
         name: &str,
         direction: ExtensionDirection,
     ) -> Result<&'a ExtensionDescriptor, ExtensionDispatchError> {
-        self.ensure_registry(registry)?;
         validate_dispatch_name(name)?;
-        let owners = registry
-            .descriptors
-            .values()
-            .filter(|descriptor| {
-                self.active.contains_key(&descriptor.id)
-                    && descriptor
-                        .notification
-                        .as_ref()
-                        .is_some_and(|notification| notification.name == name)
-            })
-            .collect::<Vec<_>>();
-        resolve_directional_dispatch(owners, name, direction, "notification", |descriptor| {
-            descriptor
-                .notification
-                .as_ref()
-                .map(|notification| notification.direction)
-        })
+        let descriptor = self.admit_capability(registry, request_era, capability)?;
+        let Some(notification) = descriptor.notification.as_ref() else {
+            return Err(ExtensionDispatchError::CapabilityDoesNotOwn {
+                capability: capability.to_string(),
+                field: "notification",
+                value: name.to_owned(),
+            });
+        };
+        if notification.name != name {
+            return Err(ExtensionDispatchError::CapabilityDoesNotOwn {
+                capability: capability.to_string(),
+                field: "notification",
+                value: name.to_owned(),
+            });
+        }
+        if notification.direction != direction {
+            return Err(ExtensionDispatchError::DirectionMismatch {
+                field: "notification",
+                value: name.to_owned(),
+                expected: direction,
+                actual: notification.direction,
+            });
+        }
+        Ok(descriptor)
     }
 
-    /// Resolves an active extension result discriminator without a core fallback.
-    pub fn dispatch_result<'a>(
+    /// Admits a result discriminator owned by an active capability for one modern request.
+    pub fn admit_result_discriminator<'a>(
         &self,
         registry: &'a ExtensionDescriptorRegistry,
+        request_era: ProtocolEra,
+        capability: &ExtensionId,
         discriminator: &str,
     ) -> Result<&'a ExtensionDescriptor, ExtensionDispatchError> {
-        self.ensure_registry(registry)?;
         validate_dispatch_name(discriminator)?;
-        let owners = registry
-            .descriptors
-            .values()
-            .filter(|descriptor| {
-                self.active.contains_key(&descriptor.id)
-                    && descriptor.result_discriminator.as_deref() == Some(discriminator)
-            })
-            .collect::<Vec<_>>();
-        match owners.as_slice() {
-            [] => Err(ExtensionDispatchError::NoActiveOwner {
+        let descriptor = self.admit_capability(registry, request_era, capability)?;
+        if descriptor.result_discriminator.as_deref() != Some(discriminator) {
+            return Err(ExtensionDispatchError::CapabilityDoesNotOwn {
+                capability: capability.to_string(),
                 field: "result discriminator",
                 value: discriminator.to_owned(),
-            }),
-            [descriptor] => Ok(descriptor),
-            _ => Err(ExtensionDispatchError::AmbiguousActiveOwner {
-                field: "result discriminator",
-                value: discriminator.to_owned(),
-            }),
+            });
         }
+        Ok(descriptor)
     }
 
     fn ensure_registry(
@@ -1091,6 +1185,19 @@ impl NegotiatedExtensionSet {
             Err(ExtensionDispatchError::RegistryReceiptMismatch)
         }
     }
+
+    fn ensure_request_era(&self, request_era: ProtocolEra) -> Result<(), ExtensionDispatchError> {
+        if matches!(request_era, ProtocolEra::Legacy2024) {
+            return Err(ExtensionDispatchError::LegacyProtocolExcluded);
+        }
+        if self.protocol_era != request_era {
+            return Err(ExtensionDispatchError::ProtocolEraMismatch {
+                negotiated: self.protocol_era,
+                request: request_era,
+            });
+        }
+        Ok(())
+    }
 }
 
 fn validate_dispatch_name(name: &str) -> Result<(), ExtensionDispatchError> {
@@ -1098,51 +1205,6 @@ fn validate_dispatch_name(name: &str) -> Result<(), ExtensionDispatchError> {
         return Err(ExtensionDispatchError::NameTooLong(name.to_owned()));
     }
     Ok(())
-}
-
-fn resolve_directional_dispatch<'a>(
-    owners: Vec<&'a ExtensionDescriptor>,
-    value: &str,
-    expected: ExtensionDirection,
-    field: &'static str,
-    direction: impl Fn(&ExtensionDescriptor) -> Option<ExtensionDirection>,
-) -> Result<&'a ExtensionDescriptor, ExtensionDispatchError> {
-    let matching = owners
-        .iter()
-        .copied()
-        .filter(|descriptor| direction(descriptor) == Some(expected))
-        .collect::<Vec<_>>();
-    match matching.as_slice() {
-        [descriptor] => Ok(descriptor),
-        [] => match owners.as_slice() {
-            [descriptor] => {
-                let Some(actual) = direction(descriptor) else {
-                    return Err(ExtensionDispatchError::NoActiveOwner {
-                        field,
-                        value: value.to_owned(),
-                    });
-                };
-                Err(ExtensionDispatchError::DirectionMismatch {
-                    field,
-                    value: value.to_owned(),
-                    expected,
-                    actual,
-                })
-            }
-            [] => Err(ExtensionDispatchError::NoActiveOwner {
-                field,
-                value: value.to_owned(),
-            }),
-            _ => Err(ExtensionDispatchError::AmbiguousActiveOwner {
-                field,
-                value: value.to_owned(),
-            }),
-        },
-        _ => Err(ExtensionDispatchError::AmbiguousActiveOwner {
-            field,
-            value: value.to_owned(),
-        }),
-    }
 }
 
 fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), ExtensionRegistryError> {
@@ -1175,13 +1237,12 @@ fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Extension
             ));
         }
         if method.direction == ExtensionDirection::ClientToServer {
-            let Some(disposition) = method.http_era_disposition else {
+            if method.http_era_disposition.is_none() {
                 return Err(ExtensionRegistryError::MissingHttpEraDisposition(
                     method.name.clone(),
                 ));
-            };
-            if disposition == ExtensionHttpEraDisposition::ModernExclusive && method.legacy_fallback
-            {
+            }
+            if method.legacy_fallback {
                 return Err(ExtensionRegistryError::LegacyFallbackContradiction(
                     method.name.clone(),
                 ));
@@ -1534,9 +1595,16 @@ mod tests {
             })
         };
         let negotiated = registry
-            .negotiate(&local, &client, &server, &mut resolver)
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            )
             .expect("bilateral current-message settings negotiate");
 
+        assert_eq!(negotiated.protocol_era(), ProtocolEra::Modern2026);
         assert_eq!(negotiated.active_extensions().len(), 1);
         assert_eq!(
             negotiated
@@ -1554,8 +1622,17 @@ mod tests {
         );
         assert_eq!(
             negotiated
-                .dispatch_method(
+                .admit_capability(&registry, ProtocolEra::Modern2026, &id)
+                .expect("developer-opted-in bilateral capability is active")
+                .id,
+            id
+        );
+        assert_eq!(
+            negotiated
+                .admit_method(
                     &registry,
+                    ProtocolEra::Modern2026,
+                    &id,
                     "com.example/weather",
                     ExtensionDirection::ClientToServer,
                 )
@@ -1565,8 +1642,10 @@ mod tests {
         );
         assert_eq!(
             negotiated
-                .dispatch_notification(
+                .admit_notification(
                     &registry,
+                    ProtocolEra::Modern2026,
+                    &id,
                     "com.example/weather_changed",
                     ExtensionDirection::ServerToClient,
                 )
@@ -1576,14 +1655,21 @@ mod tests {
         );
         assert_eq!(
             negotiated
-                .dispatch_result(&registry, "com.example/weather_result")
+                .admit_result_discriminator(
+                    &registry,
+                    ProtocolEra::Modern2026,
+                    &id,
+                    "com.example/weather_result",
+                )
                 .expect("active result discriminator dispatch")
                 .id,
             id
         );
         assert_eq!(
-            negotiated.dispatch_notification(
+            negotiated.admit_notification(
                 &registry,
+                ProtocolEra::Modern2026,
+                &id,
                 "com.example/weather_changed",
                 ExtensionDirection::ClientToServer,
             ),
@@ -1595,6 +1681,259 @@ mod tests {
             }),
             "only the requested direction changes; the same active descriptor must not dispatch"
         );
+    }
+
+    fn negotiated_weather_extension() -> (
+        ExtensionDescriptorRegistry,
+        ExtensionId,
+        NegotiatedExtensionSet,
+    ) {
+        let id = ExtensionId::parse("com.example/weather").expect("valid extension ID");
+        let mut registry = ExtensionDescriptorRegistry::new();
+        registry
+            .register(descriptor(
+                id.clone(),
+                "com.example/weather",
+                "com.example/weather_changed",
+                "com.example/weather_result",
+            ))
+            .expect("descriptor registers");
+        registry
+            .freeze()
+            .expect("registry freezes before negotiation");
+
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(
+                id.clone(),
+                ExtensionSettings::new(json!({"unit": "celsius"}))
+                    .expect("bounded client settings"),
+            )]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([(
+                id.clone(),
+                ExtensionSettings::new(json!({"maxCities": 4})).expect("bounded server settings"),
+            )]),
+        };
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(id.clone());
+        let mut resolver = |descriptor: &ExtensionDescriptor,
+                            client: &ExtensionSettings,
+                            server: &ExtensionSettings| {
+            ExtensionSettings::new(json!({
+                "unit": client.as_object()["unit"].clone(),
+                "maxCities": server.as_object()["maxCities"].clone(),
+            }))
+            .map_err(|_| {
+                ExtensionNegotiationError::SettingsCompatibilityRejected(descriptor.id.to_string())
+            })
+        };
+        let negotiated = registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            )
+            .expect("developer opt-in and both peer settings negotiate");
+
+        (registry, id, negotiated)
+    }
+
+    #[test]
+    fn ext_02_executable_request_admission_positive() {
+        let (registry, id, negotiated) = negotiated_weather_extension();
+
+        assert_eq!(negotiated.protocol_era(), ProtocolEra::Modern2026);
+        assert_eq!(negotiated.active_extensions().len(), 1);
+        assert_eq!(
+            negotiated
+                .admit_capability(&registry, ProtocolEra::Modern2026, &id)
+                .expect("active extension capability is admitted per request")
+                .id,
+            id
+        );
+        assert_eq!(
+            negotiated
+                .admit_method(
+                    &registry,
+                    ProtocolEra::Modern2026,
+                    &id,
+                    "com.example/weather",
+                    ExtensionDirection::ClientToServer,
+                )
+                .expect("active extension method is admitted per request")
+                .id,
+            id
+        );
+        assert_eq!(
+            negotiated
+                .admit_result_discriminator(
+                    &registry,
+                    ProtocolEra::Modern2026,
+                    &id,
+                    "com.example/weather_result",
+                )
+                .expect("active extension result discriminator is admitted per request")
+                .id,
+            id
+        );
+    }
+
+    #[test]
+    fn ext_02_executable_request_admission_one_variable_negatives() {
+        let (registry, id, negotiated) = negotiated_weather_extension();
+        let active_count = negotiated.active_extensions().len();
+
+        assert_eq!(
+            negotiated.admit_capability(&registry, ProtocolEra::Legacy2024, &id),
+            Err(ExtensionDispatchError::LegacyProtocolExcluded),
+            "changing only the request era must exclude exact legacy admission"
+        );
+        assert_eq!(
+            negotiated.admit_method(
+                &registry,
+                ProtocolEra::Modern2026,
+                &id,
+                "com.example/weather-other",
+                ExtensionDirection::ClientToServer,
+            ),
+            Err(ExtensionDispatchError::CapabilityDoesNotOwn {
+                capability: id.to_string(),
+                field: "method",
+                value: "com.example/weather-other".to_owned(),
+            }),
+            "changing only the method spelling must reject dispatch"
+        );
+        assert_eq!(
+            negotiated.admit_result_discriminator(
+                &registry,
+                ProtocolEra::Modern2026,
+                &id,
+                "com.example/weather_result-other",
+            ),
+            Err(ExtensionDispatchError::CapabilityDoesNotOwn {
+                capability: id.to_string(),
+                field: "result discriminator",
+                value: "com.example/weather_result-other".to_owned(),
+            }),
+            "changing only the result discriminator must reject dispatch"
+        );
+        assert_eq!(
+            negotiated.active_extensions().len(),
+            active_count,
+            "rejected requests cannot mutate the bounded negotiated state"
+        );
+    }
+
+    #[test]
+    fn ext_02_developer_opt_in_and_legacy_negotiation_fail_closed() {
+        let id = ExtensionId::parse("com.example/weather").expect("valid extension ID");
+        let mut registry = ExtensionDescriptorRegistry::new();
+        registry
+            .register(descriptor(
+                id.clone(),
+                "com.example/weather",
+                "com.example/weather_changed",
+                "com.example/weather_result",
+            ))
+            .expect("descriptor registers");
+        let receipt = registry
+            .freeze()
+            .expect("registry freezes before negotiation");
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(
+                id.clone(),
+                ExtensionSettings::new(json!({})).expect("bounded client settings"),
+            )]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([(
+                id.clone(),
+                ExtensionSettings::new(json!({})).expect("bounded server settings"),
+            )]),
+        };
+        let local = ExtensionLocalEnablement::default();
+        let mut resolver_calls = 0;
+        let mut resolver = |_descriptor: &ExtensionDescriptor,
+                            _client: &ExtensionSettings,
+                            _server: &ExtensionSettings| {
+            resolver_calls += 1;
+            Ok(ExtensionSettings::new(json!({})).expect("bounded effective settings"))
+        };
+
+        let unopted = registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            )
+            .expect("registered descriptors remain inactive without developer opt-in");
+        assert_eq!(resolver_calls, 0);
+        assert_eq!(
+            unopted.inactive_reason(&id),
+            Some(ExtensionInactiveReason::LocallyDisabled)
+        );
+        assert_eq!(
+            unopted.admit_capability(&registry, ProtocolEra::Modern2026, &id),
+            Err(ExtensionDispatchError::InactiveCapability(id.to_string()))
+        );
+
+        assert_eq!(
+            registry.negotiate(
+                ProtocolEra::Legacy2024,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            ),
+            Err(ExtensionNegotiationError::LegacyProtocolExcluded),
+            "changing only the negotiation era must reject exact legacy before resolver execution"
+        );
+        assert_eq!(resolver_calls, 0);
+        assert_eq!(registry.receipt(), Some(&receipt));
+    }
+
+    #[test]
+    fn ext_02_oversized_discovery_is_rejected_before_bounded_state_allocation() {
+        let mut registry = ExtensionDescriptorRegistry::new();
+        registry.freeze().expect("empty registry freezes");
+        let settings = ExtensionSettings::new(json!({})).expect("bounded settings");
+        let client = ClientExtensionDiscovery {
+            extensions: (0..=MAX_EXTENSION_DESCRIPTORS)
+                .map(|index| {
+                    (
+                        ExtensionId::parse(format!("com.example/diagnostic-{index}"))
+                            .expect("bounded synthetic identifier"),
+                        settings.clone(),
+                    )
+                })
+                .collect(),
+        };
+        let mut resolver_called = false;
+        let mut resolver = |_descriptor: &ExtensionDescriptor,
+                            _client: &ExtensionSettings,
+                            _server: &ExtensionSettings| {
+            resolver_called = true;
+            Ok(ExtensionSettings::new(json!({})).expect("bounded effective settings"))
+        };
+
+        assert_eq!(
+            registry.negotiate(
+                ProtocolEra::Modern2026,
+                &ExtensionLocalEnablement::default(),
+                &client,
+                &ServerExtensionDiscovery::default(),
+                &mut resolver,
+            ),
+            Err(ExtensionNegotiationError::DiscoveryTooManyExtensions(
+                ExtensionPeer::Client
+            ))
+        );
+        assert!(!resolver_called);
     }
 
     #[test]
