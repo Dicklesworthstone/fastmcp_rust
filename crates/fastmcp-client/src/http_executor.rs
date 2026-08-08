@@ -17,6 +17,14 @@ pub const MODERN_MCP_ACCEPT: &str = "application/json, text/event-stream";
 pub const MODERN_MCP_ACCEPT_ENCODING: &str = "identity";
 pub const MODERN_MCP_CONTENT_TYPE: &str = "application/json";
 
+/// LIMIT-01's default cap for ignored RFC 9110 list elements in one
+/// `Content-Encoding` field value.
+///
+/// Empty elements are framing noise, never semantic content codings. Keeping
+/// the count finite prevents a response header from consuming unbounded work
+/// before this executor exposes any body bytes.
+const MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS: usize = 16;
+
 /// A single modern MCP JSON-RPC POST.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModernHttpRequest {
@@ -70,7 +78,11 @@ impl ModernHttpRequest {
         &self.body
     }
 
-    /// Builds the fixed MCP request headers without adding an encoding header.
+    /// Builds the fixed, uncoded MCP request headers.
+    ///
+    /// `Accept-Encoding` explicitly requests the canonical identity coding;
+    /// the request itself deliberately omits `Content-Encoding` because its
+    /// JSON-RPC body is not encoded.
     #[must_use]
     pub fn headers(&self) -> Vec<(String, String)> {
         let mut headers = vec![
@@ -229,7 +241,7 @@ impl ModernHttpExecutor {
         cx: &Cx,
         request: &ModernHttpRequest,
     ) -> Result<ModernHttpResponseStream, ModernHttpExecutorError> {
-        if cx.is_cancel_requested() {
+        if cx.checkpoint().is_err() {
             return Err(ModernHttpExecutorError::Cancelled);
         }
         let response = self
@@ -242,9 +254,20 @@ impl ModernHttpExecutor {
                 request.body().to_vec(),
             )
             .await
-            .map_err(ModernHttpExecutorError::Transport)?;
+            .map_err(map_transport_error)?;
+        if cx.checkpoint().is_err() {
+            return Err(ModernHttpExecutorError::Cancelled);
+        }
         let metadata = validate_response_head(response.head.status, &response.head.headers)?;
         Ok(ModernHttpResponseStream { metadata, response })
+    }
+}
+
+fn map_transport_error(error: ClientError) -> ModernHttpExecutorError {
+    if error.is_cancelled() {
+        ModernHttpExecutorError::Cancelled
+    } else {
+        ModernHttpExecutorError::Transport(error)
     }
 }
 
@@ -258,7 +281,7 @@ pub fn validate_response_head(
         return Err(ModernHttpExecutorError::Redirect { status });
     }
     let kind = if (200..300).contains(&status) {
-        let content_type = single_header(headers, "content-type")?
+        let content_type = single_header(headers, "content-type", "Content-Type")?
             .map(normalize_success_content_type)
             .transpose()?;
         match content_type {
@@ -277,16 +300,41 @@ pub fn validate_response_head(
 }
 
 fn validate_content_encoding(headers: &[(String, String)]) -> Result<(), ModernHttpExecutorError> {
-    match single_header(headers, "content-encoding")? {
-        None => Ok(()),
-        Some(value) if value.eq_ignore_ascii_case("identity") => Ok(()),
-        Some(_) => Err(ModernHttpExecutorError::UnsupportedContentEncoding),
+    let Some(value) = single_header(headers, "content-encoding", "Content-Encoding")? else {
+        return Ok(());
+    };
+
+    let mut ignored_empty_elements = 0_usize;
+    let mut semantic_codings = 0_usize;
+    for element in value.split(',') {
+        let element = trim_http_ows(element);
+        if element.is_empty() {
+            ignored_empty_elements = ignored_empty_elements.saturating_add(1);
+            if ignored_empty_elements > MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS {
+                return Err(ModernHttpExecutorError::UnsupportedContentEncoding);
+            }
+            continue;
+        }
+        if !element.eq_ignore_ascii_case(MODERN_MCP_ACCEPT_ENCODING) {
+            return Err(ModernHttpExecutorError::UnsupportedContentEncoding);
+        }
+        semantic_codings = semantic_codings.saturating_add(1);
+        if semantic_codings > 1 {
+            return Err(ModernHttpExecutorError::UnsupportedContentEncoding);
+        }
+    }
+
+    if semantic_codings == 1 {
+        Ok(())
+    } else {
+        Err(ModernHttpExecutorError::UnsupportedContentEncoding)
     }
 }
 
 fn single_header<'a>(
     headers: &'a [(String, String)],
     wanted_name: &str,
+    display_name: &'static str,
 ) -> Result<Option<&'a str>, ModernHttpExecutorError> {
     let mut values = headers
         .iter()
@@ -294,37 +342,92 @@ fn single_header<'a>(
         .map(|(_, value)| value.as_str());
     let first = values.next();
     if first.is_some() && values.next().is_some() {
-        let name = if wanted_name.eq_ignore_ascii_case("content-encoding") {
-            "Content-Encoding"
-        } else {
-            "Content-Type"
-        };
-        return Err(ModernHttpExecutorError::DuplicateResponseHeader { name });
+        return Err(ModernHttpExecutorError::DuplicateResponseHeader { name: display_name });
     }
     Ok(first)
 }
 
 fn normalize_success_content_type(value: &str) -> Result<&str, ModernHttpExecutorError> {
     let mut parts = value.split(';');
-    let essence = parts.next().map(str::trim).unwrap_or_default();
+    let essence = parts.next().map(trim_http_ows).unwrap_or_default();
     let Some(parameters) = parts.next() else {
         return Ok(essence);
     };
     if parts.next().is_some() {
         return Err(ModernHttpExecutorError::UnsupportedSuccessContentType);
     }
-    let Some((name, charset)) = parameters.trim().split_once('=') else {
+    let Some((name, charset)) = trim_http_ows(parameters).split_once('=') else {
         return Err(ModernHttpExecutorError::UnsupportedSuccessContentType);
     };
-    if !name.trim().eq_ignore_ascii_case("charset") || !charset.trim().eq_ignore_ascii_case("utf-8")
+    if !trim_http_ows(name).eq_ignore_ascii_case("charset")
+        || !trim_http_ows(charset).eq_ignore_ascii_case("utf-8")
     {
         return Err(ModernHttpExecutorError::UnsupportedSuccessContentType);
     }
     Ok(essence)
 }
 
+fn trim_http_ows(value: &str) -> &str {
+    value.trim_matches([' ', '\t'])
+}
+
 fn contains_header_control(value: &str) -> bool {
     value
         .bytes()
         .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpExecutorError,
+        ModernHttpResponseKind, validate_response_head,
+    };
+
+    #[test]
+    fn bounded_empty_content_encoding_elements_preserve_the_identity_stream_lane() {
+        let encoding = format!(
+            "{}Identity",
+            ",".repeat(MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS)
+        );
+        let response = validate_response_head(
+            200,
+            &[
+                ("Content-Type".to_owned(), "text/event-stream".to_owned()),
+                ("Content-Encoding".to_owned(), encoding),
+            ],
+        )
+        .expect("one semantic identity token admits the SSE stream");
+
+        assert_eq!(response.kind(), ModernHttpResponseKind::Sse);
+    }
+
+    #[test]
+    fn one_extra_empty_content_encoding_element_rejects_without_admitting_a_body_lane() {
+        let accepted_encoding = format!(
+            "{}identity",
+            ",".repeat(MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS)
+        );
+        let accepted_headers = vec![
+            ("Content-Type".to_owned(), "text/event-stream".to_owned()),
+            ("Content-Encoding".to_owned(), accepted_encoding),
+        ];
+        assert!(validate_response_head(200, &accepted_headers).is_ok());
+
+        // The sole changed field is one additional empty RFC 9110 list
+        // element. This pure admission function owns no mutable body state,
+        // so the rejection cannot expose or mutate a response stream.
+        let rejected_encoding = format!(
+            "{}identity",
+            ",".repeat(MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS + 1)
+        );
+        let rejected_headers = vec![
+            ("Content-Type".to_owned(), "text/event-stream".to_owned()),
+            ("Content-Encoding".to_owned(), rejected_encoding),
+        ];
+        assert!(matches!(
+            validate_response_head(200, &rejected_headers),
+            Err(ModernHttpExecutorError::UnsupportedContentEncoding)
+        ));
+    }
 }
