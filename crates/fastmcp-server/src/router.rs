@@ -239,6 +239,23 @@ fn encode_final_tools_call_result(
     serde_json::from_str(&encoded).map_err(McpError::from)
 }
 
+/// Encodes a handler-authored final resource result without reprojecting it
+/// through the legacy resource result surface. This preserves final embedded
+/// resource fields, cache policy, metadata, and open members selected by the
+/// handler.
+fn encode_final_resources_read_result(
+    result: McpResult<CompleteResult<FinalReadResourceResult>>,
+) -> McpResult<serde_json::Value> {
+    let result = result?;
+    let encoded = CoreResult::Final(FinalCoreResult::ResourcesRead {
+        result,
+        diagnostic: None,
+    })
+    .encode()
+    .map_err(|error| McpError::internal_error(error.to_string()))?;
+    serde_json::from_str(&encoded).map_err(McpError::from)
+}
+
 /// Encodes a handler-authored final prompt result without reprojecting it
 /// through the legacy prompt surface. This preserves final common content and
 /// result metadata selected by the handler.
@@ -1847,25 +1864,16 @@ impl Router {
                         "modern resources/read dispatch selected another core request",
                     ));
                 };
-                let params = legacy_read_resource_params(params.clone());
-                let result = self
-                    .handle_resources_read_in_request(
+                encode_final_resources_read_result(
+                    self.handle_resources_read_final_in_request(
                         request_ctx,
                         request_cx,
-                        &params,
+                        params,
                         SessionState::new(),
                         None,
                         None,
                     )
-                    .await;
-                encode_final_core_result(
-                    result.and_then(|result| {
-                        Self::project_final_resources_read(result, self.final_cache_hints)
-                    }),
-                    |result| FinalCoreResult::ResourcesRead {
-                        result,
-                        diagnostic: None,
-                    },
+                    .await,
                 )?
             }
             "prompts/list" => {
@@ -2758,6 +2766,82 @@ impl Router {
             meta: None,
             additional: BTreeMap::new(),
         })
+    }
+
+    /// Handles one final MCP 2026-07-28 `resources/read` request.
+    ///
+    /// Legacy dispatch remains on [`Self::handle_resources_read`], including
+    /// its exact `ReadResourceResult` shape. Final dispatch calls the final
+    /// handler hook directly so embedded resource metadata, open fields, and
+    /// cache hints are not projected through the legacy resource surface.
+    async fn handle_resources_read_final_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: FinalReadResourceParams,
+        session_state: SessionState,
+        notification_sender: Option<&NotificationSender>,
+        bidirectional_senders: Option<&BidirectionalSenders>,
+    ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        let uri = params.uri.as_str();
+        debug!(
+            target: targets::HANDLER,
+            "reading final resource; resource_key={}",
+            safe_log_label(uri)
+        );
+
+        let dispatch_started_at = request_ctx.cx().now();
+        if request_cx.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_resource_enabled(uri) {
+            return Err(McpError::new(
+                McpErrorCode::ResourceNotFound,
+                format!("Resource '{uri}' is disabled for this session"),
+            ));
+        }
+
+        let resolved = self
+            .resolve_resource(uri)
+            .ok_or_else(|| McpError::resource_not_found(uri))?;
+        let ctx = derive_handler_context(
+            request_ctx,
+            None,
+            notification_sender,
+            bidirectional_senders,
+        );
+        let handler_timeout = read_handler_timeout(request_ctx.cx(), "resource_timeout", || {
+            resolved.handler.timeout()
+        })?;
+        let effective_budget = compose_handler_budget(
+            request_ctx.cx().budget(),
+            request_ctx.budget(),
+            handler_timeout,
+            dispatch_started_at,
+        );
+        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
+        let outcome =
+            run_handler_in_request(&ctx, request_cx, effective_budget, "resource", |child_cx| {
+                resolved.handler.read_final_async_with_uri_in_request(
+                    &ctx,
+                    child_cx,
+                    uri,
+                    &resolved.params,
+                )
+            })
+            .await?;
+
+        match outcome {
+            Outcome::Ok(result) => Ok(result),
+            Outcome::Err(error) => Err(sanitize_handler_error(request_ctx.cx(), "resource", error)),
+            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => {
+                Err(sanitized_handler_panic(request_ctx.cx(), "resource"))
+            }
+        }
     }
 
     /// Handles the prompts/list request.
@@ -5921,6 +6005,79 @@ mod router_tests {
                     "io.modelcontextprotocol/clientCapabilities": {},
                 },
                 "name": "direct-final-prompt",
+            })),
+            id,
+        )
+    }
+
+    struct DirectFinalResource {
+        legacy_calls: Arc<AtomicUsize>,
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl ResourceHandler for DirectFinalResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "file:///direct-final-resource".to_owned(),
+                name: "direct-final-resource".to_owned(),
+                description: Some("legacy resource definition".to_owned()),
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![ResourceContent {
+                uri: "file:///direct-final-resource".to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                text: Some("legacy resource result".to_owned()),
+                blob: None,
+            }])
+        }
+
+        fn read_final(
+            &self,
+            _ctx: &McpContext,
+        ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            let content_meta = OpenMetadata::try_from_entries([(
+                "com.example/direct-resource".to_owned(),
+                serde_json::json!({"source": "final-handler"}),
+            )])
+            .expect("direct resource content metadata is valid");
+            Ok(CompleteResult::new(
+                FinalReadResourceResult {
+                    contents: vec![EmbeddedResourceContents::Text {
+                        uri: AbsoluteUri::parse("file:///direct-final-resource")
+                            .expect("routed direct resource URI is valid"),
+                        text: "direct final resource result".to_owned(),
+                        mime_type: Some("text/markdown".to_owned()),
+                        meta: Some(content_meta),
+                        additional: BTreeMap::from([(
+                            "com.example/direct-field".to_owned(),
+                            serde_json::json!(true),
+                        )]),
+                    }],
+                    ttl_ms: 321,
+                    cache_scope: CacheScope::Public,
+                },
+                empty_final_result_meta()?,
+            ))
+        }
+    }
+
+    fn direct_final_resource_request(id: i64) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "resources/read",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "uri": "file:///direct-final-resource",
             })),
             id,
         )
@@ -10365,6 +10522,152 @@ mod router_tests {
             .expect("reaccepted result is JSON"),
             accepted,
             "the incompatible result cannot alter the accepted final prompt contract"
+        );
+    }
+
+    #[test]
+    fn final_resources_read_dispatches_direct_handler_without_legacy_projection() {
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_resource(DirectFinalResource {
+            legacy_calls: Arc::clone(&legacy_calls),
+            final_calls: Arc::clone(&final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 98, Budget::INFINITE, &state);
+
+        let legacy = router
+            .handle_resources_read(
+                &request_ctx,
+                &ReadResourceParams {
+                    uri: "file:///direct-final-resource".to_owned(),
+                    meta: None,
+                },
+                state.clone(),
+                None,
+                None,
+            )
+            .expect("legacy resource requests retain their exact handler path");
+        assert_eq!(
+            legacy.contents[0].text.as_deref(),
+            Some("legacy resource result")
+        );
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+
+        let request = direct_final_resource_request(98);
+        let typed_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "resources/read",
+            request.params.as_ref(),
+        )
+        .expect("final resources/read request decodes through the public core surface");
+        let response = router
+            .dispatch_stateless(&request_ctx, &request)
+            .expect("final resources/read reaches the direct final handler");
+
+        assert_eq!(response["resultType"], "complete");
+        assert_eq!(response["ttlMs"], 321);
+        assert_eq!(response["cacheScope"], "public");
+        assert_eq!(
+            response["contents"][0]["text"],
+            "direct final resource result"
+        );
+        assert_eq!(response["contents"][0]["mimeType"], "text/markdown");
+        assert_eq!(
+            response["contents"][0]["_meta"]["com.example/direct-resource"]["source"],
+            "final-handler"
+        );
+        assert_eq!(response["contents"][0]["com.example/direct-field"], true);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+
+        let wire = serde_json::to_string(&response).expect("final resource response serializes");
+        let CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) = typed_request
+            .decode_result(&wire)
+            .expect("final resource result decodes through the public core surface")
+        else {
+            panic!("resources/read selects the exact final result");
+        };
+        assert_eq!(result.payload.ttl_ms, 321);
+        assert_eq!(result.payload.cache_scope, CacheScope::Public);
+        assert!(matches!(
+            result.payload.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, mime_type, .. }]
+                if text == "direct final resource result"
+                    && mime_type.as_deref() == Some("text/markdown")
+        ));
+    }
+
+    #[test]
+    fn final_resources_read_rejects_one_field_incompatible_result_type() {
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_resource(DirectFinalResource {
+            legacy_calls,
+            final_calls: Arc::clone(&final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 99, Budget::INFINITE, &state);
+        let request = direct_final_resource_request(99);
+        let typed_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "resources/read",
+            request.params.as_ref(),
+        )
+        .expect("final resources/read request decodes through the public core surface");
+        let accepted = router
+            .dispatch_stateless(&request_ctx, &request)
+            .expect("the direct final resource response is accepted");
+        let accepted_wire = serde_json::to_string(&accepted).expect("accepted result serializes");
+        let mut incompatible = accepted.clone();
+        incompatible["resultType"] = serde_json::json!("input_required");
+
+        let mut accepted_without_type = accepted.clone();
+        let mut incompatible_without_type = incompatible.clone();
+        let accepted_type = accepted_without_type
+            .as_object_mut()
+            .and_then(|object| object.remove("resultType"));
+        let incompatible_type = incompatible_without_type
+            .as_object_mut()
+            .and_then(|object| object.remove("resultType"));
+        assert_eq!(accepted_type, Some(serde_json::json!("complete")));
+        assert_eq!(incompatible_type, Some(serde_json::json!("input_required")));
+        assert_eq!(
+            incompatible_without_type, accepted_without_type,
+            "resultType is the sole incompatible result dimension"
+        );
+
+        let incompatible_wire =
+            serde_json::to_string(&incompatible).expect("incompatible result serializes");
+        assert!(matches!(
+            typed_request.decode_result(&incompatible_wire),
+            Err(fastmcp_protocol::CoreDispatchError::ResultCodec(_))
+        ));
+        assert_eq!(
+            serde_json::to_string(&accepted).expect("accepted result remains serializable"),
+            accepted_wire,
+            "rejecting the one-field incompatible result cannot mutate the accepted response"
+        );
+        assert_eq!(
+            final_calls.load(Ordering::SeqCst),
+            1,
+            "local result admission cannot invoke or mutate the direct resource handler"
+        );
+        let reaccepted = typed_request
+            .decode_result(&accepted_wire)
+            .expect("the original direct final result remains accepted");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &reaccepted.encode().expect("reaccepted result encodes"),
+            )
+            .expect("reaccepted result is JSON"),
+            accepted,
+            "the incompatible result cannot alter the accepted final resource contract"
         );
     }
 
