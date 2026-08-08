@@ -1685,7 +1685,9 @@ impl FinalTaskRuntime {
             current,
             FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
         ) {
-            return Err(McpError::invalid_params("terminal tasks cannot be cancelled"));
+            return Err(McpError::invalid_params(
+                "terminal tasks cannot be cancelled",
+            ));
         }
         self.store.request_cancellation(task_id)?;
         Ok(FinalCancelTaskResult::default())
@@ -1712,7 +1714,9 @@ impl FinalTaskRuntime {
             current,
             FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
         ) {
-            return Err(McpError::invalid_params("terminal tasks cannot be cancelled"));
+            return Err(McpError::invalid_params(
+                "terminal tasks cannot be cancelled",
+            ));
         }
         let task = FinalTask::Cancelled(transition_terminal_final_task_base(
             current.base().clone(),
@@ -1899,8 +1903,8 @@ pub type SharedTaskManager = Arc<TaskManager>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
