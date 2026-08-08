@@ -88,7 +88,17 @@ pub use server_discovery::{
     ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult, ServerDiscoveryError,
     ServerInstructionError, ServerInstructions,
 };
-pub use tasks_extension::*;
+pub use tasks_extension::{
+    CancelTaskParams as FinalCancelTaskParams, CancelTaskResult as FinalCancelTaskResult,
+    CompleteTaskResult, CreateTaskResult, EmptyTaskResult, FinalTaskCallToolResult, FinalTaskError,
+    GetTaskParams as FinalGetTaskParams, GetTaskResult as FinalGetTaskResult, MAX_TASK_ID_BYTES,
+    MAX_TASK_INPUT_MAP_ENTRIES, RELATED_TASK_META_KEY, TASK_CANCEL, TASK_GET,
+    TASK_STATUS_NOTIFICATION, TASKS_EXTENSION, Task, TaskBase, TaskDuration, TaskId as FinalTaskId,
+    TaskInputLedger, TaskInputRequests, TaskInputResponses, TaskMethodRequest, TaskRequestMeta,
+    TaskStatus as FinalTaskStatus, TaskStatusNotification,
+    TaskStatusNotificationParams as FinalTaskStatusNotificationParams, TaskTimestamp,
+    TaskWireError, UpdateTaskParams, UpdateTaskResult,
+};
 pub use types::*;
 
 // The FND-03 contract freezes unqualified `cargo test -- --exact` IDs. Keep

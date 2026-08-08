@@ -30,6 +30,8 @@ pub const TASK_UPDATE: &str = "tasks/update";
 pub const TASK_CANCEL: &str = "tasks/cancel";
 /// Exact task-status notification method name.
 pub const TASK_STATUS_NOTIFICATION: &str = "notifications/tasks";
+/// Legacy task-link metadata is forbidden inside a Task's inlined result.
+pub const RELATED_TASK_META_KEY: &str = "io.modelcontextprotocol/related-task";
 /// Maximum decoded UTF-8 bytes in a task ID.
 pub const MAX_TASK_ID_BYTES: usize = 1024;
 /// Maximum entries retained in either task input map.
@@ -427,11 +429,12 @@ impl Serialize for FinalTaskCallToolResult {
         else {
             unreachable!("tool result serializes as object")
         };
-        members.insert(
-            "resultType".to_owned(),
-            Value::String("complete".to_owned()),
-        );
         if let Some(meta) = &self.meta {
+            if meta.entries().contains_key(RELATED_TASK_META_KEY) {
+                return Err(serde::ser::Error::custom(
+                    "completed task result forbids related-task metadata",
+                ));
+            }
             members.insert(
                 "_meta".to_owned(),
                 serde_json::to_value(meta).map_err(serde::ser::Error::custom)?,
@@ -456,9 +459,9 @@ impl<'de> Deserialize<'de> for FinalTaskCallToolResult {
         let Value::Object(mut members) = Value::deserialize(deserializer)? else {
             return Err(D::Error::custom("completed task result must be an object"));
         };
-        if members.remove("resultType") != Some(Value::String("complete".to_owned())) {
+        if members.contains_key("resultType") {
             return Err(D::Error::custom(
-                "completed task result requires resultType complete",
+                "completed task result must be a flattened tools/call result",
             ));
         }
         let meta = members
@@ -466,6 +469,14 @@ impl<'de> Deserialize<'de> for FinalTaskCallToolResult {
             .map(serde_json::from_value)
             .transpose()
             .map_err(D::Error::custom)?;
+        if meta
+            .as_ref()
+            .is_some_and(|meta| meta.entries().contains_key(RELATED_TASK_META_KEY))
+        {
+            return Err(D::Error::custom(
+                "completed task result forbids related-task metadata",
+            ));
+        }
         let mut result_members = Map::new();
         for key in ["content", "isError", "structuredContent"] {
             if let Some(value) = members.remove(key) {
@@ -483,8 +494,7 @@ impl<'de> Deserialize<'de> for FinalTaskCallToolResult {
 }
 
 /// Shared final task fields.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct TaskBase {
     #[serde(rename = "taskId")]
     pub task_id: TaskId,
@@ -507,6 +517,73 @@ pub struct TaskBase {
         skip_serializing_if = "Option::is_none"
     )]
     pub poll_interval_ms: Option<TaskDuration>,
+}
+
+struct RequiredTaskTtl(Option<TaskDuration>);
+
+impl<'de> Deserialize<'de> for RequiredTaskTtl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<TaskDuration>::deserialize(deserializer).map(Self)
+    }
+}
+
+struct OptionalTaskField<T>(Option<T>);
+
+impl<T> Default for OptionalTaskField<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<'de, T> Deserialize<'de> for OptionalTaskField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        T::deserialize(deserializer).map(|value| Self(Some(value)))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskBaseWire {
+    #[serde(rename = "taskId")]
+    task_id: TaskId,
+    status: TaskStatus,
+    #[serde(rename = "statusMessage", default)]
+    status_message: OptionalTaskField<String>,
+    #[serde(rename = "createdAt")]
+    created_at: TaskTimestamp,
+    #[serde(rename = "lastUpdatedAt")]
+    last_updated_at: TaskTimestamp,
+    #[serde(rename = "ttlMs")]
+    ttl_ms: RequiredTaskTtl,
+    #[serde(rename = "pollIntervalMs", default)]
+    poll_interval_ms: OptionalTaskField<TaskDuration>,
+}
+
+impl<'de> Deserialize<'de> for TaskBase {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = TaskBaseWire::deserialize(deserializer)?;
+        Ok(Self {
+            task_id: wire.task_id,
+            status: wire.status,
+            status_message: wire.status_message.0,
+            created_at: wire.created_at,
+            last_updated_at: wire.last_updated_at,
+            ttl_ms: wire.ttl_ms.0,
+            poll_interval_ms: wire.poll_interval_ms.0,
+        })
+    }
 }
 
 /// Status-discriminated final Task payload.
@@ -1018,12 +1095,60 @@ impl<'de> Deserialize<'de> for TaskStatusNotificationParams {
 }
 
 /// Exact `notifications/tasks` JSON-RPC notification.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub struct TaskStatusNotification {
-    pub jsonrpc: String,
-    pub method: String,
     pub params: TaskStatusNotificationParams,
+}
+
+impl TaskStatusNotification {
+    /// Creates an exact `notifications/tasks` notification.
+    #[must_use]
+    pub const fn new(params: TaskStatusNotificationParams) -> Self {
+        Self { params }
+    }
+}
+
+impl Serialize for TaskStatusNotification {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut members = Map::new();
+        members.insert(
+            "jsonrpc".to_owned(),
+            Value::String(JSONRPC_VERSION.to_owned()),
+        );
+        members.insert(
+            "method".to_owned(),
+            Value::String(TASK_STATUS_NOTIFICATION.to_owned()),
+        );
+        members.insert(
+            "params".to_owned(),
+            serde_json::to_value(&self.params).map_err(serde::ser::Error::custom)?,
+        );
+        Value::Object(members).serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskStatusNotificationWire {
+    jsonrpc: String,
+    method: String,
+    params: TaskStatusNotificationParams,
+}
+
+impl<'de> Deserialize<'de> for TaskStatusNotification {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = TaskStatusNotificationWire::deserialize(deserializer)?;
+        if wire.jsonrpc != JSONRPC_VERSION || wire.method != TASK_STATUS_NOTIFICATION {
+            return Err(D::Error::custom("invalid notifications/tasks notification"));
+        }
+        Ok(Self::new(wire.params))
+    }
 }
 
 #[cfg(test)]
@@ -1119,5 +1244,99 @@ mod tests {
             serde_json::to_value(before).expect("after state"),
             "rejection must not alter task input state"
         );
+    }
+
+    #[test]
+    fn completed_task_flattens_inner_result_and_preserves_open_fields() {
+        let wire = serde_json::json!({
+            "resultType": "complete",
+            "taskId": "task-1",
+            "status": "completed",
+            "createdAt": "2026-07-28T12:00:00.000Z",
+            "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+            "ttlMs": null,
+            "result": {
+                "content": [],
+                "x-inner": { "preserved": true }
+            },
+            "x-envelope": { "preserved": true }
+        });
+
+        let decoded: GetTaskResult =
+            serde_json::from_value(wire.clone()).expect("flattened completed task");
+        let reencoded = serde_json::to_value(decoded).expect("reserialize completed task");
+        assert_eq!(reencoded, wire);
+        assert!(reencoded["result"].get("resultType").is_none());
+        assert_eq!(reencoded["result"]["x-inner"]["preserved"], true);
+        assert_eq!(reencoded["x-envelope"]["preserved"], true);
+
+        let mut with_result_type = wire.clone();
+        with_result_type["result"]["resultType"] = serde_json::json!("complete");
+        assert!(serde_json::from_value::<GetTaskResult>(with_result_type).is_err());
+
+        let mut with_legacy_related_task = wire;
+        with_legacy_related_task["result"]["_meta"] = serde_json::json!({
+            (RELATED_TASK_META_KEY): { "taskId": "task-1" }
+        });
+        assert!(serde_json::from_value::<GetTaskResult>(with_legacy_related_task).is_err());
+    }
+
+    #[test]
+    fn task_base_requires_ttl_and_rejects_present_null_optional_fields() {
+        let wire = serde_json::json!({
+            "resultType": "complete",
+            "taskId": "task-1",
+            "status": "working",
+            "createdAt": "2026-07-28T12:00:00.000Z",
+            "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+            "ttlMs": null
+        });
+        let accepted: GetTaskResult =
+            serde_json::from_value(wire.clone()).expect("unlimited TTL is valid");
+        assert_eq!(
+            serde_json::to_value(accepted).expect("unlimited TTL serializes"),
+            wire
+        );
+
+        let mut missing_ttl = wire.clone();
+        missing_ttl
+            .as_object_mut()
+            .expect("result object")
+            .remove("ttlMs");
+        assert!(serde_json::from_value::<GetTaskResult>(missing_ttl).is_err());
+
+        let mut null_poll_interval = wire.clone();
+        null_poll_interval["pollIntervalMs"] = Value::Null;
+        assert!(serde_json::from_value::<GetTaskResult>(null_poll_interval).is_err());
+
+        let mut null_status_message = wire;
+        null_status_message["statusMessage"] = Value::Null;
+        assert!(serde_json::from_value::<GetTaskResult>(null_status_message).is_err());
+    }
+
+    #[test]
+    fn task_status_notification_enforces_exact_method_vocabulary() {
+        let wire = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tasks",
+            "params": {
+                "taskId": "task-1",
+                "status": "working",
+                "createdAt": "2026-07-28T12:00:00.000Z",
+                "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+                "ttlMs": null,
+                "x-notification": { "preserved": true }
+            }
+        });
+        let notification: TaskStatusNotification =
+            serde_json::from_value(wire.clone()).expect("exact notification");
+        assert_eq!(
+            serde_json::to_value(notification).expect("notification serializes"),
+            wire
+        );
+
+        let mut wrong_method = wire;
+        wrong_method["method"] = serde_json::json!("notifications/tasks/status");
+        assert!(serde_json::from_value::<TaskStatusNotification>(wrong_method).is_err());
     }
 }
