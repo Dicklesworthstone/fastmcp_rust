@@ -9,10 +9,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeMap};
+use serde::{de::Error as _, ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::{ServerInfo, protocol_version::FINAL_PROTOCOL_VERSION};
+use crate::{
+    protocol_version::FINAL_PROTOCOL_VERSION, OpenMetadata, ServerInfo,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY,
+};
 
 /// The exact JSON-RPC method for final server discovery.
 pub const SERVER_DISCOVER_METHOD: &str = "server/discover";
@@ -35,10 +38,78 @@ pub const MAX_DISCOVERY_EXTENSION_VALUE_BYTES: usize = 16 * 1024;
 /// Reserved result-metadata key that identifies the responding server.
 pub const SERVER_DISCOVER_SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 
-/// The typed empty `params` object for a `server/discover` request.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerDiscoverRequest {}
+/// Typed final `params` for a `server/discover` request.
+///
+/// Final requests always carry the common request metadata. Unknown
+/// method-specific members remain inert and round-trip so a newer peer does
+/// not become undecodable merely by extending this open object.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ServerDiscoverRequest {
+    #[serde(rename = "_meta")]
+    metadata: OpenMetadata,
+    #[serde(flatten)]
+    extras: BTreeMap<String, Value>,
+}
+
+impl Default for ServerDiscoverRequest {
+    fn default() -> Self {
+        let metadata = OpenMetadata::try_from_entries([
+            (
+                FINAL_PROTOCOL_VERSION_META_KEY.to_owned(),
+                Value::String(FINAL_PROTOCOL_VERSION.to_owned()),
+            ),
+            (
+                FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
+                Value::Object(serde_json::Map::new()),
+            ),
+        ])
+        .expect("the fixed final discovery request metadata is valid");
+        Self {
+            metadata,
+            extras: BTreeMap::new(),
+        }
+    }
+}
+
+impl ServerDiscoverRequest {
+    /// Returns the required request metadata without granting its self-reported
+    /// values any authority.
+    #[must_use]
+    pub fn metadata(&self) -> &OpenMetadata {
+        &self.metadata
+    }
+}
+
+#[derive(Deserialize)]
+struct ServerDiscoverRequestWire {
+    #[serde(rename = "_meta")]
+    metadata: OpenMetadata,
+    #[serde(flatten)]
+    extras: BTreeMap<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for ServerDiscoverRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ServerDiscoverRequestWire::deserialize(deserializer)?;
+        let protocol_version = wire.metadata.protocol_version().map_err(D::Error::custom)?;
+        let client_capabilities = wire
+            .metadata
+            .client_capabilities()
+            .map_err(D::Error::custom)?;
+        if protocol_version != Some(FINAL_PROTOCOL_VERSION) || client_capabilities.is_none() {
+            return Err(D::Error::custom(
+                ServerDiscoveryError::InvalidRequestMetadata,
+            ));
+        }
+        Ok(Self {
+            metadata: wire.metadata,
+            extras: wire.extras,
+        })
+    }
+}
 
 /// A server behavior whose installation can be advertised through discovery.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -180,6 +251,30 @@ impl<'de> Deserialize<'de> for DiscoveryCacheScope {
     }
 }
 
+/// The only complete payload shape this method can carry.
+///
+/// Older peers may omit the discriminator; final clients must treat that as
+/// `complete` while final servers always emit it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+enum DiscoveryResultType {
+    #[serde(rename = "complete")]
+    Complete,
+}
+
+impl<'de> Deserialize<'de> for DiscoveryResultType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "complete" => Ok(Self::Complete),
+            _ => Err(D::Error::custom(
+                "server/discover resultType must be `complete`",
+            )),
+        }
+    }
+}
+
 /// Required final caching hints for a `server/discover` result.
 ///
 /// Safe local construction is intentionally limited to the private scope.
@@ -221,67 +316,23 @@ impl DiscoveryCacheHints {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EmptyCapability {}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ListCapability {
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    list_changed: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ResourcesCapability {
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    subscribe: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    list_changed: bool,
-}
-
 /// Typed capability shape derived from an installed behavior registry.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+///
+/// `ServerCapabilities` is deliberately an open object in the final schema.
+/// Retaining its members as JSON preserves both known capability settings and
+/// future peer-defined capabilities without recasting them as local authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerDiscoverCapabilities {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    logging: Option<EmptyCapability>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    completions: Option<EmptyCapability>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<ListCapability>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resources: Option<ResourcesCapability>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompts: Option<ListCapability>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    extensions: Option<BTreeMap<String, Value>>,
+    members: BTreeMap<String, Value>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ServerDiscoverCapabilitiesWire {
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    logging: Option<EmptyCapability>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    completions: Option<EmptyCapability>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    tools: Option<ListCapability>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    resources: Option<ResourcesCapability>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    prompts: Option<ListCapability>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    extensions: Option<BTreeMap<String, Value>>,
-}
-
-fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    T::deserialize(deserializer).map(Some)
+impl Serialize for ServerDiscoverCapabilities {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.members.serialize(serializer)
+    }
 }
 
 impl<'de> Deserialize<'de> for ServerDiscoverCapabilities {
@@ -289,23 +340,9 @@ impl<'de> Deserialize<'de> for ServerDiscoverCapabilities {
     where
         D: Deserializer<'de>,
     {
-        let wire = ServerDiscoverCapabilitiesWire::deserialize(deserializer)?;
-        if let Some(extensions) = wire.extensions.as_ref() {
-            if extensions.is_empty() {
-                return Err(D::Error::custom(
-                    ServerDiscoveryError::EmptyExtensionSettings,
-                ));
-            }
-            validate_extensions(extensions).map_err(D::Error::custom)?;
-        }
-        Ok(Self {
-            logging: wire.logging,
-            completions: wire.completions,
-            tools: wire.tools,
-            resources: wire.resources,
-            prompts: wire.prompts,
-            extensions: wire.extensions,
-        })
+        let members = BTreeMap::<String, Value>::deserialize(deserializer)?;
+        validate_capability_members(&members).map_err(D::Error::custom)?;
+        Ok(Self { members })
     }
 }
 
@@ -323,27 +360,106 @@ impl ServerDiscoverCapabilities {
         let resources_subscribe = registry.contains(ServerBehavior::ResourcesSubscribe)
             && registry.contains(ServerBehavior::SubscriptionsListen)
             && registry.contains(ServerBehavior::ResourceUpdateDelivery);
+        let mut members = BTreeMap::new();
 
-        Ok(Self {
-            logging: registry
-                .contains(ServerBehavior::LoggingRequestEmitter)
-                .then_some(EmptyCapability {}),
-            completions: registry
-                .contains(ServerBehavior::CompletionComplete)
-                .then_some(EmptyCapability {}),
-            tools: tools_list.then_some(ListCapability {
-                list_changed: registry.contains(ServerBehavior::ToolsListChangedNotification),
-            }),
-            resources: resources_list.then_some(ResourcesCapability {
-                subscribe: resources_subscribe,
-                list_changed: registry.contains(ServerBehavior::ResourcesListChangedNotification),
-            }),
-            prompts: prompts_list.then_some(ListCapability {
-                list_changed: registry.contains(ServerBehavior::PromptsListChangedNotification),
-            }),
-            extensions: (!extensions.is_empty()).then_some(extensions),
-        })
+        if registry.contains(ServerBehavior::LoggingRequestEmitter) {
+            members.insert("logging".to_owned(), Value::Object(serde_json::Map::new()));
+        }
+        if registry.contains(ServerBehavior::CompletionComplete) {
+            members.insert(
+                "completions".to_owned(),
+                Value::Object(serde_json::Map::new()),
+            );
+        }
+        if tools_list {
+            let mut tools = serde_json::Map::new();
+            if registry.contains(ServerBehavior::ToolsListChangedNotification) {
+                tools.insert("listChanged".to_owned(), Value::Bool(true));
+            }
+            members.insert("tools".to_owned(), Value::Object(tools));
+        }
+        if resources_list {
+            let mut resources = serde_json::Map::new();
+            if resources_subscribe {
+                resources.insert("subscribe".to_owned(), Value::Bool(true));
+            }
+            if registry.contains(ServerBehavior::ResourcesListChangedNotification) {
+                resources.insert("listChanged".to_owned(), Value::Bool(true));
+            }
+            members.insert("resources".to_owned(), Value::Object(resources));
+        }
+        if prompts_list {
+            let mut prompts = serde_json::Map::new();
+            if registry.contains(ServerBehavior::PromptsListChangedNotification) {
+                prompts.insert("listChanged".to_owned(), Value::Bool(true));
+            }
+            members.insert("prompts".to_owned(), Value::Object(prompts));
+        }
+        if !extensions.is_empty() {
+            members.insert(
+                "extensions".to_owned(),
+                Value::Object(extensions.into_iter().collect()),
+            );
+        }
+
+        Ok(Self { members })
     }
+}
+
+fn validate_capability_members(
+    members: &BTreeMap<String, Value>,
+) -> Result<(), ServerDiscoveryError> {
+    for capability in ["logging", "completions"] {
+        if members
+            .get(capability)
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(ServerDiscoveryError::InvalidCapabilityShape);
+        }
+    }
+
+    for capability in ["tools", "prompts"] {
+        if let Some(Value::Object(settings)) = members.get(capability) {
+            if settings
+                .get("listChanged")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(ServerDiscoveryError::InvalidCapabilityShape);
+            }
+        } else if members.contains_key(capability) {
+            return Err(ServerDiscoveryError::InvalidCapabilityShape);
+        }
+    }
+
+    if let Some(Value::Object(settings)) = members.get("resources") {
+        for field in ["listChanged", "subscribe"] {
+            if settings.get(field).is_some_and(|value| !value.is_boolean()) {
+                return Err(ServerDiscoveryError::InvalidCapabilityShape);
+            }
+        }
+    } else if members.contains_key("resources") {
+        return Err(ServerDiscoveryError::InvalidCapabilityShape);
+    }
+
+    if let Some(Value::Object(settings)) = members.get("experimental") {
+        if settings.values().any(|value| !value.is_object()) {
+            return Err(ServerDiscoveryError::InvalidCapabilityShape);
+        }
+    } else if members.contains_key("experimental") {
+        return Err(ServerDiscoveryError::InvalidCapabilityShape);
+    }
+
+    if let Some(Value::Object(settings)) = members.get("extensions") {
+        let extensions = settings
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        validate_extensions(&extensions)?;
+    } else if members.contains_key("extensions") {
+        return Err(ServerDiscoveryError::InvalidCapabilityShape);
+    }
+
+    Ok(())
 }
 
 fn validate_extensions(extensions: &BTreeMap<String, Value>) -> Result<(), ServerDiscoveryError> {
@@ -360,6 +476,9 @@ fn validate_extensions(extensions: &BTreeMap<String, Value>) -> Result<(), Serve
                 length: name.len(),
                 maximum: MAX_DISCOVERY_EXTENSION_NAME_BYTES,
             });
+        }
+        if !value.is_object() {
+            return Err(ServerDiscoveryError::InvalidCapabilityShape);
         }
         let encoded_len = serde_json::to_vec(value)
             .map_err(|_| ServerDiscoveryError::ExtensionValueEncoding)?
@@ -454,6 +573,8 @@ impl<'de> Deserialize<'de> for OptionalServerInstructions {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerDiscoverResult {
+    #[serde(rename = "resultType")]
+    result_type: DiscoveryResultType,
     #[serde(rename = "supportedVersions")]
     supported_versions: Vec<String>,
     capabilities: ServerDiscoverCapabilities,
@@ -466,6 +587,8 @@ pub struct ServerDiscoverResult {
     instructions: Option<ServerInstructions>,
     #[serde(flatten)]
     cache_hints: DiscoveryCacheHints,
+    #[serde(flatten)]
+    extras: BTreeMap<String, Value>,
 }
 
 impl ServerDiscoverResult {
@@ -479,6 +602,7 @@ impl ServerDiscoverResult {
         cache_hints: DiscoveryCacheHints,
     ) -> Self {
         Self {
+            result_type: DiscoveryResultType::Complete,
             supported_versions: SERVER_DISCOVER_SUPPORTED_VERSIONS
                 .iter()
                 .map(|version| (*version).to_owned())
@@ -487,10 +611,11 @@ impl ServerDiscoverResult {
             metadata: ServerDiscoverResultMetadata::server_generated(server_info),
             instructions,
             cache_hints,
+            extras: BTreeMap::new(),
         }
     }
 
-    /// Returns the exact final protocol versions advertised on the wire.
+    /// Returns the protocol versions advertised by this server.
     #[must_use]
     pub fn supported_versions(&self) -> &[String] {
         &self.supported_versions
@@ -522,8 +647,10 @@ impl ServerDiscoverResult {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct ServerDiscoverResultWire {
+    #[serde(rename = "resultType", default = "complete_discovery_result")]
+    result_type: DiscoveryResultType,
     #[serde(rename = "supportedVersions")]
     supported_versions: Vec<String>,
     capabilities: ServerDiscoverCapabilities,
@@ -535,6 +662,12 @@ struct ServerDiscoverResultWire {
     ttl_ms: u64,
     #[serde(rename = "cacheScope")]
     cache_scope: DiscoveryCacheScope,
+    #[serde(flatten)]
+    extras: BTreeMap<String, Value>,
+}
+
+const fn complete_discovery_result() -> DiscoveryResultType {
+    DiscoveryResultType::Complete
 }
 
 impl<'de> Deserialize<'de> for ServerDiscoverResult {
@@ -543,21 +676,14 @@ impl<'de> Deserialize<'de> for ServerDiscoverResult {
         D: Deserializer<'de>,
     {
         let wire = ServerDiscoverResultWire::deserialize(deserializer)?;
-        let expected: Vec<String> = SERVER_DISCOVER_SUPPORTED_VERSIONS
-            .iter()
-            .map(|version| (*version).to_owned())
-            .collect();
-        if wire.supported_versions != expected {
-            return Err(D::Error::custom(
-                ServerDiscoveryError::UnsupportedProtocolVersions,
-            ));
-        }
         Ok(Self {
+            result_type: wire.result_type,
             supported_versions: wire.supported_versions,
             capabilities: wire.capabilities,
             metadata: wire.metadata,
             instructions: wire.instructions.0,
             cache_hints: DiscoveryCacheHints::from_peer_wire(wire.ttl_ms, wire.cache_scope),
+            extras: wire.extras,
         })
     }
 }
@@ -565,10 +691,10 @@ impl<'de> Deserialize<'de> for ServerDiscoverResult {
 /// Why a server discovery value could not be safely constructed or admitted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServerDiscoveryError {
-    /// The supplied result advertised a version list other than the exact final list.
-    UnsupportedProtocolVersions,
-    /// The `capabilities.extensions` field was present without an enabled extension.
-    EmptyExtensionSettings,
+    /// The request did not carry the required final request metadata.
+    InvalidRequestMetadata,
+    /// A known capability field did not use its schema-required object shape.
+    InvalidCapabilityShape,
     /// The registry attempted to advertise more extension settings than allowed.
     TooManyExtensionSettings {
         /// Observed extension setting count.
@@ -597,12 +723,15 @@ pub enum ServerDiscoveryError {
 impl fmt::Display for ServerDiscoveryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedProtocolVersions => write!(
+            Self::InvalidRequestMetadata => write!(
                 formatter,
-                "server/discover must advertise exactly {SERVER_DISCOVER_SUPPORTED_VERSIONS:?}"
+                "server/discover requires final protocol version and client capabilities metadata"
             ),
-            Self::EmptyExtensionSettings => {
-                write!(formatter, "empty capabilities.extensions must be omitted")
+            Self::InvalidCapabilityShape => {
+                write!(
+                    formatter,
+                    "server/discover capability has an invalid schema shape"
+                )
             }
             Self::TooManyExtensionSettings { actual, maximum } => {
                 write!(
@@ -633,12 +762,12 @@ impl Error for ServerDiscoveryError {}
 mod tests {
     use std::collections::BTreeMap;
 
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     use crate::{
-        DiscoveryCacheHints, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
-        ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
-        ServerDiscoverResult, ServerDiscoveryError, ServerInfo, ServerInstructions,
+        DiscoveryCacheHints, ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities,
+        ServerDiscoverRequest, ServerDiscoverResult, ServerInfo, ServerInstructions,
+        SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
     };
 
     fn fully_installed_capabilities() -> ServerDiscoverCapabilities {
@@ -679,7 +808,16 @@ mod tests {
             serde_json::to_value(&result).expect("the typed result encodes through the public API");
 
         assert_eq!(SERVER_DISCOVER_METHOD, "server/discover");
-        assert_eq!(request, json!({}));
+        assert_eq!(
+            request,
+            json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })
+        );
+        assert_eq!(wire["resultType"], json!("complete"));
         assert_eq!(
             wire["supportedVersions"],
             json!(SERVER_DISCOVER_SUPPORTED_VERSIONS)
@@ -733,6 +871,34 @@ mod tests {
     }
 
     #[test]
+    fn server_discover_accepts_schema_valid_supported_versions() {
+        let admitted = ServerDiscoverResult::new(
+            fully_installed_capabilities(),
+            ServerInfo {
+                name: "contract-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let mut peer_wire: Value =
+            serde_json::to_value(&admitted).expect("the admitted result encodes");
+        peer_wire["supportedVersions"] = json!(["2024-11-05", "2026-07-28"]);
+
+        let decoded: ServerDiscoverResult = serde_json::from_value(peer_wire)
+            .expect("the final schema permits any string version advertisement");
+        assert_eq!(
+            decoded
+                .supported_versions()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["2024-11-05", "2026-07-28"],
+            "version selection remains a negotiation-layer concern"
+        );
+    }
+
+    #[test]
     fn srv_02_b_planted_negative() {
         let admitted = ServerDiscoverResult::new(
             fully_installed_capabilities(),
@@ -747,14 +913,13 @@ mod tests {
             serde_json::to_vec(&admitted).expect("the admitted result has a stable wire image");
         let mut planted: Value =
             serde_json::to_value(&admitted).expect("the admitted result encodes");
-        planted["supportedVersions"] = json!(["2024-11-05"]);
+        planted["resultType"] = json!("input_required");
 
         let rejection = serde_json::from_value::<ServerDiscoverResult>(planted)
-            .expect_err("only the forbidden supported-version dimension changed");
+            .expect_err("only the incompatible result type changed");
         assert_eq!(
             rejection.to_string(),
-            ServerDiscoveryError::UnsupportedProtocolVersions.to_string(),
-            "the typed version validator reports one deterministic refusal"
+            "server/discover resultType must be `complete`"
         );
         assert_eq!(
             serde_json::to_vec(&admitted).expect("the admitted result still encodes"),
