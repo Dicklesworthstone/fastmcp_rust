@@ -141,7 +141,7 @@ use fastmcp_transport::http::{
 
 use asupersync::codec::Framed;
 use asupersync::http::h1::{Http1Codec, Method as Http1Method, Response as Http1Response};
-use asupersync::io::AsyncWriteExt;
+use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use asupersync::stream::StreamExt;
 use asupersync::{Budget, CancelKind, Cx, RegionId, channel::mpsc as asupersync_mpsc};
@@ -172,7 +172,7 @@ use fastmcp_protocol::{
     ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY, GetPromptParams, InitializeParams,
     JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
     ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
-    MAX_SERVER_INSTRUCTIONS_BYTES, Prompt, ReadResourceParams, RequestId, Resource,
+    MAX_SERVER_INSTRUCTIONS_BYTES, ProgressMarker, Prompt, ReadResourceParams, RequestId, Resource,
     ResourceTemplate, SERVER_DISCOVER_METHOD, ServerCapabilities, ServerDiscoverCapabilities,
     ServerDiscoverRequest, ServerDiscoverResult, ServerExtensionDiscovery, ServerInfo,
     ServerInstructions, SetLogLevelParams, SubscribeResourceParams, Tool,
@@ -2202,6 +2202,33 @@ impl ServerHttpSession {
         }
     }
 
+    /// Admits a modern SSE body without synchronously dispatching its request.
+    ///
+    /// The socket writer owns this body and its request-owned dispatch child so
+    /// progress notifications can be written as they are committed, rather
+    /// than being collapsed into a single static HTTP body after dispatch.
+    fn begin_modern_sse(
+        &mut self,
+        cx: &Cx,
+        request: HttpRequest,
+    ) -> Result<
+        Result<(JsonRpcRequest, DualEraHttpSseResponse), ServerHttpEndpointResponse>,
+        DualEraHttpEndpointError,
+    > {
+        if matches!(self.server.protocol_policy, ProtocolPolicy::LegacyOnly) {
+            return Ok(Err(ServerHttpEndpointResponse::Immediate(
+                HttpResponse::new(HttpStatus::BAD_REQUEST),
+            )));
+        }
+        let endpoint_response = self.endpoint_session.handle(cx, request)?;
+        let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
+            return self.handle_modern(cx, endpoint_response).map(Err);
+        };
+        let mut request = self.endpoint_session.recv_modern_request(cx)?;
+        remove_modern_protocol_metadata(&mut request);
+        Ok(Ok((request, sse)))
+    }
+
     fn handle_legacy(
         &mut self,
         cx: &Cx,
@@ -2431,6 +2458,90 @@ async fn send_legacy_sse_stream(
     Ok(())
 }
 
+async fn send_modern_sse_stream(
+    cx: &Cx,
+    stream: AsyncTcpStream,
+    server: Arc<Server>,
+    request: JsonRpcRequest,
+    response: DualEraHttpSseResponse,
+) -> Result<(), ()> {
+    let response_head = legacy_sse_response_head(response.response())?;
+    let sender = response.sender();
+    let request_cancellation = sender.request_cancellation();
+    let request_id = request_id_to_u64(request.id.as_ref());
+    let policy = server.protocol_policy;
+    let (mut reader, mut writer) = stream.into_split();
+
+    let peer_cancellation = request_cancellation.clone();
+    let mut peer_closed = cx
+        .spawn(move |_peer_cx| async move {
+            let mut byte = [0_u8; 1];
+            let _ = reader.read(&mut byte).await;
+            peer_cancellation.cancel();
+        })
+        .map_err(|_| ())?;
+
+    let response_sender = sender.clone();
+    let mut dispatch = cx
+        .spawn(move |request_cx| async move {
+            let inbound = InboundRequestContext::new(
+                request_cx.clone(),
+                request_id,
+                InboundRequestTransport::Http,
+            );
+            let notification_cx = request_cx.clone();
+            let notification_sender: NotificationSender = Arc::new(move |notification| {
+                let _ = response_sender.send_notification(&notification_cx, notification);
+            });
+            let cancellation = response_sender.request_cancellation();
+            let response = Arc::clone(&server)
+                .dispatch_with_protocol_policy_owned(
+                    policy,
+                    &inbound,
+                    request,
+                    cancellation,
+                    notification_sender,
+                )
+                .await;
+            if let Some(response) = response {
+                let _ = response_sender.send_response(&request_cx, response);
+            }
+        })
+        .map_err(|_| ())?;
+
+    let result = async {
+        writer.write_all(&response_head).await.map_err(|_| ())?;
+        writer.flush().await.map_err(|_| ())?;
+        loop {
+            match response.pop_event() {
+                Ok(Some(event)) => {
+                    let bytes = event.to_bytes().map_err(|_| ())?;
+                    let prefix = format!("{:X}\r\n", bytes.len());
+                    writer.write_all(prefix.as_bytes()).await.map_err(|_| ())?;
+                    writer.write_all(&bytes).await.map_err(|_| ())?;
+                    writer.write_all(b"\r\n").await.map_err(|_| ())?;
+                    writer.flush().await.map_err(|_| ())?;
+                }
+                Ok(None) if response.is_finished() => break,
+                Ok(None) => cx.sleep(Duration::from_millis(1)).await,
+                Err(_) => return Err(()),
+            }
+        }
+        writer.write_all(b"0\r\n\r\n").await.map_err(|_| ())?;
+        writer.flush().await.map_err(|_| ())
+    }
+    .await;
+
+    if result.is_err() {
+        request_cancellation.cancel();
+        dispatch.abort();
+    }
+    peer_closed.abort();
+    let _ = peer_closed.join(cx).await;
+    let _ = dispatch.join(cx).await;
+    result
+}
+
 fn http_endpoint_response_to_static(cx: &Cx, response: ServerHttpEndpointResponse) -> HttpResponse {
     match response {
         ServerHttpEndpointResponse::Immediate(response) => response,
@@ -2531,6 +2642,48 @@ async fn serve_http_connection(
 
     let is_legacy_sse = request.method == HttpMethod::Get
         && request.path == endpoint.server.http_config.legacy_sse_path;
+    let is_modern_sse = request.method == HttpMethod::Post
+        && request.path == endpoint.server.http_config.handler_config.base_path
+        && request.header("accept").is_some_and(|accept| {
+            accept
+                .split(',')
+                .any(|value| value.trim() == "text/event-stream")
+        });
+    if is_modern_sse {
+        let mut session = match endpoint.open_session(cx) {
+            Ok(session) => session,
+            Err(_) => {
+                let _ = send_h1_response(&mut framed, HttpResponse::internal_error()).await;
+                return;
+            }
+        };
+        let response = session.begin_modern_sse(cx, request);
+        match response {
+            Ok(Ok((request, response))) => {
+                let stream = framed.into_inner();
+                let _ = send_modern_sse_stream(
+                    cx,
+                    stream,
+                    Arc::clone(&endpoint.server),
+                    request,
+                    response,
+                )
+                .await;
+                session.close();
+                return;
+            }
+            Ok(Err(response)) => {
+                let _ =
+                    send_h1_response(&mut framed, http_endpoint_response_to_static(cx, response))
+                        .await;
+                return;
+            }
+            Err(_) => {
+                let _ = send_h1_response(&mut framed, HttpResponse::bad_request()).await;
+                return;
+            }
+        }
+    }
     if !is_legacy_sse {
         let response = dispatch_http_request(cx, &endpoint, &legacy_sessions, request);
         let _ = send_h1_response(&mut framed, response).await;
@@ -2868,6 +3021,16 @@ impl Server {
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
     ) -> McpResult<serde_json::Value> {
+        // Extension fallback is a modern-only escape hatch after the frozen
+        // core router rejects an unknown method.  Do not let a request merely
+        // shaped like an extension call reach either negotiation or an
+        // extension handler: admission requires the exact final-era marker
+        // carried by the current request.
+        if modern_protocol_version(request) != Some(MODERN_PROTOCOL_VERSION) {
+            return Err(McpError::invalid_request(
+                "Extension requests require the admitted MCP 2026-07-28 protocol version",
+            ));
+        }
         let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
             return Err(McpError::method_not_found(&request.method));
         };
@@ -3204,6 +3367,189 @@ impl Server {
                 )
             }
         })
+    }
+
+    async fn dispatch_stateless_owned_with_cancellation(
+        self: Arc<Self>,
+        inbound: &InboundRequestContext,
+        request: JsonRpcRequest,
+        request_cancellation: McpRequestCancellation,
+        notification_sender: NotificationSender,
+    ) -> Option<JsonRpcResponse> {
+        let method = request.method.clone();
+        let response_id = request.id.clone();
+        let is_notification = response_id.is_none();
+        let started_at = Instant::now();
+        let response_for_error = |error: McpError| {
+            response_id.clone().map(|id| {
+                let masked = mask_peer_error(error, self.mask_error_details);
+                JsonRpcResponse::error(
+                    Some(id),
+                    JsonRpcError {
+                        code: masked.code.into(),
+                        message: masked.message,
+                        data: masked.data,
+                    },
+                )
+            })
+        };
+        if request.validate().is_err() {
+            return response_for_error(McpError::invalid_request("Invalid JSON-RPC request"));
+        }
+        if !is_notification && is_notification_only_method(&method) {
+            return response_for_error(McpError::invalid_request(
+                "MCP notification method must not carry a request id",
+            ));
+        }
+        if is_notification && is_request_only_method(&method) {
+            return None;
+        }
+        if inbound.request_id() != request_id_to_u64(response_id.as_ref()) {
+            return response_for_error(McpError::invalid_request(
+                "Inbound request identity does not match the JSON-RPC request id",
+            ));
+        }
+        let mut request_ctx = inbound
+            .request_context()
+            .with_request_cancellation(request_cancellation);
+        if let Some(marker) = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get("progressToken"))
+            .cloned()
+            .and_then(|marker| serde_json::from_value::<ProgressMarker>(marker).ok())
+        {
+            let sender = notification_sender.clone();
+            request_ctx = request_ctx.with_progress_reporter(
+                ProgressNotificationSender::new(marker, move |notification| sender(notification))
+                    .into_reporter(),
+            );
+        }
+        let budget = self.create_request_budget(request_ctx.cx());
+        if let Some(error) = Self::request_budget_error(request_ctx.cx(), budget) {
+            return response_for_error(error);
+        }
+        let Some((request_ctx, _request_lease_guard)) = request_ctx
+            .with_budget_ceiling(budget)
+            .begin_request_scope()
+        else {
+            return response_for_error(McpError::internal_error(
+                "request scope could not be established",
+            ));
+        };
+        if !request_ctx.commit_anonymous_auth() {
+            return response_for_error(McpError::internal_error(
+                "anonymous request admission could not be committed",
+            ));
+        }
+
+        let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
+        let result: McpResult<serde_json::Value> = (|| async {
+            for middleware in self.middleware.iter() {
+                Self::enforce_request_context(&request_ctx)?;
+                entered_middleware.push(middleware.as_ref());
+                match catch_extension_unwind(|| middleware.on_request(&request_ctx, &request)) {
+                    Ok(Ok(MiddlewareDecision::Continue)) => {}
+                    Ok(Ok(MiddlewareDecision::Respond(value))) => return Ok(value),
+                    Ok(Err(error)) => return Err(error),
+                    Err(_payload) => return Err(extension_panic_error("middleware_on_request")),
+                }
+            }
+            if request.method == SERVER_DISCOVER_METHOD {
+                let params = request
+                    .params
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                serde_json::from_value::<ServerDiscoverRequest>(params)
+                    .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                serde_json::to_value(self.server_discovery()?).map_err(McpError::from)
+            } else {
+                match Arc::clone(&self.router)
+                    .dispatch_stateless_owned(request_ctx.clone(), request.clone())
+                    .await
+                {
+                    Err(error) if error.code == McpErrorCode::MethodNotFound => {
+                        self.dispatch_extension_fallback(&request_ctx, &request)
+                    }
+                    result => result,
+                }
+            }
+        })()
+        .await;
+        let result = match result {
+            Ok(value) => self
+                .apply_middleware_response(&entered_middleware, &request_ctx, &request, value)
+                .map_err(|error| {
+                    self.apply_middleware_error(&entered_middleware, &request_ctx, &request, error)
+                }),
+            Err(error) => {
+                Err(self.apply_middleware_error(&entered_middleware, &request_ctx, &request, error))
+            }
+        };
+        let result = Self::request_context_error(&request_ctx).map_or(result, Err);
+        if let Some(stats) = &self.stats {
+            stats.record_request(&method, started_at.elapsed(), result.is_ok());
+        }
+        if is_notification {
+            if let Err(error) = result {
+                error!(
+                    target: targets::HANDLER,
+                    "Stateless notification failed; method_key={:016x}; code={:?}",
+                    stable_hash_request_id(&method),
+                    error.code
+                );
+            }
+            return None;
+        }
+        let response_id = response_id.expect("non-notification requests have an id");
+        Some(match result {
+            Ok(value) => JsonRpcResponse::success(response_id, value),
+            Err(error) => {
+                let masked = mask_peer_error(error, self.mask_error_details);
+                JsonRpcResponse::error(
+                    Some(response_id),
+                    JsonRpcError {
+                        code: masked.code.into(),
+                        message: masked.message,
+                        data: masked.data,
+                    },
+                )
+            }
+        })
+    }
+
+    async fn dispatch_with_protocol_policy_owned(
+        self: Arc<Self>,
+        policy: ProtocolPolicy,
+        inbound: &InboundRequestContext,
+        request: JsonRpcRequest,
+        request_cancellation: McpRequestCancellation,
+        notification_sender: NotificationSender,
+    ) -> Option<JsonRpcResponse> {
+        if matches!(policy, ProtocolPolicy::ModernOnly)
+            && request.method == "initialize"
+            && request.validate().is_ok()
+            && inbound.request_id() == request_id_to_u64(request.id.as_ref())
+        {
+            return request.id.clone().map(|id| {
+                JsonRpcResponse::error(
+                    Some(id),
+                    JsonRpcError {
+                        code: (-32601).into(),
+                        message: MODERN_ONLY_INITIALIZE_MESSAGE.to_owned(),
+                        data: Some(serde_json::json!({ "supported": ["2026-07-28"] })),
+                    },
+                )
+            });
+        }
+        self.dispatch_stateless_owned_with_cancellation(
+            inbound,
+            request,
+            request_cancellation,
+            notification_sender,
+        )
+        .await
     }
 
     /// Dispatches one adapter-admitted exact-2024 request without applying the
@@ -8954,8 +9300,8 @@ mod lib_unit_tests {
             "tasks/get",
             Some(serde_json::json!({
                 "value": 41,
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
                 "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
                     "io.modelcontextprotocol/clientCapabilities": {
                         "extensions": {
                             "io.modelcontextprotocol/tasks": settings,
@@ -9028,6 +9374,38 @@ mod lib_unit_tests {
             .error
             .expect("incompatible extension settings must fail closed");
         assert_eq!(error.code, i32::from(McpErrorCode::InvalidParams));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn modern_extension_fallback_rejects_wrong_protocol_metadata_before_invocation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = extension_registry_test_server(Arc::clone(&calls));
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory);
+
+        let admitted = server
+            .dispatch_stateless(
+                &inbound,
+                &extension_tasks_get_request(serde_json::json!({})),
+            )
+            .expect("modern extension request must have a response");
+        assert!(admitted.error.is_none());
+
+        let mut rejected = extension_tasks_get_request(serde_json::json!({}));
+        *rejected
+            .params
+            .as_mut()
+            .and_then(|value| value.get_mut("io.modelcontextprotocol/protocolVersion"))
+            .expect("test request must contain its protocol version") =
+            serde_json::json!(LEGACY_PROTOCOL_VERSION);
+        let rejected = server
+            .dispatch_stateless(&inbound, &rejected)
+            .expect("wrong-era extension request must have an error response");
+        assert_eq!(
+            rejected.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InvalidRequest))
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

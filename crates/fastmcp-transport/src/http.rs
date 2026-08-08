@@ -58,7 +58,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use asupersync::{Cx, channel::mpsc};
-use fastmcp_core::draw_security_identifier;
+use fastmcp_core::{McpRequestCancellation, draw_security_identifier};
 use fastmcp_protocol::protocol_version::{
     FinalHttpRequestMetadata, RequestAdmissionError, RequestVersionMetadata,
     admit_final_http_request,
@@ -1764,12 +1764,14 @@ impl StreamableHttpRequestIngress {
 /// Dequeues release the corresponding count and serialized-byte reservations
 /// exactly once.
 pub struct StreamableHttpResponseStream {
+    codec: Codec,
     mailbox: Arc<Mutex<StreamableResponseMailbox>>,
     request_states: Arc<Mutex<HashMap<RequestId, Arc<StreamableHttpRequestCancellationState>>>>,
     pending_count: Arc<AtomicUsize>,
     endpoint_count: Arc<AtomicUsize>,
     active_admissions: Arc<AtomicUsize>,
     capacity: usize,
+    max_queued_bytes: usize,
     owner_open: Arc<AtomicBool>,
     admissions_open: Arc<AtomicBool>,
     poll_interval: Duration,
@@ -1783,12 +1785,14 @@ impl Clone for StreamableHttpResponseStream {
     fn clone(&self) -> Self {
         self.endpoint_count.fetch_add(1, Ordering::Relaxed);
         Self {
+            codec: self.codec.clone(),
             mailbox: Arc::clone(&self.mailbox),
             request_states: Arc::clone(&self.request_states),
             pending_count: Arc::clone(&self.pending_count),
             endpoint_count: Arc::clone(&self.endpoint_count),
             active_admissions: Arc::clone(&self.active_admissions),
             capacity: self.capacity,
+            max_queued_bytes: self.max_queued_bytes,
             owner_open: Arc::clone(&self.owner_open),
             admissions_open: Arc::clone(&self.admissions_open),
             poll_interval: self.poll_interval,
@@ -1945,6 +1949,138 @@ impl StreamableHttpResponseStream {
         Ok(request_states.contains_key(request_id))
     }
 
+    fn request_response_guard_is_active(
+        &self,
+        cancellation: &StreamableHttpRequestCancellation,
+    ) -> Result<bool, TransportError> {
+        let request_states = match self.request_states.try_lock() {
+            Ok(request_states) => request_states,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err(streamable_queue_full_error(
+                    "streamable HTTP request-response registry is busy",
+                ));
+            }
+        };
+        Ok(request_states
+            .get(cancellation.request_id())
+            .is_some_and(|state| Arc::ptr_eq(state, &cancellation.state)))
+    }
+
+    fn enqueue_request_message(
+        &self,
+        cx: &Cx,
+        cancellation: &StreamableHttpRequestCancellation,
+        message: StreamableHttpRequestResponseMessage,
+    ) -> Result<(), TransportError> {
+        if !self.owner_open.load(Ordering::Acquire) || !self.admissions_open.load(Ordering::Acquire)
+        {
+            return Err(TransportError::Closed);
+        }
+        cancellation.checkpoint(cx)?;
+        let _admission =
+            begin_streamable_admission(&self.admissions_open, &self.active_admissions)?;
+        let serialized_bytes = match &message {
+            StreamableHttpRequestResponseMessage::Notification(notification) => {
+                self.codec.encode_request(notification)?.len()
+            }
+            StreamableHttpRequestResponseMessage::Response(response) => {
+                self.codec.encode_response(response)?.len()
+            }
+        };
+        cancellation.checkpoint(cx)?;
+        let mut mailbox = match self.mailbox.try_lock() {
+            Ok(mailbox) => mailbox,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err(streamable_queue_full_error(
+                    "streamable response mailbox is busy",
+                ));
+            }
+        };
+        if !self.owner_open.load(Ordering::Acquire) || !self.admissions_open.load(Ordering::Acquire)
+        {
+            return Err(TransportError::Closed);
+        }
+        cancellation.checkpoint(cx)?;
+        if mailbox.queue.len() >= self.capacity {
+            return Err(streamable_queue_full_error(
+                "streamable response queue is full",
+            ));
+        }
+        let prospective = mailbox
+            .retained_bytes
+            .checked_add(serialized_bytes)
+            .filter(|bytes| *bytes <= self.max_queued_bytes)
+            .ok_or_else(|| {
+                streamable_queue_full_error("streamable response byte budget is full")
+            })?;
+        mailbox.queue.push_back(QueuedResponse {
+            request_id: Some(cancellation.request_id().clone()),
+            message,
+            serialized_bytes,
+        });
+        mailbox.retained_bytes = prospective;
+        self.pending_count.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn send_response_for_request(
+        &self,
+        cx: &Cx,
+        cancellation: &StreamableHttpRequestCancellation,
+        response: JsonRpcResponse,
+    ) -> Result<(), TransportError> {
+        if response.id.as_ref() != Some(cancellation.request_id()) {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP response ID does not match its request response body",
+            )));
+        }
+        cancellation.checkpoint(cx)?;
+        if !self.request_response_guard_is_active(cancellation)? {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP response guard does not belong to this live transport request",
+            )));
+        }
+        cancellation.with_message_commit(cx, true, || {
+            self.enqueue_request_message(
+                cx,
+                cancellation,
+                StreamableHttpRequestResponseMessage::Response(response),
+            )
+        })
+    }
+
+    fn send_notification_for_request(
+        &self,
+        cx: &Cx,
+        cancellation: &StreamableHttpRequestCancellation,
+        notification: JsonRpcRequest,
+    ) -> Result<(), TransportError> {
+        if !notification.is_notification() {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP request-owned messages must be JSON-RPC notifications",
+            )));
+        }
+        cancellation.checkpoint(cx)?;
+        if !self.request_response_guard_is_active(cancellation)? {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP notification guard does not belong to this live transport request",
+            )));
+        }
+        cancellation.with_message_commit(cx, false, || {
+            self.enqueue_request_message(
+                cx,
+                cancellation,
+                StreamableHttpRequestResponseMessage::Notification(notification),
+            )
+        })
+    }
+
     fn discard_request_messages(&self, request_id: &RequestId) {
         let mut mailbox = self
             .mailbox
@@ -2079,6 +2215,7 @@ impl StreamableHttpResponseStream {
             cancelled: AtomicBool::new(false),
             terminal_committed: AtomicBool::new(false),
             response_commit_gate: Mutex::new(()),
+            request_cancellation: McpRequestCancellation::new(),
         });
         let mut request_states = match self.request_states.try_lock() {
             Ok(request_states) => request_states,
@@ -2143,6 +2280,7 @@ struct StreamableHttpRequestCancellationState {
     cancelled: AtomicBool,
     terminal_committed: AtomicBool,
     response_commit_gate: Mutex<()>,
+    request_cancellation: McpRequestCancellation,
 }
 
 impl StreamableHttpRequestCancellation {
@@ -2153,6 +2291,7 @@ impl StreamableHttpRequestCancellation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.state.cancelled.store(true, Ordering::Release);
+        self.state.request_cancellation.cancel();
     }
 
     fn with_message_commit<T>(
@@ -2203,6 +2342,14 @@ impl StreamableHttpRequestCancellation {
         &self.state.request_id
     }
 
+    /// Returns the server request-cancellation domain paired with this HTTP
+    /// response body. Dropping the body cancels this domain before it can
+    /// admit a later handler effect.
+    #[must_use]
+    pub fn request_cancellation(&self) -> McpRequestCancellation {
+        self.state.request_cancellation.clone()
+    }
+
     /// Observes caller cancellation and the request response body's lifetime.
     ///
     /// Callers must checkpoint again after any independently cancellable work
@@ -2228,6 +2375,17 @@ pub struct StreamableHttpRequestResponseStream {
     request_states: Arc<Mutex<HashMap<RequestId, Arc<StreamableHttpRequestCancellationState>>>>,
     cancellation: StreamableHttpRequestCancellation,
     finished: AtomicBool,
+}
+
+/// Cloneable producer for one request-owned Streamable HTTP response body.
+///
+/// Producers can emit ordered notifications and the one terminal response
+/// without owning the body itself. Once the body is dropped, the paired
+/// cancellation state rejects every later producer effect.
+#[derive(Clone)]
+pub struct StreamableHttpRequestResponseSender {
+    responses: StreamableHttpResponseStream,
+    cancellation: StreamableHttpRequestCancellation,
 }
 
 impl Drop for StreamableHttpRequestResponseStream {
@@ -2260,6 +2418,18 @@ impl StreamableHttpRequestResponseStream {
     #[must_use]
     pub fn cancellation(&self) -> StreamableHttpRequestCancellation {
         self.cancellation.clone()
+    }
+
+    /// Returns a producer for this exact request body.
+    ///
+    /// The producer preserves the body's ordering and request ownership while
+    /// allowing request work to run independently from socket streaming.
+    #[must_use]
+    pub fn sender(&self) -> StreamableHttpRequestResponseSender {
+        StreamableHttpRequestResponseSender {
+            responses: self.responses.clone(),
+            cancellation: self.cancellation(),
+        }
     }
 
     /// Returns the request ID bound to this response body.
@@ -2351,6 +2521,30 @@ impl StreamableHttpRequestResponseStream {
             }
             std::thread::sleep(self.responses.poll_interval);
         }
+    }
+}
+
+impl StreamableHttpRequestResponseSender {
+    /// Returns the request cancellation domain paired with this producer.
+    #[must_use]
+    pub fn request_cancellation(&self) -> McpRequestCancellation {
+        self.cancellation.request_cancellation()
+    }
+
+    /// Commits one notification before this body's terminal response.
+    pub fn send_notification(
+        &self,
+        cx: &Cx,
+        notification: JsonRpcRequest,
+    ) -> Result<(), TransportError> {
+        self.responses
+            .send_notification_for_request(cx, &self.cancellation, notification)
+    }
+
+    /// Commits this body's one terminal response.
+    pub fn send_response(&self, cx: &Cx, response: JsonRpcResponse) -> Result<(), TransportError> {
+        self.responses
+            .send_response_for_request(cx, &self.cancellation, response)
     }
 }
 
@@ -2737,12 +2931,14 @@ impl StreamableHttpTransport {
         self.response_externalized = true;
         self.response_endpoint_count.store(1, Ordering::Release);
         Ok(StreamableHttpResponseStream {
+            codec: self.codec.clone(),
             mailbox: Arc::clone(&self.response_mailbox),
             request_states: Arc::clone(&self.request_response_states),
             pending_count: Arc::clone(&self.response_pending_count),
             endpoint_count: Arc::clone(&self.response_endpoint_count),
             active_admissions: Arc::clone(&self.response_active_admissions),
             capacity: self.capacity(),
+            max_queued_bytes: self.max_queued_bytes_per_direction,
             owner_open: Arc::clone(&self.owner_open),
             admissions_open: Arc::clone(&self.response_admissions_open),
             poll_interval: self.poll_interval,
@@ -3475,6 +3671,28 @@ impl DualEraHttpSseResponse {
         self.body.cancellation()
     }
 
+    /// Returns a producer for notifications and the terminal response of this
+    /// exact request-owned SSE body.
+    #[must_use]
+    pub fn sender(&self) -> StreamableHttpRequestResponseSender {
+        self.body.sender()
+    }
+
+    /// Returns whether this body has emitted its terminal response.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.body.is_finished()
+    }
+
+    /// Tries to frame the next notification or terminal response as an SSE
+    /// `message` event without blocking the caller's runtime worker.
+    pub fn pop_event(&self) -> Result<Option<SseEvent>, DualEraHttpEndpointError> {
+        let Some(message) = self.body.pop_message()? else {
+            return Ok(None);
+        };
+        Self::frame_message(&self.codec, message).map(Some)
+    }
+
     /// Receives and frames the next notification or terminal response as an
     /// SSE `message` event.
     ///
@@ -3482,12 +3700,19 @@ impl DualEraHttpSseResponse {
     /// request body. These events deliberately have no resumable ID; resumable
     /// IDs belong only to the separately retained legacy SSE stream.
     pub fn recv_event(&self, cx: &Cx) -> Result<SseEvent, DualEraHttpEndpointError> {
-        let mut encoded = match self.body.recv_message(cx)? {
+        Self::frame_message(&self.codec, self.body.recv_message(cx)?)
+    }
+
+    fn frame_message(
+        codec: &Codec,
+        message: StreamableHttpRequestResponseMessage,
+    ) -> Result<SseEvent, DualEraHttpEndpointError> {
+        let mut encoded = match message {
             StreamableHttpRequestResponseMessage::Notification(notification) => {
-                self.codec.encode_request(&notification)?
+                codec.encode_request(&notification)?
             }
             StreamableHttpRequestResponseMessage::Response(response) => {
-                self.codec.encode_response(&response)?
+                codec.encode_response(&response)?
             }
         };
         if encoded.pop() != Some(b'\n') {
