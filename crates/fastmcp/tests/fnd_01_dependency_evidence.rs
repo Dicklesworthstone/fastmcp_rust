@@ -10,7 +10,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 903_486;
 const FROZEN_POLICY_SHA256: &str =
-    "0893044432caadca11431c5db701ab5053305a0ff740d385d193ec02f01ac533";
+    "5321a65ec4a271419952ec046c55065d47d5f496da0843ba100a6c9174a731d1";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -34184,7 +34184,7 @@ mod ordinary {
         "609f0ce94ad6403a3324f1afd705f641573469a833fd3271e84b0647e86f2f5a";
     const ASSERTION_CANONICAL_BYTES: usize = 77_379;
     const ASSERTION_CANONICAL_SHA256: &str =
-        "fec2d08b49d7e8be67d0a1b4d3078e4ac168bffd76b0bd0d91544227701a4393";
+        "66240fbc127cf06ac32f96ebd54d80cf540ae08d26cc2be834b1efc209ccfecb";
     const EXPECTED_RECEIPTS: usize = 14;
     const EXPECTED_RECEIPT_TOMLS: usize = 10;
     const EXPECTED_RECEIPT_BINARIES: usize = 4;
@@ -34249,7 +34249,7 @@ mod ordinary {
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
     const ACTION_DOWNLOAD_ARTIFACT: &str =
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
-    const ACTION_INSTALL: &str = "taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf";
+    const ACTION_INSTALL: &str = "taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed";
     const ACTION_GITHUB_RELEASE: &str =
         "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65";
     const WORKFLOW_ACTION_IDENTITIES: &[(&str, usize, usize)] = &[
@@ -84941,7 +84941,7 @@ original = "value"
         assert_core_conformance_rejection(
             &license_overclaim,
             &files,
-            "FND01|Error|E_CORE_CONFORMANCE_LICENSE|license_provenance.core_2026_07_28",
+            "FND01|Error|E_CORE_CONFORMANCE_LICENSE|license_provenance.core_2026_07_28|",
             &baseline_binding,
             baseline_source_tree_sha256,
         );
