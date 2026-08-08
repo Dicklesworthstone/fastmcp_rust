@@ -1335,7 +1335,7 @@ impl HttpServerConfig {
 /// identifier, lifecycle adapter, and SSE response stream for this one session.
 pub struct ServerHttpEndpoint {
     server: Arc<Server>,
-    endpoint: DualEraHttpEndpoint,
+    legacy_origin: String,
 }
 
 /// A server-owned session opened through [`ServerHttpEndpoint`].
@@ -1359,7 +1359,124 @@ pub enum ServerHttpEndpointResponse {
     LegacySse(DualEraHttpLegacySseResponse),
 }
 
-type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<Mutex<ServerHttpSession>>>>>;
+/// Cancellation authority deliberately kept outside the session mutex.
+///
+/// A legacy client sends cancellation on a separate POST connection while the
+/// request it targets may be running synchronously under the session lock. The
+/// control frame must therefore authenticate and cancel through the server's
+/// request registry without waiting for that lock.
+#[derive(Clone)]
+struct HttpLegacyCancellationControl {
+    server: Arc<Server>,
+    session_id: u64,
+    session_principal: SessionPrincipalBinding,
+    max_body_size: usize,
+}
+
+impl HttpLegacyCancellationControl {
+    fn handle(&self, cx: &Cx, request: &HttpRequest) -> Option<HttpResponse> {
+        if request.query.len() != 1
+            || request.query.get("session_id").is_none()
+            || !request
+                .content_type()
+                .unwrap_or("")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+            || request.body.len() > self.max_body_size
+            || [
+                "mcp-protocol-version",
+                "mcp-method",
+                "mcp-name",
+                "mcp-session-id",
+            ]
+            .iter()
+            .any(|name| request.header(name).is_some())
+        {
+            return None;
+        }
+
+        let mut codec = Codec::new();
+        codec.set_max_message_size(self.max_body_size);
+        let Ok(mut notification) = codec.decode_complete_request(&request.body) else {
+            return None;
+        };
+        if notification.id.is_some() || notification.method != "notifications/cancelled" {
+            return None;
+        }
+        if notification.validate().is_err() {
+            return Some(HttpResponse::bad_request());
+        }
+
+        match self.server.authenticate_cancelled_control_notification(
+            cx,
+            &self.session_principal,
+            &mut notification,
+        ) {
+            Ok(params) => {
+                self.server
+                    .handle_cancelled_notification(self.session_id, params);
+                Some(HttpResponse::new(HttpStatus::ACCEPTED))
+            }
+            Err(_) => Some(HttpResponse::bad_request()),
+        }
+    }
+}
+
+struct LiveHttpSession {
+    session: Mutex<ServerHttpSession>,
+    cancellation: HttpLegacyCancellationControl,
+}
+
+type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveHttpSession>>>>;
+
+struct HttpConnectionLimiter {
+    limit: usize,
+    active: AtomicUsize,
+}
+
+impl HttpConnectionLimiter {
+    const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<HttpConnectionPermit> {
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.limit {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(HttpConnectionPermit {
+                        limiter: Arc::clone(self),
+                    });
+                }
+                Err(observed) => active = observed,
+            }
+        }
+    }
+}
+
+struct HttpConnectionPermit {
+    limiter: Arc<HttpConnectionLimiter>,
+}
+
+impl Drop for HttpConnectionPermit {
+    fn drop(&mut self) {
+        self.limiter.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Retains every connection child admitted by one live HTTP listener.
 ///
@@ -1404,6 +1521,7 @@ pub struct BoundHttpServer {
     listener: AsyncTcpListener,
     endpoint: Arc<ServerHttpEndpoint>,
     legacy_sessions: LiveHttpSessionRegistry,
+    connection_limiter: Arc<HttpConnectionLimiter>,
 }
 
 impl BoundHttpServer {
@@ -1417,6 +1535,16 @@ impl BoundHttpServer {
     /// Accepts real HTTP/1.1 loopback or network connections until the caller
     /// cancels the owning context.
     pub async fn serve(self, cx: &Cx) -> McpResult<()> {
+        let server = Arc::clone(&self.endpoint.server);
+        server.init_rich_logging();
+        if let Some(stats) = &server.stats {
+            stats.connection_opened();
+        }
+        if !server.run_startup_hook() {
+            server.graceful_shutdown_returning();
+            return Err(McpError::internal_error("HTTP server startup hook failed"));
+        }
+
         let connection_scope = cx.scope();
         let mut connection_children = HttpConnectionChildren::default();
         let result = 'listener: loop {
@@ -1437,21 +1565,25 @@ impl BoundHttpServer {
             };
             let endpoint = Arc::clone(&self.endpoint);
             let legacy_sessions = Arc::clone(&self.legacy_sessions);
-            let connection = cx
-                .spawn_in(&connection_scope, move |connection_cx| async move {
+            let connection = match self.connection_limiter.try_acquire() {
+                Some(permit) => cx.spawn_in(&connection_scope, move |connection_cx| async move {
+                    let _permit = permit;
                     serve_http_connection(&connection_cx, stream, endpoint, legacy_sessions).await;
-                })
-                .map_err(|error| {
-                    McpError::internal_error(format!(
-                        "HTTP connection task admission failed: {error}"
-                    ))
-                });
+                }),
+                None => cx.spawn_in(&connection_scope, move |_connection_cx| async move {
+                    let _ = send_http_connection_limit_response(stream).await;
+                }),
+            }
+            .map_err(|error| {
+                McpError::internal_error(format!("HTTP connection task admission failed: {error}"))
+            });
             match connection {
                 Ok(connection) => connection_children.tasks.push(connection),
                 Err(error) => break Err(error),
             }
         };
         connection_children.cancel_and_join(cx).await;
+        server.graceful_shutdown_returning();
         result
     }
 }
@@ -1465,26 +1597,21 @@ impl Server {
         self,
         legacy_origin: impl Into<String>,
     ) -> Result<ServerHttpEndpoint, DualEraHttpEndpointError> {
-        let server = Arc::new(self);
-        let mut config = DualEraHttpEndpointConfig::new(
-            server.http_config.legacy_sse_path.clone(),
-            server.http_config.legacy_message_path.clone(),
-            legacy_origin,
-        );
-        config.legacy_request_capacity = server.http_config.legacy_request_capacity;
-        let endpoint = DualEraHttpEndpoint::new(
-            HttpRequestHandler::with_config(server.http_config.handler_config.clone()),
-            config,
-        )?;
-        Ok(ServerHttpEndpoint { server, endpoint })
+        let endpoint = ServerHttpEndpoint {
+            server: Arc::new(self),
+            legacy_origin: legacy_origin.into(),
+        };
+        let _ = endpoint.transport_endpoint(&endpoint.legacy_origin)?;
+        Ok(endpoint)
     }
 
     /// Binds the dual-era HTTP listener on the caller-owned [`Cx`].
     ///
     /// This performs only listener setup. Call [`BoundHttpServer::serve`] to
     /// accept connections, or use [`Self::serve_http`] for the turnkey
-    /// lifecycle. The exact legacy SSE endpoint advertises this listener's
-    /// resolved local address, including a kernel-selected port.
+    /// lifecycle. The exact legacy SSE endpoint derives its advertised
+    /// authority from the client's `Host` header, with the resolved local
+    /// address as the fallback for direct embeddings.
     pub async fn bind_http(self, cx: &Cx, addr: impl Into<String>) -> McpResult<BoundHttpServer> {
         if cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
@@ -1495,6 +1622,7 @@ impl Server {
         let local_addr = listener.local_addr().map_err(|error| {
             McpError::internal_error(format!("HTTP listener address unavailable: {error}"))
         })?;
+        let max_connections = self.http_config.max_connections;
         let endpoint = self
             .into_http_endpoint(format!("http://{local_addr}"))
             .map_err(|error| {
@@ -1504,6 +1632,7 @@ impl Server {
             listener,
             endpoint: Arc::new(endpoint),
             legacy_sessions: Arc::new(Mutex::new(HashMap::new())),
+            connection_limiter: Arc::new(HttpConnectionLimiter::new(max_connections)),
         })
     }
 
@@ -1517,7 +1646,31 @@ impl Server {
 impl ServerHttpEndpoint {
     /// Opens one independently bounded live HTTP session.
     pub fn open_session(&self, cx: &Cx) -> Result<ServerHttpSession, DualEraHttpEndpointError> {
-        let endpoint_session = self.endpoint.open_session()?;
+        self.open_session_with_legacy_origin(cx, &self.legacy_origin)
+    }
+
+    fn transport_endpoint(
+        &self,
+        legacy_origin: &str,
+    ) -> Result<DualEraHttpEndpoint, DualEraHttpEndpointError> {
+        let mut config = DualEraHttpEndpointConfig::new(
+            self.server.http_config.legacy_sse_path.clone(),
+            self.server.http_config.legacy_message_path.clone(),
+            legacy_origin,
+        );
+        config.legacy_request_capacity = self.server.http_config.legacy_request_capacity;
+        DualEraHttpEndpoint::new(
+            HttpRequestHandler::with_config(self.server.http_config.handler_config.clone()),
+            config,
+        )
+    }
+
+    fn open_session_with_legacy_origin(
+        &self,
+        cx: &Cx,
+        legacy_origin: &str,
+    ) -> Result<ServerHttpSession, DualEraHttpEndpointError> {
+        let endpoint_session = self.transport_endpoint(legacy_origin)?.open_session()?;
         let legacy_session =
             Session::new(self.server.info.clone(), self.server.capabilities.clone());
         let legacy_binding = runtime_legacy_binding(legacy_session.id());
@@ -1530,6 +1683,18 @@ impl ServerHttpEndpoint {
             legacy_active_request: Arc::new(Mutex::new(None)),
             legacy_request_cx: Arc::new(Mutex::new(cx.clone())),
         })
+    }
+
+    fn open_session_for_legacy_sse(
+        &self,
+        cx: &Cx,
+        request: &HttpRequest,
+    ) -> Result<ServerHttpSession, DualEraHttpEndpointError> {
+        let legacy_origin = request
+            .header("host")
+            .and_then(legacy_origin_from_host)
+            .unwrap_or_else(|| self.legacy_origin.clone());
+        self.open_session_with_legacy_origin(cx, &legacy_origin)
     }
 }
 
@@ -1704,6 +1869,27 @@ impl ServerHttpSession {
         }
         self.endpoint_session.close();
     }
+
+    fn cancellation_control(&self) -> HttpLegacyCancellationControl {
+        HttpLegacyCancellationControl {
+            server: Arc::clone(&self.server),
+            session_id: self.legacy_binding.generation(),
+            session_principal: self.legacy_session.principal_binding(),
+            max_body_size: self.server.http_config.handler_config.max_body_size,
+        }
+    }
+}
+
+fn legacy_origin_from_host(host: &str) -> Option<String> {
+    if host.is_empty()
+        || host.bytes().any(|byte| {
+            byte.is_ascii_whitespace()
+                || matches!(byte, b'/' | b'?' | b'#' | b'\\' | b'\r' | b'\n' | b'\0')
+        })
+    {
+        return None;
+    }
+    Some(format!("http://{host}"))
 }
 
 fn h1_request_to_transport(
@@ -1764,7 +1950,11 @@ fn h1_request_to_transport(
     Ok(transport)
 }
 
-fn h1_response(response: HttpResponse) -> Http1Response {
+fn h1_response(mut response: HttpResponse) -> Http1Response {
+    response
+        .headers
+        .retain(|name, _| !name.eq_ignore_ascii_case("connection"));
+    response = response.with_header("connection", "close");
     let mut h1 = Http1Response::new(response.status.0, "", response.body);
     for (name, value) in response.headers {
         h1 = h1.with_header(name, value);
@@ -1782,9 +1972,22 @@ async fn send_h1_response(
         .map_err(|_| ())
 }
 
+async fn send_http_connection_limit_response(stream: AsyncTcpStream) -> Result<(), ()> {
+    let mut framed = Framed::new(stream, Http1Codec::new());
+    send_h1_response(
+        &mut framed,
+        HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+            .with_json(&serde_json::json!({"error": "too many connections"})),
+    )
+    .await
+}
+
 fn legacy_sse_response_head(response: &HttpResponse) -> Result<Vec<u8>, ()> {
     let mut head = format!("HTTP/1.1 {} OK\r\n", response.status.0).into_bytes();
     for (name, value) in &response.headers {
+        if name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
         if name
             .bytes()
             .chain(value.bytes())
@@ -1862,7 +2065,11 @@ fn dispatch_http_request(
         let Some(session) = session else {
             return HttpResponse::new(HttpStatus::NOT_FOUND);
         };
+        if let Some(response) = session.cancellation.handle(cx, &request) {
+            return response;
+        }
         let response = session
+            .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .handle(cx, request)
@@ -1926,7 +2133,7 @@ async fn serve_http_connection(
         return;
     }
 
-    let mut session = match endpoint.open_session(cx) {
+    let mut session = match endpoint.open_session_for_legacy_sse(cx, &request) {
         Ok(session) => session,
         Err(_) => {
             let _ = send_h1_response(&mut framed, HttpResponse::internal_error()).await;
@@ -1946,7 +2153,10 @@ async fn serve_http_connection(
             return;
         }
     };
-    let session = Arc::new(Mutex::new(session));
+    let session = Arc::new(LiveHttpSession {
+        cancellation: session.cancellation_control(),
+        session: Mutex::new(session),
+    });
     legacy_sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1959,6 +2169,7 @@ async fn serve_http_connection(
         .remove(&session_id);
     if let Some(session) = removed {
         session
+            .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .close();
@@ -10804,6 +11015,14 @@ mod lib_unit_tests {
                     "modern loopback response status was unexpected: {response}"
                 ));
             }
+            if !response
+                .to_ascii_lowercase()
+                .contains("\r\nconnection: close\r\n")
+            {
+                return Err(format!(
+                    "single-request HTTP response did not declare connection closure: {response}"
+                ));
+            }
             let response: JsonRpcResponse = serde_json::from_slice(live_http_response_body(
                 response.as_bytes(),
             )?)
@@ -10823,6 +11042,176 @@ mod lib_unit_tests {
                     "modern loopback discovery result was unexpected: {response:?}"
                 ));
             }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_honors_configured_connection_limit() {
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("live-http-connection-limit", "1.0.0")
+                .http_config(HttpServerConfig::new().max_connections(0))
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("connection-limit bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("connection-limit address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let request = JsonRpcRequest::new(
+                SERVER_DISCOVER_METHOD,
+                Some(serde_json::json!({
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    },
+                })),
+                802_i64,
+            );
+            let body = serde_json::to_vec(&request)
+                .map_err(|error| format!("connection-limit request did not serialize: {error}"))?;
+            let request = live_http_post(
+                "/mcp",
+                &body,
+                &[
+                    ("Accept", "application/json"),
+                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                    ("Mcp-Method", SERVER_DISCOVER_METHOD),
+                ],
+            );
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let response = live_http_exchange(address, request).await;
+                    caller_cx.cancel_with(CancelKind::User, Some("connection-limit complete"));
+                    response
+                })
+                .map_err(|error| format!("connection-limit client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let response = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("connection-limit client failed: {error:?}"))??;
+            serve.map_err(|error| format!("connection-limit server failed: {error}"))?;
+
+            let response = std::str::from_utf8(&response)
+                .map_err(|error| format!("connection-limit response was not UTF-8: {error}"))?;
+            if !response.starts_with("HTTP/1.1 503")
+                || !response
+                    .to_ascii_lowercase()
+                    .contains("\r\nconnection: close\r\n")
+            {
+                return Err(format!(
+                    "configured connection limit did not reject the public HTTP connection: {response}"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_runs_lifespan_hooks_once() {
+        run_live_http_test(|cx| async move {
+            let startup = Arc::new(AtomicUsize::new(0));
+            let shutdown = Arc::new(AtomicUsize::new(0));
+            let startup_hook = Arc::clone(&startup);
+            let shutdown_hook = Arc::clone(&shutdown);
+            let bound = Server::new("live-http-lifespan", "1.0.0")
+                .on_startup(move || {
+                    startup_hook.fetch_add(1, Ordering::AcqRel);
+                    Ok::<(), std::io::Error>(())
+                })
+                .on_shutdown(move || {
+                    shutdown_hook.fetch_add(1, Ordering::AcqRel);
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("lifespan HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("lifespan HTTP address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let response = live_http_exchange(
+                        address,
+                        b"GET /health HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
+                            .to_vec(),
+                    )
+                    .await;
+                    caller_cx.cancel_with(CancelKind::User, Some("lifespan HTTP complete"));
+                    response
+                })
+                .map_err(|error| format!("lifespan HTTP client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let response = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("lifespan HTTP client failed: {error:?}"))??;
+            serve.map_err(|error| format!("lifespan HTTP server failed: {error}"))?;
+            if !response.starts_with(b"HTTP/1.1 200") {
+                return Err(format!("lifespan health request failed: {response:?}"));
+            }
+            if startup.load(Ordering::Acquire) != 1 || shutdown.load(Ordering::Acquire) != 1 {
+                return Err(format!(
+                    "HTTP lifespan hooks were not run exactly once (startup={}, shutdown={})",
+                    startup.load(Ordering::Acquire),
+                    shutdown.load(Ordering::Acquire),
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_legacy_sse_advertises_the_request_host_on_wildcard_bind() {
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("live-http-host-origin", "1.0.0")
+                .build()
+                .bind_http(&cx, "0.0.0.0:0")
+                .await
+                .map_err(|error| format!("wildcard HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("wildcard HTTP address failed: {error}"))?;
+            let loopback = SocketAddr::from(([127, 0, 0, 1], address.port()));
+            let advertised_host = format!("public.example.test:{}", address.port());
+            let expected_endpoint = format!("data: http://{advertised_host}/messages?session_id=");
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let mut stream = AsyncTcpStream::connect(loopback)
+                        .await
+                        .map_err(|error| format!("wildcard SSE connect failed: {error}"))?;
+                    stream
+                        .write_all(
+                            format!(
+                                "GET /sse HTTP/1.1\r\nHost: {advertised_host}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .map_err(|error| format!("wildcard SSE write failed: {error}"))?;
+                    stream
+                        .flush()
+                        .await
+                        .map_err(|error| format!("wildcard SSE flush failed: {error}"))?;
+                    let mut received = Vec::new();
+                    read_live_http_until(&mut stream, &mut received, expected_endpoint.as_bytes())
+                        .await?;
+                    caller_cx.cancel_with(CancelKind::User, Some("wildcard SSE complete"));
+                    Ok(())
+                })
+                .map_err(|error| format!("wildcard SSE client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("wildcard SSE client failed: {error:?}"))??;
+            serve.map_err(|error| format!("wildcard SSE server failed: {error}"))?;
             Ok(())
         });
     }
@@ -10969,6 +11358,182 @@ mod lib_unit_tests {
                 .map_err(|error| format!("legacy loopback client failed: {error:?}"))?;
             serve.map_err(|error| format!("legacy loopback server failed: {error}"))?;
             client
+        });
+    }
+
+    #[test]
+    fn live_http_legacy_cancellation_bypasses_the_busy_session_lock() {
+        run_live_http_test(|cx| async move {
+            let started = Arc::new(AtomicBool::new(false));
+            let observed_cancellation = Arc::new(AtomicBool::new(false));
+            let observed_by_server = Arc::clone(&observed_cancellation);
+            let bound = Server::new("live-http-legacy-cancellation", "1.0.0")
+                .tool(LiveLegacyCancellationTool {
+                    started: Arc::clone(&started),
+                    observed_cancellation: Arc::clone(&observed_cancellation),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("legacy cancellation HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("legacy cancellation HTTP address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |client_cx| async move {
+                    let mut stream = AsyncTcpStream::connect(address)
+                        .await
+                        .map_err(|error| format!("legacy cancellation SSE connect failed: {error}"))?;
+                    stream
+                        .write_all(
+                            b"GET /sse HTTP/1.1\r\nHost: loopback\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                        )
+                        .await
+                        .map_err(|error| format!("legacy cancellation SSE write failed: {error}"))?;
+                    stream
+                        .flush()
+                        .await
+                        .map_err(|error| format!("legacy cancellation SSE flush failed: {error}"))?;
+
+                    let mut received = Vec::new();
+                    let endpoint_prefix = format!("data: http://{address}/messages?session_id=");
+                    read_live_http_until(&mut stream, &mut received, endpoint_prefix.as_bytes())
+                        .await?;
+                    let received_text = std::str::from_utf8(&received).map_err(|error| {
+                        format!("legacy cancellation SSE endpoint was not UTF-8: {error}")
+                    })?;
+                    let session_id = received_text
+                        .split_once(&endpoint_prefix)
+                        .and_then(|(_, remainder)| remainder.split_whitespace().next())
+                        .ok_or_else(|| {
+                            "legacy cancellation SSE endpoint omitted its session identifier"
+                                .to_string()
+                        })?
+                        .to_owned();
+
+                    for request in [
+                        JsonRpcRequest::new(
+                            "initialize",
+                            Some(serde_json::json!({
+                                "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                                "capabilities": {},
+                                "clientInfo": {"name": "legacy-cancellation-client", "version": "1.0.0"},
+                            })),
+                            821_i64,
+                        ),
+                        JsonRpcRequest::notification("notifications/initialized", None),
+                    ] {
+                        let body = serde_json::to_vec(&request).map_err(|error| {
+                            format!("legacy cancellation setup request did not serialize: {error}")
+                        })?;
+                        let response = live_http_exchange(
+                            address,
+                            live_http_post(
+                                &format!("/messages?session_id={session_id}"),
+                                &body,
+                                &[],
+                            ),
+                        )
+                        .await?;
+                        if !response.starts_with(b"HTTP/1.1 202") {
+                            return Err(format!(
+                                "legacy cancellation setup request was not accepted: {response:?}"
+                            ));
+                        }
+                    }
+
+                    let call = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_legacy_cancellation_tool",
+                            "arguments": {},
+                        })),
+                        822_i64,
+                    );
+                    let call_body = serde_json::to_vec(&call).map_err(|error| {
+                        format!("legacy cancellation call did not serialize: {error}")
+                    })?;
+                    let call_request = live_http_post(
+                        &format!("/messages?session_id={session_id}"),
+                        &call_body,
+                        &[],
+                    );
+                    let mut call = client_cx
+                        .spawn(move |_call_cx| async move {
+                            live_http_exchange(address, call_request).await
+                        })
+                        .map_err(|error| {
+                            format!("legacy cancellation call admission failed: {error}")
+                        })?;
+
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while !started.load(Ordering::Acquire) && Instant::now() < deadline {
+                        client_cx
+                            .checkpoint()
+                            .map_err(|error| format!("legacy cancellation client stopped: {error}"))?;
+                        asupersync::time::sleep(client_cx.now(), Duration::from_millis(1)).await;
+                    }
+                    if !started.load(Ordering::Acquire) {
+                        return Err("legacy cancellation handler did not start".to_string());
+                    }
+
+                    let cancelled = JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(serde_json::json!({
+                            "requestId": 822,
+                            "reason": "live HTTP cancellation",
+                        })),
+                    );
+                    let cancelled_body = serde_json::to_vec(&cancelled).map_err(|error| {
+                        format!("legacy cancellation notification did not serialize: {error}")
+                    })?;
+                    let cancelled = live_http_exchange(
+                        address,
+                        live_http_post(
+                            &format!("/messages?session_id={session_id}"),
+                            &cancelled_body,
+                            &[],
+                        ),
+                    )
+                    .await?;
+                    if !cancelled.starts_with(b"HTTP/1.1 202") {
+                        return Err(format!(
+                            "legacy cancellation control POST was not accepted while request ran: {cancelled:?}"
+                        ));
+                    }
+                    let call_response = call
+                        .join(&client_cx)
+                        .await
+                        .map_err(|error| {
+                            format!("legacy cancellation call task failed: {error:?}")
+                        })??;
+                    if !call_response.starts_with(b"HTTP/1.1 202") {
+                        return Err(format!(
+                            "legacy cancellation call acknowledgement was unexpected: {call_response:?}"
+                        ));
+                    }
+                    if !observed_by_server.load(Ordering::Acquire) {
+                        return Err(
+                            "legacy cancellation notification did not reach the running handler"
+                                .to_string(),
+                        );
+                    }
+                    caller_cx.cancel_with(CancelKind::User, Some("legacy cancellation complete"));
+                    Ok(())
+                })
+                .map_err(|error| format!("legacy cancellation client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("legacy cancellation client failed: {error:?}"))??;
+            serve.map_err(|error| format!("legacy cancellation server failed: {error}"))?;
+            if !observed_cancellation.load(Ordering::Acquire) {
+                return Err("live HTTP legacy handler did not observe cancellation".to_string());
+            }
+            Ok(())
         });
     }
 
