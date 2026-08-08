@@ -2095,6 +2095,26 @@ impl StreamableHttpResponseStream {
                 "streamable HTTP request already has a live response body",
             )));
         }
+        let mailbox = match self.mailbox.try_lock() {
+            Ok(mailbox) => mailbox,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err(streamable_queue_full_error(
+                    "streamable HTTP response mailbox is busy",
+                ));
+            }
+        };
+        if mailbox
+            .queue
+            .iter()
+            .any(|queued| queued.request_id.as_ref() == Some(&request_id))
+        {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "streamable HTTP response is already queued for this request ID",
+            )));
+        }
+        drop(mailbox);
         request_states.insert(request_id.clone(), Arc::clone(&state));
         Ok(StreamableHttpRequestResponseStream {
             responses: self.clone(),
@@ -5931,6 +5951,57 @@ X-Checksum: abc123\r\n\
         local_cancellation
             .checkpoint(&cx)
             .expect("the local body remains live after a foreign-owner rejection");
+    }
+
+    #[test]
+    fn streamable_http_rejects_sse_binding_over_an_unowned_queued_response() {
+        let mut transport = StreamableHttpTransport::new();
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let request_id = RequestId::Number(707);
+        let cx = Cx::for_testing();
+        transport
+            .send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    request_id.clone(),
+                    serde_json::json!({"unowned": true}),
+                )),
+            )
+            .expect("an unowned response is queued before SSE binding");
+        let pending_before = response_stream.pending_responses();
+        let retained_before = transport
+            .response_mailbox
+            .lock()
+            .expect("response mailbox is available")
+            .retained_bytes;
+
+        // Planted forbidden dimension: only a generic response for this ID
+        // was queued before the otherwise valid SSE body registration.
+        assert!(matches!(
+            response_stream.for_request(request_id.clone()),
+            Err(TransportError::Io(ref error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(response_stream.pending_responses(), pending_before);
+        assert_eq!(
+            transport
+                .response_mailbox
+                .lock()
+                .expect("response mailbox is available")
+                .retained_bytes,
+            retained_before,
+            "rejected SSE binding must preserve the generic response byte reservation"
+        );
+        assert_eq!(
+            response_stream
+                .pop_response(Some(&request_id))
+                .expect("the generic response remains independently consumable")
+                .expect("the generic response remains queued")
+                .id,
+            Some(request_id)
+        );
+        assert_eq!(response_stream.pending_responses(), 0);
     }
 
     #[test]
