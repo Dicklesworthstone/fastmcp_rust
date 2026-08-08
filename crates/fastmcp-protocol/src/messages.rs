@@ -26,8 +26,9 @@ use crate::protocol_policy::ProtocolEra;
 use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
 use crate::result::{
     CompleteResult, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonMember,
-    ResultDecodeError, ResultPeerDiagnostic, UnknownResultMembers, decode_peer_result_for_era,
-    encode_complete_result, exact_json_from_serde, exact_json_to_serde,
+    InputRequiredResult, ResultDecodeError, ResultPeerDiagnostic, UnknownResultMembers,
+    decode_peer_result_for_era, encode_complete_result, encode_result, exact_json_from_serde,
+    exact_json_to_serde,
 };
 use crate::types::{
     ClientCapabilities, ClientInfo, LegacyContent, LegacyMetadata, LegacyPromptMessage,
@@ -1853,9 +1854,10 @@ pub enum LegacyCoreResult {
 
 /// Final result dispatch for the currently supported core methods.
 ///
-/// Each branch carries the bounded final complete-result algebra and preserves
-/// its absent-result-type compatibility diagnostic for callers that record
-/// peer conformance.
+/// Every complete branch carries the bounded final complete-result algebra.
+/// `tools/call`, `resources/read`, and `prompts/get` additionally carry the
+/// final MRTR `input_required` branch. Both preserve an absent-result-type
+/// compatibility diagnostic for callers that record peer conformance.
 #[derive(Debug, Clone)]
 pub enum FinalCoreResult {
     /// `server/discover`.
@@ -1875,6 +1877,11 @@ pub enum FinalCoreResult {
         result: CompleteResult<FinalCallToolResult>,
         diagnostic: Option<ResultPeerDiagnostic>,
     },
+    /// `tools/call` requires client input before a retry.
+    ToolsCallInputRequired {
+        result: InputRequiredResult,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
     /// `resources/list`.
     ResourcesList {
         result: CompleteResult<FinalListResourcesResult>,
@@ -1890,6 +1897,11 @@ pub enum FinalCoreResult {
         result: CompleteResult<FinalReadResourceResult>,
         diagnostic: Option<ResultPeerDiagnostic>,
     },
+    /// `resources/read` requires client input before a retry.
+    ResourcesReadInputRequired {
+        result: InputRequiredResult,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
     /// `prompts/list`.
     PromptsList {
         result: CompleteResult<FinalListPromptsResult>,
@@ -1898,6 +1910,11 @@ pub enum FinalCoreResult {
     /// `prompts/get`.
     PromptsGet {
         result: CompleteResult<FinalGetPromptResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+    /// `prompts/get` requires client input before a retry.
+    PromptsGetInputRequired {
+        result: InputRequiredResult,
         diagnostic: Option<ResultPeerDiagnostic>,
     },
     /// `subscriptions/listen` graceful termination.
@@ -2378,12 +2395,19 @@ impl FinalCoreRequest {
                 &["tools", "nextCursor", "ttlMs", "cacheScope"],
             )
             .map(|(result, diagnostic)| FinalCoreResult::ToolsList { result, diagnostic }),
-            Self::ToolsCall(_) => decode_final_complete(
+            Self::ToolsCall(_) => decode_final_complete_or_input_required(
                 TOOLS_CALL,
                 input,
                 &["content", "isError", "structuredContent"],
             )
-            .map(|(result, diagnostic)| FinalCoreResult::ToolsCall { result, diagnostic }),
+            .map(|result| match result {
+                FinalMethodResult::Complete { result, diagnostic } => {
+                    FinalCoreResult::ToolsCall { result, diagnostic }
+                }
+                FinalMethodResult::InputRequired { result, diagnostic } => {
+                    FinalCoreResult::ToolsCallInputRequired { result, diagnostic }
+                }
+            }),
             Self::ResourcesList(_) => decode_final_complete(
                 RESOURCES_LIST,
                 input,
@@ -2400,23 +2424,38 @@ impl FinalCoreRequest {
                     FinalCoreResult::ResourceTemplatesList { result, diagnostic }
                 })
             }
-            Self::ResourcesRead(_) => {
-                decode_final_complete(RESOURCES_READ, input, &["contents", "ttlMs", "cacheScope"])
-                    .map(|(result, diagnostic)| FinalCoreResult::ResourcesRead {
-                        result,
-                        diagnostic,
-                    })
-            }
+            Self::ResourcesRead(_) => decode_final_complete_or_input_required(
+                RESOURCES_READ,
+                input,
+                &["contents", "ttlMs", "cacheScope"],
+            )
+            .map(|result| match result {
+                FinalMethodResult::Complete { result, diagnostic } => {
+                    FinalCoreResult::ResourcesRead { result, diagnostic }
+                }
+                FinalMethodResult::InputRequired { result, diagnostic } => {
+                    FinalCoreResult::ResourcesReadInputRequired { result, diagnostic }
+                }
+            }),
             Self::PromptsList(_) => decode_final_complete(
                 PROMPTS_LIST,
                 input,
                 &["prompts", "nextCursor", "ttlMs", "cacheScope"],
             )
             .map(|(result, diagnostic)| FinalCoreResult::PromptsList { result, diagnostic }),
-            Self::PromptsGet(_) => {
-                decode_final_complete(PROMPTS_GET, input, &["description", "messages"])
-                    .map(|(result, diagnostic)| FinalCoreResult::PromptsGet { result, diagnostic })
-            }
+            Self::PromptsGet(_) => decode_final_complete_or_input_required(
+                PROMPTS_GET,
+                input,
+                &["description", "messages"],
+            )
+            .map(|result| match result {
+                FinalMethodResult::Complete { result, diagnostic } => {
+                    FinalCoreResult::PromptsGet { result, diagnostic }
+                }
+                FinalMethodResult::InputRequired { result, diagnostic } => {
+                    FinalCoreResult::PromptsGetInputRequired { result, diagnostic }
+                }
+            }),
             Self::SubscriptionsListen(_) => {
                 let (result, diagnostic) = decode_final_complete(SUBSCRIPTIONS_LISTEN, input, &[])?;
                 let subscription_id = subscription_id_from_result(&result)?;
@@ -2511,12 +2550,12 @@ impl FinalCoreResult {
             Self::Discover(_) => SERVER_DISCOVER,
             Self::Completion { .. } => COMPLETION_COMPLETE,
             Self::ToolsList { .. } => TOOLS_LIST,
-            Self::ToolsCall { .. } => TOOLS_CALL,
+            Self::ToolsCall { .. } | Self::ToolsCallInputRequired { .. } => TOOLS_CALL,
             Self::ResourcesList { .. } => RESOURCES_LIST,
             Self::ResourceTemplatesList { .. } => RESOURCES_TEMPLATES_LIST,
-            Self::ResourcesRead { .. } => RESOURCES_READ,
+            Self::ResourcesRead { .. } | Self::ResourcesReadInputRequired { .. } => RESOURCES_READ,
             Self::PromptsList { .. } => PROMPTS_LIST,
-            Self::PromptsGet { .. } => PROMPTS_GET,
+            Self::PromptsGet { .. } | Self::PromptsGetInputRequired { .. } => PROMPTS_GET,
             Self::SubscriptionsListen { .. } => SUBSCRIPTIONS_LISTEN,
         }
     }
@@ -2542,6 +2581,9 @@ impl FinalCoreResult {
                 result,
                 &["content", "isError", "structuredContent"],
             ),
+            Self::ToolsCallInputRequired { result, .. } => {
+                encode_final_input_required(TOOLS_CALL, result)
+            }
             Self::ResourcesList { result, .. } => encode_final_complete(
                 RESOURCES_LIST,
                 result,
@@ -2555,6 +2597,9 @@ impl FinalCoreResult {
             Self::ResourcesRead { result, .. } => {
                 encode_final_complete(RESOURCES_READ, result, &["contents", "ttlMs", "cacheScope"])
             }
+            Self::ResourcesReadInputRequired { result, .. } => {
+                encode_final_input_required(RESOURCES_READ, result)
+            }
             Self::PromptsList { result, .. } => encode_final_complete(
                 PROMPTS_LIST,
                 result,
@@ -2562,6 +2607,9 @@ impl FinalCoreResult {
             ),
             Self::PromptsGet { result, .. } => {
                 encode_final_complete(PROMPTS_GET, result, &["description", "messages"])
+            }
+            Self::PromptsGetInputRequired { result, .. } => {
+                encode_final_input_required(PROMPTS_GET, result)
             }
             Self::SubscriptionsListen {
                 result,
@@ -2674,11 +2722,35 @@ fn encode_legacy_result<T: Serialize>(
     })
 }
 
+enum FinalMethodResult<T> {
+    Complete {
+        result: CompleteResult<T>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+    InputRequired {
+        result: InputRequiredResult,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+}
+
 fn decode_final_complete<T: DeserializeOwned>(
     method: &'static str,
     input: &str,
     known_names: &[&str],
 ) -> Result<(CompleteResult<T>, Option<ResultPeerDiagnostic>), CoreDispatchError> {
+    let FinalMethodResult::Complete { result, diagnostic } =
+        decode_final_complete_or_input_required(method, input, known_names)?
+    else {
+        return Err(CoreDispatchError::UnexpectedFinalResultType { method });
+    };
+    Ok((result, diagnostic))
+}
+
+fn decode_final_complete_or_input_required<T: DeserializeOwned>(
+    method: &'static str,
+    input: &str,
+    known_names: &[&str],
+) -> Result<FinalMethodResult<T>, CoreDispatchError> {
     let wire: Value =
         serde_json::from_str(input).map_err(|_| CoreDispatchError::InvalidResult {
             era: ProtocolEra::Modern2026,
@@ -2698,8 +2770,14 @@ fn decode_final_complete<T: DeserializeOwned>(
         ProtocolEra::Modern2026,
         &CoreResultDiscriminatorPolicy,
     )?;
-    let DecodedResult::Complete(complete) = decoded else {
-        return Err(CoreDispatchError::UnexpectedFinalResultType { method });
+    let complete = match decoded {
+        DecodedResult::Complete(complete) => complete,
+        DecodedResult::InputRequired(result) => {
+            return Ok(FinalMethodResult::InputRequired { result, diagnostic });
+        }
+        DecodedResult::Deferred(_) => {
+            return Err(CoreDispatchError::UnexpectedFinalResultType { method });
+        }
     };
     let CompleteResult { meta, extras, .. } = complete;
     let mut selected = serde_json::Map::new();
@@ -2718,14 +2796,14 @@ fn decode_final_complete<T: DeserializeOwned>(
         }
     })?;
     let extras = UnknownResultMembers::try_new(remaining, known_names)?;
-    Ok((
-        CompleteResult {
+    Ok(FinalMethodResult::Complete {
+        result: CompleteResult {
             payload,
             meta,
             extras,
         },
         diagnostic,
-    ))
+    })
 }
 
 fn subscription_id_from_result(
@@ -2789,6 +2867,25 @@ fn encode_final_complete<T: Serialize>(
     }
     encode_complete_result(&result.meta, members, known_names, &result.extras)
         .map_err(CoreDispatchError::from)
+}
+
+fn encode_final_input_required(
+    method: &'static str,
+    result: &InputRequiredResult,
+) -> Result<String, CoreDispatchError> {
+    if result.meta.server_info.is_some()
+        || result
+            .extras
+            .members()
+            .iter()
+            .any(|member| member.name == "serverInfo")
+    {
+        return Err(CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method,
+        });
+    }
+    Ok(encode_result(&DecodedResult::InputRequired(result.clone())))
 }
 
 // ============================================================================
@@ -4903,6 +5000,108 @@ mod tests {
         assert_eq!(
             legacy_result.encode().expect("legacy result re-encodes"),
             legacy_wire
+        );
+    }
+
+    #[test]
+    fn final_core_input_required_results_round_trip_for_mrtr_methods() {
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        let requests = [
+            (
+                TOOLS_CALL,
+                serde_json::json!({
+                    "_meta": metadata,
+                    "name": "collect-input"
+                }),
+            ),
+            (
+                RESOURCES_READ,
+                serde_json::json!({
+                    "_meta": metadata,
+                    "uri": "file:///workspace/status"
+                }),
+            ),
+            (
+                PROMPTS_GET,
+                serde_json::json!({
+                    "_meta": metadata,
+                    "name": "collect-input"
+                }),
+            ),
+        ];
+        let wire = r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"retry-7","com.example/opaque":{"retained":true}}"#;
+
+        for (method, params) in requests {
+            let request = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params))
+                .expect("each final MRTR-capable request decodes");
+            let result = request
+                .decode_result(wire)
+                .expect("input-required result is admitted for the selected method");
+            let input_required = match (&result, method) {
+                (
+                    CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }),
+                    TOOLS_CALL,
+                )
+                | (
+                    CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired {
+                        result, ..
+                    }),
+                    RESOURCES_READ,
+                )
+                | (
+                    CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }),
+                    PROMPTS_GET,
+                ) => result,
+                _ => panic!("{method} must select its final input-required branch"),
+            };
+            assert!(
+                input_required
+                    .input_requests()
+                    .and_then(|requests| requests.get("roots"))
+                    .is_some(),
+                "{method} preserves the exact MRTR input request map"
+            );
+            assert_eq!(input_required.request_state(), Some("retry-7"));
+            assert_eq!(
+                result.encode().expect("input-required result re-encodes"),
+                wire,
+                "{method} retains input-required state and open siblings"
+            );
+        }
+    }
+
+    #[test]
+    fn final_core_rejects_input_required_for_ineligible_method_without_mutation() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_LIST, Some(&params))
+            .expect("final tools/list request decodes");
+        let accepted = r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"retry-7"}"#;
+        let baseline = request
+            .decode_result(accepted)
+            .expect("complete tools/list retains foreign open siblings inertly");
+        let planted = accepted.replacen("\"complete\"", "\"input_required\"", 1);
+
+        assert!(
+            matches!(
+                request.decode_result(&planted),
+                Err(CoreDispatchError::UnexpectedFinalResultType { method: TOOLS_LIST })
+            ),
+            "changing only resultType cannot make tools/list MRTR-capable"
+        );
+        assert_eq!(
+            baseline
+                .encode()
+                .expect("accepted complete result remains encodable"),
+            accepted,
+            "the rejected input-required discriminator leaves the accepted result unchanged"
         );
     }
 
