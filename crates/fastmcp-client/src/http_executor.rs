@@ -2006,8 +2006,8 @@ mod tests {
             );
             write_response(&mut probe, 200, "application/json", modern_discovery_body());
 
-            let (mut request, _) = listener.accept().expect("accept modern request");
-            let request = read_request(&mut request);
+            let (mut stream, _) = listener.accept().expect("accept modern request");
+            let request = read_request(&mut stream);
             assert!(request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
             assert!(
                 request
@@ -2022,7 +2022,7 @@ mod tests {
                 "2026-07-28"
             );
             write_response(
-                &mut request,
+                &mut stream,
                 200,
                 "application/json",
                 br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}"#,

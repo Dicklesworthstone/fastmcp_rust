@@ -102,7 +102,7 @@ use fastmcp_protocol::{
     FinalRequestMeta, GetPromptParams, GetTaskParams, GetTaskResult, InitializeParams,
     InitializeResult, JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
-    ListTasksParams, ListTasksResult, ListToolsParams, ListToolsResult, LogLevel, LogMessageParams,
+    ListTasksParams, ListTasksResult, ListToolsParams, LogLevel, LogMessageParams,
     PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, PromptMessage, ReadResourceParams,
     RequestId, RequestMeta, Resource, ResourceContent, ResourceTemplate, ServerCapabilities,
     ServerInfo, SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo,
@@ -7026,10 +7026,11 @@ mod tests {
         assert!(!id_error.message.contains(id_canary));
 
         let payload_canary = "PEER-PAYLOAD-SECRET-CANARY";
-        let payload_error = decode_response_payload::<ListToolsResult>(serde_json::json!({
-            "tools": payload_canary
-        }))
-        .expect_err("a malformed typed response must fail closed");
+        let payload_error =
+            decode_response_payload::<fastmcp_protocol::ListToolsResult>(serde_json::json!({
+                "tools": payload_canary
+            }))
+            .expect_err("a malformed typed response must fail closed");
         assert_eq!(payload_error.message, INVALID_RESPONSE_PAYLOAD_ERROR);
         assert!(!payload_error.message.contains(payload_canary));
     }
