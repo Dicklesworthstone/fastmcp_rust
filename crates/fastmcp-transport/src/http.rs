@@ -461,6 +461,8 @@ pub enum HttpError {
     BodyTooLarge { size: usize, max: usize },
     /// Unsupported Transfer-Encoding.
     UnsupportedTransferEncoding(String),
+    /// Unsupported request Content-Encoding.
+    UnsupportedContentEncoding(String),
     /// JSON encoding or decoding error.
     JsonError(serde_json::Error),
     /// Codec error.
@@ -491,6 +493,7 @@ impl std::fmt::Display for HttpError {
             }
             Self::BodyTooLarge { size, max } => write!(f, "body too large: {size} > {max} bytes"),
             Self::UnsupportedTransferEncoding(_) => write!(f, "unsupported transfer encoding"),
+            Self::UnsupportedContentEncoding(_) => write!(f, "unsupported content encoding"),
             Self::JsonError(e) => write!(f, "JSON error: {}", e),
             Self::CodecError(e) => write!(f, "codec error: {}", e),
             Self::Timeout => write!(f, "request timeout"),
@@ -589,11 +592,68 @@ fn validate_mcp_request_metadata(request: &HttpRequest) -> Result<(), HttpError>
     }
 
     let content_type = request.content_type().unwrap_or("");
-    let media_type = content_type.split(';').next().unwrap_or("").trim();
-    if !media_type.eq_ignore_ascii_case("application/json") {
+    if !is_modern_json_content_type(content_type) {
         return Err(HttpError::InvalidContentType(content_type.to_string()));
     }
+    if let Some(coding) = request.header("content-encoding")
+        && !is_identity_content_coding(coding)
+    {
+        return Err(HttpError::UnsupportedContentEncoding(coding.to_string()));
+    }
     Ok(())
+}
+
+/// Accepts exactly `application/json`, optionally with one single
+/// `charset=utf-8` parameter, ASCII-case-insensitively. A different charset
+/// or any other parameter must be refused before body admission rather than
+/// silently decoded as UTF-8 anyway.
+fn is_modern_json_content_type(value: &str) -> bool {
+    let mut parts = value.split(';');
+    let essence = parts.next().unwrap_or("").trim();
+    if !essence.eq_ignore_ascii_case("application/json") {
+        return false;
+    }
+    let Some(parameter) = parts.next() else {
+        return true;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let Some((name, charset)) = parameter.trim().split_once('=') else {
+        return false;
+    };
+    name.trim().eq_ignore_ascii_case("charset") && charset.trim().eq_ignore_ascii_case("utf-8")
+}
+
+/// Maximum ignored empty RFC 9110 list elements in one request
+/// `Content-Encoding` value; framing noise stays finite.
+const MAX_IGNORED_REQUEST_CONTENT_ENCODING_EMPTY_ELEMENTS: usize = 16;
+
+/// A present request `Content-Encoding` must reduce to exactly one semantic
+/// `identity` token. Any compressed or unknown coding is a transport failure
+/// with no JSON-RPC dispatch; without this check a coded body would reach
+/// JSON admission and fail there with a misleading diagnostic.
+fn is_identity_content_coding(value: &str) -> bool {
+    let mut ignored_empty_elements = 0_usize;
+    let mut semantic_codings = 0_usize;
+    for element in value.split(',') {
+        let element = element.trim_matches([' ', '\t']);
+        if element.is_empty() {
+            ignored_empty_elements += 1;
+            if ignored_empty_elements > MAX_IGNORED_REQUEST_CONTENT_ENCODING_EMPTY_ELEMENTS {
+                return false;
+            }
+            continue;
+        }
+        if !element.eq_ignore_ascii_case("identity") {
+            return false;
+        }
+        semantic_codings += 1;
+        if semantic_codings > 1 {
+            return false;
+        }
+    }
+    semantic_codings == 1
 }
 
 fn is_origin_allowed(config: &HttpHandlerConfig, origin: &str) -> bool {
@@ -5847,6 +5907,64 @@ X-Checksum: abc123\r\n\
         assert_eq!(response.status, HttpStatus::BAD_REQUEST);
         let body_str = String::from_utf8(response.body).unwrap();
         assert!(body_str.contains("\"error\""));
+    }
+
+    #[test]
+    fn modern_json_content_type_admits_only_a_utf8_charset_parameter() {
+        assert!(is_modern_json_content_type("application/json"));
+        assert!(is_modern_json_content_type("Application/JSON"));
+        assert!(is_modern_json_content_type(
+            "application/json; charset=utf-8"
+        ));
+        assert!(is_modern_json_content_type(
+            "application/json; charset=UTF-8"
+        ));
+
+        // The changed variable in each rejection is one parameter detail.
+        assert!(!is_modern_json_content_type(
+            "application/json; charset=utf-16"
+        ));
+        assert!(!is_modern_json_content_type(
+            "application/json; charset=utf-8; boundary=x"
+        ));
+        assert!(!is_modern_json_content_type("application/json; nonsense"));
+        assert!(!is_modern_json_content_type("text/json"));
+        assert!(!is_modern_json_content_type(""));
+    }
+
+    #[test]
+    fn request_content_coding_admits_only_singleton_identity() {
+        assert!(is_identity_content_coding("identity"));
+        assert!(is_identity_content_coding("Identity"));
+        assert!(is_identity_content_coding(", identity"));
+
+        assert!(!is_identity_content_coding("gzip"));
+        assert!(!is_identity_content_coding("identity, identity"));
+        assert!(!is_identity_content_coding(""));
+        assert!(!is_identity_content_coding(",,,"));
+    }
+
+    #[test]
+    fn coded_request_bodies_are_refused_before_json_admission() {
+        let handler = HttpRequestHandler::new();
+
+        // The identical request without the coding header parses; the sole
+        // changed variable is the compressed content coding, which must be
+        // a typed transport refusal rather than a JSON diagnostic.
+        let admitted = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
+            .with_header("Content-Type", "application/json")
+            .with_body(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec());
+        assert!(handler.parse_request(&admitted).is_ok());
+
+        let coded = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
+            .with_header("Content-Type", "application/json")
+            .with_header("Content-Encoding", "gzip")
+            .with_body(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec());
+        let result = handler.parse_request(&coded);
+        assert!(matches!(
+            result,
+            Err(HttpError::UnsupportedContentEncoding(value)) if value == "gzip"
+        ));
     }
 
     #[test]
