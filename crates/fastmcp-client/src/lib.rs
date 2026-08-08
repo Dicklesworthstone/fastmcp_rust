@@ -54,6 +54,7 @@ pub use execution::{
     RequestExecution, RequestExecutor, clt_01_a_manifest_digest, clt_01_b_manifest_digest,
 };
 pub use fastmcp_core::CanonicalHttpUrl;
+pub use fastmcp_protocol::common_types::LoggingLevel;
 pub use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, HttpModernProbe, HttpProbeBody, ProtocolEra,
     ProtocolPolicy, ProtocolVersion,
@@ -61,7 +62,7 @@ pub use fastmcp_protocol::protocol_policy::{
 pub use fastmcp_protocol::{
     CoreResult, FinalCompletionArgument as CompletionArgument,
     FinalCompletionContext as CompletionContext, FinalCompletionReference as CompletionReference,
-    FinalCoreResult, LegacyCoreResult, LoggingLevel, SubscriptionFilter,
+    FinalCoreResult, LegacyCoreResult, SubscriptionFilter,
 };
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, LegacySseHttpClient,
@@ -93,19 +94,19 @@ use std::time::{Duration, Instant};
 
 use asupersync::{Cx, channel::oneshot};
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sha256_bounded};
+use fastmcp_protocol::common_types::{ContentBlock, EmbeddedResourceContents, RawIcon};
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancelledParams,
     ClientCapabilities, ClientInfo, Content, CoreDispatchError, CoreRequest, CorrelationKey,
-    FinalRequestMeta, GetPromptParams, GetPromptResult, GetTaskParams, GetTaskResult,
-    InitializeParams, InitializeResult, JSONRPC_VERSION, JsonRpcError, JsonRpcMessage,
-    JsonRpcRequest, JsonRpcResponse, ListPromptsParams, ListPromptsResult,
-    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListTasksParams, ListTasksResult, ListToolsParams, ListToolsResult,
-    LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage,
-    ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource, ResourceContent,
-    ResourceTemplate, ServerCapabilities, ServerInfo, SetLogLevelParams, SubmitTaskParams,
-    SubmitTaskResult, TaskId, TaskInfo, TaskResult, TaskStatus, Tool,
+    FinalRequestMeta, GetPromptParams, GetTaskParams, GetTaskResult, InitializeParams,
+    InitializeResult, JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
+    ListTasksParams, ListTasksResult, ListToolsParams, ListToolsResult, LogLevel, LogMessageParams,
+    PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, PromptMessage, ReadResourceParams,
+    RequestId, RequestMeta, Resource, ResourceContent, ResourceTemplate, ServerCapabilities,
+    ServerInfo, SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo,
+    TaskResult, TaskStatus, Tool, ToolAnnotations,
 };
 use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
 
@@ -1637,6 +1638,268 @@ fn decode_response_payload<R: serde::de::DeserializeOwned>(
 ) -> McpResult<R> {
     serde_json::from_value(value)
         .map_err(|_| McpError::internal_error(INVALID_RESPONSE_PAYLOAD_ERROR))
+}
+
+/// Projects one final icon collection to the one-icon legacy convenience
+/// surface without attempting to deserialize final component shapes as legacy
+/// wire values.
+fn final_icon_to_legacy(icons: Option<Vec<RawIcon>>) -> Option<fastmcp_protocol::Icon> {
+    icons
+        .and_then(|icons| icons.into_iter().next())
+        .map(|icon| fastmcp_protocol::Icon {
+            src: Some(icon.src.as_str().to_owned()),
+            mime_type: icon.mime_type,
+            sizes: icon.sizes.map(|sizes| sizes.join(" ")),
+        })
+}
+
+fn final_tool_to_legacy(tool: fastmcp_protocol::FinalTool) -> Tool {
+    Tool {
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.input_schema,
+        output_schema: tool.output_schema,
+        icon: final_icon_to_legacy(tool.icons),
+        version: None,
+        tags: Vec::new(),
+        annotations: tool.annotations.map(|annotations| ToolAnnotations {
+            destructive: annotations.destructive,
+            idempotent: annotations.idempotent,
+            read_only: annotations.read_only,
+            open_world_hint: annotations.open_world_hint,
+        }),
+    }
+}
+
+fn final_resource_to_legacy(resource: fastmcp_protocol::FinalResource) -> Resource {
+    Resource {
+        uri: resource.uri.as_str().to_owned(),
+        name: resource.name,
+        description: resource.description,
+        mime_type: resource.mime_type,
+        icon: final_icon_to_legacy(resource.icons),
+        version: None,
+        tags: Vec::new(),
+    }
+}
+
+fn final_resource_template_to_legacy(
+    template: fastmcp_protocol::FinalResourceTemplate,
+) -> ResourceTemplate {
+    ResourceTemplate {
+        uri_template: template.uri_template,
+        name: template.name,
+        description: template.description,
+        mime_type: template.mime_type,
+        icon: final_icon_to_legacy(template.icons),
+        version: None,
+        tags: Vec::new(),
+    }
+}
+
+fn final_prompt_to_legacy(prompt: fastmcp_protocol::FinalPrompt) -> Prompt {
+    Prompt {
+        name: prompt.name,
+        description: prompt.description,
+        arguments: prompt
+            .arguments
+            .unwrap_or_default()
+            .into_iter()
+            .map(|argument| PromptArgument {
+                name: argument.name,
+                description: argument.description,
+                required: argument.required.unwrap_or(false),
+            })
+            .collect(),
+        icon: final_icon_to_legacy(prompt.icons),
+        version: None,
+        tags: Vec::new(),
+    }
+}
+
+fn final_resource_content_to_legacy(resource: EmbeddedResourceContents) -> ResourceContent {
+    match resource {
+        EmbeddedResourceContents::Text {
+            uri,
+            text,
+            mime_type,
+        } => ResourceContent {
+            uri: uri.as_str().to_owned(),
+            mime_type,
+            text: Some(text),
+            blob: None,
+        },
+        EmbeddedResourceContents::Blob {
+            uri,
+            blob,
+            mime_type,
+        } => ResourceContent {
+            uri: uri.as_str().to_owned(),
+            mime_type,
+            text: None,
+            blob: Some(blob),
+        },
+    }
+}
+
+fn final_content_to_legacy(content: ContentBlock) -> McpResult<Content> {
+    match content {
+        ContentBlock::Text { text, .. } => Ok(Content::Text { text }),
+        ContentBlock::Image {
+            data, mime_type, ..
+        } => Ok(Content::Image { data, mime_type }),
+        ContentBlock::Audio {
+            data, mime_type, ..
+        } => Ok(Content::Audio { data, mime_type }),
+        ContentBlock::Resource { resource, .. } => Ok(Content::Resource {
+            resource: final_resource_content_to_legacy(resource),
+        }),
+        ContentBlock::ResourceLink { .. } => Err(McpError::invalid_request(
+            "Final content cannot be represented by the legacy convenience API",
+        )),
+    }
+}
+
+fn unexpected_convenience_result(method: &str) -> McpError {
+    McpError::invalid_request(format!(
+        "Negotiated core result was not a {method} result for the convenience API"
+    ))
+}
+
+fn convenience_tools_page(result: CoreResult) -> McpResult<(Vec<Tool>, Option<String>)> {
+    match result {
+        CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
+            Ok((result.tools, result.next_cursor))
+        }
+        CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
+            let fastmcp_protocol::FinalListToolsResult {
+                tools, next_cursor, ..
+            } = result.payload;
+            Ok((
+                tools.into_iter().map(final_tool_to_legacy).collect(),
+                next_cursor,
+            ))
+        }
+        _ => Err(unexpected_convenience_result("tools/list")),
+    }
+}
+
+fn convenience_resources_page(result: CoreResult) -> McpResult<(Vec<Resource>, Option<String>)> {
+    match result {
+        CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+            Ok((result.resources, result.next_cursor))
+        }
+        CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
+            let fastmcp_protocol::FinalListResourcesResult {
+                resources,
+                next_cursor,
+                ..
+            } = result.payload;
+            Ok((
+                resources
+                    .into_iter()
+                    .map(final_resource_to_legacy)
+                    .collect(),
+                next_cursor,
+            ))
+        }
+        _ => Err(unexpected_convenience_result("resources/list")),
+    }
+}
+
+fn convenience_resource_templates_page(
+    result: CoreResult,
+) -> McpResult<(Vec<ResourceTemplate>, Option<String>)> {
+    match result {
+        CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => {
+            Ok((result.resource_templates, result.next_cursor))
+        }
+        CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) => {
+            let fastmcp_protocol::FinalListResourceTemplatesResult {
+                resource_templates,
+                next_cursor,
+                ..
+            } = result.payload;
+            Ok((
+                resource_templates
+                    .into_iter()
+                    .map(final_resource_template_to_legacy)
+                    .collect(),
+                next_cursor,
+            ))
+        }
+        _ => Err(unexpected_convenience_result("resources/templates/list")),
+    }
+}
+
+fn convenience_prompts_page(result: CoreResult) -> McpResult<(Vec<Prompt>, Option<String>)> {
+    match result {
+        CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+            Ok((result.prompts, result.next_cursor))
+        }
+        CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
+            let fastmcp_protocol::FinalListPromptsResult {
+                prompts,
+                next_cursor,
+                ..
+            } = result.payload;
+            Ok((
+                prompts.into_iter().map(final_prompt_to_legacy).collect(),
+                next_cursor,
+            ))
+        }
+        _ => Err(unexpected_convenience_result("prompts/list")),
+    }
+}
+
+fn convenience_tool_call(result: CoreResult) -> McpResult<CallToolResult> {
+    match result {
+        CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => Ok(result),
+        CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+            let fastmcp_protocol::FinalCallToolResult {
+                content, is_error, ..
+            } = result.payload;
+            Ok(CallToolResult {
+                content: content
+                    .into_iter()
+                    .map(final_content_to_legacy)
+                    .collect::<McpResult<Vec<_>>>()?,
+                is_error,
+            })
+        }
+        _ => Err(unexpected_convenience_result("tools/call")),
+    }
+}
+
+fn convenience_resource_read(result: CoreResult) -> McpResult<Vec<ResourceContent>> {
+    match result {
+        CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => Ok(result.contents),
+        CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => Ok(result
+            .payload
+            .contents
+            .into_iter()
+            .map(final_resource_content_to_legacy)
+            .collect()),
+        _ => Err(unexpected_convenience_result("resources/read")),
+    }
+}
+
+fn convenience_prompt_get(result: CoreResult) -> McpResult<Vec<PromptMessage>> {
+    match result {
+        CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => Ok(result.messages),
+        CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) => result
+            .payload
+            .messages
+            .into_iter()
+            .map(|message| {
+                Ok(PromptMessage {
+                    role: message.role,
+                    content: final_content_to_legacy(message.content)?,
+                })
+            })
+            .collect(),
+        _ => Err(unexpected_convenience_result("prompts/get")),
+    }
 }
 
 fn validate_initialize_result(result: &InitializeResult) -> McpResult<()> {
@@ -3254,24 +3517,27 @@ impl Client {
     /// or the server's ping response fails.
     pub fn ping(&mut self) -> McpResult<()> {
         self.ensure_initialized()?;
-        let _: serde_json::Value = self.send_request("ping", serde_json::json!({}))?;
-        Ok(())
-    }
-
-    /// Sends `ping` and returns its negotiated, method-aware core result.
-    ///
-    /// A modern session returns [`CoreResult::Final`] with
-    /// [`FinalCoreResult::Ping`]. An exact legacy session returns
-    /// [`CoreResult::Legacy`] with its unchanged acknowledgement shape.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or the result violates the
-    /// selected-era `ping` contract. A contradictory core result terminates
-    /// the connection.
-    pub fn ping_typed(&mut self) -> McpResult<CoreResult> {
-        self.ensure_initialized()?;
-        self.send_typed_core_request("ping", serde_json::json!({}))
+        match self.session.selected_era() {
+            Some(ProtocolEra::Modern2026) => {
+                // Final `ping` is an ordinary JSON-RPC request, not a core
+                // request/result-algebra member. It still carries final
+                // request metadata, but its acknowledgement must not be
+                // decoded through `FinalCoreResult`.
+                let params = self.prepare_request_parameters(serde_json::json!({}))?;
+                let _: serde_json::Value = self.send_prepared_request("ping", params)?;
+                Ok(())
+            }
+            Some(ProtocolEra::Legacy2024) => {
+                // Retain the exact legacy core admission and acknowledgement
+                // decoding path. In particular, this must never gain final
+                // request metadata just because a modern peer supports it.
+                let _: serde_json::Value = self.send_request("ping", serde_json::json!({}))?;
+                Ok(())
+            }
+            None => Err(McpError::internal_error(
+                "Client has no negotiated protocol era for ping",
+            )),
+        }
     }
 
     /// Generates the next request ID.
@@ -3955,12 +4221,11 @@ impl Client {
 
         loop {
             budget.begin_page()?;
-            let mut params = ListToolsParams::default();
-            params.cursor = cursor.clone();
-            let result: ListToolsResult = self.send_request("tools/list", params)?;
-            budget.account_page(&result.tools)?;
-            all.extend(result.tools);
-            cursor = budget.admit_next_cursor(result.next_cursor)?;
+            let (tools, next_cursor) =
+                convenience_tools_page(self.list_tools_typed(cursor.as_deref())?)?;
+            budget.account_page(&tools)?;
+            all.extend(tools);
+            cursor = budget.admit_next_cursor(next_cursor)?;
             if cursor.is_none() {
                 break;
             }
@@ -3987,12 +4252,9 @@ impl Client {
     ) -> McpResult<BoundedListPage<Tool>> {
         let cursor_parameter = validate_list_page_request(cursor, limits)?;
         self.ensure_initialized()?;
-        let params = ListToolsParams {
-            cursor: cursor_parameter,
-            ..ListToolsParams::default()
-        };
-        let result: ListToolsResult = self.send_request("tools/list", params)?;
-        bounded_list_page(result.tools, cursor, result.next_cursor, limits)
+        let (tools, next_cursor) =
+            convenience_tools_page(self.list_tools_typed(cursor_parameter.as_deref())?)?;
+        bounded_list_page(tools, cursor, next_cursor, limits)
     }
 
     /// Calls a tool and returns its negotiated, method-aware core result.
@@ -4031,12 +4293,7 @@ impl Client {
         arguments: serde_json::Value,
     ) -> McpResult<Vec<Content>> {
         self.ensure_initialized()?;
-        let params = CallToolParams {
-            name: name.to_string(),
-            arguments: Some(arguments),
-            meta: None,
-        };
-        let result: CallToolResult = self.send_request("tools/call", params)?;
+        let result = convenience_tool_call(self.call_tool_typed(name, arguments)?)?;
 
         if result.is_error {
             // Extract error message from content if available
@@ -4094,13 +4351,13 @@ impl Client {
             }),
         };
 
-        let result: CallToolResult = self.send_request_with_progress(
+        let result = convenience_tool_call(self.send_typed_core_request_with_progress(
             "tools/call",
             params,
             request_id,
             &progress_marker,
             on_progress,
-        )?;
+        )?)?;
 
         if result.is_error {
             // Extract error message from content if available
@@ -4136,6 +4393,68 @@ impl Client {
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
         let params_value = self.prepare_request_parameters(params_value)?;
         let core_request = self.prepared_core_request(method, &params_value)?;
+
+        let result = self.send_prepared_request_with_progress(
+            method,
+            params_value,
+            request_id,
+            expected_marker,
+            on_progress,
+        )?;
+
+        if let Some(core_request) = core_request
+            && let Err(error) = decode_core_result(&core_request, &result)
+        {
+            return Err(self.terminate_connection(error));
+        }
+
+        decode_response_payload(result)
+    }
+
+    /// Sends one supported core request with progress handling and retains its
+    /// selected-era result.
+    fn send_typed_core_request_with_progress<P: serde::Serialize>(
+        &mut self,
+        method: &str,
+        params: P,
+        request_id: u64,
+        expected_marker: &ProgressMarker,
+        on_progress: ProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        let timeout_policy = self.timeout_policy;
+        timeout_policy.validate()?;
+        let params_value = serde_json::to_value(params)
+            .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
+        let params_value = self.prepare_request_parameters(params_value)?;
+        let core_request = self
+            .prepared_core_request(method, &params_value)?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Method is not a supported core request in the negotiated era",
+                )
+            })?;
+        let result = self.send_prepared_request_with_progress(
+            method,
+            params_value,
+            request_id,
+            expected_marker,
+            on_progress,
+        )?;
+        decode_core_result(&core_request, &result).map_err(|error| self.terminate_connection(error))
+    }
+
+    /// Sends an already-prepared request and waits for its response while
+    /// routing matching progress notifications.
+    fn send_prepared_request_with_progress(
+        &mut self,
+        method: &str,
+        params_value: serde_json::Value,
+        request_id: u64,
+        expected_marker: &ProgressMarker,
+        on_progress: ProgressCallback<'_>,
+    ) -> McpResult<serde_json::Value> {
+        let timeout_policy = self.timeout_policy;
+        timeout_policy.validate()?;
 
         let request_id = RequestId::Number(
             i64::try_from(request_id).expect("request ID allocator enforces the i64 bound"),
@@ -4178,13 +4497,7 @@ impl Client {
             .result
             .ok_or_else(|| McpError::internal_error("No result in response"))?;
 
-        if let Some(core_request) = core_request
-            && let Err(error) = decode_core_result(&core_request, &result)
-        {
-            return Err(self.terminate_connection(error));
-        }
-
-        decode_response_payload(result)
+        Ok(result)
     }
 
     /// Receives a response from the transport, handling progress notifications.
@@ -4362,12 +4675,11 @@ impl Client {
 
         loop {
             budget.begin_page()?;
-            let mut params = ListResourcesParams::default();
-            params.cursor = cursor.clone();
-            let result: ListResourcesResult = self.send_request("resources/list", params)?;
-            budget.account_page(&result.resources)?;
-            all.extend(result.resources);
-            cursor = budget.admit_next_cursor(result.next_cursor)?;
+            let (resources, next_cursor) =
+                convenience_resources_page(self.list_resources_typed(cursor.as_deref())?)?;
+            budget.account_page(&resources)?;
+            all.extend(resources);
+            cursor = budget.admit_next_cursor(next_cursor)?;
             if cursor.is_none() {
                 break;
             }
@@ -4389,12 +4701,9 @@ impl Client {
     ) -> McpResult<BoundedListPage<Resource>> {
         let cursor_parameter = validate_list_page_request(cursor, limits)?;
         self.ensure_initialized()?;
-        let params = ListResourcesParams {
-            cursor: cursor_parameter,
-            ..ListResourcesParams::default()
-        };
-        let result: ListResourcesResult = self.send_request("resources/list", params)?;
-        bounded_list_page(result.resources, cursor, result.next_cursor, limits)
+        let (resources, next_cursor) =
+            convenience_resources_page(self.list_resources_typed(cursor_parameter.as_deref())?)?;
+        bounded_list_page(resources, cursor, next_cursor, limits)
     }
 
     /// Lists one page of resource templates and returns its negotiated core
@@ -4432,13 +4741,12 @@ impl Client {
 
         loop {
             budget.begin_page()?;
-            let mut params = ListResourceTemplatesParams::default();
-            params.cursor = cursor.clone();
-            let result: ListResourceTemplatesResult =
-                self.send_request("resources/templates/list", params)?;
-            budget.account_page(&result.resource_templates)?;
-            all.extend(result.resource_templates);
-            cursor = budget.admit_next_cursor(result.next_cursor)?;
+            let (resource_templates, next_cursor) = convenience_resource_templates_page(
+                self.list_resource_templates_typed(cursor.as_deref())?,
+            )?;
+            budget.account_page(&resource_templates)?;
+            all.extend(resource_templates);
+            cursor = budget.admit_next_cursor(next_cursor)?;
             if cursor.is_none() {
                 break;
             }
@@ -4460,18 +4768,10 @@ impl Client {
     ) -> McpResult<BoundedListPage<ResourceTemplate>> {
         let cursor_parameter = validate_list_page_request(cursor, limits)?;
         self.ensure_initialized()?;
-        let params = ListResourceTemplatesParams {
-            cursor: cursor_parameter,
-            ..ListResourceTemplatesParams::default()
-        };
-        let result: ListResourceTemplatesResult =
-            self.send_request("resources/templates/list", params)?;
-        bounded_list_page(
-            result.resource_templates,
-            cursor,
-            result.next_cursor,
-            limits,
-        )
+        let (resource_templates, next_cursor) = convenience_resource_templates_page(
+            self.list_resource_templates_typed(cursor_parameter.as_deref())?,
+        )?;
+        bounded_list_page(resource_templates, cursor, next_cursor, limits)
     }
 
     /// Configures the selected protocol era's log level behavior.
@@ -4542,12 +4842,7 @@ impl Client {
     /// Returns an error if the resource cannot be read.
     pub fn read_resource(&mut self, uri: &str) -> McpResult<Vec<ResourceContent>> {
         self.ensure_initialized()?;
-        let params = ReadResourceParams {
-            uri: uri.to_string(),
-            meta: None,
-        };
-        let result: ReadResourceResult = self.send_request("resources/read", params)?;
-        Ok(result.contents)
+        convenience_resource_read(self.read_resource_typed(uri)?)
     }
 
     /// Lists one page of prompts and returns its negotiated core result.
@@ -4583,12 +4878,11 @@ impl Client {
 
         loop {
             budget.begin_page()?;
-            let mut params = ListPromptsParams::default();
-            params.cursor = cursor.clone();
-            let result: ListPromptsResult = self.send_request("prompts/list", params)?;
-            budget.account_page(&result.prompts)?;
-            all.extend(result.prompts);
-            cursor = budget.admit_next_cursor(result.next_cursor)?;
+            let (prompts, next_cursor) =
+                convenience_prompts_page(self.list_prompts_typed(cursor.as_deref())?)?;
+            budget.account_page(&prompts)?;
+            all.extend(prompts);
+            cursor = budget.admit_next_cursor(next_cursor)?;
             if cursor.is_none() {
                 break;
             }
@@ -4610,12 +4904,9 @@ impl Client {
     ) -> McpResult<BoundedListPage<Prompt>> {
         let cursor_parameter = validate_list_page_request(cursor, limits)?;
         self.ensure_initialized()?;
-        let params = ListPromptsParams {
-            cursor: cursor_parameter,
-            ..ListPromptsParams::default()
-        };
-        let result: ListPromptsResult = self.send_request("prompts/list", params)?;
-        bounded_list_page(result.prompts, cursor, result.next_cursor, limits)
+        let (prompts, next_cursor) =
+            convenience_prompts_page(self.list_prompts_typed(cursor_parameter.as_deref())?)?;
+        bounded_list_page(prompts, cursor, next_cursor, limits)
     }
 
     /// Gets a prompt and returns its negotiated, method-aware core result.
@@ -4654,17 +4945,7 @@ impl Client {
         arguments: std::collections::HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
         self.ensure_initialized()?;
-        let params = GetPromptParams {
-            name: name.to_string(),
-            arguments: if arguments.is_empty() {
-                None
-            } else {
-                Some(arguments)
-            },
-            meta: None,
-        };
-        let result: GetPromptResult = self.send_request("prompts/get", params)?;
-        Ok(result.messages)
+        convenience_prompt_get(self.get_prompt_typed(name, arguments)?)
     }
 
     /// Completes one prompt or resource-template argument in the selected era.
@@ -8612,7 +8893,7 @@ mod tests {
              IFS= read -r request || exit 1; \
              case \"$request\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
              case \"$request\" in *io.modelcontextprotocol/logLevel*) exit 1 ;; \
-             *) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\"}}}}' ;; esac; \
+             *) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; esac; \
              exec sleep 2"
         )
     }
@@ -8627,7 +8908,7 @@ mod tests {
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r request || exit 1; \
              case \"$request\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"io.modelcontextprotocol/logLevel\":\"notice\"'*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -8721,7 +9002,7 @@ mod tests {
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"resultType\":\"complete\",\"messages\":[]}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r ping || exit 1; \
              case \"$ping\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"io.modelcontextprotocol/logLevel\":\"notice\"'*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -8811,8 +9092,8 @@ mod tests {
          IFS= read -r lifecycle || exit 1; \
          case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
          IFS= read -r request || exit 1; \
-         case \"$request\" in *ping*) \
-         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac; \
+         case \"$request\" in *ping*io.modelcontextprotocol/protocolVersion*|*ping*io.modelcontextprotocol/clientCapabilities*) exit 1 ;; \
+         *ping*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac; \
          exec sleep 2"
     }
 
@@ -8995,6 +9276,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn clt_01_modern_ping_is_not_a_core_request() {
+        let modern_result =
+            modern_discovery_response("modern-ping-server", &[MODERN_PROTOCOL_VERSION]);
+        let script = modern_public_client_script(&modern_result);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the client");
+
+        client
+            .ping()
+            .expect("the bare JSON-RPC acknowledgement must not decode as a final core result");
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clt_01_final_typed_client_result_positive() {
         let script = modern_typed_call_client_script(
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"typed result"}],"isError":false}}"#,
@@ -9017,6 +9318,53 @@ mod tests {
         assert!(!result.payload.is_error);
         assert_eq!(result.payload.content.len(), 1);
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_modern_convenience_tool_projects_final_content() {
+        let script = modern_typed_call_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"convenience result","annotations":{"audience":["user"]}}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+
+        let content = client
+            .call_tool("echo", serde_json::json!({"text": "convenience"}))
+            .expect("the convenience API projects final content instead of decoding it as legacy");
+        assert!(matches!(
+            content.as_slice(),
+            [Content::Text { text }] if text == "convenience result"
+        ));
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_modern_convenience_tool_null_discriminator_rejected() {
+        // This differs from the accepted convenience result only in `resultType`.
+        let script = modern_typed_call_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"convenience result","annotations":{"audience":["user"]}}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("same modern discovery initializes the public client");
+
+        let error = client
+            .call_tool("echo", serde_json::json!({"text": "convenience"}))
+            .expect_err("an explicit null discriminator remains a terminal protocol violation");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(!client.is_initialized());
+        assert!(client.responses.terminal_error().is_some());
     }
 
     #[cfg(unix)]
@@ -9070,12 +9418,9 @@ mod tests {
         client
             .set_log_level_typed(LoggingLevel::Notice)
             .expect("modern logging configuration is retained for later request metadata");
-        assert!(matches!(
-            client
-                .ping_typed()
-                .expect("typed ping returns final result"),
-            CoreResult::Final(FinalCoreResult::Ping { .. })
-        ));
+        client
+            .ping()
+            .expect("final ping remains outside the core result algebra");
         client.close().expect("modern client cleanup");
     }
 
@@ -9091,12 +9436,9 @@ mod tests {
         )
         .expect("same modern discovery initializes the public client");
 
-        assert!(matches!(
-            client
-                .ping_typed()
-                .expect("one omitted final logging configuration remains absent on the wire"),
-            CoreResult::Final(FinalCoreResult::Ping { .. })
-        ));
+        client
+            .ping()
+            .expect("one omitted final logging configuration remains absent on the wire");
         client.close().expect("modern client cleanup");
     }
 
@@ -9116,7 +9458,7 @@ mod tests {
             .set_log_level_typed(LoggingLevel::Notice)
             .expect("Auto-modern stores final configuration without a logging RPC");
         client
-            .ping_typed()
+            .ping()
             .expect("the following Auto-modern request carries the final log level");
         client.close().expect("Auto-modern client cleanup");
     }
@@ -9629,6 +9971,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn leg_03_ping_preserves_the_exact_legacy_request_path() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_public_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy initialization succeeds before the exact ping request");
+
+        client
+            .ping()
+            .expect("legacy ping keeps its core acknowledgement and omits final metadata");
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn leg_03_typed_client_result_preserves_exact_legacy_decode() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -9646,6 +10005,27 @@ mod tests {
         };
         assert!(!result.is_error);
         assert_eq!(result.content.len(), 1);
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_convenience_tool_preserves_exact_legacy_decode() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_typed_call_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
+
+        let content = client
+            .call_tool("echo", serde_json::json!({"text": "legacy"}))
+            .expect("the convenience API retains the exact legacy result shape");
+        assert!(matches!(
+            content.as_slice(),
+            [Content::Text { text }] if text == "legacy result"
+        ));
         client.close().expect("legacy client cleanup");
     }
 
