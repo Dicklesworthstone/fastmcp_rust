@@ -2976,6 +2976,7 @@ pub struct ReadResourceParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadResourceResult {
     /// Resource contents.
+    #[serde(deserialize_with = "deserialize_legacy_resource_contents")]
     pub contents: Vec<LegacyResourceContent>,
     /// Open legacy result metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -2983,6 +2984,39 @@ pub struct ReadResourceResult {
     /// Other schema-allowed result members.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub additional: BTreeMap<String, Value>,
+}
+
+/// Decodes the exact legacy resource-content one-of without discarding open members.
+///
+/// `LegacyResourceContent` is intentionally untagged because the 2024 wire
+/// shape selects its variant by `text` or `blob`. Its flattened open members
+/// otherwise allow an object with both (or neither) fields to match an
+/// unintended variant, so inspect the two discriminating fields before asking
+/// serde to preserve the typed fields, `_meta`, and additional members.
+fn deserialize_legacy_resource_contents<'de, D>(
+    deserializer: D,
+) -> Result<Vec<LegacyResourceContent>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let contents = Vec::<Value>::deserialize(deserializer)?;
+    contents
+        .into_iter()
+        .map(|content| {
+            let Value::Object(object) = &content else {
+                return Err(serde::de::Error::custom(
+                    "legacy resource content must be an object",
+                ));
+            };
+            match (object.contains_key("text"), object.contains_key("blob")) {
+                (true, false) | (false, true) => serde_json::from_value(content)
+                    .map_err(|error| serde::de::Error::custom(error.to_string())),
+                (true, true) | (false, false) => Err(serde::de::Error::custom(
+                    "legacy resource content must contain exactly one of text or blob",
+                )),
+            }
+        })
+        .collect()
 }
 
 /// resources/subscribe request params.
@@ -5630,6 +5664,87 @@ mod tests {
         let value = serde_json::to_value(&result).expect("serialize");
         assert_eq!(value["contents"][0]["uri"], "file://test.txt");
         assert_eq!(value["contents"][0]["text"], "Hello!");
+    }
+
+    #[test]
+    fn legacy_resource_content_one_of_valid_text_and_blob_round_trip_open_members() {
+        let wire = serde_json::json!({
+            "contents": [
+                {
+                    "uri": "file:///report.txt",
+                    "text": "ready",
+                    "mimeType": "text/plain",
+                    "_meta": {"legacy": "text"},
+                    "com.example/resource": {"retain": true}
+                },
+                {
+                    "uri": "file:///report.bin",
+                    "blob": "cmVhZHk=",
+                    "mimeType": "application/octet-stream",
+                    "_meta": {"legacy": "blob"},
+                    "com.example/resource": ["retain"]
+                }
+            ],
+            "_meta": {"legacy": "read-result"},
+            "com.example/result": {"retain": true}
+        });
+
+        let result: ReadResourceResult =
+            serde_json::from_value(wire.clone()).expect("exact text and blob members decode");
+
+        let LegacyResourceContent::Text { additional, .. } = &result.contents[0] else {
+            panic!("text discriminator selects the text variant");
+        };
+        assert_eq!(additional["_meta"], serde_json::json!({"legacy": "text"}));
+        assert_eq!(
+            additional["com.example/resource"],
+            serde_json::json!({"retain": true})
+        );
+        let LegacyResourceContent::Blob { additional, .. } = &result.contents[1] else {
+            panic!("blob discriminator selects the blob variant");
+        };
+        assert_eq!(additional["_meta"], serde_json::json!({"legacy": "blob"}));
+        assert_eq!(
+            additional["com.example/resource"],
+            serde_json::json!(["retain"])
+        );
+        assert_eq!(
+            serde_json::to_value(&result).expect("exact legacy contents re-encode"),
+            wire
+        );
+    }
+
+    #[test]
+    fn legacy_resource_content_one_of_rejects_ambiguous_or_missing_payload_negative() {
+        let accepted = serde_json::json!({
+            "contents": [{
+                "uri": "file:///report.txt",
+                "text": "ready",
+                "_meta": {"legacy": "resource"},
+                "com.example/resource": {"retain": true}
+            }]
+        });
+        assert!(
+            serde_json::from_value::<ReadResourceResult>(accepted.clone()).is_ok(),
+            "the one-of baseline remains valid"
+        );
+
+        let mut both = accepted.clone();
+        both["contents"][0]["blob"] = serde_json::json!("cmVhZHk=");
+        assert!(
+            serde_json::from_value::<ReadResourceResult>(both).is_err(),
+            "only adding blob to a valid text resource must reject an ambiguous one-of"
+        );
+
+        let mut neither = accepted;
+        neither["contents"][0]
+            .as_object_mut()
+            .expect("baseline content is an object")
+            .remove("text");
+        assert!(
+            serde_json::from_value::<ReadResourceResult>(neither).is_err(),
+            "only removing text from the same resource must reject an empty one-of"
+        );
     }
 
     // ========================================================================
