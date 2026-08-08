@@ -326,9 +326,9 @@ pub use fastmcp_client::{
     ClientHttpNegotiationError, ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
     ClientProtocolPlanError, ClientSession, CompletionContext, CompletionParams,
     CompletionReference, ExecutionTerminalReason, ExecutionTerminalRecord, ExecutionTerminalState,
-    ListPageLimits, OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback,
-    Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
-    SubscriptionFilter, SubscriptionListenCollector,
+    FinalToolCallOutcome, ListPageLimits, OpaquePagination, PaginationBounds, PendingRequestRecord,
+    ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
+    RequestTimeoutSource, SubscriptionFilter, SubscriptionListenCollector,
 };
 
 // Public client HTTP execution and configuration surfaces.
@@ -365,7 +365,8 @@ pub mod auto {
         Client, ClientBuilder, ClientHttpConnection, ClientHttpConnectionError,
         ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
         ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
-        ClientProtocolPlanError, ClientSession, SubscriptionFilter, SubscriptionListenCollector,
+        ClientProtocolPlanError, ClientSession, FinalToolCallOutcome, SubscriptionFilter,
+        SubscriptionListenCollector,
     };
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::protocol_policy::{
@@ -412,9 +413,9 @@ pub mod modern {
         ClientHttpNegotiationError, ClientHttpNegotiationState, ClientHttpResponse,
         ClientProtocolPlan, ClientProtocolPlanError, ClientSession, CompletionContext,
         CompletionParams, CompletionReference, ExecutionTerminalReason, ExecutionTerminalRecord,
-        ExecutionTerminalState, ListPageLimits, OpaquePagination, PaginationBounds,
-        PendingRequestRecord, ProgressCallback, Request, RequestExecution, RequestExecutor,
-        RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionFilter,
+        ExecutionTerminalState, FinalToolCallOutcome, ListPageLimits, OpaquePagination,
+        PaginationBounds, PendingRequestRecord, ProgressCallback, Request, RequestExecution,
+        RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionFilter,
         SubscriptionListenCollector,
     };
     pub use fastmcp_client::{http_executor, mcp_config};
@@ -662,6 +663,7 @@ pub mod prelude {
         FinalReadResourceResult,
         FinalResourceUpdatedNotificationParams,
         FinalSubscriptionsAcknowledgedNotificationParams,
+        FinalToolCallOutcome,
         FinalToolOutcome,
         HttpEndpointBundle,
         HttpEndpointBundleError,
@@ -1023,11 +1025,16 @@ mod tests {
     fn facade_exposes_dual_era_http_and_final_typed_client_contracts() {
         use std::collections::HashMap;
 
-        use super::{Client, FinalCallToolResult, FinalGetPromptResult, FinalReadResourceResult};
+        use super::{
+            Client, FinalCallToolResult, FinalGetPromptResult, FinalReadResourceResult,
+            FinalToolCallOutcome,
+        };
         use super::{JsonValue, McpResult, auto, legacy_2024, modern};
 
         let _: fn(&mut Client, &str, JsonValue) -> McpResult<FinalCallToolResult> =
             Client::call_tool_final;
+        let _: fn(&mut Client, &str, JsonValue) -> McpResult<FinalToolCallOutcome> =
+            Client::call_tool_final_outcome;
         let _: fn(&mut Client, &str) -> McpResult<FinalReadResourceResult> =
             Client::read_resource_final;
         let _: fn(&mut Client, &str, HashMap<String, String>) -> McpResult<FinalGetPromptResult> =
@@ -1076,14 +1083,16 @@ mod tests {
         use super::prelude::{
             BoundHttpServer, Client, DualEraHttpEndpoint, DualEraHttpEndpointConfig,
             DualEraHttpEndpointError, FinalCallToolResult, FinalGetPromptResult,
-            FinalReadResourceResult, JsonValue, McpResult, ModernHttpClient, ModernHttpClientError,
-            ModernHttpConnectOutcome, ModernHttpSubscriptionListenCollector,
+            FinalReadResourceResult, FinalToolCallOutcome, JsonValue, McpResult, ModernHttpClient,
+            ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpSubscriptionListenCollector,
             ModernHttpSubscriptionListenError, ServerHttpEndpoint, ServerHttpEndpointResponse,
             ServerHttpSession, SseLimits, SubscriptionListenCollector, auto,
         };
 
         let _: fn(&mut Client, &str, JsonValue) -> McpResult<FinalCallToolResult> =
             Client::call_tool_final;
+        let _: fn(&mut Client, &str, JsonValue) -> McpResult<FinalToolCallOutcome> =
+            Client::call_tool_final_outcome;
         let _: fn(&mut Client, &str) -> McpResult<FinalReadResourceResult> =
             Client::read_resource_final;
         let _: fn(&mut Client, &str, HashMap<String, String>) -> McpResult<FinalGetPromptResult> =
