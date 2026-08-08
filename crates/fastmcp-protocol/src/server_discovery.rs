@@ -9,12 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use serde::{de::Error as _, ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeMap};
 use serde_json::Value;
 
 use crate::{
-    protocol_version::FINAL_PROTOCOL_VERSION, OpenMetadata, ServerInfo,
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, OpenMetadata, ServerInfo,
+    protocol_version::FINAL_PROTOCOL_VERSION,
 };
 
 /// The exact JSON-RPC method for final server discovery.
@@ -762,12 +762,12 @@ impl Error for ServerDiscoveryError {}
 mod tests {
     use std::collections::BTreeMap;
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use crate::{
-        DiscoveryCacheHints, ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities,
-        ServerDiscoverRequest, ServerDiscoverResult, ServerInfo, ServerInstructions,
-        SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
+        DiscoveryCacheHints, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
+        ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
+        ServerDiscoverResult, ServerInfo, ServerInstructions,
     };
 
     fn fully_installed_capabilities() -> ServerDiscoverCapabilities {
