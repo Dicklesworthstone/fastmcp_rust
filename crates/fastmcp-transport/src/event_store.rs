@@ -1331,6 +1331,7 @@ mod tests {
         let second = store
             .replay_bounded("subscription", first.next_after_id())
             .expect("the page cursor must resume at the first unreturned event");
+        assert!(second.is_complete());
         assert_eq!(
             second
                 .into_events()
@@ -1339,7 +1340,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![id3]
         );
-        assert!(second.is_complete());
     }
 
     #[test]
