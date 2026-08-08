@@ -6963,11 +6963,11 @@ X-Checksum: abc123\r\n\
             .expect("resumed retained event parses")
             .expect("one event remains after the cursor");
         assert_eq!(resumed_event.id.as_deref(), Some(second_id.as_str()));
-        assert_eq!(
+        assert!(
             resumed_reader
                 .read_event(&cx)
-                .expect("resumed stream reaches its finite replay tail"),
-            None
+                .expect("resumed stream reaches its finite replay tail")
+                .is_none()
         );
 
         let legacy_request =

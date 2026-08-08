@@ -938,9 +938,12 @@ impl LegacySseHttpClient {
         loop {
             match self.stream.next_event(cx).await? {
                 Some(LegacySseEvent::Message(payload)) => {
-                    return decode_strict_jsonrpc_message(&payload, MAX_LEGACY_SSE_MESSAGE_BYTES)
-                        .map(Some)
-                        .map_err(|_| LegacySseHttpClientError::MessageDecodeFailed);
+                    return decode_strict_jsonrpc_message(
+                        payload.as_bytes(),
+                        MAX_LEGACY_SSE_MESSAGE_BYTES,
+                    )
+                    .map(Some)
+                    .map_err(|_| LegacySseHttpClientError::MessageDecodeFailed);
                 }
                 Some(LegacySseEvent::Endpoint(_)) => {
                     return Err(LegacySseHttpClientError::UnexpectedEndpointEvent);

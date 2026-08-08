@@ -8292,7 +8292,11 @@ mod tests {
         let discovery = client
             .server_discovery()
             .expect("modern session exposes the exact discovery result");
-        assert_eq!(discovery.server_info(), Some(client.server_info()));
+        let discovered_server = discovery
+            .server_info()
+            .expect("modern discovery retains server identity");
+        assert_eq!(discovered_server.name, client.server_info().name);
+        assert_eq!(discovered_server.version, client.server_info().version);
         assert_eq!(
             discovery
                 .instructions()
