@@ -4,7 +4,9 @@ use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
 };
-use fastmcp_protocol::{ClientCapabilities, ClientInfo, ServerCapabilities, ServerInfo};
+use fastmcp_protocol::{
+    ClientCapabilities, ClientInfo, ServerCapabilities, ServerDiscoverResult, ServerInfo,
+};
 
 /// Immutable transport policy and trusted endpoint configuration for one client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +110,13 @@ pub struct ClientSession {
     server_info: ServerInfo,
     /// Server capabilities received during initialization.
     server_capabilities: ServerCapabilities,
+    /// Exact final discovery state when the modern handshake succeeded.
+    ///
+    /// Legacy initialization has no counterpart for final discovery
+    /// capabilities, instructions, result metadata, or cache hints. Retaining
+    /// the typed result keeps those final-only fields available without
+    /// projecting them onto the legacy capability shape.
+    server_discovery: Option<ServerDiscoverResult>,
     /// Negotiated protocol version.
     protocol_version: String,
     /// Immutable era selected from the successful handshake.
@@ -131,6 +140,7 @@ impl ClientSession {
             client_capabilities,
             server_info,
             server_capabilities,
+            server_discovery: None,
             selected_era: ProtocolVersion::parse(&protocol_version)
                 .ok()
                 .map(ProtocolVersion::era),
@@ -143,6 +153,15 @@ impl ClientSession {
     pub fn with_protocol_plan(mut self, protocol_plan: ClientProtocolPlan) -> Self {
         self.protocol_plan = protocol_plan;
         self
+    }
+
+    pub(crate) fn with_server_discovery(mut self, server_discovery: ServerDiscoverResult) -> Self {
+        self.server_discovery = Some(server_discovery);
+        self
+    }
+
+    pub(crate) fn set_protocol_plan(&mut self, protocol_plan: ClientProtocolPlan) {
+        self.protocol_plan = protocol_plan;
     }
 
     /// Returns the client info.
@@ -167,6 +186,17 @@ impl ClientSession {
     #[must_use]
     pub fn server_capabilities(&self) -> &ServerCapabilities {
         &self.server_capabilities
+    }
+
+    /// Returns the lossless final `server/discover` result when modern
+    /// negotiation succeeded.
+    ///
+    /// A `None` value denotes the exact 2024-11-05 initialization path (or a
+    /// session that has not yet negotiated). Callers using final MCP must use
+    /// this result instead of the legacy [`Self::server_capabilities`] view.
+    #[must_use]
+    pub fn server_discovery(&self) -> Option<&ServerDiscoverResult> {
+        self.server_discovery.as_ref()
     }
 
     /// Returns the negotiated protocol version.

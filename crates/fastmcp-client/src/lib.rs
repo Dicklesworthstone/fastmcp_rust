@@ -2517,6 +2517,27 @@ pub struct Client {
     initialization_error: Option<McpError>,
 }
 
+/// Successful client negotiation, kept in its protocol-native shape until it
+/// is committed to session state.
+enum ClientInitialization {
+    /// Exact 2024-11-05 initialization response.
+    Legacy(InitializeResult),
+    /// Final `server/discover` response plus its required server identity.
+    Modern {
+        server_info: ServerInfo,
+        discovery: ServerDiscoverResult,
+    },
+}
+
+impl ClientInitialization {
+    fn protocol_version(&self) -> &str {
+        match self {
+            Self::Legacy(result) => &result.protocol_version,
+            Self::Modern { .. } => MODERN_PROTOCOL_VERSION,
+        }
+    }
+}
+
 impl Client {
     fn retain_cleanup_error(&mut self, error: McpError) {
         self.cleanup_error = Some(match self.cleanup_error.take() {
@@ -2809,7 +2830,7 @@ impl Client {
         };
 
         // Perform initialization handshake
-        let init_result = match client.initialize(client_info, client_capabilities) {
+        let initialization = match client.initialize(client_info, client_capabilities) {
             Ok(result) => result,
             Err(error) => {
                 let cleanup = client.close();
@@ -2817,17 +2838,8 @@ impl Client {
             }
         };
 
-        // Update session with server response
-        let init_protocol_version = init_result.protocol_version.clone();
-        let protocol_plan = client.session.protocol_plan().clone();
-        client.session = ClientSession::new(
-            client.session.client_info().clone(),
-            client.session.client_capabilities().clone(),
-            init_result.server_info,
-            init_result.capabilities,
-            init_result.protocol_version,
-        )
-        .with_protocol_plan(protocol_plan);
+        let init_protocol_version = initialization.protocol_version().to_owned();
+        client.replace_session_after_initialization(initialization);
 
         // Send the spec-correct `notifications/initialized` lifecycle notification.
         if init_protocol_version == PROTOCOL_VERSION
@@ -2845,14 +2857,7 @@ impl Client {
 
     fn set_protocol_plan_after_selection(&mut self, protocol_plan: ClientProtocolPlan) {
         let selected_era = self.session.selected_era();
-        self.session = ClientSession::new(
-            self.session.client_info().clone(),
-            self.session.client_capabilities().clone(),
-            self.session.server_info().clone(),
-            self.session.server_capabilities().clone(),
-            self.session.protocol_version().to_owned(),
-        )
-        .with_protocol_plan(protocol_plan);
+        self.session.set_protocol_plan(protocol_plan);
         debug_assert!(self.session.selected_era() == selected_era);
     }
 
@@ -2986,22 +2991,13 @@ impl Client {
         // Perform initialization
         let client_info = self.session.client_info().clone();
         let capabilities = self.session.client_capabilities().clone();
-        let init_result = match self.initialize(client_info, capabilities) {
+        let initialization = match self.initialize(client_info, capabilities) {
             Ok(result) => result,
             Err(error) => return Err(self.record_initialization_failure(error)),
         };
 
-        // Update session with server response
-        let init_protocol_version = init_result.protocol_version.clone();
-        let protocol_plan = self.session.protocol_plan().clone();
-        self.session = ClientSession::new(
-            self.session.client_info().clone(),
-            self.session.client_capabilities().clone(),
-            init_result.server_info,
-            init_result.capabilities,
-            init_result.protocol_version,
-        )
-        .with_protocol_plan(protocol_plan);
+        let init_protocol_version = initialization.protocol_version().to_owned();
+        self.replace_session_after_initialization(initialization);
 
         // Exact 2024-11-05 transitions require the lifecycle acknowledgement.
         // Modern discovery has no corresponding initialized notification.
@@ -3101,6 +3097,16 @@ impl Client {
     #[must_use]
     pub fn server_capabilities(&self) -> &ServerCapabilities {
         self.session.server_capabilities()
+    }
+
+    /// Returns the exact final `server/discover` result for a modern session.
+    ///
+    /// This retains final capabilities, instructions, metadata, and cache
+    /// semantics without projecting them into the legacy initialization
+    /// result. Exact 2024-11-05 sessions return `None`.
+    #[must_use]
+    pub fn server_discovery(&self) -> Option<&ServerDiscoverResult> {
+        self.session.server_discovery()
     }
 
     /// Returns the protocol version negotiated during initialization.
@@ -3650,17 +3656,45 @@ impl Client {
         &mut self,
         client_info: ClientInfo,
         capabilities: ClientCapabilities,
-    ) -> McpResult<InitializeResult> {
+    ) -> McpResult<ClientInitialization> {
         match self.session.protocol_plan().policy() {
             ProtocolPolicy::ModernOnly => self.initialize_modern(client_info, capabilities),
             // The public Auto entry point performs its isolated modern probe
             // before constructing this legacy client. Retaining this exact
             // path here keeps deferred initialization from converting a
             // configured legacy process into a second selection attempt.
-            ProtocolPolicy::Auto | ProtocolPolicy::LegacyOnly => {
-                self.initialize_legacy(client_info, capabilities)
-            }
+            ProtocolPolicy::Auto | ProtocolPolicy::LegacyOnly => self
+                .initialize_legacy(client_info, capabilities)
+                .map(ClientInitialization::Legacy),
         }
+    }
+
+    fn replace_session_after_initialization(&mut self, initialization: ClientInitialization) {
+        let client_info = self.session.client_info().clone();
+        let client_capabilities = self.session.client_capabilities().clone();
+        let protocol_plan = self.session.protocol_plan().clone();
+        self.session = match initialization {
+            ClientInitialization::Legacy(result) => ClientSession::new(
+                client_info,
+                client_capabilities,
+                result.server_info,
+                result.capabilities,
+                result.protocol_version,
+            )
+            .with_protocol_plan(protocol_plan),
+            ClientInitialization::Modern {
+                server_info,
+                discovery,
+            } => ClientSession::new(
+                client_info,
+                client_capabilities,
+                server_info,
+                ServerCapabilities::default(),
+                MODERN_PROTOCOL_VERSION.to_owned(),
+            )
+            .with_server_discovery(discovery)
+            .with_protocol_plan(protocol_plan),
+        };
     }
 
     fn initialize_legacy(
@@ -3683,7 +3717,7 @@ impl Client {
         &mut self,
         _client_info: ClientInfo,
         _capabilities: ClientCapabilities,
-    ) -> McpResult<InitializeResult> {
+    ) -> McpResult<ClientInitialization> {
         let params = serde_json::to_value(ServerDiscoverRequest::default())
             .map_err(|error| {
                 McpError::internal_error(format!(
@@ -3695,11 +3729,9 @@ impl Client {
         let server_info = result.server_info().cloned().ok_or_else(|| {
             McpError::internal_error("Modern server/discover response has no _meta server info")
         })?;
-        Ok(InitializeResult {
-            protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
-            capabilities: ServerCapabilities::default(),
+        Ok(ClientInitialization::Modern {
             server_info,
-            instructions: None,
+            discovery: result,
         })
     }
 
@@ -8171,6 +8203,42 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_discovery_response_with_final_state(server_name: &str, cache_scope: &str) -> String {
+        let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+            &fastmcp_protocol::ServerBehaviorRegistry::from_behaviors([
+                fastmcp_protocol::ServerBehavior::ToolsList,
+                fastmcp_protocol::ServerBehavior::ToolsListChangedNotification,
+            ]),
+            std::collections::BTreeMap::from([(
+                "io.fastmcp.session-state".to_owned(),
+                serde_json::json!({ "mode": "lossless" }),
+            )]),
+        )
+        .expect("the installed final behavior registry is discoverable");
+        let instructions = fastmcp_protocol::ServerInstructions::new("use the final contract")
+            .expect("bounded test instructions are admitted");
+        let result = ServerDiscoverResult::new(
+            capabilities,
+            ServerInfo {
+                name: server_name.to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            Some(instructions),
+            fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(73),
+        );
+        let mut result = serde_json::to_value(result)
+            .expect("typed modern discovery result serializes deterministically");
+        result["_meta"]["io.fastmcp.session-state"] = serde_json::json!({ "origin": "peer" });
+        result["cacheScope"] = serde_json::json!(cache_scope);
+        serde_json::to_string(&serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": 1,
+            "result": result,
+        }))
+        .expect("modern discovery response serializes deterministically")
+    }
+
+    #[cfg(unix)]
     fn legacy_public_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in *initialize*2024-11-05*) \
@@ -8206,6 +8274,66 @@ mod tests {
             .ping()
             .expect("modern execution sends per-request metadata after discovery");
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_j_positive() {
+        let modern_result = modern_discovery_response_with_final_state("stateful-modern", "public");
+        let script = modern_public_client_script(&modern_result);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery retains its final session state");
+
+        let discovery = client
+            .server_discovery()
+            .expect("modern session exposes the exact discovery result");
+        assert_eq!(discovery.server_info(), Some(client.server_info()));
+        assert_eq!(
+            discovery
+                .instructions()
+                .expect("peer instructions are retained")
+                .as_str(),
+            "use the final contract"
+        );
+        assert_eq!(discovery.cache_hints().ttl_ms(), 73);
+        assert!(discovery.cache_hints().is_public());
+        let retained = serde_json::to_value(discovery)
+            .expect("the retained final discovery result stays serializable");
+        assert_eq!(
+            retained["capabilities"]["extensions"]["io.fastmcp.session-state"],
+            serde_json::json!({ "mode": "lossless" })
+        );
+        assert_eq!(
+            retained["_meta"]["io.fastmcp.session-state"],
+            serde_json::json!({ "origin": "peer" })
+        );
+        client.close().expect("stateful modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_j_planted_negative() {
+        // This differs from the positive discovery response only in the final
+        // cache scope. It must be rejected rather than silently replaced by
+        // legacy-default cache state.
+        let modern_result =
+            modern_discovery_response_with_final_state("stateful-modern", "not-a-cache-scope");
+        let script = modern_public_client_script(&modern_result);
+        let error = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .err()
+        .expect("invalid final cache semantics must reject the modern session");
+
+        assert_eq!(error.code, McpErrorCode::InternalError);
     }
 
     #[cfg(unix)]
@@ -8246,6 +8374,10 @@ mod tests {
         assert_eq!(
             client.selected_protocol_era(),
             Some(ProtocolEra::Modern2026)
+        );
+        assert!(
+            client.server_discovery().is_some(),
+            "Auto plan replacement retains the completed modern discovery result"
         );
         client
             .ping()
@@ -8290,6 +8422,10 @@ mod tests {
             Some(ProtocolEra::Legacy2024)
         );
         assert_eq!(client.protocol_version(), PROTOCOL_VERSION);
+        assert!(
+            client.server_discovery().is_none(),
+            "exact legacy initialization never fabricates final discovery state"
+        );
         client
             .ping()
             .expect("legacy client executes after initialized notification");
