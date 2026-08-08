@@ -2227,6 +2227,81 @@ mod async_handler_expansion_tests {
     }
 
     #[test]
+    fn final_result_wrapper_forms_select_the_direct_modern_hooks() {
+        let tool_result: syn::ReturnType = syn::parse_quote!(
+            -> Result<
+                fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>,
+                std::io::Error,
+            >
+        );
+        let tool_mcp_result: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_core::McpResult<
+                fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>,
+            >
+        );
+        assert!(
+            generate_final_tool_result_conversion(&tool_result)
+                .expect("Result final tool return selects the direct hook")
+                .to_string()
+                .contains("map_err")
+        );
+        assert_eq!(
+            generate_final_tool_result_conversion(&tool_mcp_result)
+                .expect("McpResult final tool return selects the direct hook")
+                .to_string(),
+            "result"
+        );
+
+        let resource_result: syn::ReturnType = syn::parse_quote!(
+            -> Result<
+                fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>,
+                std::io::Error,
+            >
+        );
+        let resource_mcp_result: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_core::McpResult<
+                fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>,
+            >
+        );
+        assert!(
+            generate_final_resource_result_conversion(&resource_result)
+                .expect("Result final resource return selects the direct hook")
+                .to_string()
+                .contains("map_err")
+        );
+        assert_eq!(
+            generate_final_resource_result_conversion(&resource_mcp_result)
+                .expect("McpResult final resource return selects the direct hook")
+                .to_string(),
+            "result"
+        );
+
+        let prompt_result: syn::ReturnType = syn::parse_quote!(
+            -> Result<
+                fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalGetPromptResult>,
+                std::io::Error,
+            >
+        );
+        let prompt_mcp_result: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_core::McpResult<
+                fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalGetPromptResult>,
+            >
+        );
+        assert!(
+            generate_final_prompt_result_conversion(&prompt_result)
+                .expect("Result final prompt return selects the direct hook")
+                .to_string()
+                .contains("map_err")
+        );
+        assert_eq!(
+            generate_final_prompt_result_conversion(&prompt_mcp_result)
+                .expect("McpResult final prompt return selects the direct hook")
+                .to_string(),
+            "result"
+        );
+    }
+
+    #[test]
     fn final_tool_projection_matches_open_content_without_erasing_wire_fields() {
         let tokens = generate_final_tool_payload_projection(quote! { result.payload }).to_string();
 
