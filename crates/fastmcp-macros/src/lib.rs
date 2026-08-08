@@ -2073,6 +2073,7 @@ mod async_handler_expansion_tests {
             tool.contains("fn call_final_outcome_async_in_request"),
             "{tool}"
         );
+        assert!(tool.contains("fastmcp_core :: Cx"), "{tool}");
         assert!(tool.contains("FinalToolOutcome :: Complete"), "{tool}");
 
         let resource_name = format_ident!("modern_resource");
