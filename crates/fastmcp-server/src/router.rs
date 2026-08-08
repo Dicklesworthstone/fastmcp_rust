@@ -17,7 +17,9 @@ use fastmcp_core::{
     McpContext, McpError, McpErrorCode, McpOutcome, McpResult, SessionState, block_on,
     sha256_bounded,
 };
-use fastmcp_protocol::common_types::{AbsoluteUri, EmbeddedResourceContents};
+use fastmcp_protocol::common_types::{
+    AbsoluteUri, Annotations, EmbeddedResourceContents, OpenMetadata, RawIcon,
+};
 use fastmcp_protocol::methods::COMPLETION_COMPLETE;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
@@ -278,7 +280,13 @@ fn project_final_tool_annotations(
     }
 }
 
-fn project_final_resource_catalog_entry(resource: Resource) -> McpResult<FinalResource> {
+fn project_final_resource_catalog_entry(
+    resource: Resource,
+    title: Option<String>,
+    icons: Option<Vec<RawIcon>>,
+    annotations: Option<Annotations>,
+    meta: Option<OpenMetadata>,
+) -> McpResult<FinalResource> {
     let uri = AbsoluteUri::parse(resource.uri).map_err(|error| {
         McpError::internal_error(format!(
             "legacy resource URI cannot be projected into the final catalog: {error}",
@@ -287,13 +295,13 @@ fn project_final_resource_catalog_entry(resource: Resource) -> McpResult<FinalRe
     Ok(FinalResource {
         uri,
         name: resource.name,
-        title: None,
+        title,
         description: resource.description,
-        icons: None,
+        icons,
         mime_type: resource.mime_type,
         size: None,
-        annotations: None,
-        meta: None,
+        annotations,
+        meta,
     })
 }
 
@@ -1644,7 +1652,11 @@ impl Router {
                 );
                 encode_final_core_result(
                     result.and_then(|result| {
-                        Self::project_final_resources_list(result, self.final_cache_hints)
+                        self.project_final_resources_list(
+                            request_ctx,
+                            result,
+                            self.final_cache_hints,
+                        )
                     }),
                     |result| FinalCoreResult::ResourcesList {
                         result,
@@ -1671,8 +1683,12 @@ impl Router {
                     None,
                 );
                 encode_final_core_result(
-                    result.map(|result| {
-                        Self::project_final_resource_templates_list(result, self.final_cache_hints)
+                    result.and_then(|result| {
+                        self.project_final_resource_templates_list(
+                            request_ctx,
+                            result,
+                            self.final_cache_hints,
+                        )
                     }),
                     |result| FinalCoreResult::ResourceTemplatesList {
                         result,
@@ -1725,8 +1741,8 @@ impl Router {
                     None,
                 );
                 encode_final_core_result(
-                    result.map(|result| {
-                        Self::project_final_prompts_list(result, self.final_cache_hints)
+                    result.and_then(|result| {
+                        self.project_final_prompts_list(request_ctx, result, self.final_cache_hints)
                     }),
                     |result| FinalCoreResult::PromptsList {
                         result,
@@ -1847,13 +1863,31 @@ impl Router {
     }
 
     fn project_final_resources_list(
+        &self,
+        request_ctx: &McpContext,
         result: ListResourcesResult,
         cache_hints: FinalCacheHintPolicy,
     ) -> McpResult<FinalListResourcesResult> {
         let resources = result
             .resources
             .into_iter()
-            .map(project_final_resource_catalog_entry)
+            .map(|resource| {
+                let handler = self.resources.get(&resource.uri).ok_or_else(|| {
+                    McpError::internal_error("listed resource is absent from the router catalog")
+                })?;
+                let (title, icons, annotations, meta) = crate::catch_extension_unwind(|| {
+                    (
+                        handler.final_title().map(str::to_owned),
+                        handler.final_icons().map(|icons| icons.to_vec()),
+                        handler.final_annotations().cloned(),
+                        handler.final_metadata().cloned(),
+                    )
+                })
+                .map_err(|_payload| {
+                    sanitized_handler_panic(request_ctx.cx(), "resource_definition")
+                })?;
+                project_final_resource_catalog_entry(resource, title, icons, annotations, meta)
+            })
             .collect::<McpResult<Vec<_>>>()?;
         Ok(FinalListResourcesResult {
             resources,
@@ -1864,70 +1898,114 @@ impl Router {
     }
 
     fn project_final_resource_templates_list(
+        &self,
+        request_ctx: &McpContext,
         result: ListResourceTemplatesResult,
         cache_hints: FinalCacheHintPolicy,
-    ) -> FinalListResourceTemplatesResult {
-        FinalListResourceTemplatesResult {
-            resource_templates: result
-                .resource_templates
-                .into_iter()
-                .map(|template| FinalResourceTemplate {
+    ) -> McpResult<FinalListResourceTemplatesResult> {
+        let resource_templates = result
+            .resource_templates
+            .into_iter()
+            .map(|template| {
+                let entry = self
+                    .resource_templates
+                    .get(&template.uri_template)
+                    .ok_or_else(|| {
+                        McpError::internal_error(
+                            "listed resource template is absent from the router catalog",
+                        )
+                    })?;
+                let (title, icons, annotations, meta) = match entry.handler.as_deref() {
+                    Some(handler) => crate::catch_extension_unwind(|| {
+                        (
+                            handler.final_template_title().map(str::to_owned),
+                            handler.final_template_icons().map(|icons| icons.to_vec()),
+                            handler.final_template_annotations().cloned(),
+                            handler.final_template_metadata().cloned(),
+                        )
+                    })
+                    .map_err(|_payload| {
+                        sanitized_handler_panic(request_ctx.cx(), "resource_definition")
+                    })?,
+                    None => (None, None, None, None),
+                };
+
+                Ok(FinalResourceTemplate {
                     uri_template: template.uri_template,
                     name: template.name,
-                    title: None,
+                    title,
                     description: template.description,
-                    icons: None,
+                    icons,
                     mime_type: template.mime_type,
-                    annotations: None,
-                    meta: None,
+                    annotations,
+                    meta,
                 })
-                .collect(),
+            })
+            .collect::<McpResult<Vec<_>>>()?;
+        Ok(FinalListResourceTemplatesResult {
+            resource_templates,
             next_cursor: result.next_cursor,
             ttl_ms: cache_hints.list_ttl_ms,
             cache_scope: cache_hints.scope,
-        }
+        })
     }
 
     fn project_final_prompts_list(
+        &self,
+        request_ctx: &McpContext,
         result: ListPromptsResult,
         cache_hints: FinalCacheHintPolicy,
-    ) -> FinalListPromptsResult {
-        FinalListPromptsResult {
-            prompts: result
-                .prompts
-                .into_iter()
-                .map(|prompt| {
-                    let Prompt {
-                        name,
-                        description,
-                        arguments,
-                        ..
-                    } = prompt;
-                    let arguments = (!arguments.is_empty()).then(|| {
-                        arguments
-                            .into_iter()
-                            .map(|argument| FinalPromptArgument {
-                                name: argument.name,
-                                title: None,
-                                description: argument.description,
-                                required: argument.required.then_some(true),
-                            })
-                            .collect()
-                    });
-                    FinalPrompt {
-                        name,
-                        title: None,
-                        description,
-                        icons: None,
-                        arguments,
-                        meta: None,
-                    }
+    ) -> McpResult<FinalListPromptsResult> {
+        let prompts = result
+            .prompts
+            .into_iter()
+            .map(|prompt| {
+                let handler = self.prompts.get(&prompt.name).ok_or_else(|| {
+                    McpError::internal_error("listed prompt is absent from the router catalog")
+                })?;
+                let (title, icons, meta) = crate::catch_extension_unwind(|| {
+                    (
+                        handler.final_title().map(str::to_owned),
+                        handler.final_icons().map(|icons| icons.to_vec()),
+                        handler.final_metadata().cloned(),
+                    )
                 })
-                .collect(),
+                .map_err(|_payload| {
+                    sanitized_handler_panic(request_ctx.cx(), "prompt_definition")
+                })?;
+                let Prompt {
+                    name,
+                    description,
+                    arguments,
+                    ..
+                } = prompt;
+                let arguments = (!arguments.is_empty()).then(|| {
+                    arguments
+                        .into_iter()
+                        .map(|argument| FinalPromptArgument {
+                            name: argument.name,
+                            title: None,
+                            description: argument.description,
+                            required: Some(argument.required),
+                        })
+                        .collect()
+                });
+                Ok(FinalPrompt {
+                    name,
+                    title,
+                    description,
+                    icons,
+                    arguments,
+                    meta,
+                })
+            })
+            .collect::<McpResult<Vec<_>>>()?;
+        Ok(FinalListPromptsResult {
+            prompts,
             next_cursor: result.next_cursor,
             ttl_ms: cache_hints.list_ttl_ms,
             cache_scope: cache_hints.scope,
-        }
+        })
     }
 
     fn project_final_resources_read(
@@ -5053,11 +5131,12 @@ mod router_tests {
     use asupersync::types::CancelKind;
     use fastmcp_core::{McpContext, McpResult, SessionState};
     use fastmcp_protocol::common_types::{
-        ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
+        Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
     };
     use fastmcp_protocol::{
         CompleteResult, CompletionValues, Content, FinalCallToolResult, FinalCompletionParams,
-        LegacyCompletionParams, Prompt, PromptMessage, Resource, ResourceContent, Tool,
+        LegacyCompletionParams, Prompt, PromptArgument, PromptMessage, Resource, ResourceContent,
+        ResourceTemplate, Tool,
     };
     use std::fmt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5237,6 +5316,140 @@ mod router_tests {
 
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
             Ok(vec![Content::text("legacy final catalog result")])
+        }
+    }
+
+    struct FinalCatalogResource {
+        metadata: OpenMetadata,
+        icons: Vec<RawIcon>,
+        annotations: Annotations,
+    }
+
+    impl ResourceHandler for FinalCatalogResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "file:///final-catalog-resource".to_owned(),
+                name: "final-catalog-resource".to_owned(),
+                description: Some("final resource description".to_owned()),
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn final_title(&self) -> Option<&str> {
+            Some("Final Catalog Resource")
+        }
+
+        fn final_icons(&self) -> Option<&[RawIcon]> {
+            Some(&self.icons)
+        }
+
+        fn final_annotations(&self) -> Option<&Annotations> {
+            Some(&self.annotations)
+        }
+
+        fn final_metadata(&self) -> Option<&OpenMetadata> {
+            Some(&self.metadata)
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct FinalCatalogResourceTemplate {
+        metadata: OpenMetadata,
+        icons: Vec<RawIcon>,
+        annotations: Annotations,
+    }
+
+    impl ResourceHandler for FinalCatalogResourceTemplate {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "template://placeholder".to_owned(),
+                name: "final-catalog-template".to_owned(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            Some(ResourceTemplate {
+                uri_template: "template://{id}".to_owned(),
+                name: "final-catalog-template".to_owned(),
+                description: Some("final template description".to_owned()),
+                mime_type: Some("application/json".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            })
+        }
+
+        fn final_template_title(&self) -> Option<&str> {
+            Some("Final Catalog Template")
+        }
+
+        fn final_template_icons(&self) -> Option<&[RawIcon]> {
+            Some(&self.icons)
+        }
+
+        fn final_template_annotations(&self) -> Option<&Annotations> {
+            Some(&self.annotations)
+        }
+
+        fn final_template_metadata(&self) -> Option<&OpenMetadata> {
+            Some(&self.metadata)
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct FinalCatalogPrompt {
+        metadata: OpenMetadata,
+        icons: Vec<RawIcon>,
+    }
+
+    impl PromptHandler for FinalCatalogPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "final-catalog-prompt".to_owned(),
+                description: Some("final prompt description".to_owned()),
+                arguments: vec![PromptArgument {
+                    name: "optional-argument".to_owned(),
+                    description: Some("must remain explicitly false".to_owned()),
+                    required: false,
+                }],
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn final_title(&self) -> Option<&str> {
+            Some("Final Catalog Prompt")
+        }
+
+        fn final_icons(&self) -> Option<&[RawIcon]> {
+            Some(&self.icons)
+        }
+
+        fn final_metadata(&self) -> Option<&OpenMetadata> {
+            Some(&self.metadata)
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            Ok(Vec::new())
         }
     }
 
@@ -9488,6 +9701,243 @@ mod router_tests {
             "the one-field rejection cannot alter the accepted final result"
         );
         assert_eq!(MACRO_DUAL_ERA_TOOL_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn final_catalog_preserves_resource_template_and_prompt_fields() {
+        let resource_metadata = OpenMetadata::try_from_entries([(
+            "com.example/resource".to_owned(),
+            serde_json::json!({"source": "resource-handler"}),
+        )])
+        .expect("resource metadata is valid");
+        let template_metadata = OpenMetadata::try_from_entries([(
+            "com.example/template".to_owned(),
+            serde_json::json!({"source": "template-handler"}),
+        )])
+        .expect("template metadata is valid");
+        let prompt_metadata = OpenMetadata::try_from_entries([(
+            "com.example/prompt".to_owned(),
+            serde_json::json!({"source": "prompt-handler"}),
+        )])
+        .expect("prompt metadata is valid");
+        let resource_annotations = Annotations {
+            audience: None,
+            priority: Some(0.25),
+            last_modified: Some("2026-08-08T00:00:00Z".to_owned()),
+        };
+        let template_annotations = Annotations {
+            audience: None,
+            priority: Some(0.75),
+            last_modified: Some("2026-08-08T00:00:01Z".to_owned()),
+        };
+        let resource_icon = RawIcon::try_with_details(
+            "https://example.test/resource.png",
+            Some("image/png".to_owned()),
+            Some(vec!["32x32".to_owned()]),
+            None,
+        )
+        .expect("resource icon is valid");
+        let template_icon = RawIcon::try_with_details(
+            "https://example.test/template.png",
+            Some("image/png".to_owned()),
+            Some(vec!["48x48".to_owned()]),
+            None,
+        )
+        .expect("template icon is valid");
+        let prompt_icon = RawIcon::try_with_details(
+            "https://example.test/prompt.png",
+            Some("image/png".to_owned()),
+            Some(vec!["64x64".to_owned()]),
+            None,
+        )
+        .expect("prompt icon is valid");
+
+        let mut router = Router::new();
+        router.add_resource(FinalCatalogResource {
+            metadata: resource_metadata,
+            icons: vec![resource_icon],
+            annotations: resource_annotations,
+        });
+        router.add_resource(FinalCatalogResourceTemplate {
+            metadata: template_metadata,
+            icons: vec![template_icon],
+            annotations: template_annotations,
+        });
+        router.add_prompt(FinalCatalogPrompt {
+            metadata: prompt_metadata,
+            icons: vec![prompt_icon],
+        });
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 96, Budget::INFINITE, &state);
+        let final_metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+
+        let resources = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/list",
+                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                    96_i64,
+                ),
+            )
+            .expect("final resource catalog is encoded");
+        assert_eq!(resources["resources"][0]["title"], "Final Catalog Resource");
+        assert_eq!(
+            resources["resources"][0]["icons"][0]["src"],
+            "https://example.test/resource.png"
+        );
+        assert_eq!(resources["resources"][0]["annotations"]["priority"], 0.25);
+        assert_eq!(
+            resources["resources"][0]["_meta"]["com.example/resource"]["source"],
+            "resource-handler"
+        );
+
+        let templates = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/templates/list",
+                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                    97_i64,
+                ),
+            )
+            .expect("final resource-template catalog is encoded");
+        assert_eq!(
+            templates["resourceTemplates"][0]["title"],
+            "Final Catalog Template"
+        );
+        assert_eq!(
+            templates["resourceTemplates"][0]["icons"][0]["src"],
+            "https://example.test/template.png"
+        );
+        assert_eq!(
+            templates["resourceTemplates"][0]["annotations"]["priority"],
+            0.75
+        );
+        assert_eq!(
+            templates["resourceTemplates"][0]["_meta"]["com.example/template"]["source"],
+            "template-handler"
+        );
+
+        let prompts = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "prompts/list",
+                    Some(serde_json::json!({"_meta": final_metadata})),
+                    98_i64,
+                ),
+            )
+            .expect("final prompt catalog is encoded");
+        assert_eq!(prompts["prompts"][0]["title"], "Final Catalog Prompt");
+        assert_eq!(
+            prompts["prompts"][0]["icons"][0]["src"],
+            "https://example.test/prompt.png"
+        );
+        assert_eq!(
+            prompts["prompts"][0]["_meta"]["com.example/prompt"]["source"],
+            "prompt-handler"
+        );
+        assert_eq!(prompts["prompts"][0]["arguments"][0]["required"], false);
+    }
+
+    #[test]
+    fn final_resource_catalog_missing_metadata_is_non_mutating() {
+        let metadata = OpenMetadata::try_from_entries([(
+            "com.example/resource".to_owned(),
+            serde_json::json!({"source": "resource-handler"}),
+        )])
+        .expect("resource metadata is valid");
+        let icon = RawIcon::try_with_details(
+            "https://example.test/resource.png",
+            Some("image/png".to_owned()),
+            None,
+            None,
+        )
+        .expect("resource icon is valid");
+        let mut router = Router::new();
+        router.add_resource(FinalCatalogResource {
+            metadata,
+            icons: vec![icon],
+            annotations: Annotations::default(),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 99, Budget::INFINITE, &state);
+        let baseline = JsonRpcRequest::new(
+            "resources/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            99_i64,
+        );
+        let mut planted = baseline.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("final resource-list parameters are an object")
+            .remove("_meta");
+
+        assert_eq!(baseline.method, planted.method);
+        assert_eq!(baseline.id, planted.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .map(serde_json::Map::len),
+            Some(1),
+            "the final metadata object is the sole baseline parameter"
+        );
+        assert_eq!(
+            planted
+                .params
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .map(serde_json::Map::len),
+            Some(0),
+            "the planted request differs only by final metadata removal"
+        );
+        let catalog_before = serde_json::to_vec(&router.resources()).expect("catalog serializes");
+        let planted_before = serde_json::to_vec(&planted).expect("request serializes");
+        let baseline_result = router
+            .dispatch_stateless(&request_ctx, &baseline)
+            .expect("final baseline is accepted");
+        assert_eq!(
+            baseline_result["resources"][0]["title"],
+            "Final Catalog Resource"
+        );
+
+        let error = router
+            .dispatch_stateless(&request_ctx, &planted)
+            .expect_err("only final request metadata is refused");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            serde_json::to_vec(&planted).expect("rejected request serializes"),
+            planted_before,
+            "the one-field rejection cannot mutate caller-owned input"
+        );
+        assert_eq!(
+            serde_json::to_vec(&router.resources()).expect("catalog serializes"),
+            catalog_before,
+            "the one-field rejection cannot mutate the resource catalog"
+        );
+        assert_eq!(
+            router
+                .dispatch_stateless(&request_ctx, &baseline)
+                .expect("the baseline remains accepted after rejection"),
+            baseline_result,
+            "the one-field rejection cannot alter final field preservation"
+        );
     }
 
     #[test]

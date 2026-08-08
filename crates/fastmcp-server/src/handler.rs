@@ -21,7 +21,7 @@ use fastmcp_core::{
     SessionState,
 };
 use fastmcp_protocol::common_types::{
-    AbsoluteUri, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
+    AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
 use fastmcp_protocol::{
     CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy, DecodedResult,
@@ -593,6 +593,54 @@ pub trait ResourceHandler: Send + Sync {
         None
     }
 
+    /// Returns the final display title for this concrete resource.
+    fn final_title(&self) -> Option<&str> {
+        None
+    }
+
+    /// Returns the final icon set for this concrete resource.
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        None
+    }
+
+    /// Returns the final annotations for this concrete resource.
+    fn final_annotations(&self) -> Option<&Annotations> {
+        None
+    }
+
+    /// Returns final open metadata for this concrete resource.
+    fn final_metadata(&self) -> Option<&OpenMetadata> {
+        None
+    }
+
+    /// Returns the final display title for this resource template.
+    ///
+    /// This is used only when [`Self::template`] returns `Some`.
+    fn final_template_title(&self) -> Option<&str> {
+        None
+    }
+
+    /// Returns the final icon set for this resource template.
+    ///
+    /// This is used only when [`Self::template`] returns `Some`.
+    fn final_template_icons(&self) -> Option<&[RawIcon]> {
+        None
+    }
+
+    /// Returns the final annotations for this resource template.
+    ///
+    /// This is used only when [`Self::template`] returns `Some`.
+    fn final_template_annotations(&self) -> Option<&Annotations> {
+        None
+    }
+
+    /// Returns final open metadata for this resource template.
+    ///
+    /// This is used only when [`Self::template`] returns `Some`.
+    fn final_template_metadata(&self) -> Option<&OpenMetadata> {
+        None
+    }
+
     /// Returns the resource's icon, if any.
     ///
     /// Default implementation returns `None`. Override to provide an icon.
@@ -721,6 +769,21 @@ pub trait ResourceHandler: Send + Sync {
 pub trait PromptHandler: Send + Sync {
     /// Returns the prompt definition.
     fn definition(&self) -> Prompt;
+
+    /// Returns the final display title for this prompt.
+    fn final_title(&self) -> Option<&str> {
+        None
+    }
+
+    /// Returns the final icon set for this prompt.
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        None
+    }
+
+    /// Returns final open metadata for this prompt.
+    fn final_metadata(&self) -> Option<&OpenMetadata> {
+        None
+    }
 
     /// Returns the prompt's icon, if any.
     ///
@@ -1095,6 +1158,38 @@ impl ResourceHandler for MountedResourceHandler {
         self.mounted_template.clone()
     }
 
+    fn final_title(&self) -> Option<&str> {
+        self.inner.final_title()
+    }
+
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        self.inner.final_icons()
+    }
+
+    fn final_annotations(&self) -> Option<&Annotations> {
+        self.inner.final_annotations()
+    }
+
+    fn final_metadata(&self) -> Option<&OpenMetadata> {
+        self.inner.final_metadata()
+    }
+
+    fn final_template_title(&self) -> Option<&str> {
+        self.inner.final_template_title()
+    }
+
+    fn final_template_icons(&self) -> Option<&[RawIcon]> {
+        self.inner.final_template_icons()
+    }
+
+    fn final_template_annotations(&self) -> Option<&Annotations> {
+        self.inner.final_template_annotations()
+    }
+
+    fn final_template_metadata(&self) -> Option<&OpenMetadata> {
+        self.inner.final_template_metadata()
+    }
+
     fn icon(&self) -> Option<&Icon> {
         self.inner.icon()
     }
@@ -1202,6 +1297,18 @@ impl PromptHandler for MountedPromptHandler {
         let mut def = self.inner.definition();
         def.name.clone_from(&self.mounted_name);
         def
+    }
+
+    fn final_title(&self) -> Option<&str> {
+        self.inner.final_title()
+    }
+
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        self.inner.final_icons()
+    }
+
+    fn final_metadata(&self) -> Option<&OpenMetadata> {
+        self.inner.final_metadata()
     }
 
     fn icon(&self) -> Option<&Icon> {
