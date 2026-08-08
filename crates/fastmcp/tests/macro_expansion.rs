@@ -24,10 +24,10 @@
 use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
 use fastmcp_protocol::FinalCallToolResult;
 use fastmcp_rust::{
-    CompleteResult, Content, ContentBlock, Cx, GetPromptResult, JsonSchema, LabConfig, LabRuntime,
-    McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler, PromptMessage,
-    ReadResourceResult, ResourceContent, ResourceHandler, ResultMeta, Role, ServerInfo,
-    ToolHandler, prompt, resource, tool,
+    CompleteResult, Content, ContentBlock, Cx, GetPromptResult, Implementation, JsonSchema,
+    LabConfig, LabRuntime, McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler,
+    PromptMessage, ReadResourceResult, ResourceContent, ResourceHandler, ResultMeta, Role,
+    ServerInfo, ToolHandler, prompt, resource, tool,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -1227,9 +1227,13 @@ fn resource_result_ok() {
 // --- Final complete resource result projection ---
 
 fn final_result_meta() -> ResultMeta {
-    ResultMeta::server_generated(ServerInfo {
+    ResultMeta::server_generated(Implementation {
         name: "macro-expansion-test".to_string(),
         version: "1.0.0".to_string(),
+        title: None,
+        description: None,
+        website_url: None,
+        icons: Vec::new(),
     })
 }
 
