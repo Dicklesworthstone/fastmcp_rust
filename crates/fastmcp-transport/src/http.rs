@@ -52,19 +52,21 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{
-    Arc, Mutex, TryLockError,
     atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex, TryLockError,
 };
 use std::time::{Duration, Instant};
 
-use asupersync::{Cx, channel::mpsc};
+use asupersync::{channel::mpsc, Cx};
 use fastmcp_core::draw_security_identifier;
 use fastmcp_protocol::protocol_version::{
-    FinalHttpRequestMetadata, RequestAdmissionError, RequestVersionMetadata,
-    admit_final_http_request,
+    admit_final_http_request, FinalHttpRequestMetadata, RequestAdmissionError,
+    RequestVersionMetadata,
 };
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 
+use crate::event_store::{EventStore, EventStoreConfig, EventStoreError};
+use crate::sse::SseEvent;
 use crate::{Codec, CodecError, Transport, TransportError};
 
 // =============================================================================
@@ -1786,14 +1788,7 @@ impl Drop for StreamableHttpResponseStream {
         let previous = self.endpoint_count.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "response-stream endpoint count underflow");
         if previous == 1 {
-            close_streamable_admissions(&self.admissions_open, &self.active_admissions);
-            let mut mailbox = self
-                .mailbox
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            mailbox.queue.clear();
-            mailbox.retained_bytes = 0;
-            self.pending_count.store(0, Ordering::Release);
+            self.terminate();
         }
     }
 }
@@ -1907,6 +1902,29 @@ impl StreamableHttpResponseStream {
     /// bounded response admissions already inside the gate.
     pub fn close(&self) {
         close_streamable_admissions(&self.admissions_open, &self.active_admissions);
+    }
+
+    fn terminate(&self) {
+        close_streamable_admissions(&self.admissions_open, &self.active_admissions);
+
+        let request_states = {
+            let mut request_states = self
+                .request_states
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *request_states)
+        };
+        for state in request_states.into_values() {
+            StreamableHttpRequestCancellation { state }.cancel();
+        }
+
+        let mut mailbox = self
+            .mailbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mailbox.queue.clear();
+        mailbox.retained_bytes = 0;
+        self.pending_count.store(0, Ordering::Release);
     }
 
     /// Returns whether the owner or shared response producer has closed.
@@ -2189,7 +2207,7 @@ fn release_streamable_bytes(retained_bytes: &AtomicUsize, serialized_bytes: usiz
 
 fn http_checkpoint(cx: &Cx) -> Result<(), TransportError> {
     cx.checkpoint().map_err(|error| {
-        use asupersync::{CancelKind, error::ErrorKind};
+        use asupersync::{error::ErrorKind, CancelKind};
 
         match cx.cancel_reason().map(|reason| reason.kind) {
             Some(CancelKind::Deadline | CancelKind::Timeout) => TransportError::Timeout,
@@ -2834,6 +2852,649 @@ impl Transport for StreamableHttpTransport {
     fn close(&mut self) -> Result<(), TransportError> {
         self.close_queues();
         Ok(())
+    }
+}
+
+// =============================================================================
+// Dual-era HTTP/SSE endpoint composition
+// =============================================================================
+
+/// Configuration for one endpoint that serves modern Streamable HTTP and
+/// exact MCP 2024-11-05 SSE clients side by side.
+#[derive(Debug, Clone)]
+pub struct DualEraHttpEndpointConfig {
+    /// GET route for the legacy SSE event stream.
+    pub legacy_sse_path: String,
+    /// POST route advertised to the legacy SSE client by its first event.
+    pub legacy_message_path: String,
+    /// Plain-HTTP origin used to construct the opaque legacy POST URI.
+    pub legacy_origin: String,
+    /// Maximum legacy POST requests retained before application dispatch.
+    pub legacy_request_capacity: usize,
+    /// Bounded retention configuration for resumable legacy SSE messages.
+    pub event_store: EventStoreConfig,
+}
+
+impl DualEraHttpEndpointConfig {
+    /// Creates a configuration with bounded defaults for the two legacy routes.
+    #[must_use]
+    pub fn new(
+        legacy_sse_path: impl Into<String>,
+        legacy_message_path: impl Into<String>,
+        legacy_origin: impl Into<String>,
+    ) -> Self {
+        Self {
+            legacy_sse_path: legacy_sse_path.into(),
+            legacy_message_path: legacy_message_path.into(),
+            legacy_origin: legacy_origin.into(),
+            legacy_request_capacity: DEFAULT_STREAMABLE_QUEUE_CAPACITY,
+            event_store: EventStoreConfig::default(),
+        }
+    }
+}
+
+/// Failure while constructing or operating a [`DualEraHttpEndpoint`].
+#[derive(Debug)]
+pub enum DualEraHttpEndpointError {
+    /// The endpoint configuration does not provide disjoint, valid routes.
+    InvalidConfiguration(String),
+    /// Modern HTTP admission failed.
+    Http(HttpError),
+    /// A bounded transport operation failed.
+    Transport(TransportError),
+    /// Event retention or bounded replay failed.
+    EventStore(EventStoreError),
+    /// The session identifier could not be generated.
+    Session(HttpSessionError),
+    /// The session has been closed and can no longer admit work.
+    Closed,
+}
+
+impl std::fmt::Display for DualEraHttpEndpointError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfiguration(message) => {
+                write!(
+                    formatter,
+                    "invalid dual-era HTTP endpoint configuration: {message}"
+                )
+            }
+            Self::Http(error) => write!(formatter, "modern HTTP admission failed: {error}"),
+            Self::Transport(error) => write!(formatter, "HTTP transport failed: {error}"),
+            Self::EventStore(error) => write!(formatter, "legacy SSE replay failed: {error}"),
+            Self::Session(error) => write!(formatter, "HTTP session setup failed: {error}"),
+            Self::Closed => formatter.write_str("dual-era HTTP session is closed"),
+        }
+    }
+}
+
+impl std::error::Error for DualEraHttpEndpointError {}
+
+impl From<HttpError> for DualEraHttpEndpointError {
+    fn from(error: HttpError) -> Self {
+        Self::Http(error)
+    }
+}
+
+impl From<TransportError> for DualEraHttpEndpointError {
+    fn from(error: TransportError) -> Self {
+        Self::Transport(error)
+    }
+}
+
+impl From<CodecError> for DualEraHttpEndpointError {
+    fn from(error: CodecError) -> Self {
+        Self::Transport(TransportError::Codec(error))
+    }
+}
+
+impl From<EventStoreError> for DualEraHttpEndpointError {
+    fn from(error: EventStoreError) -> Self {
+        Self::EventStore(error)
+    }
+}
+
+impl From<HttpSessionError> for DualEraHttpEndpointError {
+    fn from(error: HttpSessionError) -> Self {
+        Self::Session(error)
+    }
+}
+
+/// A public endpoint composition for modern Streamable HTTP and legacy SSE.
+///
+/// The modern route is owned by the supplied [`HttpRequestHandler`]. The two
+/// legacy routes remain explicit and disjoint: one GET opens the SSE stream,
+/// while the exact POST URI advertised in its first event is the only ingress
+/// for legacy client requests.
+pub struct DualEraHttpEndpoint {
+    handler: Arc<HttpRequestHandler>,
+    config: DualEraHttpEndpointConfig,
+}
+
+impl DualEraHttpEndpoint {
+    /// Validates a dual-era endpoint configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any route is malformed or overlaps another route,
+    /// when the legacy origin cannot be used by [`LegacySseHttpPostSink`], or
+    /// when a configured queue or event store bound is invalid.
+    pub fn new(
+        handler: HttpRequestHandler,
+        config: DualEraHttpEndpointConfig,
+    ) -> Result<Self, DualEraHttpEndpointError> {
+        validate_dual_era_path("legacy SSE route", &config.legacy_sse_path)?;
+        validate_dual_era_path("legacy message route", &config.legacy_message_path)?;
+        validate_legacy_http_origin(&config.legacy_origin)?;
+        if config.legacy_request_capacity == 0
+            || config.legacy_request_capacity > MAX_STREAMABLE_QUEUE_CAPACITY
+        {
+            return Err(DualEraHttpEndpointError::InvalidConfiguration(
+                "legacy request capacity is outside the supported range".to_string(),
+            ));
+        }
+        if config.event_store.max_stream_id_bytes < 64 {
+            return Err(DualEraHttpEndpointError::InvalidConfiguration(
+                "event-store stream identifier bound cannot retain a session identifier"
+                    .to_string(),
+            ));
+        }
+        let modern_path = &handler.config().base_path;
+        if config.legacy_sse_path == config.legacy_message_path
+            || config.legacy_sse_path == *modern_path
+            || config.legacy_message_path == *modern_path
+        {
+            return Err(DualEraHttpEndpointError::InvalidConfiguration(
+                "modern, legacy SSE, and legacy POST routes must be distinct".to_string(),
+            ));
+        }
+
+        EventStore::with_config(config.event_store.clone())?;
+
+        Ok(Self {
+            handler: Arc::new(handler),
+            config,
+        })
+    }
+
+    /// Opens one independently bounded endpoint session.
+    ///
+    /// The session owns its modern request/response transport, legacy request
+    /// queue, and legacy replay retention. Dropping or closing it clears all
+    /// three deterministically.
+    pub fn open_session(&self) -> Result<DualEraHttpSession, DualEraHttpEndpointError> {
+        let session_id = generate_session_id()?;
+        let mut transport =
+            StreamableHttpTransport::with_capacity(self.config.legacy_request_capacity)?;
+        let (modern_ingress, modern_responses) = transport.split_handles()?;
+        let mut legacy_codec = Codec::new();
+        legacy_codec.set_max_message_size(self.handler.config().max_body_size);
+        let legacy_message_endpoint = format!(
+            "{}{}?session_id={session_id}",
+            self.config.legacy_origin, self.config.legacy_message_path
+        );
+
+        Ok(DualEraHttpSession {
+            handler: Arc::clone(&self.handler),
+            legacy_sse_path: self.config.legacy_sse_path.clone(),
+            legacy_message_path: self.config.legacy_message_path.clone(),
+            session_id: session_id.clone(),
+            legacy_message_endpoint,
+            legacy_request_capacity: self.config.legacy_request_capacity,
+            legacy_requests: VecDeque::new(),
+            legacy_events: EventStore::with_config(self.config.event_store.clone())?,
+            legacy_stream_id: session_id,
+            legacy_codec,
+            modern_transport: transport,
+            modern_ingress,
+            modern_responses,
+            closed: false,
+        })
+    }
+}
+
+fn validate_dual_era_path(label: &str, path: &str) -> Result<(), DualEraHttpEndpointError> {
+    if !path.starts_with('/')
+        || path.len() == 1
+        || path
+            .bytes()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0' | b'?' | b'#'))
+    {
+        return Err(DualEraHttpEndpointError::InvalidConfiguration(format!(
+            "{label} must be a non-root absolute path without query, fragment, or control bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_legacy_http_origin(origin: &str) -> Result<(), DualEraHttpEndpointError> {
+    let Some(authority) = origin.strip_prefix("http://") else {
+        return Err(DualEraHttpEndpointError::InvalidConfiguration(
+            "legacy origin must use the plain HTTP scheme supported by the legacy POST sink"
+                .to_string(),
+        ));
+    };
+    if authority.is_empty()
+        || authority.bytes().any(|byte| {
+            byte.is_ascii_whitespace()
+                || matches!(byte, b'/' | b'?' | b'#' | b'\\' | b'\r' | b'\n' | b'\0')
+        })
+    {
+        return Err(DualEraHttpEndpointError::InvalidConfiguration(
+            "legacy origin must contain exactly one nonempty HTTP authority".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn sse_http_response(body: Vec<u8>) -> HttpResponse {
+    HttpResponse::new(HttpStatus::OK)
+        .with_header("content-type", "text/event-stream")
+        .with_header("cache-control", "no-cache")
+        .with_header("connection", "keep-alive")
+        .with_header("x-accel-buffering", "no")
+        .with_body(body)
+}
+
+fn method_rejection(allowed: &str) -> HttpResponse {
+    HttpResponse::new(HttpStatus::METHOD_NOT_ALLOWED).with_header("allow", allowed)
+}
+
+fn legacy_post_has_modern_binding_headers(request: &HttpRequest) -> bool {
+    [
+        "mcp-protocol-version",
+        "mcp-method",
+        "mcp-name",
+        "mcp-session-id",
+    ]
+    .iter()
+    .any(|name| request.header(name).is_some())
+}
+
+/// The externally renderable result of one [`DualEraHttpSession`] request.
+pub enum DualEraHttpEndpointResponse {
+    /// A complete HTTP response, including legacy SSE GET and legacy POST responses.
+    Immediate(HttpResponse),
+    /// A modern JSON response that becomes available after application dispatch.
+    ModernJson(DualEraHttpJsonResponse),
+    /// A modern request-scoped SSE response body.
+    ModernSse(DualEraHttpSseResponse),
+}
+
+/// One admitted modern JSON response awaiting its matching JSON-RPC response.
+pub struct DualEraHttpJsonResponse {
+    handler: Arc<HttpRequestHandler>,
+    responses: StreamableHttpResponseStream,
+    request_id: RequestId,
+    origin: Option<String>,
+}
+
+impl DualEraHttpJsonResponse {
+    /// Tries to render the one response bound to this modern request.
+    ///
+    /// `Ok(None)` means application dispatch has not yet committed its final
+    /// response. The returned HTTP value has the normal JSON response headers.
+    pub fn try_response(&self) -> Result<Option<HttpResponse>, DualEraHttpEndpointError> {
+        let Some(response) = self.responses.pop_response(Some(&self.request_id))? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.handler
+                .try_create_response(&response, self.origin.as_deref())?,
+        ))
+    }
+}
+
+/// One finite modern SSE response body bound to its exact JSON-RPC request.
+pub struct DualEraHttpSseResponse {
+    response: HttpResponse,
+    body: StreamableHttpRequestResponseStream,
+    codec: Codec,
+}
+
+impl DualEraHttpSseResponse {
+    /// Returns the HTTP status and headers to send before the finite SSE body.
+    #[must_use]
+    pub fn response(&self) -> &HttpResponse {
+        &self.response
+    }
+
+    /// Returns the request-owned cancellation guard for application dispatch.
+    #[must_use]
+    pub fn cancellation(&self) -> StreamableHttpRequestCancellation {
+        self.body.cancellation()
+    }
+
+    /// Receives and frames the one response as an SSE `message` event.
+    ///
+    /// The modern event deliberately has no resumable ID; resumable IDs belong
+    /// only to the separately retained legacy SSE stream.
+    pub fn recv_event(&self, cx: &Cx) -> Result<SseEvent, DualEraHttpEndpointError> {
+        let response = self.body.recv_response(cx)?;
+        let mut encoded = self.codec.encode_response(&response)?;
+        if encoded.pop() != Some(b'\n') {
+            return Err(DualEraHttpEndpointError::Transport(TransportError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "JSON-RPC codec omitted its NDJSON delimiter",
+                ),
+            )));
+        }
+        let data = String::from_utf8(encoded).map_err(|error| {
+            DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error,
+            )))
+        })?;
+        Ok(SseEvent::message(data))
+    }
+}
+
+/// A session combining modern Streamable HTTP with exact legacy SSE/POST flow.
+pub struct DualEraHttpSession {
+    handler: Arc<HttpRequestHandler>,
+    legacy_sse_path: String,
+    legacy_message_path: String,
+    session_id: String,
+    legacy_message_endpoint: String,
+    legacy_request_capacity: usize,
+    legacy_requests: VecDeque<JsonRpcRequest>,
+    legacy_events: EventStore,
+    legacy_stream_id: String,
+    legacy_codec: Codec,
+    modern_transport: StreamableHttpTransport,
+    modern_ingress: StreamableHttpRequestIngress,
+    modern_responses: StreamableHttpResponseStream,
+    closed: bool,
+}
+
+impl DualEraHttpSession {
+    /// Returns the opaque session value required by the advertised legacy POST URI.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Returns the exact legacy POST URI advertised in the first SSE event.
+    #[must_use]
+    pub fn legacy_message_endpoint(&self) -> &str {
+        &self.legacy_message_endpoint
+    }
+
+    /// Returns whether this session has stopped admitting work.
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Handles one request against exactly one modern or legacy route.
+    ///
+    /// Modern requests are admitted through the existing final HTTP boundary.
+    /// Legacy GET returns an endpoint event followed by a bounded replay page;
+    /// legacy POST accepts only the URI advertised for this exact session.
+    pub fn handle(
+        &mut self,
+        cx: &Cx,
+        request: HttpRequest,
+    ) -> Result<DualEraHttpEndpointResponse, DualEraHttpEndpointError> {
+        if self.closed {
+            return Err(DualEraHttpEndpointError::Closed);
+        }
+        http_checkpoint(cx)?;
+
+        if request.path == self.handler.config().base_path {
+            return self.handle_modern(cx, request);
+        }
+        if request.path == self.legacy_sse_path {
+            return self.handle_legacy_sse(request);
+        }
+        if request.path == self.legacy_message_path {
+            return self.handle_legacy_post(request);
+        }
+        Ok(DualEraHttpEndpointResponse::Immediate(HttpResponse::new(
+            HttpStatus::NOT_FOUND,
+        )))
+    }
+
+    fn handle_modern(
+        &mut self,
+        cx: &Cx,
+        request: HttpRequest,
+    ) -> Result<DualEraHttpEndpointResponse, DualEraHttpEndpointError> {
+        let origin = request.header("origin").map(str::to_owned);
+        let admission = self.handler.admit_modern_request(&request)?;
+        let json_rpc = admission.request().clone();
+
+        match admission.response_representation() {
+            HttpResponseRepresentation::Json => {
+                self.modern_ingress.push_request(cx, json_rpc.clone())?;
+                let Some(request_id) = json_rpc.id else {
+                    return Ok(DualEraHttpEndpointResponse::Immediate(HttpResponse::new(
+                        HttpStatus::ACCEPTED,
+                    )));
+                };
+                Ok(DualEraHttpEndpointResponse::ModernJson(
+                    DualEraHttpJsonResponse {
+                        handler: Arc::clone(&self.handler),
+                        responses: self.modern_responses.clone(),
+                        request_id,
+                        origin,
+                    },
+                ))
+            }
+            HttpResponseRepresentation::Sse => {
+                let body = admission.bind_sse_response_body(&self.modern_responses)?;
+                self.modern_ingress.push_request(cx, json_rpc)?;
+                Ok(DualEraHttpEndpointResponse::ModernSse(
+                    DualEraHttpSseResponse {
+                        response: sse_http_response(Vec::new()),
+                        body,
+                        codec: Codec::new(),
+                    },
+                ))
+            }
+        }
+    }
+
+    fn handle_legacy_sse(
+        &self,
+        request: HttpRequest,
+    ) -> Result<DualEraHttpEndpointResponse, DualEraHttpEndpointError> {
+        validate_http_request_headers(&request)?;
+        if request.method != HttpMethod::Get {
+            return Ok(DualEraHttpEndpointResponse::Immediate(method_rejection(
+                "GET",
+            )));
+        }
+
+        let replay = self
+            .legacy_events
+            .replay_bounded(&self.legacy_stream_id, request.header("last-event-id"))?;
+        let mut body = SseEvent::endpoint(&self.legacy_message_endpoint).to_bytes()?;
+        for event in replay.events() {
+            let data = event
+                .data
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "legacy SSE retention contained a non-string message payload",
+                    )))
+                })?;
+            body.extend_from_slice(&SseEvent::message(data).with_id(&event.id).to_bytes()?);
+        }
+        Ok(DualEraHttpEndpointResponse::Immediate(sse_http_response(
+            body,
+        )))
+    }
+
+    fn handle_legacy_post(
+        &mut self,
+        request: HttpRequest,
+    ) -> Result<DualEraHttpEndpointResponse, DualEraHttpEndpointError> {
+        validate_http_request_headers(&request)?;
+        if request.method != HttpMethod::Post {
+            return Ok(DualEraHttpEndpointResponse::Immediate(method_rejection(
+                "POST",
+            )));
+        }
+        if request.query.len() != 1
+            || request.query.get("session_id").map(String::as_str) != Some(self.session_id())
+        {
+            return Ok(DualEraHttpEndpointResponse::Immediate(HttpResponse::new(
+                HttpStatus::NOT_FOUND,
+            )));
+        }
+        let content_type = request.content_type().unwrap_or("");
+        if !content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("application/json")
+            || legacy_post_has_modern_binding_headers(&request)
+        {
+            return Ok(DualEraHttpEndpointResponse::Immediate(
+                HttpResponse::bad_request(),
+            ));
+        }
+        if request.body.len() > self.handler.config().max_body_size {
+            return Err(DualEraHttpEndpointError::Http(HttpError::BodyTooLarge {
+                size: request.body.len(),
+                max: self.handler.config().max_body_size,
+            }));
+        }
+        if self.legacy_requests.len() >= self.legacy_request_capacity {
+            return Ok(DualEraHttpEndpointResponse::Immediate(HttpResponse::new(
+                HttpStatus::SERVICE_UNAVAILABLE,
+            )));
+        }
+
+        let request = self.legacy_codec.decode_complete_request(&request.body)?;
+        self.legacy_requests.push_back(request);
+        Ok(DualEraHttpEndpointResponse::Immediate(HttpResponse::new(
+            HttpStatus::ACCEPTED,
+        )))
+    }
+
+    /// Receives one modern request after final HTTP admission.
+    pub fn recv_modern_request(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<JsonRpcRequest, DualEraHttpEndpointError> {
+        if self.closed {
+            return Err(DualEraHttpEndpointError::Closed);
+        }
+        match self.modern_transport.recv(cx)? {
+            JsonRpcMessage::Request(request) => Ok(request),
+            JsonRpcMessage::Response(_) => Err(DualEraHttpEndpointError::Transport(
+                TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "modern request ingress yielded a JSON-RPC response",
+                )),
+            )),
+        }
+    }
+
+    /// Removes the next legacy client POST request in FIFO order.
+    #[must_use]
+    pub fn take_legacy_request(&mut self) -> Option<JsonRpcRequest> {
+        (!self.closed)
+            .then(|| self.legacy_requests.pop_front())
+            .flatten()
+    }
+
+    /// Sends one finite JSON response for a modern JSON-selected request.
+    pub fn send_modern_json_response(
+        &mut self,
+        cx: &Cx,
+        response: JsonRpcResponse,
+    ) -> Result<(), DualEraHttpEndpointError> {
+        if self.closed {
+            return Err(DualEraHttpEndpointError::Closed);
+        }
+        self.modern_transport
+            .send(cx, &JsonRpcMessage::Response(response))?;
+        Ok(())
+    }
+
+    /// Sends one response for the exact modern SSE request owned by `cancellation`.
+    pub fn send_modern_sse_response(
+        &mut self,
+        cx: &Cx,
+        cancellation: &StreamableHttpRequestCancellation,
+        response: JsonRpcResponse,
+    ) -> Result<(), DualEraHttpEndpointError> {
+        if self.closed {
+            return Err(DualEraHttpEndpointError::Closed);
+        }
+        self.modern_transport
+            .send_response_for_request(cx, cancellation, response)?;
+        Ok(())
+    }
+
+    /// Retains and publishes one legacy server-to-client SSE message.
+    ///
+    /// Each successful call returns the event ID rendered on subsequent GET
+    /// responses and accepted by `Last-Event-ID` for bounded resumption.
+    pub fn publish_legacy_message(
+        &self,
+        message: &JsonRpcMessage,
+    ) -> Result<String, DualEraHttpEndpointError> {
+        if self.closed {
+            return Err(DualEraHttpEndpointError::Closed);
+        }
+        let mut encoded = match message {
+            JsonRpcMessage::Request(request) => self.legacy_codec.encode_request(request)?,
+            JsonRpcMessage::Response(response) => self.legacy_codec.encode_response(response)?,
+        };
+        if encoded.pop() != Some(b'\n') {
+            return Err(DualEraHttpEndpointError::Transport(TransportError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "JSON-RPC codec omitted its NDJSON delimiter",
+                ),
+            )));
+        }
+        let data = String::from_utf8(encoded).map_err(|error| {
+            DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error,
+            )))
+        })?;
+        Ok(self.legacy_events.store_event(
+            &self.legacy_stream_id,
+            Some(serde_json::Value::String(data)),
+        )?)
+    }
+
+    /// Returns the number of retained messages for this legacy SSE session.
+    #[must_use]
+    pub fn retained_legacy_event_count(&self) -> usize {
+        self.legacy_events
+            .get_events_after(&self.legacy_stream_id, None)
+            .len()
+    }
+
+    /// Closes the session, cancels all live modern response bodies, and clears
+    /// queued modern work plus retained legacy request and replay state.
+    pub fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        self.modern_ingress.close();
+        self.modern_responses.terminate();
+        let _ = self.modern_transport.close();
+        self.legacy_requests.clear();
+        self.legacy_events.clear_stream(&self.legacy_stream_id);
+    }
+}
+
+impl Drop for DualEraHttpSession {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -5049,12 +5710,10 @@ X-Checksum: abc123\r\n\
             .retained_bytes;
         assert!(retained_before > 0);
 
-        assert!(
-            response_stream
-                .pop_response(Some(&RequestId::Number(404)))
-                .expect("unmatched pop is not terminal")
-                .is_none()
-        );
+        assert!(response_stream
+            .pop_response(Some(&RequestId::Number(404)))
+            .expect("unmatched pop is not terminal")
+            .is_none());
         assert_eq!(transport.pending_responses(), 1);
         assert_eq!(
             transport
@@ -6178,5 +6837,282 @@ X-Checksum: abc123\r\n\
         let request = HttpRequest::new(HttpMethod::Options, "/mcp/v1");
         let response = handler.handle_options(&request);
         assert_eq!(response.status, HttpStatus::METHOD_NOT_ALLOWED);
+    }
+
+    fn dual_era_modern_sse_request(id: i64) -> HttpRequest {
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "weather",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                }
+            })),
+            id,
+        );
+        HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("accept", "text/event-stream")
+            .with_header("MCP-Protocol-Version", "2026-07-28")
+            .with_header("Mcp-Method", "tools/call")
+            .with_header("Mcp-Name", "weather")
+            .with_body(serde_json::to_vec(&request).expect("modern request serializes"))
+    }
+
+    fn dual_era_endpoint() -> DualEraHttpEndpoint {
+        let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
+            base_path: "/mcp".to_string(),
+            ..HttpHandlerConfig::default()
+        });
+        let mut config =
+            DualEraHttpEndpointConfig::new("/legacy/sse", "/legacy/messages", "http://legacy.test");
+        config.event_store = EventStoreConfig::no_expiry().max_replay_events(8);
+        DualEraHttpEndpoint::new(handler, config).expect("dual-era endpoint configuration is valid")
+    }
+
+    #[test]
+    fn dual_era_endpoint_composes_resumable_legacy_sse_with_modern_request_bodies() {
+        let endpoint = dual_era_endpoint();
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let cx = Cx::for_testing();
+        let codec = Codec::new();
+
+        let first_id = session
+            .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(41),
+                serde_json::json!({"phase": "first"}),
+            )))
+            .expect("first legacy message is retained");
+        let second_id = session
+            .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(42),
+                serde_json::json!({"phase": "second"}),
+            )))
+            .expect("second legacy message is retained");
+
+        let legacy_get = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/legacy/sse"))
+            .expect("legacy GET is admitted");
+        let DualEraHttpEndpointResponse::Immediate(legacy_get) = legacy_get else {
+            panic!("legacy GET returns a complete SSE HTTP response");
+        };
+        assert_eq!(legacy_get.status, HttpStatus::OK);
+        assert_eq!(
+            legacy_get.headers.get("content-type"),
+            Some(&"text/event-stream".to_string())
+        );
+        assert_eq!(
+            legacy_get.headers.get("cache-control"),
+            Some(&"no-cache".to_string())
+        );
+        assert_eq!(
+            legacy_get.headers.get("connection"),
+            Some(&"keep-alive".to_string())
+        );
+        assert_eq!(
+            legacy_get.headers.get("x-accel-buffering"),
+            Some(&"no".to_string())
+        );
+
+        let mut legacy_reader = crate::sse::SseReader::new(Cursor::new(legacy_get.body));
+        assert_eq!(
+            legacy_reader
+                .read_endpoint(&cx)
+                .expect("legacy endpoint event parses"),
+            Some(session.legacy_message_endpoint().to_string())
+        );
+        let first_event = legacy_reader
+            .read_event(&cx)
+            .expect("first retained legacy event parses")
+            .expect("first retained event is present");
+        assert_eq!(first_event.id.as_deref(), Some(first_id.as_str()));
+        assert!(matches!(
+            codec
+                .decode_complete_message(first_event.data.as_bytes())
+                .expect("first retained data remains JSON-RPC"),
+            JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(41))
+        ));
+        let second_event = legacy_reader
+            .read_event(&cx)
+            .expect("second retained legacy event parses")
+            .expect("second retained event is present");
+        assert_eq!(second_event.id.as_deref(), Some(second_id.as_str()));
+
+        let resumed_get = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Get, "/legacy/sse")
+                    .with_header("last-event-id", first_id.clone()),
+            )
+            .expect("retained legacy cursor resumes the stream");
+        let DualEraHttpEndpointResponse::Immediate(resumed_get) = resumed_get else {
+            panic!("resumed legacy GET returns a complete SSE HTTP response");
+        };
+        let mut resumed_reader = crate::sse::SseReader::new(Cursor::new(resumed_get.body));
+        assert_eq!(
+            resumed_reader
+                .read_endpoint(&cx)
+                .expect("resumed stream begins with its endpoint event"),
+            Some(session.legacy_message_endpoint().to_string())
+        );
+        let resumed_event = resumed_reader
+            .read_event(&cx)
+            .expect("resumed retained event parses")
+            .expect("one event remains after the cursor");
+        assert_eq!(resumed_event.id.as_deref(), Some(second_id.as_str()));
+        assert_eq!(
+            resumed_reader
+                .read_event(&cx)
+                .expect("resumed stream reaches its finite replay tail"),
+            None
+        );
+
+        let legacy_request =
+            JsonRpcRequest::new("ping", Some(serde_json::json!({"value": 1})), 77_i64);
+        let legacy_post = HttpRequest::new(HttpMethod::Post, "/legacy/messages")
+            .with_header("content-type", "application/json")
+            .with_query("session_id", session.session_id())
+            .with_body(
+                codec
+                    .encode_request(&legacy_request)
+                    .expect("legacy request serializes"),
+            );
+        let legacy_post = session
+            .handle(&cx, legacy_post)
+            .expect("advertised legacy POST is admitted");
+        let DualEraHttpEndpointResponse::Immediate(legacy_post) = legacy_post else {
+            panic!("legacy POST has a complete HTTP acceptance response");
+        };
+        assert_eq!(legacy_post.status, HttpStatus::ACCEPTED);
+        assert_eq!(
+            session
+                .take_legacy_request()
+                .expect("legacy POST reaches only the legacy request queue")
+                .method,
+            "ping"
+        );
+
+        let modern_sse = session
+            .handle(&cx, dual_era_modern_sse_request(91))
+            .expect("modern request with matching directional headers is admitted");
+        let DualEraHttpEndpointResponse::ModernSse(modern_sse) = modern_sse else {
+            panic!("modern Accept selection creates a request-scoped SSE response body");
+        };
+        assert_eq!(
+            modern_sse.response().headers.get("content-type"),
+            Some(&"text/event-stream".to_string())
+        );
+        assert_eq!(
+            modern_sse.response().headers.get("x-accel-buffering"),
+            Some(&"no".to_string())
+        );
+        assert_eq!(
+            session
+                .recv_modern_request(&cx)
+                .expect("only the modern route reaches the modern transport")
+                .method,
+            "tools/call"
+        );
+        let cancellation = modern_sse.cancellation();
+        session
+            .send_modern_sse_response(
+                &cx,
+                &cancellation,
+                JsonRpcResponse::success(RequestId::Number(91), serde_json::json!({"ok": true})),
+            )
+            .expect("the bound modern SSE response is committed through its guard");
+        let modern_event = modern_sse
+            .recv_event(&cx)
+            .expect("the bound modern response renders as an SSE event");
+        assert!(modern_event.id.is_none());
+        assert!(matches!(
+            codec
+                .decode_complete_message(modern_event.data.as_bytes())
+                .expect("modern SSE data remains JSON-RPC"),
+            JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(91))
+        ));
+
+        let mut modern_json_request = dual_era_modern_sse_request(93);
+        modern_json_request
+            .headers
+            .insert("accept".to_string(), "application/json".to_string());
+        let modern_json = session
+            .handle(&cx, modern_json_request)
+            .expect("modern JSON request with matching directional headers is admitted");
+        let DualEraHttpEndpointResponse::ModernJson(modern_json) = modern_json else {
+            panic!("modern JSON Accept selection creates a finite JSON response handle");
+        };
+        assert_eq!(
+            session
+                .recv_modern_request(&cx)
+                .expect("modern JSON request reaches the modern transport")
+                .method,
+            "tools/call"
+        );
+        session
+            .send_modern_json_response(
+                &cx,
+                JsonRpcResponse::success(RequestId::Number(93), serde_json::json!({"ok": true})),
+            )
+            .expect("modern JSON response is committed");
+        let modern_json = modern_json
+            .try_response()
+            .expect("modern JSON response rendering succeeds")
+            .expect("the matching modern JSON response is available");
+        assert_eq!(modern_json.status, HttpStatus::OK);
+        assert_eq!(
+            modern_json.headers.get("content-type"),
+            Some(&"application/json".to_string())
+        );
+        assert!(matches!(
+            codec
+                .decode_complete_message(&modern_json.body)
+                .expect("modern JSON body remains JSON-RPC"),
+            JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(93))
+        ));
+
+        let abandoned = session
+            .handle(&cx, dual_era_modern_sse_request(92))
+            .expect("second modern SSE request is admitted before cleanup");
+        let DualEraHttpEndpointResponse::ModernSse(abandoned) = abandoned else {
+            panic!("second modern request has its own response body");
+        };
+        let abandoned_cancellation = abandoned.cancellation();
+        session.close();
+        assert!(session.is_closed());
+        assert!(abandoned_cancellation.is_cancelled());
+        assert_eq!(session.retained_legacy_event_count(), 0);
+        assert!(session.take_legacy_request().is_none());
+    }
+
+    #[test]
+    fn dual_era_endpoint_rejects_only_the_wrong_legacy_sse_method_without_mutation() {
+        let endpoint = dual_era_endpoint();
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let cx = Cx::for_testing();
+        let allowed = HttpRequest::new(HttpMethod::Get, "/legacy/sse");
+        let mut rejected = allowed.clone();
+        rejected.method = HttpMethod::Post;
+
+        let allowed = session
+            .handle(&cx, allowed)
+            .expect("the baseline legacy SSE GET is admitted");
+        let DualEraHttpEndpointResponse::Immediate(allowed) = allowed else {
+            panic!("baseline legacy SSE route returns an immediate response");
+        };
+        assert_eq!(allowed.status, HttpStatus::OK);
+        let event_count_before = session.retained_legacy_event_count();
+
+        let rejected = session
+            .handle(&cx, rejected)
+            .expect("method rejection is an HTTP response rather than a queue mutation");
+        let DualEraHttpEndpointResponse::Immediate(rejected) = rejected else {
+            panic!("rejected legacy SSE method returns an immediate response");
+        };
+        assert_eq!(rejected.status, HttpStatus::METHOD_NOT_ALLOWED);
+        assert_eq!(rejected.headers.get("allow"), Some(&"GET".to_string()));
+        assert_eq!(session.retained_legacy_event_count(), event_count_before);
+        assert!(session.take_legacy_request().is_none());
     }
 }
