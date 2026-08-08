@@ -61,6 +61,15 @@ pub const DEFAULT_MAX_EVENT_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Default maximum compact-JSON payload bytes retained across all streams (64 MiB).
 pub const DEFAULT_MAX_TOTAL_EVENT_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default maximum events returned by one modern replay page.
+pub const DEFAULT_MAX_REPLAY_EVENTS: usize = 64;
+
+/// Default compact-JSON payload bytes returned by one modern replay page (1 MiB).
+pub const DEFAULT_MAX_REPLAY_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Default maximum UTF-8 byte length of an untrusted replay cursor.
+pub const DEFAULT_MAX_REPLAY_CURSOR_BYTES: usize = 256;
+
 /// Default TTL for events (1 hour).
 pub const DEFAULT_TTL_SECS: u64 = 3600;
 
@@ -98,6 +107,21 @@ pub enum EventStoreError {
         /// Configured maximum aggregate number of bytes.
         max_bytes: usize,
     },
+    /// A replay cursor exceeded its configured UTF-8 byte limit.
+    ReplayCursorTooLong {
+        /// Configured maximum number of bytes.
+        max_bytes: usize,
+    },
+    /// A supplied replay cursor is not retained by the named stream.
+    ///
+    /// This intentionally does not disclose whether the cursor belongs to a
+    /// different stream or has expired/been evicted from this one.
+    ReplayCursorNotRetained,
+    /// One retained event cannot fit in an otherwise empty replay page.
+    ReplayEventPayloadTooLarge {
+        /// Configured maximum compact-JSON payload bytes per replay page.
+        max_bytes: usize,
+    },
     /// A JSON value could not be measured using its compact wire encoding.
     PayloadMeasurementFailed,
 }
@@ -126,6 +150,17 @@ impl std::fmt::Display for EventStoreError {
             Self::AggregatePayloadLimitExceeded { max_bytes } => write!(
                 formatter,
                 "event store would exceed its configured {max_bytes}-byte aggregate payload limit"
+            ),
+            Self::ReplayCursorTooLong { max_bytes } => write!(
+                formatter,
+                "replay cursor exceeds the configured {max_bytes}-byte limit"
+            ),
+            Self::ReplayCursorNotRetained => {
+                formatter.write_str("replay cursor is not retained for the requested stream")
+            }
+            Self::ReplayEventPayloadTooLarge { max_bytes } => write!(
+                formatter,
+                "replay event exceeds the configured {max_bytes}-byte replay page limit"
             ),
             Self::PayloadMeasurementFailed => {
                 formatter.write_str("event payload size could not be measured")
@@ -166,6 +201,65 @@ impl EventEntry {
             Some(ttl) => self.created_at.elapsed() > ttl,
             None => false,
         }
+    }
+}
+
+/// One bounded, immutable page of retained events for a named stream.
+///
+/// A caller resumes by passing [`Self::next_after_id`] back to
+/// [`EventStore::replay_bounded`]. The page is a retention snapshot: events
+/// stored after the method releases the store lock are never appended to this
+/// value implicitly.
+#[derive(Debug, Clone)]
+pub struct ReplayBatch {
+    events: Vec<EventEntry>,
+    next_after_id: Option<EventId>,
+    payload_bytes: usize,
+    complete: bool,
+}
+
+impl ReplayBatch {
+    fn empty() -> Self {
+        Self {
+            events: Vec::new(),
+            next_after_id: None,
+            payload_bytes: 0,
+            complete: true,
+        }
+    }
+
+    /// Returns the retained events in chronological order.
+    #[must_use]
+    pub fn events(&self) -> &[EventEntry] {
+        &self.events
+    }
+
+    /// Consumes the page and returns its retained events in chronological order.
+    #[must_use]
+    pub fn into_events(self) -> Vec<EventEntry> {
+        self.events
+    }
+
+    /// Returns the exclusive cursor for the next replay page, when one exists.
+    ///
+    /// If no event was emitted, this preserves the admitted input cursor. A
+    /// fresh empty stream therefore has no cursor until its producer records
+    /// an event or an explicit priming event.
+    #[must_use]
+    pub fn next_after_id(&self) -> Option<&str> {
+        self.next_after_id.as_deref()
+    }
+
+    /// Returns the compact-JSON payload bytes in this page.
+    #[must_use]
+    pub const fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
+    /// Returns whether this page reached the retained tail at its snapshot.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.complete
     }
 }
 
