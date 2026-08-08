@@ -28,9 +28,10 @@ use fastmcp_protocol::{
     FinalReadResourceResult,
 };
 use fastmcp_rust::{
-    CompleteResult, Content, ContentBlock, Cx, Implementation, JsonSchema, LabConfig, LabRuntime,
-    McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler, PromptMessage,
-    ResourceContent, ResourceHandler, ResultMeta, Role, ToolHandler, prompt, resource, tool,
+    CompleteResult, Content, ContentBlock, Cx, FinalToolOutcome, Implementation,
+    InputRequiredResult, JsonSchema, LabConfig, LabRuntime, McpContext, McpError, McpOutcome,
+    McpResult, Outcome, PromptHandler, PromptMessage, ResourceContent, ResourceHandler, ResultMeta,
+    Role, ToolHandler, prompt, resource, tool,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -691,6 +692,141 @@ fn tool_final_complete_resource_link_rejects_lossy_legacy_projection() {
         error.message,
         "final tool content cannot be projected exactly through the legacy handler"
     );
+}
+
+// --- Final tool outcome algebra ---
+
+fn final_tool_outcome(mode: &str) -> FinalToolOutcome {
+    match mode {
+        "complete" => FinalToolOutcome::Complete(final_tool_payload("outcome-complete")),
+        "input-required" => FinalToolOutcome::InputRequired(
+            InputRequiredResult::new(None, Some("retry-state".to_string()), final_result_meta())
+                .expect("request state makes input-required valid"),
+        ),
+        "create-task" => FinalToolOutcome::CreateTask {
+            status_message: Some("queued".to_string()),
+        },
+        _ => unreachable!("test calls only supported final tool outcome modes"),
+    }
+}
+
+#[tool]
+fn final_tool_outcome_direct(mode: String) -> fastmcp_rust::FinalToolOutcome {
+    final_tool_outcome(&mode)
+}
+
+#[tool]
+fn final_tool_outcome_result(mode: String) -> Result<fastmcp_rust::FinalToolOutcome, McpError> {
+    if mode == "error" {
+        return Err(McpError::invalid_params("outcome result rejected"));
+    }
+    Ok(final_tool_outcome(&mode))
+}
+
+#[tool]
+fn final_tool_outcome_mcp_result(mode: String) -> McpResult<fastmcp_rust::FinalToolOutcome> {
+    Ok(final_tool_outcome(&mode))
+}
+
+#[tool]
+async fn final_tool_outcome_async_input_required(
+    ctx: &McpContext,
+    cancel_request: bool,
+) -> fastmcp_rust::FinalToolOutcome {
+    if cancel_request {
+        ctx.cx().set_cancel_requested(true);
+    }
+    final_tool_outcome("input-required")
+}
+
+#[test]
+fn tool_final_outcome_variants_reach_the_final_outcome_hook() {
+    let ctx = test_ctx();
+    let handlers: [Box<dyn ToolHandler>; 3] = [
+        Box::new(FinalToolOutcomeDirect),
+        Box::new(FinalToolOutcomeResult),
+        Box::new(FinalToolOutcomeMcpResult),
+    ];
+
+    for handler in handlers {
+        assert!(
+            handler.call(&ctx, json!({"mode": "complete"})).is_err(),
+            "the disjoint final outcome must not leak through the legacy hook"
+        );
+
+        match handler
+            .call_final_outcome(&ctx, json!({"mode": "complete"}))
+            .expect("complete outcome is preserved")
+        {
+            FinalToolOutcome::Complete(result) => {
+                let ContentBlock::Text { text, .. } = &result.payload.content[0] else {
+                    panic!("complete outcome keeps text content");
+                };
+                assert_eq!(text, "outcome-complete");
+            }
+            _ => panic!("expected complete final tool outcome"),
+        }
+
+        assert!(matches!(
+            handler
+                .call_final_outcome(&ctx, json!({"mode": "input-required"}))
+                .expect("input-required outcome is preserved"),
+            FinalToolOutcome::InputRequired(_)
+        ));
+        assert!(matches!(
+            handler
+                .call_final_outcome(&ctx, json!({"mode": "create-task"}))
+                .expect("task creation outcome is preserved"),
+            FinalToolOutcome::CreateTask {
+                status_message: Some(ref message),
+            } if message == "queued"
+        ));
+    }
+}
+
+#[test]
+fn tool_final_outcome_result_preserves_mcp_error() {
+    let error =
+        match FinalToolOutcomeResult.call_final_outcome(&test_ctx(), json!({"mode": "error"})) {
+            Err(error) => error,
+            Ok(_) => panic!("the handler's McpError must cross the final outcome hook unchanged"),
+        };
+
+    assert_eq!(error.code, fastmcp_rust::McpErrorCode::InvalidParams);
+    assert_eq!(error.message, "outcome result rejected");
+}
+
+#[test]
+fn async_tool_final_outcome_request_hook_rejects_pre_cancelled_request() {
+    let handler = FinalToolOutcomeAsyncInputRequired;
+    let request_cx = Cx::for_testing();
+    request_cx.set_cancel_requested(true);
+    let ctx = McpContext::new(request_cx.clone(), 62);
+    let outcome = run_outcome(async move {
+        handler
+            .call_final_outcome_async_in_request(
+                &ctx,
+                &request_cx,
+                json!({"cancel_request": false}),
+            )
+            .await
+    });
+
+    assert!(matches!(outcome, Outcome::Cancelled(_)));
+}
+
+#[test]
+fn async_tool_final_outcome_request_hook_discards_post_handler_cancelled_outcome() {
+    let handler = FinalToolOutcomeAsyncInputRequired;
+    let request_cx = Cx::for_testing();
+    let ctx = McpContext::new(request_cx.clone(), 63);
+    let outcome = run_outcome(async move {
+        handler
+            .call_final_outcome_async_in_request(&ctx, &request_cx, json!({"cancel_request": true}))
+            .await
+    });
+
+    assert!(matches!(outcome, Outcome::Cancelled(_)));
 }
 
 // --- Tool with HashMap parameter ---

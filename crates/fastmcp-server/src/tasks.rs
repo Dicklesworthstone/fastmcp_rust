@@ -1556,6 +1556,9 @@ pub trait FinalTaskStore: Send + Sync {
     /// Loads one task by its opaque final identifier.
     fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>>;
 
+    /// Loads one task together with its store-issued monotonic generation.
+    fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>>;
+
     /// Durably replaces a task and records its status notification atomically.
     fn replace_task(
         &self,
@@ -1563,11 +1566,74 @@ pub trait FinalTaskStore: Send + Sync {
         notification: FinalTaskStatusNotification,
     ) -> McpResult<()>;
 
+    /// Atomically compares a store-issued generation, replaces, and records
+    /// the replacement notification.
+    ///
+    /// The comparison against `expected.generation`, replacement task write, and
+    /// replacement notification write form one atomic operation. Returns
+    /// `false` without changing either retained value when another transition
+    /// won first.
+    fn replace_task_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+    ) -> McpResult<bool>;
+
     /// Durably records cooperative cancellation intent for a known task.
     fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()>;
 
+    /// Atomically records cancellation intent only when the task retains
+    /// `expected`'s store-issued generation.
+    ///
+    /// Returns `false` without mutation when another transition won first.
+    fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool>;
+
     /// Returns the durable cooperative-cancellation intent for a known task.
     fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool>;
+}
+
+/// One final task plus the opaque monotonic generation assigned by its store.
+///
+/// A generation changes on every accepted task-state or cancellation-intent
+/// mutation, even when the wire task value itself is unchanged. It therefore
+/// prevents ABA transitions that task-value equality cannot detect.
+#[derive(Clone, Debug)]
+pub struct FinalTaskSnapshot {
+    task: FinalTask,
+    generation: u64,
+}
+
+impl FinalTaskSnapshot {
+    /// Creates a snapshot returned by a [`FinalTaskStore`].
+    ///
+    /// `generation` is an opaque, store-owned version token: an external
+    /// durable store must allocate a new strictly monotonic value for every
+    /// accepted task-state or cancellation-intent mutation of this task. It
+    /// must compare that value atomically with the corresponding replacement
+    /// or cancellation write. Callers must treat it solely as a CAS token.
+    #[must_use]
+    pub fn new(task: FinalTask, generation: u64) -> Self {
+        Self { task, generation }
+    }
+
+    /// Returns the retained final task.
+    #[must_use]
+    pub const fn task(&self) -> &FinalTask {
+        &self.task
+    }
+
+    /// Returns the store-issued generation for compare-and-swap operations.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Consumes this snapshot and returns its task.
+    #[must_use]
+    pub fn into_task(self) -> FinalTask {
+        self.task
+    }
 }
 
 /// Default maximum number of retained tasks in [`InMemoryFinalTaskStore`].
@@ -1585,20 +1651,31 @@ pub const DEFAULT_IN_MEMORY_FINAL_TASKS: usize = 1_024;
 /// need either property must supply their own [`FinalTaskStore`].
 pub struct InMemoryFinalTaskStore {
     max_tasks: usize,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     state: Mutex<InMemoryFinalTaskState>,
 }
 
 #[derive(Default)]
 struct InMemoryFinalTaskState {
     tasks: BTreeMap<FinalTaskId, FinalTask>,
+    generations: BTreeMap<FinalTaskId, u64>,
+    next_generation: u64,
     cancellation_requests: BTreeSet<FinalTaskId>,
     latest_notifications: BTreeMap<FinalTaskId, FinalTaskStatusNotification>,
     expires_at: BTreeMap<FinalTaskId, Instant>,
 }
 
 impl InMemoryFinalTaskStore {
-    /// Creates a store that refuses new tasks after retaining `max_tasks`.
+    /// Creates a store with the system monotonic clock and bounded retention.
     pub fn new(max_tasks: usize) -> McpResult<Self> {
+        Self::with_clock(max_tasks, Arc::new(Instant::now))
+    }
+
+    /// Creates a store with an application-supplied monotonic retention clock.
+    pub fn with_clock(
+        max_tasks: usize,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> McpResult<Self> {
         if max_tasks == 0 {
             return Err(McpError::invalid_params(
                 "In-memory final task store capacity must be positive",
@@ -1606,6 +1683,7 @@ impl InMemoryFinalTaskStore {
         }
         Ok(Self {
             max_tasks,
+            clock,
             state: Mutex::new(InMemoryFinalTaskState::default()),
         })
     }
@@ -1619,11 +1697,12 @@ impl InMemoryFinalTaskStore {
     /// Returns the current number of retained tasks.
     #[must_use]
     pub fn task_count(&self) -> usize {
+        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         state.tasks.len()
     }
 
@@ -1633,11 +1712,12 @@ impl InMemoryFinalTaskStore {
         &self,
         task_id: &FinalTaskId,
     ) -> Option<FinalTaskStatusNotification> {
+        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         state.latest_notifications.get(task_id).cloned()
     }
 }
@@ -1657,12 +1737,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     ) -> McpResult<()> {
         let task_id = task.base().task_id.clone();
         ensure_final_task_notification_matches_task(&task, &notification)?;
-        let expires_at = in_memory_final_task_expiry(&task)?;
+        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.tasks.contains_key(&task_id) {
             return Err(McpError::invalid_params("Task already exists"));
         }
@@ -1671,10 +1751,13 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 "In-memory final task store capacity reached",
             ));
         }
+        let expires_at = in_memory_final_task_expiry(&task, now)?;
+        let generation = next_in_memory_final_task_generation(&mut state)?;
         state
             .latest_notifications
             .insert(task_id.clone(), notification);
         state.tasks.insert(task_id.clone(), task);
+        state.generations.insert(task_id.clone(), generation);
         if let Some(expires_at) = expires_at {
             state.expires_at.insert(task_id, expires_at);
         }
@@ -1682,12 +1765,29 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
+        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         Ok(state.tasks.get(task_id).cloned())
+    }
+
+    fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        let Some(task) = state.tasks.get(task_id).cloned() else {
+            return Ok(None);
+        };
+        let generation = state.generations.get(task_id).copied().ok_or_else(|| {
+            McpError::internal_error("In-memory final task store is missing a task generation")
+        })?;
+        Ok(Some(FinalTaskSnapshot::new(task, generation)))
     }
 
     fn replace_task(
@@ -1697,40 +1797,90 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     ) -> McpResult<()> {
         let task_id = task.base().task_id.clone();
         ensure_final_task_notification_matches_task(&task, &notification)?;
+        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if !state.tasks.contains_key(&task_id) {
             return Err(McpError::invalid_params("Task not found"));
         }
-        state
-            .latest_notifications
-            .insert(task_id.clone(), notification);
-        state.tasks.insert(task_id, task);
+        replace_in_memory_final_task(&mut state, task, notification, now)?;
         Ok(())
+    }
+
+    fn replace_task_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+    ) -> McpResult<bool> {
+        let task_id = task.base().task_id.clone();
+        if expected.task().base().task_id != task_id {
+            return Err(McpError::invalid_params(
+                "Expected and replacement final task IDs must match",
+            ));
+        }
+        ensure_final_task_notification_matches_task(&task, &notification)?;
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        if state.generations.get(&task_id) != Some(&expected.generation()) {
+            return Ok(false);
+        }
+        replace_in_memory_final_task(&mut state, task, notification, now)?;
+        Ok(true)
     }
 
     fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
+        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if !state.tasks.contains_key(task_id) {
             return Err(McpError::invalid_params("Task not found"));
         }
-        state.cancellation_requests.insert(task_id.clone());
+        if !state.cancellation_requests.contains(task_id) {
+            let generation = next_in_memory_final_task_generation(&mut state)?;
+            state.cancellation_requests.insert(task_id.clone());
+            state.generations.insert(task_id.clone(), generation);
+        }
         Ok(())
     }
 
-    fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+    fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
+        let task_id = &expected.task().base().task_id;
+        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        if state.generations.get(task_id) != Some(&expected.generation()) {
+            return Ok(false);
+        }
+        if state.cancellation_requests.contains(task_id) {
+            return Ok(true);
+        }
+        let generation = next_in_memory_final_task_generation(&mut state)?;
+        state.cancellation_requests.insert(task_id.clone());
+        state.generations.insert(task_id.clone(), generation);
+        Ok(true)
+    }
+
+    fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if !state.tasks.contains_key(task_id) {
             return Err(McpError::invalid_params("Task not found"));
         }
@@ -1742,26 +1892,79 @@ fn ensure_final_task_notification_matches_task(
     task: &FinalTask,
     notification: &FinalTaskStatusNotification,
 ) -> McpResult<()> {
-    if notification.params.task.base().task_id != task.base().task_id {
+    let retained_task = serde_json::to_value(task).map_err(|error| {
+        McpError::internal_error(format!(
+            "Could not encode retained final task for validation: {error}"
+        ))
+    })?;
+    let notified_task = serde_json::to_value(&notification.params.task).map_err(|error| {
+        McpError::internal_error(format!(
+            "Could not encode final task notification for validation: {error}"
+        ))
+    })?;
+    if notified_task != retained_task {
         return Err(McpError::invalid_params(
-            "Final task notification task ID must match the retained task",
+            "Final task notification must contain exactly the retained task",
         ));
     }
     Ok(())
 }
 
-fn in_memory_final_task_expiry(task: &FinalTask) -> McpResult<Option<Instant>> {
-    let Some(ttl) = task.base().ttl_ms.as_ref() else {
+fn in_memory_final_task_expiry(task: &FinalTask, now: Instant) -> McpResult<Option<Instant>> {
+    let Some(ttl_ms) = task
+        .base()
+        .ttl_ms
+        .as_ref()
+        .map(FinalTaskDuration::as_millis)
+    else {
         return Ok(None);
     };
-    Instant::now()
-        .checked_add(StdDuration::from_millis(ttl.as_millis()))
+    now.checked_add(StdDuration::from_millis(ttl_ms))
         .map(Some)
         .ok_or_else(|| McpError::internal_error("Task TTL exceeds process-local clock range"))
 }
 
-fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState) {
-    let now = Instant::now();
+fn next_in_memory_final_task_generation(state: &mut InMemoryFinalTaskState) -> McpResult<u64> {
+    let generation = state.next_generation.checked_add(1).ok_or_else(|| {
+        McpError::internal_error("In-memory final task generation space is exhausted")
+    })?;
+    state.next_generation = generation;
+    Ok(generation)
+}
+
+fn replace_in_memory_final_task(
+    state: &mut InMemoryFinalTaskState,
+    task: FinalTask,
+    notification: FinalTaskStatusNotification,
+    now: Instant,
+) -> McpResult<()> {
+    let task_id = task.base().task_id.clone();
+    let expires_at = in_memory_final_task_expiry(&task, now)?;
+    let generation = next_in_memory_final_task_generation(state)?;
+    let terminal = matches!(
+        &task,
+        FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
+    );
+    state
+        .latest_notifications
+        .insert(task_id.clone(), notification);
+    state.tasks.insert(task_id.clone(), task);
+    state.generations.insert(task_id.clone(), generation);
+    match expires_at {
+        Some(expires_at) => {
+            state.expires_at.insert(task_id.clone(), expires_at);
+        }
+        None => {
+            state.expires_at.remove(&task_id);
+        }
+    }
+    if terminal {
+        state.cancellation_requests.remove(&task_id);
+    }
+    Ok(())
+}
+
+fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now: Instant) {
     let expired_task_ids = state
         .expires_at
         .iter()
@@ -1770,6 +1973,7 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState) {
     for task_id in expired_task_ids {
         state.expires_at.remove(&task_id);
         state.tasks.remove(&task_id);
+        state.generations.remove(&task_id);
         state.cancellation_requests.remove(&task_id);
         state.latest_notifications.remove(&task_id);
     }
@@ -1900,7 +2104,7 @@ impl FinalTaskRuntime {
     /// Returns the exact final `tasks/get` complete result.
     pub fn get_task(&self, task_id: &FinalTaskId) -> McpResult<FinalGetTaskResult> {
         Ok(fastmcp_protocol::CompleteTaskResult {
-            task: self.load_task(task_id)?,
+            task: self.load_task_snapshot(task_id)?.into_task(),
             meta: None,
             additional: BTreeMap::new(),
         })
@@ -1920,17 +2124,21 @@ impl FinalTaskRuntime {
         }
         FinalTaskInputLedger::from_requests(&input_requests)
             .map_err(|error| McpError::invalid_params(error.to_string()))?;
-        let current = self.load_task(task_id)?;
-        let FinalTask::Working(base) = current else {
+        let current = self.load_task_snapshot(task_id)?;
+        let FinalTask::Working(base) = current.task() else {
             return Err(McpError::invalid_params(
                 "only a working task can require client input",
             ));
         };
         let task = FinalTask::InputRequired {
-            base: transition_final_task_base(base, FinalTaskStatus::InputRequired, status_message)?,
+            base: transition_final_task_base(
+                base.clone(),
+                FinalTaskStatus::InputRequired,
+                status_message,
+            )?,
             input_requests,
         };
-        self.persist_replace(task.clone())?;
+        self.persist_transition(&current, task.clone())?;
         Ok(task)
     }
 
@@ -1940,14 +2148,15 @@ impl FinalTaskRuntime {
         task_id: &FinalTaskId,
         input_responses: &FinalTaskInputResponses,
     ) -> McpResult<UpdateTaskResult> {
-        let current = self.load_task(task_id)?;
+        let current = self.load_task_snapshot(task_id)?;
         let FinalTask::InputRequired {
             base,
-            mut input_requests,
-        } = current
+            input_requests,
+        } = current.task()
         else {
             return Ok(UpdateTaskResult::default());
         };
+        let mut input_requests = input_requests.clone();
         let ledger = FinalTaskInputLedger::from_requests(&input_requests)
             .map_err(|error| McpError::invalid_params(error.to_string()))?;
         ledger
@@ -1958,32 +2167,40 @@ impl FinalTaskRuntime {
         }
         let task = if input_requests.is_empty() {
             FinalTask::Working(transition_final_task_base(
-                base,
+                base.clone(),
                 FinalTaskStatus::Working,
                 None,
             )?)
         } else {
             FinalTask::InputRequired {
-                base: transition_final_task_base(base, FinalTaskStatus::InputRequired, None)?,
+                base: transition_final_task_base(
+                    base.clone(),
+                    FinalTaskStatus::InputRequired,
+                    None,
+                )?,
                 input_requests,
             }
         };
-        self.persist_replace(task)?;
+        self.persist_transition(&current, task)?;
         Ok(UpdateTaskResult::default())
     }
 
     /// Durably acknowledges cooperative `tasks/cancel` intent.
     pub fn cancel_task(&self, task_id: &FinalTaskId) -> McpResult<FinalCancelTaskResult> {
-        let current = self.load_task(task_id)?;
+        let current = self.load_task_snapshot(task_id)?;
         if matches!(
-            current,
+            current.task(),
             FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
         ) {
             return Err(McpError::invalid_params(
                 "terminal tasks cannot be cancelled",
             ));
         }
-        self.store.request_cancellation(task_id)?;
+        if !self.store.request_cancellation_if_current(&current)? {
+            return Err(McpError::invalid_params(
+                "Task state changed before cancellation could be recorded",
+            ));
+        }
         Ok(FinalCancelTaskResult::default())
     }
 
@@ -2003,9 +2220,9 @@ impl FinalTaskRuntime {
                 "task cancellation has not been requested",
             ));
         }
-        let current = self.load_task(task_id)?;
+        let current = self.load_task_snapshot(task_id)?;
         if matches!(
-            current,
+            current.task(),
             FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
         ) {
             return Err(McpError::invalid_params(
@@ -2013,11 +2230,11 @@ impl FinalTaskRuntime {
             ));
         }
         let task = FinalTask::Cancelled(transition_terminal_final_task_base(
-            current.base().clone(),
+            current.task().base().clone(),
             FinalTaskStatus::Cancelled,
             status_message,
         )?);
-        self.persist_replace(task.clone())?;
+        self.persist_transition(&current, task.clone())?;
         Ok(task)
     }
 
@@ -2028,19 +2245,19 @@ impl FinalTaskRuntime {
         result: FinalTaskCallToolResult,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
-        let current = self.load_task(task_id)?;
-        let FinalTask::Working(base) = current else {
+        let current = self.load_task_snapshot(task_id)?;
+        let FinalTask::Working(base) = current.task() else {
             return Err(McpError::invalid_params("only a working task can complete"));
         };
         let task = FinalTask::Completed {
             base: transition_terminal_final_task_base(
-                base,
+                base.clone(),
                 FinalTaskStatus::Completed,
                 status_message,
             )?,
             result,
         };
-        self.persist_replace(task.clone())?;
+        self.persist_transition(&current, task.clone())?;
         Ok(task)
     }
 
@@ -2051,36 +2268,36 @@ impl FinalTaskRuntime {
         error: FinalTaskError,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
-        let current = self.load_task(task_id)?;
+        let current = self.load_task_snapshot(task_id)?;
         if matches!(
-            current,
+            current.task(),
             FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
         ) {
             return Err(McpError::invalid_params("terminal tasks cannot fail"));
         }
         let task = FinalTask::Failed {
             base: transition_terminal_final_task_base(
-                current.base().clone(),
+                current.task().base().clone(),
                 FinalTaskStatus::Failed,
                 status_message,
             )?,
             error,
         };
-        self.persist_replace(task.clone())?;
+        self.persist_transition(&current, task.clone())?;
         Ok(task)
     }
 
-    fn load_task(&self, task_id: &FinalTaskId) -> McpResult<FinalTask> {
-        let task = self
+    fn load_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<FinalTaskSnapshot> {
+        let snapshot = self
             .store
-            .get_task(task_id)?
+            .get_task_snapshot(task_id)?
             .ok_or_else(|| McpError::invalid_params("Task not found"))?;
-        if &task.base().task_id != task_id {
+        if &snapshot.task().base().task_id != task_id {
             return Err(McpError::internal_error(
                 "Final task store returned a task under the wrong identifier",
             ));
         }
-        Ok(task)
+        Ok(snapshot)
     }
 
     fn persist_new(&self, task: FinalTask) -> McpResult<()> {
@@ -2090,9 +2307,16 @@ impl FinalTaskRuntime {
         Ok(())
     }
 
-    fn persist_replace(&self, task: FinalTask) -> McpResult<()> {
+    fn persist_transition(&self, expected: &FinalTaskSnapshot, task: FinalTask) -> McpResult<()> {
         let notification = final_task_notification(&task);
-        self.store.replace_task(task, notification.clone())?;
+        if !self
+            .store
+            .replace_task_if_current(expected, task, notification.clone())?
+        {
+            return Err(McpError::invalid_params(
+                "Task state changed before the transition could be recorded",
+            ));
+        }
         self.emit(notification);
         Ok(())
     }
@@ -2243,6 +2467,7 @@ pub type SharedTaskManager = Arc<TaskManager>;
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::thread;
     use std::time::Duration;
@@ -2275,6 +2500,47 @@ mod tests {
                 .expect("typed roots input request"),
         );
         requests
+    }
+
+    fn final_working_task_without_ttl(task_id: &str) -> FinalTask {
+        let timestamp = FinalTaskTimestamp::parse("2026-07-28T12:00:00.000Z")
+            .expect("fixed test timestamp is valid");
+        FinalTask::Working(FinalTaskBase {
+            task_id: FinalTaskId::parse(task_id).expect("fixed test task ID is valid"),
+            status: FinalTaskStatus::Working,
+            status_message: None,
+            created_at: timestamp.clone(),
+            last_updated_at: timestamp,
+            ttl_ms: None,
+            poll_interval_ms: None,
+        })
+    }
+
+    fn final_working_task_with_ttl(task_id: &str, ttl_ms: u64) -> FinalTask {
+        let FinalTask::Working(mut base) = final_working_task_without_ttl(task_id) else {
+            unreachable!("the helper always constructs a working task");
+        };
+        base.ttl_ms = Some(final_task_duration(ttl_ms).expect("fixed test task TTL is valid"));
+        FinalTask::Working(base)
+    }
+
+    fn in_memory_store_with_test_clock(
+        max_tasks: usize,
+    ) -> (Arc<InMemoryFinalTaskStore>, Arc<Mutex<Instant>>) {
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let clock_now = Arc::clone(&now);
+        let clock: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(move || {
+            *clock_now
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        (
+            Arc::new(
+                InMemoryFinalTaskStore::with_clock(max_tasks, clock)
+                    .expect("positive bounded store capacity is valid"),
+            ),
+            now,
+        )
     }
 
     #[test]
@@ -2332,6 +2598,257 @@ mod tests {
                 .task,
             FinalTask::Working(_)
         ));
+    }
+
+    #[test]
+    fn task_03_in_memory_store_positive_ttl_reclaims_capacity_at_deterministic_deadline() {
+        const TTL_MS: u64 = 60_000;
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let first = final_working_task_with_ttl("task-positive-ttl-first", TTL_MS);
+        let first_id = first.base().task_id.clone();
+        store
+            .create_task(first.clone(), final_task_notification(&first))
+            .expect("first task fits the bounded store");
+        let mut clock = now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *clock = clock
+            .checked_add(StdDuration::from_millis(TTL_MS))
+            .expect("positive task TTL fits the monotonic test clock");
+        drop(clock);
+
+        let second = final_working_task_without_ttl("task-positive-ttl-second");
+        let second_id = second.base().task_id.clone();
+        store
+            .create_task(second.clone(), final_task_notification(&second))
+            .expect("the expired first task releases bounded capacity");
+
+        assert!(
+            store
+                .get_task(&first_id)
+                .expect("expired task lookup is readable")
+                .is_none()
+        );
+        assert!(store.latest_notification(&first_id).is_none());
+        assert_eq!(store.task_count(), 1);
+        assert!(
+            store
+                .get_task(&second_id)
+                .expect("replacement task lookup is readable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn task_03_in_memory_store_positive_ttl_one_millisecond_before_deadline_preserves_state() {
+        const TTL_MS: u64 = 60_000;
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let first = final_working_task_with_ttl("task-positive-ttl-first", TTL_MS);
+        let first_id = first.base().task_id.clone();
+        store
+            .create_task(first.clone(), final_task_notification(&first))
+            .expect("first task fits the bounded store");
+        let mut clock = now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *clock = clock
+            .checked_add(StdDuration::from_millis(TTL_MS - 1))
+            .expect("pre-deadline duration fits the monotonic test clock");
+        drop(clock);
+
+        let second = final_working_task_without_ttl("task-positive-ttl-second");
+        assert!(
+            store
+                .create_task(second.clone(), final_task_notification(&second))
+                .is_err(),
+            "only advancing the clock by one fewer millisecond preserves the first task"
+        );
+        assert_eq!(store.task_count(), 1);
+        assert!(
+            store
+                .get_task(&first_id)
+                .expect("pre-deadline task lookup is readable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn task_03_in_memory_store_absent_ttl_has_no_automatic_expiry() {
+        const ELAPSED_MS: u64 = 60_000;
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let first = final_working_task_without_ttl("task-absent-ttl-first");
+        let first_id = first.base().task_id.clone();
+        store
+            .create_task(first.clone(), final_task_notification(&first))
+            .expect("first task without a TTL fits the bounded store");
+        let mut clock = now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *clock = clock
+            .checked_add(StdDuration::from_millis(ELAPSED_MS))
+            .expect("test clock can advance without an automatic task expiry");
+        drop(clock);
+
+        let second = final_working_task_without_ttl("task-absent-ttl-second");
+        assert!(
+            store
+                .create_task(second.clone(), final_task_notification(&second))
+                .is_err(),
+            "an omitted TTL leaves the first task retained and capacity unavailable"
+        );
+        assert_eq!(store.task_count(), 1);
+        assert!(
+            store
+                .get_task(&first_id)
+                .expect("task without a TTL remains readable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn task_03_in_memory_store_rejects_stale_transition_after_terminal_commit() {
+        let store = InMemoryFinalTaskStore::default();
+        let working = final_working_task_without_ttl("task-atomic-transition");
+        let task_id = working.base().task_id.clone();
+        store
+            .create_task(working.clone(), final_task_notification(&working))
+            .expect("working task creates");
+        let working_snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("working task snapshot is readable")
+            .expect("working task snapshot is retained");
+
+        let mut cancelled_base = working.base().clone();
+        cancelled_base.status = FinalTaskStatus::Cancelled;
+        let cancelled = FinalTask::Cancelled(cancelled_base);
+        assert!(
+            store
+                .replace_task_if_current(
+                    &working_snapshot,
+                    cancelled.clone(),
+                    final_task_notification(&cancelled),
+                )
+                .expect("terminal compare-and-replace is readable")
+        );
+
+        let mut input_required_base = working.base().clone();
+        input_required_base.status = FinalTaskStatus::InputRequired;
+        let stale_input_required = FinalTask::InputRequired {
+            base: input_required_base,
+            input_requests: final_roots_request(),
+        };
+        assert!(
+            !store
+                .replace_task_if_current(
+                    &working_snapshot,
+                    stale_input_required.clone(),
+                    final_task_notification(&stale_input_required),
+                )
+                .expect("stale compare-and-replace is readable"),
+            "the stale working snapshot cannot overwrite a terminal transition"
+        );
+        assert!(matches!(
+            store
+                .get_task(&task_id)
+                .expect("terminal task lookup is readable"),
+            Some(FinalTask::Cancelled(_))
+        ));
+    }
+
+    #[test]
+    fn task_03_final_task_snapshot_public_constructor_retains_opaque_generation() {
+        let task = final_working_task_without_ttl("task-public-snapshot");
+        let task_id = task.base().task_id.clone();
+        let snapshot = FinalTaskSnapshot::new(task, 41);
+
+        assert_eq!(snapshot.task().base().task_id, task_id);
+        assert_eq!(snapshot.generation(), 41);
+    }
+
+    #[test]
+    fn task_03_in_memory_store_generation_rejects_aba_replacement() {
+        let store = InMemoryFinalTaskStore::default();
+        let working = final_working_task_without_ttl("task-generation-aba");
+        let task_id = working.base().task_id.clone();
+        store
+            .create_task(working.clone(), final_task_notification(&working))
+            .expect("working task creates");
+        let initial_snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("initial snapshot is readable")
+            .expect("working task is retained");
+
+        assert!(
+            store
+                .replace_task_if_current(
+                    &initial_snapshot,
+                    working.clone(),
+                    final_task_notification(&working),
+                )
+                .expect("same-value replacement is accepted for the current generation")
+        );
+        assert!(
+            !store
+                .replace_task_if_current(
+                    &initial_snapshot,
+                    working.clone(),
+                    final_task_notification(&working),
+                )
+                .expect("stale same-value replacement is readable"),
+            "only the store generation changes, so a reused wire value cannot pass CAS"
+        );
+    }
+
+    #[test]
+    fn task_03_in_memory_store_replacement_recomputes_expiry_atomically() {
+        const TTL_MS: u64 = 60_000;
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let expiring = final_working_task_with_ttl("task-replacement-expiry", TTL_MS);
+        let task_id = expiring.base().task_id.clone();
+        store
+            .create_task(expiring.clone(), final_task_notification(&expiring))
+            .expect("expiring task creates");
+
+        let non_expiring = final_working_task_without_ttl("task-replacement-expiry");
+        store
+            .replace_task(non_expiring.clone(), final_task_notification(&non_expiring))
+            .expect("finite-to-absent replacement updates retained expiry atomically");
+        let mut clock = now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *clock = clock
+            .checked_add(StdDuration::from_millis(TTL_MS))
+            .expect("test clock reaches the original expiry");
+        drop(clock);
+        assert!(
+            store
+                .get_task(&task_id)
+                .expect("replacement task lookup is readable")
+                .is_some(),
+            "removing the TTL removes the original expiry at the same replacement boundary"
+        );
+
+        let expiring_again = final_working_task_with_ttl("task-replacement-expiry", TTL_MS);
+        store
+            .replace_task(
+                expiring_again.clone(),
+                final_task_notification(&expiring_again),
+            )
+            .expect("absent-to-finite replacement installs a new expiry atomically");
+        let mut clock = now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *clock = clock
+            .checked_add(StdDuration::from_millis(TTL_MS))
+            .expect("test clock reaches the replacement expiry");
+        drop(clock);
+        assert!(
+            store
+                .get_task(&task_id)
+                .expect("expired replacement task lookup is readable")
+                .is_none(),
+            "only the replacement TTL changes from the retained non-expiring baseline"
+        );
     }
 
     #[test]
@@ -2440,6 +2957,62 @@ mod tests {
                 .expect("serialize post-rejection notification"),
             first_notification_before,
             "mismatched notification cannot replace the retained notification"
+        );
+    }
+
+    #[test]
+    fn task_03_in_memory_store_rejects_same_id_notification_base_drift_without_mutation() {
+        let store = InMemoryFinalTaskStore::default();
+        let task = final_working_task_without_ttl("task-notification-base-drift");
+        let task_id = task.base().task_id.clone();
+        let notification = final_task_notification(&task);
+        store
+            .create_task(task.clone(), notification.clone())
+            .expect("matching task and notification create");
+        let snapshot_before = store
+            .get_task_snapshot(&task_id)
+            .expect("stored task snapshot is readable")
+            .expect("created task is retained");
+        let task_before = serde_json::to_value(snapshot_before.task())
+            .expect("serialize retained task before rejection");
+        let notification_before = serde_json::to_value(&notification)
+            .expect("serialize retained notification before rejection");
+
+        let mut drifted_notification = notification.clone();
+        let FinalTask::Working(base) = &mut drifted_notification.params.task else {
+            panic!("baseline notification contains the working task");
+        };
+        base.status_message = Some("only the notification task base drifted".to_owned());
+
+        let error = store
+            .replace_task_if_current(&snapshot_before, task, drifted_notification)
+            .expect_err("same-ID notification base drift must be rejected");
+
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        let snapshot_after = store
+            .get_task_snapshot(&task_id)
+            .expect("stored task snapshot remains readable")
+            .expect("rejection preserves the retained task");
+        assert_eq!(
+            serde_json::to_value(snapshot_after.task())
+                .expect("serialize retained task after rejection"),
+            task_before,
+            "rejection preserves the retained task"
+        );
+        assert_eq!(
+            snapshot_after.generation(),
+            snapshot_before.generation(),
+            "rejection preserves the compare-and-swap generation"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                store
+                    .latest_notification(&task_id)
+                    .expect("rejection preserves the retained notification"),
+            )
+            .expect("serialize retained notification after rejection"),
+            notification_before,
+            "rejection preserves the retained notification"
         );
     }
 

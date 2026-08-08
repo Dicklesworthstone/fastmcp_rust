@@ -115,7 +115,7 @@ use session::{
 };
 pub use tasks::{
     DEFAULT_IN_MEMORY_FINAL_TASKS, FinalTaskNotificationEmitter, FinalTaskRuntime,
-    FinalTaskRuntimeConfig, FinalTaskStore, InMemoryFinalTaskStore,
+    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, InMemoryFinalTaskStore,
 };
 #[cfg(test)]
 pub(crate) use tasks::{SharedTaskManager, TaskManager};
@@ -992,6 +992,50 @@ fn stdio_opening_frame(request: &JsonRpcRequest) -> StdioOpeningFrame {
         StdioOpeningFrame::LegacyInitialize
     } else {
         StdioOpeningFrame::RequestWithoutModernMetadata
+    }
+}
+
+/// Classifies the first complete stdio envelope before any envelope-specific
+/// side effect can run. Auto selection is one-shot: a response, an invalid
+/// request, or a notification without final metadata is a terminal opening
+/// rejection rather than a frame the pump may ignore and retry after.
+fn classify_initial_stdio_envelope(
+    classifier: &mut StdioEraClassifier,
+    message: &JsonRpcMessage,
+) -> Result<ProtocolEra, StdioEraDecision> {
+    let opening = match message {
+        JsonRpcMessage::Response(_) => StdioOpeningFrame::Response,
+        JsonRpcMessage::Request(request) if request.validate().is_err() => {
+            StdioOpeningFrame::Malformed
+        }
+        JsonRpcMessage::Request(request) => stdio_opening_frame(request),
+    };
+    match classifier.classify_opening(opening) {
+        StdioEraDecision::Selected {
+            era: ProtocolEra::Modern2026,
+            modern_version: Some(ModernVersionSupport::Supported),
+        } => Ok(ProtocolEra::Modern2026),
+        StdioEraDecision::Selected {
+            era: ProtocolEra::Legacy2024,
+            modern_version: None,
+        } => Ok(ProtocolEra::Legacy2024),
+        decision => Err(decision),
+    }
+}
+
+/// Rejects a malformed receive failure as an Auto connection's terminal
+/// opening frame. Later malformed frames retain ordinary JSON-RPC recovery
+/// behavior because their era was already selected.
+fn reject_initial_stdio_malformed(classifier: &mut StdioEraClassifier) -> StdioEraDecision {
+    classifier.classify_opening(StdioOpeningFrame::Malformed)
+}
+
+fn cancelled_notification_matches_stdio_era(era: ProtocolEra, request: &JsonRpcRequest) -> bool {
+    match era {
+        ProtocolEra::Legacy2024 => modern_protocol_version(request).is_none(),
+        ProtocolEra::Modern2026 => {
+            modern_protocol_version(request) == Some(MODERN_PROTOCOL_VERSION)
+        }
     }
 }
 
@@ -3550,6 +3594,13 @@ impl Server {
         }
     }
 
+    fn reject_invalid_launch_policy_or_exit(&self) {
+        if let Err(error) = self.ensure_launch_policy_is_valid() {
+            error!(target: targets::SERVER, "Server startup rejected: {error}");
+            std::process::exit(1);
+        }
+    }
+
     /// Returns the installed frozen extension handler registry, if configured.
     #[must_use]
     pub fn extension_handler_registry(&self) -> Option<&ExtensionHandlerRegistry> {
@@ -4941,6 +4992,7 @@ impl Server {
     /// blocking stdio pump runs as a caller-owned blocking child, leaving the
     /// caller runtime free to schedule bounded, request-owned modern children.
     pub fn run_stdio(self) -> ! {
+        self.reject_invalid_launch_policy_or_exit();
         block_on(async move {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
             self.run_stdio_with_cx(&cx).await
@@ -4963,6 +5015,7 @@ impl Server {
     /// shutdown hook; running a hook concurrently with a live handler would
     /// violate the hook's quiescence contract.
     pub async fn run_stdio_with_cx(self, cx: &Cx) -> ! {
+        self.reject_invalid_launch_policy_or_exit();
         let dispatch_cx = cx.clone();
         let mut pump =
             match cx.spawn_blocking(move |pump_cx| self.run_stdio_pump(&pump_cx, &dispatch_cx)) {
@@ -4989,10 +5042,6 @@ impl Server {
     }
 
     fn run_stdio_pump(self, cx: &Cx, dispatch_cx: &Cx) -> i32 {
-        if let Err(error) = self.ensure_launch_policy_is_valid() {
-            log::error!(target: "fastmcp_rust::server", "Server startup rejected: {error}");
-            return 1;
-        }
         // Initialize rich logging first, before any log output
         self.init_rich_logging();
 
@@ -5095,6 +5144,7 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
+        self.reject_invalid_launch_policy_or_exit();
         block_on(async move {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
             self.run_transport_with_cx(&cx, transport)
@@ -5108,6 +5158,7 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
+        self.reject_invalid_launch_policy_or_exit();
         self.run_transport_with_label(cx, transport, "custom")
     }
 
@@ -5115,6 +5166,7 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
+        self.reject_invalid_launch_policy_or_exit();
         self.init_rich_logging();
 
         let shared = SharedTransport::new(transport);
@@ -5271,6 +5323,7 @@ impl Server {
         R: TransportRecvHalf + Send + 'static,
         S: TransportSendHalf + 'static,
     {
+        self.reject_invalid_launch_policy_or_exit();
         let dispatch_cx = cx.clone();
         let mut pump = match cx.spawn_blocking(move |pump_cx| {
             self.run_split_transport_returning_with_dispatch_cx(
@@ -5327,6 +5380,7 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
+        self.ensure_launch_policy_is_valid()?;
         block_on(async move {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
             self.run_transport_returning_with_cx(&cx, transport)
@@ -5341,6 +5395,7 @@ impl Server {
         W: Write + Send + 'static,
         R: Iterator<Item = JsonRpcRequest> + Send + 'static,
     {
+        self.reject_invalid_launch_policy_or_exit();
         let (recv_half, send_half) =
             SseServerTransport::new(writer, request_source, endpoint_url).into_split();
         block_on(async move {
@@ -5362,6 +5417,7 @@ impl Server {
         W: Write + Send + 'static,
         R: Iterator<Item = JsonRpcRequest> + Send + 'static,
     {
+        self.reject_invalid_launch_policy_or_exit();
         let (recv_half, send_half) =
             SseServerTransport::new(writer, request_source, endpoint_url).into_split();
         self.run_split_transport_with_label(cx, recv_half, send_half, "sse")
@@ -5376,21 +5432,25 @@ impl Server {
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
-        let transport = WsTransport::new(reader, writer);
+        self.reject_invalid_launch_policy_or_exit();
+        let (recv_half, send_half) = WsTransport::new(reader, writer).into_split();
         block_on(async move {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.run_transport_with_label(&cx, transport, "websocket")
+            self.run_split_transport_with_label(&cx, recv_half, send_half, "websocket")
+                .await
         })
     }
 
     /// Runs the server using WebSocket transport with a provided Cx.
-    pub fn run_websocket_with_cx<R, W>(self, cx: &Cx, reader: R, writer: W) -> !
+    pub async fn run_websocket_with_cx<R, W>(self, cx: &Cx, reader: R, writer: W) -> !
     where
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
-        let transport = WsTransport::new(reader, writer);
-        self.run_transport_with_label(cx, transport, "websocket")
+        self.reject_invalid_launch_policy_or_exit();
+        let (recv_half, send_half) = WsTransport::new(reader, writer).into_split();
+        self.run_split_transport_with_label(cx, recv_half, send_half, "websocket")
+            .await
     }
 
     // =========================================================================
@@ -6300,26 +6360,52 @@ impl Server {
                     break;
                 }
                 Err(TransportError::Cancelled) => break,
-                Err(error) => match classify_receive_error(&error) {
-                    ReceiveErrorDisposition::ReplyWithParseError => {
-                        if send_uncorrelated_parse_error(&send, cx).is_err() {
-                            exit_code = 1;
-                            break;
-                        }
-                        continue;
-                    }
-                    ReceiveErrorDisposition::ReplyWithInvalidRequest(request_id) => {
-                        if send_invalid_request(&send, cx, request_id).is_err() {
-                            exit_code = 1;
-                            break;
-                        }
-                        continue;
-                    }
-                    ReceiveErrorDisposition::Terminate => {
+                Err(error) => {
+                    let disposition = classify_receive_error(&error);
+                    if enforce_runtime_era
+                        && negotiated_era.is_none()
+                        && matches!(
+                            &disposition,
+                            ReceiveErrorDisposition::ReplyWithParseError
+                                | ReceiveErrorDisposition::ReplyWithInvalidRequest(_)
+                        )
+                    {
+                        let _ = reject_initial_stdio_malformed(&mut era_classifier);
+                        let _ = match disposition {
+                            ReceiveErrorDisposition::ReplyWithParseError => {
+                                send_uncorrelated_parse_error(&send, cx)
+                            }
+                            ReceiveErrorDisposition::ReplyWithInvalidRequest(request_id) => {
+                                send_invalid_request(&send, cx, request_id)
+                            }
+                            ReceiveErrorDisposition::Terminate => unreachable!(
+                                "only recoverable malformed input reaches the Auto opening rejection"
+                            ),
+                        };
                         exit_code = 1;
                         break;
                     }
-                },
+                    match disposition {
+                        ReceiveErrorDisposition::ReplyWithParseError => {
+                            if send_uncorrelated_parse_error(&send, cx).is_err() {
+                                exit_code = 1;
+                                break;
+                            }
+                            continue;
+                        }
+                        ReceiveErrorDisposition::ReplyWithInvalidRequest(request_id) => {
+                            if send_invalid_request(&send, cx, request_id).is_err() {
+                                exit_code = 1;
+                                break;
+                            }
+                            continue;
+                        }
+                        ReceiveErrorDisposition::Terminate => {
+                            exit_code = 1;
+                            break;
+                        }
+                    }
+                }
             };
 
             // The receive implementation rechecks its stop predicate after a
@@ -6329,6 +6415,29 @@ impl Server {
             if worker_failed.load(Ordering::Acquire) {
                 exit_code = 1;
                 break;
+            }
+
+            if enforce_runtime_era && negotiated_era.is_none() {
+                match classify_initial_stdio_envelope(&mut era_classifier, &message) {
+                    Ok(era) => negotiated_era = Some(era),
+                    Err(_) => {
+                        if let JsonRpcMessage::Request(request) = &message {
+                            let _ = if request.validate().is_err() {
+                                send_invalid_request(&send, cx, request.id.clone())
+                            } else if let Some(response) = protocol_era_refusal(request) {
+                                send.lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                    cx,
+                                    &JsonRpcMessage::Response(response),
+                                )
+                            } else {
+                                Ok(())
+                            };
+                        }
+                        exit_code = 1;
+                        break;
+                    }
+                }
             }
 
             // Account at the receive boundary so queued, rejected, cancelled,
@@ -6369,6 +6478,14 @@ impl Server {
                 JsonRpcMessage::Request(mut request)
                     if request.id.is_none() && request.method == "notifications/cancelled" =>
                 {
+                    let Some(era) = negotiated_era else {
+                        exit_code = 1;
+                        break;
+                    };
+                    if !cancelled_notification_matches_stdio_era(era, &request) {
+                        exit_code = 1;
+                        break;
+                    }
                     if request.validate().is_err() {
                         if send_invalid_request(&send, cx, request.id).is_err() {
                             exit_code = 1;
@@ -11070,12 +11187,47 @@ mod lib_unit_tests {
     }
 
     #[derive(Default)]
+    struct ServerFinalTaskState {
+        tasks: std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, fastmcp_protocol::Task>,
+        generations: std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, u64>,
+        next_generation: u64,
+        cancellation_requests: std::collections::BTreeSet<fastmcp_protocol::FinalTaskId>,
+        notifications: Vec<fastmcp_protocol::TaskStatusNotification>,
+    }
+
+    #[derive(Default)]
     struct ServerFinalTaskStore {
-        tasks: Mutex<
-            std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, fastmcp_protocol::Task>,
-        >,
-        cancellation_requests: Mutex<std::collections::BTreeSet<fastmcp_protocol::FinalTaskId>>,
-        notifications: Mutex<Vec<fastmcp_protocol::TaskStatusNotification>>,
+        state: Mutex<ServerFinalTaskState>,
+    }
+
+    fn next_server_final_task_generation(state: &mut ServerFinalTaskState) -> McpResult<u64> {
+        let generation = state.next_generation.checked_add(1).ok_or_else(|| {
+            McpError::internal_error("Server final task test-store generation space is exhausted")
+        })?;
+        state.next_generation = generation;
+        Ok(generation)
+    }
+
+    fn ensure_server_final_task_notification_matches_task(
+        task: &fastmcp_protocol::Task,
+        notification: &fastmcp_protocol::TaskStatusNotification,
+    ) -> McpResult<()> {
+        let retained_task = serde_json::to_value(task).map_err(|error| {
+            McpError::internal_error(format!(
+                "Could not encode retained final task for validation: {error}"
+            ))
+        })?;
+        let notified_task = serde_json::to_value(&notification.params.task).map_err(|error| {
+            McpError::internal_error(format!(
+                "Could not encode final task notification for validation: {error}"
+            ))
+        })?;
+        if notified_task != retained_task {
+            return Err(McpError::invalid_params(
+                "Final task notification must contain exactly the retained task",
+            ));
+        }
+        Ok(())
     }
 
     impl FinalTaskStore for ServerFinalTaskStore {
@@ -11085,18 +11237,18 @@ mod lib_unit_tests {
             notification: fastmcp_protocol::TaskStatusNotification,
         ) -> McpResult<()> {
             let task_id = task.base().task_id.clone();
-            let mut tasks = self
-                .tasks
+            ensure_server_final_task_notification_matches_task(&task, &notification)?;
+            let mut state = self
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if tasks.contains_key(&task_id) {
+            if state.tasks.contains_key(&task_id) {
                 return Err(McpError::invalid_params("Task already exists"));
             }
-            tasks.insert(task_id, task);
-            self.notifications
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(notification);
+            let generation = next_server_final_task_generation(&mut state)?;
+            state.tasks.insert(task_id.clone(), task);
+            state.generations.insert(task_id, generation);
+            state.notifications.push(notification);
             Ok(())
         }
 
@@ -11105,11 +11257,29 @@ mod lib_unit_tests {
             task_id: &fastmcp_protocol::FinalTaskId,
         ) -> McpResult<Option<fastmcp_protocol::Task>> {
             Ok(self
-                .tasks
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tasks
                 .get(task_id)
                 .cloned())
+        }
+
+        fn get_task_snapshot(
+            &self,
+            task_id: &fastmcp_protocol::FinalTaskId,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(task) = state.tasks.get(task_id).cloned() else {
+                return Ok(None);
+            };
+            let generation = state.generations.get(task_id).copied().ok_or_else(|| {
+                McpError::internal_error("Server final task test store is missing a generation")
+            })?;
+            Ok(Some(FinalTaskSnapshot::new(task, generation)))
         }
 
         fn replace_task(
@@ -11118,45 +11288,190 @@ mod lib_unit_tests {
             notification: fastmcp_protocol::TaskStatusNotification,
         ) -> McpResult<()> {
             let task_id = task.base().task_id.clone();
-            let mut tasks = self
-                .tasks
+            ensure_server_final_task_notification_matches_task(&task, &notification)?;
+            let mut state = self
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !tasks.contains_key(&task_id) {
+            if !state.tasks.contains_key(&task_id) {
                 return Err(McpError::invalid_params("Task not found"));
             }
-            tasks.insert(task_id, task);
-            self.notifications
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(notification);
+            let generation = next_server_final_task_generation(&mut state)?;
+            let terminal = matches!(
+                &task,
+                fastmcp_protocol::Task::Completed { .. }
+                    | fastmcp_protocol::Task::Failed { .. }
+                    | fastmcp_protocol::Task::Cancelled(_)
+            );
+            state.tasks.insert(task_id.clone(), task);
+            state.generations.insert(task_id.clone(), generation);
+            state.notifications.push(notification);
+            if terminal {
+                state.cancellation_requests.remove(&task_id);
+            }
             Ok(())
         }
 
+        fn replace_task_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            task: fastmcp_protocol::Task,
+            notification: fastmcp_protocol::TaskStatusNotification,
+        ) -> McpResult<bool> {
+            let task_id = task.base().task_id.clone();
+            if expected.task().base().task_id != task_id {
+                return Err(McpError::invalid_params(
+                    "Expected and replacement final task IDs must match",
+                ));
+            }
+            ensure_server_final_task_notification_matches_task(&task, &notification)?;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.generations.get(&task_id) != Some(&expected.generation()) {
+                return Ok(false);
+            }
+            let generation = next_server_final_task_generation(&mut state)?;
+            let terminal = matches!(
+                &task,
+                fastmcp_protocol::Task::Completed { .. }
+                    | fastmcp_protocol::Task::Failed { .. }
+                    | fastmcp_protocol::Task::Cancelled(_)
+            );
+            state.tasks.insert(task_id.clone(), task);
+            state.generations.insert(task_id.clone(), generation);
+            state.notifications.push(notification);
+            if terminal {
+                state.cancellation_requests.remove(&task_id);
+            }
+            Ok(true)
+        }
+
         fn request_cancellation(&self, task_id: &fastmcp_protocol::FinalTaskId) -> McpResult<()> {
-            if self.get_task(task_id)?.is_none() {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.tasks.contains_key(task_id) {
                 return Err(McpError::invalid_params("Task not found"));
             }
-            self.cancellation_requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(task_id.clone());
+            if !state.cancellation_requests.contains(task_id) {
+                let generation = next_server_final_task_generation(&mut state)?;
+                state.cancellation_requests.insert(task_id.clone());
+                state.generations.insert(task_id.clone(), generation);
+            }
             Ok(())
+        }
+
+        fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
+            let task_id = &expected.task().base().task_id;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.generations.get(task_id) != Some(&expected.generation()) {
+                return Ok(false);
+            }
+            if !state.cancellation_requests.contains(task_id) {
+                let generation = next_server_final_task_generation(&mut state)?;
+                state.cancellation_requests.insert(task_id.clone());
+                state.generations.insert(task_id.clone(), generation);
+            }
+            Ok(true)
         }
 
         fn is_cancellation_requested(
             &self,
             task_id: &fastmcp_protocol::FinalTaskId,
         ) -> McpResult<bool> {
-            if self.get_task(task_id)?.is_none() {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.tasks.contains_key(task_id) {
                 return Err(McpError::invalid_params("Task not found"));
             }
-            Ok(self
-                .cancellation_requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(task_id))
+            Ok(state.cancellation_requests.contains(task_id))
         }
+    }
+
+    #[test]
+    fn server_final_task_store_rejects_same_id_notification_base_drift_without_mutation() {
+        let store = Arc::new(ServerFinalTaskStore::default());
+        let runtime = FinalTaskRuntime::new(
+            Arc::clone(&store) as Arc<dyn FinalTaskStore>,
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000))
+                .expect("valid final Tasks timing policy"),
+            Arc::new(|_| {}),
+        );
+        let created = runtime
+            .create_task(None)
+            .expect("matching task and notification create");
+        let task_id = created.task.base().task_id.clone();
+        let snapshot_before = store
+            .get_task_snapshot(&task_id)
+            .expect("stored task snapshot is readable")
+            .expect("created task is retained");
+        let task_before = serde_json::to_value(snapshot_before.task())
+            .expect("serialize retained task before rejection");
+        let notifications_before = {
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            serde_json::to_value(&state.notifications)
+                .expect("serialize retained notifications before rejection")
+        };
+
+        let mut drifted_notification = {
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .notifications
+                .last()
+                .cloned()
+                .expect("created task retains its notification")
+        };
+        let fastmcp_protocol::Task::Working(base) = &mut drifted_notification.params.task else {
+            panic!("baseline notification contains the working task");
+        };
+        base.status_message = Some("only the notification task base drifted".to_owned());
+
+        let error = store
+            .replace_task_if_current(&snapshot_before, created.task, drifted_notification)
+            .expect_err("same-ID notification base drift must be rejected");
+
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        let snapshot_after = store
+            .get_task_snapshot(&task_id)
+            .expect("stored task snapshot remains readable")
+            .expect("rejection preserves the retained task");
+        assert_eq!(
+            serde_json::to_value(snapshot_after.task())
+                .expect("serialize retained task after rejection"),
+            task_before,
+            "rejection preserves the retained task"
+        );
+        assert_eq!(
+            snapshot_after.generation(),
+            snapshot_before.generation(),
+            "rejection preserves the compare-and-swap generation"
+        );
+        let notifications_after = {
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            serde_json::to_value(&state.notifications)
+                .expect("serialize retained notifications after rejection")
+        };
+        assert_eq!(
+            notifications_after, notifications_before,
+            "rejection preserves the retained notification history"
+        );
     }
 
     fn final_tasks_test_runtime(
@@ -11468,9 +11783,10 @@ mod lib_unit_tests {
         );
         assert_eq!(
             store
-                .tasks
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tasks
                 .len(),
             1,
             "the admitted result must name a task already durable in the application store"
@@ -11493,9 +11809,10 @@ mod lib_unit_tests {
         );
         assert_eq!(
             store
-                .tasks
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tasks
                 .len(),
             1,
             "rejected task capability must leave durable state unchanged"
@@ -11529,9 +11846,10 @@ mod lib_unit_tests {
         );
         assert_eq!(
             store
-                .tasks
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tasks
                 .len(),
             1,
             "exact MCP 2024-11-05 must never enter the final task producer"
@@ -14345,6 +14663,264 @@ mod lib_unit_tests {
         }
     }
 
+    fn run_live_websocket_split<R, W>(server: Server, reader: R, writer: W) -> Result<(), String>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        let (recv_half, send_half) = WsTransport::new(reader, writer).into_split();
+        run_live_split_transport(server, recv_half, send_half)
+    }
+
+    fn masked_websocket_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mask = [0x41, 0x73, 0x19, 0xC7];
+        let mut frame = Vec::with_capacity(payload.len() + 14);
+        frame.push(0x80 | opcode);
+        match payload.len() {
+            length @ 0..=125 => frame.push(0x80 | length as u8),
+            length @ 126..=65_535 => {
+                frame.push(0x80 | 126);
+                frame.extend_from_slice(&(length as u16).to_be_bytes());
+            }
+            length => {
+                frame.push(0x80 | 127);
+                frame.extend_from_slice(&(length as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+        );
+        frame
+    }
+
+    fn masked_websocket_message(message: JsonRpcMessage) -> Vec<u8> {
+        let payload = serde_json::to_vec(&message)
+            .expect("live WebSocket request fixture must serialize to JSON-RPC");
+        masked_websocket_frame(0x01, &payload)
+    }
+
+    fn websocket_responses(output: &Arc<Mutex<Vec<u8>>>) -> Vec<JsonRpcResponse> {
+        let output = output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut responses = Vec::new();
+        let mut offset = 0;
+
+        while offset + 2 <= output.len() {
+            let first = output[offset];
+            let second = output[offset + 1];
+            let opcode = first & 0x0F;
+            let masked = second & 0x80 != 0;
+            offset += 2;
+
+            let mut payload_length = usize::from(second & 0x7F);
+            match payload_length {
+                126 => {
+                    if offset + 2 > output.len() {
+                        break;
+                    }
+                    payload_length =
+                        usize::from(u16::from_be_bytes([output[offset], output[offset + 1]]));
+                    offset += 2;
+                }
+                127 => {
+                    if offset + 8 > output.len() {
+                        break;
+                    }
+                    let Ok(length) = usize::try_from(u64::from_be_bytes([
+                        output[offset],
+                        output[offset + 1],
+                        output[offset + 2],
+                        output[offset + 3],
+                        output[offset + 4],
+                        output[offset + 5],
+                        output[offset + 6],
+                        output[offset + 7],
+                    ])) else {
+                        break;
+                    };
+                    payload_length = length;
+                    offset += 8;
+                }
+                _ => {}
+            }
+
+            if masked {
+                if offset + 4 > output.len() {
+                    break;
+                }
+                offset += 4;
+            }
+            let Some(payload_end) = offset.checked_add(payload_length) else {
+                break;
+            };
+            if payload_end > output.len() {
+                break;
+            }
+            if opcode == 0x01 && !masked {
+                if let Ok(JsonRpcMessage::Response(response)) =
+                    serde_json::from_slice(&output[offset..payload_end])
+                {
+                    responses.push(response);
+                }
+            }
+            offset = payload_end;
+        }
+
+        responses
+    }
+
+    fn websocket_response_count(output: &Arc<Mutex<Vec<u8>>>, id: i64) -> usize {
+        websocket_responses(output)
+            .iter()
+            .filter(|response| response.id == Some(id.into()))
+            .count()
+    }
+
+    fn websocket_response(output: &Arc<Mutex<Vec<u8>>>, id: i64) -> Option<JsonRpcResponse> {
+        websocket_responses(output)
+            .into_iter()
+            .find(|response| response.id == Some(id.into()))
+    }
+
+    fn websocket_output_has_exact_response_counts(
+        output: &Arc<Mutex<Vec<u8>>>,
+        ids: &[i64],
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if ids
+                .iter()
+                .all(|id| websocket_response_count(output, *id) == 1)
+            {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        false
+    }
+
+    struct LiveWebSocketWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for LiveWebSocketWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct LiveWebSocketOverlapReader {
+        input: Vec<u8>,
+        offset: usize,
+        control: Arc<LiveModernControl>,
+        output: Arc<Mutex<Vec<u8>>>,
+        close_emitted: bool,
+    }
+
+    impl Read for LiveWebSocketOverlapReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset == self.input.len() && !self.close_emitted {
+                if !self.control.wait_for_started(2, Duration::from_secs(2)) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "modern WebSocket requests did not overlap",
+                    ));
+                }
+                self.control.release(1300);
+                self.control.release(1301);
+                if !websocket_output_has_exact_response_counts(&self.output, &[1300, 1301]) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "modern WebSocket responses did not arrive",
+                    ));
+                }
+                self.input.extend(masked_websocket_frame(0x08, &[]));
+                self.close_emitted = true;
+            }
+            if self.offset == self.input.len() {
+                return Ok(0);
+            }
+            let count = buffer.len().min(self.input.len() - self.offset);
+            buffer[..count].copy_from_slice(&self.input[self.offset..self.offset + count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    struct LiveWebSocketCancellationReader {
+        input: Vec<u8>,
+        offset: usize,
+        control: Arc<LiveModernControl>,
+        output: Arc<Mutex<Vec<u8>>>,
+        cancelled_request_id: u64,
+        phase: u8,
+    }
+
+    impl Read for LiveWebSocketCancellationReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset == self.input.len() {
+                match self.phase {
+                    0 => {
+                        if !self.control.wait_for_started(2, Duration::from_secs(2)) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "modern WebSocket requests did not start",
+                            ));
+                        }
+                        self.input
+                            .extend(masked_websocket_message(modern_cancelled_notification(
+                                self.cancelled_request_id,
+                            )));
+                        self.phase = 1;
+                    }
+                    1 => {
+                        if !self.control.wait_for_cancellation(
+                            self.cancelled_request_id,
+                            Duration::from_secs(2),
+                        ) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "targeted WebSocket cancellation did not reach its request",
+                            ));
+                        }
+                        self.control.release(if self.cancelled_request_id == 1400 {
+                            1401
+                        } else {
+                            1400
+                        });
+                        if !websocket_output_has_exact_response_counts(&self.output, &[1400, 1401])
+                        {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "targeted WebSocket cancellation did not preserve both responses",
+                            ));
+                        }
+                        self.input.extend(masked_websocket_frame(0x08, &[]));
+                        self.phase = 2;
+                    }
+                    _ => return Ok(0),
+                }
+            }
+            let count = buffer.len().min(self.input.len() - self.offset);
+            buffer[..count].copy_from_slice(&self.input[self.offset..self.offset + count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
     struct ProtocolPolicyScriptTransport {
         inbound: std::collections::VecDeque<JsonRpcMessage>,
         sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
@@ -14382,6 +14958,18 @@ mod lib_unit_tests {
         JsonRpcMessage::Request(JsonRpcRequest::notification(
             "notifications/initialized",
             Some(serde_json::json!({
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                },
+            })),
+        ))
+    }
+
+    fn modern_cancelled_notification(request_id: u64) -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({
+                "requestId": request_id,
                 "_meta": {
                     MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
                 },
@@ -14648,6 +15236,37 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn latched_launch_policy_rejects_transport_before_receive_side_effect() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+        let server = ServerBuilder::from_launch_protocol_policy(
+            "invalid-launch-policy",
+            "1.0.0",
+            Err(ServerLaunchPolicyError::InvalidValue),
+        )
+        .build();
+
+        let error = server
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyProbeTransport {
+                    next: Some(modern_discovery_opening_request()),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::clone(&receive_calls),
+                },
+            )
+            .expect_err("latched launch policy must reject before transport receive");
+
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(receive_calls.load(Ordering::Acquire), 0);
+        assert!(
+            sent.lock()
+                .expect("sent mutex must not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn server_builder_policy_admits_selected_modern_runtime_era() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let receive_calls = Arc::new(AtomicUsize::new(0));
@@ -14753,6 +15372,95 @@ mod lib_unit_tests {
         assert_eq!(response.id, Some(905_i64.into()));
         assert!(response.error.is_none());
         assert!(response.result.is_some());
+    }
+
+    #[test]
+    fn stdio_auto_classifies_the_first_envelope_before_legacy_fallback() {
+        let mut accepted = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        assert_eq!(
+            classify_initial_stdio_envelope(&mut accepted, &modern_discovery_opening_request()),
+            Ok(ProtocolEra::Modern2026),
+            "the exact modern opening selects modern exactly once"
+        );
+
+        let mut rejected = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let response = JsonRpcMessage::Response(JsonRpcResponse::success(
+            906_i64.into(),
+            serde_json::json!({}),
+        ));
+        assert!(matches!(
+            classify_initial_stdio_envelope(&mut rejected, &response),
+            Err(StdioEraDecision::RejectedAndClosed {
+                reason:
+                    fastmcp_protocol::protocol_policy::StdioEraRejection::ResponseCannotClassify,
+            })
+        ));
+        assert!(matches!(
+            rejected.state(),
+            fastmcp_protocol::protocol_policy::StdioEraState::TerminalWithoutEra
+        ));
+        assert!(matches!(
+            rejected.classify_opening(StdioOpeningFrame::LegacyInitialize),
+            StdioEraDecision::AlreadyTerminal
+        ));
+
+        let mut malformed = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        assert!(matches!(
+            reject_initial_stdio_malformed(&mut malformed),
+            StdioEraDecision::RejectedAndClosed {
+                reason: fastmcp_protocol::protocol_policy::StdioEraRejection::MalformedOpeningFrame,
+            }
+        ));
+        assert!(matches!(
+            malformed.state(),
+            fastmcp_protocol::protocol_policy::StdioEraState::TerminalWithoutEra
+        ));
+    }
+
+    #[test]
+    fn final_cancelled_notification_requires_exact_modern_metadata() {
+        let accepted = JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({
+                "requestId": 907,
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                },
+            })),
+        );
+        assert!(
+            cancelled_notification_matches_stdio_era(ProtocolEra::Modern2026, &accepted),
+            "the exact final protocol marker admits a modern cancellation"
+        );
+        assert!(
+            !cancelled_notification_matches_stdio_era(ProtocolEra::Legacy2024, &accepted),
+            "changing only the negotiated era rejects final metadata on a legacy connection"
+        );
+
+        let mut rejected = accepted.clone();
+        rejected
+            .params
+            .as_mut()
+            .and_then(|params| params.get_mut("_meta"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("baseline cancellation retains its metadata object")
+            .remove(MODERN_PROTOCOL_VERSION_METADATA_KEY);
+        assert!(
+            !cancelled_notification_matches_stdio_era(ProtocolEra::Modern2026, &rejected),
+            "removing only the final protocol marker rejects the otherwise identical cancellation"
+        );
+        assert_eq!(
+            rejected
+                .params
+                .as_ref()
+                .and_then(|params| params.get("requestId")),
+            Some(&serde_json::json!(907)),
+            "the rejected cancellation preserves every non-era parameter"
+        );
+        assert!(
+            cancelled_notification_matches_stdio_era(ProtocolEra::Legacy2024, &rejected),
+            "removing only the final marker restores the same cancellation to the legacy era"
+        );
     }
 
     #[test]
@@ -16415,6 +17123,85 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn live_websocket_split_requests_overlap_and_emit_one_response_per_id() {
+        let control = Arc::new(LiveModernControl::default());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut input = masked_websocket_message(modern_discovery_opening_request());
+        input.extend(masked_websocket_message(modern_controlled_tool_request(
+            1300,
+        )));
+        input.extend(masked_websocket_message(modern_controlled_tool_request(
+            1301,
+        )));
+
+        let run_result = run_live_websocket_split(
+            Server::new("live-websocket-split-overlap", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LiveModernControlledTool {
+                    control: Arc::clone(&control),
+                })
+                .build(),
+            LiveWebSocketOverlapReader {
+                input,
+                offset: 0,
+                control: Arc::clone(&control),
+                output: Arc::clone(&output),
+                close_emitted: false,
+            },
+            LiveWebSocketWriter {
+                output: Arc::clone(&output),
+            },
+        );
+
+        assert!(
+            control.max_active() >= 2,
+            "live WebSocket ingress must permit two request-owned modern children to overlap; \
+             run_result={run_result:?}"
+        );
+        assert_eq!(websocket_response_count(&output, 1300), 1);
+        assert_eq!(websocket_response_count(&output, 1301), 1);
+        run_result.expect("live WebSocket split dispatch must drain both modern requests");
+    }
+
+    #[test]
+    fn live_websocket_split_overlap_legacy_only_rejects_before_children_start() {
+        let control = Arc::new(LiveModernControl::default());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut input = masked_websocket_message(modern_discovery_opening_request());
+        input.extend(masked_websocket_message(modern_controlled_tool_request(
+            1300,
+        )));
+        input.extend(masked_websocket_message(modern_controlled_tool_request(
+            1301,
+        )));
+
+        run_live_websocket_split(
+            Server::new("live-websocket-split-overlap", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .tool(LiveModernControlledTool {
+                    control: Arc::clone(&control),
+                })
+                .build(),
+            LiveWebSocketOverlapReader {
+                input,
+                offset: 0,
+                control: Arc::clone(&control),
+                output: Arc::clone(&output),
+                close_emitted: false,
+            },
+            LiveWebSocketWriter {
+                output: Arc::clone(&output),
+            },
+        )
+        .expect_err("changing only the policy must reject the identical modern WebSocket stream");
+
+        assert_eq!(control.max_active(), 0);
+        assert_eq!(websocket_response_count(&output, 905), 1);
+        assert_eq!(websocket_response_count(&output, 1300), 0);
+        assert_eq!(websocket_response_count(&output, 1301), 0);
+    }
+
+    #[test]
     fn live_modern_split_transport_legacy_only_policy_rejects_before_children_start() {
         let control = Arc::new(LiveModernControl::default());
         let responses = Arc::new(LiveModernResponses::default());
@@ -16472,10 +17259,7 @@ mod lib_unit_tests {
                 }
                 3 => {
                     if control_for_receive.wait_for_started(2, Duration::from_secs(2)) {
-                        Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
-                            "notifications/cancelled",
-                            Some(serde_json::json!({ "requestId": 200 })),
-                        )))
+                        Ok(modern_cancelled_notification(200))
                     } else {
                         Err(TransportError::Timeout)
                     }
@@ -16514,6 +17298,99 @@ mod lib_unit_tests {
                 .response(201)
                 .is_some_and(|response| response.error.is_none())
         );
+    }
+
+    #[test]
+    fn live_websocket_split_cancellation_isolated_to_the_matching_request() {
+        let control = Arc::new(LiveModernControl::default());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut input = masked_websocket_message(modern_discovery_opening_request());
+        input.extend(masked_websocket_message(modern_controlled_tool_request(
+            1400,
+        )));
+        input.extend(masked_websocket_message(modern_controlled_tool_request(
+            1401,
+        )));
+
+        let run_result = run_live_websocket_split(
+            Server::new("live-websocket-split-cancellation", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LiveModernControlledTool {
+                    control: Arc::clone(&control),
+                })
+                .build(),
+            LiveWebSocketCancellationReader {
+                input,
+                offset: 0,
+                control: Arc::clone(&control),
+                output: Arc::clone(&output),
+                cancelled_request_id: 1400,
+                phase: 0,
+            },
+            LiveWebSocketWriter {
+                output: Arc::clone(&output),
+            },
+        );
+
+        assert!(control.was_cancelled(1400));
+        assert!(!control.was_cancelled(1401));
+        assert_eq!(websocket_response_count(&output, 1400), 1);
+        assert_eq!(websocket_response_count(&output, 1401), 1);
+        assert_eq!(
+            websocket_response(&output, 1400)
+                .and_then(|response| response.error)
+                .map(|error| error.code),
+            Some(i32::from(McpErrorCode::RequestCancelled))
+        );
+        assert!(websocket_response(&output, 1401).is_some_and(|response| response.error.is_none()));
+        run_result.expect("targeted live WebSocket cancellation must preserve the sibling request");
+    }
+
+    #[test]
+    fn live_websocket_split_cancellation_one_variable_negative_targets_only_the_changed_id() {
+        let control = Arc::new(LiveModernControl::default());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut input = masked_websocket_message(modern_discovery_opening_request());
+        input.extend(masked_websocket_message(modern_controlled_tool_request(
+            1400,
+        )));
+        input.extend(masked_websocket_message(modern_controlled_tool_request(
+            1401,
+        )));
+
+        let run_result = run_live_websocket_split(
+            Server::new("live-websocket-split-cancellation", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LiveModernControlledTool {
+                    control: Arc::clone(&control),
+                })
+                .build(),
+            LiveWebSocketCancellationReader {
+                input,
+                offset: 0,
+                control: Arc::clone(&control),
+                output: Arc::clone(&output),
+                // This differs from the matching-target positive only in the cancelled id.
+                cancelled_request_id: 1401,
+                phase: 0,
+            },
+            LiveWebSocketWriter {
+                output: Arc::clone(&output),
+            },
+        );
+
+        assert!(!control.was_cancelled(1400));
+        assert!(control.was_cancelled(1401));
+        assert_eq!(websocket_response_count(&output, 1400), 1);
+        assert_eq!(websocket_response_count(&output, 1401), 1);
+        assert!(websocket_response(&output, 1400).is_some_and(|response| response.error.is_none()));
+        assert_eq!(
+            websocket_response(&output, 1401)
+                .and_then(|response| response.error)
+                .map(|error| error.code),
+            Some(i32::from(McpErrorCode::RequestCancelled))
+        );
+        run_result.expect("changing the cancellation id must preserve the other WebSocket request");
     }
 
     #[test]

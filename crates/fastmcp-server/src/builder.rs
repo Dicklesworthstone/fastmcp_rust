@@ -146,7 +146,7 @@ impl ServerBuilder {
         )
     }
 
-    fn from_launch_protocol_policy(
+    pub(crate) fn from_launch_protocol_policy(
         name: impl Into<String>,
         version: impl Into<String>,
         launch_protocol_policy: Result<Option<ProtocolPolicy>, ServerLaunchPolicyError>,
@@ -1329,6 +1329,10 @@ impl ServerBuilder {
     /// fallback policy.
     #[must_use]
     pub fn build(mut self) -> Server {
+        if let Some(error) = self.launch_protocol_policy.as_ref().err().copied() {
+            return self.build_latched_invalid(error);
+        }
+
         // Configure router with strict input validation setting
         self.router
             .set_strict_input_validation(self.strict_input_validation);
@@ -1396,6 +1400,45 @@ impl ServerBuilder {
             extension_runtime,
             final_task_runtime: self.final_task_runtime,
             final_subscriptions,
+        }
+    }
+
+    fn build_latched_invalid(self, launch_policy_error: ServerLaunchPolicyError) -> Server {
+        let console = fastmcp_console::console::FastMcpConsole::with_enabled(
+            self.console_config.should_use_rich(),
+        );
+
+        Server {
+            info: self.info,
+            capabilities: self.capabilities,
+            router: Arc::new(self.router),
+            instructions: self.instructions,
+            request_timeout_secs: self.request_timeout_secs,
+            stats: if self.stats_enabled {
+                Some(ServerStats::new())
+            } else {
+                None
+            },
+            mask_error_details: self.mask_error_details,
+            logging: self.logging,
+            console_config: self.console_config,
+            console,
+            lifespan: Mutex::new(Some(self.lifespan)),
+            auth_provider: self.auth_provider,
+            middleware: Arc::new(self.middleware),
+            active_requests: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            task_manager: self.task_manager,
+            max_bidirectional_requests_per_connection: self
+                .max_bidirectional_requests_per_connection,
+            protocol_policy: self.protocol_policy,
+            launch_policy_error: Some(launch_policy_error),
+            http_config: self.http_config,
+            // Do not freeze extension handlers or install task emitters after
+            // a reserved launch-policy failure.
+            extension_runtime: None,
+            final_task_runtime: None,
+            final_subscriptions: Arc::new(FinalSubscriptionRegistry::default()),
         }
     }
 
@@ -2030,6 +2073,21 @@ mod tests {
             fastmcp_transport::http::DualEraHttpEndpointError::InvalidConfiguration(message)
                 if message.contains(FASTMCP_PROTOCOL_POLICY_ENV)
         ));
+    }
+
+    #[test]
+    fn latched_invalid_launch_policy_quarantines_builder_runtime_configuration() {
+        let server = ServerBuilder::from_launch_protocol_policy(
+            "srv",
+            "1.0",
+            Err(ServerLaunchPolicyError::InvalidValue),
+        )
+        .mcp_apps()
+        .expect("builder configuration remains ergonomic before launch")
+        .build();
+
+        assert!(server.extension_handler_registry().is_none());
+        assert!(server.final_task_runtime().is_none());
     }
 
     #[test]

@@ -853,6 +853,12 @@ fn generate_tool_result_conversion(
 ) -> TokenStream2 {
     if final_complete_return_kind(output, "FinalCallToolResult").is_some() {
         generate_result_conversion(output)
+    } else if final_tool_outcome_return_kind(output).is_some() {
+        quote! {
+            Err(fastmcp_core::McpError::internal_error(
+                "final #[tool] handlers must be invoked through ToolHandler::call_final_outcome",
+            ))
+        }
     } else if typed_output_schema {
         generate_schema_bound_result_conversion(output)
     } else {
@@ -873,6 +879,23 @@ fn generate_final_tool_result_conversion(output: &syn::ReturnType) -> Option<Tok
     }
 }
 
+/// Generates the direct final-outcome conversion for a tool returning the
+/// complete, input-required, or task-creation algebra.
+fn generate_final_tool_outcome_conversion(output: &syn::ReturnType) -> Option<TokenStream2> {
+    match final_tool_outcome_return_kind(output)? {
+        FinalCompleteReturnKind::Direct => Some(quote! { Ok(result) }),
+        FinalCompleteReturnKind::Result
+            if final_tool_outcome_result_preserves_mcp_error(output) =>
+        {
+            Some(quote! { result })
+        }
+        FinalCompleteReturnKind::Result => Some(quote! {
+            result.map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))
+        }),
+        FinalCompleteReturnKind::McpResult => Some(quote! { result }),
+    }
+}
+
 fn generate_tool_execution_methods(
     is_async: bool,
     expects_context: bool,
@@ -881,7 +904,63 @@ fn generate_tool_execution_methods(
     param_extractions: &[TokenStream2],
     result_conversion: &TokenStream2,
     final_result_conversion: Option<&TokenStream2>,
+    final_outcome_conversion: Option<&TokenStream2>,
 ) -> TokenStream2 {
+    let final_outcome_request_method = if final_outcome_conversion.is_some() {
+        quote! {
+            fn call_final_outcome_async_in_request<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                request_cx: &'a fastmcp_core::Cx,
+                arguments: serde_json::Value,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<fastmcp_server::FinalToolOutcome>,
+            > {
+                Box::pin(async move {
+                    if request_cx.checkpoint().is_err() {
+                        return fastmcp_core::cancelled();
+                    }
+
+                    let outcome = self.call_final_outcome_async(ctx, arguments).await;
+                    if request_cx.checkpoint().is_err() {
+                        fastmcp_core::cancelled()
+                    } else {
+                        outcome
+                    }
+                })
+            }
+        }
+    } else {
+        quote! {
+            fn call_final_outcome_async_in_request<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                request_cx: &'a fastmcp_core::Cx,
+                arguments: serde_json::Value,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<fastmcp_server::FinalToolOutcome>,
+            > {
+                Box::pin(async move {
+                    match self.call_final_async_in_request(ctx, request_cx, arguments).await {
+                        fastmcp_core::Outcome::Ok(result) => {
+                            fastmcp_core::Outcome::Ok(
+                                fastmcp_server::FinalToolOutcome::Complete(result),
+                            )
+                        }
+                        fastmcp_core::Outcome::Err(error) => fastmcp_core::Outcome::Err(error),
+                        fastmcp_core::Outcome::Cancelled(reason) => {
+                            fastmcp_core::Outcome::Cancelled(reason)
+                        }
+                        fastmcp_core::Outcome::Panicked(payload) => {
+                            fastmcp_core::Outcome::Panicked(payload)
+                        }
+                    }
+                })
+            }
+        }
+    };
     let modern_request_methods = quote! {
         fn call_async_in_request<'a>(
             &'a self,
@@ -909,32 +988,7 @@ fn generate_tool_execution_methods(
             self.call_final_async(ctx, arguments)
         }
 
-        fn call_final_outcome_async_in_request<'a>(
-            &'a self,
-            ctx: &'a fastmcp_core::McpContext,
-            request_cx: &'a fastmcp_core::Cx,
-            arguments: serde_json::Value,
-        ) -> fastmcp_server::BoxFuture<
-            'a,
-            fastmcp_core::McpOutcome<fastmcp_server::FinalToolOutcome>,
-        > {
-            Box::pin(async move {
-                match self.call_final_async_in_request(ctx, request_cx, arguments).await {
-                    fastmcp_core::Outcome::Ok(result) => {
-                        fastmcp_core::Outcome::Ok(
-                            fastmcp_server::FinalToolOutcome::Complete(result),
-                        )
-                    }
-                    fastmcp_core::Outcome::Err(error) => fastmcp_core::Outcome::Err(error),
-                    fastmcp_core::Outcome::Cancelled(reason) => {
-                        fastmcp_core::Outcome::Cancelled(reason)
-                    }
-                    fastmcp_core::Outcome::Panicked(payload) => {
-                        fastmcp_core::Outcome::Panicked(payload)
-                    }
-                }
-            })
-        }
+        #final_outcome_request_method
     };
     let sync_invocation = if expects_context {
         quote! { #fn_name(ctx, #(#param_names),*) }
@@ -943,6 +997,36 @@ fn generate_tool_execution_methods(
     };
 
     if !is_async {
+        let legacy_method = if final_outcome_conversion.is_some() {
+            quote! {
+                fn call(
+                    &self,
+                    _ctx: &fastmcp_core::McpContext,
+                    _arguments: serde_json::Value,
+                ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::Content>> {
+                    Err(fastmcp_core::McpError::internal_error(
+                        "final #[tool] handlers must be invoked through ToolHandler::call_final_outcome",
+                    ))
+                }
+            }
+        } else {
+            quote! {
+                fn call(
+                    &self,
+                    ctx: &fastmcp_core::McpContext,
+                    arguments: serde_json::Value,
+                ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::Content>> {
+                    let arguments = arguments.as_object()
+                        .cloned()
+                        .unwrap_or_default();
+
+                    #(#param_extractions)*
+
+                    let result = #sync_invocation;
+                    #result_conversion
+                }
+            }
+        };
         let final_method = final_result_conversion.map_or_else(TokenStream2::new, |conversion| {
             quote! {
                 fn call_final(
@@ -963,23 +1047,31 @@ fn generate_tool_execution_methods(
                 }
             }
         });
+        let final_outcome_method =
+            final_outcome_conversion.map_or_else(TokenStream2::new, |conversion| {
+                quote! {
+                    fn call_final_outcome(
+                        &self,
+                        ctx: &fastmcp_core::McpContext,
+                        arguments: serde_json::Value,
+                    ) -> fastmcp_core::McpResult<fastmcp_server::FinalToolOutcome> {
+                        let arguments = arguments.as_object()
+                            .cloned()
+                            .unwrap_or_default();
+
+                        #(#param_extractions)*
+
+                        let result = #sync_invocation;
+                        #conversion
+                    }
+                }
+            });
         return quote! {
-            fn call(
-                &self,
-                ctx: &fastmcp_core::McpContext,
-                arguments: serde_json::Value,
-            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::Content>> {
-                let arguments = arguments.as_object()
-                    .cloned()
-                    .unwrap_or_default();
-
-                #(#param_extractions)*
-
-                let result = #sync_invocation;
-                #result_conversion
-            }
+            #legacy_method
 
             #final_method
+
+            #final_outcome_method
 
             #modern_request_methods
         };
@@ -1026,6 +1118,86 @@ fn generate_tool_execution_methods(
         }
     });
 
+    let final_outcome_method =
+        final_outcome_conversion.map_or_else(TokenStream2::new, |conversion| {
+            quote! {
+                fn call_final_outcome_async<'a>(
+                    &'a self,
+                    ctx: &'a fastmcp_core::McpContext,
+                    arguments: serde_json::Value,
+                ) -> fastmcp_server::BoxFuture<
+                    'a,
+                    fastmcp_core::McpOutcome<fastmcp_server::FinalToolOutcome>,
+                > {
+                    Box::pin(async move {
+                        let result: fastmcp_core::McpResult<fastmcp_server::FinalToolOutcome> = async move {
+                            let arguments = arguments.as_object()
+                                .cloned()
+                                .unwrap_or_default();
+
+                            #(#param_extractions)*
+
+                            let result = #async_invocation;
+                            #conversion
+                        }.await;
+
+                        match result {
+                            Ok(value) => fastmcp_core::Outcome::Ok(value),
+                            Err(error) => fastmcp_core::Outcome::Err(error),
+                        }
+                    })
+                }
+            }
+        });
+
+    let legacy_async_method = if final_outcome_conversion.is_some() {
+        quote! {
+            fn call_async<'a>(
+                &'a self,
+                _ctx: &'a fastmcp_core::McpContext,
+                _arguments: serde_json::Value,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<Vec<fastmcp_protocol::Content>>,
+            > {
+                Box::pin(async {
+                    fastmcp_core::Outcome::Err(fastmcp_core::McpError::internal_error(
+                        "final #[tool] handlers must be invoked through ToolHandler::call_final_outcome_async",
+                    ))
+                })
+            }
+        }
+    } else {
+        quote! {
+            fn call_async<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                arguments: serde_json::Value,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<Vec<fastmcp_protocol::Content>>,
+            > {
+                Box::pin(async move {
+                    let result: fastmcp_core::McpResult<Vec<fastmcp_protocol::Content>> = async move {
+                        let arguments = arguments.as_object()
+                            .cloned()
+                            .unwrap_or_default();
+
+                        #(#param_extractions)*
+
+                        let result = #async_invocation;
+                        #result_conversion
+                    }.await;
+
+                    match result {
+                        Ok(value) => fastmcp_core::Outcome::Ok(value),
+                        Err(error) => fastmcp_core::Outcome::Err(error),
+                    }
+                })
+            }
+        }
+    };
+
     quote! {
         fn call(
             &self,
@@ -1037,34 +1209,11 @@ fn generate_tool_execution_methods(
             ))
         }
 
-        fn call_async<'a>(
-            &'a self,
-            ctx: &'a fastmcp_core::McpContext,
-            arguments: serde_json::Value,
-        ) -> fastmcp_server::BoxFuture<
-            'a,
-            fastmcp_core::McpOutcome<Vec<fastmcp_protocol::Content>>,
-        > {
-            Box::pin(async move {
-                let result: fastmcp_core::McpResult<Vec<fastmcp_protocol::Content>> = async move {
-                    let arguments = arguments.as_object()
-                        .cloned()
-                        .unwrap_or_default();
-
-                    #(#param_extractions)*
-
-                    let result = #async_invocation;
-                    #result_conversion
-                }.await;
-
-                match result {
-                    Ok(value) => fastmcp_core::Outcome::Ok(value),
-                    Err(error) => fastmcp_core::Outcome::Err(error),
-                }
-            })
-        }
+        #legacy_async_method
 
         #final_method
+
+        #final_outcome_method
 
         #modern_request_methods
     }
@@ -1142,6 +1291,87 @@ fn final_complete_return_kind(
     }
 }
 
+fn final_tool_outcome_return_kind(output: &syn::ReturnType) -> Option<FinalCompleteReturnKind> {
+    let value = return_type_value(output)?;
+    if is_canonical_final_tool_outcome(value) {
+        return Some(FinalCompleteReturnKind::Direct);
+    }
+
+    let success = first_type_argument(value)?;
+    if !is_canonical_final_tool_outcome(success) {
+        return None;
+    }
+    if type_has_last_ident(value, "McpResult") {
+        Some(FinalCompleteReturnKind::McpResult)
+    } else if type_has_last_ident(value, "Result") {
+        Some(FinalCompleteReturnKind::Result)
+    } else {
+        None
+    }
+}
+
+fn final_tool_outcome_result_preserves_mcp_error(output: &syn::ReturnType) -> bool {
+    let Some(value) = return_type_value(output) else {
+        return false;
+    };
+    let Type::Path(type_path) = value else {
+        return false;
+    };
+    let Some(segment) = type_path.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Result" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return false;
+    };
+    arguments
+        .args
+        .iter()
+        .filter_map(|argument| match argument {
+            syn::GenericArgument::Type(value) => Some(value),
+            _ => None,
+        })
+        .nth(1)
+        .is_some_and(|error| type_has_last_ident(error, "McpError"))
+}
+
+fn final_tool_outcome_candidate(output: &syn::ReturnType) -> Option<&Type> {
+    let value = return_type_value(output)?;
+    if type_has_last_ident(value, "FinalToolOutcome") {
+        return Some(value);
+    }
+
+    let success = first_type_argument(value)?;
+    type_has_last_ident(success, "FinalToolOutcome").then_some(success)
+}
+
+fn is_canonical_final_tool_outcome(ty: &Type) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    let segments = &type_path.path.segments;
+    if segments.len() < 2
+        || !segments
+            .last()
+            .is_some_and(|segment| segment.ident == "FinalToolOutcome")
+    {
+        return false;
+    }
+
+    let Some(root) = segments.first().map(|segment| segment.ident.to_string()) else {
+        return false;
+    };
+    if matches!(root.as_str(), "fastmcp_rust" | "fastmcp_server") {
+        return true;
+    }
+
+    ["fastmcp-rust", "fastmcp-server"]
+        .into_iter()
+        .any(|package| matches!(crate_name(package), Ok(FoundCrate::Name(name)) if name == root))
+}
+
 fn type_contains_final_result_term(ty: &Type) -> bool {
     const FINAL_RESULT_TERMS: &[&str] = &[
         "CompleteResult",
@@ -1149,6 +1379,7 @@ fn type_contains_final_result_term(ty: &Type) -> bool {
         "CacheableResult",
         "PaginatedResult",
         "FinalCallToolResult",
+        "FinalToolOutcome",
         "FinalReadResourceResult",
         "FinalGetPromptResult",
         "ReadResourceResult",
@@ -1191,7 +1422,17 @@ fn validate_final_handler_return(
     let Some(value) = return_type_value(output) else {
         return Ok(());
     };
+    if payload == "FinalCallToolResult"
+        && let Some(candidate) = final_tool_outcome_candidate(output)
+        && !is_canonical_final_tool_outcome(candidate)
+    {
+        return Err(syn::Error::new_spanned(
+            candidate,
+            "final #[tool] outcomes must use fastmcp_rust::FinalToolOutcome or fastmcp_server::FinalToolOutcome",
+        ));
+    }
     if final_complete_return_kind(output, payload).is_some()
+        || (payload == "FinalCallToolResult" && final_tool_outcome_return_kind(output).is_some())
         || final_payload
             .is_some_and(|payload| final_complete_return_kind(output, payload).is_some())
         || !type_contains_final_result_term(value)
@@ -1959,10 +2200,10 @@ fn generate_resource_execution_methods(
 mod async_handler_expansion_tests {
     use super::{
         found_crate_path, generate_final_prompt_result_conversion,
-        generate_final_resource_result_conversion, generate_final_tool_payload_projection,
-        generate_final_tool_result_conversion, generate_prompt_execution_methods,
-        generate_resource_execution_methods, generate_tool_execution_methods,
-        validate_final_handler_return,
+        generate_final_resource_result_conversion, generate_final_tool_outcome_conversion,
+        generate_final_tool_payload_projection, generate_final_tool_result_conversion,
+        generate_prompt_execution_methods, generate_resource_execution_methods,
+        generate_tool_execution_methods, validate_final_handler_return,
     };
     use proc_macro_crate::FoundCrate;
     use quote::{format_ident, quote};
@@ -1986,6 +2227,7 @@ mod async_handler_expansion_tests {
             &[&param],
             &[quote! { let value: String = String::new(); }],
             &quote! { Ok(vec![]) },
+            None,
             None,
         );
 
@@ -2036,6 +2278,7 @@ mod async_handler_expansion_tests {
             &[],
             &quote! { Ok(vec![]) },
             None,
+            None,
         )
         .to_string();
 
@@ -2065,6 +2308,7 @@ mod async_handler_expansion_tests {
             &[],
             &quote! { Ok(vec![]) },
             Some(&tool_conversion),
+            None,
         )
         .to_string();
         assert!(tool.contains("fn call_async_in_request"), "{tool}");
@@ -2169,12 +2413,88 @@ mod async_handler_expansion_tests {
             &[],
             &quote! { Ok(vec![]) },
             Some(&conversion),
+            None,
         )
         .to_string();
 
         assert!(tokens.contains("fn call_final"), "{tokens}");
         assert!(tokens.contains("FinalCallToolResult"), "{tokens}");
         assert!(!tokens.contains("result . payload"), "{tokens}");
+    }
+
+    #[test]
+    fn final_tool_outcome_return_forms_select_the_disjoint_hook() {
+        let fn_name = format_ident!("final_tool_outcome");
+        for output in [
+            syn::parse_quote!(-> fastmcp_server::FinalToolOutcome),
+            syn::parse_quote!(-> Result<fastmcp_server::FinalToolOutcome, std::io::Error>),
+            syn::parse_quote!(-> fastmcp_core::McpResult<fastmcp_server::FinalToolOutcome>),
+        ] {
+            let conversion = generate_final_tool_outcome_conversion(&output)
+                .expect("every supported final tool outcome return form selects the outcome hook");
+            let tokens = generate_tool_execution_methods(
+                false,
+                false,
+                &fn_name,
+                &[],
+                &[],
+                &quote! { unreachable!() },
+                None,
+                Some(&conversion),
+            )
+            .to_string();
+
+            assert!(tokens.contains("fn call_final_outcome"), "{tokens}");
+            assert!(tokens.contains("FinalToolOutcome"), "{tokens}");
+            assert!(
+                tokens.contains("must be invoked through ToolHandler :: call_final_outcome"),
+                "{tokens}"
+            );
+            assert!(!tokens.contains("fn call_final ("), "{tokens}");
+        }
+    }
+
+    #[test]
+    fn final_tool_outcome_rejects_ambiguous_lookalike_type() {
+        let accepted: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_rust::FinalToolOutcome
+        );
+        let ambiguous: syn::ReturnType = syn::parse_quote!(
+            -> FinalToolOutcome
+        );
+        let consumer_local: syn::ReturnType = syn::parse_quote!(
+            -> crate::FinalToolOutcome
+        );
+
+        assert!(
+            validate_final_handler_return(
+                &accepted,
+                "tool",
+                "FinalCallToolResult",
+                None,
+                "Vec<Content>",
+            )
+            .is_ok()
+        );
+        let error = validate_final_handler_return(
+            &ambiguous,
+            "tool",
+            "FinalCallToolResult",
+            None,
+            "Vec<Content>",
+        )
+        .expect_err("bare same-named return type must fail before expansion");
+
+        assert!(error.to_string().contains("fastmcp_rust::FinalToolOutcome"));
+        let error = validate_final_handler_return(
+            &consumer_local,
+            "tool",
+            "FinalCallToolResult",
+            None,
+            "Vec<Content>",
+        )
+        .expect_err("consumer-local same-named return type must fail before expansion");
+        assert!(error.to_string().contains("fastmcp_rust::FinalToolOutcome"));
     }
 
     #[test]
@@ -2194,6 +2514,7 @@ mod async_handler_expansion_tests {
             &[],
             &legacy_conversion,
             Some(&final_conversion),
+            None,
         )
         .to_string();
         let (_, final_hook) = tokens
@@ -2215,6 +2536,7 @@ mod async_handler_expansion_tests {
             &[],
             &legacy_conversion,
             Some(&final_conversion),
+            None,
         );
         assert_direct_async_expansion(async_tokens.clone(), "fn call_final_async");
         let async_expansion = async_tokens.to_string();
@@ -3291,6 +3613,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     let return_type = &input_fn.sig.output;
     let result_conversion = generate_tool_result_conversion(return_type, typed_output_schema);
     let final_result_conversion = generate_final_tool_result_conversion(return_type);
+    let final_outcome_conversion = generate_final_tool_outcome_conversion(return_type);
 
     let execution_methods = generate_tool_execution_methods(
         is_async,
@@ -3300,6 +3623,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         &param_extractions,
         &result_conversion,
         final_result_conversion.as_ref(),
+        final_outcome_conversion.as_ref(),
     );
 
     // Generate the handler implementation
