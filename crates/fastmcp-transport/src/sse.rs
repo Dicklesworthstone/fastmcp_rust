@@ -66,7 +66,7 @@ use std::io::{BufReader, Read, Write};
 use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 
-use crate::{Codec, CodecError, Transport, TransportError};
+use crate::{Codec, CodecError, Transport, TransportError, TransportRecvHalf, TransportSendHalf};
 
 /// Maximum wire-line size for SSE events.
 const MAX_SSE_LINE_SIZE: usize = 64 * 1024;
@@ -1108,6 +1108,28 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> SseServerTransport<W, R> {
         }
         Ok(())
     }
+
+    /// Separates typed POST ingress from SSE response egress.
+    ///
+    /// The two returned halves own disjoint I/O resources, so a server can
+    /// continue receiving requests while a request-owned child commits its
+    /// response to the event stream.
+    #[must_use]
+    pub fn into_split(self) -> (SseServerRecvHalf<R>, SseServerSendHalf<W>) {
+        (
+            SseServerRecvHalf {
+                request_codec: self.request_codec,
+                request_source: self.request_source,
+                closed: self.closed,
+            },
+            SseServerSendHalf {
+                writer: self.writer,
+                endpoint_sent: self.endpoint_sent,
+                endpoint_url: self.endpoint_url,
+                closed: self.closed,
+            },
+        )
+    }
 }
 
 impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for SseServerTransport<W, R> {
@@ -1148,6 +1170,74 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for SseServerTransp
         self.closed = true;
         // SSE connections don't have a close frame; flush once and let the
         // connection drop. SseWriter makes this idempotent and terminal.
+        self.writer.close()
+    }
+}
+
+/// Independently owned typed POST ingress for an SSE server transport.
+pub struct SseServerRecvHalf<R> {
+    request_codec: Codec,
+    request_source: R,
+    closed: bool,
+}
+
+impl<R: Iterator<Item = JsonRpcRequest>> TransportRecvHalf for SseServerRecvHalf<R> {
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+
+        match self.request_source.next() {
+            Some(request) => {
+                self.request_codec.encode_request(&request)?;
+                Ok(JsonRpcMessage::Request(request))
+            }
+            None => {
+                self.closed = true;
+                Err(TransportError::Closed)
+            }
+        }
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.closed = true;
+        Ok(())
+    }
+}
+
+/// Independently owned event-stream egress for an SSE server transport.
+pub struct SseServerSendHalf<W> {
+    writer: SseWriter<W>,
+    endpoint_sent: bool,
+    endpoint_url: String,
+    closed: bool,
+}
+
+impl<W: Write> SseServerSendHalf<W> {
+    fn ensure_endpoint_sent(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        if !self.endpoint_sent {
+            self.writer.write_endpoint(cx, &self.endpoint_url)?;
+            self.endpoint_sent = true;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write + Send> TransportSendHalf for SseServerSendHalf<W> {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if self.closed || self.writer.closed {
+            self.closed = true;
+            return Err(TransportError::Closed);
+        }
+        self.ensure_endpoint_sent(cx)?;
+        self.writer.write_message(cx, message)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.closed = true;
         self.writer.close()
     }
 }
@@ -1304,6 +1394,30 @@ impl<R: Read, W: Write> Transport for SseClientTransport<R, W> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct SharedWriteBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedWriteBuffer {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().expect("shared SSE output lock").clone()
+        }
+    }
+
+    impl Write for SharedWriteBuffer {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("shared SSE output lock poisoned"))?
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     struct ByteAtATime {
         inner: Cursor<Vec<u8>>,
@@ -1347,6 +1461,53 @@ mod tests {
         assert!(output.contains("event: endpoint\n"));
         assert!(output.contains("data: http://localhost:8080/messages\n"));
         assert!(output.ends_with("\n\n")); // Blank line terminator
+    }
+
+    #[test]
+    fn sse_server_split_halves_preserve_endpoint_and_response() {
+        let output = SharedWriteBuffer::default();
+        let request = JsonRpcRequest::new("tools/list", None, 41_i64);
+        let (mut recv_half, mut send_half) =
+            SseServerTransport::new(output.clone(), [request.clone()].into_iter(), "/mcp")
+                .into_split();
+        let cx = Cx::for_testing();
+
+        let received = recv_half.recv(&cx).expect("split ingress request");
+        let JsonRpcMessage::Request(received) = received else {
+            panic!("split ingress must preserve the request variant");
+        };
+        assert_eq!(received.method, request.method);
+        assert_eq!(received.id, request.id);
+        send_half
+            .send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    41.into(),
+                    serde_json::json!({"tools": []}),
+                )),
+            )
+            .expect("split egress response");
+
+        let bytes = String::from_utf8(output.bytes()).expect("SSE output is UTF-8");
+        assert!(bytes.starts_with("event: endpoint\ndata: /mcp\n\n"));
+        assert!(bytes.contains("event: message\n"));
+        assert!(bytes.contains("\"id\":41"));
+    }
+
+    #[test]
+    fn sse_server_split_cancelled_ingress_leaves_egress_unchanged() {
+        let output = SharedWriteBuffer::default();
+        let request = JsonRpcRequest::new("tools/list", None, 42_i64);
+        let (mut recv_half, _send_half) =
+            SseServerTransport::new(output.clone(), [request].into_iter(), "/mcp").into_split();
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        assert!(matches!(
+            recv_half.recv(&cx),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(output.bytes().is_empty());
     }
 
     #[test]

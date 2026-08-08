@@ -141,6 +141,28 @@ pub trait Transport {
     fn close(&mut self) -> Result<(), TransportError>;
 }
 
+/// Independently owned receive half of a full-duplex MCP transport.
+///
+/// Unlike [`Transport`], this half never owns the response writer. A server
+/// may therefore block in [`Self::recv`] while a request-owned child commits a
+/// response through the matching [`TransportSendHalf`].
+pub trait TransportRecvHalf {
+    /// Receives the next JSON-RPC message.
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError>;
+
+    /// Closes the receive half.
+    fn close(&mut self) -> Result<(), TransportError>;
+}
+
+/// Independently owned send half of a full-duplex MCP transport.
+pub trait TransportSendHalf: Send {
+    /// Sends one JSON-RPC message without acquiring the receive half.
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError>;
+
+    /// Closes the send half.
+    fn close(&mut self) -> Result<(), TransportError>;
+}
+
 /// Transport error types.
 #[derive(Debug)]
 pub enum TransportError {
