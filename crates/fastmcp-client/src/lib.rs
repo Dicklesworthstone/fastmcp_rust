@@ -107,7 +107,8 @@ use fastmcp_protocol::common_types::{
     ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
 use fastmcp_protocol::extensions::{
-    ExtensionLocalEnablement, official_tasks_empty_settings, register_official_tasks_extension,
+    ExtensionLocalEnablement, OFFICIAL_TASKS_RESULT_DISCRIMINATOR, official_tasks_empty_settings,
+    register_official_tasks_extension,
 };
 use fastmcp_protocol::methods::{Final2026Peer, final_2026_07_28_method};
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
@@ -212,6 +213,17 @@ pub struct SubscriptionListenCollector {
     pub task_notifications: Vec<FinalTaskStatusNotification>,
     /// The final complete result that terminated the listener.
     pub terminal: CompleteResult<FinalSubscriptionsListenResult>,
+}
+
+/// Exact modern `tools/call` outcome without projecting away result algebra.
+#[derive(Debug, Clone)]
+pub enum FinalToolCallOutcome {
+    /// The tool completed synchronously with final content.
+    Complete(CompleteResult<FinalCallToolResult>),
+    /// The tool created a durable Tasks-extension task.
+    Task(fastmcp_protocol::CreateTaskResult),
+    /// The tool requires client input before it can complete.
+    InputRequired(fastmcp_protocol::InputRequiredResult),
 }
 
 fn subscription_listener_protocol_error(message: &'static str) -> McpError {
@@ -372,11 +384,13 @@ fn validate_subscription_notification_filter(
     }
 }
 
-fn admit_final_tasks_discovery_surface(
+fn negotiate_final_tasks_discovery(
     discovery: &ServerDiscoverResult,
-    name: &str,
-    direction: ExtensionDirection,
-) -> McpResult<()> {
+) -> McpResult<(
+    ExtensionDescriptorRegistry,
+    fastmcp_protocol::ExtensionId,
+    fastmcp_protocol::extensions::NegotiatedExtensionSet,
+)> {
     let capabilities = serde_json::to_value(discovery.capabilities()).map_err(|error| {
         McpError::internal_error(format!(
             "Failed to retain final Tasks capability discovery: {error}"
@@ -435,6 +449,15 @@ fn admit_final_tasks_discovery_surface(
                 "io.modelcontextprotocol/tasks requires bilateral empty settings",
             )
         })?;
+    Ok((registry, task_extension, negotiated))
+}
+
+fn admit_final_tasks_discovery_surface(
+    discovery: &ServerDiscoverResult,
+    name: &str,
+    direction: ExtensionDirection,
+) -> McpResult<()> {
+    let (registry, task_extension, negotiated) = negotiate_final_tasks_discovery(discovery)?;
     let admitted = if name == TASK_STATUS_NOTIFICATION {
         negotiated
             .admit_notification(
@@ -461,6 +484,26 @@ fn admit_final_tasks_discovery_surface(
             "Tasks surface is not admitted by the negotiated official extension",
         )
     })
+}
+
+fn admit_final_tasks_result_discriminator(
+    discovery: &ServerDiscoverResult,
+    discriminator: &str,
+) -> McpResult<()> {
+    let (registry, task_extension, negotiated) = negotiate_final_tasks_discovery(discovery)?;
+    negotiated
+        .admit_result_discriminator(
+            &registry,
+            ProtocolEra::Modern2026,
+            &task_extension,
+            discriminator,
+        )
+        .map(|_| ())
+        .map_err(|_| {
+            McpError::invalid_params(
+                "Tasks result is not admitted by the negotiated official extension",
+            )
+        })
 }
 
 fn final_log_level(level: LogLevel) -> LoggingLevel {
@@ -4391,9 +4434,22 @@ impl Client {
         method: &str,
         params: P,
     ) -> McpResult<CoreResult> {
+        self.send_typed_core_request_with_tasks(method, params, false)
+    }
+
+    fn send_typed_core_request_with_tasks<P: serde::Serialize>(
+        &mut self,
+        method: &str,
+        params: P,
+        declare_tasks: bool,
+    ) -> McpResult<CoreResult> {
         let params_value = serde_json::to_value(params)
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
-        let params_value = self.prepare_request_parameters(params_value)?;
+        let params_value = if declare_tasks {
+            self.with_final_tasks_client_capability(params_value)?
+        } else {
+            self.prepare_request_parameters(params_value)?
+        };
         let core_request = self
             .prepared_core_request(method, &params_value)?
             .ok_or_else(|| {
@@ -5292,6 +5348,43 @@ impl Client {
             meta: None,
         };
         self.send_typed_core_request("tools/call", params)
+    }
+
+    /// Calls a final tool with the official Tasks result surface enabled.
+    ///
+    /// Bilateral empty-settings negotiation is proved from the retained
+    /// discovery response before a request ID is allocated. The request then
+    /// declares Tasks explicitly and returns the exact complete, task, or
+    /// input-required branch without legacy projection.
+    pub fn call_tool_final_outcome(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolCallOutcome> {
+        self.require_modern_final_result_session("tools/call")?;
+        let discovery = self.server_discovery().ok_or_else(|| {
+            McpError::invalid_params(
+                "Modern Tasks requires the retained final server/discover response",
+            )
+        })?;
+        admit_final_tasks_result_discriminator(discovery, OFFICIAL_TASKS_RESULT_DISCRIMINATOR)?;
+        let params = CallToolParams {
+            name: name.to_owned(),
+            arguments: Some(arguments),
+            meta: None,
+        };
+        match self.send_typed_core_request_with_tasks("tools/call", params, true)? {
+            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                Ok(FinalToolCallOutcome::Complete(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
+                Ok(FinalToolCallOutcome::Task(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
+                Ok(FinalToolCallOutcome::InputRequired(result))
+            }
+            _ => Err(unexpected_convenience_result("tools/call")),
+        }
     }
 
     /// Calls a tool and returns its exact MCP 2026-07-28 result payload.
@@ -10582,6 +10675,23 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_final_tool_task_client_script(response: &str) -> String {
+        let discovery_response =
+            modern_tasks_discovery_response("tool-task-modern-server", serde_json::json!({}));
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r call || exit 1; \
+             case \"$call\" in *'\"method\":\"tools/call\"'*) ;; *) exit 1 ;; esac; \
+             case \"$call\" in *'\"name\":\"durable-tool\"'*) ;; *) exit 1 ;; esac; \
+             case \"$call\" in *'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{response}'; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
     fn modern_discovery_response_with_final_state(server_name: &str, cache_scope: &str) -> String {
         let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
             &fastmcp_protocol::ServerBehaviorRegistry::from_behaviors([
@@ -10992,6 +11102,53 @@ mod tests {
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(!client.is_initialized());
         client.close().expect("contradictory Tasks client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_tasks_final_tool_outcome_retains_exact_created_task() {
+        let script = modern_final_tool_task_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"task","taskId":"task-73","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("Tasks-capable discovery initializes the tool client");
+
+        let outcome = client
+            .call_tool_final_outcome("durable-tool", serde_json::json!({"work": 73}))
+            .expect("bilaterally negotiated tool result retains its exact task branch");
+        let FinalToolCallOutcome::Task(result) = outcome else {
+            panic!("Tasks-backed tools/call must not be projected into complete content");
+        };
+        assert_eq!(result.task.base().task_id.as_str(), "task-73");
+        assert!(matches!(result.task, FinalTask::Working(_)));
+        client.close().expect("final tool task client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_tasks_final_tool_outcome_rejects_one_field_result_type_change() {
+        // This differs from the admitted task result only in `resultType`.
+        let script = modern_final_tool_task_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-73","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("Tasks-capable discovery initializes before the planted response");
+
+        let error = client
+            .call_tool_final_outcome("durable-tool", serde_json::json!({"work": 73}))
+            .expect_err("one changed result discriminator must fail the connection closed");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(!client.is_initialized());
     }
 
     #[cfg(unix)]
