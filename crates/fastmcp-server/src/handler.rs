@@ -20,11 +20,15 @@ use fastmcp_core::{
     McpContext, McpError, McpOutcome, McpResult, NotificationSender, Outcome, ProgressReporter,
     SessionState,
 };
+use fastmcp_protocol::common_types::{
+    AbsoluteUri, ContentBlock, EmbeddedResourceContents, Implementation, OpenMetadata, RawIcon,
+};
 use fastmcp_protocol::{
-    CompletionValues, Content, CoreResultDiscriminatorPolicy, DecodedResult, FinalCompletionParams,
-    Icon, JsonRpcRequest, LegacyCompletionParams, ProgressMarker, ProgressParams, Prompt,
-    PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultPeerEra, Tool,
-    ToolAnnotations, decode_peer_result, encode_result,
+    CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy, DecodedResult,
+    FinalCallToolResult, FinalCompletionParams, Icon, JsonRpcRequest, LegacyCompletionParams,
+    ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource, ResourceContent,
+    ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations, decode_peer_result,
+    encode_result,
 };
 
 // ============================================================================
@@ -277,6 +281,83 @@ pub(crate) fn encode_final_complete_result<T: serde::Serialize>(
     serde_json::from_str(&encode_result(&decoded)).map_err(McpError::from)
 }
 
+/// Promotes an exact legacy tool payload into the final complete-result algebra.
+///
+/// This is the compatibility direction used by legacy-only tool handlers when
+/// a final request reaches the router. Every legacy content variant is mapped
+/// without discarding information; malformed legacy embedded resources are
+/// refused rather than authored as a different final resource.
+pub(crate) fn promote_legacy_tool_content(
+    content: Vec<Content>,
+) -> McpResult<CompleteResult<FinalCallToolResult>> {
+    let content = content
+        .into_iter()
+        .map(|content| match content {
+            Content::Text { text } => Ok(ContentBlock::Text {
+                text,
+                annotations: None,
+                meta: None,
+            }),
+            Content::Image { data, mime_type } => Ok(ContentBlock::Image {
+                data,
+                mime_type,
+                annotations: None,
+                meta: None,
+            }),
+            Content::Audio { data, mime_type } => Ok(ContentBlock::Audio {
+                data,
+                mime_type,
+                annotations: None,
+                meta: None,
+            }),
+            Content::Resource { resource } => {
+                let uri = AbsoluteUri::parse(resource.uri).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "legacy tool resource cannot be promoted to the final handler result: {error}",
+                    ))
+                })?;
+                let embedded = match (resource.text, resource.blob) {
+                    (Some(text), None) => EmbeddedResourceContents::Text {
+                        uri,
+                        text,
+                        mime_type: resource.mime_type,
+                    },
+                    (None, Some(blob)) => EmbeddedResourceContents::Blob {
+                        uri,
+                        blob,
+                        mime_type: resource.mime_type,
+                    },
+                    _ => {
+                        return Err(McpError::internal_error(
+                            "legacy tool resource cannot be promoted without exactly one text or blob payload",
+                        ));
+                    }
+                };
+                Ok(ContentBlock::Resource {
+                    resource: embedded,
+                    annotations: None,
+                    meta: None,
+                })
+            }
+        })
+        .collect::<McpResult<Vec<_>>>()?;
+
+    let server_info = Implementation::try_new("fastmcp-server", env!("CARGO_PKG_VERSION"))
+        .map_err(|error| {
+            McpError::internal_error(format!(
+                "server identity cannot construct a final tool result: {error}",
+            ))
+        })?;
+
+    Ok(CompleteResult::new(
+        FinalCallToolResult {
+            content,
+            is_error: false,
+        },
+        ResultMeta::server_generated(server_info),
+    ))
+}
+
 /// Handler for a tool.
 ///
 /// This trait is typically implemented via the `#[tool]` macro.
@@ -340,6 +421,28 @@ pub trait ToolHandler: Send + Sync {
         None
     }
 
+    /// Returns the final display title for this tool.
+    ///
+    /// This final-only field is deliberately separate from the legacy tool
+    /// definition so modern catalog projection never synthesizes or leaks a
+    /// legacy version/tag field.
+    fn final_title(&self) -> Option<&str> {
+        None
+    }
+
+    /// Returns the validated final icon set for this tool.
+    ///
+    /// A legacy singular icon is not projected automatically because its
+    /// optional source and scalar size hint do not form an exact final icon.
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        None
+    }
+
+    /// Returns final open metadata for this tool's catalog entry.
+    fn final_metadata(&self) -> Option<&OpenMetadata> {
+        None
+    }
+
     /// Returns the tool's custom timeout duration.
     ///
     /// Default implementation returns `None`, meaning no additional handler
@@ -387,6 +490,37 @@ pub trait ToolHandler: Send + Sync {
         })
     }
 
+    /// Calls the tool through the final MCP 2026-07-28 result surface.
+    ///
+    /// Legacy-only handlers retain their exact [`Self::call`] result and are
+    /// promoted without loss into a complete final result. Handlers that
+    /// author final-only metadata, annotations, resource links, or a tool
+    /// error result should override this method (or its async counterpart) so
+    /// the router can preserve the supplied final result algebra exactly.
+    fn call_final(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        promote_legacy_tool_content(self.call(ctx, arguments)?)
+    }
+
+    /// Asynchronously calls the tool through the final result surface.
+    ///
+    /// The default delegates to [`Self::call_final`].
+    fn call_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
+        Box::pin(async move {
+            match self.call_final(ctx, arguments) {
+                Ok(value) => Outcome::Ok(value),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
     /// Calls the tool from a request-owned structured child.
     ///
     /// Modern router dispatch supplies the child [`Cx`] that owns this handler
@@ -401,6 +535,19 @@ pub trait ToolHandler: Send + Sync {
         arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
         self.call_async(ctx, arguments)
+    }
+
+    /// Calls the tool's final result hook from a request-owned child.
+    ///
+    /// Existing final async handlers keep their behavior through the default
+    /// delegation to [`Self::call_final_async`].
+    fn call_final_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
+        self.call_final_async(ctx, arguments)
     }
 }
 
@@ -775,6 +922,18 @@ impl ToolHandler for MountedToolHandler {
         self.inner.output_schema()
     }
 
+    fn final_title(&self) -> Option<&str> {
+        self.inner.final_title()
+    }
+
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        self.inner.final_icons()
+    }
+
+    fn final_metadata(&self) -> Option<&OpenMetadata> {
+        self.inner.final_metadata()
+    }
+
     fn timeout(&self) -> Option<Duration> {
         self.inner.timeout()
     }
@@ -798,6 +957,32 @@ impl ToolHandler for MountedToolHandler {
         arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
         self.inner.call_async_in_request(ctx, request_cx, arguments)
+    }
+
+    fn call_final(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        self.inner.call_final(ctx, arguments)
+    }
+
+    fn call_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
+        self.inner.call_final_async(ctx, arguments)
+    }
+
+    fn call_final_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
+        self.inner
+            .call_final_async_in_request(ctx, request_cx, arguments)
     }
 }
 
@@ -1324,6 +1509,80 @@ mod tests {
         let ctx = McpContext::new(cx, 1);
         let result = tool.call(&ctx, serde_json::json!({"x": 1})).unwrap();
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn tool_handler_final_surface_promotes_legacy_content_without_changing_legacy_call() {
+        let tool = StubTool;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let legacy = tool
+            .call(&ctx, serde_json::json!({"x": 1}))
+            .expect("legacy handler result");
+        let final_result = tool
+            .call_final(&ctx, serde_json::json!({"x": 1}))
+            .expect("legacy handler promotes into the final result algebra");
+
+        assert!(matches!(legacy.as_slice(), [Content::Text { .. }]));
+        assert!(matches!(
+            final_result.payload.content.as_slice(),
+            [ContentBlock::Text { .. }]
+        ));
+        assert_eq!(
+            final_result
+                .meta
+                .server_info
+                .as_ref()
+                .map(|info| info.name.as_str()),
+            Some("fastmcp-server")
+        );
+    }
+
+    #[test]
+    fn tool_handler_final_catalog_accessors_preserve_final_only_fields() {
+        struct FinalCatalogTool {
+            metadata: OpenMetadata,
+            icons: Vec<RawIcon>,
+        }
+
+        impl ToolHandler for FinalCatalogTool {
+            fn definition(&self) -> Tool {
+                (StubTool).definition()
+            }
+
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                Ok(vec![Content::text("final catalog")])
+            }
+
+            fn final_title(&self) -> Option<&str> {
+                Some("Final Title")
+            }
+
+            fn final_icons(&self) -> Option<&[RawIcon]> {
+                Some(&self.icons)
+            }
+
+            fn final_metadata(&self) -> Option<&OpenMetadata> {
+                Some(&self.metadata)
+            }
+        }
+
+        let metadata = OpenMetadata::try_from_entries([(
+            "com.example/catalog".to_owned(),
+            serde_json::json!({"preserve": true}),
+        )])
+        .expect("final metadata");
+        let icons = vec![RawIcon::try_new("https://example.test/icon.png").expect("final icon")];
+        let tool = FinalCatalogTool { metadata, icons };
+
+        assert_eq!(tool.final_title(), Some("Final Title"));
+        assert_eq!(tool.final_icons().map(<[RawIcon]>::len), Some(1));
+        assert_eq!(
+            tool.final_metadata()
+                .and_then(|metadata| metadata.get("com.example/catalog")),
+            Some(&serde_json::json!({"preserve": true}))
+        );
+        assert!(tool.output_schema().is_none());
     }
 
     #[test]

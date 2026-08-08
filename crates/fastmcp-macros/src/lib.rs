@@ -824,6 +824,19 @@ fn generate_tool_result_conversion(
     }
 }
 
+/// Generates the exact final result conversion for a tool that already
+/// returns the public final complete-result algebra. The legacy execution path
+/// remains responsible for its strict, lossless projection to `Vec<Content>`.
+fn generate_final_tool_result_conversion(output: &syn::ReturnType) -> Option<TokenStream2> {
+    match final_complete_return_kind(output, "FinalCallToolResult")? {
+        FinalCompleteReturnKind::Direct => Some(quote! { Ok(result) }),
+        FinalCompleteReturnKind::Result => Some(quote! {
+            result.map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))
+        }),
+        FinalCompleteReturnKind::McpResult => Some(quote! { result }),
+    }
+}
+
 fn generate_tool_execution_methods(
     is_async: bool,
     expects_context: bool,
@@ -831,6 +844,7 @@ fn generate_tool_execution_methods(
     param_names: &[&Ident],
     param_extractions: &[TokenStream2],
     result_conversion: &TokenStream2,
+    final_result_conversion: Option<&TokenStream2>,
 ) -> TokenStream2 {
     let sync_invocation = if expects_context {
         quote! { #fn_name(ctx, #(#param_names),*) }
@@ -839,6 +853,26 @@ fn generate_tool_execution_methods(
     };
 
     if !is_async {
+        let final_method = final_result_conversion.map_or_else(TokenStream2::new, |conversion| {
+            quote! {
+                fn call_final(
+                    &self,
+                    ctx: &fastmcp_core::McpContext,
+                    arguments: serde_json::Value,
+                ) -> fastmcp_core::McpResult<
+                    fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>,
+                > {
+                    let arguments = arguments.as_object()
+                        .cloned()
+                        .unwrap_or_default();
+
+                    #(#param_extractions)*
+
+                    let result = #sync_invocation;
+                    #conversion
+                }
+            }
+        });
         return quote! {
             fn call(
                 &self,
@@ -854,6 +888,8 @@ fn generate_tool_execution_methods(
                 let result = #sync_invocation;
                 #result_conversion
             }
+
+            #final_method
         };
     }
 
@@ -862,6 +898,41 @@ fn generate_tool_execution_methods(
     } else {
         quote! { #fn_name(#(#param_names),*).await }
     };
+
+    let final_method = final_result_conversion.map_or_else(TokenStream2::new, |conversion| {
+        quote! {
+            fn call_final_async<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                arguments: serde_json::Value,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<
+                    fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>,
+                >,
+            > {
+                Box::pin(async move {
+                    let result: fastmcp_core::McpResult<
+                        fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>,
+                    > = async move {
+                        let arguments = arguments.as_object()
+                            .cloned()
+                            .unwrap_or_default();
+
+                        #(#param_extractions)*
+
+                        let result = #async_invocation;
+                        #conversion
+                    }.await;
+
+                    match result {
+                        Ok(value) => fastmcp_core::Outcome::Ok(value),
+                        Err(error) => fastmcp_core::Outcome::Err(error),
+                    }
+                })
+            }
+        }
+    });
 
     quote! {
         fn call(
@@ -900,6 +971,8 @@ fn generate_tool_execution_methods(
                 }
             })
         }
+
+        #final_method
     }
 }
 
@@ -1501,8 +1574,8 @@ fn generate_resource_execution_methods(
 #[allow(clippy::items_after_test_module)]
 mod async_handler_expansion_tests {
     use super::{
-        found_crate_path, generate_prompt_execution_methods, generate_resource_execution_methods,
-        generate_tool_execution_methods,
+        found_crate_path, generate_final_tool_result_conversion, generate_prompt_execution_methods,
+        generate_resource_execution_methods, generate_tool_execution_methods,
     };
     use proc_macro_crate::FoundCrate;
     use quote::{format_ident, quote};
@@ -1526,6 +1599,7 @@ mod async_handler_expansion_tests {
             &[&param],
             &[quote! { let value: String = String::new(); }],
             &quote! { Ok(vec![]) },
+            None,
         );
 
         assert_direct_async_expansion(tokens, "fn call_async");
@@ -1541,6 +1615,7 @@ mod async_handler_expansion_tests {
             "example://resource",
             &[],
             &quote! { Ok(vec![]) },
+            None,
         );
 
         assert_direct_async_expansion(tokens, "fn read_async_with_uri");
@@ -1578,6 +1653,30 @@ mod async_handler_expansion_tests {
         assert!(tokens.contains("fn call"), "{tokens}");
         assert!(!tokens.contains("fn call_async"), "{tokens}");
         assert!(!tokens.contains(". await"), "{tokens}");
+    }
+
+    #[test]
+    fn final_tool_expansion_keeps_exact_final_result_hook() {
+        let fn_name = format_ident!("final_tool");
+        let output: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>
+        );
+        let conversion = generate_final_tool_result_conversion(&output)
+            .expect("the complete final tool result selects the final hook");
+        let tokens = generate_tool_execution_methods(
+            false,
+            false,
+            &fn_name,
+            &[],
+            &[],
+            &quote! { Ok(vec![]) },
+            Some(&conversion),
+        )
+        .to_string();
+
+        assert!(tokens.contains("fn call_final"), "{tokens}");
+        assert!(tokens.contains("FinalCallToolResult"), "{tokens}");
+        assert!(!tokens.contains("result . payload"), "{tokens}");
     }
 
     #[test]
@@ -2329,6 +2428,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Analyze return type to determine conversion strategy
     let return_type = &input_fn.sig.output;
     let result_conversion = generate_tool_result_conversion(return_type, typed_output_schema);
+    let final_result_conversion = generate_final_tool_result_conversion(return_type);
 
     let execution_methods = generate_tool_execution_methods(
         is_async,
@@ -2337,6 +2437,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         &param_names,
         &param_extractions,
         &result_conversion,
+        final_result_conversion.as_ref(),
     );
 
     // Generate the handler implementation

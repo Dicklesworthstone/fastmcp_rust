@@ -17,17 +17,21 @@ use fastmcp_core::{
     McpContext, McpError, McpErrorCode, McpOutcome, McpResult, SessionState, block_on,
     sha256_bounded,
 };
+use fastmcp_protocol::common_types::{
+    AbsoluteUri, EmbeddedResourceContents, OpenMetadata, RawIcon,
+};
 use fastmcp_protocol::methods::COMPLETION_COMPLETE;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
-    CallToolParams, CallToolResult, Content, CoreRequest, FinalCompletionParams,
-    FinalCompletionResult, FinalCoreRequest, GetPromptParams, GetPromptResult, InitializeParams,
-    InitializeResult, JsonRpcRequest, LegacyCompletionParams, LegacyCompletionResult,
-    LegacyCoreRequest, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
-    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
-    ListToolsResult, PROTOCOL_VERSION, ProgressMarker, Prompt, ReadResourceParams,
-    ReadResourceResult, Resource, ResourceTemplate, ServerBehavior, ServerBehaviorRegistry, Tool,
-    validate, validate_strict,
+    CacheScope, CallToolParams, CallToolResult, CompleteResult, Content, CoreRequest, CoreResult,
+    FinalCallToolParams, FinalCallToolResult, FinalCompletionParams, FinalCompletionResult,
+    FinalCoreRequest, FinalCoreResult, FinalListParams, FinalReadResourceParams, GetPromptParams,
+    GetPromptResult, InitializeParams, InitializeResult, JsonRpcRequest, LegacyCompletionParams,
+    LegacyCompletionResult, LegacyCoreRequest, ListPromptsParams, ListPromptsResult,
+    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
+    ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker,
+    Prompt, ReadResourceParams, ReadResourceResult, Resource, ResourceContent, ResourceTemplate,
+    ServerBehavior, ServerBehaviorRegistry, Tool, ToolAnnotations, validate, validate_strict,
 };
 #[cfg(test)]
 use fastmcp_protocol::{
@@ -213,6 +217,244 @@ fn encode_stateless_handler_result<T: serde::Serialize>(
     result: McpResult<T>,
 ) -> McpResult<serde_json::Value> {
     encode_final_complete_result(result?)
+}
+
+/// Encodes a handler-authored final tool result without reprojecting it through
+/// the legacy result surface. This preserves the complete result's metadata
+/// and inert open members under the protocol-owned final codec.
+fn encode_final_tools_call_result(
+    result: McpResult<CompleteResult<FinalCallToolResult>>,
+) -> McpResult<serde_json::Value> {
+    let result = result?;
+    let encoded = CoreResult::Final(FinalCoreResult::ToolsCall {
+        result,
+        diagnostic: None,
+    })
+    .encode()
+    .map_err(|error| McpError::internal_error(error.to_string()))?;
+    serde_json::from_str(&encoded).map_err(McpError::from)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FinalCacheHintPolicy {
+    list_ttl_ms: u64,
+    resource_read_ttl_ms: u64,
+    scope: CacheScope,
+}
+
+impl Default for FinalCacheHintPolicy {
+    fn default() -> Self {
+        Self {
+            list_ttl_ms: 5 * 60 * 1_000,
+            resource_read_ttl_ms: 60 * 60 * 1_000,
+            scope: CacheScope::Private,
+        }
+    }
+}
+
+impl FinalCacheHintPolicy {
+    const fn ttl_ms_for(self, resource_read: bool) -> u64 {
+        if resource_read {
+            self.resource_read_ttl_ms
+        } else {
+            self.list_ttl_ms
+        }
+    }
+
+    const fn scope_wire(self) -> &'static str {
+        match self.scope {
+            CacheScope::Public => "public",
+            CacheScope::Private => "private",
+        }
+    }
+}
+
+/// Encodes a modern cacheable list or resource-read result with the required
+/// cache hints. Legacy dispatch never calls this boundary.
+fn encode_final_cacheable_result<T: serde::Serialize>(
+    result: McpResult<T>,
+    policy: FinalCacheHintPolicy,
+    resource_read: bool,
+) -> McpResult<serde_json::Value> {
+    let mut encoded = encode_final_complete_result(result?)?;
+    let object = encoded.as_object_mut().ok_or_else(|| {
+        McpError::internal_error("modern cacheable result must encode as an object")
+    })?;
+    object.insert(
+        "ttlMs".to_owned(),
+        serde_json::Value::from(policy.ttl_ms_for(resource_read)),
+    );
+    object.insert(
+        "cacheScope".to_owned(),
+        serde_json::Value::String(policy.scope_wire().to_owned()),
+    );
+    Ok(encoded)
+}
+
+/// Exact 2026 catalog model for a tool. Legacy `icon`, `version`, and `tags`
+/// are deliberately not representable here.
+#[derive(serde::Serialize)]
+struct FinalToolCatalogEntry {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(rename = "inputSchema")]
+    input_schema: serde_json::Value,
+    #[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
+    output_schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<ToolAnnotations>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    icons: Vec<RawIcon>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    meta: Option<OpenMetadata>,
+}
+
+/// Exact 2026 catalog model for a resource.
+#[derive(serde::Serialize)]
+struct FinalResourceCatalogEntry {
+    uri: AbsoluteUri,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+}
+
+/// Exact 2026 catalog model for a resource template.
+#[derive(serde::Serialize)]
+struct FinalResourceTemplateCatalogEntry {
+    #[serde(rename = "uriTemplate")]
+    uri_template: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+}
+
+/// Exact 2026 catalog model for a prompt.
+#[derive(serde::Serialize)]
+struct FinalPromptCatalogEntry {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    arguments: Vec<fastmcp_protocol::PromptArgument>,
+}
+
+#[derive(serde::Serialize)]
+struct FinalToolsListResult {
+    tools: Vec<FinalToolCatalogEntry>,
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct FinalResourcesListResult {
+    resources: Vec<FinalResourceCatalogEntry>,
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct FinalResourceTemplatesListResult {
+    #[serde(rename = "resourceTemplates")]
+    resource_templates: Vec<FinalResourceTemplateCatalogEntry>,
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct FinalPromptsListResult {
+    prompts: Vec<FinalPromptCatalogEntry>,
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct FinalResourcesReadResult {
+    contents: Vec<EmbeddedResourceContents>,
+}
+
+fn project_final_resource_catalog_entry(
+    resource: Resource,
+) -> McpResult<FinalResourceCatalogEntry> {
+    let uri = AbsoluteUri::parse(resource.uri).map_err(|error| {
+        McpError::internal_error(format!(
+            "legacy resource URI cannot be projected into the final catalog: {error}",
+        ))
+    })?;
+    Ok(FinalResourceCatalogEntry {
+        uri,
+        name: resource.name,
+        description: resource.description,
+        mime_type: resource.mime_type,
+    })
+}
+
+fn promote_resource_content(resource: ResourceContent) -> McpResult<EmbeddedResourceContents> {
+    let uri = AbsoluteUri::parse(resource.uri).map_err(|error| {
+        McpError::internal_error(format!(
+            "legacy resource content cannot be projected into the final result: {error}",
+        ))
+    })?;
+    match (resource.text, resource.blob) {
+        (Some(text), None) => Ok(EmbeddedResourceContents::Text {
+            uri,
+            text,
+            mime_type: resource.mime_type,
+        }),
+        (None, Some(blob)) => Ok(EmbeddedResourceContents::Blob {
+            uri,
+            blob,
+            mime_type: resource.mime_type,
+        }),
+        _ => Err(McpError::internal_error(
+            "legacy resource content cannot be promoted without exactly one text or blob payload",
+        )),
+    }
+}
+
+fn legacy_list_tools_params(params: FinalListParams) -> ListToolsParams {
+    ListToolsParams {
+        cursor: params.cursor,
+        include_tags: params.include_tags,
+        exclude_tags: params.exclude_tags,
+    }
+}
+
+fn legacy_list_resources_params(params: FinalListParams) -> ListResourcesParams {
+    ListResourcesParams {
+        cursor: params.cursor,
+        include_tags: params.include_tags,
+        exclude_tags: params.exclude_tags,
+    }
+}
+
+fn legacy_list_resource_templates_params(params: FinalListParams) -> ListResourceTemplatesParams {
+    ListResourceTemplatesParams {
+        cursor: params.cursor,
+        include_tags: params.include_tags,
+        exclude_tags: params.exclude_tags,
+    }
+}
+
+fn legacy_list_prompts_params(params: FinalListParams) -> ListPromptsParams {
+    ListPromptsParams {
+        cursor: params.cursor,
+        include_tags: params.include_tags,
+        exclude_tags: params.exclude_tags,
+    }
+}
+
+fn legacy_read_resource_params(params: FinalReadResourceParams) -> ReadResourceParams {
+    ReadResourceParams {
+        uri: params.uri.as_str().to_owned(),
+        meta: None,
+    }
 }
 
 fn encode_cursor_offset(offset: usize) -> String {
@@ -493,6 +735,8 @@ pub struct Router {
     /// When `None`, list methods return all items in a single response and
     /// `nextCursor` is always omitted.
     list_page_size: Option<usize>,
+    /// Cache policy emitted on exact modern catalog and resource-read results.
+    final_cache_hints: FinalCacheHintPolicy,
 }
 
 impl Router {
@@ -512,6 +756,7 @@ impl Router {
             sorted_template_keys: Vec::new(),
             strict_input_validation: false,
             list_page_size: None,
+            final_cache_hints: FinalCacheHintPolicy::default(),
         }
     }
 
@@ -522,6 +767,33 @@ impl Router {
     /// opaque base64 cursors.
     pub fn set_list_page_size(&mut self, page_size: Option<usize>) {
         self.list_page_size = page_size.filter(|n| *n > 0);
+    }
+
+    /// Sets the cache hints emitted by final catalog and resource-read
+    /// responses. The default is a five-minute private catalog TTL and a
+    /// one-hour private resource-read TTL.
+    pub fn set_final_cache_hint_policy(
+        &mut self,
+        list_ttl_ms: u64,
+        resource_read_ttl_ms: u64,
+        scope: CacheScope,
+    ) {
+        self.final_cache_hints = FinalCacheHintPolicy {
+            list_ttl_ms,
+            resource_read_ttl_ms,
+            scope,
+        };
+    }
+
+    /// Returns the active final cache-hint policy as
+    /// `(list_ttl_ms, resource_read_ttl_ms, scope)`.
+    #[must_use]
+    pub const fn final_cache_hint_policy(&self) -> (u64, u64, CacheScope) {
+        (
+            self.final_cache_hints.list_ttl_ms,
+            self.final_cache_hints.resource_read_ttl_ms,
+            self.final_cache_hints.scope,
+        )
     }
 
     /// Sets whether to use strict input validation.
@@ -1410,13 +1682,33 @@ impl Router {
                 )?
             }
             "tools/list" => {
-                let params = parse_stateless_params_or_default(params)?;
-                encode_stateless_handler_result(self.handle_tools_list(request_ctx, params, None))?
+                let request =
+                    CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", params.as_ref())
+                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let CoreRequest::Final(FinalCoreRequest::ToolsList(params)) = request else {
+                    return Err(McpError::internal_error(
+                        "modern tools/list dispatch selected another core request",
+                    ));
+                };
+                let result =
+                    self.handle_tools_list(request_ctx, legacy_list_tools_params(params), None);
+                encode_final_cacheable_result(
+                    result.and_then(|result| self.project_final_tools_list(request_ctx, result)),
+                    self.final_cache_hints,
+                    false,
+                )?
             }
             "tools/call" => {
-                let params = parse_stateless_params(params)?;
-                encode_stateless_handler_result(
-                    self.handle_tools_call_in_request(
+                let request =
+                    CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", params.as_ref())
+                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let CoreRequest::Final(FinalCoreRequest::ToolsCall(params)) = request else {
+                    return Err(McpError::internal_error(
+                        "modern tools/call dispatch selected another core request",
+                    ));
+                };
+                encode_final_tools_call_result(
+                    self.handle_tools_call_final_in_request(
                         request_ctx,
                         request_cx,
                         params,
@@ -1428,25 +1720,61 @@ impl Router {
                 )?
             }
             "resources/list" => {
-                let params = parse_stateless_params_or_default(params)?;
-                encode_stateless_handler_result(self.handle_resources_list(
+                let request =
+                    CoreRequest::decode(ProtocolEra::Modern2026, "resources/list", params.as_ref())
+                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let CoreRequest::Final(FinalCoreRequest::ResourcesList(params)) = request else {
+                    return Err(McpError::internal_error(
+                        "modern resources/list dispatch selected another core request",
+                    ));
+                };
+                let result = self.handle_resources_list(
                     request_ctx,
-                    params,
+                    legacy_list_resources_params(params),
                     None,
-                ))?
+                );
+                encode_final_cacheable_result(
+                    result.and_then(Self::project_final_resources_list),
+                    self.final_cache_hints,
+                    false,
+                )?
             }
             "resources/templates/list" => {
-                let params = parse_stateless_params_or_default(params)?;
-                encode_stateless_handler_result(self.handle_resource_templates_list(
+                let request = CoreRequest::decode(
+                    ProtocolEra::Modern2026,
+                    "resources/templates/list",
+                    params.as_ref(),
+                )
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let CoreRequest::Final(FinalCoreRequest::ResourceTemplatesList(params)) = request
+                else {
+                    return Err(McpError::internal_error(
+                        "modern resources/templates/list dispatch selected another core request",
+                    ));
+                };
+                let result = self.handle_resource_templates_list(
                     request_ctx,
-                    params,
+                    legacy_list_resource_templates_params(params),
                     None,
-                ))?
+                );
+                encode_final_cacheable_result(
+                    result.map(Self::project_final_resource_templates_list),
+                    self.final_cache_hints,
+                    false,
+                )?
             }
             "resources/read" => {
-                let params = parse_stateless_params(params)?;
-                encode_stateless_handler_result(
-                    self.handle_resources_read_in_request(
+                let request =
+                    CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", params.as_ref())
+                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let CoreRequest::Final(FinalCoreRequest::ResourcesRead(params)) = request else {
+                    return Err(McpError::internal_error(
+                        "modern resources/read dispatch selected another core request",
+                    ));
+                };
+                let params = legacy_read_resource_params(params);
+                let result = self
+                    .handle_resources_read_in_request(
                         request_ctx,
                         request_cx,
                         &params,
@@ -1454,16 +1782,29 @@ impl Router {
                         None,
                         None,
                     )
-                    .await,
+                    .await;
+                encode_final_cacheable_result(
+                    result.and_then(Self::project_final_resources_read),
+                    self.final_cache_hints,
+                    true,
                 )?
             }
             "prompts/list" => {
-                let params = parse_stateless_params_or_default(params)?;
-                encode_stateless_handler_result(self.handle_prompts_list(
-                    request_ctx,
-                    params,
-                    None,
-                ))?
+                let request =
+                    CoreRequest::decode(ProtocolEra::Modern2026, "prompts/list", params.as_ref())
+                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let CoreRequest::Final(FinalCoreRequest::PromptsList(params)) = request else {
+                    return Err(McpError::internal_error(
+                        "modern prompts/list dispatch selected another core request",
+                    ));
+                };
+                let result =
+                    self.handle_prompts_list(request_ctx, legacy_list_prompts_params(params), None);
+                encode_final_cacheable_result(
+                    result.map(Self::project_final_prompts_list),
+                    self.final_cache_hints,
+                    false,
+                )?
             }
             "prompts/get" => {
                 let params = parse_stateless_params(params)?;
@@ -1533,6 +1874,106 @@ impl Router {
             tools: tools.get(offset..end).unwrap_or_default().to_vec(),
             next_cursor,
         })
+    }
+
+    fn project_final_tools_list(
+        &self,
+        request_ctx: &McpContext,
+        result: ListToolsResult,
+    ) -> McpResult<FinalToolsListResult> {
+        let tools = result
+            .tools
+            .into_iter()
+            .map(|tool| {
+                let handler = self.tools.get(&tool.name).ok_or_else(|| {
+                    McpError::internal_error("listed tool is absent from the router catalog")
+                })?;
+                let (title, icons, meta) = crate::catch_extension_unwind(|| {
+                    (
+                        handler.final_title().map(str::to_owned),
+                        handler
+                            .final_icons()
+                            .map(<[RawIcon]>::to_vec)
+                            .unwrap_or_default(),
+                        handler.final_metadata().cloned(),
+                    )
+                })
+                .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
+
+                Ok(FinalToolCatalogEntry {
+                    name: tool.name,
+                    title,
+                    description: tool.description,
+                    input_schema: tool.input_schema,
+                    output_schema: tool.output_schema,
+                    annotations: tool.annotations,
+                    icons,
+                    meta,
+                })
+            })
+            .collect::<McpResult<Vec<_>>>()?;
+        Ok(FinalToolsListResult {
+            tools,
+            next_cursor: result.next_cursor,
+        })
+    }
+
+    fn project_final_resources_list(
+        result: ListResourcesResult,
+    ) -> McpResult<FinalResourcesListResult> {
+        let resources = result
+            .resources
+            .into_iter()
+            .map(project_final_resource_catalog_entry)
+            .collect::<McpResult<Vec<_>>>()?;
+        Ok(FinalResourcesListResult {
+            resources,
+            next_cursor: result.next_cursor,
+        })
+    }
+
+    fn project_final_resource_templates_list(
+        result: ListResourceTemplatesResult,
+    ) -> FinalResourceTemplatesListResult {
+        FinalResourceTemplatesListResult {
+            resource_templates: result
+                .resource_templates
+                .into_iter()
+                .map(|template| FinalResourceTemplateCatalogEntry {
+                    uri_template: template.uri_template,
+                    name: template.name,
+                    description: template.description,
+                    mime_type: template.mime_type,
+                })
+                .collect(),
+            next_cursor: result.next_cursor,
+        }
+    }
+
+    fn project_final_prompts_list(result: ListPromptsResult) -> FinalPromptsListResult {
+        FinalPromptsListResult {
+            prompts: result
+                .prompts
+                .into_iter()
+                .map(|prompt| FinalPromptCatalogEntry {
+                    name: prompt.name,
+                    description: prompt.description,
+                    arguments: prompt.arguments,
+                })
+                .collect(),
+            next_cursor: result.next_cursor,
+        }
+    }
+
+    fn project_final_resources_read(
+        result: ReadResourceResult,
+    ) -> McpResult<FinalResourcesReadResult> {
+        let contents = result
+            .contents
+            .into_iter()
+            .map(promote_resource_content)
+            .collect::<McpResult<Vec<_>>>()?;
+        Ok(FinalResourcesReadResult { contents })
     }
 
     /// Handles the tools/call request.
@@ -1748,6 +2189,105 @@ impl Router {
                     }],
                     is_error: true,
                 })
+            }
+            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "tool")),
+        }
+    }
+
+    /// Handles one final MCP 2026-07-28 `tools/call` request.
+    ///
+    /// Legacy dispatch remains on [`Self::handle_tools_call`], including its
+    /// exact `CallToolResult` behavior. Final dispatch calls the final handler
+    /// hook directly and encodes the returned complete result with the typed
+    /// core result codec.
+    async fn handle_tools_call_final_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: FinalCallToolParams,
+        session_state: SessionState,
+        notification_sender: Option<&NotificationSender>,
+        bidirectional_senders: Option<&BidirectionalSenders>,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        debug!(
+            target: targets::HANDLER,
+            "calling final tool; tool_key={}; arguments_present={}",
+            safe_log_label(&params.name),
+            params.arguments.is_some()
+        );
+
+        let dispatch_started_at = request_ctx.cx().now();
+        if request_cx.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_tool_enabled(&params.name) {
+            return Err(McpError::new(
+                McpErrorCode::MethodNotFound,
+                format!("Tool '{}' is disabled for this session", params.name),
+            ));
+        }
+
+        let handler = self
+            .tools
+            .get(&params.name)
+            .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", params.name)))?;
+        let arguments = params.arguments.unwrap_or_else(|| serde_json::json!({}));
+        let tool_def = crate::catch_extension_unwind(|| handler.definition())
+            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
+        let validation_result = if self.strict_input_validation {
+            validate_strict(&tool_def.input_schema, &arguments)
+        } else {
+            validate(&tool_def.input_schema, &arguments)
+        };
+        if let Err(validation_errors) = validation_result {
+            let error_messages: Vec<String> = validation_errors
+                .iter()
+                .map(|error| format!("{}: {}", error.path, error.message))
+                .collect();
+            return Err(McpError::invalid_params(format!(
+                "Input validation failed: {}",
+                error_messages.join("; ")
+            )));
+        }
+
+        let ctx = derive_handler_context(
+            request_ctx,
+            None,
+            notification_sender,
+            bidirectional_senders,
+        );
+        let handler_timeout =
+            read_handler_timeout(request_ctx.cx(), "tool_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            request_ctx.cx().budget(),
+            request_ctx.budget(),
+            handler_timeout,
+            dispatch_started_at,
+        );
+        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
+        let outcome =
+            run_handler_in_request(&ctx, request_cx, effective_budget, "tool", |child_cx| {
+                handler.call_final_async_in_request(&ctx, child_cx, arguments)
+            })
+            .await?;
+
+        match outcome {
+            Outcome::Ok(result) => Ok(result),
+            Outcome::Err(error) => {
+                let error = sanitize_handler_error(request_ctx.cx(), "tool", error);
+                if is_framework_terminal_tool_error(error.code) {
+                    return Err(error);
+                }
+                let mut result =
+                    crate::handler::promote_legacy_tool_content(vec![Content::Text {
+                        text: error.message,
+                    }])?;
+                result.payload.is_error = true;
+                Ok(result)
             }
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "tool")),
@@ -4542,12 +5082,14 @@ mod router_tests {
     use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
     use asupersync::types::CancelKind;
     use fastmcp_core::{McpContext, McpResult, SessionState};
+    use fastmcp_protocol::common_types::{ContentBlock, Implementation, OpenMetadata, RawIcon};
     use fastmcp_protocol::{
-        CompletionValues, Content, FinalCompletionParams, LegacyCompletionParams, Prompt,
-        PromptMessage, Resource, ResourceContent, Tool,
+        CompleteResult, CompletionValues, Content, ExactJsonMember, FinalCallToolResult,
+        FinalCompletionParams, LegacyCompletionParams, Prompt, PromptMessage, Resource,
+        ResourceContent, ResultMeta, Tool, UnknownResultMembers, parse_exact_json,
     };
     use std::fmt;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
 
@@ -4593,6 +5135,10 @@ mod router_tests {
                 let request = JsonRpcRequest::new(
                     "tools/call",
                     Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
                         "name": "concurrent-modern-tool",
                         "arguments": {"request": label},
                     })),
@@ -4646,6 +5192,73 @@ mod router_tests {
         }
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
             Ok(vec![Content::text(format!("called {}", self.name))])
+        }
+    }
+
+    static MACRO_DUAL_ERA_TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn macro_dual_era_result_meta() -> ResultMeta {
+        ResultMeta::server_generated(
+            Implementation::try_new("macro-dual-era-tool", "1.0.0")
+                .expect("test implementation identity"),
+        )
+    }
+
+    #[fastmcp_derive::tool]
+    fn macro_dual_era_tool() -> CompleteResult<FinalCallToolResult> {
+        MACRO_DUAL_ERA_TOOL_CALLS.fetch_add(1, Ordering::SeqCst);
+        let mut result = CompleteResult::new(
+            FinalCallToolResult {
+                content: vec![ContentBlock::text("macro final tool result")],
+                is_error: false,
+            },
+            macro_dual_era_result_meta(),
+        );
+        result.extras = UnknownResultMembers::try_new(
+            vec![ExactJsonMember {
+                name: "structuredContent".to_owned(),
+                value: parse_exact_json(r#"{"weather":"clear"}"#)
+                    .expect("structured content is exact JSON"),
+            }],
+            &["content", "isError"],
+        )
+        .expect("structured content is a legal final tool member");
+        result
+    }
+
+    struct FinalCatalogTool {
+        metadata: OpenMetadata,
+        icons: Vec<RawIcon>,
+    }
+
+    impl ToolHandler for FinalCatalogTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "final-catalog-tool".to_owned(),
+                description: Some("final catalog description".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: Some(serde_json::json!({"type": "object"})),
+                icon: Some(fastmcp_protocol::Icon::new("https://legacy.test/icon.png")),
+                version: Some("legacy-version".to_owned()),
+                tags: vec!["legacy-tag".to_owned()],
+                annotations: None,
+            }
+        }
+
+        fn final_title(&self) -> Option<&str> {
+            Some("Final Catalog Tool")
+        }
+
+        fn final_icons(&self) -> Option<&[RawIcon]> {
+            Some(&self.icons)
+        }
+
+        fn final_metadata(&self) -> Option<&OpenMetadata> {
+            Some(&self.metadata)
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("legacy final catalog result")])
         }
     }
 
@@ -8757,9 +9370,10 @@ mod router_tests {
     }
 
     #[test]
-    fn srv_01_srv_04_modern_shipped_handler_uses_final_complete_contract() {
+    fn macro_tool_dispatches_exact_legacy_and_final_complete_results() {
         let mut router = Router::new();
-        router.add_tool(NamedTool::new("final-contract-tool"));
+        MACRO_DUAL_ERA_TOOL_CALLS.store(0, Ordering::SeqCst);
+        router.add_tool(MacroDualEraTool);
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 91, Budget::INFINITE, &state);
@@ -8768,7 +9382,7 @@ mod router_tests {
             .handle_tools_call(
                 &request_ctx,
                 CallToolParams {
-                    name: "final-contract-tool".to_string(),
+                    name: "macro_dual_era_tool".to_string(),
                     arguments: Some(serde_json::json!({})),
                     meta: None,
                 },
@@ -8782,6 +9396,7 @@ mod router_tests {
             legacy_wire.get("resultType").is_none(),
             "the exact legacy result shape remains unchanged"
         );
+        assert_eq!(legacy_wire["content"][0]["text"], "macro final tool result");
 
         let modern = router
             .dispatch_stateless(
@@ -8789,7 +9404,11 @@ mod router_tests {
                 &JsonRpcRequest::new(
                     "tools/call",
                     Some(serde_json::json!({
-                        "name": "final-contract-tool",
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                        "name": "macro_dual_era_tool",
                         "arguments": {},
                     })),
                     91_i64,
@@ -8803,19 +9422,30 @@ mod router_tests {
         );
         assert_eq!(modern.get("content"), legacy_wire.get("content"));
         assert_eq!(modern.get("isError"), legacy_wire.get("isError"));
+        assert_eq!(modern["serverInfo"]["name"], "macro-dual-era-tool");
+        assert_eq!(
+            modern["structuredContent"],
+            serde_json::json!({"weather": "clear"})
+        );
+        assert_eq!(MACRO_DUAL_ERA_TOOL_CALLS.load(Ordering::SeqCst), 2);
     }
 
     #[test]
-    fn srv_01_srv_04_modern_shipped_handler_planted_negative_is_non_mutating() {
+    fn macro_tool_final_metadata_negative_is_non_mutating() {
         let mut router = Router::new();
-        router.add_tool(NamedTool::new("final-contract-tool"));
+        MACRO_DUAL_ERA_TOOL_CALLS.store(0, Ordering::SeqCst);
+        router.add_tool(MacroDualEraTool);
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 92, Budget::INFINITE, &state);
         let baseline = JsonRpcRequest::new(
             "tools/call",
             Some(serde_json::json!({
-                "name": "final-contract-tool",
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "macro_dual_era_tool",
                 "arguments": {},
             })),
             92_i64,
@@ -8826,10 +9456,7 @@ mod router_tests {
             .as_mut()
             .and_then(serde_json::Value::as_object_mut)
             .expect("tools/call parameters are an object")
-            .insert(
-                "name".to_string(),
-                serde_json::json!("missing-final-contract-tool"),
-            );
+            .remove("_meta");
 
         assert_eq!(baseline.method, planted.method);
         assert_eq!(baseline.id, planted.id);
@@ -8837,12 +9464,12 @@ mod router_tests {
             baseline
                 .params
                 .as_ref()
-                .and_then(|params| params.get("arguments")),
+                .and_then(|params| params.get("name")),
             planted
                 .params
                 .as_ref()
-                .and_then(|params| params.get("arguments")),
-            "the handler name is the only planted dimension"
+                .and_then(|params| params.get("name")),
+            "the final metadata object is the sole planted dimension"
         );
         let catalog_before = serde_json::to_vec(&router.tools()).expect("catalog serializes");
         let planted_before = serde_json::to_vec(&planted).expect("request serializes");
@@ -8854,11 +9481,12 @@ mod router_tests {
             baseline_result.get("resultType"),
             Some(&serde_json::json!("complete"))
         );
+        assert_eq!(MACRO_DUAL_ERA_TOOL_CALLS.load(Ordering::SeqCst), 1);
 
         let error = router
             .dispatch_stateless(&request_ctx, &planted)
-            .expect_err("only the unregistered handler name is refused");
-        assert_eq!(error.code, McpErrorCode::MethodNotFound);
+            .expect_err("only final metadata is refused");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(
             serde_json::to_vec(&planted).expect("rejected request serializes"),
             planted_before,
@@ -8868,6 +9496,165 @@ mod router_tests {
             serde_json::to_vec(&router.tools()).expect("catalog serializes"),
             catalog_before,
             "typed refusal cannot mutate the installed handler catalog"
+        );
+        assert_eq!(
+            MACRO_DUAL_ERA_TOOL_CALLS.load(Ordering::SeqCst),
+            1,
+            "metadata refusal cannot invoke the macro-generated tool"
+        );
+        assert_eq!(
+            router
+                .dispatch_stateless(&request_ctx, &baseline)
+                .expect("the unchanged baseline remains accepted after the rejection"),
+            baseline_result,
+            "the one-field rejection cannot alter the accepted final result"
+        );
+        assert_eq!(MACRO_DUAL_ERA_TOOL_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn final_catalog_and_resource_read_emit_exact_models_and_cache_hints() {
+        let metadata = OpenMetadata::try_from_entries([(
+            "com.example/catalog".to_owned(),
+            serde_json::json!({"source": "handler"}),
+        )])
+        .expect("valid final catalog metadata");
+        let icon = RawIcon::try_with_details(
+            "https://example.test/tool.png",
+            Some("image/png".to_owned()),
+            Some(vec!["48x48".to_owned()]),
+            None,
+        )
+        .expect("valid final icon");
+        let mut router = Router::new();
+        router.set_final_cache_hint_policy(123, 456, CacheScope::Private);
+        router.add_tool(FinalCatalogTool {
+            metadata,
+            icons: vec![icon],
+        });
+        router.add_resource(NamedResource::new("file:///catalog-resource"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 93, Budget::INFINITE, &state);
+
+        let legacy = router
+            .handle_tools_list(&request_ctx, ListToolsParams::default(), None)
+            .expect("legacy catalog remains available");
+        let legacy_wire = serde_json::to_value(&legacy).expect("legacy catalog serializes");
+        assert!(legacy_wire.get("ttlMs").is_none());
+        assert!(legacy_wire.get("cacheScope").is_none());
+        assert!(legacy_wire["tools"][0].get("icon").is_some());
+        assert!(legacy_wire["tools"][0].get("version").is_some());
+        assert!(legacy_wire["tools"][0].get("tags").is_some());
+
+        let final_metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let modern_list = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "tools/list",
+                    Some(serde_json::json!({"_meta": final_metadata})),
+                    93_i64,
+                ),
+            )
+            .expect("final catalog is projected through the exact model");
+        assert_eq!(modern_list["resultType"], "complete");
+        assert_eq!(modern_list["ttlMs"], 123);
+        assert_eq!(modern_list["cacheScope"], "private");
+        assert_eq!(modern_list["tools"][0]["title"], "Final Catalog Tool");
+        assert_eq!(
+            modern_list["tools"][0]["icons"][0]["sizes"],
+            serde_json::json!(["48x48"])
+        );
+        assert_eq!(
+            modern_list["tools"][0]["_meta"]["com.example/catalog"]["source"],
+            "handler"
+        );
+        assert_eq!(modern_list["tools"][0]["outputSchema"]["type"], "object");
+        assert!(modern_list["tools"][0].get("icon").is_none());
+        assert!(modern_list["tools"][0].get("version").is_none());
+        assert!(modern_list["tools"][0].get("tags").is_none());
+
+        let modern_read = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                        "uri": "file:///catalog-resource",
+                    })),
+                    94_i64,
+                ),
+            )
+            .expect("final resource content is projected through the final model");
+        assert_eq!(modern_read["ttlMs"], 456);
+        assert_eq!(modern_read["cacheScope"], "private");
+        assert_eq!(
+            modern_read["contents"][0]["uri"],
+            "file:///catalog-resource"
+        );
+        assert_eq!(modern_read["contents"][0]["text"], "content");
+    }
+
+    #[test]
+    fn final_catalog_missing_metadata_is_non_mutating() {
+        let mut router = Router::new();
+        router.add_tool(NamedTool::new("metadata-guarded-tool"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 95, Budget::INFINITE, &state);
+        let baseline = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            95_i64,
+        );
+        let mut planted = baseline.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("final list parameters are an object")
+            .remove("_meta");
+        assert_eq!(baseline.method, planted.method);
+        assert_eq!(baseline.id, planted.id);
+        let catalog_before = serde_json::to_vec(&router.tools()).expect("catalog serializes");
+        let planted_before = serde_json::to_vec(&planted).expect("request serializes");
+
+        let baseline_result = router
+            .dispatch_stateless(&request_ctx, &baseline)
+            .expect("the final baseline is accepted");
+        let error = router
+            .dispatch_stateless(&request_ctx, &planted)
+            .expect_err("only missing final metadata is refused");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            serde_json::to_vec(&planted).expect("rejected request serializes"),
+            planted_before,
+            "the rejected one-field request remains unchanged"
+        );
+        assert_eq!(
+            serde_json::to_vec(&router.tools()).expect("catalog serializes"),
+            catalog_before,
+            "the rejected one-field request cannot mutate the catalog"
+        );
+        assert_eq!(
+            router
+                .dispatch_stateless(&request_ctx, &baseline)
+                .expect("the unchanged final baseline remains accepted"),
+            baseline_result,
+            "the rejection cannot alter final cache hints or catalog projection"
         );
     }
 
