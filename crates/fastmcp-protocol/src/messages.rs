@@ -30,8 +30,9 @@ use crate::result::{
     encode_complete_result, exact_json_from_serde, exact_json_to_serde,
 };
 use crate::types::{
-    ClientCapabilities, ClientInfo, Content, Prompt, PromptMessage, Resource, ResourceContent,
-    ResourceTemplate, ServerCapabilities, ServerInfo, Tool,
+    ClientCapabilities, ClientInfo, LegacyContent, LegacyMetadata, LegacyPromptMessage,
+    LegacyResourceContent, Prompt, Resource, ResourceTemplate, ServerCapabilities, ServerInfo,
+    Tool,
 };
 
 // ============================================================================
@@ -2482,7 +2483,7 @@ pub struct CallToolParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallToolResult {
     /// Tool output content.
-    pub content: Vec<Content>,
+    pub content: Vec<LegacyContent>,
     /// Whether the tool call errored.
     #[serde(
         rename = "isError",
@@ -2490,6 +2491,12 @@ pub struct CallToolResult {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub is_error: bool,
+    /// Open legacy result metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<LegacyMetadata>,
+    /// Other schema-allowed result members.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional: BTreeMap<String, Value>,
 }
 
 // ============================================================================
@@ -2575,7 +2582,13 @@ pub struct ReadResourceParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadResourceResult {
     /// Resource contents.
-    pub contents: Vec<ResourceContent>,
+    pub contents: Vec<LegacyResourceContent>,
+    /// Open legacy result metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<LegacyMetadata>,
+    /// Other schema-allowed result members.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional: BTreeMap<String, Value>,
 }
 
 /// resources/subscribe request params.
@@ -2648,7 +2661,13 @@ pub struct GetPromptResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Prompt messages.
-    pub messages: Vec<PromptMessage>,
+    pub messages: Vec<LegacyPromptMessage>,
+    /// Open legacy result metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<LegacyMetadata>,
+    /// Other schema-allowed result members.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional: BTreeMap<String, Value>,
 }
 
 // ============================================================================
@@ -5022,10 +5041,14 @@ mod tests {
     #[test]
     fn call_tool_result_success() {
         let result = CallToolResult {
-            content: vec![Content::Text {
+            content: vec![LegacyContent::Text {
                 text: "42".to_string(),
+                annotations: None,
+                additional: BTreeMap::new(),
             }],
             is_error: false,
+            meta: None,
+            additional: BTreeMap::new(),
         };
         let value = serde_json::to_value(&result).expect("serialize");
         assert_eq!(value["content"][0]["type"], "text");
@@ -5037,13 +5060,111 @@ mod tests {
     #[test]
     fn call_tool_result_error() {
         let result = CallToolResult {
-            content: vec![Content::Text {
+            content: vec![LegacyContent::Text {
                 text: "Something went wrong".to_string(),
+                annotations: None,
+                additional: BTreeMap::new(),
             }],
             is_error: true,
+            meta: None,
+            additional: BTreeMap::new(),
         };
         let value = serde_json::to_value(&result).expect("serialize");
         assert_eq!(value["isError"], true);
+    }
+
+    #[test]
+    fn legacy_2024_content_results_round_trip_open_wire_members() {
+        let tool_wire = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": "ready",
+                "annotations": {
+                    "audience": ["assistant"],
+                    "priority": 0.75,
+                    "com.example/annotation": {"retain": true}
+                },
+                "_meta": {"legacy": "content"},
+                "com.example/content": {"retain": true}
+            }],
+            "_meta": {"legacy": "tool-result"},
+            "com.example/result": ["retain"]
+        });
+        let tool_result: CallToolResult =
+            serde_json::from_value(tool_wire.clone()).expect("legacy tool result decodes");
+        assert_eq!(
+            serde_json::to_value(&tool_result).expect("legacy tool result re-encodes"),
+            tool_wire
+        );
+
+        let read_wire = serde_json::json!({
+            "contents": [{
+                "uri": "file:///report.txt",
+                "text": "ready",
+                "_meta": {"legacy": "resource"},
+                "com.example/resource": {"retain": true}
+            }],
+            "_meta": {"legacy": "read-result"},
+            "com.example/result": {"retain": true}
+        });
+        let read_result: ReadResourceResult =
+            serde_json::from_value(read_wire.clone()).expect("legacy read result decodes");
+        assert_eq!(
+            serde_json::to_value(&read_result).expect("legacy read result re-encodes"),
+            read_wire
+        );
+
+        let prompt_wire = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": "summarize",
+                    "_meta": {"legacy": "prompt-content"},
+                    "com.example/content": "retain"
+                },
+                "_meta": {"legacy": "prompt-message"},
+                "com.example/message": true
+            }],
+            "_meta": {"legacy": "prompt-result"},
+            "com.example/result": {"retain": true}
+        });
+        let prompt_result: GetPromptResult =
+            serde_json::from_value(prompt_wire.clone()).expect("legacy prompt result decodes");
+        assert_eq!(
+            serde_json::to_value(&prompt_result).expect("legacy prompt result re-encodes"),
+            prompt_wire
+        );
+    }
+
+    #[test]
+    fn legacy_2024_call_tool_rejects_only_audio_discriminator_without_mutating_baseline() {
+        let accepted = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": "payload",
+                "data": "UklGRg==",
+                "mimeType": "audio/wav"
+            }]
+        });
+        let accepted_result: CallToolResult =
+            serde_json::from_value(accepted.clone()).expect("legacy text content decodes");
+        assert_eq!(
+            serde_json::to_value(&accepted_result).expect("legacy text content re-encodes"),
+            accepted
+        );
+
+        let baseline = accepted.clone();
+        let mut planted = accepted.clone();
+        planted["content"][0]["type"] = serde_json::json!("audio");
+        assert!(
+            serde_json::from_value::<CallToolResult>(planted).is_err(),
+            "the exact 2024 tools/call content union excludes audio"
+        );
+        assert_eq!(
+            accepted, baseline,
+            "the one-field audio discriminator rejection cannot mutate accepted legacy wire"
+        );
     }
 
     // ========================================================================
@@ -5103,12 +5224,14 @@ mod tests {
     #[test]
     fn read_resource_result_serialization() {
         let result = ReadResourceResult {
-            contents: vec![ResourceContent {
+            contents: vec![LegacyResourceContent::Text {
                 uri: "file://test.txt".to_string(),
                 mime_type: Some("text/plain".to_string()),
-                text: Some("Hello!".to_string()),
-                blob: None,
+                text: "Hello!".to_string(),
+                additional: BTreeMap::new(),
             }],
+            meta: None,
+            additional: BTreeMap::new(),
         };
         let value = serde_json::to_value(&result).expect("serialize");
         assert_eq!(value["contents"][0]["uri"], "file://test.txt");
@@ -5180,12 +5303,17 @@ mod tests {
     fn get_prompt_result_serialization() {
         let result = GetPromptResult {
             description: Some("A greeting prompt".to_string()),
-            messages: vec![PromptMessage {
+            messages: vec![LegacyPromptMessage {
                 role: crate::types::Role::User,
-                content: Content::Text {
+                content: LegacyContent::Text {
                     text: "Say hello".to_string(),
+                    annotations: None,
+                    additional: BTreeMap::new(),
                 },
+                additional: BTreeMap::new(),
             }],
+            meta: None,
+            additional: BTreeMap::new(),
         };
         let value = serde_json::to_value(&result).expect("serialize");
         assert_eq!(value["description"], "A greeting prompt");
@@ -5198,6 +5326,8 @@ mod tests {
         let result = GetPromptResult {
             description: None,
             messages: vec![],
+            meta: None,
+            additional: BTreeMap::new(),
         };
         let value = serde_json::to_value(&result).expect("serialize");
         assert!(value.get("description").is_none());

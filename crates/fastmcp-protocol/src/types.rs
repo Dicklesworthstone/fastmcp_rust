@@ -2,6 +2,8 @@
 //!
 //! Core types used in MCP communication.
 
+use std::collections::BTreeMap;
+
 use crate::common_types::{AbsoluteUri, Annotations, OpenMetadata, RawIcon, SamplingContentBlock};
 use base64::Engine as _;
 use serde::de::Error as _;
@@ -711,7 +713,93 @@ where
     Ok(value)
 }
 
-/// Content types in MCP messages.
+/// Legacy 2024 metadata, retained exactly as an open JSON object.
+///
+/// The 2024-11-05 schema permits arbitrary JSON members in result `_meta`
+/// objects. This intentionally remains distinct from the final-era
+/// [`OpenMetadata`] policy.
+pub type LegacyMetadata = BTreeMap<String, serde_json::Value>;
+
+/// Exact 2024-11-05 content blocks carried in legacy results.
+///
+/// The legacy `Content` surface remains available to 2026 adapters. This
+/// separate wire model preserves the annotations, `_meta`, and open members
+/// that the checked-in 2024 schema permits, while deliberately excluding audio
+/// from the legacy content union.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum LegacyContent {
+    /// Text content.
+    Text {
+        /// The text content.
+        text: String,
+        /// Optional presentation annotations.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Annotations>,
+        /// Other schema-allowed content members, including an open `_meta` value.
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, serde_json::Value>,
+    },
+    /// Image content.
+    Image {
+        /// Base64-encoded image data.
+        data: String,
+        /// MIME type (e.g., `image/png`).
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        /// Optional presentation annotations.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Annotations>,
+        /// Other schema-allowed content members, including an open `_meta` value.
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, serde_json::Value>,
+    },
+    /// An embedded resource.
+    Resource {
+        /// Resource contents.
+        resource: LegacyResourceContent,
+        /// Optional presentation annotations.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Annotations>,
+        /// Other schema-allowed content members, including an open `_meta` value.
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, serde_json::Value>,
+    },
+}
+
+/// Exact 2024-11-05 resource contents carried by legacy results.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LegacyResourceContent {
+    /// Text resource contents.
+    Text {
+        /// Resource URI.
+        uri: String,
+        /// Resource text.
+        text: String,
+        /// Optional MIME type.
+        #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        /// Other schema-allowed resource members, including an open `_meta` value.
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, serde_json::Value>,
+    },
+    /// Binary resource contents.
+    Blob {
+        /// Resource URI.
+        uri: String,
+        /// Base64-encoded resource data.
+        blob: String,
+        /// Optional MIME type.
+        #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        /// Other schema-allowed resource members, including an open `_meta` value.
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, serde_json::Value>,
+    },
+}
+
+/// Content types used by the broader server and 2026 adapter surfaces.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Content {
@@ -853,6 +941,18 @@ pub enum Role {
     User,
     /// Assistant role.
     Assistant,
+}
+
+/// Exact 2024-11-05 prompt messages carried in legacy results.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPromptMessage {
+    /// Message role.
+    pub role: Role,
+    /// Exact legacy message content.
+    pub content: LegacyContent,
+    /// Other schema-allowed message members, including an open `_meta` value.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional: BTreeMap<String, serde_json::Value>,
 }
 
 /// A message in a prompt.
