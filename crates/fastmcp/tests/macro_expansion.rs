@@ -22,11 +22,12 @@
 #![allow(dead_code)]
 
 use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
+use fastmcp_protocol::FinalCallToolResult;
 use fastmcp_rust::{
-    CompleteResult, Content, Cx, GetPromptResult, JsonSchema, LabConfig, LabRuntime, McpContext,
-    McpError, McpOutcome, McpResult, Outcome, PromptHandler, PromptMessage, ReadResourceResult,
-    ResourceContent, ResourceHandler, ResultMeta, Role, ServerInfo, ToolHandler, prompt, resource,
-    tool,
+    CompleteResult, Content, ContentBlock, Cx, GetPromptResult, JsonSchema, LabConfig, LabRuntime,
+    McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler, PromptMessage,
+    ReadResourceResult, ResourceContent, ResourceHandler, ResultMeta, Role, ServerInfo,
+    ToolHandler, prompt, resource, tool,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -573,6 +574,118 @@ fn tool_output_schema_in_definition() {
     assert!(def.output_schema.is_some());
     let schema = def.output_schema.unwrap();
     assert_eq!(schema["type"], "object");
+}
+
+// --- Final complete tool result projection ---
+
+fn final_tool_payload(text: &str) -> CompleteResult<FinalCallToolResult> {
+    CompleteResult::new(
+        FinalCallToolResult {
+            content: vec![
+                ContentBlock::text(text),
+                ContentBlock::image("aGVsbG8=", "image/png").expect("image content"),
+                ContentBlock::audio("aGVsbG8=", "audio/ogg").expect("audio content"),
+                ContentBlock::resource(
+                    "final://tool/embedded-resource",
+                    "embedded",
+                    Some("text/plain".to_string()),
+                )
+                .expect("embedded resource content"),
+            ],
+            is_error: false,
+        },
+        final_result_meta(),
+    )
+}
+
+#[tool(output_schema = serde_json::json!({
+    "type": "object",
+    "properties": { "answer": { "type": "string" } },
+    "required": ["answer"]
+}))]
+fn final_complete_tool_direct() -> CompleteResult<FinalCallToolResult> {
+    final_tool_payload("direct")
+}
+
+#[tool]
+fn final_complete_tool_result() -> Result<CompleteResult<FinalCallToolResult>, McpError> {
+    Ok(final_tool_payload("result"))
+}
+
+#[tool]
+fn final_complete_tool_mcp_result() -> McpResult<CompleteResult<FinalCallToolResult>> {
+    Ok(final_tool_payload("mcp-result"))
+}
+
+#[test]
+fn tool_final_complete_results_project_exact_legacy_content_and_output_schema() {
+    let direct = FinalCompleteToolDirect;
+    assert_eq!(
+        direct.output_schema(),
+        Some(json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"]
+        }))
+    );
+    assert_eq!(direct.definition().output_schema, direct.output_schema());
+
+    let ctx = test_ctx();
+    let handlers: [Box<dyn ToolHandler>; 3] = [
+        Box::new(direct),
+        Box::new(FinalCompleteToolResult),
+        Box::new(FinalCompleteToolMcpResult),
+    ];
+
+    for (handler, expected_text) in handlers.into_iter().zip(["direct", "result", "mcp-result"]) {
+        let content = handler
+            .call(&ctx, json!({}))
+            .expect("final complete result projects");
+        assert_eq!(content.len(), 4);
+        assert_eq!(expect_text(&content[0]), expected_text);
+        assert!(matches!(
+            &content[1],
+            Content::Image { data, mime_type } if data == "aGVsbG8=" && mime_type == "image/png"
+        ));
+        assert!(matches!(
+            &content[2],
+            Content::Audio { data, mime_type } if data == "aGVsbG8=" && mime_type == "audio/ogg"
+        ));
+        let Content::Resource { resource } = &content[3] else {
+            panic!("embedded final resource must preserve the legacy content variant");
+        };
+        assert_eq!(resource.uri, "final://tool/embedded-resource");
+        assert_eq!(resource.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(resource.text.as_deref(), Some("embedded"));
+        assert!(resource.blob.is_none());
+    }
+}
+
+#[tool]
+fn final_complete_tool_with_resource_link() -> CompleteResult<FinalCallToolResult> {
+    CompleteResult::new(
+        FinalCallToolResult {
+            content: vec![
+                ContentBlock::resource_link("final://tool/embedded-resource", "embedded")
+                    .expect("resource link content"),
+            ],
+            is_error: false,
+        },
+        final_result_meta(),
+    )
+}
+
+#[test]
+fn tool_final_complete_resource_link_rejects_lossy_legacy_projection() {
+    let error = FinalCompleteToolWithResourceLink
+        .call(&test_ctx(), json!({}))
+        .expect_err("changing only to a resource link must reject lossy legacy projection");
+
+    assert_eq!(error.code, fastmcp_rust::McpErrorCode::InternalError);
+    assert_eq!(
+        error.message,
+        "final tool content cannot be projected exactly through the legacy handler"
+    );
 }
 
 // --- Tool with HashMap parameter ---

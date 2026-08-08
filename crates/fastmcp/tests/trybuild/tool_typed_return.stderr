@@ -1,0 +1,5 @@
+error: ambiguous or cross-era final #[tool] return; use CompleteResult<FinalCallToolResult>, Result<CompleteResult<FinalCallToolResult>, E>, or McpResult<CompleteResult<FinalCallToolResult>> so the legacy handler can project Vec<Content>
+ --> tests/trybuild/tool_typed_return.rs:6:4
+  |
+6 | fn final_tool() -> fastmcp_rust::CompleteResult<fastmcp_rust::ReadResourceResult> {
+  |    ^^^^^^^^^^

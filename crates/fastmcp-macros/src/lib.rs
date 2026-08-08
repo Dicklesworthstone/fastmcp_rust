@@ -516,6 +516,12 @@ fn to_pascal_case(s: &str) -> String {
 
 /// Represents different return type conversion strategies.
 enum ReturnTypeKind {
+    /// Returns a final CompleteResult<FinalCallToolResult> directly.
+    FinalComplete,
+    /// Returns Result<CompleteResult<FinalCallToolResult>, E>.
+    ResultFinalComplete,
+    /// Returns McpResult<CompleteResult<FinalCallToolResult>>.
+    McpResultFinalComplete,
     /// Returns Vec<Content> directly
     VecContent,
     /// Returns String, wrap in Content::Text
@@ -536,6 +542,15 @@ enum ReturnTypeKind {
 
 /// Analyzes a function's return type and determines conversion strategy.
 fn analyze_return_type(output: &syn::ReturnType) -> ReturnTypeKind {
+    match final_complete_return_kind(output, "FinalCallToolResult") {
+        Some(FinalCompleteReturnKind::Direct) => return ReturnTypeKind::FinalComplete,
+        Some(FinalCompleteReturnKind::Result) => return ReturnTypeKind::ResultFinalComplete,
+        Some(FinalCompleteReturnKind::McpResult) => {
+            return ReturnTypeKind::McpResultFinalComplete;
+        }
+        None => {}
+    }
+
     match output {
         syn::ReturnType::Default => ReturnTypeKind::Unit,
         syn::ReturnType::Type(_, ty) => analyze_type(ty),
@@ -599,11 +614,102 @@ fn analyze_type(ty: &Type) -> ReturnTypeKind {
     ReturnTypeKind::Other
 }
 
+/// Generates the exact final-to-legacy content projection available to the
+/// current tool handler trait. Content annotations, metadata, resource links,
+/// and the final tool-error bit cannot be represented by `Vec<Content>`, so
+/// the conversion rejects them rather than silently weakening a final result.
+fn generate_final_tool_payload_projection(value: TokenStream2) -> TokenStream2 {
+    quote! {
+        let final_result = #value;
+        if final_result.is_error {
+            Err(fastmcp_core::McpError::internal_error(
+                "final tool result cannot be projected exactly through the legacy handler",
+            ))
+        } else {
+            final_result
+                .content
+                .into_iter()
+                .map(|content| match content {
+                    fastmcp_protocol::common_types::ContentBlock::Text {
+                        text,
+                        annotations: None,
+                        meta: None,
+                    } => Ok(fastmcp_protocol::Content::Text { text }),
+                    fastmcp_protocol::common_types::ContentBlock::Image {
+                        data,
+                        mime_type,
+                        annotations: None,
+                        meta: None,
+                    } => Ok(fastmcp_protocol::Content::Image { data, mime_type }),
+                    fastmcp_protocol::common_types::ContentBlock::Audio {
+                        data,
+                        mime_type,
+                        annotations: None,
+                        meta: None,
+                    } => Ok(fastmcp_protocol::Content::Audio { data, mime_type }),
+                    fastmcp_protocol::common_types::ContentBlock::Resource {
+                        resource,
+                        annotations: None,
+                        meta: None,
+                    } => {
+                        let resource = match resource {
+                            fastmcp_protocol::common_types::EmbeddedResourceContents::Text {
+                                uri,
+                                text,
+                                mime_type,
+                            } => fastmcp_protocol::ResourceContent {
+                                uri: uri.as_str().to_owned(),
+                                mime_type,
+                                text: Some(text),
+                                blob: None,
+                            },
+                            fastmcp_protocol::common_types::EmbeddedResourceContents::Blob {
+                                uri,
+                                blob,
+                                mime_type,
+                            } => fastmcp_protocol::ResourceContent {
+                                uri: uri.as_str().to_owned(),
+                                mime_type,
+                                text: None,
+                                blob: Some(blob),
+                            },
+                        };
+                        Ok(fastmcp_protocol::Content::Resource { resource })
+                    }
+                    _ => Err(fastmcp_core::McpError::internal_error(
+                        "final tool content cannot be projected exactly through the legacy handler",
+                    )),
+                })
+                .collect()
+        }
+    }
+}
+
 /// Generates code to convert a function result to Vec<Content>.
 fn generate_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
     let kind = analyze_return_type(output);
 
     match kind {
+        ReturnTypeKind::FinalComplete => {
+            generate_final_tool_payload_projection(quote! { result.payload })
+        }
+        ReturnTypeKind::ResultFinalComplete => {
+            let projection =
+                generate_final_tool_payload_projection(quote! { result_value.payload });
+            quote! {
+                let result_value = result
+                    .map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))?;
+                #projection
+            }
+        }
+        ReturnTypeKind::McpResultFinalComplete => {
+            let projection =
+                generate_final_tool_payload_projection(quote! { result_value.payload });
+            quote! {
+                let result_value = result?;
+                #projection
+            }
+        }
         ReturnTypeKind::Unit => quote! {
             Ok(vec![])
         },
@@ -709,7 +815,9 @@ fn generate_tool_result_conversion(
     output: &syn::ReturnType,
     typed_output_schema: bool,
 ) -> TokenStream2 {
-    if typed_output_schema {
+    if final_complete_return_kind(output, "FinalCallToolResult").is_some() {
+        generate_result_conversion(output)
+    } else if typed_output_schema {
         generate_schema_bound_result_conversion(output)
     } else {
         generate_result_conversion(output)
@@ -873,6 +981,7 @@ fn type_contains_final_result_term(ty: &Type) -> bool {
         "InputRequiredResult",
         "CacheableResult",
         "PaginatedResult",
+        "FinalCallToolResult",
         "ReadResourceResult",
         "GetPromptResult",
     ];
@@ -1950,6 +2059,17 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(paths) => paths,
         Err(error) => return error.to_compile_error().into(),
     };
+
+    if let Err(error) = validate_final_handler_return(
+        &input_fn.sig.output,
+        "tool",
+        "FinalCallToolResult",
+        "Vec<Content>",
+    ) {
+        return syn::Error::new_spanned(&input_fn.sig.ident, error.to_string())
+            .to_compile_error()
+            .into();
+    }
 
     let typed_output_schema = if let Some(schema_expr) = attrs.output_schema.as_ref() {
         if let Err(error) = validate_output_schema_expr(schema_expr) {
