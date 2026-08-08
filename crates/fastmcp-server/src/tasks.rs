@@ -894,7 +894,7 @@ pub(crate) enum OfficialTaskStatus {
 impl OfficialTaskStatus {
     #[must_use]
     fn is_terminal(self) -> bool {
-        matches!(Self::Completed | Self::Failed | Self::Cancelled, self)
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 }
 
