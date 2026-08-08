@@ -434,13 +434,9 @@ where
             self.config.clone(),
             (self.make_handler)(binding),
         )?;
+        let index = self.bindings.len();
         self.bindings.push(LiveLegacy2024Binding { binding, adapter });
-        Ok(self
-            .bindings
-            .last()
-            .expect("a successfully installed binding is retained")
-            .adapter
-            .installed_receipt())
+        Ok(self.bindings[index].adapter.installed_receipt())
     }
 
     /// Returns the number of currently live peer lifecycles.
@@ -1277,6 +1273,7 @@ const fn direction_bytes(direction: Legacy2024Direction) -> &'static [u8] {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
     use fastmcp_protocol::methods::{
         Legacy2024ListChangedCapability, Legacy2024ResourcesCapability,
@@ -1298,36 +1295,65 @@ mod tests {
         }
     }
 
+    struct LiveRecordingHandler {
+        binding: LegacyPeerBinding,
+        calls: Arc<Mutex<Vec<(LegacyPeerBinding, &'static str)>>>,
+    }
+
+    impl Legacy2024Handler for LiveRecordingHandler {
+        fn handle_legacy_2024(
+            &mut self,
+            method: &'static str,
+            _params: Option<&Value>,
+        ) -> Result<Value, Legacy2024HandlerError> {
+            self.calls
+                .lock()
+                .expect("live handler call log must not be poisoned")
+                .push((self.binding, method));
+            Ok(json!({
+                "bindingGeneration": self.binding.generation(),
+                "handled": method,
+            }))
+        }
+    }
+
     const TEST_TRANSPORT_PARTITION: LegacyAuthenticatedPeerPartition =
         LegacyAuthenticatedPeerPartition::from_authenticated_transport([7; 32]);
 
     fn binding() -> LegacyPeerBinding {
-        LegacyPeerBinding::from_authenticated_transport(TEST_TRANSPORT_PARTITION, 7)
+        binding_for(TEST_TRANSPORT_PARTITION, 7)
+    }
+
+    fn binding_for(
+        partition: LegacyAuthenticatedPeerPartition,
+        generation: u64,
+    ) -> LegacyPeerBinding {
+        LegacyPeerBinding::from_authenticated_transport(partition, generation)
+    }
+
+    fn server_config() -> Legacy2024ServerConfig {
+        Legacy2024ServerConfig {
+            capabilities: Legacy2024ServerCapabilities {
+                logging: Some(BTreeMap::default()),
+                tools: Some(Legacy2024ListChangedCapability::default()),
+                resources: Some(Legacy2024ResourcesCapability {
+                    subscribe: true,
+                    ..Legacy2024ResourcesCapability::default()
+                }),
+                prompts: Some(Legacy2024ListChangedCapability::default()),
+                ..Legacy2024ServerCapabilities::default()
+            },
+            server_info: Legacy2024ServerInfo {
+                name: "legacy-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            instructions: Some("exact legacy profile".to_owned()),
+        }
     }
 
     fn adapter() -> Legacy2024ServerAdapter<RecordingHandler> {
-        Legacy2024ServerAdapter::install(
-            binding(),
-            Legacy2024ServerConfig {
-                capabilities: Legacy2024ServerCapabilities {
-                    logging: Some(BTreeMap::default()),
-                    tools: Some(Legacy2024ListChangedCapability::default()),
-                    resources: Some(Legacy2024ResourcesCapability {
-                        subscribe: true,
-                        ..Legacy2024ResourcesCapability::default()
-                    }),
-                    prompts: Some(Legacy2024ListChangedCapability::default()),
-                    ..Legacy2024ServerCapabilities::default()
-                },
-                server_info: Legacy2024ServerInfo {
-                    name: "legacy-server".to_owned(),
-                    version: "1.0.0".to_owned(),
-                },
-                instructions: Some("exact legacy profile".to_owned()),
-            },
-            RecordingHandler::default(),
-        )
-        .expect("exact test configuration must install")
+        Legacy2024ServerAdapter::install(binding(), server_config(), RecordingHandler::default())
+            .expect("exact test configuration must install")
     }
 
     fn initialize() -> Value {
@@ -1504,5 +1530,176 @@ mod tests {
             assert_eq!(adapter.snapshot(), before);
         }
         assert!(adapter.handler.methods.is_empty());
+    }
+
+    #[test]
+    fn leg_02_i_positive() {
+        let left = binding_for(
+            LegacyAuthenticatedPeerPartition::from_authenticated_transport([0x11; 32]),
+            101,
+        );
+        let right = binding_for(
+            LegacyAuthenticatedPeerPartition::from_authenticated_transport([0x22; 32]),
+            202,
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handler_calls = Arc::clone(&calls);
+        let mut lifecycle = Legacy2024LiveServerLifecycle::new(
+            server_config(),
+            2,
+            move |binding| LiveRecordingHandler {
+                binding,
+                calls: Arc::clone(&handler_calls),
+            },
+        )
+        .expect("bounded exact-2024 live lifecycle must install");
+
+        assert_eq!(lifecycle.max_live_bindings(), 2);
+        assert!(lifecycle.install(left).unwrap().matches_binding(left));
+        assert!(lifecycle.install(right).unwrap().matches_binding(right));
+        assert_eq!(lifecycle.active_binding_count(), 2);
+
+        for binding in [left, right] {
+            assert!(matches!(
+                lifecycle.receive(binding, initialize()),
+                Ok(Legacy2024Outbound::Response(_))
+            ));
+            assert_eq!(
+                lifecycle.receive(
+                    binding,
+                    json!({"jsonrpc": "2.0", "method": NOTIFICATIONS_INITIALIZED}),
+                ),
+                Ok(Legacy2024Outbound::NoResponse)
+            );
+        }
+
+        assert_eq!(
+            lifecycle.receive(
+                left,
+                json!({"jsonrpc": "2.0", "id": 2, "method": TOOLS_LIST}),
+            ),
+            Ok(Legacy2024Outbound::Response(json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": {"bindingGeneration": 101, "handled": TOOLS_LIST},
+            })))
+        );
+        assert_eq!(
+            lifecycle.receive(
+                right,
+                json!({"jsonrpc": "2.0", "id": 3, "method": TOOLS_LIST}),
+            ),
+            Ok(Legacy2024Outbound::Response(json!({
+                "jsonrpc": "2.0", "id": 3,
+                "result": {"bindingGeneration": 202, "handled": TOOLS_LIST},
+            })))
+        );
+        assert_eq!(
+            lifecycle.receive(
+                left,
+                json!({
+                    "jsonrpc": "2.0", "id": 4, "method": RESOURCES_SUBSCRIBE,
+                    "params": {"uri": "file:///left-only"},
+                }),
+            ),
+            Ok(Legacy2024Outbound::Response(
+                json!({"jsonrpc": "2.0", "id": 4, "result": {}})
+            ))
+        );
+        assert_eq!(
+            lifecycle.make_reverse_request(left, PING, json!({})),
+            Ok(Legacy2024Outbound::ReverseRequest(
+                json!({"jsonrpc": "2.0", "id": 1, "method": PING, "params": {}})
+            ))
+        );
+        assert_eq!(
+            lifecycle.receive(left, json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+            Ok(Legacy2024Outbound::NoResponse)
+        );
+
+        let left_before_close = lifecycle.snapshot(left).unwrap();
+        let right_before_close = lifecycle.snapshot(right).unwrap();
+        assert_eq!(left_before_close.subscriptions, ["file:///left-only"]);
+        assert_eq!(left_before_close.reservation_count, 1);
+        assert!(right_before_close.subscriptions.is_empty());
+        assert_eq!(right_before_close.reservation_count, 0);
+
+        let left_closed = lifecycle.close(left).unwrap();
+        assert_eq!(left_closed.lifecycle, Legacy2024Lifecycle::Closed);
+        assert_eq!(left_closed.reservation_count, 0);
+        assert_eq!(left_closed.close_release_count, 1);
+        assert_eq!(lifecycle.active_binding_count(), 1);
+        assert_eq!(lifecycle.snapshot(right).unwrap(), right_before_close);
+
+        let right_closed = lifecycle.close(right).unwrap();
+        assert_eq!(right_closed.lifecycle, Legacy2024Lifecycle::Closed);
+        assert_eq!(right_closed.reservation_count, 0);
+        assert_eq!(right_closed.close_release_count, 1);
+        assert_eq!(lifecycle.active_binding_count(), 0);
+        assert_eq!(
+            *calls
+                .lock()
+                .expect("live handler call log must not be poisoned"),
+            vec![(left, TOOLS_LIST), (right, TOOLS_LIST)]
+        );
+    }
+
+    #[test]
+    fn leg_02_i_planted_negative() {
+        let left = binding_for(
+            LegacyAuthenticatedPeerPartition::from_authenticated_transport([0x31; 32]),
+            303,
+        );
+        let right = binding_for(
+            LegacyAuthenticatedPeerPartition::from_authenticated_transport([0x32; 32]),
+            404,
+        );
+        let wrong_owner = binding_for(
+            LegacyAuthenticatedPeerPartition::from_authenticated_transport([0x33; 32]),
+            303,
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handler_calls = Arc::clone(&calls);
+        let mut lifecycle = Legacy2024LiveServerLifecycle::new(
+            server_config(),
+            2,
+            move |binding| LiveRecordingHandler {
+                binding,
+                calls: Arc::clone(&handler_calls),
+            },
+        )
+        .expect("bounded exact-2024 live lifecycle must install");
+
+        for binding in [left, right] {
+            lifecycle.install(binding).unwrap();
+            lifecycle.receive(binding, initialize()).unwrap();
+            lifecycle
+                .receive(
+                    binding,
+                    json!({"jsonrpc": "2.0", "method": NOTIFICATIONS_INITIALIZED}),
+                )
+                .unwrap();
+        }
+        let left_before = lifecycle.snapshot(left).unwrap();
+        let right_before = lifecycle.snapshot(right).unwrap();
+
+        let error = lifecycle
+            .receive(wrong_owner, initialize())
+            .expect_err("changing only the authenticated owner must not select a live lifecycle");
+        assert_eq!(error.code(), -32600);
+        assert_eq!(
+            error.message(),
+            "legacy peer binding has no live adapter lifecycle"
+        );
+        assert_eq!(lifecycle.snapshot(left).unwrap(), left_before);
+        assert_eq!(lifecycle.snapshot(right).unwrap(), right_before);
+        assert_eq!(lifecycle.active_binding_count(), 2);
+        assert!(calls
+            .lock()
+            .expect("live handler call log must not be poisoned")
+            .is_empty());
+
+        assert_eq!(lifecycle.close(left).unwrap().close_release_count, 1);
+        assert_eq!(lifecycle.close(right).unwrap().close_release_count, 1);
+        assert_eq!(lifecycle.active_binding_count(), 0);
     }
 }
