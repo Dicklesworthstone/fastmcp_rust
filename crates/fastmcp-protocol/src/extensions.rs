@@ -3,7 +3,7 @@
 //! This module admits extension metadata and settings only.  It deliberately
 //! owns no handler, transport, authorization, or client/server runtime state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use fastmcp_core::sha256_bounded;
@@ -15,6 +15,22 @@ pub const MAX_EXTENSION_DESCRIPTORS: usize = 128;
 pub const MAX_EXTENSION_ID_BYTES: usize = 512;
 /// Maximum bytes in one canonical descriptor-registry digest subject.
 pub const MAX_EXTENSION_REGISTRY_CANONICAL_BYTES: usize = 256 * 1024;
+/// Maximum extension settings entries preserved at the generic boundary.
+pub const MAX_EXTENSION_SETTINGS_ENTRIES: usize = 128;
+/// Maximum UTF-8 bytes in one extension settings key.
+pub const MAX_EXTENSION_SETTINGS_KEY_BYTES: usize = 512;
+/// Maximum canonical JSON bytes in one extension settings value.
+pub const MAX_EXTENSION_SETTINGS_VALUE_BYTES: usize = 16 * 1024;
+/// Maximum nesting depth admitted in a generic extension settings value.
+pub const MAX_EXTENSION_SETTINGS_NESTING: usize = 32;
+/// Maximum UTF-8 bytes in an extension-owned method or notification name.
+pub const MAX_EXTENSION_MEMBER_NAME_BYTES: usize = 512;
+/// Maximum extension-owned routing headers registered by one descriptor.
+pub const MAX_EXTENSION_ROUTING_HEADERS: usize = 32;
+/// Maximum UTF-8 bytes in an extension-owned routing header name.
+pub const MAX_EXTENSION_ROUTING_HEADER_BYTES: usize = 256;
+/// Maximum notification method names owned by one stdio correlation descriptor.
+pub const MAX_STDIO_CORRELATION_METHODS: usize = 32;
 
 /// A validated extension identifier, preserving its exact wire spelling.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -88,6 +104,7 @@ impl ExtensionSettings {
         let Value::Object(map) = value else {
             return Err(ExtensionRegistryError::SettingsNotObject);
         };
+        validate_settings_map(&map)?;
         Ok(Self(map))
     }
 
@@ -111,6 +128,52 @@ impl ExtensionSettings {
         serde_json::from_value(Value::Object(self.0.clone()))
             .map_err(|_| ExtensionRegistryError::SettingsCodecRejected)
     }
+}
+
+fn validate_settings_map(map: &Map<String, Value>) -> Result<(), ExtensionRegistryError> {
+    if map.len() > MAX_EXTENSION_SETTINGS_ENTRIES {
+        return Err(ExtensionRegistryError::SettingsTooManyEntries);
+    }
+    for (key, value) in map {
+        if key.len() > MAX_EXTENSION_SETTINGS_KEY_BYTES {
+            return Err(ExtensionRegistryError::SettingsKeyTooLong);
+        }
+        validate_settings_value(value, 0)?;
+        let encoded = serde_json::to_vec(value).map_err(|_| ExtensionRegistryError::SettingsTooLarge)?;
+        if encoded.len() > MAX_EXTENSION_SETTINGS_VALUE_BYTES {
+            return Err(ExtensionRegistryError::SettingsTooLarge);
+        }
+    }
+    Ok(())
+}
+
+fn validate_settings_value(
+    value: &Value,
+    depth: usize,
+) -> Result<(), ExtensionRegistryError> {
+    if depth > MAX_EXTENSION_SETTINGS_NESTING {
+        return Err(ExtensionRegistryError::SettingsTooDeep);
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                validate_settings_value(value, depth + 1)?;
+            }
+        }
+        Value::Object(values) => {
+            if values.len() > MAX_EXTENSION_SETTINGS_ENTRIES {
+                return Err(ExtensionRegistryError::SettingsTooManyEntries);
+            }
+            for (key, value) in values {
+                if key.len() > MAX_EXTENSION_SETTINGS_KEY_BYTES {
+                    return Err(ExtensionRegistryError::SettingsKeyTooLong);
+                }
+                validate_settings_value(value, depth + 1)?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+    Ok(())
 }
 
 /// Public discovery input for one enabled local extension.
@@ -280,6 +343,14 @@ pub enum ExtensionRegistryError {
     SettingsNotObject,
     /// Typed settings decoding rejected the otherwise preserved object.
     SettingsCodecRejected,
+    /// Generic settings exceeded the fixed number of retained members.
+    SettingsTooManyEntries,
+    /// A generic settings key exceeded its fixed byte limit.
+    SettingsKeyTooLong,
+    /// A generic settings value exceeded its fixed encoded-byte limit.
+    SettingsTooLarge,
+    /// A generic settings value exceeded its fixed nesting limit.
+    SettingsTooDeep,
     /// A descriptor omitted a required stable owner value.
     MissingOwner(&'static str),
     /// A descriptor ID was registered twice.
@@ -292,6 +363,14 @@ pub enum ExtensionRegistryError {
     LegacyFallbackContradiction(String),
     /// A descriptor attempted to claim a legacy/shared core method.
     CoreMethodCollision(String),
+    /// A descriptor attempted to claim a legacy/shared core notification.
+    CoreNotificationCollision(String),
+    /// A descriptor attempted to claim a final-core result discriminator.
+    CoreResultDiscriminatorCollision(String),
+    /// A descriptor member exceeded its bounded wire-name limit.
+    MemberNameTooLong { field: &'static str, value: String },
+    /// A descriptor claimed the same local wire name in incompatible roles.
+    LocalOwnershipCollision { field: &'static str, value: String },
     /// Registration occurred after the immutable registry was frozen.
     Frozen,
     /// The canonical digest subject exceeded its bounded limit.
@@ -313,6 +392,18 @@ impl fmt::Display for ExtensionRegistryError {
             Self::SettingsCodecRejected => {
                 formatter.write_str("extension settings codec rejected object")
             }
+            Self::SettingsTooManyEntries => {
+                formatter.write_str("extension settings exceed their entry limit")
+            }
+            Self::SettingsKeyTooLong => {
+                formatter.write_str("extension settings key exceeds its byte limit")
+            }
+            Self::SettingsTooLarge => {
+                formatter.write_str("extension settings value exceeds its byte limit")
+            }
+            Self::SettingsTooDeep => {
+                formatter.write_str("extension settings exceed their nesting limit")
+            }
             Self::MissingOwner(field) => {
                 write!(formatter, "missing extension descriptor owner: {field}")
             }
@@ -333,6 +424,22 @@ impl fmt::Display for ExtensionRegistryError {
             Self::CoreMethodCollision(value) => write!(
                 formatter,
                 "extension method collides with legacy/shared core method: {value}"
+            ),
+            Self::CoreNotificationCollision(value) => write!(
+                formatter,
+                "extension notification collides with legacy/shared core notification: {value}"
+            ),
+            Self::CoreResultDiscriminatorCollision(value) => write!(
+                formatter,
+                "extension result discriminator collides with final-core result: {value}"
+            ),
+            Self::MemberNameTooLong { field, value } => write!(
+                formatter,
+                "extension {field} exceeds its byte limit: {value}"
+            ),
+            Self::LocalOwnershipCollision { field, value } => write!(
+                formatter,
+                "extension {field} has incompatible local ownership: {value}"
             ),
             Self::Frozen => formatter.write_str("extension descriptor registry is frozen"),
             Self::DigestTooLarge => {

@@ -82,13 +82,13 @@ use std::time::{Duration, Instant};
 
 use asupersync::{Cx, channel::oneshot};
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sha256_bounded};
+use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancelledParams,
-    ClientCapabilities, ClientInfo, Content, CorrelationKey, GetPromptParams, GetPromptResult,
-    FinalRequestMeta, GetTaskParams, GetTaskResult, InitializeParams, InitializeResult,
+    ClientCapabilities, ClientInfo, Content, CorrelationKey, FinalRequestMeta, GetPromptParams,
+    GetPromptResult, GetTaskParams, GetTaskResult, InitializeParams, InitializeResult,
     JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    ListPromptsParams,
-    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
     ListResourcesParams, ListResourcesResult, ListTasksParams, ListTasksResult, ListToolsParams,
     ListToolsResult, LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt,
     PromptMessage, ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource,
@@ -96,7 +96,6 @@ use fastmcp_protocol::{
     SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo, TaskResult, TaskStatus, Tool,
 };
 use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
-use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 
 /// Callback for receiving progress notifications during tool execution.
 ///
@@ -1567,7 +1566,10 @@ fn auto_legacy_fallback_is_authorized(error: &McpError) -> bool {
     // so it remains modern and cannot authorize a legacy attempt.
     matches!(
         error.code,
-        McpErrorCode::ParseError | McpErrorCode::InvalidRequest | McpErrorCode::MethodNotFound | McpErrorCode::InvalidParams
+        McpErrorCode::ParseError
+            | McpErrorCode::InvalidRequest
+            | McpErrorCode::MethodNotFound
+            | McpErrorCode::InvalidParams
     )
 }
 
@@ -3185,7 +3187,9 @@ impl Client {
             additional_metadata: Default::default(),
         };
         let final_metadata = serde_json::to_value(final_metadata).map_err(|error| {
-            McpError::internal_error(format!("Failed to serialize modern request metadata: {error}"))
+            McpError::internal_error(format!(
+                "Failed to serialize modern request metadata: {error}"
+            ))
         })?;
         let final_metadata = final_metadata.as_object().ok_or_else(|| {
             McpError::internal_error("Modern request metadata did not serialize as an object")
@@ -3690,10 +3694,14 @@ impl Client {
         let server_info = result
             .get("serverInfo")
             .cloned()
-            .ok_or_else(|| McpError::internal_error("Modern server/discover response has no serverInfo"))
+            .ok_or_else(|| {
+                McpError::internal_error("Modern server/discover response has no serverInfo")
+            })
             .and_then(|value| {
                 serde_json::from_value(value).map_err(|_| {
-                    McpError::internal_error("Modern server/discover response has invalid serverInfo")
+                    McpError::internal_error(
+                        "Modern server/discover response has invalid serverInfo",
+                    )
                 })
             })?;
         Ok(InitializeResult {
@@ -8161,8 +8169,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clt_01_i_positive() {
-        let modern_result =
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2026-07-28\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"modern-server\",\"version\":\"1.0.0\"}}}";
+        let modern_result = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2026-07-28\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"modern-server\",\"version\":\"1.0.0\"}}}";
         let script = modern_public_client_script(modern_result);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -8173,7 +8180,10 @@ mod tests {
         .expect("modern-only discovery initializes the public client");
 
         assert_eq!(client.protocol_policy(), ProtocolPolicy::ModernOnly);
-        assert_eq!(client.selected_protocol_era(), Some(ProtocolEra::Modern2026));
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(ProtocolEra::Modern2026)
+        );
         assert_eq!(client.protocol_version(), MODERN_PROTOCOL_VERSION);
         client
             .ping()
@@ -8187,8 +8197,7 @@ mod tests {
         // Only the discovery result's advertised version differs from the
         // accepted modern path. A malformed modern success may not turn into
         // legacy initialization or a second execution path.
-        let legacy_advertisement =
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2024-11-05\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"modern-server\",\"version\":\"1.0.0\"}}}";
+        let legacy_advertisement = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2024-11-05\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"modern-server\",\"version\":\"1.0.0\"}}}";
         let script = modern_public_client_script(legacy_advertisement);
         let error = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -8204,8 +8213,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clt_02_i_positive() {
-        let modern_result =
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2026-07-28\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"auto-modern-server\",\"version\":\"1.0.0\"}}}";
+        let modern_result = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2026-07-28\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"auto-modern-server\",\"version\":\"1.0.0\"}}}";
         let script = modern_public_client_script(modern_result);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -8216,24 +8224,30 @@ mod tests {
         .expect("auto retains a successful modern selection");
 
         assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
-        assert_eq!(client.selected_protocol_era(), Some(ProtocolEra::Modern2026));
-        client.ping().expect("auto-selected modern client executes normally");
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(ProtocolEra::Modern2026)
+        );
+        client
+            .ping()
+            .expect("auto-selected modern client executes normally");
         client.close().expect("auto modern cleanup");
     }
 
     #[cfg(unix)]
     #[test]
     fn clt_02_i_planted_negative() {
-        // The policy is the only changed input. The legacy peer accepts only
-        // initialize, proving ModernOnly does not silently use the legacy
-        // execution path.
+        // Only the discovery result's version differs from the Auto positive.
+        // An invalid modern success is not an authorized fallback signal.
+        let legacy_advertisement = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2024-11-05\"],\"capabilities\":{},\"serverInfo\":{\"name\":\"auto-modern-server\",\"version\":\"1.0.0\"}}}";
+        let script = modern_public_client_script(legacy_advertisement);
         let error = Client::stdio_with_protocol_plan_with_cx(
             "sh",
-            &["-c", legacy_public_client_script()],
-            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
             Cx::for_request(),
         )
-        .expect_err("modern-only must not emit legacy initialize");
+        .expect_err("auto must not downgrade from a malformed modern discovery result");
 
         assert_eq!(error.code, McpErrorCode::InternalError);
     }
@@ -8250,9 +8264,14 @@ mod tests {
         .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
 
         assert_eq!(client.protocol_policy(), ProtocolPolicy::LegacyOnly);
-        assert_eq!(client.selected_protocol_era(), Some(ProtocolEra::Legacy2024));
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(ProtocolEra::Legacy2024)
+        );
         assert_eq!(client.protocol_version(), PROTOCOL_VERSION);
-        client.ping().expect("legacy client executes after initialized notification");
+        client
+            .ping()
+            .expect("legacy client executes after initialized notification");
         client.close().expect("legacy client cleanup");
     }
 
