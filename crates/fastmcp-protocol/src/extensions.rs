@@ -1646,7 +1646,7 @@ mod tests {
         let accepted = ExtensionSettings::new(json!({"nested": accepted_value.clone()}))
             .expect("the exact nesting bound is admitted");
 
-        let planted = Value::Array(vec![accepted_value]);
+        let planted = Value::Array(vec![accepted_value.clone()]);
         assert_eq!(
             ExtensionSettings::new(json!({"nested": planted})),
             Err(ExtensionRegistryError::SettingsTooDeep),
