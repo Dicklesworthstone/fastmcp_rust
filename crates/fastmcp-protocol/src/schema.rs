@@ -575,50 +575,62 @@ fn validate_object(
     obj: &serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
+    context: ValidationContext<'_>,
 ) {
     // Check required fields
     if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
         for req in required {
             if let Some(req_name) = req.as_str() {
                 if !obj.contains_key(req_name) {
-                    errors.push(ValidationError {
-                        path: path.to_string(),
-                        message: format!("missing required field: {req_name}"),
-                    });
+                    push_error(errors, path, format!("missing required field: {req_name}"));
                 }
             }
         }
     }
 
-    // Validate properties
-    if let Some(properties) = schema.get("properties").and_then(|v| v.as_object()) {
-        for (key, value) in obj {
-            if let Some(prop_schema) = properties.get(key) {
-                let prop_path = format!("{path}.{key}");
-                validate_internal(prop_schema, value, &prop_path, errors);
+    let properties = schema.get("properties").and_then(Value::as_object);
+    let patterns = compile_pattern_properties(schema, path, errors);
+
+    for (key, value) in obj {
+        let property_path = format!("{path}.{key}");
+        if let Some(property_schema) = properties.and_then(|properties| properties.get(key)) {
+            validate_internal(property_schema, value, &property_path, errors, context);
+        }
+        for (pattern, pattern_schema) in &patterns {
+            if pattern.is_match(key) {
+                validate_internal(pattern_schema, value, &property_path, errors, context);
             }
         }
     }
 
-    // Check additionalProperties constraint
-    if let Some(additional) = schema.get("additionalProperties") {
-        // Get properties map directly - avoid collecting keys into Vec
-        let properties = schema.get("properties").and_then(|v| v.as_object());
+    if let Some(property_name_schema) = schema.get("propertyNames") {
+        for key in obj.keys() {
+            let property_path = format!("{path}.{key}");
+            validate_internal(
+                property_name_schema,
+                &Value::String(key.clone()),
+                &property_path,
+                errors,
+                context,
+            );
+        }
+    }
 
+    validate_dependencies(schema, obj, path, errors, context);
+
+    // Check additionalProperties after applying both named and pattern properties.
+    if let Some(additional) = schema.get("additionalProperties") {
         for (key, value) in obj {
-            // Use contains_key directly on the Map (O(1) lookup) instead of Vec::contains (O(n))
-            let is_defined_property = properties.is_some_and(|p| p.contains_key(key));
+            let is_defined_property = properties.is_some_and(|properties| properties.contains_key(key))
+                || patterns.iter().any(|(pattern, _)| pattern.is_match(key));
             if !is_defined_property {
                 match additional {
                     Value::Bool(false) => {
-                        errors.push(ValidationError {
-                            path: path.to_string(),
-                            message: format!("additional property not allowed: {key}"),
-                        });
+                        push_error(errors, path, format!("additional property not allowed: {key}"));
                     }
                     Value::Object(_) => {
                         let prop_path = format!("{path}.{key}");
-                        validate_internal(additional, value, &prop_path, errors);
+                        validate_internal(additional, value, &prop_path, errors, context);
                     }
                     _ => {}
                 }
@@ -632,10 +644,11 @@ fn validate_object(
         .and_then(serde_json::Value::as_u64)
     {
         if (obj.len() as u64) < min {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("object must have at least {min} properties"),
-            });
+            push_error(
+                errors,
+                path,
+                format!("object must have at least {min} properties"),
+            );
         }
     }
     if let Some(max) = schema
@@ -643,10 +656,85 @@ fn validate_object(
         .and_then(serde_json::Value::as_u64)
     {
         if (obj.len() as u64) > max {
-            errors.push(ValidationError {
-                path: path.to_string(),
-                message: format!("object must have at most {max} properties"),
-            });
+            push_error(
+                errors,
+                path,
+                format!("object must have at most {max} properties"),
+            );
+        }
+    }
+}
+
+fn compile_pattern_properties<'a>(
+    schema: &'a serde_json::Map<String, Value>,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) -> Vec<(Regex, &'a Value)> {
+    let Some(pattern_properties) = schema.get("patternProperties").and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    if pattern_properties.len() > MAX_PATTERN_PROPERTIES {
+        push_error(errors, path, "patternProperties exceeds entry limit");
+        return Vec::new();
+    }
+
+    let mut patterns = Vec::with_capacity(pattern_properties.len());
+    for (source, pattern_schema) in pattern_properties {
+        if source.len() > MAX_PATTERN_PROPERTY_BYTES {
+            push_error(errors, path, "patternProperties pattern exceeds byte limit");
+            continue;
+        }
+        match Regex::new(source) {
+            Ok(pattern) => patterns.push((pattern, pattern_schema)),
+            Err(_) => push_error(errors, path, "invalid patternProperties pattern"),
+        }
+    }
+    patterns
+}
+
+fn validate_dependencies(
+    schema: &serde_json::Map<String, Value>,
+    obj: &serde_json::Map<String, Value>,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: ValidationContext<'_>,
+) {
+    if let Some(dependent_required) = schema.get("dependentRequired").and_then(Value::as_object)
+    {
+        for (trigger, required) in dependent_required {
+            if !obj.contains_key(trigger) {
+                continue;
+            }
+            if let Some(required) = required.as_array() {
+                for required_property in required {
+                    if let Some(required_property) = required_property.as_str() {
+                        if !obj.contains_key(required_property) {
+                            push_error(
+                                errors,
+                                path,
+                                format!(
+                                    "property {trigger} requires property {required_property}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(dependent_schemas) = schema.get("dependentSchemas").and_then(Value::as_object) {
+        for (trigger, dependent_schema) in dependent_schemas {
+            if obj.contains_key(trigger) {
+                validate_internal(
+                    dependent_schema,
+                    &Value::Object(obj.clone()),
+                    path,
+                    errors,
+                    context,
+                );
+            }
         }
     }
 }
