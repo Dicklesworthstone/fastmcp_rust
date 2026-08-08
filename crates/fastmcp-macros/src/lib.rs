@@ -65,13 +65,13 @@
 use std::collections::HashMap;
 
 use proc_macro::TokenStream;
-use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro_crate::{crate_name, FoundCrate};
 use quote::{format_ident, quote};
 use syn::spanned::Spanned as _;
 use syn::{
-    Attribute, FnArg, Ident, ItemFn, Lit, LitStr, Meta, Pat, Token, Type, parse::Parse,
-    parse::ParseStream, parse_macro_input,
+    parse::Parse, parse::ParseStream, parse_macro_input, Attribute, FnArg, Ident, ItemFn, Lit,
+    LitStr, Meta, Pat, Token, Type,
 };
 
 /// Crate paths used by handler macro expansions.
@@ -660,12 +660,15 @@ fn generate_schema_bound_content(value: TokenStream2) -> TokenStream2 {
 /// keeps the content representation aligned with its advertised schema.
 fn generate_schema_bound_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
     let wrapped_result = match output {
-        syn::ReturnType::Type(_, Type::Path(type_path)) => type_path
-            .path
-            .segments
-            .last()
-            .map(|segment| segment.ident == "Result" || segment.ident == "McpResult")
-            .unwrap_or(false),
+        syn::ReturnType::Type(_, output_type) => match output_type.as_ref() {
+            Type::Path(type_path) => type_path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident == "Result" || segment.ident == "McpResult")
+                .unwrap_or(false),
+            _ => false,
+        },
         _ => false,
     };
 
@@ -674,11 +677,14 @@ fn generate_schema_bound_result_conversion(output: &syn::ReturnType) -> TokenStr
     }
 
     let is_mcp_result = match output {
-        syn::ReturnType::Type(_, Type::Path(type_path)) => type_path
-            .path
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "McpResult"),
+        syn::ReturnType::Type(_, output_type) => match output_type.as_ref() {
+            Type::Path(type_path) => type_path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "McpResult"),
+            _ => false,
+        },
         _ => false,
     };
 
@@ -1662,8 +1668,8 @@ fn validate_output_schema_expr(schema_expr: &syn::Expr) -> syn::Result<()> {
 #[allow(clippy::items_after_test_module)]
 mod schema_bound_tool_expansion_tests {
     use super::{
-        OutputSchemaSource, generate_tool_result_conversion, output_schema_source,
-        output_schema_value, typed_output_schema_matches_return, validate_output_schema_expr,
+        generate_tool_result_conversion, output_schema_source, output_schema_value,
+        typed_output_schema_matches_return, validate_output_schema_expr, OutputSchemaSource,
     };
 
     #[test]
