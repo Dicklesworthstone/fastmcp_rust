@@ -77,6 +77,325 @@ const SSE_DATA_LINE_WIRE_OVERHEAD: usize = b"data: \n".len();
 /// Effective JSON-RPC message ceiling for this SSE implementation.
 const MAX_SSE_MESSAGE_SIZE: usize = MAX_SSE_LINE_SIZE - SSE_DATA_LINE_WIRE_OVERHEAD;
 
+/// Explicit bounds for a modern request-scoped SSE response body.
+///
+/// Modern Streamable HTTP uses the WHATWG event-stream framing rules.  The
+/// collector receives chunks from the HTTP body, so both the current line and
+/// the assembled event need their own bounded accounting rather than relying
+/// on a caller to retain an arbitrary body prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModernSseLimits {
+    max_line_bytes: usize,
+    max_event_bytes: usize,
+    max_keepalive_lines: usize,
+}
+
+impl ModernSseLimits {
+    /// Creates nonzero bounds for one modern HTTP SSE body.
+    #[must_use]
+    pub const fn new(
+        max_line_bytes: usize,
+        max_event_bytes: usize,
+        max_keepalive_lines: usize,
+    ) -> Option<Self> {
+        if max_line_bytes == 0 || max_event_bytes == 0 || max_keepalive_lines == 0 {
+            return None;
+        }
+        Some(Self {
+            max_line_bytes,
+            max_event_bytes,
+            max_keepalive_lines,
+        })
+    }
+
+    /// Returns the maximum raw or decoded bytes retained for one line.
+    #[must_use]
+    pub const fn max_line_bytes(self) -> usize {
+        self.max_line_bytes
+    }
+
+    /// Returns the maximum raw or decoded bytes retained for one event.
+    #[must_use]
+    pub const fn max_event_bytes(self) -> usize {
+        self.max_event_bytes
+    }
+
+    /// Returns the maximum non-dispatching lines accepted between events.
+    #[must_use]
+    pub const fn max_keepalive_lines(self) -> usize {
+        self.max_keepalive_lines
+    }
+}
+
+/// The bounded parser's report when the HTTP response body reaches EOF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModernSseEndOfStream {
+    /// Whether an unterminated event with at least one `data` field was discarded.
+    pub discarded_pending_event: bool,
+    /// Whether an unterminated final line was discarded.
+    pub discarded_partial_line: bool,
+}
+
+/// Refusals from the bounded modern HTTP SSE framing parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModernSseParseError {
+    /// A raw or replacement-decoded line exceeds its configured bound.
+    LineTooLong {
+        /// The configured line bound.
+        limit_bytes: usize,
+    },
+    /// An assembled event exceeds its configured bound.
+    EventTooLarge {
+        /// The configured event bound.
+        limit_bytes: usize,
+    },
+    /// Too many inert/comment-only lines arrived before a dispatch.
+    KeepaliveFlood {
+        /// The configured line-count bound.
+        limit_lines: usize,
+    },
+    /// Input was supplied after an earlier refusal released parser state.
+    Poisoned,
+}
+
+/// The outcome of incrementally dispatching a decoded modern SSE event.
+///
+/// This remains crate-private because public callers use [`ModernSseDecoder::push`].
+/// The HTTP collector uses it to process each completed event immediately
+/// instead of retaining every event from an arbitrarily large body chunk.
+#[derive(Debug)]
+pub(crate) enum ModernSsePushError<E> {
+    /// Bounded SSE framing refused the input.
+    Parse(ModernSseParseError),
+    /// The immediate event consumer refused a completed payload.
+    Consumer(E),
+}
+
+impl std::fmt::Display for ModernSseParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LineTooLong { limit_bytes } => {
+                write!(formatter, "modern SSE line exceeds {limit_bytes} bytes")
+            }
+            Self::EventTooLarge { limit_bytes } => {
+                write!(formatter, "modern SSE event exceeds {limit_bytes} bytes")
+            }
+            Self::KeepaliveFlood { limit_lines } => {
+                write!(
+                    formatter,
+                    "modern SSE stream exceeds {limit_lines} inert lines"
+                )
+            }
+            Self::Poisoned => formatter.write_str("modern SSE parser already refused input"),
+        }
+    }
+}
+
+impl std::error::Error for ModernSseParseError {}
+
+/// Incremental, chunk-invariant WHATWG event-stream decoder for modern HTTP.
+///
+/// Each successful [`Self::push`] returns only completed `data` payloads in
+/// wire order.  `event`, `id`, `retry`, and unknown fields remain framing
+/// inputs only: modern request-scoped bodies must not acquire reconnect or
+/// cross-request routing state from them.
+#[derive(Debug)]
+pub struct ModernSseDecoder {
+    limits: ModernSseLimits,
+    raw_line: Vec<u8>,
+    pending_cr: bool,
+    bom_window_open: bool,
+    data: String,
+    event_raw_bytes: usize,
+    keepalive_lines: usize,
+    poisoned: bool,
+}
+
+impl ModernSseDecoder {
+    /// Creates an empty bounded decoder.
+    #[must_use]
+    pub fn new(limits: ModernSseLimits) -> Self {
+        Self {
+            limits,
+            raw_line: Vec::new(),
+            pending_cr: false,
+            bom_window_open: true,
+            data: String::new(),
+            event_raw_bytes: 0,
+            keepalive_lines: 0,
+            poisoned: false,
+        }
+    }
+
+    /// Feeds one HTTP body chunk and returns every completed SSE data payload.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, ModernSseParseError> {
+        let mut dispatched = Vec::new();
+        match self.push_with(chunk, |payload| {
+            dispatched.push(payload);
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(()) => Ok(dispatched),
+            Err(ModernSsePushError::Parse(error)) => Err(error),
+            Err(ModernSsePushError::Consumer(never)) => match never {},
+        }
+    }
+
+    /// Feeds one HTTP body chunk and immediately dispatches each completed
+    /// event in wire order.
+    ///
+    /// Unlike [`Self::push`], this does not retain all completed events from
+    /// the supplied chunk.  A consumer refusal leaves final lifecycle policy
+    /// to the owner of the stream.
+    pub(crate) fn push_with<E>(
+        &mut self,
+        chunk: &[u8],
+        mut consume: impl FnMut(String) -> Result<(), E>,
+    ) -> Result<(), ModernSsePushError<E>> {
+        if self.poisoned {
+            return Err(ModernSsePushError::Parse(ModernSseParseError::Poisoned));
+        }
+        for &byte in chunk {
+            if self.pending_cr {
+                self.pending_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => {
+                    if let Err(error) = self.complete_line(&mut consume) {
+                        return Err(self.poison_push_error(error));
+                    }
+                    self.pending_cr = true;
+                }
+                b'\n' => {
+                    if let Err(error) = self.complete_line(&mut consume) {
+                        return Err(self.poison_push_error(error));
+                    }
+                }
+                byte => {
+                    if self.raw_line.len() >= self.limits.max_line_bytes {
+                        return Err(ModernSsePushError::Parse(self.poison(
+                            ModernSseParseError::LineTooLong {
+                                limit_bytes: self.limits.max_line_bytes,
+                            },
+                        )));
+                    }
+                    self.raw_line.push(byte);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finishes the body without synthesizing a final blank line.
+    pub fn finish(self) -> Result<ModernSseEndOfStream, ModernSseParseError> {
+        if self.poisoned {
+            return Err(ModernSseParseError::Poisoned);
+        }
+        Ok(ModernSseEndOfStream {
+            discarded_pending_event: !self.data.is_empty(),
+            discarded_partial_line: !self.raw_line.is_empty(),
+        })
+    }
+
+    fn poison(&mut self, error: ModernSseParseError) -> ModernSseParseError {
+        self.raw_line = Vec::new();
+        self.data = String::new();
+        self.event_raw_bytes = 0;
+        self.keepalive_lines = 0;
+        self.poisoned = true;
+        error
+    }
+
+    fn poison_push_error<E>(&mut self, error: ModernSsePushError<E>) -> ModernSsePushError<E> {
+        match error {
+            ModernSsePushError::Parse(error) => ModernSsePushError::Parse(self.poison(error)),
+            ModernSsePushError::Consumer(error) => ModernSsePushError::Consumer(error),
+        }
+    }
+
+    fn complete_line<E>(
+        &mut self,
+        consume: &mut impl FnMut(String) -> Result<(), E>,
+    ) -> Result<(), ModernSsePushError<E>> {
+        let mut raw = std::mem::take(&mut self.raw_line);
+        if self.bom_window_open {
+            self.bom_window_open = false;
+            if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                raw.drain(..3);
+            }
+        }
+        let raw_len = raw.len();
+        let line = String::from_utf8_lossy(&raw);
+        if line.len() > self.limits.max_line_bytes {
+            return Err(ModernSsePushError::Parse(self.poison(
+                ModernSseParseError::LineTooLong {
+                    limit_bytes: self.limits.max_line_bytes,
+                },
+            )));
+        }
+        self.process_line(&line, raw_len, consume)
+    }
+
+    fn process_line<E>(
+        &mut self,
+        line: &str,
+        raw_len: usize,
+        consume: &mut impl FnMut(String) -> Result<(), E>,
+    ) -> Result<(), ModernSsePushError<E>> {
+        if line.is_empty() {
+            if self.data.is_empty() {
+                return self.count_inert_line().map_err(ModernSsePushError::Parse);
+            }
+            let mut payload = std::mem::take(&mut self.data);
+            debug_assert!(payload.ends_with('\n'));
+            payload.pop();
+            self.event_raw_bytes = 0;
+            self.keepalive_lines = 0;
+            return consume(payload).map_err(ModernSsePushError::Consumer);
+        }
+        if line.starts_with(':') {
+            return self.count_inert_line().map_err(ModernSsePushError::Parse);
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
+        };
+        if field != "data" {
+            return self.count_inert_line().map_err(ModernSsePushError::Parse);
+        }
+        let decoded_after = self
+            .data
+            .len()
+            .saturating_add(value.len())
+            .saturating_add(1);
+        let raw_after = self.event_raw_bytes.saturating_add(raw_len);
+        if decoded_after > self.limits.max_event_bytes || raw_after > self.limits.max_event_bytes {
+            return Err(ModernSsePushError::Parse(self.poison(
+                ModernSseParseError::EventTooLarge {
+                    limit_bytes: self.limits.max_event_bytes,
+                },
+            )));
+        }
+        self.data.push_str(value);
+        self.data.push('\n');
+        self.event_raw_bytes = raw_after;
+        self.keepalive_lines = 0;
+        Ok(())
+    }
+
+    fn count_inert_line(&mut self) -> Result<(), ModernSseParseError> {
+        self.keepalive_lines = self.keepalive_lines.saturating_add(1);
+        if self.keepalive_lines > self.limits.max_keepalive_lines {
+            return Err(ModernSseParseError::KeepaliveFlood {
+                limit_lines: self.limits.max_keepalive_lines,
+            });
+        }
+        Ok(())
+    }
+}
+
 // =============================================================================
 // SSE Event Types
 // =============================================================================

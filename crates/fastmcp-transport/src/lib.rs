@@ -58,10 +58,11 @@ pub use codec::{Codec, CodecError, InvalidMessageKind};
 /// or qualify turnkey HTTP serving.
 pub use http::{
     HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
-    HttpResponseRepresentation, HttpStatus, ModernHttpRequestAdmission,
-    StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
-    StreamableHttpResponseStream, StreamableHttpTransport,
+    HttpResponseRepresentation, HttpStatus, ModernHttpRequestAdmission, ModernHttpSseCollector,
+    ModernHttpSseCollectorError, StreamableHttpRequestCancellation,
+    StreamableHttpRequestResponseStream, StreamableHttpResponseStream, StreamableHttpTransport,
 };
+pub use sse::{ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits, ModernSseParseError};
 pub use stdio::{AsyncStdioTransport, StdioTransport};
 
 use asupersync::Cx;

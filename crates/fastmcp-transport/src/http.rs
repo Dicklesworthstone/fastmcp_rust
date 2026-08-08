@@ -66,8 +66,257 @@ use fastmcp_protocol::protocol_version::{
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 
 use crate::event_store::{EventStore, EventStoreConfig, EventStoreError};
-use crate::sse::SseEvent;
+use crate::sse::{
+    ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits, ModernSseParseError,
+    ModernSsePushError, SseEvent,
+};
 use crate::{Codec, CodecError, Transport, TransportError};
+
+/// Result of consuming one finite modern HTTP SSE response body.
+///
+/// The collector binds every terminal JSON-RPC response to one outgoing
+/// request ID. Server notifications are passed to the supplied callback in
+/// wire order before the terminal response is returned at EOF.
+#[derive(Debug)]
+pub struct ModernHttpSseCollector {
+    request_id: RequestId,
+    decoder: Option<ModernSseDecoder>,
+    codec: Codec,
+    terminal: Option<JsonRpcResponse>,
+}
+
+/// Errors while collecting one request-scoped modern HTTP SSE response body.
+#[derive(Debug)]
+pub enum ModernHttpSseCollectorError {
+    /// The request ID cannot be used as a JSON-RPC correlation key.
+    InvalidRequestId,
+    /// Caller cancellation stopped collection before a terminal response.
+    Cancelled,
+    /// Bounded SSE framing refused the response body.
+    Sse(ModernSseParseError),
+    /// A completed SSE payload was not one valid bounded JSON-RPC message.
+    Codec(CodecError),
+    /// The transport context expired while consuming the response body.
+    Transport(TransportError),
+    /// Notification delivery returned an application transport error.
+    NotificationDelivery(TransportError),
+    /// A server-to-client request carried an ID and is therefore not a notification.
+    NonNotificationRequest {
+        /// The request ID unexpectedly carried by the server message.
+        request_id: RequestId,
+    },
+    /// A terminal response belongs to a request other than this SSE body.
+    TerminalResponseIdMismatch {
+        /// The outgoing request ID bound to this body.
+        expected: RequestId,
+        /// The response ID observed on the body, including absent IDs.
+        actual: Option<RequestId>,
+    },
+    /// A second terminal response arrived after the body's first terminal response.
+    DuplicateTerminalResponse {
+        /// The request ID bound to this body.
+        request_id: RequestId,
+    },
+    /// A notification arrived after this finite response had terminated.
+    NotificationAfterTerminal {
+        /// The request ID bound to this body.
+        request_id: RequestId,
+    },
+    /// The HTTP body ended before a correlated terminal response.
+    EndOfStream {
+        /// Exact incomplete SSE framing discarded at EOF.
+        framing: ModernSseEndOfStream,
+    },
+    /// The response body was already finished or refused.
+    Closed,
+}
+
+impl std::fmt::Display for ModernHttpSseCollectorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequestId => {
+                formatter.write_str("modern HTTP SSE collector has invalid request ID")
+            }
+            Self::Cancelled => formatter.write_str("modern HTTP SSE collection was cancelled"),
+            Self::Sse(error) => error.fmt(formatter),
+            Self::Codec(error) => error.fmt(formatter),
+            Self::Transport(error) => error.fmt(formatter),
+            Self::NotificationDelivery(error) => error.fmt(formatter),
+            Self::NonNotificationRequest { request_id } => write!(
+                formatter,
+                "modern HTTP SSE server request {request_id:?} is not a notification"
+            ),
+            Self::TerminalResponseIdMismatch { expected, actual } => write!(
+                formatter,
+                "modern HTTP SSE response ID {actual:?} does not match request {expected:?}"
+            ),
+            Self::DuplicateTerminalResponse { request_id } => write!(
+                formatter,
+                "modern HTTP SSE body for request {request_id:?} emitted a duplicate terminal response"
+            ),
+            Self::NotificationAfterTerminal { request_id } => write!(
+                formatter,
+                "modern HTTP SSE body for request {request_id:?} emitted a notification after its terminal response"
+            ),
+            Self::EndOfStream { .. } => formatter
+                .write_str("modern HTTP SSE body ended before its correlated terminal response"),
+            Self::Closed => formatter.write_str("modern HTTP SSE collector is closed"),
+        }
+    }
+}
+
+impl std::error::Error for ModernHttpSseCollectorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Sse(error) => Some(error),
+            Self::Codec(error) => Some(error),
+            Self::Transport(error) => Some(error),
+            Self::NotificationDelivery(error) => Some(error),
+            Self::InvalidRequestId
+            | Self::Cancelled
+            | Self::NonNotificationRequest { .. }
+            | Self::TerminalResponseIdMismatch { .. }
+            | Self::DuplicateTerminalResponse { .. }
+            | Self::NotificationAfterTerminal { .. }
+            | Self::EndOfStream { .. }
+            | Self::Closed => None,
+        }
+    }
+}
+
+impl ModernHttpSseCollector {
+    /// Creates a bounded collector for exactly one outgoing request.
+    ///
+    /// The decoder uses WHATWG SSE framing in replacement mode and the
+    /// existing strict transport codec for each completed JSON-RPC payload.
+    pub fn new(
+        request_id: RequestId,
+        limits: ModernSseLimits,
+    ) -> Result<Self, ModernHttpSseCollectorError> {
+        if request_id.validate().is_err() {
+            return Err(ModernHttpSseCollectorError::InvalidRequestId);
+        }
+        let mut codec = Codec::new();
+        codec.set_max_message_size(limits.max_event_bytes());
+        Ok(Self {
+            request_id,
+            decoder: Some(ModernSseDecoder::new(limits)),
+            codec,
+            terminal: None,
+        })
+    }
+
+    /// Incrementally consumes an HTTP response-body chunk.
+    ///
+    /// Each server notification is delivered immediately in wire order. A
+    /// response is retained only if its ID exactly matches this collector's
+    /// request ID. Continue feeding chunks through EOF so duplicate terminals
+    /// cannot be hidden after an otherwise valid first response.
+    pub fn push(
+        &mut self,
+        cx: &Cx,
+        chunk: &[u8],
+        mut deliver_notification: impl FnMut(JsonRpcRequest) -> Result<(), TransportError>,
+    ) -> Result<(), ModernHttpSseCollectorError> {
+        if let Err(error) = Self::checkpoint(cx) {
+            return Err(self.refuse(error));
+        }
+
+        let request_id = self.request_id.clone();
+        let result = {
+            let decoder = self
+                .decoder
+                .as_mut()
+                .ok_or(ModernHttpSseCollectorError::Closed)?;
+            let codec = &mut self.codec;
+            let terminal = &mut self.terminal;
+            decoder.push_with(chunk, |event| {
+                Self::checkpoint(cx)?;
+                let message = codec
+                    .decode_complete_message(event.as_bytes())
+                    .map_err(ModernHttpSseCollectorError::Codec)?;
+                match message {
+                    JsonRpcMessage::Request(notification) => {
+                        if terminal.is_some() {
+                            return Err(ModernHttpSseCollectorError::NotificationAfterTerminal {
+                                request_id: request_id.clone(),
+                            });
+                        }
+                        if let Some(request_id) = notification.id.clone() {
+                            return Err(ModernHttpSseCollectorError::NonNotificationRequest {
+                                request_id,
+                            });
+                        }
+                        deliver_notification(notification)
+                            .map_err(ModernHttpSseCollectorError::NotificationDelivery)
+                    }
+                    JsonRpcMessage::Response(response) => {
+                        if terminal.is_some() {
+                            return Err(ModernHttpSseCollectorError::DuplicateTerminalResponse {
+                                request_id: request_id.clone(),
+                            });
+                        }
+                        if response.id.as_ref() != Some(&request_id) {
+                            return Err(ModernHttpSseCollectorError::TerminalResponseIdMismatch {
+                                expected: request_id.clone(),
+                                actual: response.id,
+                            });
+                        }
+                        *terminal = Some(response);
+                        Ok(())
+                    }
+                }
+            })
+        };
+        match result {
+            Ok(()) => {}
+            Err(ModernSsePushError::Parse(error)) => {
+                return Err(self.refuse(ModernHttpSseCollectorError::Sse(error)));
+            }
+            Err(ModernSsePushError::Consumer(error)) => return Err(self.refuse(error)),
+        }
+
+        if let Err(error) = Self::checkpoint(cx) {
+            return Err(self.refuse(error));
+        }
+        Ok(())
+    }
+
+    /// Ends the finite HTTP body and returns its one correlated terminal response.
+    ///
+    /// EOF without a terminal response is an error even if the SSE framing was
+    /// otherwise clean. An unfinished final SSE event is reported in the EOF
+    /// error instead of being synthesized into a JSON-RPC message.
+    pub fn finish(&mut self, cx: &Cx) -> Result<JsonRpcResponse, ModernHttpSseCollectorError> {
+        Self::checkpoint(cx)?;
+        let decoder = self
+            .decoder
+            .take()
+            .ok_or(ModernHttpSseCollectorError::Closed)?;
+        let framing = decoder.finish().map_err(ModernHttpSseCollectorError::Sse)?;
+        if framing.discarded_pending_event || framing.discarded_partial_line {
+            self.terminal = None;
+            return Err(ModernHttpSseCollectorError::EndOfStream { framing });
+        }
+        self.terminal
+            .take()
+            .ok_or(ModernHttpSseCollectorError::EndOfStream { framing })
+    }
+
+    fn checkpoint(cx: &Cx) -> Result<(), ModernHttpSseCollectorError> {
+        match http_checkpoint(cx) {
+            Ok(()) => Ok(()),
+            Err(TransportError::Cancelled) => Err(ModernHttpSseCollectorError::Cancelled),
+            Err(error) => Err(ModernHttpSseCollectorError::Transport(error)),
+        }
+    }
+
+    fn refuse(&mut self, error: ModernHttpSseCollectorError) -> ModernHttpSseCollectorError {
+        self.decoder = None;
+        self.terminal = None;
+        error
+    }
+}
 
 // =============================================================================
 // HTTP Request/Response Types
@@ -8637,5 +8886,200 @@ X-Checksum: abc123\r\n\
         assert_eq!(rejected.headers.get("allow"), Some(&"GET".to_string()));
         assert_eq!(session.retained_legacy_event_count(), event_count_before);
         assert!(session.take_legacy_request().is_none());
+    }
+
+    #[test]
+    fn modern_http_sse_collector_incrementally_delivers_notifications_then_terminal() {
+        let request_id = RequestId::Number(4_201);
+        let notification = JsonRpcRequest::notification(
+            "notifications/progress",
+            Some(serde_json::json!({"progress": 50})),
+        );
+        let response = JsonRpcResponse::success(
+            request_id.clone(),
+            serde_json::json!({"result": "complete"}),
+        );
+        let notification_json = serde_json::to_string(&notification).expect("notification encodes");
+        let notification_bytes = notification_json.as_bytes().to_vec();
+        let response_json = serde_json::to_string(&response).expect("response encodes");
+        let body = format!(
+            "event: ignored\r\ndata: {notification_json}\r\n\r\ndata: {response_json}\r\n\r\n"
+        );
+        let split = body.len() / 2;
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let mut collector =
+            ModernHttpSseCollector::new(request_id.clone(), limits).expect("valid request ID");
+        let cx = Cx::for_testing();
+        let mut notifications = Vec::new();
+
+        collector
+            .push(&cx, &body.as_bytes()[..split], |notification| {
+                notifications.push(
+                    serde_json::to_vec(&notification).expect("delivered notification encodes"),
+                );
+                Ok(())
+            })
+            .expect("a partial HTTP chunk does not synthesize an SSE event");
+        collector
+            .push(&cx, &body.as_bytes()[split..], |notification| {
+                notifications.push(
+                    serde_json::to_vec(&notification).expect("delivered notification encodes"),
+                );
+                Ok(())
+            })
+            .expect("the remaining chunk admits its notification and terminal response");
+
+        assert_eq!(notifications, vec![notification_bytes]);
+        assert_eq!(
+            collector
+                .finish(&cx)
+                .expect("EOF returns the one correlated terminal response"),
+            response
+        );
+    }
+
+    #[test]
+    fn modern_http_sse_collector_rejects_only_mismatched_terminal_id() {
+        let request_id = RequestId::Number(4_202);
+        let response = JsonRpcResponse::success(
+            RequestId::Number(4_203),
+            serde_json::json!({"result": "complete"}),
+        );
+        let response_json = serde_json::to_string(&response).expect("response encodes");
+        let body = format!("data: {response_json}\n\n");
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let mut collector =
+            ModernHttpSseCollector::new(request_id.clone(), limits).expect("valid request ID");
+        let cx = Cx::for_testing();
+
+        assert!(matches!(
+            collector.push(&cx, body.as_bytes(), |_| Ok(())),
+            Err(ModernHttpSseCollectorError::TerminalResponseIdMismatch {
+                expected,
+                actual: Some(RequestId::Number(4_203)),
+            }) if expected == request_id
+        ));
+        assert_collector_is_closed(&mut collector, &cx);
+    }
+
+    #[test]
+    fn modern_http_sse_collector_rejects_only_trailing_incomplete_bytes_after_terminal() {
+        let request_id = RequestId::Number(4_204);
+        let response = JsonRpcResponse::success(request_id.clone(), serde_json::json!(true));
+        let response_json = serde_json::to_string(&response).expect("response encodes");
+        let complete_body = format!("data: {response_json}\n\n");
+        let body = format!("{complete_body}data: {{");
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let mut collector =
+            ModernHttpSseCollector::new(request_id, limits).expect("valid request ID");
+        let cx = Cx::for_testing();
+
+        collector
+            .push(&cx, body.as_bytes(), |_| Ok(()))
+            .expect("the terminal is complete before the trailing partial SSE line");
+        assert!(matches!(
+            collector.finish(&cx),
+            Err(ModernHttpSseCollectorError::EndOfStream {
+                framing: ModernSseEndOfStream {
+                    discarded_pending_event: false,
+                    discarded_partial_line: true,
+                },
+            })
+        ));
+        assert_collector_is_closed(&mut collector, &cx);
+    }
+
+    #[test]
+    fn modern_http_sse_collector_poisoned_by_codec_error_cannot_release_prior_terminal() {
+        let request_id = RequestId::Number(4_205);
+        let response = JsonRpcResponse::success(request_id.clone(), serde_json::json!(true));
+        let response_json = serde_json::to_string(&response).expect("response encodes");
+        let body = format!("data: {response_json}\n\ndata: not-json\n\n");
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let mut collector =
+            ModernHttpSseCollector::new(request_id, limits).expect("valid request ID");
+        let cx = Cx::for_testing();
+
+        assert!(matches!(
+            collector.push(&cx, body.as_bytes(), |_| Ok(())),
+            Err(ModernHttpSseCollectorError::Codec(_))
+        ));
+        assert_collector_is_closed(&mut collector, &cx);
+    }
+
+    #[test]
+    fn modern_http_sse_collector_poisoned_by_sse_framing_error_stays_closed() {
+        let limits = ModernSseLimits::new(8, 4_096, 8).expect("nonzero SSE limits");
+        let mut collector = ModernHttpSseCollector::new(RequestId::Number(4_206), limits)
+            .expect("valid request ID");
+        let cx = Cx::for_testing();
+
+        assert!(matches!(
+            collector.push(&cx, b"data: too-long\n", |_| Ok(())),
+            Err(ModernHttpSseCollectorError::Sse(
+                ModernSseParseError::LineTooLong { .. }
+            ))
+        ));
+        assert_collector_is_closed(&mut collector, &cx);
+    }
+
+    #[test]
+    fn modern_http_sse_collector_poisoned_by_notification_delivery_error_stays_closed() {
+        let notification = JsonRpcRequest::notification(
+            "notifications/progress",
+            Some(serde_json::json!({"progress": 50})),
+        );
+        let notification_json = serde_json::to_string(&notification).expect("notification encodes");
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let mut collector = ModernHttpSseCollector::new(RequestId::Number(4_206), limits)
+            .expect("valid request ID");
+        let cx = Cx::for_testing();
+
+        assert!(matches!(
+            collector.push(
+                &cx,
+                format!("data: {notification_json}\n\n").as_bytes(),
+                |_| { Err(TransportError::Closed) }
+            ),
+            Err(ModernHttpSseCollectorError::NotificationDelivery(
+                TransportError::Closed
+            ))
+        ));
+        assert_collector_is_closed(&mut collector, &cx);
+    }
+
+    #[test]
+    fn modern_http_sse_collector_poisoned_by_mid_chunk_cancellation_stays_closed() {
+        let request_id = RequestId::Number(4_207);
+        let notification = JsonRpcRequest::notification("notifications/progress", None);
+        let response = JsonRpcResponse::success(request_id.clone(), serde_json::json!(true));
+        let notification_json = serde_json::to_string(&notification).expect("notification encodes");
+        let response_json = serde_json::to_string(&response).expect("response encodes");
+        let body = format!("data: {notification_json}\n\ndata: {response_json}\n\n");
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let mut collector =
+            ModernHttpSseCollector::new(request_id, limits).expect("valid request ID");
+        let cancelled_cx = Cx::for_testing();
+        let fresh_cx = Cx::for_testing();
+
+        assert!(matches!(
+            collector.push(&cancelled_cx, body.as_bytes(), |_| {
+                cancelled_cx.set_cancel_requested(true);
+                Ok(())
+            }),
+            Err(ModernHttpSseCollectorError::Cancelled)
+        ));
+        assert_collector_is_closed(&mut collector, &fresh_cx);
+    }
+
+    fn assert_collector_is_closed(collector: &mut ModernHttpSseCollector, cx: &Cx) {
+        assert!(matches!(
+            collector.push(cx, b"", |_| Ok(())),
+            Err(ModernHttpSseCollectorError::Closed)
+        ));
+        assert!(matches!(
+            collector.finish(cx),
+            Err(ModernHttpSseCollectorError::Closed)
+        ));
     }
 }
