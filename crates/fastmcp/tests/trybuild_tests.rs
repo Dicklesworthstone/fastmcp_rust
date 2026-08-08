@@ -562,8 +562,10 @@ const FACADE_ONLY_CONSUMER: &str = r#"
 #![allow(dead_code)]
 
 use mcp::{
-    Content, JsonSchema, McpResult, PromptHandler, PromptMessage, ResourceHandler, Role,
-    ToolHandler, prompt, resource, tool,
+    ClientHttpNegotiation, CompleteResult, ConfigLoader, Content, JsonSchema, McpConfig,
+    McpResult, ModernHttpExecutor, ModernHttpRequest, PromptHandler, PromptMessage,
+    ProtocolPolicy, ResourceHandler, Role, ServerConfig, ToolHandler, legacy_2024, modern,
+    prompt, resource, tool,
 };
 
 #[derive(JsonSchema)]
@@ -600,5 +602,35 @@ fn assert_generated_surface() -> McpResult<()> {
     prompt_handler(FacadePromptPrompt);
     let _ = ToolInput::json_schema();
     Ok(())
+}
+
+fn assert_dual_era_facade_surface() {
+    let request = ModernHttpRequest::new(
+        "https://mcp.example.test/mcp",
+        b"{}".to_vec(),
+        modern::PROTOCOL_VERSION,
+        modern::SERVER_DISCOVER_METHOD,
+        None,
+    )
+    .expect("facade modern HTTP executor types compile");
+    assert!(request.headers().iter().any(|(name, _)| name == "Mcp-Method"));
+    let _executor = ModernHttpExecutor::new();
+
+    let mut config = McpConfig::new();
+    config.add_server("final", ServerConfig::new("final-mcp"));
+    assert_eq!(config.server_names(), vec!["final"]);
+    let _: Option<ConfigLoader> = None;
+    let _: Option<ClientHttpNegotiation> = None;
+    let _: Option<CompleteResult<()>> = None;
+    let _: Option<modern::ContentBlock> = None;
+    let _: Option<modern::ExtensionDescriptorRegistry> = None;
+    let _: Option<modern::ServerDiscoverResult> = None;
+    let _: Option<modern::InboundRequestContext> = None;
+    let _: Option<legacy_2024::Legacy2024Lifecycle> = None;
+
+    let uri = modern::AbsoluteUri::parse("https://mcp.example.test/final")
+        .expect("facade final common types compile");
+    assert_eq!(uri.as_str(), "https://mcp.example.test/final");
+    assert_eq!(ProtocolPolicy::ModernOnly, modern::ProtocolPolicy::ModernOnly);
 }
 "#;

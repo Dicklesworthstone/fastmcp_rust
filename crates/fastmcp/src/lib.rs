@@ -155,6 +155,59 @@ pub use fastmcp_protocol::{
     SubscribeResourceParams, Tool, ToolAnnotations, ToolsCapability, UnsubscribeResourceParams,
 };
 
+pub use fastmcp_protocol::common_types;
+// Final common wire vocabulary. `FinalAbsoluteUri` avoids colliding with the
+// established core URI type; `modern::AbsoluteUri` retains the exact name.
+pub use fastmcp_protocol::common_types::{
+    AbsoluteUri as FinalAbsoluteUri, AnnotationAudience, Annotations, CancellationNotification,
+    CancellationRequestId, CommonTypeError, CommonWireDirection, ContentBlock,
+    EmbeddedResourceContents, FinalCommonTypesSchema, IconTheme, Implementation, LoggingLevel,
+    OpaqueCursor, OpenMetadata, RawIcon, RawIconSourceUri, ResourceLink, TraceContext,
+    UntrustedCancellationReason,
+};
+
+// Final result vocabulary and bounded exact-JSON helpers.
+pub use fastmcp_protocol::{
+    CacheScope, CacheTtl, CacheableResult, CompleteResult, CompleteResultPayload,
+    CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonMember, ExactJsonObject, ExactJsonValue,
+    InputRequiredResult, MetadataView, PaginatedResult, RawResultEnvelope, ResultDecodeError,
+    ResultDecodeErrorKind, ResultDiscriminatorDecision, ResultDiscriminatorPolicy, ResultMeta,
+    ResultPeerDiagnostic, ResultPeerEra, TypedCompleteMembers, UnknownResultMembers,
+    decode_peer_result, decode_typed_complete, encode_result, parse_exact_json,
+};
+
+pub use fastmcp_protocol::extensions;
+// Final extension vocabulary.
+pub use fastmcp_protocol::extensions::{
+    ClientExtensionDiscovery, EffectiveExtensionSettings, ExtensionDescriptor,
+    ExtensionDescriptorRegistry, ExtensionDirection, ExtensionDiscovery, ExtensionDispatchError,
+    ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId, ExtensionInactiveReason,
+    ExtensionLocalEnablement, ExtensionMethodDescriptor, ExtensionNegotiationError,
+    ExtensionNegotiationResolver, ExtensionNotificationDescriptor, ExtensionPeer,
+    ExtensionRegistryError, ExtensionRegistryReceipt, ExtensionRoutingHeaderDescriptor,
+    ExtensionSettings, ExtensionSettingsCompatibilityResolver, ExtensionSettingsSchema,
+    NegotiatedExtension, NegotiatedExtensionSet, ServerExtensionDiscovery,
+    StdioCorrelationDescriptor,
+};
+
+// Final `server/discover` vocabulary.
+pub use fastmcp_protocol::{
+    DiscoveryCacheHints, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
+    ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
+    ServerDiscoverResult, ServerDiscoveryError, ServerInstructionError, ServerInstructions,
+};
+
+// Final protocol-version admission vocabulary.
+pub use fastmcp_protocol::{
+    FINAL_PROTOCOL_VERSION, FinalHttpRequestMetadata, FinalProtocolVersion, FinalRequestAdmission,
+    HEADER_MISMATCH_ERROR_CODE, HeaderMismatchError, HeaderMismatchReason, MCP_METHOD_HEADER,
+    MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+    MissingRequiredClientCapabilityError, ProtocolVersionError, RequestAdmissionError,
+    RequestVersionMetadata, RequiredCapabilitiesError, SUPPORTED_FINAL_PROTOCOL_VERSIONS,
+    UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnsupportedProtocolVersionError,
+    admit_final_http_request, admit_final_request, validate_final_protocol_version,
+};
+
 /// Historical exact-2024 protocol constant retained for existing consumers.
 ///
 /// New exact-2024 code should import [`legacy_2024::PROTOCOL_VERSION`]; new
@@ -162,7 +215,15 @@ pub use fastmcp_protocol::{
 pub use fastmcp_protocol::PROTOCOL_VERSION;
 
 /// Immutable protocol-policy primitives shared by the explicit era modules.
-pub use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy, ProtocolVersion};
+pub use fastmcp_protocol::protocol_policy::{
+    HttpEndpointBundle, HttpEndpointBundleError, HttpEndpointBundleKey, HttpEraCache,
+    HttpEraDecision, HttpModernProbe, HttpProbeBody, HttpRouteKind, LEGACY_PROTOCOL_VERSION,
+    LegacyClientAdapterInstalledReceipt, LegacyReceiptBinding, LegacyServerAdapterInstalledReceipt,
+    MODERN_PROTOCOL_VERSION, ModernVersionSupport, ProtocolEra, ProtocolPolicy,
+    ProtocolPolicyError, ProtocolPolicySelection, ProtocolRole, ProtocolVersion,
+    ProtocolVersionError as ProtocolPolicyVersionError, StdioEraClassifier, StdioEraDecision,
+    StdioEraRejection, StdioEraState, StdioOpeningFrame,
+};
 
 // Re-export transport types
 pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError};
@@ -173,11 +234,14 @@ pub use fastmcp_transport::{event_store, http, memory};
 // Re-export server types
 // FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
 pub use fastmcp_server::{
-    AllowAllAuthProvider, AuthProvider, AuthRequest, HttpServerConfig, NotificationSender,
-    PendingRequests, PromptHandler, ProxyBackend, ProxyCatalog, ProxyClient, RequestSender,
-    ResourceHandler, Router, Server, ServerBuilder, Session, StaticTokenVerifier,
-    TokenAuthProvider, TokenVerifier, ToolHandler, TransportElicitationSender,
-    TransportRootsProvider, TransportSamplingSender,
+    AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders, BoxFuture,
+    ConsoleConfig, HttpServerConfig, InboundRequestContext, InboundRequestTransport, Middleware,
+    MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
+    ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog, ProxyClient,
+    RequestSender, ResourceHandler, Router, Server, ServerBuilder, ServerStats, Session,
+    StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolHandler,
+    TrafficVerbosity, TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    create_context_with_progress, create_context_with_progress_and_senders,
 };
 
 // Re-export bidirectional module for namespaced access (e.g. bidirectional::RequestSender)
@@ -189,12 +253,23 @@ pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
 pub use fastmcp_client::{
-    BoundedListPage, Client, ClientBuilder, ClientSession, ListPageLimits, RequestTimeoutPolicy,
+    BoundedListPage, Client, ClientBuilder, ClientHttpNegotiation, ClientHttpNegotiationDecision,
+    ClientHttpNegotiationError, ClientHttpNegotiationState, ClientProtocolPlan,
+    ClientProtocolPlanError, ClientSession, ListPageLimits, RequestTimeoutPolicy,
     RequestTimeoutSource,
 };
 
-// Re-export client configuration module
-pub use fastmcp_client::mcp_config;
+// Public client HTTP execution and configuration surfaces.
+pub use fastmcp_client::http_executor::{
+    MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, ModernHttpExecutor,
+    ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseMetadata,
+    ModernHttpResponseStream, validate_response_head,
+};
+pub use fastmcp_client::mcp_config::{
+    ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
+    ServerConfig, claude_desktop_config_path, default_config_paths,
+};
+pub use fastmcp_client::{http_executor, mcp_config};
 
 // Re-export macros
 pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
@@ -225,34 +300,76 @@ pub mod auto {
 /// boundaries; re-exporting a type here does not claim aggregate protocol
 /// conformance.
 pub mod modern {
+    pub use fastmcp_client::http_executor::{
+        MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, ModernHttpExecutor,
+        ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
+        ModernHttpResponseMetadata, ModernHttpResponseStream, validate_response_head,
+    };
+    pub use fastmcp_client::mcp_config::{
+        ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
+        ServerConfig, claude_desktop_config_path, default_config_paths,
+    };
     pub use fastmcp_client::{
         Client, ClientBuilder, ClientHttpNegotiation, ClientHttpNegotiationDecision,
         ClientHttpNegotiationError, ClientHttpNegotiationState, ClientProtocolPlan,
         ClientProtocolPlanError, ClientSession,
     };
+    pub use fastmcp_client::{http_executor, mcp_config};
     pub use fastmcp_core::{Cx, McpContext, McpError, McpOutcome, McpResult, Outcome};
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
+    pub use fastmcp_protocol::common_types::{
+        AbsoluteUri, AnnotationAudience, Annotations, CancellationNotification,
+        CancellationRequestId, CommonTypeError, CommonWireDirection, ContentBlock,
+        EmbeddedResourceContents, FinalCommonTypesSchema, IconTheme, Implementation, LoggingLevel,
+        OpaqueCursor, OpenMetadata, RawIcon, RawIconSourceUri, ResourceLink, TraceContext,
+        UntrustedCancellationReason,
+    };
+    pub use fastmcp_protocol::extensions::{
+        ClientExtensionDiscovery, EffectiveExtensionSettings, ExtensionDescriptor,
+        ExtensionDescriptorRegistry, ExtensionDirection, ExtensionDiscovery,
+        ExtensionDispatchError, ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId,
+        ExtensionInactiveReason, ExtensionLocalEnablement, ExtensionMethodDescriptor,
+        ExtensionNegotiationError, ExtensionNegotiationResolver, ExtensionNotificationDescriptor,
+        ExtensionPeer, ExtensionRegistryError, ExtensionRegistryReceipt,
+        ExtensionRoutingHeaderDescriptor, ExtensionSettings,
+        ExtensionSettingsCompatibilityResolver, ExtensionSettingsSchema, NegotiatedExtension,
+        NegotiatedExtensionSet, ServerExtensionDiscovery, StdioCorrelationDescriptor,
+    };
     pub use fastmcp_protocol::protocol_policy::{
-        HttpEndpointBundle, HttpEndpointBundleError, HttpEraCache, HttpEraDecision,
-        HttpModernProbe, HttpProbeBody, HttpRouteKind, MODERN_PROTOCOL_VERSION as PROTOCOL_VERSION,
-        ProtocolEra, ProtocolPolicy, ProtocolPolicyError, ProtocolPolicySelection, ProtocolRole,
-        ProtocolVersion, ProtocolVersionError,
+        HttpEndpointBundle, HttpEndpointBundleError, HttpEndpointBundleKey, HttpEraCache,
+        HttpEraDecision, HttpModernProbe, HttpProbeBody, HttpRouteKind, MODERN_PROTOCOL_VERSION,
+        ModernVersionSupport, ProtocolEra, ProtocolPolicy, ProtocolPolicyError,
+        ProtocolPolicySelection, ProtocolRole, ProtocolVersion, ProtocolVersionError,
+        StdioEraClassifier, StdioEraDecision, StdioEraRejection, StdioEraState, StdioOpeningFrame,
     };
     pub use fastmcp_protocol::{
-        ClientExtensionDiscovery, DiscoveryCacheHints, ExtensionDescriptor,
-        ExtensionDescriptorRegistry, ExtensionDirection, ExtensionDiscovery,
-        ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId,
-        ExtensionMethodDescriptor, ExtensionNegotiationResolver, ExtensionNotificationDescriptor,
-        ExtensionRegistryError, ExtensionRegistryReceipt, ExtensionRoutingHeaderDescriptor,
-        ExtensionSettings, ExtensionSettingsSchema, SERVER_DISCOVER_METHOD,
-        SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior, ServerBehaviorRegistry,
+        CacheScope, CacheTtl, CacheableResult, CompleteResult, CompleteResultPayload,
+        CoreResultDiscriminatorPolicy, DecodedResult, DiscoveryCacheHints, ExactJsonMember,
+        ExactJsonObject, ExactJsonValue, FINAL_PROTOCOL_VERSION as PROTOCOL_VERSION,
+        FinalHttpRequestMetadata, FinalProtocolVersion, FinalRequestAdmission,
+        HEADER_MISMATCH_ERROR_CODE, HeaderMismatchError, HeaderMismatchReason, InputRequiredResult,
+        MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
+        MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MetadataView,
+        MissingRequiredClientCapabilityError, PaginatedResult,
+        ProtocolVersionError as FinalProtocolVersionError, RawResultEnvelope,
+        RequestAdmissionError, RequestVersionMetadata, RequiredCapabilitiesError,
+        ResultDecodeError, ResultDecodeErrorKind, ResultDiscriminatorDecision,
+        ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic, ResultPeerEra,
+        SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
+        SUPPORTED_FINAL_PROTOCOL_VERSIONS, ServerBehavior, ServerBehaviorRegistry,
         ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
-        ServerDiscoveryError, ServerExtensionDiscovery, ServerInstructionError, ServerInstructions,
-        StdioCorrelationDescriptor,
+        ServerDiscoveryError, ServerInstructionError, ServerInstructions, TypedCompleteMembers,
+        UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnknownResultMembers,
+        UnsupportedProtocolVersionError, admit_final_http_request, admit_final_request,
+        decode_peer_result, decode_typed_complete, encode_result, parse_exact_json,
+        validate_final_protocol_version,
     };
     pub use fastmcp_server::{
-        AuthProvider, AuthRequest, HttpServerConfig, PromptHandler, ResourceHandler, Router,
-        Server, ServerBuilder, ToolHandler,
+        AuthProvider, AuthRequest, BidirectionalSenders, BoxFuture, HttpServerConfig,
+        InboundRequestContext, InboundRequestTransport, Middleware, MiddlewareDecision,
+        MountResult, ProgressNotificationSender, PromptHandler, ResourceHandler, Router, Server,
+        ServerBuilder, TagFilters, ToolHandler, create_context_with_progress,
+        create_context_with_progress_and_senders,
     };
     pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError, http, memory};
 
@@ -280,10 +397,11 @@ pub mod legacy_2024 {
     };
     pub use fastmcp_server::legacy_2024::{
         LEGACY_2024_MAX_ADAPTER_RESERVATIONS, Legacy2024AdapterError, Legacy2024Handler,
-        Legacy2024HandlerError, Legacy2024Lifecycle, Legacy2024Outbound, Legacy2024ServerAdapter,
-        Legacy2024ServerConfig, Legacy2024ServerInfo, Legacy2024StateSnapshot,
-        LegacyAuthenticatedPeerPartition, LegacyPeerBinding,
+        Legacy2024HandlerError, Legacy2024Lifecycle, Legacy2024LiveServerLifecycle,
+        Legacy2024Outbound, Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo,
+        Legacy2024StateSnapshot, LegacyAuthenticatedPeerPartition, LegacyPeerBinding,
         LegacyServerAdapterInstalledReceipt as ServerAdapterInstalledReceipt,
+        legacy_2024_a_digest_preimage, legacy_2024_b_digest_preimage,
     };
     pub use fastmcp_transport::sse::{
         LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink, LegacySseServerTransport,
@@ -310,15 +428,42 @@ pub mod prelude {
         BoundedListPage,
         Client,
         ClientBuilder,
+        ClientHttpNegotiation,
+        ClientHttpNegotiationDecision,
+        ClientHttpNegotiationError,
+        ClientHttpNegotiationState,
+        ClientProtocolPlan,
         ClientSession,
+        CompleteResult,
+        ConfigError,
+        ConfigLoader,
         // Protocol types
         Content,
+        ContentBlock,
+        DecodedResult,
+        ExtensionDescriptor,
+        ExtensionDescriptorRegistry,
+        FINAL_PROTOCOL_VERSION,
+        FinalAbsoluteUri,
+        FinalProtocolVersion,
+        HttpEndpointConfig,
+        HttpEndpointConfigError,
+        // Server
+        InboundRequestContext,
+        InboundRequestTransport,
         JsonSchema,
         ListPageLimits,
+        McpConfig,
         McpContext,
         McpError,
         McpOutcome,
         McpResult,
+        Middleware,
+        MiddlewareDecision,
+        ModernHttpExecutor,
+        ModernHttpExecutorError,
+        ModernHttpRequest,
+        NegotiatedExtensionSet,
         // Outcome types (4-valued result)
         Outcome,
         OutcomeExt,
@@ -328,10 +473,10 @@ pub mod prelude {
         ProtocolEra,
         ProtocolPolicy,
         ProtocolVersion,
-        // Server
         ProxyBackend,
         ProxyCatalog,
         ProxyClient,
+        RequestAdmissionError,
         RequestTimeoutPolicy,
         RequestTimeoutSource,
         Resource,
@@ -339,12 +484,19 @@ pub mod prelude {
         ResultExt,
         Role,
         Server,
+        ServerBehavior,
+        ServerBehaviorRegistry,
+        ServerConfig,
+        ServerDiscoverRequest,
+        ServerDiscoverResult,
         StaticTokenVerifier,
         TokenAuthProvider,
         TokenVerifier,
         Tool,
         cancelled,
         err,
+        legacy_2024,
+        modern,
         ok,
         // Macros
         prompt,
@@ -373,7 +525,8 @@ mod tests {
     #[test]
     fn prelude_reexports_client_timeout_configuration_surface() {
         use super::prelude::{
-            Client, ClientBuilder, ClientSession, RequestTimeoutPolicy, RequestTimeoutSource,
+            Client, ClientBuilder, ClientHttpNegotiation, ClientSession, CompleteResult, McpConfig,
+            ModernHttpRequest, RequestTimeoutPolicy, RequestTimeoutSource, modern,
         };
 
         let _: ClientBuilder = Client::builder();
@@ -385,6 +538,19 @@ mod tests {
         let source: RequestTimeoutSource = RequestTimeoutSource::Idle;
         assert!(matches!(source, RequestTimeoutSource::Idle));
         let _ = std::mem::size_of::<ClientSession>();
+        let _: Option<ClientHttpNegotiation> = None;
+        let _: Option<CompleteResult<()>> = None;
+        assert!(McpConfig::new().server_names().is_empty());
+        assert!(
+            ModernHttpRequest::new(
+                "https://mcp.example.test/mcp",
+                b"{}".to_vec(),
+                modern::PROTOCOL_VERSION,
+                modern::SERVER_DISCOVER_METHOD,
+                None,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -424,5 +590,84 @@ mod tests {
         let _: Option<legacy_2024::InitializeParams> = None;
         let _: Option<legacy_2024::Legacy2024Lifecycle> = None;
         let _: Option<legacy_2024::LegacySseMessagePost> = None;
+    }
+
+    #[test]
+    fn api_02_facade_exposes_shipped_final_product_surface() {
+        use super::{legacy_2024, modern};
+
+        let uri = modern::AbsoluteUri::parse("https://mcp.example.test/final")
+            .expect("facade must expose final common URI admission");
+        assert_eq!(uri.as_str(), "https://mcp.example.test/final");
+
+        let request = modern::ModernHttpRequest::new(
+            "https://mcp.example.test/mcp",
+            br#"{}"#.to_vec(),
+            modern::PROTOCOL_VERSION,
+            modern::SERVER_DISCOVER_METHOD,
+            None,
+        )
+        .expect("facade must expose modern HTTP request construction");
+        assert!(request.headers().iter().any(
+            |(name, value)| name == "MCP-Protocol-Version" && value == modern::PROTOCOL_VERSION
+        ));
+        let _executor = modern::ModernHttpExecutor::new();
+
+        let mut config = modern::McpConfig::new();
+        config.add_server("final", modern::ServerConfig::new("final-mcp"));
+        assert_eq!(config.server_names(), vec!["final"]);
+
+        let behaviors =
+            modern::ServerBehaviorRegistry::from_behaviors([modern::ServerBehavior::ToolsList]);
+        assert!(behaviors.contains(modern::ServerBehavior::ToolsList));
+        assert!(
+            modern::ExtensionDescriptorRegistry::new()
+                .receipt()
+                .is_none()
+        );
+        assert!(matches!(
+            modern::parse_exact_json(r#"{"complete":true}"#),
+            Ok(modern::ExactJsonValue::Object(_))
+        ));
+
+        let _: Option<modern::CompleteResult<()>> = None;
+        let _: Option<modern::ContentBlock> = None;
+        let _: Option<modern::ClientHttpNegotiation> = None;
+        let _: Option<modern::HttpEndpointConfig> = None;
+        let _: Option<modern::InboundRequestContext> = None;
+        let _: Option<legacy_2024::Legacy2024LiveServerLifecycle<(), ()>> = None;
+    }
+
+    #[test]
+    fn api_02_rejects_one_field_legacy_version_in_final_request() {
+        use super::{legacy_2024, modern};
+
+        let final_request = modern::FinalHttpRequestMetadata {
+            version: modern::RequestVersionMetadata {
+                header_version: Some(modern::PROTOCOL_VERSION),
+                body_version: Some(modern::PROTOCOL_VERSION),
+            },
+            header_method: Some(modern::SERVER_DISCOVER_METHOD),
+            body_method: Some(modern::SERVER_DISCOVER_METHOD),
+            header_name: None,
+            body_name: None,
+        };
+        assert!(modern::admit_final_http_request(final_request).is_ok());
+
+        let legacy_version_in_final_request = modern::FinalHttpRequestMetadata {
+            version: modern::RequestVersionMetadata {
+                body_version: Some(legacy_2024::PROTOCOL_VERSION),
+                ..final_request.version
+            },
+            ..final_request
+        };
+        let error = modern::admit_final_http_request(legacy_version_in_final_request)
+            .expect_err("changing only the body version to legacy must be rejected");
+
+        assert!(matches!(
+            error,
+            modern::RequestAdmissionError::HeaderMismatch(header)
+                if header.reason() == modern::HeaderMismatchReason::HeaderBodyVersionMismatch
+        ));
     }
 }
