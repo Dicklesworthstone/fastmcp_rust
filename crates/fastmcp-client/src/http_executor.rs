@@ -73,13 +73,31 @@ const MAX_LEGACY_SSE_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS: usize = 16;
 
 /// A single modern MCP JSON-RPC POST.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ModernHttpRequest {
     target: String,
     body: Vec<u8>,
     protocol_version: String,
     method: String,
     name: Option<String>,
+    authorization: Option<String>,
+}
+
+impl fmt::Debug for ModernHttpRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModernHttpRequest")
+            .field("target", &self.target)
+            .field("protocol_version", &self.protocol_version)
+            .field("method", &self.method)
+            .field("name", &self.name)
+            .field("body_bytes", &self.body.len())
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl ModernHttpRequest {
@@ -110,7 +128,22 @@ impl ModernHttpRequest {
             protocol_version,
             method,
             name,
+            authorization: None,
         })
+    }
+
+    /// Attaches the bound bearer credential's `Authorization` header when —
+    /// and only when — `target` is canonically identical to the credential's
+    /// bound HTTPS resource. Any other target leaves the request
+    /// credential-free rather than downgrading or redirecting the token.
+    #[must_use]
+    pub fn with_authorization(
+        mut self,
+        credential: &crate::http_auth::BoundBearerCredential,
+        target: &fastmcp_core::CanonicalHttpUrl,
+    ) -> Self {
+        self.authorization = credential.authorization_for_target(target);
+        self
     }
 
     /// Returns the configured absolute target supplied by the caller.
@@ -150,6 +183,9 @@ impl ModernHttpRequest {
         ];
         if let Some(name) = &self.name {
             headers.push(("Mcp-Name".to_owned(), name.clone()));
+        }
+        if let Some(authorization) = &self.authorization {
+            headers.push(("Authorization".to_owned(), authorization.clone()));
         }
         headers
     }
