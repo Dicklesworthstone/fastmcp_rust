@@ -27,7 +27,7 @@ use fastmcp_rust::{
     CompleteResult, Content, ContentBlock, Cx, GetPromptResult, Implementation, JsonSchema,
     LabConfig, LabRuntime, McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler,
     PromptMessage, ReadResourceResult, ResourceContent, ResourceHandler, ResultMeta, Role,
-    ServerInfo, ToolHandler, prompt, resource, tool,
+    ToolHandler, prompt, resource, tool,
 };
 use serde_json::json;
 use std::collections::HashMap;
