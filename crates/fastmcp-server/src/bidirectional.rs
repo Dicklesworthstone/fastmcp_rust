@@ -646,6 +646,7 @@ impl SamplingSender for TransportSamplingSender {
                     })
                 },
                 include_context: None,
+                metadata: None,
                 meta: None,
             };
 
@@ -3141,7 +3142,15 @@ mod tests {
 
     #[test]
     fn transport_sampling_sender_create_message_text() {
-        let sender = make_sender_with_responder(|_| {
+        let sender = make_sender_with_responder(|request| {
+            let params = request
+                .params
+                .as_ref()
+                .expect("sampling request must retain parameters");
+            assert!(
+                params.get("metadata").is_none(),
+                "the transport must omit unspecified provider metadata"
+            );
             serde_json::json!({
                 "content": {"type": "text", "text": "Hello world"},
                 "role": "assistant",
