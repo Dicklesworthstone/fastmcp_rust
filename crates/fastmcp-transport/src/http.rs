@@ -1929,6 +1929,16 @@ impl StreamableHttpResponseStream {
         &self,
         request_id: RequestId,
     ) -> Result<StreamableHttpRequestResponseStream, TransportError> {
+        // Registering a request body is itself a response-side admission. It
+        // must share the close barrier with response commits: otherwise a
+        // listener shutdown could leave a newly registered body waiting on a
+        // stream that can no longer produce its terminal response.
+        let _admission =
+            begin_streamable_admission(&self.admissions_open, &self.active_admissions)?;
+        if !self.owner_open.load(Ordering::Acquire) {
+            return Err(TransportError::Closed);
+        }
+
         let state = Arc::new(StreamableHttpRequestCancellationState {
             request_id: request_id.clone(),
             cancelled: AtomicBool::new(false),
@@ -4799,6 +4809,46 @@ X-Checksum: abc123\r\n\
             "a cancelled request must leave queued-response accounting unchanged"
         );
         assert!(!response_stream.is_closed());
+    }
+
+    #[test]
+    fn streamable_http_response_body_admission_closes_with_the_shared_stream() {
+        let mut transport = StreamableHttpTransport::new();
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+
+        let live_body = response_stream
+            .for_request(RequestId::Number(804))
+            .expect("an open response stream admits a request-owned body");
+        assert_eq!(
+            response_stream
+                .live_request_bodies()
+                .expect("live body registry is observable"),
+            1
+        );
+        drop(live_body);
+        assert_eq!(
+            response_stream
+                .live_request_bodies()
+                .expect("dropped body releases the registry entry"),
+            0
+        );
+
+        response_stream.close();
+
+        // Planted forbidden dimension: only the shared response stream has
+        // closed. Registration must fail before it allocates a request body.
+        assert!(matches!(
+            response_stream.for_request(RequestId::Number(805)),
+            Err(TransportError::Closed)
+        ));
+        assert_eq!(
+            response_stream
+                .live_request_bodies()
+                .expect("closed admission leaves the registry unchanged"),
+            0
+        );
     }
 
     #[test]

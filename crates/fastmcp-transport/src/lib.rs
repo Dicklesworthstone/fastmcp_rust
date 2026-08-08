@@ -51,6 +51,17 @@ pub mod websocket;
 pub use async_io::{AsyncLineReader, AsyncStdin, AsyncStdout};
 
 pub use codec::{Codec, CodecError, InvalidMessageKind};
+/// Public modern per-request HTTP admission and response-stream primitives.
+///
+/// These types admit one strict HTTP request and, where negotiated, bind one
+/// finite request-scoped SSE response body. They do not start an HTTP listener
+/// or qualify turnkey HTTP serving.
+pub use http::{
+    HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
+    HttpResponseRepresentation, HttpStatus, ModernHttpRequestAdmission,
+    StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
+    StreamableHttpResponseStream, StreamableHttpTransport,
+};
 pub use stdio::{AsyncStdioTransport, StdioTransport};
 
 use asupersync::Cx;
@@ -374,7 +385,11 @@ pub trait TwoPhaseTransport: Transport {
 
 #[cfg(test)]
 mod tests {
-    use super::{Codec, CodecError, SendPermit, Transport, TransportError, TwoPhaseTransport};
+    use super::{
+        Codec, CodecError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
+        HttpResponseRepresentation, SendPermit, StreamableHttpTransport, Transport,
+        TransportError, TwoPhaseTransport,
+    };
     use asupersync::Cx;
     use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
     use std::error::Error;
@@ -759,6 +774,115 @@ mod tests {
         );
         assert!(!TransportError::Io(std::io::Error::other("err")).is_closed());
         assert!(!TransportError::Codec(CodecError::MessageTooLarge(1)).is_closed());
+    }
+
+    fn root_modern_sse_request() -> HttpRequest {
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "weather",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                }
+            })),
+            1_001_i64,
+        );
+        HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("accept", "text/event-stream")
+            .with_header("MCP-Protocol-Version", "2026-07-28")
+            .with_header("Mcp-Method", "tools/call")
+            .with_header("Mcp-Name", "weather")
+            .with_body(serde_json::to_vec(&request).expect("serialize modern request"))
+    }
+
+    #[test]
+    fn modern_http_root_api_admits_and_finishes_one_sse_response() {
+        let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
+            base_path: "/mcp".to_owned(),
+            ..HttpHandlerConfig::default()
+        });
+        let admission = handler
+            .admit_modern_request(&root_modern_sse_request())
+            .expect("the root public HTTP API admits a matching modern request");
+        assert_eq!(
+            admission.response_representation(),
+            HttpResponseRepresentation::Sse
+        );
+
+        let mut transport =
+            StreamableHttpTransport::with_capacity(1).expect("one response slot is valid");
+        let responses = transport
+            .response_stream()
+            .expect("the root public response stream is available");
+        let body = admission
+            .bind_sse_response_body(&responses)
+            .expect("the admitted request binds one root public SSE body");
+        let cancellation = body.cancellation();
+        let cx = Cx::for_testing();
+
+        transport
+            .send_response_for_request(
+                &cx,
+                &cancellation,
+                JsonRpcResponse::success(
+                    RequestId::Number(1_001),
+                    serde_json::json!({"forecast": "clear"}),
+                ),
+            )
+            .expect("the request-bound terminal response commits once");
+        assert_eq!(
+            body.recv_response(&cx)
+                .expect("the SSE body receives its terminal response")
+                .id,
+            Some(RequestId::Number(1_001))
+        );
+        assert!(body.is_finished());
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn modern_http_root_api_rejects_sse_binding_when_only_json_is_selected() {
+        let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
+            base_path: "/mcp".to_owned(),
+            ..HttpHandlerConfig::default()
+        });
+        let mut request = root_modern_sse_request();
+        // Planted forbidden dimension: only response negotiation changes.
+        request
+            .headers
+            .insert("accept".to_owned(), "application/json".to_owned());
+        let admission = handler
+            .admit_modern_request(&request)
+            .expect("JSON remains an admissible response representation");
+        assert_eq!(
+            admission.response_representation(),
+            HttpResponseRepresentation::Json
+        );
+
+        let mut transport = StreamableHttpTransport::new();
+        let responses = transport
+            .response_stream()
+            .expect("the root public response stream is available");
+        let bodies_before = responses
+            .live_request_bodies()
+            .expect("the root public body registry is observable");
+
+        assert!(matches!(
+            admission.bind_sse_response_body(&responses),
+            Err(TransportError::Io(ref error)) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(
+            responses
+                .live_request_bodies()
+                .expect("rejected SSE binding leaves no response body"),
+            bodies_before
+        );
+        assert!(
+            handler.admit_modern_request(&request).is_ok(),
+            "the planted negative changes only the response representation"
+        );
     }
 
     #[test]
