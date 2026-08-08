@@ -16,8 +16,10 @@
 //!
 //! For a live context with a safe complete partition (or a standalone context
 //! with neither session nor auth), the default method policy permits caching:
+//! - `server/discover` - 5 minute TTL
 //! - `tools/list` - 5 minute TTL
 //! - `resources/list` - 5 minute TTL
+//! - `resources/templates/list` - 5 minute TTL
 //! - `prompts/list` - 5 minute TTL
 //! - `resources/read` - 1 hour TTL
 //! - `prompts/get` - 1 hour TTL
@@ -86,6 +88,7 @@ const CACHE_ENTRY_METADATA_BYTES: usize = 512;
 
 /// Domain separators for cache request and authorization/session partitions.
 const CACHE_REQUEST_KEY_DOMAIN: &[u8] = b"fastmcp-response-cache-request-v2\0";
+const CACHE_INVALIDATION_KEY_DOMAIN: &[u8] = b"fastmcp-response-cache-invalidation-v1\0";
 const CACHE_PARTITION_KEY_DOMAIN: &[u8] = b"fastmcp-response-cache-partition-v2\0";
 const CACHE_STATELESS_PARTITION_DOMAIN: &[u8] = b"fastmcp-response-cache-stateless-partition-v1\0";
 
@@ -145,6 +148,7 @@ impl CacheEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     request_digest: Sha256Digest,
+    invalidation_digest: Sha256Digest,
     partition_digest: Sha256Digest,
 }
 
@@ -153,11 +157,40 @@ impl CacheKey {
         method: &str,
         params: Option<&serde_json::Value>,
     ) -> Option<Sha256Digest> {
+        Self::try_digest(CACHE_REQUEST_KEY_DOMAIN, method, params)
+    }
+
+    /// Derives the identity used to invalidate an entire paginated result set.
+    ///
+    /// The request key still includes the opaque cursor exactly, so distinct
+    /// pages cannot collide at lookup. Invalidation intentionally removes the
+    /// cursor from the semantic result-set identity so a catalog or resource
+    /// mutation cannot leave another page observable from the old generation.
+    fn try_invalidation_digest(
+        method: &str,
+        params: Option<&serde_json::Value>,
+    ) -> Option<Sha256Digest> {
+        let mut projection = params.cloned();
+        if let Some(serde_json::Value::Object(object)) = projection.as_mut() {
+            object.remove("cursor");
+        }
+        Self::try_digest(
+            CACHE_INVALIDATION_KEY_DOMAIN,
+            method,
+            projection.as_ref(),
+        )
+    }
+
+    fn try_digest(
+        domain: &[u8],
+        method: &str,
+        params: Option<&serde_json::Value>,
+    ) -> Option<Sha256Digest> {
         if params.is_some_and(|params| !cache_json_shape_is_bounded(params)) {
             return None;
         }
         let mut canonical = BoundedCacheBytes::new(MAX_CACHE_KEY_INPUT_BYTES);
-        canonical.write_all(CACHE_REQUEST_KEY_DOMAIN).ok()?;
+        canonical.write_all(domain).ok()?;
         let method_len = u64::try_from(method.len()).ok()?;
         canonical.write_all(&method_len.to_be_bytes()).ok()?;
         canonical.write_all(method.as_bytes()).ok()?;
@@ -178,6 +211,7 @@ impl CacheKey {
     ) -> Option<Self> {
         Some(Self {
             request_digest: Self::try_request_digest(method, params)?,
+            invalidation_digest: Self::try_invalidation_digest(method, params)?,
             partition_digest,
         })
     }
@@ -402,6 +436,62 @@ fn context_cache_commit_is_admissible(ctx: &McpContext) -> bool {
     session_partition_is_current && ctx.ensure_live().is_ok()
 }
 
+/// Returns whether request parameters carry state from a multi-round-trip
+/// continuation. Such requests are never deterministic cache lookups, even
+/// when their eventual result happens to be complete.
+fn request_carries_uncacheable_continuation(params: Option<&serde_json::Value>) -> bool {
+    let Some(serde_json::Value::Object(params)) = params else {
+        return false;
+    };
+    params.contains_key("inputResponses") || params.contains_key("requestState")
+}
+
+/// Returns whether a response can be stored by the internal memoization cache.
+///
+/// Modern responses must explicitly be `complete`; input-required and task
+/// branches never enter this cache. The absent discriminator remains accepted
+/// for the current exact-2024 compatibility surface, which did not carry
+/// `resultType`. Continuation-bearing payloads are rejected in either era.
+fn response_is_cacheable_complete(response: &serde_json::Value) -> bool {
+    let Some(response) = response.as_object() else {
+        return false;
+    };
+    if [
+        "inputResponses",
+        "requestState",
+        "task",
+        "taskId",
+        "taskStatus",
+        "requestScopedNotifications",
+        "notifications",
+    ]
+    .iter()
+    .any(|field| response.contains_key(*field))
+    {
+        return false;
+    }
+    match response.get("resultType") {
+        None => true,
+        Some(serde_json::Value::String(kind)) => kind == "complete",
+        Some(_) => false,
+    }
+}
+
+/// Returns whether a method requires `ttlMs` and `cacheScope` in a modern
+/// complete result. This list is protocol-facing and deliberately independent
+/// from the internal memoization allowlist.
+fn method_requires_protocol_cache_hints(method: &str) -> bool {
+    matches!(
+        method,
+        "server/discover"
+            | "tools/list"
+            | "prompts/list"
+            | "resources/list"
+            | "resources/read"
+            | "resources/templates/list"
+    )
+}
+
 /// Configuration for caching specific methods.
 #[derive(Debug, Clone)]
 pub struct MethodCacheConfig {
@@ -593,10 +683,10 @@ impl LruCache {
         }
     }
 
-    fn remove_request_digest(&mut self, request_digest: Sha256Digest) {
+    fn remove_invalidation_digest(&mut self, invalidation_digest: Sha256Digest) {
         let mut retained_size = self.current_size_bytes;
         self.entries.retain(|key, entry| {
-            if key.request_digest == request_digest {
+            if key.invalidation_digest == invalidation_digest {
                 retained_size = retained_size.saturating_sub(entry.size_bytes);
                 false
             } else {
@@ -604,7 +694,7 @@ impl LruCache {
             }
         });
         self.order
-            .retain(|key| key.request_digest != request_digest);
+            .retain(|key| key.invalidation_digest != invalidation_digest);
         self.current_size_bytes = retained_size;
     }
 
@@ -933,23 +1023,24 @@ impl ResponseCachingMiddleware {
         cache.clear();
     }
 
-    /// Invalidates every session/auth partition for a method and params pair.
+    /// Invalidates every session/auth partition and every cursor page for a
+    /// method and semantic-parameter set.
     pub fn invalidate(&self, method: &str, params: Option<&serde_json::Value>) {
-        let Some(request_digest) = CacheKey::try_request_digest(method, params) else {
+        let Some(invalidation_digest) = CacheKey::try_invalidation_digest(method, params) else {
             return;
         };
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.remove_request_digest(request_digest);
+        cache.remove_invalidation_digest(invalidation_digest);
     }
 
     /// Checks if a method should be cached.
     fn should_cache_method(&self, method: &str, params: Option<&serde_json::Value>) -> bool {
         match method {
-            "tools/list" => self.tools_list_config.enabled,
-            "resources/list" => self.resources_list_config.enabled,
+            "server/discover" | "tools/list" => self.tools_list_config.enabled,
+            "resources/list" | "resources/templates/list" => self.resources_list_config.enabled,
             "prompts/list" => self.prompts_list_config.enabled,
             "resources/read" => self.resources_read_config.enabled,
             "prompts/get" => self.prompts_get_config.enabled,
@@ -972,14 +1063,51 @@ impl ResponseCachingMiddleware {
     /// Gets the TTL for a specific method.
     fn get_ttl(&self, method: &str) -> Duration {
         match method {
-            "tools/list" => Duration::from_secs(self.tools_list_config.ttl_secs),
-            "resources/list" => Duration::from_secs(self.resources_list_config.ttl_secs),
+            "server/discover" | "tools/list" => {
+                Duration::from_secs(self.tools_list_config.ttl_secs)
+            }
+            "resources/list" | "resources/templates/list" => {
+                Duration::from_secs(self.resources_list_config.ttl_secs)
+            }
             "prompts/list" => Duration::from_secs(self.prompts_list_config.ttl_secs),
             "tools/call" => Duration::from_secs(self.tools_call_config.base.ttl_secs),
             "resources/read" => Duration::from_secs(self.resources_read_config.ttl_secs),
             "prompts/get" => Duration::from_secs(self.prompts_get_config.ttl_secs),
             _ => self.call_ttl,
         }
+    }
+
+    fn protocol_cache_ttl_ms(&self, method: &str) -> u64 {
+        u64::try_from(self.get_ttl(method).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Normalizes modern protocol cache hints at the server boundary.
+    ///
+    /// A handler can reduce the configured TTL, including to immediate
+    /// staleness (`0`), but it cannot increase it. This middleware holds no
+    /// sealed public-cache proof, so every locally emitted hint is private;
+    /// an untrusted `cacheScope: "public"` value is never cache authority.
+    fn apply_protocol_cache_hints(&self, method: &str, response: &mut serde_json::Value) {
+        if !method_requires_protocol_cache_hints(method) {
+            return;
+        }
+        let Some(response) = response.as_object_mut() else {
+            return;
+        };
+        if response.get("resultType").and_then(serde_json::Value::as_str) != Some("complete") {
+            return;
+        }
+
+        let configured_ttl = self.protocol_cache_ttl_ms(method);
+        let ttl_ms = response
+            .get("ttlMs")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(configured_ttl, |requested| requested.min(configured_ttl));
+        response.insert("ttlMs".to_owned(), serde_json::Value::from(ttl_ms));
+        response.insert(
+            "cacheScope".to_owned(),
+            serde_json::Value::String("private".to_owned()),
+        );
     }
 
     fn record_hit(&self) {
@@ -1010,6 +1138,9 @@ impl Middleware for ResponseCachingMiddleware {
         }
         // Check if this method should be cached
         if !self.should_cache_method(&request.method, request.params.as_ref()) {
+            return Ok(MiddlewareDecision::Continue);
+        }
+        if request_carries_uncacheable_continuation(request.params.as_ref()) {
             return Ok(MiddlewareDecision::Continue);
         }
 
@@ -1067,13 +1198,19 @@ impl Middleware for ResponseCachingMiddleware {
         &self,
         ctx: &McpContext,
         request: &JsonRpcRequest,
-        response: serde_json::Value,
+        mut response: serde_json::Value,
     ) -> McpResult<serde_json::Value> {
         if self.instance_id == 0 {
             return Ok(response);
         }
+        self.apply_protocol_cache_hints(&request.method, &mut response);
         // Only cache if this method is cacheable
         if !self.should_cache_method(&request.method, request.params.as_ref()) {
+            return Ok(response);
+        }
+        if request_carries_uncacheable_continuation(request.params.as_ref())
+            || !response_is_cacheable_complete(&response)
+        {
             return Ok(response);
         }
         if ctx.response_was_cache_hit(self.instance_id) {
