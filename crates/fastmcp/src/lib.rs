@@ -150,7 +150,7 @@ pub use fastmcp_protocol::{
     GetPromptResult, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
     ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
     ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel, Prompt,
-    PromptArgument, PromptMessage, ReadResourceParams, ReadResourceResult, Resource,
+    PromptArgument, PromptMessage, ReadResourceParams, ReadResourceResult, RequestId, Resource,
     ResourceContent, ResourceTemplate, ResourcesCapability, Role, ServerCapabilities, ServerInfo,
     SubscribeResourceParams, Tool, ToolAnnotations, ToolsCapability, UnsubscribeResourceParams,
 };
@@ -166,14 +166,22 @@ pub use fastmcp_protocol::common_types::{
     UntrustedCancellationReason,
 };
 
-// Final result vocabulary and bounded exact-JSON helpers.
+// Final typed core dispatch, result vocabulary, and bounded exact-JSON helpers.
 pub use fastmcp_protocol::{
     CacheScope, CacheTtl, CacheableResult, CompleteResult, CompleteResultPayload,
-    CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonMember, ExactJsonObject, ExactJsonValue,
-    InputRequiredResult, MetadataView, PaginatedResult, RawResultEnvelope, ResultDecodeError,
-    ResultDecodeErrorKind, ResultDiscriminatorDecision, ResultDiscriminatorPolicy, ResultMeta,
-    ResultPeerDiagnostic, ResultPeerEra, TypedCompleteMembers, UnknownResultMembers,
-    decode_peer_result, decode_typed_complete, encode_result, parse_exact_json,
+    CoreDispatchError, CoreRequest, CoreResult, CoreResultDiscriminatorPolicy, DecodedResult,
+    ExactJsonMember, ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY,
+    FinalCallToolParams, FinalCallToolResult, FinalCoreRequest, FinalCoreResult, FinalEmptyParams,
+    FinalEmptyResult, FinalGetPromptParams, FinalGetPromptResult, FinalListParams,
+    FinalListPromptsResult, FinalListResourceTemplatesResult, FinalListResourcesResult,
+    FinalListToolsResult, FinalPromptMessage, FinalReadResourceParams, FinalReadResourceResult,
+    FinalRequestMeta, FinalSetLogLevelParams, InputRequiredResult, LegacyCoreRequest,
+    LegacyCoreResult, LegacyEmptyResult, MetadataView, PaginatedResult, RawResultEnvelope,
+    ResultDecodeError, ResultDecodeErrorKind, ResultDiscriminatorDecision,
+    ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic, ResultPeerEra,
+    TypedCompleteMembers, UnknownResultMembers, decode_peer_result, decode_typed_complete,
+    encode_result, parse_exact_json,
 };
 
 pub use fastmcp_protocol::extensions;
@@ -246,6 +254,15 @@ pub use fastmcp_server::{
 
 // Re-export bidirectional module for namespaced access (e.g. bidirectional::RequestSender)
 pub use fastmcp_server::bidirectional;
+pub use fastmcp_server::bidirectional::{
+    DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND, DEFAULT_MAX_MRTR_INPUT_REQUESTS_TOTAL,
+    DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES, DEFAULT_MAX_MRTR_REQUEST_STATES, DEFAULT_MAX_MRTR_ROUNDS,
+    DEFAULT_MRTR_REQUEST_STATE_TTL, HARD_MAX_MRTR_INPUT_REQUESTS_PER_ROUND,
+    HARD_MAX_MRTR_INPUT_REQUESTS_TOTAL, HARD_MAX_MRTR_REQUEST_STATE_BYTES,
+    HARD_MAX_MRTR_REQUEST_STATE_TTL, HARD_MAX_MRTR_REQUEST_STATES, HARD_MAX_MRTR_ROUNDS,
+    MrtrCompletedInputs, MrtrExchangeRegistry, MrtrInputKind, MrtrInputRequest, MrtrInputRequests,
+    MrtrInputRequired, MrtrInputResponse, MrtrInputResponses, MrtrRequestState, MrtrRetry,
+};
 
 // Re-export server middleware modules (no Docket/Redis in FND-01 surface).
 pub use fastmcp_server::providers;
@@ -261,9 +278,11 @@ pub use fastmcp_client::{
 
 // Public client HTTP execution and configuration surfaces.
 pub use fastmcp_client::http_executor::{
-    MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, ModernHttpExecutor,
-    ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseMetadata,
-    ModernHttpResponseStream, validate_response_head,
+    LegacySseHttpClient, LegacySseHttpClientError, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
+    MODERN_MCP_CONTENT_TYPE, ModernHttpClient, ModernHttpClientError, ModernHttpConnectOutcome,
+    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
+    ModernHttpResponseMetadata, ModernHttpResponseStream, ModernHttpSseResponseStream,
+    validate_response_head,
 };
 pub use fastmcp_client::mcp_config::{
     ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
@@ -301,9 +320,11 @@ pub mod auto {
 /// conformance.
 pub mod modern {
     pub use fastmcp_client::http_executor::{
-        MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, ModernHttpExecutor,
+        MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, ModernHttpClient,
+        ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpExecutor,
         ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
-        ModernHttpResponseMetadata, ModernHttpResponseStream, validate_response_head,
+        ModernHttpResponseMetadata, ModernHttpResponseStream, ModernHttpSseResponseStream,
+        validate_response_head,
     };
     pub use fastmcp_client::mcp_config::{
         ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
@@ -343,16 +364,23 @@ pub mod modern {
         StdioEraClassifier, StdioEraDecision, StdioEraRejection, StdioEraState, StdioOpeningFrame,
     };
     pub use fastmcp_protocol::{
-        CacheScope, CacheTtl, CacheableResult, CompleteResult, CompleteResultPayload,
+        CacheScope, CacheTtl, CacheableResult, ClientCapabilities, ClientInfo, CompleteResult,
+        CompleteResultPayload, CoreDispatchError, CoreRequest, CoreResult,
         CoreResultDiscriminatorPolicy, DecodedResult, DiscoveryCacheHints, ExactJsonMember,
-        ExactJsonObject, ExactJsonValue, FINAL_PROTOCOL_VERSION as PROTOCOL_VERSION,
-        FinalHttpRequestMetadata, FinalProtocolVersion, FinalRequestAdmission,
+        ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
+        FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION as PROTOCOL_VERSION,
+        FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY, FinalCallToolParams,
+        FinalCallToolResult, FinalCoreRequest, FinalCoreResult, FinalEmptyParams, FinalEmptyResult,
+        FinalGetPromptParams, FinalGetPromptResult, FinalHttpRequestMetadata, FinalListParams,
+        FinalListPromptsResult, FinalListResourceTemplatesResult, FinalListResourcesResult,
+        FinalListToolsResult, FinalPromptMessage, FinalProtocolVersion, FinalReadResourceParams,
+        FinalReadResourceResult, FinalRequestAdmission, FinalRequestMeta, FinalSetLogLevelParams,
         HEADER_MISMATCH_ERROR_CODE, HeaderMismatchError, HeaderMismatchReason, InputRequiredResult,
         MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
         MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MetadataView,
         MissingRequiredClientCapabilityError, PaginatedResult,
         ProtocolVersionError as FinalProtocolVersionError, RawResultEnvelope,
-        RequestAdmissionError, RequestVersionMetadata, RequiredCapabilitiesError,
+        RequestAdmissionError, RequestId, RequestVersionMetadata, RequiredCapabilitiesError,
         ResultDecodeError, ResultDecodeErrorKind, ResultDiscriminatorDecision,
         ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic, ResultPeerEra,
         SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
@@ -363,6 +391,16 @@ pub mod modern {
         UnsupportedProtocolVersionError, admit_final_http_request, admit_final_request,
         decode_peer_result, decode_typed_complete, encode_result, parse_exact_json,
         validate_final_protocol_version,
+    };
+    pub use fastmcp_server::bidirectional::{
+        DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND, DEFAULT_MAX_MRTR_INPUT_REQUESTS_TOTAL,
+        DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES, DEFAULT_MAX_MRTR_REQUEST_STATES,
+        DEFAULT_MAX_MRTR_ROUNDS, DEFAULT_MRTR_REQUEST_STATE_TTL,
+        HARD_MAX_MRTR_INPUT_REQUESTS_PER_ROUND, HARD_MAX_MRTR_INPUT_REQUESTS_TOTAL,
+        HARD_MAX_MRTR_REQUEST_STATE_BYTES, HARD_MAX_MRTR_REQUEST_STATE_TTL,
+        HARD_MAX_MRTR_REQUEST_STATES, HARD_MAX_MRTR_ROUNDS, MrtrCompletedInputs,
+        MrtrExchangeRegistry, MrtrInputKind, MrtrInputRequest, MrtrInputRequests,
+        MrtrInputRequired, MrtrInputResponse, MrtrInputResponses, MrtrRequestState, MrtrRetry,
     };
     pub use fastmcp_server::{
         AuthProvider, AuthRequest, BidirectionalSenders, BoxFuture, HttpServerConfig,
@@ -387,13 +425,19 @@ pub mod modern {
 /// the responsibility of the immutable policy and the transport-specific
 /// negotiation layer.
 pub mod legacy_2024 {
+    pub use fastmcp_client::http_executor::{LegacySseHttpClient, LegacySseHttpClientError};
     pub use fastmcp_protocol::methods;
     pub use fastmcp_protocol::protocol_policy::{
         LEGACY_PROTOCOL_VERSION, LegacyClientAdapterInstalledReceipt,
         LegacyServerAdapterInstalledReceipt, ProtocolEra, ProtocolPolicy, ProtocolVersion,
     };
     pub use fastmcp_protocol::{
-        CancelledParams, InitializeParams, InitializeResult, PROTOCOL_VERSION,
+        CallToolParams, CallToolResult, CancelledParams, GetPromptParams, GetPromptResult,
+        InitializeParams, InitializeResult, LegacyCoreRequest, LegacyCoreResult, LegacyEmptyResult,
+        ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
+        ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
+        ListToolsResult, PROTOCOL_VERSION, ReadResourceParams, ReadResourceResult,
+        SetLogLevelParams,
     };
     pub use fastmcp_server::legacy_2024::{
         LEGACY_2024_MAX_ADAPTER_RESERVATIONS, Legacy2024AdapterError, Legacy2024Handler,
@@ -526,7 +570,7 @@ mod tests {
     fn prelude_reexports_client_timeout_configuration_surface() {
         use super::prelude::{
             Client, ClientBuilder, ClientHttpNegotiation, ClientSession, CompleteResult, McpConfig,
-            ModernHttpRequest, RequestTimeoutPolicy, RequestTimeoutSource, modern,
+            ModernHttpRequest, RequestTimeoutPolicy, RequestTimeoutSource, legacy_2024, modern,
         };
 
         let _: ClientBuilder = Client::builder();
@@ -551,6 +595,17 @@ mod tests {
             )
             .is_ok()
         );
+
+        let _: Option<modern::FinalCallToolParams> = None;
+        let _: Option<modern::FinalCallToolResult> = None;
+        let _: Option<modern::ClientInfo> = None;
+        let _: Option<modern::RequestId> = None;
+        let _: Option<modern::CoreRequest> = None;
+        let _: Option<modern::CoreResult> = None;
+        let _: Option<modern::ModernHttpClient> = None;
+        let _: Option<modern::MrtrExchangeRegistry> = None;
+        let _: Option<legacy_2024::CallToolParams> = None;
+        let _: Option<legacy_2024::LegacySseHttpClient> = None;
     }
 
     #[test]
@@ -588,7 +643,9 @@ mod tests {
         assert_eq!(binding.generation(), 7);
         assert_eq!(legacy_2024::PROTOCOL_VERSION, "2024-11-05");
         let _: Option<legacy_2024::InitializeParams> = None;
+        let _: Option<legacy_2024::CallToolParams> = None;
         let _: Option<legacy_2024::Legacy2024Lifecycle> = None;
+        let _: Option<legacy_2024::LegacySseHttpClient> = None;
         let _: Option<legacy_2024::LegacySseMessagePost> = None;
     }
 
@@ -635,7 +692,55 @@ mod tests {
         let _: Option<modern::ClientHttpNegotiation> = None;
         let _: Option<modern::HttpEndpointConfig> = None;
         let _: Option<modern::InboundRequestContext> = None;
+        let final_meta = modern::FinalRequestMeta::new(modern::ClientCapabilities::default());
+        assert_eq!(final_meta.protocol_version, modern::PROTOCOL_VERSION);
+        let _: Option<modern::ClientInfo> = None;
+        let _: Option<modern::RequestId> = None;
+        let _: &str = modern::FINAL_PROTOCOL_VERSION_META_KEY;
+        let _: &str = modern::FINAL_CLIENT_CAPABILITIES_META_KEY;
+        let _: &str = modern::FINAL_CLIENT_INFO_META_KEY;
+        let _: &str = modern::FINAL_SERVER_INFO_META_KEY;
+        let _: Option<modern::FinalListParams> = None;
+        let _: Option<modern::FinalCallToolParams> = None;
+        let _: Option<modern::FinalReadResourceParams> = None;
+        let _: Option<modern::FinalGetPromptParams> = None;
+        let _: Option<modern::FinalSetLogLevelParams> = None;
+        let _: Option<modern::FinalEmptyParams> = None;
+        let _: Option<modern::FinalListToolsResult> = None;
+        let _: Option<modern::FinalCallToolResult> = None;
+        let _: Option<modern::FinalListResourcesResult> = None;
+        let _: Option<modern::FinalListResourceTemplatesResult> = None;
+        let _: Option<modern::FinalReadResourceResult> = None;
+        let _: Option<modern::FinalListPromptsResult> = None;
+        let _: Option<modern::FinalPromptMessage> = None;
+        let _: Option<modern::FinalGetPromptResult> = None;
+        let _: Option<modern::FinalEmptyResult> = None;
+        let _: Option<modern::FinalCoreRequest> = None;
+        let _: Option<modern::FinalCoreResult> = None;
+        let _: Option<modern::CoreRequest> = None;
+        let _: Option<modern::CoreResult> = None;
+        let _: Option<modern::CoreDispatchError> = None;
+        let _: Option<modern::ModernHttpClient> = None;
+        let _: Option<modern::ModernHttpConnectOutcome> = None;
+        let _: Option<modern::ModernHttpClientError> = None;
+        let _: Option<modern::ModernHttpSseResponseStream> = None;
+        let _: Option<super::FinalRequestMeta> = None;
+        let _: Option<super::ModernHttpClient> = None;
+        let _: Option<super::MrtrExchangeRegistry> = None;
+        let _: Option<super::LegacySseHttpClient> = None;
+        let mrtr_requests = modern::MrtrInputRequests::new([(
+            "roots".to_owned(),
+            modern::MrtrInputRequest::roots(),
+        )])
+        .expect("facade must expose final MRTR request construction");
+        assert_eq!(mrtr_requests.len(), 1);
+        let _mrtr_registry = modern::MrtrExchangeRegistry::new();
+        assert_eq!(
+            modern::DEFAULT_MAX_MRTR_ROUNDS,
+            super::DEFAULT_MAX_MRTR_ROUNDS
+        );
         let _: Option<legacy_2024::Legacy2024LiveServerLifecycle<(), ()>> = None;
+        let _: Option<legacy_2024::LegacySseHttpClientError> = None;
     }
 
     #[test]

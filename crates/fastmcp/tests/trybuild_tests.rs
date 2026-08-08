@@ -563,9 +563,10 @@ const FACADE_ONLY_CONSUMER: &str = r#"
 
 use mcp::{
     ClientHttpNegotiation, CompleteResult, ConfigLoader, Content, JsonSchema, McpConfig,
-    McpResult, ModernHttpExecutor, ModernHttpRequest, PromptHandler, PromptMessage,
-    ProtocolPolicy, ResourceHandler, Role, ServerConfig, ToolHandler, legacy_2024, modern,
-    prompt, resource, tool,
+    McpResult, FinalRequestMeta, LegacySseHttpClient, ModernHttpClient, ModernHttpExecutor,
+    ModernHttpRequest, MrtrExchangeRegistry, PromptHandler, PromptMessage, ProtocolPolicy,
+    ResourceHandler, Role, ServerConfig, ToolHandler, legacy_2024, modern, prompt, resource,
+    tool,
 };
 
 #[derive(JsonSchema)]
@@ -622,15 +623,73 @@ fn assert_dual_era_facade_surface() {
     let _: Option<ConfigLoader> = None;
     let _: Option<ClientHttpNegotiation> = None;
     let _: Option<CompleteResult<()>> = None;
+    let _: Option<FinalRequestMeta> = None;
+    let _: Option<ModernHttpClient> = None;
+    let _: Option<MrtrExchangeRegistry> = None;
+    let _: Option<LegacySseHttpClient> = None;
     let _: Option<modern::ContentBlock> = None;
     let _: Option<modern::ExtensionDescriptorRegistry> = None;
     let _: Option<modern::ServerDiscoverResult> = None;
     let _: Option<modern::InboundRequestContext> = None;
+    let final_meta = modern::FinalRequestMeta::new(modern::ClientCapabilities::default());
+    assert_eq!(final_meta.protocol_version, modern::PROTOCOL_VERSION);
+    let _: Option<modern::ClientInfo> = None;
+    let _: Option<modern::RequestId> = None;
+    let _: &str = modern::FINAL_PROTOCOL_VERSION_META_KEY;
+    let _: Option<modern::FinalListParams> = None;
+    let _: Option<modern::FinalCallToolParams> = None;
+    let _: Option<modern::FinalReadResourceParams> = None;
+    let _: Option<modern::FinalGetPromptParams> = None;
+    let _: Option<modern::FinalSetLogLevelParams> = None;
+    let _: Option<modern::FinalEmptyParams> = None;
+    let _: Option<modern::FinalListToolsResult> = None;
+    let _: Option<modern::FinalCallToolResult> = None;
+    let _: Option<modern::FinalListResourcesResult> = None;
+    let _: Option<modern::FinalListResourceTemplatesResult> = None;
+    let _: Option<modern::FinalReadResourceResult> = None;
+    let _: Option<modern::FinalListPromptsResult> = None;
+    let _: Option<modern::FinalPromptMessage> = None;
+    let _: Option<modern::FinalGetPromptResult> = None;
+    let _: Option<modern::FinalEmptyResult> = None;
+    let _: Option<modern::FinalCoreRequest> = None;
+    let _: Option<modern::FinalCoreResult> = None;
+    let _: Option<modern::CoreRequest> = None;
+    let _: Option<modern::CoreResult> = None;
+    let _: Option<modern::CoreDispatchError> = None;
+    let _: Option<modern::ModernHttpClient> = None;
+    let _: Option<modern::ModernHttpConnectOutcome> = None;
+    let _: Option<modern::ModernHttpClientError> = None;
+    let _: Option<modern::ModernHttpSseResponseStream> = None;
+    let requests = modern::MrtrInputRequests::new([(
+        "roots".to_owned(),
+        modern::MrtrInputRequest::roots(),
+    )])
+    .expect("facade final MRTR input request types compile");
+    assert_eq!(requests.len(), 1);
+    let _registry = modern::MrtrExchangeRegistry::new();
+    assert_eq!(modern::DEFAULT_MAX_MRTR_ROUNDS, 8);
+    let _: Option<legacy_2024::CallToolParams> = None;
     let _: Option<legacy_2024::Legacy2024Lifecycle> = None;
+    let _: Option<legacy_2024::LegacySseHttpClient> = None;
+    let _: Option<legacy_2024::LegacySseHttpClientError> = None;
 
     let uri = modern::AbsoluteUri::parse("https://mcp.example.test/final")
         .expect("facade final common types compile");
     assert_eq!(uri.as_str(), "https://mcp.example.test/final");
     assert_eq!(ProtocolPolicy::ModernOnly, modern::ProtocolPolicy::ModernOnly);
+}
+
+fn assert_prelude_dual_era_surface() {
+    use mcp::prelude::*;
+
+    let _: Option<modern::FinalRequestMeta> = None;
+    let _: Option<modern::FinalCallToolParams> = None;
+    let _: Option<modern::ClientInfo> = None;
+    let _: Option<modern::RequestId> = None;
+    let _: Option<modern::CoreRequest> = None;
+    let _: Option<modern::ModernHttpClient> = None;
+    let _: Option<modern::MrtrExchangeRegistry> = None;
+    let _: Option<legacy_2024::CallToolParams> = None;
+    let _: Option<legacy_2024::LegacySseHttpClient> = None;
 }
 "#;
