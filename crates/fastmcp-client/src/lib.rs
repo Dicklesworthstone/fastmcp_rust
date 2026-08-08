@@ -3997,6 +3997,7 @@ impl Client {
         let params_value = serde_json::to_value(params)
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
         let params_value = self.prepare_request_parameters(params_value)?;
+        let core_request = self.prepared_core_request(method, &params_value)?;
 
         let request_id = RequestId::Number(
             i64::try_from(request_id).expect("request ID allocator enforces the i64 bound"),
@@ -4038,6 +4039,12 @@ impl Client {
         let result = response
             .result
             .ok_or_else(|| McpError::internal_error("No result in response"))?;
+
+        if let Some(core_request) = core_request
+            && let Err(error) = decode_core_result(&core_request, &result)
+        {
+            return Err(self.terminate_connection(error));
+        }
 
         decode_response_payload(result)
     }
@@ -8443,6 +8450,60 @@ mod tests {
         let error = client
             .call_tool_typed("echo", serde_json::json!({"text": "typed"}))
             .expect_err("an explicit null discriminator is not an omitted complete discriminator");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(!client.is_initialized());
+        assert!(client.responses.terminal_error().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_progress_client_result_positive() {
+        let script = modern_typed_call_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+        let mut on_progress = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {};
+
+        let content = client
+            .call_tool_with_progress(
+                "echo",
+                serde_json::json!({"text": "progress"}),
+                &mut on_progress,
+            )
+            .expect("progress calls admit the same negotiated complete result");
+        assert_eq!(content.len(), 1);
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_progress_client_result_null_discriminator_rejected() {
+        // This differs from the accepted progress response only in `resultType`.
+        let script = modern_typed_call_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("same modern discovery initializes the public client");
+        let mut on_progress = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {};
+
+        let error = client
+            .call_tool_with_progress(
+                "echo",
+                serde_json::json!({"text": "progress"}),
+                &mut on_progress,
+            )
+            .expect_err("an explicit null discriminator is rejected after progress admission");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(!client.is_initialized());
         assert!(client.responses.terminal_error().is_some());
