@@ -271,10 +271,11 @@ pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
 pub use fastmcp_client::{
-    BoundedListPage, Client, ClientBuilder, ClientHttpNegotiation, ClientHttpNegotiationDecision,
-    ClientHttpNegotiationError, ClientHttpNegotiationState, ClientProtocolPlan,
-    ClientProtocolPlanError, ClientSession, CompletionContext, CompletionParams,
-    CompletionReference, ListPageLimits, RequestTimeoutPolicy, RequestTimeoutSource,
+    BoundedListPage, Client, ClientBuilder, ClientHttpConnection, ClientHttpConnectionError,
+    ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
+    ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError,
+    ClientSession, CompletionContext, CompletionParams, CompletionReference, ListPageLimits,
+    RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionFilter,
 };
 
 // Public client HTTP execution and configuration surfaces.
@@ -332,10 +333,11 @@ pub mod modern {
         ServerConfig, claude_desktop_config_path, default_config_paths,
     };
     pub use fastmcp_client::{
-        Client, ClientBuilder, ClientHttpNegotiation, ClientHttpNegotiationDecision,
-        ClientHttpNegotiationError, ClientHttpNegotiationState, ClientProtocolPlan,
+        Client, ClientBuilder, ClientHttpConnection, ClientHttpConnectionError,
+        ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
+        ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
         ClientProtocolPlanError, ClientSession, CompletionContext, CompletionParams,
-        CompletionReference,
+        CompletionReference, SubscriptionFilter,
     };
     pub use fastmcp_client::{http_executor, mcp_config};
     pub use fastmcp_core::{Cx, McpContext, McpError, McpOutcome, McpResult, Outcome};
@@ -480,10 +482,13 @@ pub mod prelude {
         BoundedListPage,
         Client,
         ClientBuilder,
+        ClientHttpConnection,
+        ClientHttpConnectionError,
         ClientHttpNegotiation,
         ClientHttpNegotiationDecision,
         ClientHttpNegotiationError,
         ClientHttpNegotiationState,
+        ClientHttpResponse,
         ClientProtocolPlan,
         ClientSession,
         CompleteResult,
@@ -546,6 +551,7 @@ pub mod prelude {
         ServerDiscoverRequest,
         ServerDiscoverResult,
         StaticTokenVerifier,
+        SubscriptionFilter,
         TokenAuthProvider,
         TokenVerifier,
         Tool,

@@ -1,7 +1,8 @@
 //! Active downstream facade probe for both HTTP protocol eras.
 
 use fastmcp_rust::{
-    CompletionContext, CompletionHandler, CompletionParams, CompletionReference, legacy_2024,
+    ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, CompletionContext,
+    CompletionHandler, CompletionParams, CompletionReference, SubscriptionFilter, legacy_2024,
     modern,
 };
 
@@ -85,6 +86,41 @@ mod prelude_client_completion_input_reachability {
     }
 }
 
+fn assert_client_http_and_subscription_exports(
+    connection: ClientHttpConnection,
+    response: ClientHttpResponse,
+    error: ClientHttpConnectionError,
+) {
+    fn accepts_modern_connection(_connection: modern::ClientHttpConnection) {}
+    fn accepts_modern_error(_error: modern::ClientHttpConnectionError) {}
+
+    accepts_modern_connection(connection);
+    accepts_modern_error(error);
+    match response {
+        modern::ClientHttpResponse::Modern(_) | modern::ClientHttpResponse::Legacy(_) => {}
+    }
+
+    let _: modern::SubscriptionFilter = SubscriptionFilter {
+        tools_list_changed: Some(true),
+        ..SubscriptionFilter::default()
+    };
+}
+
+mod prelude_client_http_and_subscription_reachability {
+    use fastmcp_rust::prelude::*;
+
+    pub(super) fn assert_reachable() {
+        let _: Option<ClientHttpConnection> = None;
+        let _: Option<ClientHttpConnectionError> = None;
+        let _: Option<ClientHttpResponse> = None;
+        let filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        let _ = filter;
+    }
+}
+
 fn assert_legacy_sse_method_signatures(
     cx: &legacy_2024::Cx,
     plan: legacy_2024::ClientProtocolPlan,
@@ -146,5 +182,7 @@ fn main() {
     prelude_completion_handler_reachability::assert_reachable();
     assert_client_completion_input_exports();
     prelude_client_completion_input_reachability::assert_reachable();
+    let _ = assert_client_http_and_subscription_exports;
+    prelude_client_http_and_subscription_reachability::assert_reachable();
     assert_dual_era_completion_exports();
 }
