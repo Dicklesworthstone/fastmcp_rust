@@ -251,29 +251,9 @@ impl<'de> Deserialize<'de> for DiscoveryCacheScope {
     }
 }
 
-/// The only complete payload shape this method can carry.
-///
-/// Older peers may omit the discriminator; final clients must treat that as
-/// `complete` while final servers always emit it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-enum DiscoveryResultType {
-    #[serde(rename = "complete")]
-    Complete,
-}
-
-impl<'de> Deserialize<'de> for DiscoveryResultType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        match String::deserialize(deserializer)?.as_str() {
-            "complete" => Ok(Self::Complete),
-            _ => Err(D::Error::custom(
-                "server/discover resultType must be `complete`",
-            )),
-        }
-    }
-}
+/// Locally emitted `server/discover` results use the standard complete
+/// discriminator. Peer results retain the schema-open string verbatim.
+const COMPLETE_DISCOVERY_RESULT_TYPE: &str = "complete";
 
 /// Required final caching hints for a `server/discover` result.
 ///
@@ -574,7 +554,7 @@ impl<'de> Deserialize<'de> for OptionalServerInstructions {
 #[serde(rename_all = "camelCase")]
 pub struct ServerDiscoverResult {
     #[serde(rename = "resultType")]
-    result_type: DiscoveryResultType,
+    result_type: String,
     #[serde(rename = "supportedVersions")]
     supported_versions: Vec<String>,
     capabilities: ServerDiscoverCapabilities,
@@ -602,7 +582,7 @@ impl ServerDiscoverResult {
         cache_hints: DiscoveryCacheHints,
     ) -> Self {
         Self {
-            result_type: DiscoveryResultType::Complete,
+            result_type: COMPLETE_DISCOVERY_RESULT_TYPE.to_owned(),
             supported_versions: SERVER_DISCOVER_SUPPORTED_VERSIONS
                 .iter()
                 .map(|version| (*version).to_owned())
@@ -619,6 +599,12 @@ impl ServerDiscoverResult {
     #[must_use]
     pub fn supported_versions(&self) -> &[String] {
         &self.supported_versions
+    }
+
+    /// Returns the schema-open result discriminator received from the peer.
+    #[must_use]
+    pub fn result_type(&self) -> &str {
+        &self.result_type
     }
 
     /// Returns the derived capability shape.
@@ -649,8 +635,8 @@ impl ServerDiscoverResult {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerDiscoverResultWire {
-    #[serde(rename = "resultType", default = "complete_discovery_result")]
-    result_type: DiscoveryResultType,
+    #[serde(rename = "resultType")]
+    result_type: String,
     #[serde(rename = "supportedVersions")]
     supported_versions: Vec<String>,
     capabilities: ServerDiscoverCapabilities,
@@ -664,10 +650,6 @@ struct ServerDiscoverResultWire {
     cache_scope: DiscoveryCacheScope,
     #[serde(flatten)]
     extras: BTreeMap<String, Value>,
-}
-
-const fn complete_discovery_result() -> DiscoveryResultType {
-    DiscoveryResultType::Complete
 }
 
 impl<'de> Deserialize<'de> for ServerDiscoverResult {
@@ -899,6 +881,42 @@ mod tests {
     }
 
     #[test]
+    fn server_discover_round_trips_schema_open_result_type() {
+        let admitted = ServerDiscoverResult::new(
+            fully_installed_capabilities(),
+            ServerInfo {
+                name: "contract-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let unchanged_before =
+            serde_json::to_vec(&admitted).expect("the admitted result has a stable wire image");
+        let mut peer_wire: Value =
+            serde_json::to_value(&admitted).expect("the admitted result encodes");
+        peer_wire["resultType"] = json!("com.example/deferred-discovery");
+
+        let decoded: ServerDiscoverResult = serde_json::from_value(peer_wire.clone())
+            .expect("a schema-open discovery resultType is retained");
+        assert_eq!(
+            decoded.result_type(),
+            "com.example/deferred-discovery",
+            "the typed API exposes the received open discriminator"
+        );
+        assert_eq!(
+            serde_json::to_value(decoded).expect("the open discriminator re-encodes"),
+            peer_wire,
+            "the schema-valid open resultType round-trips unchanged"
+        );
+        assert_eq!(
+            serde_json::to_vec(&admitted).expect("the admitted result still encodes"),
+            unchanged_before,
+            "admitting a separate peer result cannot mutate locally admitted state"
+        );
+    }
+
+    #[test]
     fn srv_02_b_planted_negative() {
         let admitted = ServerDiscoverResult::new(
             fully_installed_capabilities(),
@@ -911,20 +929,21 @@ mod tests {
         );
         let unchanged_before =
             serde_json::to_vec(&admitted).expect("the admitted result has a stable wire image");
-        let mut planted: Value =
+        let mut missing_result_type: Value =
             serde_json::to_value(&admitted).expect("the admitted result encodes");
-        planted["resultType"] = json!("input_required");
+        missing_result_type
+            .as_object_mut()
+            .expect("the discovery result is an object")
+            .remove("resultType");
 
-        let rejection = serde_json::from_value::<ServerDiscoverResult>(planted)
-            .expect_err("only the incompatible result type changed");
-        assert_eq!(
-            rejection.to_string(),
-            "server/discover resultType must be `complete`"
+        assert!(
+            serde_json::from_value::<ServerDiscoverResult>(missing_result_type).is_err(),
+            "removing only required resultType rejects the final discovery result"
         );
         assert_eq!(
             serde_json::to_vec(&admitted).expect("the admitted result still encodes"),
             unchanged_before,
-            "rejected peer input cannot mutate the named admitted result state"
+            "rejecting the one-field variant cannot mutate locally admitted state"
         );
     }
 
