@@ -273,8 +273,8 @@ pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 pub use fastmcp_client::{
     BoundedListPage, Client, ClientBuilder, ClientHttpNegotiation, ClientHttpNegotiationDecision,
     ClientHttpNegotiationError, ClientHttpNegotiationState, ClientProtocolPlan,
-    ClientProtocolPlanError, ClientSession, ListPageLimits, RequestTimeoutPolicy,
-    RequestTimeoutSource,
+    ClientProtocolPlanError, ClientSession, CompletionContext, CompletionParams,
+    CompletionReference, ListPageLimits, RequestTimeoutPolicy, RequestTimeoutSource,
 };
 
 // Public client HTTP execution and configuration surfaces.
@@ -334,7 +334,8 @@ pub mod modern {
     pub use fastmcp_client::{
         Client, ClientBuilder, ClientHttpNegotiation, ClientHttpNegotiationDecision,
         ClientHttpNegotiationError, ClientHttpNegotiationState, ClientProtocolPlan,
-        ClientProtocolPlanError, ClientSession,
+        ClientProtocolPlanError, ClientSession, CompletionContext, CompletionParams,
+        CompletionReference,
     };
     pub use fastmcp_client::{http_executor, mcp_config};
     pub use fastmcp_core::{Cx, McpContext, McpError, McpOutcome, McpResult, Outcome};
@@ -486,7 +487,10 @@ pub mod prelude {
         ClientProtocolPlan,
         ClientSession,
         CompleteResult,
+        CompletionContext,
         CompletionHandler,
+        CompletionParams,
+        CompletionReference,
         ConfigError,
         ConfigLoader,
         // Protocol types

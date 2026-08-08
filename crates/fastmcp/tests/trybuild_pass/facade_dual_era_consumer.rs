@@ -1,6 +1,9 @@
 //! Active downstream facade probe for both HTTP protocol eras.
 
-use fastmcp_rust::{CompletionHandler, legacy_2024, modern};
+use fastmcp_rust::{
+    CompletionContext, CompletionHandler, CompletionParams, CompletionReference, legacy_2024,
+    modern,
+};
 
 struct DownstreamCompletionHandler;
 
@@ -43,6 +46,42 @@ mod prelude_completion_handler_reachability {
 
     pub(super) fn assert_reachable() {
         accepts_prelude_completion_handler::<super::DownstreamCompletionHandler>();
+    }
+}
+
+fn assert_client_completion_input_exports() {
+    let root_params = CompletionParams {
+        reference: CompletionReference::Prompt {
+            name: "city".to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "prefix".to_owned(),
+            value: "bo".to_owned(),
+        },
+        context: Some(CompletionContext::default()),
+    };
+    let _: modern::CompletionParams = root_params;
+    let _: modern::CompletionReference = CompletionReference::Prompt {
+        name: "city".to_owned(),
+    };
+    let _: modern::CompletionContext = CompletionContext::default();
+}
+
+mod prelude_client_completion_input_reachability {
+    use fastmcp_rust::prelude::*;
+
+    pub(super) fn assert_reachable() {
+        let params = CompletionParams {
+            reference: CompletionReference::Prompt {
+                name: "city".to_owned(),
+            },
+            argument: modern::FinalCompletionArgument {
+                name: "prefix".to_owned(),
+                value: "bo".to_owned(),
+            },
+            context: Some(CompletionContext::default()),
+        };
+        let _ = params;
     }
 }
 
@@ -105,5 +144,7 @@ fn main() {
     let _ = assert_legacy_sse_method_signatures;
     assert_completion_handler_reachability();
     prelude_completion_handler_reachability::assert_reachable();
+    assert_client_completion_input_exports();
+    prelude_client_completion_input_reachability::assert_reachable();
     assert_dual_era_completion_exports();
 }
