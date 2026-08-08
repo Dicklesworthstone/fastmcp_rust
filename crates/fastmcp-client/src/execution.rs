@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, sha256_bounded};
 use fastmcp_protocol::{
-    CancelledParams, CoreResultDiscriminatorPolicy, DecodedResult, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, RequestId, ResultPeerDiagnostic, ResultPeerEra, decode_peer_result,
+    CancelledParams, CoreRequest, CoreResult, CoreResultDiscriminatorPolicy, DecodedResult,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId, ResultPeerDiagnostic,
+    ResultPeerEra, decode_peer_result,
 };
 use fastmcp_transport::{Transport, TransportError};
 use serde_json::Value;
@@ -104,6 +105,21 @@ pub fn clt_01_b_manifest_digest() -> Sha256Digest {
         CLT_01_B_MANIFEST_ROWS.len(),
     )
     .expect("the fixed CLT-01 B manifest is within its exact byte bound")
+}
+
+/// Decodes a core response through the exact request and negotiated-era type.
+///
+/// The request owns the method-specific result shape, so this cannot conflate a
+/// final `tools/call` response with a legacy result or with another core
+/// method's complete payload. The caller owns connection policy after a peer
+/// violates this contract.
+pub(crate) fn decode_core_result(request: &CoreRequest, result: &Value) -> McpResult<CoreResult> {
+    let encoded = serde_json::to_string(result).map_err(|_| {
+        McpError::invalid_request("Peer core result could not be encoded for protocol admission")
+    })?;
+    request
+        .decode_result(&encoded)
+        .map_err(|_| McpError::invalid_request("Peer core result failed protocol decoding"))
 }
 
 /// Public snapshot of one active correlation record.

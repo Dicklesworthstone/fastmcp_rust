@@ -58,6 +58,7 @@ pub use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, HttpModernProbe, HttpProbeBody, ProtocolEra,
     ProtocolPolicy, ProtocolVersion,
 };
+pub use fastmcp_protocol::{CoreResult, FinalCoreResult, LegacyCoreResult};
 pub use mcp_config::claude_desktop_config_path;
 pub use negotiation::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
@@ -87,15 +88,16 @@ use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sh
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancelledParams,
-    ClientCapabilities, ClientInfo, Content, CorrelationKey, FinalRequestMeta, GetPromptParams,
-    GetPromptResult, GetTaskParams, GetTaskResult, InitializeParams, InitializeResult,
-    JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
-    ListResourcesParams, ListResourcesResult, ListTasksParams, ListTasksResult, ListToolsParams,
-    ListToolsResult, LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt,
-    PromptMessage, ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource,
-    ResourceContent, ResourceTemplate, ServerCapabilities, ServerInfo, SetLogLevelParams,
-    SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo, TaskResult, TaskStatus, Tool,
+    ClientCapabilities, ClientInfo, Content, CoreDispatchError, CoreRequest, CorrelationKey,
+    FinalRequestMeta, GetPromptParams, GetPromptResult, GetTaskParams, GetTaskResult,
+    InitializeParams, InitializeResult, JSONRPC_VERSION, JsonRpcError, JsonRpcMessage,
+    JsonRpcRequest, JsonRpcResponse, ListPromptsParams, ListPromptsResult,
+    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
+    ListResourcesResult, ListTasksParams, ListTasksResult, ListToolsParams, ListToolsResult,
+    LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage,
+    ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource, ResourceContent,
+    ResourceTemplate, ServerCapabilities, ServerInfo, SetLogLevelParams, SubmitTaskParams,
+    SubmitTaskResult, TaskId, TaskInfo, TaskResult, TaskStatus, Tool,
 };
 use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
 
@@ -104,6 +106,8 @@ use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDisc
 /// The callback receives the progress value, optional total, and optional message.
 pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<&str>);
 use fastmcp_transport::{StdioTransport, Transport, TransportError};
+
+use crate::execution::decode_core_result;
 
 const MIN_TASK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_LOCAL_TASK_POLL_INTERVAL: Duration = Duration::from_mins(5);
@@ -3219,6 +3223,28 @@ impl Client {
         }
     }
 
+    /// Decodes a prepared supported-core request in the immutable selected era.
+    ///
+    /// Non-core methods continue through the ordinary response path. A core
+    /// request with invalid selected-era parameters is rejected before any
+    /// request ID is allocated or bytes are committed to the peer.
+    fn prepared_core_request(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> McpResult<Option<CoreRequest>> {
+        let Some(era) = self.session.selected_era() else {
+            return Ok(None);
+        };
+        match CoreRequest::decode(era, method, Some(params)) {
+            Ok(request) => Ok(Some(request)),
+            Err(CoreDispatchError::UnsupportedMethod { .. }) => Ok(None),
+            Err(_) => Err(McpError::invalid_params(
+                "Client core request parameters do not match the negotiated protocol era",
+            )),
+        }
+    }
+
     /// Sends a request and waits for response.
     fn send_request<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &mut self,
@@ -3232,6 +3258,29 @@ impl Client {
         let params_value = serde_json::to_value(params)
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
         let params_value = self.prepare_request_parameters(params_value)?;
+        let core_request = self.prepared_core_request(method, &params_value)?;
+        let result = self.send_prepared_request(method, params_value)?;
+
+        if let Some(core_request) = core_request
+            && let Err(error) = decode_core_result(&core_request, &result)
+        {
+            return Err(self.terminate_connection(error));
+        }
+
+        decode_response_payload(result)
+    }
+
+    /// Sends an already-prepared request and returns its raw result value.
+    ///
+    /// Callers that need an era-aware result must decode this value with the
+    /// request that selected its method-specific response contract.
+    fn send_prepared_request(
+        &mut self,
+        method: &str,
+        params_value: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        let timeout_policy = self.timeout_policy;
+        timeout_policy.validate()?;
         let id = self.next_request_id()?;
 
         let (request_id, request) = {
@@ -3274,7 +3323,27 @@ impl Client {
             .result
             .ok_or_else(|| McpError::internal_error("No result in response"))?;
 
-        decode_response_payload(result)
+        Ok(result)
+    }
+
+    /// Sends one supported core request and retains its selected-era result.
+    fn send_typed_core_request<P: serde::Serialize>(
+        &mut self,
+        method: &str,
+        params: P,
+    ) -> McpResult<CoreResult> {
+        let params_value = serde_json::to_value(params)
+            .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
+        let params_value = self.prepare_request_parameters(params_value)?;
+        let core_request = self
+            .prepared_core_request(method, &params_value)?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Method is not a supported core request in the negotiated era",
+                )
+            })?;
+        let result = self.send_prepared_request(method, params_value)?;
+        decode_core_result(&core_request, &result).map_err(|error| self.terminate_connection(error))
     }
 
     /// Sends a notification (no response expected).
@@ -3786,6 +3855,31 @@ impl Client {
         };
         let result: ListToolsResult = self.send_request("tools/list", params)?;
         bounded_list_page(result.tools, cursor, result.next_cursor, limits)
+    }
+
+    /// Calls a tool and returns its negotiated, method-aware core result.
+    ///
+    /// A modern session returns [`CoreResult::Final`] with a typed
+    /// [`FinalCoreResult::ToolsCall`] payload. An exact legacy session returns
+    /// [`CoreResult::Legacy`] with its unchanged `tools/call` result shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the peer result does not match
+    /// the selected era and `tools/call` response contract. A contradictory
+    /// core response terminates the connection.
+    pub fn call_tool_typed(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let params = CallToolParams {
+            name: name.to_string(),
+            arguments: Some(arguments),
+            meta: None,
+        };
+        self.send_typed_core_request("tools/call", params)
     }
 
     /// Calls a tool with the given arguments.
@@ -8177,6 +8271,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_typed_call_client_script(call_response: &str) -> String {
+        let discovery_response =
+            modern_discovery_response("typed-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r second || exit 1; \
+             case \"$second\" in *tools/call*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{call_response}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
     fn modern_discovery_response(server_name: &str, supported_versions: &[&str]) -> String {
         let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
             &fastmcp_protocol::ServerBehaviorRegistry::default(),
@@ -8252,6 +8361,20 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn legacy_typed_call_client_script() -> &'static str {
+        "IFS= read -r first || exit 1; \
+         case \"$first\" in *initialize*2024-11-05*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}' ;; *) exit 1 ;; esac; \
+         IFS= read -r lifecycle || exit 1; \
+         case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+         IFS= read -r request || exit 1; \
+         case \"$request\" in *tools/call*) ;; *) exit 1 ;; esac; \
+         case \"$request\" in *io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
+         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"legacy result\"}],\"isError\":false}}' ;; esac; \
+         exec sleep 2"
+    }
+
+    #[cfg(unix)]
     #[test]
     fn clt_01_i_positive() {
         let modern_result = modern_discovery_response("modern-server", &[MODERN_PROTOCOL_VERSION]);
@@ -8274,6 +8397,55 @@ mod tests {
             .ping()
             .expect("modern execution sends per-request metadata after discovery");
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_final_typed_client_result_positive() {
+        let script = modern_typed_call_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"typed result"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+
+        let result = client
+            .call_tool_typed("echo", serde_json::json!({"text": "typed"}))
+            .expect("a negotiated modern tool call retains its typed final result");
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result, diagnostic }) = result else {
+            panic!("modern tools/call must not decode through the legacy result shape");
+        };
+        assert!(diagnostic.is_none());
+        assert!(!result.payload.is_error);
+        assert_eq!(result.payload.content.len(), 1);
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_final_typed_client_result_null_discriminator_rejected() {
+        // This differs from the accepted modern result only in `resultType`.
+        let script = modern_typed_call_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"typed result"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("same modern discovery initializes the public client");
+
+        let error = client
+            .call_tool_typed("echo", serde_json::json!({"text": "typed"}))
+            .expect_err("an explicit null discriminator is not an omitted complete discriminator");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(!client.is_initialized());
+        assert!(client.responses.terminal_error().is_some());
     }
 
     #[cfg(unix)]
@@ -8433,6 +8605,28 @@ mod tests {
         client
             .ping()
             .expect("legacy client executes after initialized notification");
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_typed_client_result_preserves_exact_legacy_decode() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_typed_call_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
+
+        let result = client
+            .call_tool_typed("echo", serde_json::json!({"text": "legacy"}))
+            .expect("the exact legacy tools/call response remains accepted");
+        let CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) = result else {
+            panic!("legacy tools/call must not require a final result discriminator");
+        };
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 1);
         client.close().expect("legacy client cleanup");
     }
 
