@@ -13,6 +13,7 @@ use fastmcp_protocol::common_types::{
     RawIcon, TraceContext,
 };
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 fn request_metadata() -> OpenMetadata {
     OpenMetadata::try_from_entries([
@@ -142,9 +143,12 @@ fn prt_02_a_positive() {
                 uri: AbsoluteUri::parse("https://example.test/embedded").expect("embedded URI"),
                 text: "embedded".to_owned(),
                 mime_type: Some("text/plain".to_owned()),
+                meta: None,
+                additional: BTreeMap::new(),
             },
             annotations: None,
             meta: Some(metadata),
+            additional: BTreeMap::new(),
         },
     ];
     for content in content_rows {
