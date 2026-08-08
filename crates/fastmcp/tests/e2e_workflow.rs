@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::thread::JoinHandle;
 
-use fastmcp_protocol::Tool;
+use fastmcp_protocol::{LegacyContent, LegacyPromptMessage, LegacyResourceContent, Tool};
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
     McpContext, McpResult, PromptMessage, ResourceContent, ResourceTemplate, Role, Server,
@@ -232,25 +232,27 @@ fn workflow_complete_lifecycle() {
         .call_tool("echo", json!({"message": "workflow test"}))
         .unwrap();
     assert!(
-        matches!(echo_result.first(), Some(Content::Text { .. })),
+        matches!(echo_result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = echo_result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = echo_result.first() else {
         return;
     };
     assert_eq!(text, "workflow test");
 
     let status = client.read_resource("app://status").unwrap();
-    let status_json: serde_json::Value =
-        serde_json::from_str(status[0].text.as_ref().unwrap()).unwrap();
+    let LegacyResourceContent::Text { text, .. } = &status[0] else {
+        return;
+    };
+    let status_json: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(status_json["status"], "healthy");
 
     let mut args = HashMap::new();
     args.insert("topic".to_string(), "MCP protocol".to_string());
     let help = client.get_prompt("help", args).unwrap();
+    let LegacyPromptMessage { content, .. } = &help[0];
     assert!(
-        help[0]
-            .content
+        content
             .as_text()
             .is_some_and(|t| t.contains("MCP protocol"))
     );
@@ -305,10 +307,10 @@ fn workflow_error_recovery_continues_after_tool_error() {
         .call_tool("fail_on_demand", json!({"fail": false}))
         .unwrap();
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "Success");
@@ -324,10 +326,10 @@ fn workflow_error_recovery_continues_after_tool_error() {
         .call_tool("echo", json!({"message": "still alive"}))
         .unwrap();
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "still alive");
@@ -377,10 +379,10 @@ fn workflow_unknown_tool_doesnt_break_session() {
         .call_tool("echo", json!({"message": "after"}))
         .unwrap();
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "after");
@@ -401,7 +403,10 @@ fn workflow_unknown_resource_doesnt_break_session() {
 
     // Read a valid resource again (should still work)
     let content = client.read_resource("file:///README.md").unwrap();
-    assert!(content[0].text.as_ref().unwrap().contains("Test Project"));
+    let LegacyResourceContent::Text { text, .. } = &content[0] else {
+        return;
+    };
+    assert!(text.contains("Test Project"));
 }
 
 // ============================================================================
@@ -420,10 +425,10 @@ fn workflow_sequential_clients_same_server() {
             .call_tool("echo", json!({"message": format!("client-{i}")}))
             .unwrap();
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert_eq!(text, &format!("client-{i}"));
@@ -477,10 +482,10 @@ fn workflow_two_independent_servers() {
         .call_tool("echo", json!({"message": "from A"}))
         .unwrap();
     assert!(
-        matches!(echo.first(), Some(Content::Text { .. })),
+        matches!(echo.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = echo.first() else {
+    let Some(LegacyContent::Text { text, .. }) = echo.first() else {
         return;
     };
     assert_eq!(text, "from A");
@@ -515,15 +520,15 @@ fn workflow_get_prompt_without_arguments() {
 
     let messages = client.get_prompt("system_prompt", HashMap::new()).unwrap();
     assert_eq!(messages.len(), 1);
-    assert!(matches!(messages[0].role, Role::Assistant));
-    let Some(first) = messages.first() else {
+    let Some(LegacyPromptMessage { role, content, .. }) = messages.first() else {
         return;
     };
+    assert!(matches!(*role, Role::Assistant));
     assert!(
-        matches!(&first.content, Content::Text { .. }),
+        matches!(content, LegacyContent::Text { .. }),
         "expected text content"
     );
-    let Content::Text { text } = &first.content else {
+    let LegacyContent::Text { text, .. } = content else {
         return;
     };
     assert!(text.contains("helpful assistant"));
@@ -543,10 +548,10 @@ fn workflow_many_sequential_tool_calls() {
         let msg = format!("message-{i}");
         let result = client.call_tool("echo", json!({"message": msg})).unwrap();
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert_eq!(text, &msg);
@@ -565,10 +570,10 @@ fn workflow_interleaved_list_and_call() {
 
         let result = client.call_tool("counter", json!({"value": 42})).unwrap();
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert_eq!(text, "42");
@@ -720,14 +725,14 @@ fn workflow_prompt_arguments_preserved() {
 // Content type helper for assertions
 // ============================================================================
 
-trait ContentExt {
+trait LegacyContentExt {
     fn as_text(&self) -> Option<&str>;
 }
 
-impl ContentExt for Content {
+impl LegacyContentExt for LegacyContent {
     fn as_text(&self) -> Option<&str> {
         match self {
-            Content::Text { text } => Some(text),
+            LegacyContent::Text { text, .. } => Some(text),
             _ => None,
         }
     }
@@ -1521,10 +1526,10 @@ fn workflow_concurrent_clients_isolation() {
             .unwrap();
 
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert!(text.contains(&format!("value_from_client_{}", num)));
@@ -1537,10 +1542,10 @@ fn workflow_concurrent_clients_isolation() {
             .unwrap();
 
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         // Each client should see only its own value
@@ -1595,10 +1600,10 @@ fn workflow_concurrent_interleaved_operations() {
                     .unwrap();
 
                 assert!(
-                    matches!(result.first(), Some(Content::Text { .. })),
+                    matches!(result.first(), Some(LegacyContent::Text { .. })),
                     "expected text content"
                 );
-                let Some(Content::Text { text }) = result.first() else {
+                let Some(LegacyContent::Text { text, .. }) = result.first() else {
                     std::panic::panic_any("expected text content".to_string());
                 };
                 assert!(
@@ -1673,10 +1678,10 @@ fn workflow_concurrent_no_crosstalk() {
                 .unwrap();
 
             assert!(
-                matches!(result.first(), Some(Content::Text { .. })),
+                matches!(result.first(), Some(LegacyContent::Text { .. })),
                 "expected text content"
             );
-            let Some(Content::Text { text }) = result.first() else {
+            let Some(LegacyContent::Text { text, .. }) = result.first() else {
                 return;
             };
             let retrieved = text.clone();
@@ -1745,10 +1750,10 @@ fn workflow_concurrent_session_state_persistence() {
             .unwrap();
 
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert_eq!(text, &format!("value_{}", i), "Key {} has wrong value", i);
@@ -1760,10 +1765,10 @@ fn workflow_concurrent_session_state_persistence() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "NOT_FOUND");
@@ -2036,11 +2041,11 @@ fn session_state_isolated_per_client() {
     assert!(
         matches!(
             (&result_a[0], &result_b[0]),
-            (Content::Text { .. }, Content::Text { .. })
+            (LegacyContent::Text { .. }, LegacyContent::Text { .. })
         ),
         "expected text content"
     );
-    let (Content::Text { text: text_a }, Content::Text { text: text_b }) =
+    let (LegacyContent::Text { text: text_a, .. }, LegacyContent::Text { text: text_b, .. }) =
         (&result_a[0], &result_b[0])
     else {
         return;
@@ -2137,10 +2142,10 @@ fn session_multiple_clients_independent_lifecycle() {
             .call_tool("echo", json!({"message": format!("from-client-{}", i)}))
             .unwrap();
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert!(text.contains(&format!("from-client-{}", i)));
@@ -2193,10 +2198,10 @@ fn session_state_persists_across_operations() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "stored_value", "Session state should persist");
@@ -2370,10 +2375,10 @@ fn tool_call_string_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("string_val: hello world"));
@@ -2389,10 +2394,10 @@ fn tool_call_integer_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("int_val: 42"));
@@ -2408,10 +2413,10 @@ fn tool_call_float_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("float_val: 3.14159"));
@@ -2427,10 +2432,10 @@ fn tool_call_boolean_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("bool_val: true"));
@@ -2440,10 +2445,10 @@ fn tool_call_boolean_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("bool_val: false"));
@@ -2459,10 +2464,10 @@ fn tool_call_array_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("array_val: [len=3]"));
@@ -2481,10 +2486,10 @@ fn tool_call_object_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("object_val: {keys=2}"));
@@ -2500,10 +2505,10 @@ fn tool_call_null_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("null_val: null"));
@@ -2527,10 +2532,10 @@ fn tool_call_multiple_argument_types() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("string_val: test"));
@@ -2547,10 +2552,10 @@ fn tool_call_empty_arguments() {
     let result = client.call_tool("types_test", json!({})).unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("(no arguments provided)"));
@@ -2566,10 +2571,10 @@ fn tool_call_required_argument_provided() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("required: value123"));
@@ -2592,10 +2597,10 @@ fn tool_call_required_and_optional_arguments() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("required: required_value"));
@@ -2628,10 +2633,10 @@ fn tool_call_returns_multiple_content() {
 
     for (i, content) in result.iter().enumerate() {
         assert!(
-            matches!(content, Content::Text { .. }),
+            matches!(content, LegacyContent::Text { .. }),
             "expected text content"
         );
-        let Content::Text { text } = content else {
+        let LegacyContent::Text { text, .. } = content else {
             return;
         };
         assert_eq!(text, &format!("Item {}", i + 1));
@@ -2673,10 +2678,10 @@ fn tool_call_unicode_arguments() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "こんにちは世界 🌍 مرحبا");
@@ -2695,10 +2700,10 @@ fn tool_call_special_characters() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("Line 1"));
@@ -2717,10 +2722,10 @@ fn tool_call_large_string_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text.len(), 10_000);
@@ -2747,10 +2752,10 @@ fn tool_call_nested_object_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("object_val: {keys=1}"));
@@ -2766,10 +2771,10 @@ fn tool_call_negative_numbers() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("int_val: -42"));
@@ -2788,10 +2793,10 @@ fn tool_call_sequential_success() {
             .unwrap();
 
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert_eq!(text, &format!("call_{}", i));
@@ -2978,10 +2983,19 @@ fn resource_read_plain_text() {
     let content = client.read_resource("text://plain").unwrap();
 
     assert_eq!(content.len(), 1);
-    assert_eq!(content[0].uri, "text://plain");
-    assert_eq!(content[0].mime_type.as_deref(), Some("text/plain"));
-    assert_eq!(content[0].text.as_deref(), Some("Hello, World!"));
-    assert!(content[0].blob.is_none());
+    assert!(matches!(&content[0], LegacyResourceContent::Text { .. }));
+    let LegacyResourceContent::Text {
+        uri,
+        mime_type,
+        text,
+        ..
+    } = &content[0]
+    else {
+        return;
+    };
+    assert_eq!(uri, "text://plain");
+    assert_eq!(mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(text, "Hello, World!");
 }
 
 #[test]
@@ -2992,9 +3006,15 @@ fn resource_read_json() {
     let content = client.read_resource("data://config.json").unwrap();
 
     assert_eq!(content.len(), 1);
-    assert_eq!(content[0].mime_type.as_deref(), Some("application/json"));
+    let LegacyResourceContent::Text {
+        mime_type, text, ..
+    } = &content[0]
+    else {
+        return;
+    };
+    assert_eq!(mime_type.as_deref(), Some("application/json"));
 
-    let json: serde_json::Value = serde_json::from_str(content[0].text.as_ref().unwrap()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(json["name"], "test-config");
     assert_eq!(json["version"], "1.0.0");
     assert_eq!(json["settings"]["debug"], true);
@@ -3009,15 +3029,16 @@ fn resource_read_binary() {
     let content = client.read_resource("binary://data.bin").unwrap();
 
     assert_eq!(content.len(), 1);
-    assert_eq!(
-        content[0].mime_type.as_deref(),
-        Some("application/octet-stream")
-    );
-    assert!(content[0].text.is_none());
-    assert!(content[0].blob.is_some());
+    assert!(matches!(&content[0], LegacyResourceContent::Blob { .. }));
+    let LegacyResourceContent::Blob {
+        mime_type, blob, ..
+    } = &content[0]
+    else {
+        return;
+    };
+    assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
 
     // Verify blob is base64 encoded
-    let blob = content[0].blob.as_ref().unwrap();
     assert!(!blob.is_empty());
     // Base64 uses only alphanumeric chars and +/=
     assert!(
@@ -3034,7 +3055,9 @@ fn resource_read_unicode() {
     let content = client.read_resource("text://unicode").unwrap();
 
     assert_eq!(content.len(), 1);
-    let text = content[0].text.as_ref().unwrap();
+    let LegacyResourceContent::Text { text, .. } = &content[0] else {
+        return;
+    };
     assert!(text.contains("日本語"));
     assert!(text.contains("中文"));
     assert!(text.contains("العربية"));
@@ -3050,7 +3073,9 @@ fn resource_read_large_content() {
     let content = client.read_resource("data://large").unwrap();
 
     assert_eq!(content.len(), 1);
-    let text = content[0].text.as_ref().unwrap();
+    let LegacyResourceContent::Text { text, .. } = &content[0] else {
+        return;
+    };
     assert_eq!(text.len(), 100_000);
     assert!(text.chars().all(|c| c == 'x'));
 }
@@ -3064,9 +3089,17 @@ fn resource_read_multiple_content_items() {
 
     assert_eq!(content.len(), 3, "Should return 3 content items");
 
-    assert_eq!(content[0].text.as_deref(), Some("Part 1"));
-    assert_eq!(content[1].text.as_deref(), Some("Part 2"));
-    assert_eq!(content[2].text.as_deref(), Some("Part 3"));
+    let [
+        LegacyResourceContent::Text { text: first, .. },
+        LegacyResourceContent::Text { text: second, .. },
+        LegacyResourceContent::Text { text: third, .. },
+    ] = content.as_slice()
+    else {
+        return;
+    };
+    assert_eq!(first, "Part 1");
+    assert_eq!(second, "Part 2");
+    assert_eq!(third, "Part 3");
 }
 
 #[test]
@@ -3121,9 +3154,18 @@ fn resource_read_sequential() {
     let content2 = client.read_resource("data://config.json").unwrap();
     let content3 = client.read_resource("text://unicode").unwrap();
 
-    assert_eq!(content1[0].text.as_deref(), Some("Hello, World!"));
-    assert!(content2[0].text.as_ref().unwrap().contains("test-config"));
-    assert!(content3[0].text.as_ref().unwrap().contains("日本語"));
+    let LegacyResourceContent::Text { text: text1, .. } = &content1[0] else {
+        return;
+    };
+    let LegacyResourceContent::Text { text: text2, .. } = &content2[0] else {
+        return;
+    };
+    let LegacyResourceContent::Text { text: text3, .. } = &content3[0] else {
+        return;
+    };
+    assert_eq!(text1, "Hello, World!");
+    assert!(text2.contains("test-config"));
+    assert!(text3.contains("日本語"));
 }
 
 #[test]
