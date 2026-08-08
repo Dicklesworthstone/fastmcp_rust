@@ -297,8 +297,8 @@ impl ResultMeta {
     /// Attaches final common metadata without synthesizing it when absent.
     #[must_use]
     pub fn with_metadata(mut self, metadata: OpenMetadata) -> Self {
-        let exact =
-            exact_json_from_serde_unchecked(&serde_json::Value::Object(metadata.entries().clone()));
+        let object = metadata.entries().clone().into_iter().collect();
+        let exact = exact_json_from_serde_unchecked(&serde_json::Value::Object(object));
         let ExactJsonValue::Object(exact_meta) = exact else {
             unreachable!("metadata always encodes as an object");
         };
@@ -1029,9 +1029,8 @@ fn append_result_meta(members: &mut Vec<ExactJsonMember>, meta: &ResultMeta) {
             name: "_meta".to_owned(),
             value: meta.exact_meta.as_ref().map_or_else(
                 || {
-                    exact_json_from_serde_unchecked(&serde_json::Value::Object(
-                        value.entries().clone(),
-                    ))
+                    let object = value.entries().clone().into_iter().collect();
+                    exact_json_from_serde_unchecked(&serde_json::Value::Object(object))
                 },
                 |exact| ExactJsonValue::Object(exact.clone()),
             ),

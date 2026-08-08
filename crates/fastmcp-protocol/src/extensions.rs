@@ -1855,11 +1855,11 @@ mod tests {
             )]),
         };
         let local = ExtensionLocalEnablement::default();
-        let mut resolver_calls = 0;
+        let resolver_calls = std::cell::Cell::new(0);
         let mut resolver = |_descriptor: &ExtensionDescriptor,
                             _client: &ExtensionSettings,
                             _server: &ExtensionSettings| {
-            resolver_calls += 1;
+            resolver_calls.set(resolver_calls.get() + 1);
             Ok(ExtensionSettings::new(json!({})).expect("bounded effective settings"))
         };
 
@@ -1872,7 +1872,7 @@ mod tests {
                 &mut resolver,
             )
             .expect("registered descriptors remain inactive without developer opt-in");
-        assert_eq!(resolver_calls, 0);
+        assert_eq!(resolver_calls.get(), 0);
         assert_eq!(
             unopted.inactive_reason(&id),
             Some(ExtensionInactiveReason::LocallyDisabled)
@@ -1893,7 +1893,7 @@ mod tests {
             Err(ExtensionNegotiationError::LegacyProtocolExcluded),
             "changing only the negotiation era must reject exact legacy before resolver execution"
         );
-        assert_eq!(resolver_calls, 0);
+        assert_eq!(resolver_calls.get(), 0);
         assert_eq!(registry.receipt(), Some(&receipt));
     }
 
