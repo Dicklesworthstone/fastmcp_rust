@@ -19,9 +19,10 @@ use crate::proxy::{ProxyPromptHandler, ProxyResourceHandler, ProxyToolHandler};
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
 use crate::{
-    AuthProvider, DuplicateBehavior, ExtensionHandlerRegistry, FinalTaskRuntime, HttpServerConfig,
-    LifespanHooks, LoggingConfig, PromptHandler, ProxyCatalog, ProxyClient, ResourceHandler,
-    Router, Server, ServerExtensionConfigurationError, ServerExtensionRuntime, ToolHandler,
+    AuthProvider, DuplicateBehavior, ExtensionHandlerRegistry, FinalSubscriptionRegistry,
+    FinalTaskRuntime, HttpServerConfig, LifespanHooks, LoggingConfig, PromptHandler, ProxyCatalog,
+    ProxyClient, ResourceHandler, Router, Server, ServerExtensionConfigurationError,
+    ServerExtensionRuntime, ToolHandler,
 };
 
 /// Default request timeout in seconds.
@@ -1261,6 +1262,7 @@ impl ServerBuilder {
             http_config: self.http_config,
             extension_runtime,
             final_task_runtime: self.final_task_runtime,
+            final_subscriptions: Arc::new(FinalSubscriptionRegistry::default()),
         }
     }
 }

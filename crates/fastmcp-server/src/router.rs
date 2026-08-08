@@ -1409,24 +1409,32 @@ impl Router {
     /// Returns the immutable behavior registry for final server discovery.
     ///
     /// This records only APIs backed by this router's installed catalog. The
-    /// modern stateless dispatcher has no logging-request emitter,
-    /// list-change producer, subscription listener, or resource-update
-    /// delivery path, so none of those behaviors can be advertised merely
-    /// because adjacent legacy code compiled.
+    /// The server composition supplies final subscription execution and
+    /// publishes catalog/resource changes through its request-owned listener
+    /// registry. This router records the catalog branches that can therefore
+    /// be selected by those final filters; it still does not advertise the
+    /// removed logging-request emitter.
     #[must_use]
     pub(crate) fn server_discovery_behavior_registry(&self) -> ServerBehaviorRegistry {
-        let mut behaviors = Vec::with_capacity(4);
+        let mut behaviors = Vec::with_capacity(11);
+        behaviors.push(ServerBehavior::SubscriptionsListen);
         if self.completion_handler.is_some() {
             behaviors.push(ServerBehavior::CompletionComplete);
         }
         if !self.tool_order.is_empty() {
             behaviors.push(ServerBehavior::ToolsList);
+            behaviors.push(ServerBehavior::ToolsListChangedNotification);
         }
         if !self.resource_order.is_empty() || !self.resource_template_order.is_empty() {
             behaviors.push(ServerBehavior::ResourcesList);
+            behaviors.push(ServerBehavior::ResourcesListChangedNotification);
+        }
+        if !self.resource_order.is_empty() {
+            behaviors.push(ServerBehavior::ResourceUpdateDelivery);
         }
         if !self.prompt_order.is_empty() {
             behaviors.push(ServerBehavior::PromptsList);
+            behaviors.push(ServerBehavior::PromptsListChangedNotification);
         }
         ServerBehaviorRegistry::from_behaviors(behaviors)
     }

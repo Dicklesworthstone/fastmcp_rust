@@ -158,6 +158,7 @@ use fastmcp_core::{
     McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
+use fastmcp_protocol::common_types::Implementation;
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, ExtensionNegotiationError, ExtensionSettingsCompatibilityResolver,
 };
@@ -169,16 +170,20 @@ use fastmcp_protocol::protocol_policy::{
     ProtocolPolicy, StdioEraClassifier, StdioEraDecision, StdioOpeningFrame,
 };
 use fastmcp_protocol::{
-    CallToolParams, CancelledParams, ClientExtensionDiscovery, CorrelationKey, DiscoveryCacheHints,
-    ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionId, ExtensionRegistryError,
-    ExtensionRegistryReceipt, ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY,
-    GetPromptParams, InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
-    ListToolsParams, LogLevel, LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES, ProgressMarker,
-    Prompt, ReadResourceParams, RequestId, Resource, ResourceTemplate, SERVER_DISCOVER_METHOD,
-    ServerCapabilities, ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
-    ServerExtensionDiscovery, ServerInfo, ServerInstructions, SetLogLevelParams,
-    SubscribeResourceParams, Tool, UnsubscribeResourceParams,
+    CallToolParams, CancelledParams, ClientExtensionDiscovery, CompleteResult, CoreResult,
+    CorrelationKey, DiscoveryCacheHints, ExtensionDescriptor, ExtensionDescriptorRegistry,
+    ExtensionId, ExtensionRegistryError, ExtensionRegistryReceipt, ExtensionSettings,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SERVER_INFO_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
+    FinalCoreResult, FinalSubscriptionsAcknowledgedNotificationParams,
+    FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, GetPromptParams,
+    InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel,
+    LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES, OpenMetadata, ProgressMarker, Prompt,
+    ReadResourceParams, RequestId, Resource, ResourceTemplate, ResultMeta, SERVER_DISCOVER_METHOD,
+    SUBSCRIPTIONS_LISTEN, ServerCapabilities, ServerDiscoverCapabilities, ServerDiscoverRequest,
+    ServerDiscoverResult, ServerExtensionDiscovery, ServerInfo, ServerInstructions,
+    ServerNotification, SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
+    UnsubscribeResourceParams,
 };
 use legacy_2024::{
     Legacy2024AdapterError, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Outbound,
@@ -961,6 +966,7 @@ fn is_request_only_method(method: &str) -> bool {
             | "resources/unsubscribe"
             | "prompts/list"
             | "prompts/get"
+            | SUBSCRIPTIONS_LISTEN
             | "tasks/list"
             | "tasks/get"
             | "tasks/cancel"
@@ -1912,6 +1918,290 @@ pub enum ServerHttpEndpointResponse {
     LegacySse(DualEraHttpLegacySseResponse),
 }
 
+/// Upper bound for live final subscription streams owned by one server.
+///
+/// Each entry retains only a selected filter, request ID, and a transport
+/// notification callback. The callback remains owned by the originating
+/// request transport; this registry never creates a background runtime.
+const MAX_FINAL_SUBSCRIPTION_STREAMS: usize = 64;
+
+/// A server-wide registry of request-owned final subscription streams.
+///
+/// Stdio and modern HTTP both install the same entry after their mandatory
+/// acknowledgement has been sent. Events are cloned and tagged per entry so a
+/// notification can never escape its accepted filter or correlation ID.
+#[derive(Default)]
+struct FinalSubscriptionRegistry {
+    inner: Mutex<FinalSubscriptionRegistryState>,
+    terminating: AtomicBool,
+}
+
+#[derive(Default)]
+struct FinalSubscriptionRegistryState {
+    next_key: usize,
+    entries: HashMap<usize, FinalSubscriptionEntry>,
+}
+
+#[derive(Clone)]
+struct FinalSubscriptionEntry {
+    subscription_id: RequestId,
+    accepted_filter: SubscriptionFilter,
+    notification_sender: NotificationSender,
+    acknowledged: bool,
+}
+
+/// Removes one subscription entry when its request exits for any reason.
+struct FinalSubscriptionLease {
+    registry: Arc<FinalSubscriptionRegistry>,
+    key: usize,
+}
+
+impl Drop for FinalSubscriptionLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .registry
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.entries.remove(&self.key);
+    }
+}
+
+impl FinalSubscriptionRegistry {
+    fn open(
+        self: &Arc<Self>,
+        subscription_id: RequestId,
+        requested: SubscriptionFilter,
+        notification_sender: NotificationSender,
+    ) -> McpResult<FinalSubscriptionLease> {
+        if subscription_id.validate().is_err() {
+            return Err(McpError::invalid_request(
+                "subscriptions/listen requires a valid JSON-RPC request id",
+            ));
+        }
+        if self.terminating.load(Ordering::Acquire) {
+            return Err(McpError::request_cancelled());
+        }
+
+        let accepted_filter = accepted_subscription_filter(&requested);
+        let acknowledgement =
+            subscription_acknowledgement(subscription_id.clone(), accepted_filter.clone())?;
+        let acknowledgement = acknowledgement.encode().map_err(|error| {
+            McpError::internal_error(format!(
+                "failed to encode subscriptions/listen acknowledgement: {error}"
+            ))
+        })?;
+
+        let key = {
+            let mut state = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.terminating.load(Ordering::Acquire) {
+                return Err(McpError::request_cancelled());
+            }
+            if state.entries.len() >= MAX_FINAL_SUBSCRIPTION_STREAMS {
+                return Err(McpError::new(
+                    McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE),
+                    "final subscription stream capacity exhausted",
+                ));
+            }
+            let mut key = state.next_key;
+            while state.entries.contains_key(&key) {
+                key = key.checked_add(1).unwrap_or(0);
+            }
+            state.next_key = key.checked_add(1).unwrap_or(0);
+            let previous = state.entries.insert(
+                key,
+                FinalSubscriptionEntry {
+                    subscription_id,
+                    accepted_filter,
+                    notification_sender: notification_sender.clone(),
+                    acknowledged: false,
+                },
+            );
+            debug_assert!(previous.is_none());
+            key
+        };
+
+        // The entry remains non-deliverable until this callback has received
+        // the acknowledgement. Concurrent publishers therefore cannot put an
+        // event in front of the mandatory first stream message.
+        notification_sender(acknowledgement);
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.entries.get_mut(&key) {
+            entry.acknowledged = true;
+        }
+        drop(state);
+
+        Ok(FinalSubscriptionLease {
+            registry: Arc::clone(self),
+            key,
+        })
+    }
+
+    fn publish(&self, notification: ServerNotification) -> McpResult<usize> {
+        if !is_final_subscription_event(&notification) {
+            return Err(McpError::invalid_params(
+                "only final catalog or resource change notifications may use subscriptions/listen",
+            ));
+        }
+        let targets = {
+            let state = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .entries
+                .values()
+                .filter(|entry| {
+                    entry.acknowledged
+                        && subscription_filter_accepts(&entry.accepted_filter, &notification)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        // Author all recipient-specific metadata before sending the first
+        // callback. If one entry cannot be represented within the bounded
+        // metadata contract, no recipient observes a partial publication.
+        let mut deliveries = Vec::with_capacity(targets.len());
+        for entry in targets {
+            let event = tag_subscription_notification(&notification, &entry.subscription_id)?;
+            let wire = event.encode().map_err(|error| {
+                McpError::internal_error(format!(
+                    "failed to encode final subscription notification: {error}"
+                ))
+            })?;
+            deliveries.push((entry.notification_sender, wire));
+        }
+        let count = deliveries.len();
+        for (sender, notification) in deliveries {
+            sender(notification);
+        }
+        Ok(count)
+    }
+
+    fn terminate(&self) -> usize {
+        self.terminating.store(true, Ordering::Release);
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len()
+    }
+
+    fn is_terminating(&self) -> bool {
+        self.terminating.load(Ordering::Acquire)
+    }
+}
+
+fn accepted_subscription_filter(requested: &SubscriptionFilter) -> SubscriptionFilter {
+    SubscriptionFilter {
+        prompts_list_changed: requested.prompts_list_changed.filter(|accepted| *accepted),
+        resource_subscriptions: requested.resource_subscriptions.clone(),
+        resources_list_changed: requested
+            .resources_list_changed
+            .filter(|accepted| *accepted),
+        tools_list_changed: requested.tools_list_changed.filter(|accepted| *accepted),
+        // Unknown extension filter keys remain schema-open but are never
+        // activated by the core server execution path.
+        additional: BTreeMap::new(),
+    }
+}
+
+fn subscription_metadata(
+    existing: Option<OpenMetadata>,
+    subscription_id: &RequestId,
+) -> McpResult<OpenMetadata> {
+    let mut entries = existing.map_or_else(BTreeMap::new, |metadata| metadata.entries().clone());
+    entries.insert(
+        FINAL_SUBSCRIPTION_ID_META_KEY.to_owned(),
+        serde_json::to_value(subscription_id).map_err(McpError::from)?,
+    );
+    OpenMetadata::try_from_entries(entries)
+        .map_err(|_| McpError::invalid_params("invalid final subscription metadata"))
+}
+
+fn subscription_acknowledgement(
+    subscription_id: RequestId,
+    accepted_filter: SubscriptionFilter,
+) -> McpResult<ServerNotification> {
+    Ok(ServerNotification::SubscriptionsAcknowledged(
+        FinalSubscriptionsAcknowledgedNotificationParams {
+            meta: Some(subscription_metadata(None, &subscription_id)?),
+            notifications: accepted_filter,
+            additional: BTreeMap::new(),
+        },
+    ))
+}
+
+fn is_final_subscription_event(notification: &ServerNotification) -> bool {
+    matches!(
+        notification,
+        ServerNotification::ResourcesListChanged(_)
+            | ServerNotification::ToolsListChanged(_)
+            | ServerNotification::PromptsListChanged(_)
+            | ServerNotification::ResourceUpdated(_)
+    )
+}
+
+fn subscription_filter_accepts(
+    filter: &SubscriptionFilter,
+    notification: &ServerNotification,
+) -> bool {
+    match notification {
+        ServerNotification::ResourcesListChanged(_) => filter.resources_list_changed == Some(true),
+        ServerNotification::ToolsListChanged(_) => filter.tools_list_changed == Some(true),
+        ServerNotification::PromptsListChanged(_) => filter.prompts_list_changed == Some(true),
+        ServerNotification::ResourceUpdated(params) => filter
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| uris.iter().any(|uri| uri == params.uri.as_str())),
+        ServerNotification::Cancelled(_)
+        | ServerNotification::Progress(_)
+        | ServerNotification::Message(_)
+        | ServerNotification::SubscriptionsAcknowledged(_) => false,
+    }
+}
+
+fn tag_subscription_notification(
+    notification: &ServerNotification,
+    subscription_id: &RequestId,
+) -> McpResult<ServerNotification> {
+    match notification {
+        ServerNotification::ResourcesListChanged(params) => {
+            let mut params = params.clone().unwrap_or_default();
+            params.meta = Some(subscription_metadata(params.meta, subscription_id)?);
+            Ok(ServerNotification::ResourcesListChanged(Some(params)))
+        }
+        ServerNotification::ToolsListChanged(params) => {
+            let mut params = params.clone().unwrap_or_default();
+            params.meta = Some(subscription_metadata(params.meta, subscription_id)?);
+            Ok(ServerNotification::ToolsListChanged(Some(params)))
+        }
+        ServerNotification::PromptsListChanged(params) => {
+            let mut params = params.clone().unwrap_or_default();
+            params.meta = Some(subscription_metadata(params.meta, subscription_id)?);
+            Ok(ServerNotification::PromptsListChanged(Some(params)))
+        }
+        ServerNotification::ResourceUpdated(params) => {
+            let mut params = params.clone();
+            params.meta = Some(subscription_metadata(params.meta, subscription_id)?);
+            Ok(ServerNotification::ResourceUpdated(params))
+        }
+        ServerNotification::Cancelled(_)
+        | ServerNotification::Progress(_)
+        | ServerNotification::Message(_)
+        | ServerNotification::SubscriptionsAcknowledged(_) => Err(McpError::invalid_params(
+            "notification does not belong on a final subscription stream",
+        )),
+    }
+}
+
 /// Cancellation authority deliberately kept outside the session mutex.
 ///
 /// A legacy client sends cancellation on a separate POST connection while the
@@ -2636,9 +2926,14 @@ async fn send_modern_sse_stream(
                 InboundRequestTransport::Http,
             );
             let notification_cx = request_cx.clone();
+            let notification_cancellation = response_sender.request_cancellation();
             let notification_sender: NotificationSender = Arc::new(move |notification| {
-                let _ =
-                    notification_response_sender.send_notification(&notification_cx, notification);
+                if notification_response_sender
+                    .send_notification(&notification_cx, notification)
+                    .is_err()
+                {
+                    notification_cancellation.cancel();
+                }
             });
             let cancellation = response_sender.request_cancellation();
             let response = Arc::clone(&server)
@@ -2925,6 +3220,8 @@ pub struct Server {
     extension_runtime: Option<Arc<ServerExtensionRuntime>>,
     /// Application-owned final Tasks state retained for the caller's supervisor.
     final_task_runtime: Option<FinalTaskRuntime>,
+    /// Request-owned final subscription streams shared by stdio and HTTP.
+    final_subscriptions: Arc<FinalSubscriptionRegistry>,
 }
 
 impl Server {
@@ -2985,6 +3282,35 @@ impl Server {
     #[must_use]
     pub fn final_task_runtime(&self) -> Option<&FinalTaskRuntime> {
         self.final_task_runtime.as_ref()
+    }
+
+    /// Publishes one final catalog or resource change notification to every
+    /// live `subscriptions/listen` request whose accepted filter matches it.
+    ///
+    /// The server tags each delivered notification with that request's exact
+    /// subscription ID. Request-scoped notifications such as progress and
+    /// messages are rejected rather than being broadcast.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` when `notification` is not a final
+    /// subscription event, or an internal error when it cannot be encoded.
+    pub fn publish_subscription_notification(
+        &self,
+        notification: ServerNotification,
+    ) -> McpResult<usize> {
+        self.final_subscriptions.publish(notification)
+    }
+
+    /// Begins graceful termination for all live final subscription streams.
+    ///
+    /// Each request-owned stream observes this transition, emits its terminal
+    /// `CompleteResult`, and removes itself. Transport disconnect and explicit
+    /// request cancellation instead remove the stream without a terminal
+    /// response because the peer can no longer consume it.
+    #[must_use]
+    pub fn terminate_subscription_streams(&self) -> usize {
+        self.final_subscriptions.terminate()
     }
 
     /// Negotiates currently advertised client extension settings against this server.
@@ -3644,6 +3970,15 @@ impl Server {
                     Err(error) => Err(error),
                 }
             }
+            None if request.method == SUBSCRIPTIONS_LISTEN => {
+                self.dispatch_final_subscriptions_listen(
+                    &request_ctx,
+                    &request,
+                    request_cancellation.clone(),
+                    notification_sender,
+                )
+                .await
+            }
             None => match Arc::clone(&self.router)
                 .dispatch_stateless_owned(request_ctx.clone(), request.clone())
                 .await
@@ -3694,6 +4029,103 @@ impl Server {
                 )
             }
         })
+    }
+
+    /// Executes one final `subscriptions/listen` request until the server
+    /// begins graceful stream termination or the request transport is
+    /// cancelled. The registry lease is intentionally scoped to this future:
+    /// cancellation, disconnect, and every error path remove the entry before
+    /// the request response path can run.
+    async fn dispatch_final_subscriptions_listen(
+        self: &Arc<Self>,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+        request_cancellation: McpRequestCancellation,
+        notification_sender: NotificationSender,
+    ) -> McpResult<serde_json::Value> {
+        let subscription_id = request.id.clone().ok_or_else(|| {
+            McpError::invalid_request("subscriptions/listen must carry a JSON-RPC request id")
+        })?;
+        let params = request
+            .params
+            .clone()
+            .ok_or_else(|| McpError::invalid_params("subscriptions/listen requires parameters"))
+            .and_then(|params| {
+                serde_json::from_value::<FinalSubscriptionsListenParams>(params)
+                    .map_err(|error| McpError::invalid_params(error.to_string()))
+            })?;
+        let protocol_version = params.meta.protocol_version().map_err(|_| {
+            McpError::invalid_params("subscriptions/listen has invalid protocol metadata")
+        })?;
+        let client_capabilities = params.meta.client_capabilities().map_err(|_| {
+            McpError::invalid_params("subscriptions/listen has invalid client capabilities")
+        })?;
+        if protocol_version != Some(MODERN_PROTOCOL_VERSION) || client_capabilities.is_none() {
+            return Err(McpError::invalid_params(
+                "subscriptions/listen requires exact final request metadata",
+            ));
+        }
+
+        if request_cancellation.is_cancel_requested() || request_ctx.ensure_live().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+
+        let _lease = self.final_subscriptions.open(
+            subscription_id.clone(),
+            params.notifications,
+            notification_sender,
+        )?;
+
+        while !self.final_subscriptions.is_terminating() {
+            if request_cancellation.is_cancel_requested() || request_ctx.ensure_live().is_err() {
+                return Err(McpError::request_cancelled());
+            }
+            // The registry is intentionally transport-neutral. Polling uses
+            // the caller-owned clock and never creates a detached wake task;
+            // a request cancellation wakes its transport-owned dispatch task.
+            asupersync::time::sleep(request_ctx.cx().now(), Duration::from_millis(1)).await;
+        }
+
+        if request_cancellation.is_cancel_requested() || request_ctx.ensure_live().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        self.final_subscription_complete_result(&subscription_id)
+    }
+
+    fn final_subscription_complete_result(
+        &self,
+        subscription_id: &RequestId,
+    ) -> McpResult<serde_json::Value> {
+        let server_info =
+            Implementation::try_new(self.info.name.clone(), self.info.version.clone())
+                .map_err(|_| McpError::internal_error("server identity is invalid"))?;
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            FINAL_SERVER_INFO_META_KEY.to_owned(),
+            serde_json::to_value(&server_info).map_err(McpError::from)?,
+        );
+        metadata.insert(
+            FINAL_SUBSCRIPTION_ID_META_KEY.to_owned(),
+            serde_json::to_value(subscription_id).map_err(McpError::from)?,
+        );
+        let metadata = OpenMetadata::try_from_entries(metadata)
+            .map_err(|_| McpError::internal_error("final subscription metadata is invalid"))?;
+        let result = CompleteResult::new(
+            FinalSubscriptionsListenResult {},
+            ResultMeta::server_generated(server_info).with_metadata(metadata),
+        );
+        let wire = CoreResult::Final(FinalCoreResult::SubscriptionsListen {
+            result,
+            subscription_id: subscription_id.clone(),
+            diagnostic: None,
+        })
+        .encode()
+        .map_err(|error| {
+            McpError::internal_error(format!(
+                "failed to encode final subscriptions/listen completion: {error}"
+            ))
+        })?;
+        serde_json::from_str(&wire).map_err(McpError::from)
     }
 
     async fn dispatch_with_protocol_policy_owned(
@@ -5642,13 +6074,47 @@ impl Server {
                                                 InboundRequestTransport::Stdio,
                                             );
                                             let started = Instant::now();
-                                            let response = request_server
-                                                .dispatch_with_protocol_policy_and_cancellation(
-                                                    request_server.protocol_policy,
-                                                    &inbound,
-                                                    &request,
-                                                    Some(request_cancellation.clone()),
+                                            let response = if request.method == SUBSCRIPTIONS_LISTEN {
+                                                let notification_send = Arc::clone(&request_send);
+                                                let notification_cx = request_cx.clone();
+                                                let notification_cancellation =
+                                                    request_cancellation.clone();
+                                                let notification_sender: NotificationSender = Arc::new(
+                                                    move |notification| {
+                                                        let mut send_guard = notification_send
+                                                            .lock()
+                                                            .unwrap_or_else(
+                                                                std::sync::PoisonError::into_inner,
+                                                            );
+                                                        if send_guard(
+                                                            &notification_cx,
+                                                            &JsonRpcMessage::Request(notification),
+                                                        )
+                                                        .is_err()
+                                                        {
+                                                            notification_cancellation.cancel();
+                                                        }
+                                                    },
                                                 );
+                                                block_on(
+                                                    Arc::clone(&request_server)
+                                                        .dispatch_with_protocol_policy_owned(
+                                                            request_server.protocol_policy,
+                                                            &inbound,
+                                                            request.clone(),
+                                                            request_cancellation.clone(),
+                                                            notification_sender,
+                                                        ),
+                                                )
+                                            } else {
+                                                request_server
+                                                    .dispatch_with_protocol_policy_and_cancellation(
+                                                        request_server.protocol_policy,
+                                                        &inbound,
+                                                        &request,
+                                                        Some(request_cancellation.clone()),
+                                                    )
+                                            };
                                             let send_result = response.map_or(Ok(()), |mut response| {
                                                 let mut send_guard = request_send
                                                     .lock()
@@ -16120,6 +16586,300 @@ mod lib_unit_tests {
         assert!(
             error.message.contains("HTTP listener bind failed"),
             "the bind failure must report the live listener boundary: {error:?}"
+        );
+    }
+
+    #[test]
+    fn final_subscription_acknowledges_filters_tags_and_releases_request_owned_state() {
+        let server = Server::new("final-subscription-stream-test", "1.0.0").build();
+        let registry = Arc::clone(&server.final_subscriptions);
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let subscription_id = RequestId::String("subscription-71".to_owned());
+        let lease = registry
+            .open(
+                subscription_id.clone(),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    resources_list_changed: Some(false),
+                    ..SubscriptionFilter::default()
+                },
+                sender,
+            )
+            .expect("final subscription should admit a bounded stream");
+
+        let acknowledgement = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first()
+            .cloned()
+            .expect("acknowledgement must be the first stream frame");
+        let ServerNotification::SubscriptionsAcknowledged(acknowledgement) =
+            ServerNotification::decode(&acknowledgement)
+                .expect("acknowledgement must use the exact final server union")
+        else {
+            panic!("first subscription frame must be an acknowledgement");
+        };
+        assert_eq!(acknowledgement.notifications.tools_list_changed, Some(true));
+        assert_eq!(acknowledgement.notifications.resources_list_changed, None);
+        let acknowledged_id: RequestId = serde_json::from_value(
+            acknowledgement
+                .meta
+                .as_ref()
+                .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                .cloned()
+                .expect("acknowledgement must carry its subscription id"),
+        )
+        .expect("subscription id metadata must retain the JSON-RPC id");
+        assert_eq!(acknowledged_id, subscription_id);
+
+        assert_eq!(
+            server
+                .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+                .expect("selected catalog event should publish"),
+            1
+        );
+        assert_eq!(
+            server
+                .publish_subscription_notification(ServerNotification::ResourcesListChanged(None))
+                .expect("unselected catalog event should be safely filtered"),
+            0
+        );
+        let delivered = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(1)
+            .cloned()
+            .expect("selected event must follow acknowledgement");
+        let ServerNotification::ToolsListChanged(Some(delivered)) =
+            ServerNotification::decode(&delivered)
+                .expect("delivered event must use the exact final server union")
+        else {
+            panic!("selected event must remain a tools/list_changed notification");
+        };
+        let delivered_id: RequestId = serde_json::from_value(
+            delivered
+                .meta
+                .as_ref()
+                .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                .cloned()
+                .expect("selected event must carry its subscription id"),
+        )
+        .expect("delivery metadata must retain the JSON-RPC id");
+        assert_eq!(delivered_id, subscription_id);
+
+        drop(lease);
+        assert!(
+            registry
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .is_empty(),
+            "request completion or cancellation must release the subscription entry"
+        );
+    }
+
+    #[test]
+    fn final_subscription_rejects_request_scoped_message_without_delivery() {
+        use fastmcp_protocol::{FinalLogMessageParams, LoggingLevel};
+
+        let server = Server::new("final-subscription-rejection-test", "1.0.0").build();
+        let registry = Arc::clone(&server.final_subscriptions);
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let _lease = registry
+            .open(
+                RequestId::Number(72),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                sender,
+            )
+            .expect("selected catalog subscription should admit");
+        assert_eq!(
+            server
+                .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+                .expect("the selected event establishes the positive neighbor"),
+            1
+        );
+        let sent_before_rejection = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+
+        let error = server
+            .publish_subscription_notification(ServerNotification::Message(FinalLogMessageParams {
+                level: LoggingLevel::Info,
+                logger: None,
+                data: serde_json::json!({"message": "request scoped"}),
+                meta: None,
+                additional: BTreeMap::new(),
+            }))
+            .expect_err("changing only the notification category must reject request-scoped logs");
+
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            sent_before_rejection,
+            "rejected request-scoped notifications must not mutate the stream"
+        );
+    }
+
+    #[test]
+    fn final_subscription_terminal_result_is_complete_and_correlated() {
+        use fastmcp_protocol::CoreRequest;
+
+        let server = Server::new("final-subscriptions-test", "1.0.0").build();
+        let subscription_id = RequestId::String("subscription-terminal".to_owned());
+        let terminal = server
+            .final_subscription_complete_result(&subscription_id)
+            .expect("terminal result should encode through the final result algebra");
+        assert_eq!(
+            terminal.get("resultType"),
+            Some(&serde_json::json!("complete"))
+        );
+        assert_eq!(
+            terminal
+                .get("_meta")
+                .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY)),
+            Some(&serde_json::to_value(&subscription_id).expect("id must serialize"))
+        );
+
+        let request_metadata = OpenMetadata::try_from_entries([
+            (
+                "io.modelcontextprotocol/protocolVersion".to_owned(),
+                serde_json::json!(MODERN_PROTOCOL_VERSION),
+            ),
+            (
+                FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
+                serde_json::json!({}),
+            ),
+        ])
+        .expect("final request metadata must be valid");
+        let params = serde_json::to_value(FinalSubscriptionsListenParams {
+            meta: request_metadata,
+            notifications: SubscriptionFilter::default(),
+        })
+        .expect("final listen parameters must serialize");
+        let request =
+            CoreRequest::decode(ProtocolEra::Modern2026, SUBSCRIPTIONS_LISTEN, Some(&params))
+                .expect("final listen request must select the final result decoder");
+        let response = JsonRpcResponse::success(subscription_id.clone(), terminal);
+        let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
+            subscription_id: decoded_id,
+            ..
+        }) = request
+            .decode_response(&response)
+            .expect("terminal complete result must round-trip with its response id")
+        else {
+            panic!("subscriptions/listen must decode only its terminal final result");
+        };
+        assert_eq!(decoded_id, subscription_id);
+    }
+
+    #[test]
+    fn final_subscription_owned_dispatch_acknowledges_before_terminal_complete_response() {
+        let server = Arc::new(Server::new("final-listen-dispatch-test", "1.0.0").build());
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let notification_sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let subscription_id = RequestId::Number(73);
+        let metadata = OpenMetadata::try_from_entries([
+            (
+                "io.modelcontextprotocol/protocolVersion".to_owned(),
+                serde_json::json!(MODERN_PROTOCOL_VERSION),
+            ),
+            (
+                FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
+                serde_json::json!({}),
+            ),
+        ])
+        .expect("final request metadata must be valid");
+        let params = serde_json::to_value(FinalSubscriptionsListenParams {
+            meta: metadata,
+            notifications: SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+        })
+        .expect("final listen parameters must serialize");
+        let request =
+            JsonRpcRequest::new(SUBSCRIPTIONS_LISTEN, Some(params), subscription_id.clone());
+        let inbound = InboundRequestContext::new(
+            Cx::for_testing(),
+            request_id_to_u64(Some(&subscription_id)),
+            InboundRequestTransport::Http,
+        );
+        let terminator = {
+            let server = Arc::clone(&server);
+            let sent = Arc::clone(&sent);
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    if !sent
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_empty()
+                    {
+                        return server.terminate_subscription_streams() == 1;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                false
+            })
+        };
+        let response = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+            ProtocolPolicy::ModernOnly,
+            &inbound,
+            request,
+            McpRequestCancellation::new(),
+            notification_sender,
+        ))
+        .expect("final subscriptions/listen must produce a terminal response after shutdown");
+
+        assert!(
+            terminator
+                .join()
+                .expect("subscription terminator must not panic"),
+            "the listener must acknowledge before graceful termination"
+        );
+        let acknowledgement = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first()
+            .cloned()
+            .expect("listener must emit its acknowledgement before completing");
+        assert!(matches!(
+            ServerNotification::decode(&acknowledgement),
+            Ok(ServerNotification::SubscriptionsAcknowledged(_))
+        ));
+        assert_eq!(response.id, Some(subscription_id));
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("resultType")),
+            Some(&serde_json::json!("complete"))
         );
     }
 }
