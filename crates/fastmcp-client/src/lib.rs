@@ -60,10 +60,11 @@ pub use fastmcp_protocol::protocol_policy::{
     ProtocolPolicy, ProtocolVersion,
 };
 pub use fastmcp_protocol::{
-    CompleteResult, CoreResult, FinalCallToolResult, FinalCompletionArgument as CompletionArgument,
-    FinalCompletionContext as CompletionContext, FinalCompletionReference as CompletionReference,
-    FinalCoreResult, FinalGetPromptResult, FinalReadResourceResult, FinalSubscriptionsListenResult,
-    LegacyCoreResult, SubscriptionFilter,
+    CallToolResult, CompleteResult, CoreResult, FinalCallToolResult,
+    FinalCompletionArgument as CompletionArgument, FinalCompletionContext as CompletionContext,
+    FinalCompletionReference as CompletionReference, FinalCoreResult, FinalGetPromptResult,
+    FinalReadResourceResult, FinalSubscriptionsListenResult, GetPromptResult, LegacyCoreResult,
+    ReadResourceResult, SubscriptionFilter,
 };
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, LegacySseHttpClient,
@@ -102,18 +103,18 @@ use fastmcp_protocol::common_types::{
 use fastmcp_protocol::methods::{Final2026Peer, final_2026_07_28_method};
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::{
-    CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancelledParams,
-    ClientCapabilities, ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey,
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalLogMessageParams, FinalProgressNotificationParams,
-    FinalRequestMeta, FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams,
-    GetTaskParams, GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION,
-    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent,
-    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListResourceTemplatesParams,
-    ListResourcesParams, ListTasksParams, ListTasksResult, ListToolsParams, LogLevel,
-    LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, ReadResourceParams,
-    RequestId, RequestMeta, Resource, ResourceTemplate, ServerCapabilities, ServerInfo,
-    ServerNotification, SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo,
-    TaskResult, TaskStatus, Tool, ToolAnnotations,
+    CallToolParams, CancelTaskParams, CancelTaskResult, CancelledParams, ClientCapabilities,
+    ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey, FINAL_SUBSCRIPTION_ID_META_KEY,
+    FinalLogMessageParams, FinalProgressNotificationParams, FinalRequestMeta,
+    FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams, GetTaskParams,
+    GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION, JsonRpcError,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyPromptMessage,
+    LegacyResourceContent, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
+    ListTasksParams, ListTasksResult, ListToolsParams, LogLevel, LogMessageParams,
+    PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, ReadResourceParams, RequestId,
+    RequestMeta, Resource, ResourceTemplate, ServerCapabilities, ServerInfo, ServerNotification,
+    SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo, TaskResult,
+    TaskStatus, Tool, ToolAnnotations,
 };
 use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
 
@@ -3749,6 +3750,22 @@ impl Client {
         )))
     }
 
+    /// Admits an API that returns an exact legacy result payload.
+    ///
+    /// The selected era is immutable after initialization. Check it before
+    /// constructing request parameters or allocating a request ID so a modern
+    /// session cannot be silently projected into the legacy vocabulary.
+    fn require_legacy_exact_result_session(&mut self, method: &str) -> McpResult<()> {
+        self.ensure_initialized()?;
+        if self.session.selected_era() == Some(ProtocolEra::Legacy2024) {
+            return Ok(());
+        }
+
+        Err(McpError::invalid_params(format!(
+            "{method} exact legacy result is available only for MCP 2024-11-05"
+        )))
+    }
+
     fn record_initialization_failure(&mut self, error: McpError) -> McpError {
         self.initialization_error = Some(error.clone());
         self.terminate_connection(error)
@@ -4148,6 +4165,18 @@ impl Client {
             .ok_or_else(|| {
                 McpError::invalid_params(
                     "Method is not a supported core request in the negotiated era",
+                )
+            })?;
+        let params_value = core_request
+            .encode_params()
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "Client core request could not be encoded in the negotiated protocol era",
+                )
+            })?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Method has no parameter object in the negotiated protocol era",
                 )
             })?;
         let result = self.send_prepared_request(method, params_value)?;
@@ -4983,6 +5012,28 @@ impl Client {
         }
     }
 
+    /// Calls a tool and returns its exact MCP 2024-11-05 result payload.
+    ///
+    /// This retains legacy result metadata and all schema-legal open members
+    /// without projecting them into the final result vocabulary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before request mutation unless the negotiated session
+    /// is MCP 2024-11-05. It also returns an error when the request fails or
+    /// the peer contradicts the legacy `tools/call` result contract.
+    pub fn call_tool_legacy(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<CallToolResult> {
+        self.require_legacy_exact_result_session("tools/call")?;
+        match self.call_tool_typed(name, arguments)? {
+            CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => Ok(result),
+            _ => Err(unexpected_convenience_result("tools/call")),
+        }
+    }
+
     /// Calls a tool with the given arguments.
     ///
     /// # Errors
@@ -5132,6 +5183,18 @@ impl Client {
             .ok_or_else(|| {
                 McpError::invalid_params(
                     "Method is not a supported core request in the negotiated era",
+                )
+            })?;
+        let params_value = core_request
+            .encode_params()
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "Client core request could not be encoded in the negotiated protocol era",
+                )
+            })?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Method has no parameter object in the negotiated protocol era",
                 )
             })?;
         let result = self.send_prepared_request_with_progress(
@@ -5590,6 +5653,24 @@ impl Client {
         }
     }
 
+    /// Reads a resource and returns its exact MCP 2024-11-05 result payload.
+    ///
+    /// This retains legacy result metadata and all schema-legal open members
+    /// without projection into the final resource result vocabulary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before request mutation unless the negotiated session
+    /// is MCP 2024-11-05. It also returns an error when the request fails or
+    /// the peer contradicts the legacy `resources/read` result contract.
+    pub fn read_resource_legacy(&mut self, uri: &str) -> McpResult<ReadResourceResult> {
+        self.require_legacy_exact_result_session("resources/read")?;
+        match self.read_resource_typed(uri)? {
+            CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => Ok(result),
+            _ => Err(unexpected_convenience_result("resources/read")),
+        }
+    }
+
     /// Reads a resource by URI.
     ///
     /// # Errors
@@ -5711,6 +5792,29 @@ impl Client {
         }
     }
 
+    /// Gets a prompt and returns its exact MCP 2024-11-05 result payload.
+    ///
+    /// This retains legacy descriptions, result metadata, and all
+    /// schema-legal open members without projection into the final prompt
+    /// result vocabulary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before request mutation unless the negotiated session
+    /// is MCP 2024-11-05. It also returns an error when the request fails or
+    /// the peer contradicts the legacy `prompts/get` result contract.
+    pub fn get_prompt_legacy(
+        &mut self,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<GetPromptResult> {
+        self.require_legacy_exact_result_session("prompts/get")?;
+        match self.get_prompt_typed(name, arguments)? {
+            CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => Ok(result),
+            _ => Err(unexpected_convenience_result("prompts/get")),
+        }
+    }
+
     /// Gets a prompt with the given arguments.
     ///
     /// # Errors
@@ -5788,6 +5892,18 @@ impl Client {
             .ok_or_else(|| {
                 McpError::invalid_params(
                     "subscriptions/listen is not a supported core request in the negotiated era",
+                )
+            })?;
+        let params_value = core_request
+            .encode_params()
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "subscriptions/listen could not be encoded in the negotiated protocol era",
+                )
+            })?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "subscriptions/listen requires a parameter object in the negotiated protocol era",
                 )
             })?;
 
@@ -11641,6 +11757,64 @@ mod tests {
             Some(&serde_json::json!({"kept": true}))
         );
         client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_exact_legacy_tool_convenience_retains_the_pinned_result() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_typed_call_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
+
+        let result = client
+            .call_tool_legacy("echo", serde_json::json!({"text": "legacy"}))
+            .expect("the legacy convenience retains the full exact result");
+        assert_eq!(
+            result
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("io.fastmcp.result")),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            result.additional.get("io.fastmcp.resultExtension"),
+            Some(&serde_json::json!({"kept": true}))
+        );
+        let [LegacyContent::Text { additional, .. }] = result.content.as_slice() else {
+            panic!("the exact legacy result must retain its text content");
+        };
+        assert_eq!(
+            additional.get("io.fastmcp.extension"),
+            Some(&serde_json::json!({"kept": true}))
+        );
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_exact_legacy_tool_convenience_rejects_a_modern_session_before_request_mutation() {
+        let script = modern_typed_call_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"modern result"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the final client");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        let error = client
+            .call_tool_legacy("echo", serde_json::json!({"text": "modern"}))
+            .expect_err("changing only the selected era cannot project a final result to legacy");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        client.close().expect("modern client cleanup");
     }
 
     #[cfg(unix)]
