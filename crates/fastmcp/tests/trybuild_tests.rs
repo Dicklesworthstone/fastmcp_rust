@@ -660,6 +660,26 @@ fn assert_dual_era_facade_surface() {
     let _: Option<modern::ModernHttpConnectOutcome> = None;
     let _: Option<modern::ModernHttpClientError> = None;
     let _: Option<modern::ModernHttpSseResponseStream> = None;
+    let final_completion = modern::FinalCompletionParams {
+        meta: modern::OpenMetadata::default(),
+        reference: modern::FinalCompletionReference::Prompt {
+            name: "city".to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "prefix".to_owned(),
+            value: "bo".to_owned(),
+        },
+        context: Some(modern::FinalCompletionContext::default()),
+    };
+    let final_completion_result = modern::FinalCompletionResult {
+        completion: modern::CompletionValues {
+            values: vec!["boston".to_owned()],
+            total: Some(1),
+            has_more: Some(false),
+        },
+    };
+    assert_eq!(final_completion.argument.value, "bo");
+    assert_eq!(final_completion_result.completion.values[0], "boston");
     let requests = modern::MrtrInputRequests::new([(
         "roots".to_owned(),
         modern::MrtrInputRequest::roots(),
@@ -672,6 +692,24 @@ fn assert_dual_era_facade_surface() {
     let _: Option<legacy_2024::Legacy2024Lifecycle> = None;
     let _: Option<legacy_2024::LegacySseHttpClient> = None;
     let _: Option<legacy_2024::LegacySseHttpClientError> = None;
+    let legacy_completion = legacy_2024::LegacyCompletionParams {
+        reference: legacy_2024::LegacyCompletionReference::Resource {
+            uri: "resource://cities".to_owned(),
+        },
+        argument: legacy_2024::LegacyCompletionArgument {
+            name: "prefix".to_owned(),
+            value: "bo".to_owned(),
+        },
+    };
+    let legacy_completion_result = legacy_2024::LegacyCompletionResult {
+        completion: legacy_2024::CompletionValues {
+            values: vec!["boston".to_owned()],
+            total: Some(1),
+            has_more: Some(false),
+        },
+    };
+    assert_eq!(legacy_completion.argument.value, "bo");
+    assert_eq!(legacy_completion_result.completion.values[0], "boston");
 
     let uri = modern::AbsoluteUri::parse("https://mcp.example.test/final")
         .expect("facade final common types compile");
@@ -704,7 +742,11 @@ fn assert_prelude_dual_era_surface() {
     let _: Option<modern::CoreRequest> = None;
     let _: Option<modern::ModernHttpClient> = None;
     let _: Option<modern::MrtrExchangeRegistry> = None;
+    let _: Option<modern::FinalCompletionParams> = None;
+    let _: Option<modern::FinalCompletionResult> = None;
     let _: Option<legacy_2024::CallToolParams> = None;
+    let _: Option<legacy_2024::LegacyCompletionParams> = None;
+    let _: Option<legacy_2024::LegacyCompletionResult> = None;
     let _: Option<legacy_2024::LegacySseHttpClient> = None;
 
     fn assert_legacy_sse_method_signatures_from_prelude(
