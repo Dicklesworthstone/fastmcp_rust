@@ -2023,6 +2023,59 @@ impl McpContext {
         &self.cx
     }
 
+    /// Admits one final dual-era result as a four-valued MCP outcome.
+    ///
+    /// The result retains both its `Modern`/`Legacy` branch and the caller's
+    /// exact terminal-reason type. This context performs its normal request
+    /// liveness check before admitting a newly completed result, so ambient
+    /// `Cx` cancellation, request-local cancellation, lease closure, and
+    /// bounded framework admission continue to win without creating a runtime.
+    #[must_use]
+    pub fn final_result_outcome<TypedResult, LegacyResult, TerminalReason>(
+        &self,
+        result: crate::combinator::FinalRequestResult<TypedResult, LegacyResult, TerminalReason>,
+    ) -> crate::McpOutcome<
+        crate::combinator::FinalRequestResult<TypedResult, LegacyResult, TerminalReason>,
+    > {
+        if self.ensure_live().is_err() {
+            return Outcome::Cancelled(self.final_result_cancellation_reason());
+        }
+        Outcome::Ok(result)
+    }
+
+    /// Preserves an already-terminal request outcome while admitting an `Ok` final result.
+    ///
+    /// A supplied cancellation reason or panic payload is returned unchanged;
+    /// only an `Ok` result is subject to the context's current liveness check.
+    #[must_use]
+    pub fn adapt_final_request_outcome<TypedResult, LegacyResult, TerminalReason>(
+        &self,
+        outcome: crate::McpOutcome<
+            crate::combinator::FinalRequestResult<TypedResult, LegacyResult, TerminalReason>,
+        >,
+    ) -> crate::McpOutcome<
+        crate::combinator::FinalRequestResult<TypedResult, LegacyResult, TerminalReason>,
+    > {
+        match outcome {
+            Outcome::Ok(result) => self.final_result_outcome(result),
+            Outcome::Err(error) => Outcome::Err(error),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        }
+    }
+
+    fn final_result_cancellation_reason(&self) -> CancelReason {
+        self.cx.cancel_reason().unwrap_or_else(|| {
+            if self.request_cancellation.is_cancel_requested() {
+                CancelReason::user("FastMCP request-local cancellation")
+            } else if !self.request_scope_is_active() {
+                CancelReason::user("FastMCP request lease closed")
+            } else {
+                CancelReason::user("FastMCP request liveness rejected final result")
+            }
+        })
+    }
+
     // ========================================================================
     // Session State Access
     // ========================================================================
@@ -4910,5 +4963,78 @@ mod tests {
         let _ = ctx.cx();
         // trace() should not panic
         ctx.trace("test event");
+    }
+
+    #[test]
+    fn final_result_outcome_preserves_dual_era_and_terminal_reason() {
+        use crate::combinator::{DualEraFinalResult, FinalRequestResult};
+
+        let context = McpContext::new(Cx::for_testing(), 1);
+        let modern = context.final_result_outcome(
+            FinalRequestResult::<u64, String, &'static str>::modern("typed-final", 42),
+        );
+        let legacy =
+            context.final_result_outcome(FinalRequestResult::<u64, String, &'static str>::legacy(
+                "legacy-final",
+                "legacy wire result".to_owned(),
+            ));
+
+        let Outcome::Ok(modern) = modern else {
+            panic!("live context admits the modern final result");
+        };
+        assert_eq!(modern.terminal_reason(), &"typed-final");
+        assert_eq!(modern.result(), &DualEraFinalResult::Modern(42));
+
+        let Outcome::Ok(legacy) = legacy else {
+            panic!("live context admits the legacy final result");
+        };
+        assert_eq!(legacy.terminal_reason(), &"legacy-final");
+        assert_eq!(
+            legacy.result(),
+            &DualEraFinalResult::Legacy("legacy wire result".to_owned())
+        );
+    }
+
+    #[test]
+    fn final_result_outcome_cancellation_negative_preserves_cx_reason() {
+        use crate::combinator::FinalRequestResult;
+        use asupersync::types::CancelKind;
+
+        let cx = Cx::for_testing();
+        cx.cancel_with(CancelKind::Timeout, Some("final-result race"));
+        let expected_reason = cx
+            .cancel_reason()
+            .expect("cancel_with records the caller-owned terminal reason");
+        let context = McpContext::new(cx, 1);
+
+        let outcome = context.final_result_outcome(
+            FinalRequestResult::<u64, String, &'static str>::modern("typed-final", 42),
+        );
+
+        let Outcome::Cancelled(reason) = outcome else {
+            panic!("changing only caller cancellation rejects the same final result");
+        };
+        assert_eq!(reason, expected_reason);
+    }
+
+    #[test]
+    fn final_result_outcome_panic_negative_preserves_payload() {
+        use crate::combinator::FinalRequestResult;
+        use asupersync::types::{CancelKind, PanicPayload};
+
+        type Final = FinalRequestResult<u64, String, &'static str>;
+
+        let cx = Cx::for_testing();
+        cx.cancel_with(CancelKind::Timeout, Some("competing terminal state"));
+        let context = McpContext::new(cx, 1);
+        let payload = PanicPayload::new("final typed result panicked");
+        let source: crate::McpOutcome<Final> = Outcome::Panicked(payload.clone());
+
+        let outcome = context.adapt_final_request_outcome(source);
+
+        let Outcome::Panicked(actual) = outcome else {
+            panic!("changing only the source terminal state to panic preserves panic");
+        };
+        assert_eq!(actual, payload);
     }
 }

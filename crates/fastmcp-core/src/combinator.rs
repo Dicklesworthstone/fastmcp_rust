@@ -44,10 +44,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use asupersync::Cx;
 use asupersync::time::{BudgetTimeExt, Sleep};
+use asupersync::types::CancelReason;
+use asupersync::{Cx, Outcome};
 
-use crate::error::{McpError, McpErrorCode, McpResult};
+use crate::error::{McpError, McpErrorCode, McpOutcome, McpResult};
 
 // ============================================================================
 // Type Aliases
@@ -55,6 +56,115 @@ use crate::error::{McpError, McpErrorCode, McpResult};
 
 /// A boxed, pinned, sendable future for use with combinators.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The exact result branch selected by a dual-era request.
+///
+/// `Modern` carries the caller's final typed result, while `Legacy` carries
+/// the exact legacy result representation. The variant is intentionally kept
+/// until the request outcome is consumed; callers must not normalize one era
+/// into the other at this boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DualEraFinalResult<TypedResult, LegacyResult> {
+    /// A final result decoded under the modern protocol era.
+    Modern(TypedResult),
+    /// A final result retained under the legacy protocol era.
+    Legacy(LegacyResult),
+}
+
+/// A final dual-era result bound to the terminal reason selected by its owner.
+///
+/// `TerminalReason` is intentionally generic so a transport or executor can
+/// retain its own precise terminal classifier instead of translating it into a
+/// core-owned approximation. Cancellation and panic remain the corresponding
+/// four-valued [`McpOutcome`] variants and are never encoded as this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalRequestResult<TypedResult, LegacyResult, TerminalReason> {
+    result: DualEraFinalResult<TypedResult, LegacyResult>,
+    terminal_reason: TerminalReason,
+}
+
+impl<TypedResult, LegacyResult, TerminalReason>
+    FinalRequestResult<TypedResult, LegacyResult, TerminalReason>
+{
+    /// Binds a modern typed final result to its exact terminal reason.
+    #[must_use]
+    pub const fn modern(terminal_reason: TerminalReason, result: TypedResult) -> Self {
+        Self {
+            result: DualEraFinalResult::Modern(result),
+            terminal_reason,
+        }
+    }
+
+    /// Binds a legacy final result to its exact terminal reason.
+    #[must_use]
+    pub const fn legacy(terminal_reason: TerminalReason, result: LegacyResult) -> Self {
+        Self {
+            result: DualEraFinalResult::Legacy(result),
+            terminal_reason,
+        }
+    }
+
+    /// Returns the retained dual-era result branch.
+    #[must_use]
+    pub const fn result(&self) -> &DualEraFinalResult<TypedResult, LegacyResult> {
+        &self.result
+    }
+
+    /// Returns the caller-owned terminal reason without translating it.
+    #[must_use]
+    pub const fn terminal_reason(&self) -> &TerminalReason {
+        &self.terminal_reason
+    }
+
+    /// Splits the result branch from its terminal reason without conversion.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        DualEraFinalResult<TypedResult, LegacyResult>,
+        TerminalReason,
+    ) {
+        (self.result, self.terminal_reason)
+    }
+}
+
+/// Adapts a completed dual-era final result into a four-valued MCP outcome.
+///
+/// The caller-owned [`Cx`] is observed without creating a runtime. A pending
+/// cancellation wins over a newly completed final result and retains the
+/// runtime's exact [`CancelReason`] when it is available. The companion
+/// [`adapt_final_request_outcome`] preserves already-terminal cancellation,
+/// error, and panic outcomes without replacing them from the context.
+#[must_use]
+pub fn final_result_outcome<TypedResult, LegacyResult, TerminalReason>(
+    cx: &Cx,
+    result: FinalRequestResult<TypedResult, LegacyResult, TerminalReason>,
+) -> McpOutcome<FinalRequestResult<TypedResult, LegacyResult, TerminalReason>> {
+    if cx.is_cancel_requested() {
+        return Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
+            CancelReason::user("caller context cancelled without an attributed reason")
+        }));
+    }
+    Outcome::Ok(result)
+}
+
+/// Preserves every terminal variant while admitting an otherwise-complete final result.
+///
+/// In particular, an existing [`Outcome::Cancelled`] retains its exact
+/// [`CancelReason`] and an existing [`Outcome::Panicked`] retains its exact
+/// panic payload, even when the caller context is also cancelled.
+#[must_use]
+pub fn adapt_final_request_outcome<TypedResult, LegacyResult, TerminalReason>(
+    cx: &Cx,
+    outcome: McpOutcome<FinalRequestResult<TypedResult, LegacyResult, TerminalReason>>,
+) -> McpOutcome<FinalRequestResult<TypedResult, LegacyResult, TerminalReason>> {
+    match outcome {
+        Outcome::Ok(result) => final_result_outcome(cx, result),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
 
 // ============================================================================
 // Internal: poll a BoxFuture stored in an Option slot
