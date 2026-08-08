@@ -14,6 +14,8 @@ pub struct ClientProtocolPlan {
     policy: ProtocolPolicy,
     http_endpoints: Option<HttpEndpointBundle>,
     modern_post_target: Option<String>,
+    legacy_sse_target: Option<String>,
+    legacy_message_post_target: Option<String>,
 }
 
 impl ClientProtocolPlan {
@@ -23,6 +25,8 @@ impl ClientProtocolPlan {
             policy,
             http_endpoints: None,
             modern_post_target: None,
+            legacy_sse_target: None,
+            legacy_message_post_target: None,
         }
     }
 
@@ -42,6 +46,10 @@ impl ClientProtocolPlan {
         let modern_post_target = modern_post
             .as_ref()
             .map(|target| target.as_str().to_owned());
+        let legacy_sse_target = legacy_sse.as_ref().map(|target| target.as_str().to_owned());
+        let legacy_message_post_target = legacy_message_post
+            .as_ref()
+            .map(|target| target.as_str().to_owned());
         let http_endpoints = HttpEndpointBundle::new(
             policy,
             modern_post,
@@ -58,6 +66,8 @@ impl ClientProtocolPlan {
             policy,
             http_endpoints: Some(http_endpoints),
             modern_post_target,
+            legacy_sse_target,
+            legacy_message_post_target,
         })
     }
 
@@ -80,6 +90,25 @@ impl ClientProtocolPlan {
     #[must_use]
     pub fn modern_post_target(&self) -> Option<&str> {
         self.modern_post_target.as_deref()
+    }
+
+    /// Returns the exact configured canonical legacy SSE GET target.
+    ///
+    /// This value is copied from the validated endpoint input before the
+    /// opaque bundle is built. The HTTP runtime uses it only to open the
+    /// legacy event stream; it never derives a route from an observed event.
+    #[must_use]
+    pub fn legacy_sse_target(&self) -> Option<&str> {
+        self.legacy_sse_target.as_deref()
+    }
+
+    /// Returns the exact configured canonical legacy message POST target.
+    ///
+    /// A legacy SSE endpoint advertisement must exactly match this immutable
+    /// target before the runtime permits a JSON-RPC POST.
+    #[must_use]
+    pub fn legacy_message_post_target(&self) -> Option<&str> {
+        self.legacy_message_post_target.as_deref()
     }
 
     pub(crate) fn validate_for_stdio(&self) -> Result<(), ClientProtocolPlanError> {

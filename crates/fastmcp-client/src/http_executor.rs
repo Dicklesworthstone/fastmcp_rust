@@ -25,7 +25,7 @@ use fastmcp_protocol::protocol_policy::{
 };
 use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, FinalRequestMeta, JsonRpcMessage, JsonRpcRequest, RequestId,
-    SERVER_DISCOVER, decode_strict_jsonrpc_message,
+    SERVER_DISCOVER, ServerDiscoverResult, decode_strict_jsonrpc_message,
 };
 
 use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError};
@@ -41,6 +41,18 @@ pub const MODERN_MCP_CONTENT_TYPE: &str = "application/json";
 
 /// Maximum response bytes retained while classifying a disposable modern probe.
 pub const MAX_MODERN_HTTP_PROBE_BODY_BYTES: usize = 64 * 1024;
+
+/// Maximum retained bytes in one legacy SSE event, including its field names.
+const MAX_LEGACY_SSE_EVENT_BYTES: usize = 64 * 1024;
+
+/// Maximum bytes in one legacy SSE line before the connection is refused.
+const MAX_LEGACY_SSE_LINE_BYTES: usize = 16 * 1024;
+
+/// Maximum ignored legacy SSE comment lines between dispatched events.
+const MAX_LEGACY_SSE_KEEPALIVE_LINES: usize = 64;
+
+/// Maximum JSON-RPC bytes accepted from one legacy `message` SSE event.
+const MAX_LEGACY_SSE_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// LIMIT-01's default cap for ignored RFC 9110 list elements in one
 /// `Content-Encoding` field value.
@@ -441,12 +453,7 @@ impl ModernHttpExecutor {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            client: HttpClient::builder()
-                .redirect_policy(RedirectPolicy::None)
-                .retry_policy(RetryPolicy::None)
-                .no_cookie_store()
-                .no_proxy()
-                .build(),
+            client: native_http_client(),
         }
     }
 
@@ -478,6 +485,15 @@ impl ModernHttpExecutor {
     }
 }
 
+fn native_http_client() -> HttpClient {
+    HttpClient::builder()
+        .redirect_policy(RedirectPolicy::None)
+        .retry_policy(RetryPolicy::None)
+        .no_cookie_store()
+        .no_proxy()
+        .build()
+}
+
 /// A configured native modern HTTP client after one successful modern probe.
 ///
 /// The executor retained here is deliberately created only after the probe has
@@ -489,29 +505,29 @@ pub struct ModernHttpClient {
     modern_post_target: String,
     client_info: ClientInfo,
     client_capabilities: ClientCapabilities,
+    server_discovery: ServerDiscoverResult,
     executor: ModernHttpExecutor,
 }
 
 /// The result of a policy-bound modern HTTP connection attempt.
-#[derive(Clone)]
 pub enum ModernHttpConnectOutcome {
     /// The probe selected MCP 2026-07-28 and a modern request client is ready.
     Modern(ModernHttpClient),
-    /// The disposable probe authorized the separately configured legacy SSE
-    /// adapter. This modern runtime does not fabricate a legacy transport.
-    LegacySseFallbackAuthorized(LegacySseFallbackAuthorization),
+    /// A recognized disposable modern refusal opened the exact configured
+    /// MCP 2024-11-05 SSE GET endpoint and pinned its advertised POST route.
+    LegacySse(LegacySseHttpClient),
 }
 
 impl ModernHttpConnectOutcome {
     /// Returns the selected era after this connection attempt, if any.
     ///
-    /// A recognized auto-policy refusal authorizes a separate legacy SSE
-    /// observation but deliberately does not select or cache legacy state.
+    /// Legacy is selected only after its first SSE `endpoint` event has been
+    /// validated against the immutable configured POST target.
     #[must_use]
     pub const fn selected_era(&self) -> Option<ProtocolEra> {
         match self {
             Self::Modern(_) => Some(ProtocolEra::Modern2026),
-            Self::LegacySseFallbackAuthorized(_) => None,
+            Self::LegacySse(_) => Some(ProtocolEra::Legacy2024),
         }
     }
 
@@ -520,23 +536,18 @@ impl ModernHttpConnectOutcome {
     pub fn into_modern(self) -> Option<ModernHttpClient> {
         match self {
             Self::Modern(client) => Some(client),
-            Self::LegacySseFallbackAuthorized(_) => None,
+            Self::LegacySse(_) => None,
         }
     }
-}
 
-/// Immutable proof that exactly one disposable modern probe authorized legacy
-/// SSE observation for the configured endpoint bundle.
-#[derive(Clone)]
-pub struct LegacySseFallbackAuthorization {
-    protocol_plan: ClientProtocolPlan,
-}
-
-impl LegacySseFallbackAuthorization {
-    /// Returns the immutable plan whose exact bundle authorized this fallback.
+    /// Returns the ready legacy SSE client when the configured legacy route
+    /// was opened after a recognized auto refusal or under `LegacyOnly`.
     #[must_use]
-    pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
-        &self.protocol_plan
+    pub fn into_legacy_sse(self) -> Option<LegacySseHttpClient> {
+        match self {
+            Self::Modern(_) => None,
+            Self::LegacySse(client) => Some(client),
+        }
     }
 }
 
@@ -545,9 +556,6 @@ impl LegacySseFallbackAuthorization {
 pub enum ModernHttpClientError {
     /// The supplied plan has no configured modern HTTP POST target.
     MissingModernPostTarget,
-    /// The native modern runtime cannot claim a legacy-only connection without
-    /// the separately installed exact legacy SSE adapter.
-    LegacyAdapterRequired,
     /// A normal modern request requires object parameters so final metadata can
     /// be bound without changing the method-specific parameter shape.
     RequestParametersMustBeObject,
@@ -568,6 +576,13 @@ pub enum ModernHttpClientError {
     Executor(ModernHttpExecutorError),
     /// The immutable-plan classifier rejected the disposable probe.
     Negotiation(ClientHttpNegotiationError),
+    /// The peer returned a recognized JSON-RPC error to `server/discover`.
+    DiscoveryRejected,
+    /// The recognized response was not the exact typed discovery reply.
+    InvalidDiscoveryResponse,
+    /// The configured native legacy SSE connection could not be opened or
+    /// safely used after policy selected its exact endpoint bundle.
+    LegacySse(LegacySseHttpClientError),
 }
 
 impl fmt::Display for ModernHttpClientError {
@@ -576,9 +591,6 @@ impl fmt::Display for ModernHttpClientError {
             Self::MissingModernPostTarget => {
                 formatter.write_str("the protocol plan has no modern MCP POST target")
             }
-            Self::LegacyAdapterRequired => formatter.write_str(
-                "legacy-only HTTP requires the separately installed exact legacy SSE adapter",
-            ),
             Self::RequestParametersMustBeObject => {
                 formatter.write_str("modern MCP request parameters must be an object")
             }
@@ -608,6 +620,11 @@ impl fmt::Display for ModernHttpClientError {
             }
             Self::Executor(error) => error.fmt(formatter),
             Self::Negotiation(error) => error.fmt(formatter),
+            Self::DiscoveryRejected => formatter.write_str("server/discover was rejected"),
+            Self::InvalidDiscoveryResponse => {
+                formatter.write_str("server/discover returned an invalid final response")
+            }
+            Self::LegacySse(error) => error.fmt(formatter),
         }
     }
 }
@@ -617,15 +634,17 @@ impl std::error::Error for ModernHttpClientError {
         match self {
             Self::Executor(error) => Some(error),
             Self::Negotiation(error) => Some(error),
+            Self::LegacySse(error) => Some(error),
             Self::MissingModernPostTarget
-            | Self::LegacyAdapterRequired
             | Self::RequestParametersMustBeObject
             | Self::MissingRequestName { .. }
             | Self::UnsupportedFinalMethod { .. }
             | Self::ServerInitiatedFinalMethod { .. }
             | Self::MissingRequestId { .. }
             | Self::NotificationHasRequestId { .. }
-            | Self::RequestEncodingFailed => None,
+            | Self::RequestEncodingFailed
+            | Self::DiscoveryRejected
+            | Self::InvalidDiscoveryResponse => None,
         }
     }
 }
@@ -634,11 +653,11 @@ impl ModernHttpClient {
     /// Connects using one immutable HTTP protocol plan and a disposable modern
     /// `server/discover` probe.
     ///
-    /// `ModernOnly` always retains the modern result. `LegacyOnly` refuses
-    /// before native network I/O because it requires the exact legacy adapter.
-    /// `Auto` returns a legacy authorization only for the negotiation layer's
-    /// recognized 400/404/405 empty-or-unrecognized refusal shapes; transport,
-    /// body, and malformed-response failures never authorize a downgrade.
+    /// `ModernOnly` always retains the modern result. `LegacyOnly` opens only
+    /// the configured legacy SSE route. `Auto` opens legacy only for the
+    /// negotiation layer's recognized 400/404/405 empty-or-unrecognized
+    /// refusal shapes; transport, body, and malformed-response failures never
+    /// authorize a downgrade.
     pub async fn connect(
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
@@ -651,7 +670,10 @@ impl ModernHttpClient {
             ));
         }
         if matches!(protocol_plan.policy(), ProtocolPolicy::LegacyOnly) {
-            return Err(ModernHttpClientError::LegacyAdapterRequired);
+            return LegacySseHttpClient::connect(cx, protocol_plan)
+                .await
+                .map(ModernHttpConnectOutcome::LegacySse)
+                .map_err(ModernHttpClientError::LegacySse);
         }
 
         let modern_post_target = protocol_plan
@@ -688,18 +710,21 @@ impl ModernHttpClient {
             .map_err(ModernHttpClientError::Negotiation)?
         {
             ClientHttpNegotiationDecision::ModernSelected => {
+                let server_discovery = decode_modern_discovery_response(&probe_body)?;
                 Ok(ModernHttpConnectOutcome::Modern(Self {
                     protocol_plan,
                     modern_post_target,
                     client_info,
                     client_capabilities,
+                    server_discovery,
                     executor: ModernHttpExecutor::new(),
                 }))
             }
             ClientHttpNegotiationDecision::LegacySseFallbackAuthorized => {
-                Ok(ModernHttpConnectOutcome::LegacySseFallbackAuthorized(
-                    LegacySseFallbackAuthorization { protocol_plan },
-                ))
+                LegacySseHttpClient::connect(cx, protocol_plan)
+                    .await
+                    .map(ModernHttpConnectOutcome::LegacySse)
+                    .map_err(ModernHttpClientError::LegacySse)
             }
         }
     }
@@ -714,6 +739,12 @@ impl ModernHttpClient {
     #[must_use]
     pub fn modern_post_target(&self) -> &str {
         &self.modern_post_target
+    }
+
+    /// Returns the exact typed discovery result that selected modern HTTP.
+    #[must_use]
+    pub const fn server_discovery(&self) -> &ServerDiscoverResult {
+        &self.server_discovery
     }
 
     /// Issues one modern JSON-RPC request through the native HTTP executor.
@@ -741,6 +772,566 @@ impl ModernHttpClient {
             .execute(cx, &request)
             .await
             .map_err(ModernHttpClientError::Executor)
+    }
+}
+
+/// A live MCP 2024-11-05 SSE connection with its advertised POST target
+/// pinned to the immutable legacy endpoint bundle.
+pub struct LegacySseHttpClient {
+    protocol_plan: ClientProtocolPlan,
+    configured_message_post_target: String,
+    advertised_message_post_target: String,
+    post_client: HttpClient,
+    stream: LegacySseResponseStream,
+}
+
+impl LegacySseHttpClient {
+    /// Opens the configured SSE GET endpoint and admits its first `endpoint`
+    /// event only when it exactly matches the immutable configured POST route.
+    pub async fn connect(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+    ) -> Result<Self, LegacySseHttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(LegacySseHttpClientError::Cancelled);
+        }
+        let sse_target = protocol_plan
+            .legacy_sse_target()
+            .ok_or(LegacySseHttpClientError::MissingSseTarget)?
+            .to_owned();
+        let configured_message_post_target = protocol_plan
+            .legacy_message_post_target()
+            .ok_or(LegacySseHttpClientError::MissingMessagePostTarget)?
+            .to_owned();
+
+        let response = native_http_client()
+            .request_streaming(
+                cx,
+                Method::Get,
+                &sse_target,
+                vec![
+                    ("Accept".to_owned(), "text/event-stream".to_owned()),
+                    (
+                        "Accept-Encoding".to_owned(),
+                        MODERN_MCP_ACCEPT_ENCODING.to_owned(),
+                    ),
+                ],
+                Vec::new(),
+            )
+            .await
+            .map_err(map_transport_error)
+            .map_err(LegacySseHttpClientError::Executor)?;
+        validate_legacy_sse_response_head(response.head.status, &response.head.headers)?;
+
+        let mut stream = LegacySseResponseStream::new(response);
+        let advertised_message_post_target = match stream.next_event(cx).await? {
+            Some(LegacySseEvent::Endpoint(target)) if !target.is_empty() => target,
+            Some(LegacySseEvent::Endpoint(_)) => {
+                return Err(LegacySseHttpClientError::EmptyAdvertisedMessagePostTarget);
+            }
+            Some(LegacySseEvent::Message(_)) => {
+                return Err(LegacySseHttpClientError::FirstEventWasNotEndpoint);
+            }
+            None => return Err(LegacySseHttpClientError::SseEndedBeforeEndpoint),
+        };
+        if advertised_message_post_target != configured_message_post_target {
+            return Err(
+                LegacySseHttpClientError::AdvertisedMessagePostTargetMismatch {
+                    configured: configured_message_post_target,
+                    advertised: advertised_message_post_target,
+                },
+            );
+        }
+
+        Ok(Self {
+            protocol_plan,
+            configured_message_post_target,
+            advertised_message_post_target,
+            post_client: native_http_client(),
+            stream,
+        })
+    }
+
+    /// Returns the immutable policy and endpoint plan used to open this client.
+    #[must_use]
+    pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
+        &self.protocol_plan
+    }
+
+    /// Returns the exact configured legacy message POST target.
+    #[must_use]
+    pub fn configured_message_post_target(&self) -> &str {
+        &self.configured_message_post_target
+    }
+
+    /// Returns the validated endpoint advertised by the first SSE event.
+    #[must_use]
+    pub fn advertised_message_post_target(&self) -> &str {
+        &self.advertised_message_post_target
+    }
+
+    /// Sends one legacy JSON-RPC envelope to the validated advertised POST URL.
+    ///
+    /// The legacy request intentionally carries no final-MCP metadata headers.
+    pub async fn send(
+        &self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+    ) -> Result<(), LegacySseHttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(LegacySseHttpClientError::Cancelled);
+        }
+        let mut body = serde_json::to_vec(message)
+            .map_err(|_| LegacySseHttpClientError::MessageEncodingFailed)?;
+        body.push(b'\n');
+        let mut response = self
+            .post_client
+            .request_streaming(
+                cx,
+                Method::Post,
+                &self.advertised_message_post_target,
+                vec![
+                    (
+                        "Content-Type".to_owned(),
+                        MODERN_MCP_CONTENT_TYPE.to_owned(),
+                    ),
+                    ("Accept".to_owned(), "application/json".to_owned()),
+                    (
+                        "Accept-Encoding".to_owned(),
+                        MODERN_MCP_ACCEPT_ENCODING.to_owned(),
+                    ),
+                ],
+                body,
+            )
+            .await
+            .map_err(map_transport_error)
+            .map_err(LegacySseHttpClientError::Executor)?;
+        if cx.checkpoint().is_err() {
+            return Err(LegacySseHttpClientError::Cancelled);
+        }
+        validate_content_encoding(&response.head.headers)
+            .map_err(LegacySseHttpClientError::Executor)?;
+        if (300..400).contains(&response.head.status) {
+            return Err(LegacySseHttpClientError::MessagePostRedirect {
+                status: response.head.status,
+            });
+        }
+        if !(200..300).contains(&response.head.status) {
+            return Err(LegacySseHttpClientError::MessagePostRejected {
+                status: response.head.status,
+            });
+        }
+        drain_native_response(cx, &mut response, MAX_LEGACY_SSE_MESSAGE_BYTES)
+            .await
+            .map_err(LegacySseHttpClientError::Executor)?;
+        Ok(())
+    }
+
+    /// Waits for the next legacy SSE `message` JSON-RPC envelope.
+    ///
+    /// A repeated `endpoint` event is refused instead of allowing it to change
+    /// the POST destination after connection establishment.
+    pub async fn next_message(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<JsonRpcMessage>, LegacySseHttpClientError> {
+        loop {
+            match self.stream.next_event(cx).await? {
+                Some(LegacySseEvent::Message(payload)) => {
+                    return decode_strict_jsonrpc_message(&payload, MAX_LEGACY_SSE_MESSAGE_BYTES)
+                        .map(Some)
+                        .map_err(|_| LegacySseHttpClientError::MessageDecodeFailed);
+                }
+                Some(LegacySseEvent::Endpoint(_)) => {
+                    return Err(LegacySseHttpClientError::UnexpectedEndpointEvent);
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Errors emitted by the exact legacy SSE GET plus advertised POST client.
+#[derive(Debug)]
+pub enum LegacySseHttpClientError {
+    /// The immutable plan omitted its legacy SSE GET target.
+    MissingSseTarget,
+    /// The immutable plan omitted its legacy message POST target.
+    MissingMessagePostTarget,
+    /// The caller's context was cancelled.
+    Cancelled,
+    /// Native HTTP setup, framing, or body consumption failed.
+    Executor(ModernHttpExecutorError),
+    /// The SSE GET endpoint returned a redirect, which must not be followed.
+    SseGetRedirect { status: u16 },
+    /// The SSE GET endpoint did not return a 2xx response.
+    SseGetRejected { status: u16 },
+    /// A successful SSE GET did not declare the required content type.
+    UnsupportedSseContentType,
+    /// The stream ended before it advertised a POST endpoint.
+    SseEndedBeforeEndpoint,
+    /// The first dispatched legacy SSE event was not `endpoint`.
+    FirstEventWasNotEndpoint,
+    /// The first `endpoint` event had an empty data value.
+    EmptyAdvertisedMessagePostTarget,
+    /// The advertised POST route differed from the configured immutable one.
+    AdvertisedMessagePostTargetMismatch {
+        configured: String,
+        advertised: String,
+    },
+    /// A later endpoint event attempted to alter an established destination.
+    UnexpectedEndpointEvent,
+    /// An SSE line exceeded the bounded legacy parser limit.
+    SseLineTooLong,
+    /// An SSE event exceeded the bounded legacy parser limit.
+    SseEventTooLarge,
+    /// An SSE field line was not valid UTF-8.
+    SseInvalidUtf8,
+    /// Too many ignored comments were received before an event boundary.
+    TooManySseKeepalives,
+    /// A JSON-RPC envelope could not be serialized for a legacy POST.
+    MessageEncodingFailed,
+    /// The legacy POST endpoint returned a redirect, which must not be followed.
+    MessagePostRedirect { status: u16 },
+    /// The legacy POST endpoint did not acknowledge the JSON-RPC envelope.
+    MessagePostRejected { status: u16 },
+    /// A legacy SSE `message` event was not a strict JSON-RPC envelope.
+    MessageDecodeFailed,
+}
+
+impl fmt::Display for LegacySseHttpClientError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSseTarget => formatter.write_str("the plan has no legacy SSE GET target"),
+            Self::MissingMessagePostTarget => {
+                formatter.write_str("the plan has no legacy message POST target")
+            }
+            Self::Cancelled => formatter.write_str("legacy SSE HTTP operation was cancelled"),
+            Self::Executor(error) => error.fmt(formatter),
+            Self::SseGetRedirect { status } => {
+                write!(
+                    formatter,
+                    "legacy SSE GET received forbidden redirect status {status}"
+                )
+            }
+            Self::SseGetRejected { status } => {
+                write!(
+                    formatter,
+                    "legacy SSE GET was rejected with status {status}"
+                )
+            }
+            Self::UnsupportedSseContentType => {
+                formatter.write_str("legacy SSE GET did not return text/event-stream")
+            }
+            Self::SseEndedBeforeEndpoint => {
+                formatter.write_str("legacy SSE ended before its endpoint event")
+            }
+            Self::FirstEventWasNotEndpoint => {
+                formatter.write_str("the first legacy SSE event was not endpoint")
+            }
+            Self::EmptyAdvertisedMessagePostTarget => {
+                formatter.write_str("legacy SSE advertised an empty message POST target")
+            }
+            Self::AdvertisedMessagePostTargetMismatch {
+                configured,
+                advertised,
+            } => write!(
+                formatter,
+                "legacy SSE advertised POST target {advertised:?} differs from configured target {configured:?}"
+            ),
+            Self::UnexpectedEndpointEvent => {
+                formatter.write_str("legacy SSE attempted to replace its established POST target")
+            }
+            Self::SseLineTooLong => formatter.write_str("legacy SSE line exceeds its byte limit"),
+            Self::SseEventTooLarge => {
+                formatter.write_str("legacy SSE event exceeds its byte limit")
+            }
+            Self::SseInvalidUtf8 => formatter.write_str("legacy SSE field line is not UTF-8"),
+            Self::TooManySseKeepalives => {
+                formatter.write_str("legacy SSE exceeded its ignored keepalive limit")
+            }
+            Self::MessageEncodingFailed => formatter.write_str("legacy JSON-RPC encoding failed"),
+            Self::MessagePostRedirect { status } => {
+                write!(
+                    formatter,
+                    "legacy message POST received forbidden redirect status {status}"
+                )
+            }
+            Self::MessagePostRejected { status } => {
+                write!(
+                    formatter,
+                    "legacy message POST was rejected with status {status}"
+                )
+            }
+            Self::MessageDecodeFailed => formatter.write_str("legacy SSE message was not JSON-RPC"),
+        }
+    }
+}
+
+impl std::error::Error for LegacySseHttpClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Executor(error) => Some(error),
+            Self::MissingSseTarget
+            | Self::MissingMessagePostTarget
+            | Self::Cancelled
+            | Self::SseGetRedirect { .. }
+            | Self::SseGetRejected { .. }
+            | Self::UnsupportedSseContentType
+            | Self::SseEndedBeforeEndpoint
+            | Self::FirstEventWasNotEndpoint
+            | Self::EmptyAdvertisedMessagePostTarget
+            | Self::AdvertisedMessagePostTargetMismatch { .. }
+            | Self::UnexpectedEndpointEvent
+            | Self::SseLineTooLong
+            | Self::SseEventTooLarge
+            | Self::SseInvalidUtf8
+            | Self::TooManySseKeepalives
+            | Self::MessageEncodingFailed
+            | Self::MessagePostRedirect { .. }
+            | Self::MessagePostRejected { .. }
+            | Self::MessageDecodeFailed => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LegacySseEvent {
+    Endpoint(String),
+    Message(String),
+}
+
+struct LegacySseResponseStream {
+    response: Option<ClientStreamingResponse<ClientIo>>,
+    parser: LegacySseParser,
+    pending_events: VecDeque<LegacySseEvent>,
+}
+
+impl LegacySseResponseStream {
+    fn new(response: ClientStreamingResponse<ClientIo>) -> Self {
+        Self {
+            response: Some(response),
+            parser: LegacySseParser::default(),
+            pending_events: VecDeque::new(),
+        }
+    }
+
+    async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<LegacySseEvent>, LegacySseHttpClientError> {
+        loop {
+            if cx.checkpoint().is_err() {
+                return Err(LegacySseHttpClientError::Cancelled);
+            }
+            if let Some(event) = self.pending_events.pop_front() {
+                return Ok(Some(event));
+            }
+            let Some(response) = self.response.as_mut() else {
+                return Ok(None);
+            };
+            let Some(frame) =
+                poll_fn(|task_cx| Pin::new(&mut response.body).poll_frame(task_cx)).await
+            else {
+                self.response = None;
+                self.parser.finish();
+                return Ok(None);
+            };
+            let Some(mut data) = frame
+                .map_err(|_| ModernHttpExecutorError::ResponseBodyReadFailed)
+                .map_err(LegacySseHttpClientError::Executor)?
+                .into_data()
+            else {
+                continue;
+            };
+            while data.has_remaining() {
+                let chunk = data.chunk();
+                self.pending_events.extend(self.parser.push(chunk)?);
+                data.advance(chunk.len());
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct LegacySseParser {
+    line: Vec<u8>,
+    pending_cr: bool,
+    event_type: Option<LegacySseEventType>,
+    data: String,
+    has_data: bool,
+    event_bytes: usize,
+    ignored_keepalives: usize,
+}
+
+#[derive(Clone, Copy)]
+enum LegacySseEventType {
+    Endpoint,
+    Message,
+    Ignore,
+}
+
+impl LegacySseParser {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<LegacySseEvent>, LegacySseHttpClientError> {
+        let mut events = Vec::new();
+        for &byte in bytes {
+            if self.pending_cr {
+                self.pending_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => {
+                    self.finish_line(&mut events)?;
+                    self.pending_cr = true;
+                }
+                b'\n' => self.finish_line(&mut events)?,
+                _ => {
+                    if self.line.len() >= MAX_LEGACY_SSE_LINE_BYTES {
+                        return Err(LegacySseHttpClientError::SseLineTooLong);
+                    }
+                    self.line.push(byte);
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn finish(&mut self) {
+        self.line.clear();
+        self.reset_event();
+    }
+
+    fn finish_line(
+        &mut self,
+        events: &mut Vec<LegacySseEvent>,
+    ) -> Result<(), LegacySseHttpClientError> {
+        let line = std::str::from_utf8(&self.line)
+            .map_err(|_| LegacySseHttpClientError::SseInvalidUtf8)?;
+        if line.is_empty() {
+            self.ignored_keepalives = 0;
+            if self.has_data {
+                let event_type = self.event_type.unwrap_or(LegacySseEventType::Message);
+                let mut data = std::mem::take(&mut self.data);
+                data.pop();
+                self.has_data = false;
+                self.event_type = None;
+                self.event_bytes = 0;
+                match event_type {
+                    LegacySseEventType::Endpoint => events.push(LegacySseEvent::Endpoint(data)),
+                    LegacySseEventType::Message => events.push(LegacySseEvent::Message(data)),
+                    LegacySseEventType::Ignore => {}
+                }
+            } else {
+                self.reset_event();
+            }
+            self.line.clear();
+            return Ok(());
+        }
+        if line.starts_with(':') {
+            self.ignored_keepalives = self.ignored_keepalives.saturating_add(1);
+            if self.ignored_keepalives > MAX_LEGACY_SSE_KEEPALIVE_LINES {
+                return Err(LegacySseHttpClientError::TooManySseKeepalives);
+            }
+            self.line.clear();
+            return Ok(());
+        }
+        self.ignored_keepalives = 0;
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        self.event_bytes = self
+            .event_bytes
+            .saturating_add(line.len().saturating_add(1));
+        if self.event_bytes > MAX_LEGACY_SSE_EVENT_BYTES {
+            return Err(LegacySseHttpClientError::SseEventTooLarge);
+        }
+        match field {
+            "event" => {
+                self.event_type = Some(match value {
+                    "endpoint" => LegacySseEventType::Endpoint,
+                    "message" => LegacySseEventType::Message,
+                    _ => LegacySseEventType::Ignore,
+                });
+            }
+            "data" => {
+                if self
+                    .data
+                    .len()
+                    .saturating_add(value.len())
+                    .saturating_add(1)
+                    > MAX_LEGACY_SSE_MESSAGE_BYTES
+                {
+                    return Err(LegacySseHttpClientError::SseEventTooLarge);
+                }
+                self.data.push_str(value);
+                self.data.push('\n');
+                self.has_data = true;
+            }
+            _ => {}
+        }
+        self.line.clear();
+        Ok(())
+    }
+
+    fn reset_event(&mut self) {
+        self.event_type = None;
+        self.data.clear();
+        self.has_data = false;
+        self.event_bytes = 0;
+    }
+}
+
+fn validate_legacy_sse_response_head(
+    status: u16,
+    headers: &[(String, String)],
+) -> Result<(), LegacySseHttpClientError> {
+    validate_content_encoding(headers).map_err(LegacySseHttpClientError::Executor)?;
+    if (300..400).contains(&status) {
+        return Err(LegacySseHttpClientError::SseGetRedirect { status });
+    }
+    if !(200..300).contains(&status) {
+        return Err(LegacySseHttpClientError::SseGetRejected { status });
+    }
+    let content_type = single_header(headers, "content-type", "Content-Type")
+        .map_err(LegacySseHttpClientError::Executor)?
+        .map(normalize_success_content_type)
+        .transpose()
+        .map_err(LegacySseHttpClientError::Executor)?;
+    match content_type {
+        Some(content_type) if content_type.eq_ignore_ascii_case("text/event-stream") => Ok(()),
+        None | Some(_) => Err(LegacySseHttpClientError::UnsupportedSseContentType),
+    }
+}
+
+async fn drain_native_response(
+    cx: &Cx,
+    response: &mut ClientStreamingResponse<ClientIo>,
+    maximum_bytes: usize,
+) -> Result<(), ModernHttpExecutorError> {
+    let mut consumed = 0_usize;
+    loop {
+        if cx.checkpoint().is_err() {
+            return Err(ModernHttpExecutorError::Cancelled);
+        }
+        let Some(frame) = poll_fn(|task_cx| Pin::new(&mut response.body).poll_frame(task_cx)).await
+        else {
+            return Ok(());
+        };
+        let Some(mut data) = frame
+            .map_err(|_| ModernHttpExecutorError::ResponseBodyReadFailed)?
+            .into_data()
+        else {
+            continue;
+        };
+        while data.has_remaining() {
+            let chunk = data.chunk();
+            if chunk.len() > maximum_bytes.saturating_sub(consumed) {
+                return Err(ModernHttpExecutorError::ResponseBodyTooLarge { maximum_bytes });
+            }
+            consumed = consumed.saturating_add(chunk.len());
+            data.advance(chunk.len());
+        }
     }
 }
 
@@ -849,6 +1440,26 @@ fn classify_modern_probe_body(body: &[u8]) -> HttpProbeBody {
         Ok(JsonRpcMessage::Response(_)) => HttpProbeBody::RecognizedModernJsonRpc,
         Ok(JsonRpcMessage::Request(_)) | Err(_) => HttpProbeBody::Unrecognized,
     }
+}
+
+fn decode_modern_discovery_response(
+    body: &[u8],
+) -> Result<ServerDiscoverResult, ModernHttpClientError> {
+    let message = decode_strict_jsonrpc_message(body, MAX_MODERN_HTTP_PROBE_BODY_BYTES)
+        .map_err(|_| ModernHttpClientError::InvalidDiscoveryResponse)?;
+    let JsonRpcMessage::Response(response) = message else {
+        return Err(ModernHttpClientError::InvalidDiscoveryResponse);
+    };
+    if response.id != Some(RequestId::Number(1)) {
+        return Err(ModernHttpClientError::InvalidDiscoveryResponse);
+    }
+    if response.error.is_some() {
+        return Err(ModernHttpClientError::DiscoveryRejected);
+    }
+    let result = response
+        .result
+        .ok_or(ModernHttpClientError::InvalidDiscoveryResponse)?;
+    serde_json::from_value(result).map_err(|_| ModernHttpClientError::InvalidDiscoveryResponse)
 }
 
 fn map_transport_error(error: ClientError) -> ModernHttpExecutorError {
