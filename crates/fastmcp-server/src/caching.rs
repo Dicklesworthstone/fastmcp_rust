@@ -1160,7 +1160,7 @@ impl ResponseCachingMiddleware {
     fn advance_discovery_generation(&self) {
         if self
             .discovery_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
                 (generation != 0)
                     .then(|| generation.checked_add(1))
                     .flatten()

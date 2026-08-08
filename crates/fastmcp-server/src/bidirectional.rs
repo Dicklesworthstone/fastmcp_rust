@@ -1077,7 +1077,7 @@ impl MrtrInputRequests {
             entries: self
                 .entries
                 .iter()
-                .filter(|(key, _)| !responses.entries.contains_key(key))
+                .filter(|(key, _)| !responses.entries.contains_key(key.as_str()))
                 .map(|(key, request)| (key.clone(), request.clone()))
                 .collect(),
         }

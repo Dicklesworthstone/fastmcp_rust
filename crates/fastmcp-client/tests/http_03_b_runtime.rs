@@ -9,8 +9,7 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp_client::http_executor::{
-    LegacySseHttpClientError, ModernHttpClient, ModernHttpClientError, ModernHttpConnectOutcome,
-    ModernHttpResponseKind,
+    ModernHttpClient, ModernHttpClientError, ModernHttpResponseKind,
 };
 use fastmcp_client::sse::{SseEndOfStream, SseLimits};
 use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan, ProtocolEra, ProtocolPolicy};
@@ -371,7 +370,7 @@ fn http_03_b_runtime_planted_negative() {
     let cx = Cx::for_request();
     let refusal = runtime_block_on(ModernHttpClient::connect(
         &cx,
-        plan(&target, ProtocolPolicy::Auto),
+        plan(&target, &target, &target, ProtocolPolicy::Auto),
         client_info(),
         ClientCapabilities::default(),
     ));

@@ -758,9 +758,11 @@ mod tests {
             .into_iter()
             .filter(|(name, _)| name != "Content-Type")
             .collect();
-        assert_eq!(
-            admit(&headers, &canonical_body()),
-            Err(ModernPostRejection::UnsupportedMediaType),
+        assert!(
+            matches!(
+                admit(&headers, &canonical_body()),
+                Err(ModernPostRejection::UnsupportedMediaType)
+            ),
             "a missing request content type is fail-closed"
         );
     }

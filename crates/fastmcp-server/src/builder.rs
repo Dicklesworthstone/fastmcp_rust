@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
 use fastmcp_core::McpResult;
+use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{
-    LoggingCapability, PromptsCapability, ProtocolPolicy, ResourceTemplate, ResourcesCapability,
+    LoggingCapability, PromptsCapability, ResourceTemplate, ResourcesCapability,
     ServerCapabilities, ServerInfo, ToolsCapability,
 };
 use log::{Level, LevelFilter};

@@ -891,6 +891,7 @@ mod tests {
     #[cfg(unix)]
     use fastmcp_client::RequestTimeoutPolicy;
     use fastmcp_core::McpContext;
+    use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
     use fastmcp_protocol::{Content, Prompt, PromptMessage, Resource, ResourceContent, Tool};
 
     use super::{ProxyBackend, ProxyCatalog, ProxyClient, ProxyPromptHandler, ProxyToolHandler};
@@ -1172,20 +1173,15 @@ exec sleep 2
                 1,
                 "sh",
                 &["-c", script.as_str()],
-                fastmcp_client::ClientProtocolPlan::stdio(
-                    fastmcp_protocol::ProtocolPolicy::ModernOnly,
-                ),
+                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
                 Cx::for_testing(),
             )
             .expect("ModernOnly connects a live modern client");
 
         let binding = proxy.upstream_binding().expect("live binding is retained");
-        assert_eq!(binding.era(), fastmcp_protocol::ProtocolEra::Modern2026);
+        assert_eq!(binding.era(), ProtocolEra::Modern2026);
         assert_eq!(binding.adapter(), super::ProxyUpstreamAdapter::ModernStdio);
-        assert_eq!(
-            binding.policy(),
-            fastmcp_protocol::ProtocolPolicy::ModernOnly
-        );
+        assert_eq!(binding.policy(), ProtocolPolicy::ModernOnly);
         assert_forwarded_tool(
             proxy
                 .call_tool(
@@ -1216,14 +1212,14 @@ exec sleep 2
                 2,
                 "sh",
                 &["-c", script.as_str()],
-                fastmcp_client::ClientProtocolPlan::stdio(fastmcp_protocol::ProtocolPolicy::Auto),
+                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
                 Cx::for_testing(),
             )
             .expect("Auto retains its live modern selection");
 
         let binding = proxy.upstream_binding().expect("live binding is retained");
-        assert_eq!(binding.era(), fastmcp_protocol::ProtocolEra::Modern2026);
-        assert_eq!(binding.policy(), fastmcp_protocol::ProtocolPolicy::Auto);
+        assert_eq!(binding.era(), ProtocolEra::Modern2026);
+        assert_eq!(binding.policy(), ProtocolPolicy::Auto);
         assert_forwarded_tool(
             proxy
                 .call_tool(
@@ -1255,15 +1251,15 @@ exec sleep 2
                 3,
                 "sh",
                 &["-c", script.as_str()],
-                fastmcp_client::ClientProtocolPlan::stdio(fastmcp_protocol::ProtocolPolicy::Auto),
+                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
                 Cx::for_testing(),
             )
             .expect("Auto selects exact legacy only after an authorized modern refusal");
 
         let binding = proxy.upstream_binding().expect("live binding is retained");
-        assert_eq!(binding.era(), fastmcp_protocol::ProtocolEra::Legacy2024);
+        assert_eq!(binding.era(), ProtocolEra::Legacy2024);
         assert_eq!(binding.adapter(), super::ProxyUpstreamAdapter::LegacyStdio);
-        assert_eq!(binding.policy(), fastmcp_protocol::ProtocolPolicy::Auto);
+        assert_eq!(binding.policy(), ProtocolPolicy::Auto);
         assert_forwarded_tool(
             proxy
                 .call_tool(
@@ -1294,20 +1290,15 @@ exec sleep 2
                 4,
                 "sh",
                 &["-c", script.as_str()],
-                fastmcp_client::ClientProtocolPlan::stdio(
-                    fastmcp_protocol::ProtocolPolicy::LegacyOnly,
-                ),
+                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
                 Cx::for_testing(),
             )
             .expect("LegacyOnly connects a live exact-2024 client");
 
         let binding = proxy.upstream_binding().expect("live binding is retained");
-        assert_eq!(binding.era(), fastmcp_protocol::ProtocolEra::Legacy2024);
+        assert_eq!(binding.era(), ProtocolEra::Legacy2024);
         assert_eq!(binding.adapter(), super::ProxyUpstreamAdapter::LegacyStdio);
-        assert_eq!(
-            binding.policy(),
-            fastmcp_protocol::ProtocolPolicy::LegacyOnly
-        );
+        assert_eq!(binding.policy(), ProtocolPolicy::LegacyOnly);
         assert_forwarded_tool(
             proxy
                 .call_tool(
@@ -1339,7 +1330,7 @@ exec sleep 2
                 5,
                 "sh",
                 &["-c", script.as_str()],
-                fastmcp_client::ClientProtocolPlan::stdio(fastmcp_protocol::ProtocolPolicy::Auto),
+                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
                 Cx::for_testing(),
             )
             .err()
