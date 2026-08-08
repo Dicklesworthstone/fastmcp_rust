@@ -494,7 +494,6 @@ pub struct FinalSubscriptionsListenParams {
 
 /// Final `notifications/subscriptions/acknowledged` parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FinalSubscriptionsAcknowledgedNotificationParams {
     /// Optional notification metadata, including the subscription ID when the
     /// acknowledgement was delivered over a subscription stream.
@@ -502,6 +501,9 @@ pub struct FinalSubscriptionsAcknowledgedNotificationParams {
     pub meta: Option<OpenMetadata>,
     /// The subset of the requested notification categories the server accepted.
     pub notifications: SubscriptionFilter,
+    /// Schema-open extension members retained without activating behavior.
+    #[serde(flatten, default)]
+    pub additional: BTreeMap<String, Value>,
 }
 
 /// Exact final `notifications/message` parameters.
@@ -510,7 +512,6 @@ pub struct FinalSubscriptionsAcknowledgedNotificationParams {
 /// `io.modelcontextprotocol/logLevel` in request metadata; this notification
 /// itself remains independent of the removed final `logging/setLevel` RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FinalLogMessageParams {
     /// Final RFC 5424 severity.
     pub level: LoggingLevel,
@@ -522,14 +523,16 @@ pub struct FinalLogMessageParams {
     /// Optional final notification metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<OpenMetadata>,
+    /// Schema-open extension members retained without activating behavior.
+    #[serde(flatten, default)]
+    pub additional: BTreeMap<String, Value>,
 }
 
 /// Exact final `notifications/cancelled` parameters.
 ///
-/// This is deliberately separate from legacy [`CancelledParams`]: the final
-/// wire shape does not admit the legacy-only `awaitCleanup` member.
+/// This is deliberately separate from legacy [`CancelledParams`], while
+/// retaining schema-open extension members without assigning them semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FinalCancelledNotificationParams {
     /// The client request ID whose result is no longer needed.
     #[serde(rename = "requestId")]
@@ -540,11 +543,13 @@ pub struct FinalCancelledNotificationParams {
     /// Optional final notification metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<OpenMetadata>,
+    /// Schema-open extension members retained without activating behavior.
+    #[serde(flatten, default)]
+    pub additional: BTreeMap<String, Value>,
 }
 
 /// Exact final `notifications/progress` parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FinalProgressNotificationParams {
     /// Token from the client request being progressed.
     #[serde(rename = "progressToken")]
@@ -560,17 +565,22 @@ pub struct FinalProgressNotificationParams {
     /// Optional final notification metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<OpenMetadata>,
+    /// Schema-open extension members retained without activating behavior.
+    #[serde(flatten, default)]
+    pub additional: BTreeMap<String, Value>,
 }
 
 /// Exact final `notifications/resources/updated` parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FinalResourceUpdatedNotificationParams {
     /// Absolute URI for the changed resource or provider-defined sub-resource.
     pub uri: AbsoluteUri,
     /// Optional final notification metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<OpenMetadata>,
+    /// Schema-open extension members retained without activating behavior.
+    #[serde(flatten, default)]
+    pub additional: BTreeMap<String, Value>,
 }
 
 /// Exact optional parameter object for final catalog-change notifications.
@@ -578,11 +588,13 @@ pub struct FinalResourceUpdatedNotificationParams {
 /// `None` in a [`ServerNotification`] omits `params` entirely; `Some` retains
 /// a present notification parameter object, including a metadata-only one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FinalEmptyNotificationParams {
     /// Optional final notification metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<OpenMetadata>,
+    /// Schema-open extension members retained without activating behavior.
+    #[serde(flatten, default)]
+    pub additional: BTreeMap<String, Value>,
 }
 
 /// Exact final `sampling/createMessage` parameters.
@@ -3721,13 +3733,21 @@ mod tests {
             NOTIFICATIONS_CANCELLED,
             Some(serde_json::json!({
                 "requestId": "client-request-7",
-                "reason": "client no longer needs this response"
+                "reason": "client no longer needs this response",
+                "awaitCleanup": true,
+                "com.example/cancellationTrace": {"attempt": 2}
             })),
         );
         let client = ClientNotification::decode(&client_wire)
             .expect("the final client union admits its cancellation notification");
         assert_eq!(client.method(), NOTIFICATIONS_CANCELLED);
         assert!(client_wire.is_notification());
+        let ClientNotification::Cancelled(params) = &client;
+        assert_eq!(
+            params.additional.get("awaitCleanup"),
+            Some(&serde_json::json!(true)),
+            "schema-open cancellation members retain legacy-looking names as opaque data"
+        );
         assert_eq!(
             serde_json::to_value(client.encode().expect("client notification re-encodes"))
                 .expect("client notification remains JSON"),
@@ -3737,7 +3757,10 @@ mod tests {
         let server_wires = vec![
             JsonRpcRequest::notification(
                 NOTIFICATIONS_CANCELLED,
-                Some(serde_json::json!({"requestId": "subscription-9"})),
+                Some(serde_json::json!({
+                    "requestId": "subscription-9",
+                    "com.example/cancellationTrace": "stream-close"
+                })),
             ),
             JsonRpcRequest::notification(
                 NOTIFICATIONS_PROGRESS,
@@ -3745,7 +3768,8 @@ mod tests {
                     "progressToken": "job-9",
                     "progress": 1.0,
                     "total": 2.0,
-                    "message": "halfway"
+                    "message": "halfway",
+                    "com.example/progressPhase": "indexing"
                 })),
             ),
             JsonRpcRequest::notification(
@@ -3753,23 +3777,34 @@ mod tests {
                 Some(serde_json::json!({
                     "level": "notice",
                     "logger": "discovery-server",
-                    "data": {"event": "catalog-refreshed"}
+                    "data": {"event": "catalog-refreshed"},
+                    "com.example/logTrace": 7
                 })),
             ),
             JsonRpcRequest::notification(
                 NOTIFICATIONS_RESOURCES_UPDATED,
-                Some(serde_json::json!({"uri": "file:///workspace/status"})),
+                Some(serde_json::json!({
+                    "uri": "file:///workspace/status",
+                    "com.example/resourceRevision": 4
+                })),
             ),
-            JsonRpcRequest::notification(NOTIFICATIONS_RESOURCES_LIST_CHANGED, None),
+            JsonRpcRequest::notification(
+                NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+                Some(serde_json::json!({"com.example/listRevision": 8})),
+            ),
             JsonRpcRequest::notification(
                 NOTIFICATIONS_TOOLS_LIST_CHANGED,
-                Some(serde_json::json!({"_meta": {"com.example/trace": "tools-4"}})),
+                Some(serde_json::json!({
+                    "_meta": {"com.example/trace": "tools-4"},
+                    "com.example/listRevision": 9
+                })),
             ),
             JsonRpcRequest::notification(NOTIFICATIONS_PROMPTS_LIST_CHANGED, None),
             JsonRpcRequest::notification(
                 NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
                 Some(serde_json::json!({
-                    "notifications": {"toolsListChanged": true}
+                    "notifications": {"toolsListChanged": true},
+                    "com.example/acknowledgement": {"accepted": true}
                 })),
             ),
         ];
@@ -3803,7 +3838,7 @@ mod tests {
     }
 
     #[test]
-    fn final_notification_unions_reject_wrong_direction_and_legacy_only_field() {
+    fn final_notification_unions_reject_wrong_direction_and_malformed_field() {
         let progress = JsonRpcRequest::notification(
             NOTIFICATIONS_PROGRESS,
             Some(serde_json::json!({"progressToken": "job-9", "progress": 1.0})),
@@ -3825,10 +3860,13 @@ mod tests {
 
         let cancellation = JsonRpcRequest::notification(
             NOTIFICATIONS_CANCELLED,
-            Some(serde_json::json!({"requestId": "client-request-7"})),
+            Some(serde_json::json!({
+                "requestId": "client-request-7",
+                "awaitCleanup": true
+            })),
         );
         let admitted = ClientNotification::decode(&cancellation)
-            .expect("final cancellation without legacy fields is admitted");
+            .expect("final cancellation preserves schema-open additional fields");
         let accepted_wire = serde_json::to_value(&cancellation).expect("accepted wire serializes");
         let mut planted = cancellation.clone();
         planted
@@ -3836,7 +3874,7 @@ mod tests {
             .as_mut()
             .and_then(Value::as_object_mut)
             .expect("cancellation owns object parameters")
-            .insert("awaitCleanup".to_owned(), serde_json::json!(true));
+            .insert("requestId".to_owned(), Value::Null);
         assert!(
             matches!(
                 ClientNotification::decode(&planted),
@@ -3844,13 +3882,13 @@ mod tests {
                     method: NOTIFICATIONS_CANCELLED
                 })
             ),
-            "changing only legacy awaitCleanup rejects the final cancellation shape"
+            "changing only required requestId to null rejects the final cancellation shape"
         );
         assert_eq!(
             serde_json::to_value(admitted.encode().expect("accepted cancellation re-encodes"))
                 .expect("accepted cancellation remains JSON"),
             accepted_wire,
-            "the one-field cross-era rejection leaves the admitted final cancellation unchanged"
+            "the one-field malformed-field rejection leaves the admitted cancellation unchanged"
         );
     }
 
@@ -4141,6 +4179,7 @@ mod tests {
             logger: Some("final.server".to_owned()),
             data: serde_json::json!({"message": "catalog refreshed"}),
             meta: None,
+            additional: BTreeMap::new(),
         };
         assert_eq!(
             serde_json::to_value(notification).expect("final log notification encodes"),
