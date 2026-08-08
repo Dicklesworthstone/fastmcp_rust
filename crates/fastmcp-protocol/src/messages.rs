@@ -657,7 +657,7 @@ pub struct FinalCreateMessageParams {
 }
 
 /// Exact final `sampling/createMessage` complete payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalCreateMessageResult {
     /// Generated final sampling content.
@@ -1012,7 +1012,7 @@ pub struct FinalEmbeddedUrlElicitationParams {
 }
 
 /// A final MRTR result payload embedded in a Task, without a JSON-RPC envelope.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FinalEmbeddedInputResponse {
     /// Sampling result payload.
     Sampling(FinalCreateMessageResult),
@@ -1092,7 +1092,7 @@ impl<'de> Deserialize<'de> for FinalEmbeddedInputResponse {
 }
 
 /// Exact roots-list result payload embedded in a Task input response map.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalEmbeddedRootsListResult {
     /// Roots supplied by the client.
@@ -1100,7 +1100,7 @@ pub struct FinalEmbeddedRootsListResult {
 }
 
 /// Exact elicitation response payload embedded in a Task input response map.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalEmbeddedElicitationResult {
     /// User action.
@@ -3750,7 +3750,7 @@ pub enum ElicitAction {
 /// Content type for elicitation responses.
 ///
 /// Values can be strings, integers, floats, booleans, arrays of strings, or null.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ElicitContentValue {
     /// Null value.
@@ -4173,6 +4173,32 @@ mod tests {
                 method,
             }) if method == SAMPLING_CREATE_MESSAGE
         ));
+    }
+
+    #[test]
+    fn final_embedded_input_response_equality_covers_each_typed_response() {
+        let sampling: FinalEmbeddedInputResponse = serde_json::from_value(serde_json::json!({
+            "content": {"type": "text", "text": "summary"},
+            "model": "final-model",
+            "role": "assistant",
+            "_meta": {"com.example/trace": {"attempt": 1}}
+        }))
+        .expect("final sampling response decodes");
+        let roots: FinalEmbeddedInputResponse = serde_json::from_value(serde_json::json!({
+            "roots": [{"uri": "file:///workspace", "name": "workspace"}]
+        }))
+        .expect("final roots response decodes");
+        let elicitation: FinalEmbeddedInputResponse = serde_json::from_value(serde_json::json!({
+            "action": "accept",
+            "content": {"choice": "yes", "attempt": 1}
+        }))
+        .expect("final elicitation response decodes");
+
+        assert_eq!(sampling, sampling.clone());
+        assert_eq!(roots, roots.clone());
+        assert_eq!(elicitation, elicitation.clone());
+        assert_ne!(sampling, roots);
+        assert_ne!(roots, elicitation);
     }
 
     #[test]
