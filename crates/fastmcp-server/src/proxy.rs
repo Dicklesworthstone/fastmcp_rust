@@ -348,6 +348,15 @@ pub struct ProxyClient {
     upstream_binding: Option<ProxyUpstreamBinding>,
 }
 
+impl std::fmt::Debug for ProxyClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProxyClient")
+            .field("upstream_binding", &self.upstream_binding)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Immutable adapter selected for one independently configured upstream leg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyUpstreamAdapter {
@@ -1163,7 +1172,7 @@ fn serialized_cache_identity<T: serde::Serialize>(value: &T, member: &str) -> Mc
 /// A cache entry is never keyed by an origin alone. Route, complete transport
 /// identity, policy (inside the HTTP bundle), adapter receipt identity, and
 /// configuration generation all participate in its identity.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ProxyUpstreamBindingRegistry {
     stdio: HashMap<StdioBindingKey, ProxyUpstreamBinding>,
     live_stdio: HashMap<LiveStdioBindingKey, ProxyUpstreamBinding>,
