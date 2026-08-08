@@ -3,7 +3,7 @@
 //! This module provides lightweight proxy handlers that forward tool/resource/prompt
 //! calls to another MCP server via a backend client.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
@@ -21,10 +21,12 @@ use fastmcp_protocol::protocol_policy::{
     StdioEraDecision, StdioOpeningFrame,
 };
 use fastmcp_protocol::{
-    ClientCapabilities, ClientInfo, Content, CoreRequest, CoreResult, FinalCoreResult,
-    FinalRequestMeta, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, LegacyCoreResult, Prompt, PromptArgument, PromptMessage, RequestId, Resource,
-    ResourceContent, ResourceTemplate, Tool, ToolAnnotations, decode_strict_jsonrpc_message,
+    CallToolResult, ClientCapabilities, ClientInfo, Content, CoreRequest, CoreResult,
+    FinalCoreResult, FinalRequestMeta, GetPromptResult, InitializeParams, InitializeResult,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyCoreResult,
+    LegacyPromptMessage, LegacyResourceContent, Prompt, PromptArgument, PromptMessage,
+    ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate, Tool,
+    ToolAnnotations, decode_strict_jsonrpc_message,
 };
 
 use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
@@ -61,6 +63,187 @@ pub trait ProxyBackend: Send {
     ) -> McpResult<Vec<PromptMessage>>;
 }
 
+/// Refuses fields which have no representation in the proxy handler surface.
+///
+/// The handler API intentionally exposes the older closed content types. An
+/// exact legacy or final wire payload must therefore be rejected whenever
+/// projecting it would erase annotations, metadata, or extension members.
+fn reject_lossy_proxy_projection(
+    context: &str,
+    annotations_present: bool,
+    metadata_present: bool,
+    additional: &BTreeMap<String, serde_json::Value>,
+) -> McpResult<()> {
+    if annotations_present {
+        return Err(McpError::invalid_request(format!(
+            "Proxy cannot losslessly project {context}: annotations are unsupported by proxy handler types"
+        )));
+    }
+    if metadata_present {
+        return Err(McpError::invalid_request(format!(
+            "Proxy cannot losslessly project {context}: metadata is unsupported by proxy handler types"
+        )));
+    }
+    if !additional.is_empty() {
+        return Err(McpError::invalid_request(format!(
+            "Proxy cannot losslessly project {context}: open fields are unsupported by proxy handler types"
+        )));
+    }
+    Ok(())
+}
+
+/// Projects exact 2024-11-05 content into the closed proxy handler surface.
+fn legacy_content_to_handler(content: LegacyContent) -> McpResult<Content> {
+    match content {
+        LegacyContent::Text {
+            text,
+            annotations,
+            additional,
+        } => {
+            reject_lossy_proxy_projection(
+                "legacy text content",
+                annotations.is_some(),
+                false,
+                &additional,
+            )?;
+            Ok(Content::Text { text })
+        }
+        LegacyContent::Image {
+            data,
+            mime_type,
+            annotations,
+            additional,
+        } => {
+            reject_lossy_proxy_projection(
+                "legacy image content",
+                annotations.is_some(),
+                false,
+                &additional,
+            )?;
+            Ok(Content::Image { data, mime_type })
+        }
+        LegacyContent::Resource {
+            resource,
+            annotations,
+            additional,
+        } => {
+            reject_lossy_proxy_projection(
+                "legacy resource content",
+                annotations.is_some(),
+                false,
+                &additional,
+            )?;
+            Ok(Content::Resource {
+                resource: legacy_resource_to_handler(resource)?,
+            })
+        }
+    }
+}
+
+fn legacy_contents_to_handler(contents: Vec<LegacyContent>) -> McpResult<Vec<Content>> {
+    contents
+        .into_iter()
+        .map(legacy_content_to_handler)
+        .collect()
+}
+
+/// Projects exact 2024-11-05 resource content only when it has no open state.
+fn legacy_resource_to_handler(resource: LegacyResourceContent) -> McpResult<ResourceContent> {
+    match resource {
+        LegacyResourceContent::Text {
+            uri,
+            text,
+            mime_type,
+            additional,
+        } => {
+            reject_lossy_proxy_projection("legacy text resource", false, false, &additional)?;
+            Ok(ResourceContent {
+                uri,
+                mime_type,
+                text: Some(text),
+                blob: None,
+            })
+        }
+        LegacyResourceContent::Blob {
+            uri,
+            blob,
+            mime_type,
+            additional,
+        } => {
+            reject_lossy_proxy_projection("legacy blob resource", false, false, &additional)?;
+            Ok(ResourceContent {
+                uri,
+                mime_type,
+                text: None,
+                blob: Some(blob),
+            })
+        }
+    }
+}
+
+fn legacy_resources_to_handler(
+    resources: Vec<LegacyResourceContent>,
+) -> McpResult<Vec<ResourceContent>> {
+    resources
+        .into_iter()
+        .map(legacy_resource_to_handler)
+        .collect()
+}
+
+fn legacy_prompt_message_to_handler(message: LegacyPromptMessage) -> McpResult<PromptMessage> {
+    reject_lossy_proxy_projection("legacy prompt message", false, false, &message.additional)?;
+    Ok(PromptMessage {
+        role: message.role,
+        content: legacy_content_to_handler(message.content)?,
+    })
+}
+
+fn legacy_prompt_messages_to_handler(
+    messages: Vec<LegacyPromptMessage>,
+) -> McpResult<Vec<PromptMessage>> {
+    messages
+        .into_iter()
+        .map(legacy_prompt_message_to_handler)
+        .collect()
+}
+
+fn legacy_tool_result_to_handler(result: CallToolResult) -> McpResult<Vec<Content>> {
+    reject_lossy_proxy_projection(
+        "legacy tools/call result",
+        false,
+        result.meta.is_some(),
+        &result.additional,
+    )?;
+    if result.is_error {
+        return Err(McpError::tool_error(
+            "Proxy cannot project a legacy tools/call error result as successful handler content",
+        ));
+    }
+    legacy_contents_to_handler(result.content)
+}
+
+fn legacy_resource_result_to_handler(
+    result: ReadResourceResult,
+) -> McpResult<Vec<ResourceContent>> {
+    reject_lossy_proxy_projection(
+        "legacy resources/read result",
+        false,
+        result.meta.is_some(),
+        &result.additional,
+    )?;
+    legacy_resources_to_handler(result.contents)
+}
+
+fn legacy_prompt_result_to_handler(result: GetPromptResult) -> McpResult<Vec<PromptMessage>> {
+    reject_lossy_proxy_projection(
+        "legacy prompts/get result",
+        false,
+        result.meta.is_some(),
+        &result.additional,
+    )?;
+    legacy_prompt_messages_to_handler(result.messages)
+}
+
 impl ProxyBackend for Client {
     fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
         self.ensure_initialized()?;
@@ -95,7 +278,7 @@ impl ProxyBackend for Client {
     }
 
     fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        Client::call_tool(self, name, arguments)
+        legacy_contents_to_handler(Client::call_tool(self, name, arguments)?)
     }
 
     fn call_tool_with_progress(
@@ -107,11 +290,16 @@ impl ProxyBackend for Client {
         let mut wrapper = |progress, total, message: Option<&str>| {
             on_progress(progress, total, message.map(ToString::to_string));
         };
-        Client::call_tool_with_progress(self, name, arguments, &mut wrapper)
+        legacy_contents_to_handler(Client::call_tool_with_progress(
+            self,
+            name,
+            arguments,
+            &mut wrapper,
+        )?)
     }
 
     fn read_resource(&mut self, uri: &str) -> McpResult<Vec<ResourceContent>> {
-        Client::read_resource(self, uri)
+        legacy_resources_to_handler(Client::read_resource(self, uri)?)
     }
 
     fn get_prompt(
@@ -119,7 +307,7 @@ impl ProxyBackend for Client {
         name: &str,
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
-        Client::get_prompt(self, name, arguments)
+        legacy_prompt_messages_to_handler(Client::get_prompt(self, name, arguments)?)
     }
 }
 
@@ -580,13 +768,12 @@ impl ProxyBackend for ProxyHttpClient {
             fastmcp_protocol::methods::TOOLS_CALL,
             serde_json::json!({"name": name, "arguments": arguments}),
         )? {
-            CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => Ok(result.content),
-            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => result
-                .payload
-                .content
-                .into_iter()
-                .map(final_content_to_legacy)
-                .collect(),
+            CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => {
+                legacy_tool_result_to_handler(result)
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                final_tool_result_to_handler(result.payload)
+            }
             _ => Err(unexpected_proxy_result("tools/call")),
         }
     }
@@ -605,13 +792,15 @@ impl ProxyBackend for ProxyHttpClient {
             fastmcp_protocol::methods::RESOURCES_READ,
             serde_json::json!({"uri": uri}),
         )? {
-            CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => Ok(result.contents),
-            CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => Ok(result
+            CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => {
+                legacy_resource_result_to_handler(result)
+            }
+            CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => result
                 .payload
                 .contents
                 .into_iter()
                 .map(embedded_resource_to_legacy)
-                .collect()),
+                .collect(),
             _ => Err(unexpected_proxy_result("resources/read")),
         }
     }
@@ -625,7 +814,9 @@ impl ProxyBackend for ProxyHttpClient {
             fastmcp_protocol::methods::PROMPTS_GET,
             serde_json::json!({"name": name, "arguments": arguments}),
         )? {
-            CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => Ok(result.messages),
+            CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => {
+                legacy_prompt_result_to_handler(result)
+            }
             CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) => result
                 .payload
                 .messages
@@ -826,48 +1017,136 @@ fn final_prompt_to_legacy(prompt: fastmcp_protocol::FinalPrompt) -> Prompt {
     }
 }
 
+fn final_tool_result_to_handler(
+    result: fastmcp_protocol::FinalCallToolResult,
+) -> McpResult<Vec<Content>> {
+    if result.is_error {
+        return Err(McpError::tool_error(
+            "Proxy cannot project a final tools/call error result as successful handler content",
+        ));
+    }
+    if result.structured_content.is_some() {
+        return Err(McpError::invalid_request(
+            "Proxy cannot losslessly project final tools/call structured content",
+        ));
+    }
+    result
+        .content
+        .into_iter()
+        .map(final_content_to_legacy)
+        .collect()
+}
+
 fn final_content_to_legacy(content: ContentBlock) -> McpResult<Content> {
     match content {
-        ContentBlock::Text { text, .. } => Ok(Content::Text { text }),
+        ContentBlock::Text {
+            text,
+            annotations,
+            meta,
+            additional,
+        } => {
+            reject_lossy_proxy_projection(
+                "final text content",
+                annotations.is_some(),
+                meta.is_some(),
+                &additional,
+            )?;
+            Ok(Content::Text { text })
+        }
         ContentBlock::Image {
-            data, mime_type, ..
-        } => Ok(Content::Image { data, mime_type }),
+            data,
+            mime_type,
+            annotations,
+            meta,
+            additional,
+        } => {
+            reject_lossy_proxy_projection(
+                "final image content",
+                annotations.is_some(),
+                meta.is_some(),
+                &additional,
+            )?;
+            Ok(Content::Image { data, mime_type })
+        }
         ContentBlock::Audio {
-            data, mime_type, ..
-        } => Ok(Content::Audio { data, mime_type }),
-        ContentBlock::Resource { resource, .. } => Ok(Content::Resource {
-            resource: embedded_resource_to_legacy(resource),
-        }),
-        ContentBlock::ResourceLink { .. }
-        | ContentBlock::ToolUse { .. }
-        | ContentBlock::ToolResult { .. } => Err(McpError::invalid_request(
+            data,
+            mime_type,
+            annotations,
+            meta,
+            additional,
+        } => {
+            reject_lossy_proxy_projection(
+                "final audio content",
+                annotations.is_some(),
+                meta.is_some(),
+                &additional,
+            )?;
+            Ok(Content::Audio { data, mime_type })
+        }
+        ContentBlock::Resource {
+            resource,
+            annotations,
+            meta,
+            additional,
+        } => {
+            reject_lossy_proxy_projection(
+                "final resource content",
+                annotations.is_some(),
+                meta.is_some(),
+                &additional,
+            )?;
+            Ok(Content::Resource {
+                resource: embedded_resource_to_legacy(resource)?,
+            })
+        }
+        ContentBlock::ResourceLink { .. } => Err(McpError::invalid_request(
             "Proxy HTTP final content cannot be represented by the legacy proxy handler surface",
         )),
     }
 }
 
-fn embedded_resource_to_legacy(resource: EmbeddedResourceContents) -> ResourceContent {
+fn embedded_resource_to_legacy(resource: EmbeddedResourceContents) -> McpResult<ResourceContent> {
     match resource {
         EmbeddedResourceContents::Text {
             uri,
             text,
             mime_type,
-        } => ResourceContent {
-            uri: uri.as_str().to_owned(),
-            text: Some(text),
-            mime_type,
-            blob: None,
-        },
+            meta,
+            additional,
+        } => {
+            reject_lossy_proxy_projection(
+                "final text resource",
+                false,
+                meta.is_some(),
+                &additional,
+            )?;
+            Ok(ResourceContent {
+                uri: uri.as_str().to_owned(),
+                text: Some(text),
+                mime_type,
+                blob: None,
+            })
+        }
         EmbeddedResourceContents::Blob {
             uri,
             blob,
             mime_type,
-        } => ResourceContent {
-            uri: uri.as_str().to_owned(),
-            text: None,
-            mime_type,
-            blob: Some(blob),
-        },
+            meta,
+            additional,
+        } => {
+            reject_lossy_proxy_projection(
+                "final blob resource",
+                false,
+                meta.is_some(),
+                &additional,
+            )?;
+            Ok(ResourceContent {
+                uri: uri.as_str().to_owned(),
+                text: None,
+                mime_type,
+                blob: Some(blob),
+            })
+        }
     }
 }
 
@@ -1577,7 +1856,7 @@ fn resource_from_template(template: &ResourceTemplate) -> Resource {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -1591,12 +1870,107 @@ mod tests {
     use fastmcp_core::{McpContext, McpErrorCode};
     use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
     use fastmcp_protocol::{
-        ClientCapabilities, ClientInfo, Content, Prompt, PromptMessage, Resource, ResourceContent,
-        Tool,
+        ClientCapabilities, ClientInfo, Content, LegacyContent, LegacyPromptMessage,
+        LegacyResourceContent, Prompt, PromptMessage, Resource, ResourceContent, Tool,
     };
 
-    use super::{ProxyBackend, ProxyCatalog, ProxyClient, ProxyPromptHandler, ProxyToolHandler};
+    use super::{
+        ProxyBackend, ProxyCatalog, ProxyClient, ProxyPromptHandler, ProxyToolHandler,
+        legacy_contents_to_handler, legacy_prompt_messages_to_handler, legacy_resource_to_handler,
+    };
     use crate::handler::{PromptHandler, ToolHandler};
+
+    #[test]
+    fn proxy_projects_closed_exact_legacy_handler_values() {
+        let contents = legacy_contents_to_handler(vec![
+            LegacyContent::Text {
+                text: "ready".to_owned(),
+                annotations: None,
+                additional: BTreeMap::new(),
+            },
+            LegacyContent::Resource {
+                resource: LegacyResourceContent::Blob {
+                    uri: "file:///report.bin".to_owned(),
+                    blob: "AAEC".to_owned(),
+                    mime_type: Some("application/octet-stream".to_owned()),
+                    additional: BTreeMap::new(),
+                },
+                annotations: None,
+                additional: BTreeMap::new(),
+            },
+        ])
+        .expect("closed legacy content is representable by proxy handlers");
+        assert_eq!(
+            serde_json::to_value(contents).expect("handler content serializes"),
+            serde_json::json!([
+                {"type": "text", "text": "ready"},
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///report.bin",
+                        "mimeType": "application/octet-stream",
+                        "blob": "AAEC"
+                    }
+                }
+            ])
+        );
+
+        let messages = legacy_prompt_messages_to_handler(vec![LegacyPromptMessage {
+            role: fastmcp_protocol::Role::Assistant,
+            content: LegacyContent::Text {
+                text: "summarized".to_owned(),
+                annotations: None,
+                additional: BTreeMap::new(),
+            },
+            additional: BTreeMap::new(),
+        }])
+        .expect("closed legacy prompt messages are representable by proxy handlers");
+        assert_eq!(
+            serde_json::to_value(messages).expect("handler prompt messages serialize"),
+            serde_json::json!([{
+                "role": "assistant",
+                "content": {"type": "text", "text": "summarized"}
+            }])
+        );
+    }
+
+    #[test]
+    fn proxy_rejects_one_legacy_resource_open_member_without_mutating_baseline() {
+        let baseline = LegacyResourceContent::Text {
+            uri: "file:///open.txt".to_owned(),
+            text: "baseline".to_owned(),
+            mime_type: Some("text/plain".to_owned()),
+            additional: BTreeMap::new(),
+        };
+        let baseline_wire = serde_json::to_value(
+            legacy_resource_to_handler(baseline.clone())
+                .expect("the baseline has no unrepresentable open members"),
+        )
+        .expect("baseline handler resource serializes");
+        let planted = LegacyResourceContent::Text {
+            uri: "file:///open.txt".to_owned(),
+            text: "baseline".to_owned(),
+            mime_type: Some("text/plain".to_owned()),
+            additional: BTreeMap::from([(
+                "com.example/extension".to_owned(),
+                serde_json::json!({"retained": true}),
+            )]),
+        };
+
+        let error = legacy_resource_to_handler(planted)
+            .expect_err("adding only one legacy open member must fail closed");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(error.message.contains("open fields"));
+        assert_eq!(
+            serde_json::to_value(
+                legacy_resource_to_handler(baseline)
+                    .expect("baseline remains representable after rejection"),
+            )
+            .expect("baseline handler resource remains serializable"),
+            baseline_wire,
+            "rejected open state cannot mutate the accepted baseline"
+        );
+    }
 
     #[derive(Default)]
     struct TestState {
