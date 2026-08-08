@@ -3,7 +3,7 @@
 //! This module provides the infrastructure for server-initiated requests to clients,
 //! such as:
 //! - `sampling/createMessage` - Request LLM completion from the client
-//! - `elicitation/elicit` - Request user input from the client
+//! - `elicitation/create` - Request user input from the client
 //! - `roots/list` - Request filesystem roots from the client
 //!
 //! # Architecture
@@ -46,8 +46,10 @@ use fastmcp_core::{
     McpError, McpErrorCode, McpRequestCancellation, McpResult, SamplingRequest, SamplingResponse,
     SamplingRole, SamplingSender, SamplingStopReason, draw_security_identifier,
 };
+use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde::ser::SerializeStruct;
 
 /// Default maximum number of concurrent server-to-client requests.
@@ -110,6 +112,7 @@ const MRTR_REQUEST_STATE_UNAVAILABLE_ERROR: &str = "Unable to create MRTR reques
 const MRTR_INPUT_MAP_ERROR: &str = "Invalid MRTR input request or response map";
 const MRTR_RESPONSE_KIND_ERROR: &str = "MRTR input response does not match its request";
 const MRTR_ROUND_LIMIT_ERROR: &str = "MRTR exchange limit reached";
+const LEGACY_INPUT_RETRY_ERROR: &str = "MCP 2024-11-05 does not support input retries";
 
 // ============================================================================
 // Pending Request Tracking
@@ -749,7 +752,7 @@ impl ElicitationSender for TransportElicitationSender {
 
             let result: fastmcp_protocol::ElicitResult = self
                 .sender
-                .send_request(&cx, "elicitation/elicit", params_value)
+                .send_request(&cx, "elicitation/create", params_value)
                 .await?;
 
             let action = match result.action {
@@ -1575,6 +1578,190 @@ impl Default for MrtrExchangeRegistry {
 }
 
 // ============================================================================
+// Dual-era Server-to-client Boundary
+// ============================================================================
+
+/// The typed outcome of one server-to-client input request.
+///
+/// Exact MCP 2024-11-05 completes the reverse JSON-RPC request and returns
+/// its typed client response. MCP 2026-07-28 instead returns a server result
+/// carrying an `input_required` exchange for the client to retry.
+#[derive(Debug, Clone)]
+pub enum DualEraServerToClientResult<T> {
+    /// A response to an exact-2024 reverse JSON-RPC request.
+    Legacy(T),
+    /// A final-era result that requires the client to retry with input.
+    InputRequired(MrtrInputRequired),
+}
+
+/// Era-selected server-to-client input boundary.
+///
+/// The exact MCP 2024-11-05 variant owns the transport sender and may issue
+/// only `sampling/createMessage`, `elicitation/create`, and `roots/list`
+/// reverse JSON-RPC requests. The MCP 2026-07-28 variant deliberately does
+/// not retain that sender: it can only issue and consume the bounded
+/// [`MrtrExchangeRegistry`] `input_required` retry flow.
+#[derive(Clone)]
+pub enum DualEraServerToClient {
+    /// Exact MCP 2024-11-05 reverse JSON-RPC support.
+    Legacy2024 {
+        /// The connection's reverse-request sender.
+        sender: RequestSender,
+    },
+    /// MCP 2026-07-28 embedded input/retry support.
+    Modern2026 {
+        /// The server-local registry for bounded input exchanges.
+        exchanges: Arc<MrtrExchangeRegistry>,
+    },
+}
+
+impl DualEraServerToClient {
+    /// Selects the sole server-to-client mechanism for one negotiated era.
+    ///
+    /// The legacy sender is intentionally consumed and discarded for MCP
+    /// 2026-07-28. That makes reverse JSON-RPC unavailable in the final-era
+    /// variant even if the connection also has a transport send callback.
+    #[must_use]
+    pub fn new(
+        era: ProtocolEra,
+        legacy_sender: RequestSender,
+        exchanges: Arc<MrtrExchangeRegistry>,
+    ) -> Self {
+        match era {
+            ProtocolEra::Legacy2024 => Self::Legacy2024 {
+                sender: legacy_sender,
+            },
+            ProtocolEra::Modern2026 => Self::Modern2026 { exchanges },
+        }
+    }
+
+    /// Returns the exact negotiated era selected by this boundary.
+    #[must_use]
+    pub const fn era(&self) -> ProtocolEra {
+        match self {
+            Self::Legacy2024 { .. } => ProtocolEra::Legacy2024,
+            Self::Modern2026 { .. } => ProtocolEra::Modern2026,
+        }
+    }
+
+    /// Requests a client sampling completion.
+    ///
+    /// In the legacy era this sends `sampling/createMessage` directly. In the
+    /// final era it returns an `input_required` result whose input descriptor
+    /// has that exact method and is owned by `owner_cancellation`.
+    pub async fn sampling_create_message(
+        &self,
+        cx: &Cx,
+        owner_cancellation: McpRequestCancellation,
+        input_key: impl Into<String>,
+        params: fastmcp_protocol::CreateMessageParams,
+    ) -> McpResult<DualEraServerToClientResult<fastmcp_protocol::CreateMessageResult>> {
+        self.dispatch(
+            cx,
+            owner_cancellation,
+            input_key.into(),
+            MrtrInputRequest::sampling(params)?,
+        )
+        .await
+    }
+
+    /// Requests client elicitation input.
+    ///
+    /// In the legacy era this sends `elicitation/create` directly. In the
+    /// final era it returns an `input_required` result whose input descriptor
+    /// has that exact method and is owned by `owner_cancellation`.
+    pub async fn elicitation_create(
+        &self,
+        cx: &Cx,
+        owner_cancellation: McpRequestCancellation,
+        input_key: impl Into<String>,
+        params: fastmcp_protocol::ElicitRequestParams,
+    ) -> McpResult<DualEraServerToClientResult<fastmcp_protocol::ElicitResult>> {
+        self.dispatch(
+            cx,
+            owner_cancellation,
+            input_key.into(),
+            MrtrInputRequest::elicitation(params)?,
+        )
+        .await
+    }
+
+    /// Requests the client's filesystem roots.
+    ///
+    /// In the legacy era this sends `roots/list` directly. In the final era
+    /// it returns an `input_required` result whose input descriptor has that
+    /// exact method and is owned by `owner_cancellation`.
+    pub async fn roots_list(
+        &self,
+        cx: &Cx,
+        owner_cancellation: McpRequestCancellation,
+        input_key: impl Into<String>,
+    ) -> McpResult<DualEraServerToClientResult<fastmcp_protocol::ListRootsResult>> {
+        self.dispatch(
+            cx,
+            owner_cancellation,
+            input_key.into(),
+            MrtrInputRequest::roots(),
+        )
+        .await
+    }
+
+    /// Consumes one final-era `inputResponses` retry.
+    ///
+    /// This accepts retries only for MCP 2026-07-28. The caller supplies the
+    /// active [`Cx`] for cancellation/budget authority; the registry retains
+    /// the request-local cancellation owner that was bound when it issued the
+    /// corresponding `input_required` result.
+    pub fn accept_input_retry(
+        &self,
+        cx: &Cx,
+        request_state: &str,
+        input_responses: MrtrInputResponses,
+    ) -> McpResult<MrtrRetry> {
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+
+        match self {
+            Self::Legacy2024 { .. } => Err(McpError::invalid_params(LEGACY_INPUT_RETRY_ERROR)),
+            Self::Modern2026 { exchanges } => exchanges.accept(request_state, input_responses),
+        }
+    }
+
+    async fn dispatch<T: DeserializeOwned>(
+        &self,
+        cx: &Cx,
+        owner_cancellation: McpRequestCancellation,
+        input_key: String,
+        input_request: MrtrInputRequest,
+    ) -> McpResult<DualEraServerToClientResult<T>> {
+        if cx.checkpoint().is_err() || owner_cancellation.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+
+        match self {
+            Self::Legacy2024 { sender } => {
+                let method = input_request.kind().method();
+                let params = input_request
+                    .params
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let response = sender
+                    .for_request(owner_cancellation)
+                    .send_request(cx, method, params)
+                    .await?;
+                Ok(DualEraServerToClientResult::Legacy(response))
+            }
+            Self::Modern2026 { exchanges } => {
+                let input_requests = MrtrInputRequests::new([(input_key, input_request)])?;
+                exchanges
+                    .issue(owner_cancellation, input_requests)
+                    .map(DualEraServerToClientResult::InputRequired)
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1840,6 +2027,202 @@ mod tests {
             .expect_err("owner cancellation must win before MRTR resolution");
         assert_eq!(cancellation_error.code, McpErrorCode::RequestCancelled);
         assert_eq!(registry.active_len(), 0, "cancelled state must be removed");
+    }
+
+    fn dual_era_boundary_with_recording_sender(
+        era: ProtocolEra,
+        sent_methods: Arc<Mutex<Vec<String>>>,
+    ) -> DualEraServerToClient {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_for_send = Arc::clone(&pending);
+        let sent_methods_for_send = Arc::clone(&sent_methods);
+        let send_fn: TransportSendFn = Arc::new(move |message| {
+            let JsonRpcMessage::Request(request) = message else {
+                panic!("the server-to-client boundary may only emit requests");
+            };
+            sent_methods_for_send
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.method.clone());
+
+            let result = match request.method.as_str() {
+                "sampling/createMessage" => serde_json::json!({
+                    "content": {"type": "text", "text": "legacy completion"},
+                    "role": "assistant",
+                    "model": "legacy-model",
+                    "stopReason": "endTurn"
+                }),
+                "elicitation/create" => serde_json::json!({"action": "decline"}),
+                "roots/list" => serde_json::json!({"roots": []}),
+                method => panic!("unexpected reverse JSON-RPC method: {method}"),
+            };
+            let id = request
+                .id
+                .clone()
+                .expect("server-to-client requests require an ID");
+            assert!(
+                pending_for_send.route_response(&JsonRpcResponse::success(id, result)),
+                "recorded reverse request must retain its response waiter"
+            );
+            Ok(())
+        });
+
+        DualEraServerToClient::new(
+            era,
+            RequestSender::new(pending, send_fn),
+            Arc::new(MrtrExchangeRegistry::new()),
+        )
+    }
+
+    #[test]
+    fn dual_era_boundary_legacy_round_trips_the_three_exact_reverse_methods() {
+        let sent_methods = Arc::new(Mutex::new(Vec::new()));
+        let boundary = dual_era_boundary_with_recording_sender(
+            ProtocolEra::Legacy2024,
+            Arc::clone(&sent_methods),
+        );
+        let cx = Cx::for_testing();
+
+        let sampling = block_on(boundary.sampling_create_message(
+            &cx,
+            McpRequestCancellation::new(),
+            "sample",
+            fastmcp_protocol::CreateMessageParams::new(Vec::new(), 16),
+        ))
+        .expect("legacy sampling must await a direct response");
+        let DualEraServerToClientResult::Legacy(sampling) = sampling else {
+            panic!("legacy sampling must not create an MRTR retry");
+        };
+        assert_eq!(sampling.model, "legacy-model");
+
+        let elicitation = block_on(boundary.elicitation_create(
+            &cx,
+            McpRequestCancellation::new(),
+            "elicit",
+            fastmcp_protocol::ElicitRequestParams::form(
+                "Continue?",
+                serde_json::json!({"type": "object"}),
+            ),
+        ))
+        .expect("legacy elicitation must await a direct response");
+        assert!(matches!(
+            elicitation,
+            DualEraServerToClientResult::Legacy(fastmcp_protocol::ElicitResult {
+                action: fastmcp_protocol::ElicitAction::Decline,
+                ..
+            })
+        ));
+
+        let roots = block_on(boundary.roots_list(&cx, McpRequestCancellation::new(), "roots"))
+            .expect("legacy roots must await a direct response");
+        let DualEraServerToClientResult::Legacy(roots) = roots else {
+            panic!("legacy roots must not create an MRTR retry");
+        };
+        assert!(roots.roots.is_empty());
+
+        assert_eq!(boundary.era(), ProtocolEra::Legacy2024);
+        assert_eq!(
+            *sent_methods
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                "sampling/createMessage".to_owned(),
+                "elicitation/create".to_owned(),
+                "roots/list".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dual_era_boundary_modern_uses_input_required_retry_flow() {
+        let sent_methods = Arc::new(Mutex::new(Vec::new()));
+        let boundary = dual_era_boundary_with_recording_sender(
+            ProtocolEra::Modern2026,
+            Arc::clone(&sent_methods),
+        );
+        let cx = Cx::for_testing();
+
+        let sampling = block_on(boundary.sampling_create_message(
+            &cx,
+            McpRequestCancellation::new(),
+            "sample",
+            fastmcp_protocol::CreateMessageParams::new(Vec::new(), 16),
+        ))
+        .expect("modern sampling must create an MRTR input result");
+        let DualEraServerToClientResult::InputRequired(required) = sampling else {
+            panic!("modern sampling must not send and await reverse JSON-RPC");
+        };
+        let wire = serde_json::to_value(&required).expect("MRTR result must serialize");
+        assert_eq!(wire["resultType"], "input_required");
+        assert_eq!(
+            wire["inputRequests"]["sample"]["method"],
+            "sampling/createMessage"
+        );
+        assert!(wire["inputRequests"]["sample"].get("jsonrpc").is_none());
+        assert!(wire["inputRequests"]["sample"].get("id").is_none());
+
+        let complete = boundary
+            .accept_input_retry(
+                &cx,
+                &mrtr_state_from_wire(&required),
+                MrtrInputResponses::new([(
+                    "sample".to_owned(),
+                    MrtrInputResponse::sampling(fastmcp_protocol::CreateMessageResult::text(
+                        "modern completion",
+                        "modern-model",
+                    ))
+                    .expect("sampling response must serialize"),
+                )])
+                .expect("one matching final response"),
+            )
+            .expect("modern retry must resolve through the MRTR registry");
+        let MrtrRetry::Complete(complete) = complete else {
+            panic!("a matching response must complete the one-input exchange");
+        };
+        assert_eq!(complete.responses().len(), 1);
+        assert_eq!(
+            complete
+                .responses()
+                .get("sample")
+                .map(MrtrInputResponse::kind),
+            Some(MrtrInputKind::Sampling)
+        );
+        assert_eq!(boundary.era(), ProtocolEra::Modern2026);
+        assert!(
+            sent_methods
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "modern input_required must not emit a reverse JSON-RPC request"
+        );
+    }
+
+    #[test]
+    fn dual_era_boundary_modern_roots_never_sends_reverse_jsonrpc() {
+        let sent_methods = Arc::new(Mutex::new(Vec::new()));
+        let boundary = dual_era_boundary_with_recording_sender(
+            ProtocolEra::Modern2026,
+            Arc::clone(&sent_methods),
+        );
+        let cx = Cx::for_testing();
+
+        let roots = block_on(boundary.roots_list(&cx, McpRequestCancellation::new(), "roots"))
+            .expect("modern roots must create an MRTR input result");
+        let DualEraServerToClientResult::InputRequired(required) = roots else {
+            panic!("changing only the selected era must disable reverse roots/list");
+        };
+        let wire = serde_json::to_value(required).expect("MRTR result must serialize");
+        assert_eq!(
+            wire["inputRequests"]["roots"],
+            serde_json::json!({"method": "roots/list"})
+        );
+        assert!(
+            sent_methods
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "MCP 2026-07-28 must not send roots/list as reverse JSON-RPC"
+        );
     }
 
     #[test]
