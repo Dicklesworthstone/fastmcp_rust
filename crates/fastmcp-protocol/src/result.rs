@@ -6,8 +6,9 @@
 
 use std::fmt;
 
-use crate::ServerInfo;
+use crate::common_types::{Implementation, OpenMetadata};
 use crate::jsonrpc::{RawJsonAdmissionError, admit_raw_jsonrpc_document};
+use crate::protocol_policy::ProtocolEra;
 
 /// Maximum encoded bytes accepted by the result codec.
 pub const MAX_RESULT_ENCODED_BYTES: usize = 1_048_576;
@@ -187,6 +188,61 @@ pub fn parse_exact_json(input: &str) -> Result<ExactJsonValue, ResultDecodeError
     Ok(value)
 }
 
+/// Converts an ordinary serde value into the result algebra's bounded exact
+/// representation before it is attached to a locally authored result.
+pub fn exact_json_from_serde(
+    value: &serde_json::Value,
+) -> Result<ExactJsonValue, ResultDecodeError> {
+    let exact = exact_json_from_serde_unchecked(value);
+    let _ = exact_json_value_len(&exact, 0)?;
+    Ok(exact)
+}
+
+fn exact_json_from_serde_unchecked(value: &serde_json::Value) -> ExactJsonValue {
+    match value {
+        serde_json::Value::Null => ExactJsonValue::Null,
+        serde_json::Value::Bool(value) => ExactJsonValue::Bool(*value),
+        serde_json::Value::String(value) => ExactJsonValue::String(value.clone()),
+        serde_json::Value::Number(value) => ExactJsonValue::Number(value.to_string()),
+        serde_json::Value::Array(values) => {
+            ExactJsonValue::Array(values.iter().map(exact_json_from_serde_unchecked).collect())
+        }
+        serde_json::Value::Object(values) => ExactJsonValue::Object(ExactJsonObject {
+            members: values
+                .iter()
+                .map(|(name, value)| ExactJsonMember {
+                    name: name.clone(),
+                    value: exact_json_from_serde_unchecked(value),
+                })
+                .collect(),
+        }),
+    }
+}
+
+/// Converts one exact result value into a serde value for a selected typed
+/// method payload. Open result siblings remain exact and are never converted
+/// unless that payload explicitly owns their member name.
+pub fn exact_json_to_serde(value: &ExactJsonValue) -> Result<serde_json::Value, ResultDecodeError> {
+    match value {
+        ExactJsonValue::Null => Ok(serde_json::Value::Null),
+        ExactJsonValue::Bool(value) => Ok(serde_json::Value::Bool(*value)),
+        ExactJsonValue::String(value) => Ok(serde_json::Value::String(value.clone())),
+        ExactJsonValue::Number(value) => serde_json::from_str(value)
+            .map_err(|_| ResultDecodeError::new(ResultDecodeErrorKind::InvalidJson, "$")),
+        ExactJsonValue::Array(values) => values
+            .iter()
+            .map(exact_json_to_serde)
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        ExactJsonValue::Object(object) => object
+            .members()
+            .iter()
+            .map(|member| Ok((member.name.clone(), exact_json_to_serde(&member.value)?)))
+            .collect::<Result<serde_json::Map<_, _>, ResultDecodeError>>()
+            .map(serde_json::Value::Object),
+    }
+}
+
 fn parse_exact_result_object(input: &str) -> Result<ExactJsonObject, ResultDecodeError> {
     admit_raw_jsonrpc_document(input.as_bytes(), MAX_RESULT_ENCODED_BYTES)
         .map_err(result_raw_admission_error)?;
@@ -222,18 +278,33 @@ fn result_raw_admission_error(error: RawJsonAdmissionError) -> ResultDecodeError
 #[derive(Debug, Clone)]
 pub struct ResultMeta {
     /// SDK-created successful results carry a server identity by default.
-    pub server_info: Option<ServerInfo>,
-    meta: Option<ExactJsonObject>,
+    pub server_info: Option<Implementation>,
+    meta: Option<OpenMetadata>,
+    exact_meta: Option<ExactJsonObject>,
 }
 
 impl ResultMeta {
     /// Creates metadata for a locally constructed successful result.
     #[must_use]
-    pub fn server_generated(server_info: ServerInfo) -> Self {
+    pub fn server_generated(server_info: Implementation) -> Self {
         Self {
             server_info: Some(server_info),
             meta: None,
+            exact_meta: None,
         }
+    }
+
+    /// Attaches final common metadata without synthesizing it when absent.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: OpenMetadata) -> Self {
+        let exact =
+            exact_json_from_serde_unchecked(&serde_json::Value::Object(metadata.entries().clone()));
+        let ExactJsonValue::Object(exact_meta) = exact else {
+            unreachable!("metadata always encodes as an object");
+        };
+        self.meta = Some(metadata);
+        self.exact_meta = Some(exact_meta);
+        self
     }
 
     /// Returns a view that behaves as an empty metadata object when `_meta` was
@@ -241,7 +312,7 @@ impl ResultMeta {
     #[must_use]
     pub fn metadata(&self) -> MetadataView<'_> {
         MetadataView {
-            object: self.meta.as_ref(),
+            object: self.exact_meta.as_ref(),
         }
     }
 }
@@ -312,6 +383,12 @@ impl UnknownResultMembers {
     #[must_use]
     pub fn members(&self) -> &[ExactJsonMember] {
         &self.members
+    }
+
+    /// Returns the retained members for a selected typed composition.
+    #[must_use]
+    pub fn into_members(self) -> Vec<ExactJsonMember> {
+        self.members
     }
 }
 
@@ -655,6 +732,15 @@ pub enum ResultPeerEra {
     Modern,
 }
 
+impl From<ProtocolEra> for ResultPeerEra {
+    fn from(era: ProtocolEra) -> Self {
+        match era {
+            ProtocolEra::Legacy2024 => Self::Legacy,
+            ProtocolEra::Modern2026 => Self::Modern,
+        }
+    }
+}
+
 /// Bounded diagnostics produced while preserving interoperable peer input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultPeerDiagnostic {
@@ -755,6 +841,19 @@ pub fn decode_peer_result(
     }
 }
 
+/// Decodes one peer result using the protocol era selected for its request.
+///
+/// This is the dispatch-facing entry point. It keeps the older
+/// [`ResultPeerEra`] spelling available for existing callers while ensuring
+/// that request and result selection share one exact era source of truth.
+pub fn decode_peer_result_for_era(
+    input: &str,
+    era: ProtocolEra,
+    policy: &dyn ResultDiscriminatorPolicy,
+) -> Result<(DecodedResult, Option<ResultPeerDiagnostic>), ResultDecodeError> {
+    decode_peer_result(input, era.into(), policy)
+}
+
 /// Decodes a selected method-specific `complete` composition.
 ///
 /// The core result envelope is admitted first. The selected payload then
@@ -804,11 +903,13 @@ pub fn decode_typed_complete<T: CompleteResultPayload>(
 }
 
 fn validate_complete_payload_names<T: CompleteResultPayload>() -> Result<(), ResultDecodeError> {
-    for (index, name) in T::KNOWN_MEMBER_NAMES.iter().enumerate() {
+    validate_known_member_names(T::KNOWN_MEMBER_NAMES)
+}
+
+fn validate_known_member_names(names: &[&str]) -> Result<(), ResultDecodeError> {
+    for (index, name) in names.iter().enumerate() {
         if COMMON_RESULT_MEMBER_NAMES.contains(name)
-            || T::KNOWN_MEMBER_NAMES[..index]
-                .iter()
-                .any(|previous| previous == name)
+            || names[..index].iter().any(|previous| previous == name)
         {
             return Err(ResultDecodeError::new(
                 ResultDecodeErrorKind::KnownMemberCollision,
@@ -820,9 +921,19 @@ fn validate_complete_payload_names<T: CompleteResultPayload>() -> Result<(), Res
 }
 
 fn decode_result_meta(members: &mut ExactJsonObject) -> Result<ResultMeta, ResultDecodeError> {
-    let meta = match members.take("_meta") {
-        None => None,
-        Some(ExactJsonValue::Object(value)) => Some(value),
+    let (meta, exact_meta) = match members.take("_meta") {
+        None => (None, None),
+        Some(ExactJsonValue::Object(value)) => (
+            Some(
+                serde_json::from_value(exact_json_to_serde(&ExactJsonValue::Object(
+                    value.clone(),
+                ))?)
+                .map_err(|_| {
+                    ResultDecodeError::new(ResultDecodeErrorKind::InvalidKnownMember, "$._meta")
+                })?,
+            ),
+            Some(value),
+        ),
         Some(_) => {
             return Err(ResultDecodeError::new(
                 ResultDecodeErrorKind::InvalidKnownMember,
@@ -832,35 +943,17 @@ fn decode_result_meta(members: &mut ExactJsonObject) -> Result<ResultMeta, Resul
     };
     let server_info = match members.take("serverInfo") {
         None => None,
-        Some(ExactJsonValue::Object(mut value)) => {
-            let Some(ExactJsonValue::String(name)) = value.take("name") else {
-                return Err(ResultDecodeError::new(
-                    ResultDecodeErrorKind::InvalidKnownMember,
-                    "$.serverInfo.name",
-                ));
-            };
-            let Some(ExactJsonValue::String(version)) = value.take("version") else {
-                return Err(ResultDecodeError::new(
-                    ResultDecodeErrorKind::InvalidKnownMember,
-                    "$.serverInfo.version",
-                ));
-            };
-            if !value.members.is_empty() {
-                return Err(ResultDecodeError::new(
-                    ResultDecodeErrorKind::InvalidKnownMember,
-                    "$.serverInfo",
-                ));
-            }
-            Some(ServerInfo { name, version })
-        }
-        Some(_) => {
-            return Err(ResultDecodeError::new(
-                ResultDecodeErrorKind::InvalidKnownMember,
-                "$.serverInfo",
-            ));
-        }
+        Some(value) => Some(
+            serde_json::from_value(exact_json_to_serde(&value)?).map_err(|_| {
+                ResultDecodeError::new(ResultDecodeErrorKind::InvalidKnownMember, "$.serverInfo")
+            })?,
+        ),
     };
-    Ok(ResultMeta { server_info, meta })
+    Ok(ResultMeta {
+        server_info,
+        meta,
+        exact_meta,
+    })
 }
 
 /// Re-emits a result without discarding or semantically rewriting any retained
@@ -896,28 +989,61 @@ pub fn encode_result(result: &DecodedResult) -> String {
     encode_exact_object(&ExactJsonObject { members })
 }
 
+/// Encodes one selected typed `complete` result through the final result
+/// algebra. Method dispatch supplies exactly the members it owns; every other
+/// admitted member remains an inert [`UnknownResultMembers`] sibling.
+pub fn encode_complete_result(
+    meta: &ResultMeta,
+    known_members: Vec<ExactJsonMember>,
+    known_names: &[&str],
+    extras: &UnknownResultMembers,
+) -> Result<String, ResultDecodeError> {
+    validate_known_member_names(known_names)?;
+    for (index, member) in known_members.iter().enumerate() {
+        if !known_names.contains(&member.name.as_str())
+            || known_members[..index]
+                .iter()
+                .any(|previous| previous.name == member.name)
+        {
+            return Err(ResultDecodeError::new(
+                ResultDecodeErrorKind::KnownMemberCollision,
+                member.name.clone(),
+            ));
+        }
+    }
+    let checked_extras = UnknownResultMembers::try_new(extras.members.clone(), known_names)?;
+    let mut members = vec![ExactJsonMember {
+        name: "resultType".to_owned(),
+        value: ExactJsonValue::String("complete".to_owned()),
+    }];
+    append_result_meta(&mut members, meta);
+    members.extend(known_members);
+    members.extend(checked_extras.members);
+    validate_local_result_members(&members)?;
+    Ok(encode_exact_object(&ExactJsonObject { members }))
+}
+
 fn append_result_meta(members: &mut Vec<ExactJsonMember>, meta: &ResultMeta) {
     if let Some(value) = &meta.meta {
         members.push(ExactJsonMember {
             name: "_meta".to_owned(),
-            value: ExactJsonValue::Object(value.clone()),
+            value: meta.exact_meta.as_ref().map_or_else(
+                || {
+                    exact_json_from_serde_unchecked(&serde_json::Value::Object(
+                        value.entries().clone(),
+                    ))
+                },
+                |exact| ExactJsonValue::Object(exact.clone()),
+            ),
         });
     }
     if let Some(server_info) = &meta.server_info {
         members.push(ExactJsonMember {
             name: "serverInfo".to_owned(),
-            value: ExactJsonValue::Object(ExactJsonObject {
-                members: vec![
-                    ExactJsonMember {
-                        name: "name".to_owned(),
-                        value: ExactJsonValue::String(server_info.name.clone()),
-                    },
-                    ExactJsonMember {
-                        name: "version".to_owned(),
-                        value: ExactJsonValue::String(server_info.version.clone()),
-                    },
-                ],
-            }),
+            value: exact_json_from_serde_unchecked(
+                &serde_json::to_value(server_info)
+                    .expect("final implementation identity always serializes"),
+            ),
         });
     }
 }

@@ -4,12 +4,25 @@
 
 use std::collections::BTreeMap;
 
-use serde::de::Visitor;
+use serde::de::{DeserializeOwned, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+use crate::common_types::{
+    AbsoluteUri, ContentBlock, EmbeddedResourceContents, LoggingLevel, OpenMetadata,
+};
 use crate::jsonrpc::RequestId;
+use crate::methods::{
+    INITIALIZE, LOGGING_SET_LEVEL, PING, PROMPTS_GET, PROMPTS_LIST, RESOURCES_LIST, RESOURCES_READ,
+    RESOURCES_TEMPLATES_LIST, TOOLS_CALL, TOOLS_LIST,
+};
+use crate::protocol_policy::ProtocolEra;
 use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
+use crate::result::{
+    CompleteResult, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonMember,
+    ResultDecodeError, ResultPeerDiagnostic, UnknownResultMembers, decode_peer_result_for_era,
+    encode_complete_result, exact_json_from_serde, exact_json_to_serde,
+};
 use crate::types::{
     ClientCapabilities, ClientInfo, Content, Prompt, PromptMessage, Resource, ResourceContent,
     ResourceTemplate, ServerCapabilities, ServerInfo, Tool,
@@ -131,6 +144,1020 @@ impl FinalRequestMeta {
             body_version: Some(&self.protocol_version),
         }
     }
+}
+
+// ============================================================================
+// Era-aware core dispatch
+// ============================================================================
+
+/// Final pagination parameters shared by the core catalog methods.
+///
+/// This is intentionally separate from the legacy list parameter structs:
+/// final requests always carry the common metadata object, while the legacy
+/// wire era negotiates through its initialize request instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalListParams {
+    /// Required final request metadata.
+    #[serde(rename = "_meta")]
+    pub meta: OpenMetadata,
+    /// Opaque pagination cursor; a present empty cursor remains present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Only include catalog entries with every listed tag.
+    #[serde(
+        rename = "includeTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub include_tags: Option<Vec<String>>,
+    /// Exclude catalog entries with any listed tag.
+    #[serde(
+        rename = "excludeTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exclude_tags: Option<Vec<String>>,
+}
+
+/// Final `tools/call` request parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalCallToolParams {
+    /// Required final request metadata.
+    #[serde(rename = "_meta")]
+    pub meta: OpenMetadata,
+    /// Name of the selected tool.
+    pub name: String,
+    /// Optional method-owned tool arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Value>,
+}
+
+/// Final `resources/read` request parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalReadResourceParams {
+    /// Required final request metadata.
+    #[serde(rename = "_meta")]
+    pub meta: OpenMetadata,
+    /// Structurally admitted resource URI.
+    pub uri: AbsoluteUri,
+}
+
+/// Final `prompts/get` request parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalGetPromptParams {
+    /// Required final request metadata.
+    #[serde(rename = "_meta")]
+    pub meta: OpenMetadata,
+    /// Name of the selected prompt.
+    pub name: String,
+    /// Optional prompt arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<BTreeMap<String, String>>,
+}
+
+/// Final `logging/setLevel` request parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalSetLogLevelParams {
+    /// Required final request metadata.
+    #[serde(rename = "_meta")]
+    pub meta: OpenMetadata,
+    /// Final RFC 5424 logging level.
+    pub level: LoggingLevel,
+}
+
+/// Final empty request parameters, used by `ping`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalEmptyParams {
+    /// Required final request metadata.
+    #[serde(rename = "_meta")]
+    pub meta: OpenMetadata,
+}
+
+/// Final `tools/list` result payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalListToolsResult {
+    /// Catalog tools in their selected order.
+    pub tools: Vec<Tool>,
+    /// Opaque next cursor, if another page is available.
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Final `tools/call` result payload using final common content blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalCallToolResult {
+    /// Final common output content.
+    pub content: Vec<ContentBlock>,
+    /// Whether the tool execution completed with a tool-level error.
+    #[serde(
+        rename = "isError",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub is_error: bool,
+}
+
+/// Final `resources/list` result payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalListResourcesResult {
+    /// Catalog resources in their selected order.
+    pub resources: Vec<Resource>,
+    /// Opaque next cursor, if another page is available.
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Final `resources/templates/list` result payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalListResourceTemplatesResult {
+    /// Catalog templates in their selected order.
+    #[serde(rename = "resourceTemplates")]
+    pub resource_templates: Vec<ResourceTemplate>,
+    /// Opaque next cursor, if another page is available.
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Final `resources/read` result payload using final common resource content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalReadResourceResult {
+    /// Read resource contents.
+    pub contents: Vec<EmbeddedResourceContents>,
+}
+
+/// Final `prompts/list` result payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalListPromptsResult {
+    /// Catalog prompts in their selected order.
+    pub prompts: Vec<Prompt>,
+    /// Opaque next cursor, if another page is available.
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// One final prompt message using a final common content block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalPromptMessage {
+    /// Role of the prompt message author.
+    pub role: crate::types::Role,
+    /// Final common message content.
+    pub content: ContentBlock,
+}
+
+/// Final `prompts/get` result payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalGetPromptResult {
+    /// Optional prompt description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Prompt messages.
+    pub messages: Vec<FinalPromptMessage>,
+}
+
+/// Empty final complete-result payload used by acknowledgement methods.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalEmptyResult {}
+
+/// Empty exact-legacy result payload used by acknowledgement methods.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyEmptyResult {}
+
+/// Legacy core requests remain exact uses of the existing message structs.
+/// They are never reinterpreted as final requests.
+#[derive(Debug, Clone)]
+pub enum LegacyCoreRequest {
+    /// `initialize` is unique to the legacy initialize-handshake era.
+    Initialize(InitializeParams),
+    /// `tools/list`.
+    ToolsList(ListToolsParams),
+    /// `tools/call`.
+    ToolsCall(CallToolParams),
+    /// `resources/list`.
+    ResourcesList(ListResourcesParams),
+    /// `resources/templates/list`.
+    ResourceTemplatesList(ListResourceTemplatesParams),
+    /// `resources/read`.
+    ResourcesRead(ReadResourceParams),
+    /// `prompts/list`.
+    PromptsList(ListPromptsParams),
+    /// `prompts/get`.
+    PromptsGet(GetPromptParams),
+    /// `logging/setLevel`.
+    SetLogLevel(SetLogLevelParams),
+    /// `ping`, which has no legacy parameter object.
+    Ping,
+}
+
+/// Final core requests use final metadata and common vocabulary throughout.
+#[derive(Debug, Clone)]
+pub enum FinalCoreRequest {
+    /// `tools/list`.
+    ToolsList(FinalListParams),
+    /// `tools/call`.
+    ToolsCall(FinalCallToolParams),
+    /// `resources/list`.
+    ResourcesList(FinalListParams),
+    /// `resources/templates/list`.
+    ResourceTemplatesList(FinalListParams),
+    /// `resources/read`.
+    ResourcesRead(FinalReadResourceParams),
+    /// `prompts/list`.
+    PromptsList(FinalListParams),
+    /// `prompts/get`.
+    PromptsGet(FinalGetPromptParams),
+    /// `logging/setLevel`.
+    SetLogLevel(FinalSetLogLevelParams),
+    /// `ping`.
+    Ping(FinalEmptyParams),
+}
+
+/// Public, era-aware dispatch for the currently supported core request set.
+#[derive(Debug, Clone)]
+pub enum CoreRequest {
+    /// Exact MCP 2024-11-05 request vocabulary.
+    Legacy(LegacyCoreRequest),
+    /// Final MCP 2026-07-28 request vocabulary.
+    Final(FinalCoreRequest),
+}
+
+/// Exact legacy response payloads, intentionally disjoint from final results.
+#[derive(Debug, Clone)]
+pub enum LegacyCoreResult {
+    /// `initialize`.
+    Initialize(InitializeResult),
+    /// `tools/list`.
+    ToolsList(ListToolsResult),
+    /// `tools/call`.
+    ToolsCall(CallToolResult),
+    /// `resources/list`.
+    ResourcesList(ListResourcesResult),
+    /// `resources/templates/list`.
+    ResourceTemplatesList(ListResourceTemplatesResult),
+    /// `resources/read`.
+    ResourcesRead(ReadResourceResult),
+    /// `prompts/list`.
+    PromptsList(ListPromptsResult),
+    /// `prompts/get`.
+    PromptsGet(GetPromptResult),
+    /// `logging/setLevel` acknowledgement.
+    SetLogLevel(LegacyEmptyResult),
+    /// `ping` acknowledgement.
+    Ping(LegacyEmptyResult),
+}
+
+/// Final result dispatch for the currently supported core methods.
+///
+/// Each branch carries the bounded final complete-result algebra and preserves
+/// its absent-result-type compatibility diagnostic for callers that record
+/// peer conformance.
+#[derive(Debug, Clone)]
+pub enum FinalCoreResult {
+    /// `tools/list`.
+    ToolsList {
+        result: CompleteResult<FinalListToolsResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+    /// `tools/call`.
+    ToolsCall {
+        result: CompleteResult<FinalCallToolResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+    /// `resources/list`.
+    ResourcesList {
+        result: CompleteResult<FinalListResourcesResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+    /// `resources/templates/list`.
+    ResourceTemplatesList {
+        result: CompleteResult<FinalListResourceTemplatesResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+    /// `resources/read`.
+    ResourcesRead {
+        result: CompleteResult<FinalReadResourceResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+    /// `prompts/list`.
+    PromptsList {
+        result: CompleteResult<FinalListPromptsResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+    /// `prompts/get`.
+    PromptsGet {
+        result: CompleteResult<FinalGetPromptResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+    /// `logging/setLevel` acknowledgement.
+    SetLogLevel {
+        result: CompleteResult<FinalEmptyResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+    /// `ping` acknowledgement.
+    Ping {
+        result: CompleteResult<FinalEmptyResult>,
+        diagnostic: Option<ResultPeerDiagnostic>,
+    },
+}
+
+/// Public, era-aware dispatch for core results.
+#[derive(Debug, Clone)]
+pub enum CoreResult {
+    /// Exact MCP 2024-11-05 result vocabulary.
+    Legacy(LegacyCoreResult),
+    /// Final MCP 2026-07-28 complete-result vocabulary.
+    Final(FinalCoreResult),
+}
+
+/// Stable errors raised while selecting a typed core request or result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreDispatchError {
+    /// The selected era does not support this method.
+    UnsupportedMethod { era: ProtocolEra, method: String },
+    /// A request's method-specific parameters could not be decoded.
+    InvalidParams {
+        era: ProtocolEra,
+        method: &'static str,
+    },
+    /// Final request metadata was absent, malformed, or for another era.
+    InvalidFinalMetadata { method: &'static str },
+    /// A legacy request attempted to carry final per-request metadata.
+    CrossEraRequestMetadata { method: &'static str },
+    /// A legacy result attempted to carry a final `resultType` discriminator.
+    CrossEraResultType { method: &'static str },
+    /// A result did not match the selected method-specific payload.
+    InvalidResult {
+        era: ProtocolEra,
+        method: &'static str,
+    },
+    /// A final result used another core discriminator.
+    UnexpectedFinalResultType { method: &'static str },
+    /// The bounded final result codec rejected the wire value.
+    ResultCodec(ResultDecodeError),
+}
+
+impl std::fmt::Display for CoreDispatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedMethod { era, method } => {
+                write!(formatter, "{method} is not supported in {era:?}")
+            }
+            Self::InvalidParams { era, method } => {
+                write!(formatter, "invalid {method} parameters for {era:?}")
+            }
+            Self::InvalidFinalMetadata { method } => {
+                write!(formatter, "invalid final metadata for {method}")
+            }
+            Self::CrossEraRequestMetadata { method } => {
+                write!(formatter, "legacy {method} cannot carry final metadata")
+            }
+            Self::CrossEraResultType { method } => {
+                write!(formatter, "legacy {method} cannot carry final resultType")
+            }
+            Self::InvalidResult { era, method } => {
+                write!(formatter, "invalid {method} result for {era:?}")
+            }
+            Self::UnexpectedFinalResultType { method } => {
+                write!(formatter, "final {method} requires a complete result")
+            }
+            Self::ResultCodec(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CoreDispatchError {}
+
+impl From<ResultDecodeError> for CoreDispatchError {
+    fn from(error: ResultDecodeError) -> Self {
+        Self::ResultCodec(error)
+    }
+}
+
+impl CoreRequest {
+    /// Decodes one core request only through the exact protocol era selected
+    /// by the connection. The two request vocabularies are deliberately
+    /// disjoint even where their method literals are shared.
+    pub fn decode(
+        era: ProtocolEra,
+        method: &str,
+        params: Option<&Value>,
+    ) -> Result<Self, CoreDispatchError> {
+        match era {
+            ProtocolEra::Legacy2024 => Self::decode_legacy(method, params),
+            ProtocolEra::Modern2026 => Self::decode_final(method, params),
+        }
+    }
+
+    /// Returns the era selected by this request.
+    #[must_use]
+    pub const fn era(&self) -> ProtocolEra {
+        match self {
+            Self::Legacy(_) => ProtocolEra::Legacy2024,
+            Self::Final(_) => ProtocolEra::Modern2026,
+        }
+    }
+
+    /// Returns the exact core method literal selected by this request.
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::Legacy(request) => request.method(),
+            Self::Final(request) => request.method(),
+        }
+    }
+
+    /// Encodes the method-owned parameter object without adding a JSON-RPC
+    /// envelope. Final requests revalidate their common metadata before
+    /// serialization so local callers cannot emit a cross-era request.
+    pub fn encode_params(&self) -> Result<Option<Value>, CoreDispatchError> {
+        match self {
+            Self::Legacy(request) => request.encode_params(),
+            Self::Final(request) => request.encode_params(),
+        }
+    }
+
+    /// Decodes the JSON-RPC result payload selected by this request.
+    pub fn decode_result(&self, input: &str) -> Result<CoreResult, CoreDispatchError> {
+        match self {
+            Self::Legacy(request) => request.decode_result(input).map(CoreResult::Legacy),
+            Self::Final(request) => request.decode_result(input).map(CoreResult::Final),
+        }
+    }
+
+    fn decode_legacy(method: &str, params: Option<&Value>) -> Result<Self, CoreDispatchError> {
+        let request =
+            match method {
+                INITIALIZE => LegacyCoreRequest::Initialize(decode_params(
+                    ProtocolEra::Legacy2024,
+                    INITIALIZE,
+                    params,
+                )?),
+                TOOLS_LIST => LegacyCoreRequest::ToolsList(decode_params(
+                    ProtocolEra::Legacy2024,
+                    TOOLS_LIST,
+                    params,
+                )?),
+                TOOLS_CALL => LegacyCoreRequest::ToolsCall(decode_params(
+                    ProtocolEra::Legacy2024,
+                    TOOLS_CALL,
+                    params,
+                )?),
+                RESOURCES_LIST => LegacyCoreRequest::ResourcesList(decode_params(
+                    ProtocolEra::Legacy2024,
+                    RESOURCES_LIST,
+                    params,
+                )?),
+                RESOURCES_TEMPLATES_LIST => LegacyCoreRequest::ResourceTemplatesList(
+                    decode_params(ProtocolEra::Legacy2024, RESOURCES_TEMPLATES_LIST, params)?,
+                ),
+                RESOURCES_READ => LegacyCoreRequest::ResourcesRead(decode_params(
+                    ProtocolEra::Legacy2024,
+                    RESOURCES_READ,
+                    params,
+                )?),
+                PROMPTS_LIST => LegacyCoreRequest::PromptsList(decode_params(
+                    ProtocolEra::Legacy2024,
+                    PROMPTS_LIST,
+                    params,
+                )?),
+                PROMPTS_GET => LegacyCoreRequest::PromptsGet(decode_params(
+                    ProtocolEra::Legacy2024,
+                    PROMPTS_GET,
+                    params,
+                )?),
+                LOGGING_SET_LEVEL => LegacyCoreRequest::SetLogLevel(decode_params(
+                    ProtocolEra::Legacy2024,
+                    LOGGING_SET_LEVEL,
+                    params,
+                )?),
+                PING => {
+                    require_absent_or_empty_params(ProtocolEra::Legacy2024, PING, params)?;
+                    LegacyCoreRequest::Ping
+                }
+                _ => {
+                    return Err(CoreDispatchError::UnsupportedMethod {
+                        era: ProtocolEra::Legacy2024,
+                        method: method.to_owned(),
+                    });
+                }
+            };
+        if legacy_params_carry_final_metadata(params) {
+            return Err(CoreDispatchError::CrossEraRequestMetadata {
+                method: request.method(),
+            });
+        }
+        if let LegacyCoreRequest::Initialize(params) = &request
+            && params.protocol_version != ProtocolEra::Legacy2024.version().as_str()
+        {
+            return Err(CoreDispatchError::InvalidParams {
+                era: ProtocolEra::Legacy2024,
+                method: INITIALIZE,
+            });
+        }
+        Ok(Self::Legacy(request))
+    }
+
+    fn decode_final(method: &str, params: Option<&Value>) -> Result<Self, CoreDispatchError> {
+        let request = match method {
+            TOOLS_LIST => FinalCoreRequest::ToolsList(decode_final_params(TOOLS_LIST, params)?),
+            TOOLS_CALL => FinalCoreRequest::ToolsCall(decode_final_params(TOOLS_CALL, params)?),
+            RESOURCES_LIST => {
+                FinalCoreRequest::ResourcesList(decode_final_params(RESOURCES_LIST, params)?)
+            }
+            RESOURCES_TEMPLATES_LIST => FinalCoreRequest::ResourceTemplatesList(
+                decode_final_params(RESOURCES_TEMPLATES_LIST, params)?,
+            ),
+            RESOURCES_READ => {
+                FinalCoreRequest::ResourcesRead(decode_final_params(RESOURCES_READ, params)?)
+            }
+            PROMPTS_LIST => {
+                FinalCoreRequest::PromptsList(decode_final_params(PROMPTS_LIST, params)?)
+            }
+            PROMPTS_GET => FinalCoreRequest::PromptsGet(decode_final_params(PROMPTS_GET, params)?),
+            LOGGING_SET_LEVEL => {
+                FinalCoreRequest::SetLogLevel(decode_final_params(LOGGING_SET_LEVEL, params)?)
+            }
+            PING => FinalCoreRequest::Ping(decode_final_params(PING, params)?),
+            _ => {
+                return Err(CoreDispatchError::UnsupportedMethod {
+                    era: ProtocolEra::Modern2026,
+                    method: method.to_owned(),
+                });
+            }
+        };
+        request.validate_metadata()?;
+        Ok(Self::Final(request))
+    }
+}
+
+impl LegacyCoreRequest {
+    /// Returns this request's exact method literal.
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::Initialize(_) => INITIALIZE,
+            Self::ToolsList(_) => TOOLS_LIST,
+            Self::ToolsCall(_) => TOOLS_CALL,
+            Self::ResourcesList(_) => RESOURCES_LIST,
+            Self::ResourceTemplatesList(_) => RESOURCES_TEMPLATES_LIST,
+            Self::ResourcesRead(_) => RESOURCES_READ,
+            Self::PromptsList(_) => PROMPTS_LIST,
+            Self::PromptsGet(_) => PROMPTS_GET,
+            Self::SetLogLevel(_) => LOGGING_SET_LEVEL,
+            Self::Ping => PING,
+        }
+    }
+
+    fn encode_params(&self) -> Result<Option<Value>, CoreDispatchError> {
+        match self {
+            Self::Initialize(params) => encode_params(ProtocolEra::Legacy2024, INITIALIZE, params),
+            Self::ToolsList(params) => encode_params(ProtocolEra::Legacy2024, TOOLS_LIST, params),
+            Self::ToolsCall(params) => encode_params(ProtocolEra::Legacy2024, TOOLS_CALL, params),
+            Self::ResourcesList(params) => {
+                encode_params(ProtocolEra::Legacy2024, RESOURCES_LIST, params)
+            }
+            Self::ResourceTemplatesList(params) => {
+                encode_params(ProtocolEra::Legacy2024, RESOURCES_TEMPLATES_LIST, params)
+            }
+            Self::ResourcesRead(params) => {
+                encode_params(ProtocolEra::Legacy2024, RESOURCES_READ, params)
+            }
+            Self::PromptsList(params) => {
+                encode_params(ProtocolEra::Legacy2024, PROMPTS_LIST, params)
+            }
+            Self::PromptsGet(params) => encode_params(ProtocolEra::Legacy2024, PROMPTS_GET, params),
+            Self::SetLogLevel(params) => {
+                encode_params(ProtocolEra::Legacy2024, LOGGING_SET_LEVEL, params)
+            }
+            Self::Ping => Ok(None),
+        }
+    }
+
+    fn decode_result(&self, input: &str) -> Result<LegacyCoreResult, CoreDispatchError> {
+        match self {
+            Self::Initialize(_) => {
+                decode_legacy_result(INITIALIZE, input).map(LegacyCoreResult::Initialize)
+            }
+            Self::ToolsList(_) => {
+                decode_legacy_result(TOOLS_LIST, input).map(LegacyCoreResult::ToolsList)
+            }
+            Self::ToolsCall(_) => {
+                decode_legacy_result(TOOLS_CALL, input).map(LegacyCoreResult::ToolsCall)
+            }
+            Self::ResourcesList(_) => {
+                decode_legacy_result(RESOURCES_LIST, input).map(LegacyCoreResult::ResourcesList)
+            }
+            Self::ResourceTemplatesList(_) => decode_legacy_result(RESOURCES_TEMPLATES_LIST, input)
+                .map(LegacyCoreResult::ResourceTemplatesList),
+            Self::ResourcesRead(_) => {
+                decode_legacy_result(RESOURCES_READ, input).map(LegacyCoreResult::ResourcesRead)
+            }
+            Self::PromptsList(_) => {
+                decode_legacy_result(PROMPTS_LIST, input).map(LegacyCoreResult::PromptsList)
+            }
+            Self::PromptsGet(_) => {
+                decode_legacy_result(PROMPTS_GET, input).map(LegacyCoreResult::PromptsGet)
+            }
+            Self::SetLogLevel(_) => {
+                decode_legacy_result(LOGGING_SET_LEVEL, input).map(LegacyCoreResult::SetLogLevel)
+            }
+            Self::Ping => decode_legacy_result(PING, input).map(LegacyCoreResult::Ping),
+        }
+    }
+}
+
+impl FinalCoreRequest {
+    /// Returns this request's exact method literal.
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::ToolsList(_) => TOOLS_LIST,
+            Self::ToolsCall(_) => TOOLS_CALL,
+            Self::ResourcesList(_) => RESOURCES_LIST,
+            Self::ResourceTemplatesList(_) => RESOURCES_TEMPLATES_LIST,
+            Self::ResourcesRead(_) => RESOURCES_READ,
+            Self::PromptsList(_) => PROMPTS_LIST,
+            Self::PromptsGet(_) => PROMPTS_GET,
+            Self::SetLogLevel(_) => LOGGING_SET_LEVEL,
+            Self::Ping(_) => PING,
+        }
+    }
+
+    fn validate_metadata(&self) -> Result<(), CoreDispatchError> {
+        let metadata = match self {
+            Self::ToolsList(params)
+            | Self::ResourcesList(params)
+            | Self::ResourceTemplatesList(params)
+            | Self::PromptsList(params) => &params.meta,
+            Self::ToolsCall(params) => &params.meta,
+            Self::ResourcesRead(params) => &params.meta,
+            Self::PromptsGet(params) => &params.meta,
+            Self::SetLogLevel(params) => &params.meta,
+            Self::Ping(params) => &params.meta,
+        };
+        let valid_version = metadata.protocol_version().ok().flatten()
+            == Some(ProtocolEra::Modern2026.version().as_str());
+        let has_capabilities = metadata.client_capabilities().ok().flatten().is_some();
+        if valid_version && has_capabilities {
+            Ok(())
+        } else {
+            Err(CoreDispatchError::InvalidFinalMetadata {
+                method: self.method(),
+            })
+        }
+    }
+
+    fn encode_params(&self) -> Result<Option<Value>, CoreDispatchError> {
+        self.validate_metadata()?;
+        match self {
+            Self::ToolsList(params) => encode_params(ProtocolEra::Modern2026, TOOLS_LIST, params),
+            Self::ToolsCall(params) => encode_params(ProtocolEra::Modern2026, TOOLS_CALL, params),
+            Self::ResourcesList(params) => {
+                encode_params(ProtocolEra::Modern2026, RESOURCES_LIST, params)
+            }
+            Self::ResourceTemplatesList(params) => {
+                encode_params(ProtocolEra::Modern2026, RESOURCES_TEMPLATES_LIST, params)
+            }
+            Self::ResourcesRead(params) => {
+                encode_params(ProtocolEra::Modern2026, RESOURCES_READ, params)
+            }
+            Self::PromptsList(params) => {
+                encode_params(ProtocolEra::Modern2026, PROMPTS_LIST, params)
+            }
+            Self::PromptsGet(params) => encode_params(ProtocolEra::Modern2026, PROMPTS_GET, params),
+            Self::SetLogLevel(params) => {
+                encode_params(ProtocolEra::Modern2026, LOGGING_SET_LEVEL, params)
+            }
+            Self::Ping(params) => encode_params(ProtocolEra::Modern2026, PING, params),
+        }
+    }
+
+    fn decode_result(&self, input: &str) -> Result<FinalCoreResult, CoreDispatchError> {
+        match self {
+            Self::ToolsList(_) => {
+                decode_final_complete(TOOLS_LIST, input, &["tools", "nextCursor"])
+                    .map(|(result, diagnostic)| FinalCoreResult::ToolsList { result, diagnostic })
+            }
+            Self::ToolsCall(_) => decode_final_complete(TOOLS_CALL, input, &["content", "isError"])
+                .map(|(result, diagnostic)| FinalCoreResult::ToolsCall { result, diagnostic }),
+            Self::ResourcesList(_) => {
+                decode_final_complete(RESOURCES_LIST, input, &["resources", "nextCursor"]).map(
+                    |(result, diagnostic)| FinalCoreResult::ResourcesList { result, diagnostic },
+                )
+            }
+            Self::ResourceTemplatesList(_) => {
+                decode_final_complete(
+                    RESOURCES_TEMPLATES_LIST,
+                    input,
+                    &["resourceTemplates", "nextCursor"],
+                )
+                .map(|(result, diagnostic)| {
+                    FinalCoreResult::ResourceTemplatesList { result, diagnostic }
+                })
+            }
+            Self::ResourcesRead(_) => decode_final_complete(RESOURCES_READ, input, &["contents"])
+                .map(|(result, diagnostic)| FinalCoreResult::ResourcesRead { result, diagnostic }),
+            Self::PromptsList(_) => {
+                decode_final_complete(PROMPTS_LIST, input, &["prompts", "nextCursor"])
+                    .map(|(result, diagnostic)| FinalCoreResult::PromptsList { result, diagnostic })
+            }
+            Self::PromptsGet(_) => {
+                decode_final_complete(PROMPTS_GET, input, &["description", "messages"])
+                    .map(|(result, diagnostic)| FinalCoreResult::PromptsGet { result, diagnostic })
+            }
+            Self::SetLogLevel(_) => decode_final_complete(LOGGING_SET_LEVEL, input, &[])
+                .map(|(result, diagnostic)| FinalCoreResult::SetLogLevel { result, diagnostic }),
+            Self::Ping(_) => decode_final_complete(PING, input, &[])
+                .map(|(result, diagnostic)| FinalCoreResult::Ping { result, diagnostic }),
+        }
+    }
+}
+
+impl CoreResult {
+    /// Returns the era selected by this result.
+    #[must_use]
+    pub const fn era(&self) -> ProtocolEra {
+        match self {
+            Self::Legacy(_) => ProtocolEra::Legacy2024,
+            Self::Final(_) => ProtocolEra::Modern2026,
+        }
+    }
+
+    /// Returns the exact method literal that selected this result type.
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::Legacy(result) => result.method(),
+            Self::Final(result) => result.method(),
+        }
+    }
+
+    /// Encodes this typed result without a JSON-RPC response envelope.
+    pub fn encode(&self) -> Result<String, CoreDispatchError> {
+        match self {
+            Self::Legacy(result) => result.encode(),
+            Self::Final(result) => result.encode(),
+        }
+    }
+}
+
+impl LegacyCoreResult {
+    /// Returns the exact method literal that selected this legacy result.
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::Initialize(_) => INITIALIZE,
+            Self::ToolsList(_) => TOOLS_LIST,
+            Self::ToolsCall(_) => TOOLS_CALL,
+            Self::ResourcesList(_) => RESOURCES_LIST,
+            Self::ResourceTemplatesList(_) => RESOURCES_TEMPLATES_LIST,
+            Self::ResourcesRead(_) => RESOURCES_READ,
+            Self::PromptsList(_) => PROMPTS_LIST,
+            Self::PromptsGet(_) => PROMPTS_GET,
+            Self::SetLogLevel(_) => LOGGING_SET_LEVEL,
+            Self::Ping(_) => PING,
+        }
+    }
+
+    fn encode(&self) -> Result<String, CoreDispatchError> {
+        match self {
+            Self::Initialize(result) => encode_legacy_result(INITIALIZE, result),
+            Self::ToolsList(result) => encode_legacy_result(TOOLS_LIST, result),
+            Self::ToolsCall(result) => encode_legacy_result(TOOLS_CALL, result),
+            Self::ResourcesList(result) => encode_legacy_result(RESOURCES_LIST, result),
+            Self::ResourceTemplatesList(result) => {
+                encode_legacy_result(RESOURCES_TEMPLATES_LIST, result)
+            }
+            Self::ResourcesRead(result) => encode_legacy_result(RESOURCES_READ, result),
+            Self::PromptsList(result) => encode_legacy_result(PROMPTS_LIST, result),
+            Self::PromptsGet(result) => encode_legacy_result(PROMPTS_GET, result),
+            Self::SetLogLevel(result) => encode_legacy_result(LOGGING_SET_LEVEL, result),
+            Self::Ping(result) => encode_legacy_result(PING, result),
+        }
+    }
+}
+
+impl FinalCoreResult {
+    /// Returns the exact method literal that selected this final result.
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::ToolsList { .. } => TOOLS_LIST,
+            Self::ToolsCall { .. } => TOOLS_CALL,
+            Self::ResourcesList { .. } => RESOURCES_LIST,
+            Self::ResourceTemplatesList { .. } => RESOURCES_TEMPLATES_LIST,
+            Self::ResourcesRead { .. } => RESOURCES_READ,
+            Self::PromptsList { .. } => PROMPTS_LIST,
+            Self::PromptsGet { .. } => PROMPTS_GET,
+            Self::SetLogLevel { .. } => LOGGING_SET_LEVEL,
+            Self::Ping { .. } => PING,
+        }
+    }
+
+    fn encode(&self) -> Result<String, CoreDispatchError> {
+        match self {
+            Self::ToolsList { result, .. } => {
+                encode_final_complete(TOOLS_LIST, result, &["tools", "nextCursor"])
+            }
+            Self::ToolsCall { result, .. } => {
+                encode_final_complete(TOOLS_CALL, result, &["content", "isError"])
+            }
+            Self::ResourcesList { result, .. } => {
+                encode_final_complete(RESOURCES_LIST, result, &["resources", "nextCursor"])
+            }
+            Self::ResourceTemplatesList { result, .. } => encode_final_complete(
+                RESOURCES_TEMPLATES_LIST,
+                result,
+                &["resourceTemplates", "nextCursor"],
+            ),
+            Self::ResourcesRead { result, .. } => {
+                encode_final_complete(RESOURCES_READ, result, &["contents"])
+            }
+            Self::PromptsList { result, .. } => {
+                encode_final_complete(PROMPTS_LIST, result, &["prompts", "nextCursor"])
+            }
+            Self::PromptsGet { result, .. } => {
+                encode_final_complete(PROMPTS_GET, result, &["description", "messages"])
+            }
+            Self::SetLogLevel { result, .. } | Self::Ping { result, .. } => {
+                encode_final_complete(self.method(), result, &[])
+            }
+        }
+    }
+}
+
+fn decode_params<T: DeserializeOwned>(
+    era: ProtocolEra,
+    method: &'static str,
+    params: Option<&Value>,
+) -> Result<T, CoreDispatchError> {
+    serde_json::from_value(
+        params
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default())),
+    )
+    .map_err(|_| CoreDispatchError::InvalidParams { era, method })
+}
+
+fn decode_final_params<T: DeserializeOwned>(
+    method: &'static str,
+    params: Option<&Value>,
+) -> Result<T, CoreDispatchError> {
+    decode_params(ProtocolEra::Modern2026, method, params)
+}
+
+fn encode_params<T: Serialize>(
+    era: ProtocolEra,
+    method: &'static str,
+    params: &T,
+) -> Result<Option<Value>, CoreDispatchError> {
+    serde_json::to_value(params)
+        .map(Some)
+        .map_err(|_| CoreDispatchError::InvalidParams { era, method })
+}
+
+fn require_absent_or_empty_params(
+    era: ProtocolEra,
+    method: &'static str,
+    params: Option<&Value>,
+) -> Result<(), CoreDispatchError> {
+    if params.is_none_or(|params| params.as_object().is_some_and(|object| object.is_empty())) {
+        Ok(())
+    } else {
+        Err(CoreDispatchError::InvalidParams { era, method })
+    }
+}
+
+fn legacy_params_carry_final_metadata(params: Option<&Value>) -> bool {
+    params
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("_meta"))
+        .and_then(Value::as_object)
+        .is_some_and(|metadata| {
+            metadata.contains_key(FINAL_PROTOCOL_VERSION_META_KEY)
+                || metadata.contains_key(FINAL_CLIENT_CAPABILITIES_META_KEY)
+        })
+}
+
+fn decode_legacy_result<T: DeserializeOwned>(
+    method: &'static str,
+    input: &str,
+) -> Result<T, CoreDispatchError> {
+    let value: Value =
+        serde_json::from_str(input).map_err(|_| CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Legacy2024,
+            method,
+        })?;
+    if value
+        .as_object()
+        .is_some_and(|object| object.contains_key("resultType"))
+    {
+        return Err(CoreDispatchError::CrossEraResultType { method });
+    }
+    serde_json::from_value(value).map_err(|_| CoreDispatchError::InvalidResult {
+        era: ProtocolEra::Legacy2024,
+        method,
+    })
+}
+
+fn encode_legacy_result<T: Serialize>(
+    method: &'static str,
+    result: &T,
+) -> Result<String, CoreDispatchError> {
+    let value = serde_json::to_value(result).map_err(|_| CoreDispatchError::InvalidResult {
+        era: ProtocolEra::Legacy2024,
+        method,
+    })?;
+    if value
+        .as_object()
+        .is_some_and(|object| object.contains_key("resultType"))
+    {
+        return Err(CoreDispatchError::CrossEraResultType { method });
+    }
+    serde_json::to_string(&value).map_err(|_| CoreDispatchError::InvalidResult {
+        era: ProtocolEra::Legacy2024,
+        method,
+    })
+}
+
+fn decode_final_complete<T: DeserializeOwned>(
+    method: &'static str,
+    input: &str,
+    known_names: &[&str],
+) -> Result<(CompleteResult<T>, Option<ResultPeerDiagnostic>), CoreDispatchError> {
+    let (decoded, diagnostic) = decode_peer_result_for_era(
+        input,
+        ProtocolEra::Modern2026,
+        &CoreResultDiscriminatorPolicy,
+    )?;
+    let DecodedResult::Complete(complete) = decoded else {
+        return Err(CoreDispatchError::UnexpectedFinalResultType { method });
+    };
+    let CompleteResult { meta, extras, .. } = complete;
+    let mut selected = serde_json::Map::new();
+    let mut remaining = Vec::new();
+    for member in extras.into_members() {
+        if known_names.contains(&member.name.as_str()) {
+            selected.insert(member.name, exact_json_to_serde(&member.value)?);
+        } else {
+            remaining.push(member);
+        }
+    }
+    let payload = serde_json::from_value(Value::Object(selected)).map_err(|_| {
+        CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method,
+        }
+    })?;
+    let extras = UnknownResultMembers::try_new(remaining, known_names)?;
+    Ok((
+        CompleteResult {
+            payload,
+            meta,
+            extras,
+        },
+        diagnostic,
+    ))
+}
+
+fn encode_final_complete<T: Serialize>(
+    method: &'static str,
+    result: &CompleteResult<T>,
+    known_names: &[&str],
+) -> Result<String, CoreDispatchError> {
+    let Value::Object(payload) =
+        serde_json::to_value(&result.payload).map_err(|_| CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method,
+        })?
+    else {
+        return Err(CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method,
+        });
+    };
+    let mut members = Vec::with_capacity(payload.len());
+    for (name, value) in payload {
+        if !known_names.contains(&name.as_str()) {
+            return Err(CoreDispatchError::InvalidResult {
+                era: ProtocolEra::Modern2026,
+                method,
+            });
+        }
+        members.push(ExactJsonMember {
+            name,
+            value: exact_json_from_serde(&value)?,
+        });
+    }
+    encode_complete_result(&result.meta, members, known_names, &result.extras)
+        .map_err(CoreDispatchError::from)
 }
 
 // ============================================================================
@@ -1334,6 +2361,108 @@ mod tests {
         assert_eq!(
             round_trip.additional_metadata.get("example.com/trace"),
             Some(&serde_json::json!(null))
+        );
+    }
+
+    #[test]
+    fn core_dispatch_round_trips_legacy_and_final_core_payloads() {
+        let final_params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "name": "echo",
+            "arguments": {"message": "hello"}
+        });
+        let final_request =
+            CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&final_params))
+                .expect("final tools/call request is typed through common metadata");
+        assert_eq!(final_request.era(), ProtocolEra::Modern2026);
+        assert_eq!(final_request.method(), TOOLS_CALL);
+        assert_eq!(
+            final_request
+                .encode_params()
+                .expect("final request re-encodes")
+                .expect("final requests always own a parameter object"),
+            final_params
+        );
+
+        let final_wire = r#"{"resultType":"complete","content":[{"type":"text","text":"ready"}],"extension":{"opaque":true}}"#;
+        let final_result = final_request
+            .decode_result(final_wire)
+            .expect("final complete result selects the tools/call payload");
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result, diagnostic }) = &final_result
+        else {
+            panic!("final tools/call result");
+        };
+        assert_eq!(diagnostic, &None);
+        assert!(matches!(
+            result.payload.content.as_slice(),
+            [ContentBlock::Text { text, .. }] if text == "ready"
+        ));
+        assert_eq!(
+            result
+                .extras
+                .members()
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            ["extension"]
+        );
+        assert_eq!(
+            final_result.encode().expect("final result re-encodes"),
+            final_wire
+        );
+
+        let legacy_params = serde_json::json!({"cursor": ""});
+        let legacy_request =
+            CoreRequest::decode(ProtocolEra::Legacy2024, TOOLS_LIST, Some(&legacy_params))
+                .expect("legacy tools/list keeps its exact parameter struct");
+        assert_eq!(legacy_request.era(), ProtocolEra::Legacy2024);
+        assert_eq!(
+            legacy_request
+                .encode_params()
+                .expect("legacy request re-encodes")
+                .expect("list request owns a parameter object"),
+            legacy_params
+        );
+        let legacy_wire = r#"{"tools":[],"nextCursor":""}"#;
+        let legacy_result = legacy_request
+            .decode_result(legacy_wire)
+            .expect("legacy result selects the legacy payload");
+        assert!(matches!(
+            legacy_result,
+            CoreResult::Legacy(LegacyCoreResult::ToolsList(_))
+        ));
+        assert_eq!(
+            legacy_result.encode().expect("legacy result re-encodes"),
+            legacy_wire
+        );
+    }
+
+    #[test]
+    fn core_dispatch_rejects_one_field_final_result_type_on_legacy_result() {
+        let request = CoreRequest::decode(ProtocolEra::Legacy2024, TOOLS_LIST, None)
+            .expect("baseline legacy request");
+        let accepted = r#"{"tools":[]}"#;
+        let baseline = request
+            .decode_result(accepted)
+            .expect("the legacy result remains accepted without a final discriminator");
+        let planted = r#"{"tools":[],"resultType":"complete"}"#;
+        assert!(
+            matches!(
+                request.decode_result(planted),
+                Err(CoreDispatchError::CrossEraResultType { method: TOOLS_LIST })
+            ),
+            "only the final resultType field changes the otherwise valid legacy result"
+        );
+        let reaccepted = request
+            .decode_result(accepted)
+            .expect("rejection cannot mutate the selected legacy dispatch");
+        assert_eq!(
+            baseline.encode().expect("baseline encodes"),
+            reaccepted.encode().expect("reaccepted value encodes"),
+            "the one-field cross-era rejection leaves the accepted legacy result unchanged"
         );
     }
 
