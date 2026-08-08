@@ -15,8 +15,8 @@ use serde_json::{Map, Value};
 use crate::common_types::{JsonInteger, OpenMetadata};
 use crate::jsonrpc::{JSONRPC_VERSION, RequestId};
 use crate::messages::{
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, FinalCallToolResult,
-    FinalEmbeddedInputKind, FinalEmbeddedInputRequest, FinalEmbeddedInputResponse,
+    FinalCallToolResult, FinalEmbeddedInputKind, FinalEmbeddedInputRequest,
+    FinalEmbeddedInputResponse,
 };
 use crate::protocol_version::FINAL_PROTOCOL_VERSION;
 
@@ -464,7 +464,7 @@ impl<'de> Deserialize<'de> for FinalTaskCallToolResult {
                 "completed task result must be a flattened tools/call result",
             ));
         }
-        let meta = members
+        let meta: Option<OpenMetadata> = members
             .remove("_meta")
             .map(serde_json::from_value)
             .transpose()
