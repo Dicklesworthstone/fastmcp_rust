@@ -593,6 +593,7 @@ fn final_tool_payload(text: &str) -> CompleteResult<FinalCallToolResult> {
                 .expect("embedded resource content"),
             ],
             is_error: false,
+            structured_content: None,
         },
         final_result_meta(),
     )
@@ -670,6 +671,7 @@ fn final_complete_tool_with_resource_link() -> CompleteResult<FinalCallToolResul
                     .expect("resource link content"),
             ],
             is_error: false,
+            structured_content: None,
         },
         final_result_meta(),
     )
