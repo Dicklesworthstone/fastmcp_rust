@@ -17,21 +17,22 @@ use fastmcp_core::{
     McpContext, McpError, McpErrorCode, McpOutcome, McpResult, SessionState, block_on,
     sha256_bounded,
 };
-use fastmcp_protocol::common_types::{
-    AbsoluteUri, EmbeddedResourceContents, OpenMetadata, RawIcon,
-};
+use fastmcp_protocol::common_types::{AbsoluteUri, EmbeddedResourceContents};
 use fastmcp_protocol::methods::COMPLETION_COMPLETE;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     CacheScope, CallToolParams, CallToolResult, CompleteResult, Content, CoreRequest, CoreResult,
     FinalCallToolParams, FinalCallToolResult, FinalCompletionParams, FinalCompletionResult,
-    FinalCoreRequest, FinalCoreResult, FinalListParams, FinalReadResourceParams, GetPromptParams,
-    GetPromptResult, InitializeParams, InitializeResult, JsonRpcRequest, LegacyCompletionParams,
+    FinalCoreRequest, FinalCoreResult, FinalListParams, FinalListPromptsResult,
+    FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult, FinalPrompt,
+    FinalPromptArgument, FinalReadResourceParams, FinalReadResourceResult, FinalResource,
+    FinalResourceTemplate, FinalTool, FinalToolAnnotations, GetPromptParams, GetPromptResult,
+    InitializeParams, InitializeResult, JsonRpcRequest, LegacyCompletionParams,
     LegacyCompletionResult, LegacyCoreRequest, ListPromptsParams, ListPromptsResult,
     ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
     ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker,
     Prompt, ReadResourceParams, ReadResourceResult, Resource, ResourceContent, ResourceTemplate,
-    ServerBehavior, ServerBehaviorRegistry, Tool, ToolAnnotations, validate, validate_strict,
+    ServerBehavior, ServerBehaviorRegistry, Tool, validate, validate_strict,
 };
 #[cfg(test)]
 use fastmcp_protocol::{
@@ -40,8 +41,7 @@ use fastmcp_protocol::{
 };
 
 use crate::handler::{
-    BidirectionalSenders, BoxFuture, ProgressNotificationSender, UriParams,
-    encode_final_complete_result,
+    BidirectionalSenders, BoxFuture, ProgressNotificationSender, UriParams, empty_final_result_meta,
 };
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
@@ -252,146 +252,48 @@ impl Default for FinalCacheHintPolicy {
     }
 }
 
-impl FinalCacheHintPolicy {
-    const fn ttl_ms_for(self, resource_read: bool) -> u64 {
-        if resource_read {
-            self.resource_read_ttl_ms
-        } else {
-            self.list_ttl_ms
-        }
-    }
-
-    const fn scope_wire(self) -> &'static str {
-        match self.scope {
-            CacheScope::Public => "public",
-            CacheScope::Private => "private",
-        }
-    }
-}
-
-/// Encodes a modern cacheable list or resource-read result with the required
-/// cache hints. Legacy dispatch never calls this boundary.
-fn encode_final_cacheable_result<T: serde::Serialize>(
+/// Encodes a server-authored final payload through the selected method's exact
+/// `FinalCoreResult` composition. This preserves typed catalog and cache
+/// fields instead of inserting unvalidated JSON after serialization.
+fn encode_final_core_result<T>(
     result: McpResult<T>,
-    policy: FinalCacheHintPolicy,
-    resource_read: bool,
+    select: impl FnOnce(CompleteResult<T>) -> FinalCoreResult,
 ) -> McpResult<serde_json::Value> {
-    let mut encoded = encode_final_complete_result(result?)?;
-    let object = encoded.as_object_mut().ok_or_else(|| {
-        McpError::internal_error("modern cacheable result must encode as an object")
-    })?;
-    object.insert(
-        "ttlMs".to_owned(),
-        serde_json::Value::from(policy.ttl_ms_for(resource_read)),
-    );
-    object.insert(
-        "cacheScope".to_owned(),
-        serde_json::Value::String(policy.scope_wire().to_owned()),
-    );
-    Ok(encoded)
+    let result = CompleteResult::new(result?, empty_final_result_meta()?);
+    let encoded = CoreResult::Final(select(result))
+        .encode()
+        .map_err(|error| McpError::internal_error(error.to_string()))?;
+    serde_json::from_str(&encoded).map_err(McpError::from)
 }
 
-/// Exact 2026 catalog model for a tool. Legacy `icon`, `version`, and `tags`
-/// are deliberately not representable here.
-#[derive(serde::Serialize)]
-struct FinalToolCatalogEntry {
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(rename = "inputSchema")]
-    input_schema: serde_json::Value,
-    #[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
-    output_schema: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    annotations: Option<ToolAnnotations>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    icons: Vec<RawIcon>,
-    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
-    meta: Option<OpenMetadata>,
+fn project_final_tool_annotations(
+    annotations: fastmcp_protocol::ToolAnnotations,
+) -> FinalToolAnnotations {
+    FinalToolAnnotations {
+        title: None,
+        destructive: annotations.destructive,
+        idempotent: annotations.idempotent,
+        read_only: annotations.read_only,
+        open_world_hint: annotations.open_world_hint,
+    }
 }
 
-/// Exact 2026 catalog model for a resource.
-#[derive(serde::Serialize)]
-struct FinalResourceCatalogEntry {
-    uri: AbsoluteUri,
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
-    mime_type: Option<String>,
-}
-
-/// Exact 2026 catalog model for a resource template.
-#[derive(serde::Serialize)]
-struct FinalResourceTemplateCatalogEntry {
-    #[serde(rename = "uriTemplate")]
-    uri_template: String,
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
-    mime_type: Option<String>,
-}
-
-/// Exact 2026 catalog model for a prompt.
-#[derive(serde::Serialize)]
-struct FinalPromptCatalogEntry {
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    arguments: Vec<fastmcp_protocol::PromptArgument>,
-}
-
-#[derive(serde::Serialize)]
-struct FinalToolsListResult {
-    tools: Vec<FinalToolCatalogEntry>,
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
-    next_cursor: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-struct FinalResourcesListResult {
-    resources: Vec<FinalResourceCatalogEntry>,
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
-    next_cursor: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-struct FinalResourceTemplatesListResult {
-    #[serde(rename = "resourceTemplates")]
-    resource_templates: Vec<FinalResourceTemplateCatalogEntry>,
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
-    next_cursor: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-struct FinalPromptsListResult {
-    prompts: Vec<FinalPromptCatalogEntry>,
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
-    next_cursor: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-struct FinalResourcesReadResult {
-    contents: Vec<EmbeddedResourceContents>,
-}
-
-fn project_final_resource_catalog_entry(
-    resource: Resource,
-) -> McpResult<FinalResourceCatalogEntry> {
+fn project_final_resource_catalog_entry(resource: Resource) -> McpResult<FinalResource> {
     let uri = AbsoluteUri::parse(resource.uri).map_err(|error| {
         McpError::internal_error(format!(
             "legacy resource URI cannot be projected into the final catalog: {error}",
         ))
     })?;
-    Ok(FinalResourceCatalogEntry {
+    Ok(FinalResource {
         uri,
         name: resource.name,
+        title: None,
         description: resource.description,
+        icons: None,
         mime_type: resource.mime_type,
+        size: None,
+        annotations: None,
+        meta: None,
     })
 }
 
@@ -1685,17 +1587,24 @@ impl Router {
                 let request =
                     CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", params.as_ref())
                         .map_err(|error| McpError::invalid_params(error.to_string()))?;
-                let CoreRequest::Final(FinalCoreRequest::ToolsList(params)) = request else {
+                let CoreRequest::Final(FinalCoreRequest::ToolsList(params)) = &request else {
                     return Err(McpError::internal_error(
                         "modern tools/list dispatch selected another core request",
                     ));
                 };
-                let result =
-                    self.handle_tools_list(request_ctx, legacy_list_tools_params(params), None);
-                encode_final_cacheable_result(
-                    result.and_then(|result| self.project_final_tools_list(request_ctx, result)),
-                    self.final_cache_hints,
-                    false,
+                let result = self.handle_tools_list(
+                    request_ctx,
+                    legacy_list_tools_params(params.clone()),
+                    None,
+                );
+                encode_final_core_result(
+                    result.and_then(|result| {
+                        self.project_final_tools_list(request_ctx, result, self.final_cache_hints)
+                    }),
+                    |result| FinalCoreResult::ToolsList {
+                        result,
+                        diagnostic: None,
+                    },
                 )?
             }
             "tools/call" => {
@@ -1723,20 +1632,24 @@ impl Router {
                 let request =
                     CoreRequest::decode(ProtocolEra::Modern2026, "resources/list", params.as_ref())
                         .map_err(|error| McpError::invalid_params(error.to_string()))?;
-                let CoreRequest::Final(FinalCoreRequest::ResourcesList(params)) = request else {
+                let CoreRequest::Final(FinalCoreRequest::ResourcesList(params)) = &request else {
                     return Err(McpError::internal_error(
                         "modern resources/list dispatch selected another core request",
                     ));
                 };
                 let result = self.handle_resources_list(
                     request_ctx,
-                    legacy_list_resources_params(params),
+                    legacy_list_resources_params(params.clone()),
                     None,
                 );
-                encode_final_cacheable_result(
-                    result.and_then(Self::project_final_resources_list),
-                    self.final_cache_hints,
-                    false,
+                encode_final_core_result(
+                    result.and_then(|result| {
+                        Self::project_final_resources_list(result, self.final_cache_hints)
+                    }),
+                    |result| FinalCoreResult::ResourcesList {
+                        result,
+                        diagnostic: None,
+                    },
                 )?
             }
             "resources/templates/list" => {
@@ -1746,7 +1659,7 @@ impl Router {
                     params.as_ref(),
                 )
                 .map_err(|error| McpError::invalid_params(error.to_string()))?;
-                let CoreRequest::Final(FinalCoreRequest::ResourceTemplatesList(params)) = request
+                let CoreRequest::Final(FinalCoreRequest::ResourceTemplatesList(params)) = &request
                 else {
                     return Err(McpError::internal_error(
                         "modern resources/templates/list dispatch selected another core request",
@@ -1754,25 +1667,29 @@ impl Router {
                 };
                 let result = self.handle_resource_templates_list(
                     request_ctx,
-                    legacy_list_resource_templates_params(params),
+                    legacy_list_resource_templates_params(params.clone()),
                     None,
                 );
-                encode_final_cacheable_result(
-                    result.map(Self::project_final_resource_templates_list),
-                    self.final_cache_hints,
-                    false,
+                encode_final_core_result(
+                    result.map(|result| {
+                        Self::project_final_resource_templates_list(result, self.final_cache_hints)
+                    }),
+                    |result| FinalCoreResult::ResourceTemplatesList {
+                        result,
+                        diagnostic: None,
+                    },
                 )?
             }
             "resources/read" => {
                 let request =
                     CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", params.as_ref())
                         .map_err(|error| McpError::invalid_params(error.to_string()))?;
-                let CoreRequest::Final(FinalCoreRequest::ResourcesRead(params)) = request else {
+                let CoreRequest::Final(FinalCoreRequest::ResourcesRead(params)) = &request else {
                     return Err(McpError::internal_error(
                         "modern resources/read dispatch selected another core request",
                     ));
                 };
-                let params = legacy_read_resource_params(params);
+                let params = legacy_read_resource_params(params.clone());
                 let result = self
                     .handle_resources_read_in_request(
                         request_ctx,
@@ -1783,27 +1700,38 @@ impl Router {
                         None,
                     )
                     .await;
-                encode_final_cacheable_result(
-                    result.and_then(Self::project_final_resources_read),
-                    self.final_cache_hints,
-                    true,
+                encode_final_core_result(
+                    result.and_then(|result| {
+                        Self::project_final_resources_read(result, self.final_cache_hints)
+                    }),
+                    |result| FinalCoreResult::ResourcesRead {
+                        result,
+                        diagnostic: None,
+                    },
                 )?
             }
             "prompts/list" => {
                 let request =
                     CoreRequest::decode(ProtocolEra::Modern2026, "prompts/list", params.as_ref())
                         .map_err(|error| McpError::invalid_params(error.to_string()))?;
-                let CoreRequest::Final(FinalCoreRequest::PromptsList(params)) = request else {
+                let CoreRequest::Final(FinalCoreRequest::PromptsList(params)) = &request else {
                     return Err(McpError::internal_error(
                         "modern prompts/list dispatch selected another core request",
                     ));
                 };
-                let result =
-                    self.handle_prompts_list(request_ctx, legacy_list_prompts_params(params), None);
-                encode_final_cacheable_result(
-                    result.map(Self::project_final_prompts_list),
-                    self.final_cache_hints,
-                    false,
+                let result = self.handle_prompts_list(
+                    request_ctx,
+                    legacy_list_prompts_params(params.clone()),
+                    None,
+                );
+                encode_final_core_result(
+                    result.map(|result| {
+                        Self::project_final_prompts_list(result, self.final_cache_hints)
+                    }),
+                    |result| FinalCoreResult::PromptsList {
+                        result,
+                        diagnostic: None,
+                    },
                 )?
             }
             "prompts/get" => {
@@ -1880,7 +1808,8 @@ impl Router {
         &self,
         request_ctx: &McpContext,
         result: ListToolsResult,
-    ) -> McpResult<FinalToolsListResult> {
+        cache_hints: FinalCacheHintPolicy,
+    ) -> McpResult<FinalListToolsResult> {
         let tools = result
             .tools
             .into_iter()
@@ -1891,89 +1820,130 @@ impl Router {
                 let (title, icons, meta) = crate::catch_extension_unwind(|| {
                     (
                         handler.final_title().map(str::to_owned),
-                        handler
-                            .final_icons()
-                            .map(<[RawIcon]>::to_vec)
-                            .unwrap_or_default(),
+                        handler.final_icons().map(|icons| icons.to_vec()),
                         handler.final_metadata().cloned(),
                     )
                 })
                 .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
 
-                Ok(FinalToolCatalogEntry {
+                Ok(FinalTool {
                     name: tool.name,
                     title,
                     description: tool.description,
                     input_schema: tool.input_schema,
                     output_schema: tool.output_schema,
-                    annotations: tool.annotations,
+                    annotations: tool.annotations.map(project_final_tool_annotations),
                     icons,
                     meta,
                 })
             })
             .collect::<McpResult<Vec<_>>>()?;
-        Ok(FinalToolsListResult {
+        Ok(FinalListToolsResult {
             tools,
             next_cursor: result.next_cursor,
+            ttl_ms: cache_hints.list_ttl_ms,
+            cache_scope: cache_hints.scope,
         })
     }
 
     fn project_final_resources_list(
         result: ListResourcesResult,
-    ) -> McpResult<FinalResourcesListResult> {
+        cache_hints: FinalCacheHintPolicy,
+    ) -> McpResult<FinalListResourcesResult> {
         let resources = result
             .resources
             .into_iter()
             .map(project_final_resource_catalog_entry)
             .collect::<McpResult<Vec<_>>>()?;
-        Ok(FinalResourcesListResult {
+        Ok(FinalListResourcesResult {
             resources,
             next_cursor: result.next_cursor,
+            ttl_ms: cache_hints.list_ttl_ms,
+            cache_scope: cache_hints.scope,
         })
     }
 
     fn project_final_resource_templates_list(
         result: ListResourceTemplatesResult,
-    ) -> FinalResourceTemplatesListResult {
-        FinalResourceTemplatesListResult {
+        cache_hints: FinalCacheHintPolicy,
+    ) -> FinalListResourceTemplatesResult {
+        FinalListResourceTemplatesResult {
             resource_templates: result
                 .resource_templates
                 .into_iter()
-                .map(|template| FinalResourceTemplateCatalogEntry {
+                .map(|template| FinalResourceTemplate {
                     uri_template: template.uri_template,
                     name: template.name,
+                    title: None,
                     description: template.description,
+                    icons: None,
                     mime_type: template.mime_type,
+                    annotations: None,
+                    meta: None,
                 })
                 .collect(),
             next_cursor: result.next_cursor,
+            ttl_ms: cache_hints.list_ttl_ms,
+            cache_scope: cache_hints.scope,
         }
     }
 
-    fn project_final_prompts_list(result: ListPromptsResult) -> FinalPromptsListResult {
-        FinalPromptsListResult {
+    fn project_final_prompts_list(
+        result: ListPromptsResult,
+        cache_hints: FinalCacheHintPolicy,
+    ) -> FinalListPromptsResult {
+        FinalListPromptsResult {
             prompts: result
                 .prompts
                 .into_iter()
-                .map(|prompt| FinalPromptCatalogEntry {
-                    name: prompt.name,
-                    description: prompt.description,
-                    arguments: prompt.arguments,
+                .map(|prompt| {
+                    let Prompt {
+                        name,
+                        description,
+                        arguments,
+                        ..
+                    } = prompt;
+                    let arguments = (!arguments.is_empty()).then(|| {
+                        arguments
+                            .into_iter()
+                            .map(|argument| FinalPromptArgument {
+                                name: argument.name,
+                                title: None,
+                                description: argument.description,
+                                required: argument.required.then_some(true),
+                            })
+                            .collect()
+                    });
+                    FinalPrompt {
+                        name,
+                        title: None,
+                        description,
+                        icons: None,
+                        arguments,
+                        meta: None,
+                    }
                 })
                 .collect(),
             next_cursor: result.next_cursor,
+            ttl_ms: cache_hints.list_ttl_ms,
+            cache_scope: cache_hints.scope,
         }
     }
 
     fn project_final_resources_read(
         result: ReadResourceResult,
-    ) -> McpResult<FinalResourcesReadResult> {
+        cache_hints: FinalCacheHintPolicy,
+    ) -> McpResult<FinalReadResourceResult> {
         let contents = result
             .contents
             .into_iter()
             .map(promote_resource_content)
             .collect::<McpResult<Vec<_>>>()?;
-        Ok(FinalResourcesReadResult { contents })
+        Ok(FinalReadResourceResult {
+            contents,
+            ttl_ms: cache_hints.resource_read_ttl_ms,
+            cache_scope: cache_hints.scope,
+        })
     }
 
     /// Handles the tools/call request.
@@ -5082,11 +5052,12 @@ mod router_tests {
     use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
     use asupersync::types::CancelKind;
     use fastmcp_core::{McpContext, McpResult, SessionState};
-    use fastmcp_protocol::common_types::{ContentBlock, Implementation, OpenMetadata, RawIcon};
+    use fastmcp_protocol::common_types::{
+        ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
+    };
     use fastmcp_protocol::{
-        CompleteResult, CompletionValues, Content, ExactJsonMember, FinalCallToolResult,
-        FinalCompletionParams, LegacyCompletionParams, Prompt, PromptMessage, Resource,
-        ResourceContent, ResultMeta, Tool, UnknownResultMembers, parse_exact_json,
+        CompleteResult, CompletionValues, Content, FinalCallToolResult, FinalCompletionParams,
+        LegacyCompletionParams, Prompt, PromptMessage, Resource, ResourceContent, Tool,
     };
     use std::fmt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5197,33 +5168,40 @@ mod router_tests {
 
     static MACRO_DUAL_ERA_TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    fn macro_dual_era_result_meta() -> ResultMeta {
-        ResultMeta::server_generated(
-            Implementation::try_new("macro-dual-era-tool", "1.0.0")
-                .expect("test implementation identity"),
-        )
+    fn final_tool_complete_result(
+        payload: FinalCallToolResult,
+    ) -> CompleteResult<FinalCallToolResult> {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+            "name": "macro_dual_era_tool",
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params))
+            .expect("test final tools/call request");
+        let mut wire = serde_json::to_value(payload).expect("final tool payload serializes");
+        wire.as_object_mut()
+            .expect("final tool payload is an object")
+            .insert("resultType".to_owned(), serde_json::json!("complete"));
+        let encoded = serde_json::to_string(&wire).expect("final tool wire serializes");
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = request
+            .decode_result(&encoded)
+            .expect("typed final tools/call result")
+        else {
+            panic!("typed final tools/call result is selected");
+        };
+        result
     }
 
     #[fastmcp_derive::tool]
     fn macro_dual_era_tool() -> CompleteResult<FinalCallToolResult> {
         MACRO_DUAL_ERA_TOOL_CALLS.fetch_add(1, Ordering::SeqCst);
-        let mut result = CompleteResult::new(
-            FinalCallToolResult {
-                content: vec![ContentBlock::text("macro final tool result")],
-                is_error: false,
-            },
-            macro_dual_era_result_meta(),
-        );
-        result.extras = UnknownResultMembers::try_new(
-            vec![ExactJsonMember {
-                name: "structuredContent".to_owned(),
-                value: parse_exact_json(r#"{"weather":"clear"}"#)
-                    .expect("structured content is exact JSON"),
-            }],
-            &["content", "isError"],
-        )
-        .expect("structured content is a legal final tool member");
-        result
+        final_tool_complete_result(FinalCallToolResult {
+            content: vec![ContentBlock::text("macro final tool result")],
+            is_error: false,
+            structured_content: Some(serde_json::json!({"weather":"clear"})),
+        })
     }
 
     struct FinalCatalogTool {
@@ -9422,7 +9400,7 @@ mod router_tests {
         );
         assert_eq!(modern.get("content"), legacy_wire.get("content"));
         assert_eq!(modern.get("isError"), legacy_wire.get("isError"));
-        assert_eq!(modern["serverInfo"]["name"], "macro-dual-era-tool");
+        assert!(modern.get("serverInfo").is_none());
         assert_eq!(
             modern["structuredContent"],
             serde_json::json!({"weather": "clear"})
@@ -9513,7 +9491,7 @@ mod router_tests {
     }
 
     #[test]
-    fn final_catalog_and_resource_read_emit_exact_models_and_cache_hints() {
+    fn core_request_decode_result_round_trips_final_catalog_and_read_cache_hints() {
         let metadata = OpenMetadata::try_from_entries([(
             "com.example/catalog".to_owned(),
             serde_json::json!({"source": "handler"}),
@@ -9547,18 +9525,22 @@ mod router_tests {
         assert!(legacy_wire["tools"][0].get("version").is_some());
         assert!(legacy_wire["tools"][0].get("tags").is_some());
 
-        let final_metadata = serde_json::json!({
-            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-            "io.modelcontextprotocol/clientCapabilities": {},
+        let final_list_params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
         });
+        let final_list_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "tools/list",
+            Some(&final_list_params),
+        )
+        .expect("final catalog request decodes through the public core surface");
         let modern_list = router
             .dispatch_stateless(
                 &request_ctx,
-                &JsonRpcRequest::new(
-                    "tools/list",
-                    Some(serde_json::json!({"_meta": final_metadata})),
-                    93_i64,
-                ),
+                &JsonRpcRequest::new("tools/list", Some(final_list_params), 93_i64),
             )
             .expect("final catalog is projected through the exact model");
         assert_eq!(modern_list["resultType"], "complete");
@@ -9577,21 +9559,65 @@ mod router_tests {
         assert!(modern_list["tools"][0].get("icon").is_none());
         assert!(modern_list["tools"][0].get("version").is_none());
         assert!(modern_list["tools"][0].get("tags").is_none());
+        let modern_list_wire =
+            serde_json::to_string(&modern_list).expect("final catalog response serializes");
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = final_list_request
+            .decode_result(&modern_list_wire)
+            .expect("final catalog response decodes through the public core surface")
+        else {
+            panic!("tools/list selects the exact final catalog result");
+        };
+        assert_eq!(result.payload.ttl_ms, 123);
+        assert_eq!(result.payload.cache_scope, CacheScope::Private);
+        let final_tool = result
+            .payload
+            .tools
+            .first()
+            .expect("final catalog contains the registered tool");
+        assert_eq!(final_tool.title.as_deref(), Some("Final Catalog Tool"));
+        assert_eq!(
+            final_tool
+                .icons
+                .as_ref()
+                .and_then(|icons| icons.first())
+                .map(|icon| icon.src.as_str()),
+            Some("https://example.test/tool.png")
+        );
+        assert_eq!(
+            final_tool
+                .meta
+                .as_ref()
+                .and_then(|metadata| metadata.get("com.example/catalog"))
+                .and_then(|value| value.get("source"))
+                .and_then(serde_json::Value::as_str),
+            Some("handler")
+        );
+        assert_eq!(
+            final_tool
+                .output_schema
+                .as_ref()
+                .and_then(|schema| schema.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("object")
+        );
 
+        let final_read_params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+            "uri": "file:///catalog-resource",
+        });
+        let final_read_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "resources/read",
+            Some(&final_read_params),
+        )
+        .expect("final resource-read request decodes through the public core surface");
         let modern_read = router
             .dispatch_stateless(
                 &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/read",
-                    Some(serde_json::json!({
-                        "_meta": {
-                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                            "io.modelcontextprotocol/clientCapabilities": {},
-                        },
-                        "uri": "file:///catalog-resource",
-                    })),
-                    94_i64,
-                ),
+                &JsonRpcRequest::new("resources/read", Some(final_read_params), 94_i64),
             )
             .expect("final resource content is projected through the final model");
         assert_eq!(modern_read["ttlMs"], 456);
@@ -9601,6 +9627,20 @@ mod router_tests {
             "file:///catalog-resource"
         );
         assert_eq!(modern_read["contents"][0]["text"], "content");
+        let modern_read_wire =
+            serde_json::to_string(&modern_read).expect("final resource-read response serializes");
+        let CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) = final_read_request
+            .decode_result(&modern_read_wire)
+            .expect("final resource-read response decodes through the public core surface")
+        else {
+            panic!("resources/read selects the exact final read result");
+        };
+        assert_eq!(result.payload.ttl_ms, 456);
+        assert_eq!(result.payload.cache_scope, CacheScope::Private);
+        assert!(matches!(
+            result.payload.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }] if text == "content"
+        ));
     }
 
     #[test]

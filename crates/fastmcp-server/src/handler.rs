@@ -21,7 +21,7 @@ use fastmcp_core::{
     SessionState,
 };
 use fastmcp_protocol::common_types::{
-    AbsoluteUri, ContentBlock, EmbeddedResourceContents, Implementation, OpenMetadata, RawIcon,
+    AbsoluteUri, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
 use fastmcp_protocol::{
     CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy, DecodedResult,
@@ -281,6 +281,31 @@ pub(crate) fn encode_final_complete_result<T: serde::Serialize>(
     serde_json::from_str(&encode_result(&decoded)).map_err(McpError::from)
 }
 
+/// Returns empty metadata for a server-authored final complete result.
+///
+/// Final method codecs reject a synthesized `serverInfo`. The protocol result
+/// algebra exposes metadata through decoded complete results, so obtain the
+/// canonical empty instance through that same bounded decoder.
+pub(crate) fn empty_final_result_meta() -> McpResult<ResultMeta> {
+    let (decoded, diagnostic) = decode_peer_result(
+        r#"{"resultType":"complete"}"#,
+        ResultPeerEra::Modern,
+        &CoreResultDiscriminatorPolicy,
+    )
+    .map_err(|_| McpError::internal_error("empty final result metadata is invalid"))?;
+    if diagnostic.is_some() {
+        return Err(McpError::internal_error(
+            "empty final result metadata must select the complete discriminator",
+        ));
+    }
+    let DecodedResult::Complete(empty_result) = decoded else {
+        return Err(McpError::internal_error(
+            "empty final result metadata must select the complete result",
+        ));
+    };
+    Ok(empty_result.meta)
+}
+
 /// Promotes an exact legacy tool payload into the final complete-result algebra.
 ///
 /// This is the compatibility direction used by legacy-only tool handlers when
@@ -342,19 +367,13 @@ pub(crate) fn promote_legacy_tool_content(
         })
         .collect::<McpResult<Vec<_>>>()?;
 
-    let server_info = Implementation::try_new("fastmcp-server", env!("CARGO_PKG_VERSION"))
-        .map_err(|error| {
-            McpError::internal_error(format!(
-                "server identity cannot construct a final tool result: {error}",
-            ))
-        })?;
-
     Ok(CompleteResult::new(
         FinalCallToolResult {
             content,
             is_error: false,
+            structured_content: None,
         },
-        ResultMeta::server_generated(server_info),
+        empty_final_result_meta()?,
     ))
 }
 
@@ -1528,14 +1547,7 @@ mod tests {
             final_result.payload.content.as_slice(),
             [ContentBlock::Text { .. }]
         ));
-        assert_eq!(
-            final_result
-                .meta
-                .server_info
-                .as_ref()
-                .map(|info| info.name.as_str()),
-            Some("fastmcp-server")
-        );
+        assert!(final_result.meta.server_info.is_none());
     }
 
     #[test]
