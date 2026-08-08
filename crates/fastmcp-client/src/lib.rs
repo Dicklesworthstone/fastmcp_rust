@@ -1820,19 +1820,23 @@ fn final_prompt_to_legacy(prompt: fastmcp_protocol::FinalPrompt) -> McpResult<Pr
 ///
 /// Legacy content has no typed metadata member: its schema permits `_meta` as
 /// one of the flattened open members. Preserve it under that original wire
-/// name, and reject only a manually-constructed contradictory value that
-/// would otherwise overwrite it.
+/// name, while rejecting manually-constructed open members that would shadow
+/// a declared legacy field.
 fn final_open_fields_to_legacy(
     field: &str,
     meta: Option<fastmcp_protocol::OpenMetadata>,
     mut additional: std::collections::BTreeMap<String, serde_json::Value>,
+    declared_members: &[&str],
 ) -> McpResult<std::collections::BTreeMap<String, serde_json::Value>> {
+    if additional
+        .keys()
+        .any(|key| key == "_meta" || declared_members.contains(&key.as_str()))
+    {
+        return Err(final_projection_error(field));
+    }
     let Some(meta) = meta else {
         return Ok(additional);
     };
-    if additional.contains_key("_meta") {
-        return Err(final_projection_error(field));
-    }
     let encoded_meta =
         serde_json::to_value(meta).map_err(|_| final_projection_error("metadata serialization"))?;
     additional.insert("_meta".to_owned(), encoded_meta);
@@ -1854,9 +1858,10 @@ fn final_resource_content_to_legacy(
             mime_type,
             text,
             additional: final_open_fields_to_legacy(
-                "conflicting resource _meta field",
+                "conflicting resource field",
                 meta,
                 additional,
+                &["uri", "text", "mimeType"],
             )?,
         }),
         EmbeddedResourceContents::Blob {
@@ -1870,9 +1875,10 @@ fn final_resource_content_to_legacy(
             mime_type,
             blob,
             additional: final_open_fields_to_legacy(
-                "conflicting resource _meta field",
+                "conflicting resource field",
                 meta,
                 additional,
+                &["uri", "blob", "mimeType"],
             )?,
         }),
     }
@@ -1889,9 +1895,10 @@ fn final_content_to_legacy(content: ContentBlock) -> McpResult<LegacyContent> {
             text,
             annotations,
             additional: final_open_fields_to_legacy(
-                "conflicting content _meta field",
+                "conflicting content field",
                 meta,
                 additional,
+                &["type", "text", "annotations"],
             )?,
         }),
         ContentBlock::Image {
@@ -1905,9 +1912,10 @@ fn final_content_to_legacy(content: ContentBlock) -> McpResult<LegacyContent> {
             mime_type,
             annotations,
             additional: final_open_fields_to_legacy(
-                "conflicting content _meta field",
+                "conflicting content field",
                 meta,
                 additional,
+                &["type", "data", "mimeType", "annotations"],
             )?,
         }),
         ContentBlock::Audio { .. } => Err(final_projection_error("audio content")),
@@ -1920,9 +1928,10 @@ fn final_content_to_legacy(content: ContentBlock) -> McpResult<LegacyContent> {
             resource: final_resource_content_to_legacy(resource)?,
             annotations,
             additional: final_open_fields_to_legacy(
-                "conflicting content _meta field",
+                "conflicting content field",
                 meta,
                 additional,
+                &["type", "resource", "annotations"],
             )?,
         }),
         ContentBlock::ResourceLink { .. } => Err(final_projection_error("resource_link content")),
@@ -10116,6 +10125,19 @@ mod tests {
             serde_json::to_value(projected).expect("projected text re-encodes"),
             representable
         );
+
+        let shadowed_text = ContentBlock::Text {
+            text: "representable".to_owned(),
+            annotations: None,
+            meta: None,
+            additional: std::collections::BTreeMap::from([(
+                "text".to_owned(),
+                serde_json::json!("shadow"),
+            )]),
+        };
+        let error = final_content_to_legacy(shadowed_text)
+            .expect_err("an open member may not shadow a declared legacy text field");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
 
         let embedded_representable = serde_json::json!({
             "type": "resource",
