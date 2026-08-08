@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use base64::Engine as _;
-use serde::ser::SerializeStruct;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -453,6 +453,9 @@ pub struct Implementation {
     /// Optional wire-preserving icon set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub icons: Vec<RawIcon>,
+    /// Schema-allowed members retained without assigning them protocol meaning.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional: BTreeMap<String, Value>,
 }
 
 /// Final MCP logging severities, aligned to RFC 5424 names.
@@ -495,6 +498,7 @@ impl Implementation {
             description: None,
             website_url: None,
             icons: Vec::new(),
+            additional: BTreeMap::new(),
         })
     }
 
@@ -518,6 +522,8 @@ struct ImplementationWire {
     website_url: Option<AbsoluteUri>,
     #[serde(default)]
     icons: Vec<RawIcon>,
+    #[serde(flatten, default)]
+    additional: BTreeMap<String, Value>,
 }
 
 impl<'de> Deserialize<'de> for Implementation {
@@ -526,18 +532,6 @@ impl<'de> Deserialize<'de> for Implementation {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        reject_unknown_fields(
-            &value,
-            &[
-                "name",
-                "version",
-                "title",
-                "description",
-                "websiteUrl",
-                "icons",
-            ],
-        )
-        .map_err(serde::de::Error::custom)?;
         reject_explicit_null_fields(&value, &["title", "description", "websiteUrl", "icons"])
             .map_err(serde::de::Error::custom)?;
         let wire: ImplementationWire =
@@ -548,6 +542,7 @@ impl<'de> Deserialize<'de> for Implementation {
         implementation.description = wire.description;
         implementation.website_url = wire.website_url;
         implementation.icons = wire.icons;
+        implementation.additional = wire.additional;
         Ok(implementation)
     }
 }
@@ -1055,9 +1050,11 @@ pub struct ResourceLink {
     /// Optional link annotations.
     pub annotations: Option<Annotations>,
     /// Optional raw size of the resource in bytes.
-    pub size: Option<u64>,
+    pub size: Option<i64>,
     /// Preserved open metadata.
     pub meta: Option<OpenMetadata>,
+    /// Schema-allowed members retained without assigning them protocol meaning.
+    pub additional: BTreeMap<String, Value>,
 }
 
 impl Serialize for ResourceLink {
@@ -1072,31 +1069,35 @@ impl Serialize for ResourceLink {
             + usize::from(self.mime_type.is_some())
             + usize::from(self.annotations.is_some())
             + usize::from(self.size.is_some())
-            + usize::from(self.meta.is_some());
-        let mut state = serializer.serialize_struct("ResourceLink", field_count)?;
-        state.serialize_field("type", "resource_link")?;
+            + usize::from(self.meta.is_some())
+            + self.additional.len();
+        let mut state = serializer.serialize_map(Some(field_count))?;
+        state.serialize_entry("type", "resource_link")?;
         if let Some(icons) = &self.icons {
-            state.serialize_field("icons", icons)?;
+            state.serialize_entry("icons", icons)?;
         }
-        state.serialize_field("name", &self.name)?;
+        state.serialize_entry("name", &self.name)?;
         if let Some(title) = &self.title {
-            state.serialize_field("title", title)?;
+            state.serialize_entry("title", title)?;
         }
-        state.serialize_field("uri", &self.uri)?;
+        state.serialize_entry("uri", &self.uri)?;
         if let Some(description) = &self.description {
-            state.serialize_field("description", description)?;
+            state.serialize_entry("description", description)?;
         }
         if let Some(mime_type) = &self.mime_type {
-            state.serialize_field("mimeType", mime_type)?;
+            state.serialize_entry("mimeType", mime_type)?;
         }
         if let Some(annotations) = &self.annotations {
-            state.serialize_field("annotations", annotations)?;
+            state.serialize_entry("annotations", annotations)?;
         }
         if let Some(size) = self.size {
-            state.serialize_field("size", &size)?;
+            state.serialize_entry("size", &size)?;
         }
         if let Some(meta) = &self.meta {
-            state.serialize_field("_meta", meta)?;
+            state.serialize_entry("_meta", meta)?;
+        }
+        for (name, value) in &self.additional {
+            state.serialize_entry(name, value)?;
         }
         state.end()
     }
@@ -1120,9 +1121,11 @@ struct ResourceLinkWire {
     #[serde(default)]
     annotations: Option<Annotations>,
     #[serde(default)]
-    size: Option<u64>,
+    size: Option<i64>,
     #[serde(rename = "_meta", default)]
     meta: Option<OpenMetadata>,
+    #[serde(flatten, default)]
+    additional: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -1137,22 +1140,6 @@ impl<'de> Deserialize<'de> for ResourceLink {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        reject_unknown_fields(
-            &value,
-            &[
-                "type",
-                "icons",
-                "name",
-                "title",
-                "uri",
-                "description",
-                "mimeType",
-                "annotations",
-                "size",
-                "_meta",
-            ],
-        )
-        .map_err(serde::de::Error::custom)?;
         reject_explicit_null_fields(
             &value,
             &[
@@ -1179,6 +1166,7 @@ impl<'de> Deserialize<'de> for ResourceLink {
             annotations: wire.annotations,
             size: wire.size,
             meta: wire.meta,
+            additional: wire.additional,
         })
     }
 }
@@ -1286,6 +1274,8 @@ pub enum ContentBlock {
         annotations: Option<Annotations>,
         #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
+        #[serde(flatten)]
+        additional: BTreeMap<String, Value>,
     },
     /// Binary image content.
     Image {
@@ -1296,6 +1286,8 @@ pub enum ContentBlock {
         annotations: Option<Annotations>,
         #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
+        #[serde(flatten)]
+        additional: BTreeMap<String, Value>,
     },
     /// Binary audio content.
     Audio {
@@ -1306,6 +1298,8 @@ pub enum ContentBlock {
         annotations: Option<Annotations>,
         #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
+        #[serde(flatten)]
+        additional: BTreeMap<String, Value>,
     },
     /// A resource link uses the exact `resource_link` discriminator.
     ResourceLink {
@@ -1322,9 +1316,11 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<Annotations>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        size: Option<u64>,
+        size: Option<i64>,
         #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
+        #[serde(flatten)]
+        additional: BTreeMap<String, Value>,
     },
     /// An embedded resource uses the exact `resource` discriminator.
     Resource {
@@ -1333,6 +1329,8 @@ pub enum ContentBlock {
         annotations: Option<Annotations>,
         #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
+        #[serde(flatten)]
+        additional: BTreeMap<String, Value>,
     },
 }
 
@@ -1345,6 +1343,8 @@ enum ContentBlockWire {
         annotations: Option<Annotations>,
         #[serde(rename = "_meta", default)]
         meta: Option<OpenMetadata>,
+        #[serde(flatten, default)]
+        additional: BTreeMap<String, Value>,
     },
     Image {
         data: String,
@@ -1354,6 +1354,8 @@ enum ContentBlockWire {
         annotations: Option<Annotations>,
         #[serde(rename = "_meta", default)]
         meta: Option<OpenMetadata>,
+        #[serde(flatten, default)]
+        additional: BTreeMap<String, Value>,
     },
     Audio {
         data: String,
@@ -1363,6 +1365,8 @@ enum ContentBlockWire {
         annotations: Option<Annotations>,
         #[serde(rename = "_meta", default)]
         meta: Option<OpenMetadata>,
+        #[serde(flatten, default)]
+        additional: BTreeMap<String, Value>,
     },
     ResourceLink {
         #[serde(default)]
@@ -1378,9 +1382,11 @@ enum ContentBlockWire {
         #[serde(default)]
         annotations: Option<Annotations>,
         #[serde(default)]
-        size: Option<u64>,
+        size: Option<i64>,
         #[serde(rename = "_meta", default)]
         meta: Option<OpenMetadata>,
+        #[serde(flatten, default)]
+        additional: BTreeMap<String, Value>,
     },
     Resource {
         resource: EmbeddedResourceContents,
@@ -1388,6 +1394,8 @@ enum ContentBlockWire {
         annotations: Option<Annotations>,
         #[serde(rename = "_meta", default)]
         meta: Option<OpenMetadata>,
+        #[serde(flatten, default)]
+        additional: BTreeMap<String, Value>,
     },
 }
 
@@ -1401,25 +1409,12 @@ impl<'de> Deserialize<'de> for ContentBlock {
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| serde::de::Error::custom("missing content discriminator"))?;
-        let allowed = match kind {
-            "text" => &["type", "text", "annotations", "_meta"][..],
-            "image" | "audio" => &["type", "data", "mimeType", "annotations", "_meta"][..],
-            "resource_link" => &[
-                "type",
-                "icons",
-                "name",
-                "title",
-                "uri",
-                "description",
-                "mimeType",
-                "annotations",
-                "size",
-                "_meta",
-            ][..],
-            "resource" => &["type", "resource", "annotations", "_meta"][..],
-            _ => return Err(serde::de::Error::custom("content discriminator")),
-        };
-        reject_unknown_fields(&value, allowed).map_err(serde::de::Error::custom)?;
+        if !matches!(
+            kind,
+            "text" | "image" | "audio" | "resource_link" | "resource"
+        ) {
+            return Err(serde::de::Error::custom("content discriminator"));
+        }
         let optional_non_null_fields = match kind {
             "resource_link" => &[
                 "icons",
@@ -1448,16 +1443,19 @@ impl<'de> Deserialize<'de> for ContentBlock {
                 text,
                 annotations,
                 meta,
+                additional,
             } => Self::Text {
                 text,
                 annotations,
                 meta,
+                additional,
             },
             ContentBlockWire::Image {
                 data,
                 mime_type,
                 annotations,
                 meta,
+                additional,
             } => {
                 valid_binary_content(&data, &mime_type, "image/")
                     .map_err(serde::de::Error::custom)?;
@@ -1466,6 +1464,7 @@ impl<'de> Deserialize<'de> for ContentBlock {
                     mime_type,
                     annotations,
                     meta,
+                    additional,
                 }
             }
             ContentBlockWire::Audio {
@@ -1473,6 +1472,7 @@ impl<'de> Deserialize<'de> for ContentBlock {
                 mime_type,
                 annotations,
                 meta,
+                additional,
             } => {
                 valid_binary_content(&data, &mime_type, "audio/")
                     .map_err(serde::de::Error::custom)?;
@@ -1481,6 +1481,7 @@ impl<'de> Deserialize<'de> for ContentBlock {
                     mime_type,
                     annotations,
                     meta,
+                    additional,
                 }
             }
             ContentBlockWire::ResourceLink {
@@ -1493,6 +1494,7 @@ impl<'de> Deserialize<'de> for ContentBlock {
                 annotations,
                 size,
                 meta,
+                additional,
             } => Self::ResourceLink {
                 icons,
                 name,
@@ -1503,17 +1505,20 @@ impl<'de> Deserialize<'de> for ContentBlock {
                 annotations,
                 size,
                 meta,
+                additional,
             },
             ContentBlockWire::Resource {
                 resource,
                 annotations,
                 meta,
+                additional,
             } => {
                 validate_embedded_resource(&resource).map_err(serde::de::Error::custom)?;
                 Self::Resource {
                     resource,
                     annotations,
                     meta,
+                    additional,
                 }
             }
         };
@@ -1530,6 +1535,7 @@ impl ContentBlock {
             text: text.into(),
             annotations: None,
             meta: None,
+            additional: BTreeMap::new(),
         }
     }
 
@@ -1546,6 +1552,7 @@ impl ContentBlock {
             mime_type,
             annotations: None,
             meta: None,
+            additional: BTreeMap::new(),
         })
     }
 
@@ -1562,6 +1569,7 @@ impl ContentBlock {
             mime_type,
             annotations: None,
             meta: None,
+            additional: BTreeMap::new(),
         })
     }
 
@@ -1580,6 +1588,7 @@ impl ContentBlock {
             annotations: None,
             size: None,
             meta: None,
+            additional: BTreeMap::new(),
         })
     }
 
@@ -1597,6 +1606,7 @@ impl ContentBlock {
             },
             annotations: None,
             meta: None,
+            additional: BTreeMap::new(),
         })
     }
 }
@@ -2140,6 +2150,7 @@ mod tests {
             annotations: Some(annotations.clone()),
             size: Some(4096),
             meta: Some(metadata.clone()),
+            additional: BTreeMap::new(),
         };
         let resource_link_wire = serde_json::to_value(&resource_link).expect("resource link");
         assert_eq!(resource_link_wire["type"], "resource_link");
@@ -2174,6 +2185,7 @@ mod tests {
             annotations: Some(annotations),
             size: Some(4096),
             meta: Some(metadata),
+            additional: BTreeMap::new(),
         };
         let content_wire = serde_json::to_value(&content).expect("content wire");
         assert_eq!(
@@ -2242,6 +2254,25 @@ mod tests {
             accepted
         );
 
+        let mut negative = accepted.clone();
+        negative["size"] = json!(-4096);
+        let negative_link: ResourceLink = serde_json::from_value(negative.clone())
+            .expect("a schema-integer resource-link size may be negative");
+        assert_eq!(negative_link.size, Some(-4096));
+        assert_eq!(
+            serde_json::to_value(&negative_link)
+                .expect("negative integer resource-link size encodes"),
+            negative
+        );
+
+        let negative_content: ContentBlock = serde_json::from_value(negative.clone())
+            .expect("content resource links preserve schema-integer sizes");
+        assert_eq!(
+            serde_json::to_value(&negative_content)
+                .expect("negative content resource-link size encodes"),
+            negative
+        );
+
         let missing = json!({
             "type": "resource_link",
             "name": "report",
@@ -2265,6 +2296,77 @@ mod tests {
             serde_json::from_value::<ResourceLink>(wrong_type).is_err(),
             "a fractional resource-link size is not an integer"
         );
+    }
+
+    #[test]
+    fn final_common_types_preserve_schema_allowed_additional_properties() {
+        let implementation = json!({
+            "name": "FastMCP",
+            "version": "0.1",
+            "com.example/implementation": {"stable": true}
+        });
+        let implementation: Implementation = serde_json::from_value(implementation.clone())
+            .expect("schema-allowed implementation property is retained");
+        assert_eq!(
+            implementation.additional.get("com.example/implementation"),
+            Some(&json!({"stable": true}))
+        );
+        assert_eq!(
+            serde_json::to_value(&implementation).expect("implementation property re-emits"),
+            json!({
+                "name": "FastMCP",
+                "version": "0.1",
+                "com.example/implementation": {"stable": true}
+            })
+        );
+
+        let resource_link = json!({
+            "type": "resource_link",
+            "name": "report",
+            "uri": "https://example.test/reports/q3",
+            "com.example/resourceLink": ["preserved"]
+        });
+        let resource_link: ResourceLink = serde_json::from_value(resource_link.clone())
+            .expect("schema-allowed resource-link property is retained");
+        assert_eq!(
+            resource_link.additional.get("com.example/resourceLink"),
+            Some(&json!(["preserved"]))
+        );
+        assert_eq!(
+            serde_json::to_value(&resource_link).expect("resource-link property re-emits"),
+            json!({
+                "type": "resource_link",
+                "name": "report",
+                "uri": "https://example.test/reports/q3",
+                "com.example/resourceLink": ["preserved"]
+            })
+        );
+        FinalCommonTypesSchema::validate(
+            CommonWireDirection::Result,
+            &serde_json::to_value(&resource_link).expect("resource-link validation wire"),
+        )
+        .expect("schema-allowed resource-link property remains valid");
+
+        let content = json!({
+            "type": "text",
+            "text": "report ready",
+            "com.example/content": {"priority": "display"}
+        });
+        let content: ContentBlock = serde_json::from_value(content.clone())
+            .expect("schema-allowed content property is retained");
+        assert_eq!(
+            serde_json::to_value(&content).expect("content property re-emits"),
+            json!({
+                "type": "text",
+                "text": "report ready",
+                "com.example/content": {"priority": "display"}
+            })
+        );
+        FinalCommonTypesSchema::validate(
+            CommonWireDirection::Result,
+            &serde_json::to_value(&content).expect("content validation wire"),
+        )
+        .expect("schema-allowed content property remains valid");
     }
 
     #[test]
