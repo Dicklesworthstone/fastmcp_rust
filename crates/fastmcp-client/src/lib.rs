@@ -372,6 +372,97 @@ fn validate_subscription_notification_filter(
     }
 }
 
+fn admit_final_tasks_discovery_surface(
+    discovery: &ServerDiscoverResult,
+    name: &str,
+    direction: ExtensionDirection,
+) -> McpResult<()> {
+    let capabilities = serde_json::to_value(discovery.capabilities()).map_err(|error| {
+        McpError::internal_error(format!(
+            "Failed to retain final Tasks capability discovery: {error}"
+        ))
+    })?;
+    let settings_value = capabilities
+        .get("extensions")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|extensions| extensions.get(fastmcp_protocol::TASKS_EXTENSION))
+        .cloned()
+        .ok_or_else(|| {
+            McpError::invalid_params(
+                "Server did not declare io.modelcontextprotocol/tasks capability",
+            )
+        })?;
+    let server_settings = ExtensionSettings::new(settings_value).map_err(|_| {
+        McpError::invalid_params(
+            "Server io.modelcontextprotocol/tasks settings are not an admitted object",
+        )
+    })?;
+
+    let mut registry = ExtensionDescriptorRegistry::new();
+    let task_extension = register_official_tasks_extension(&mut registry).map_err(|error| {
+        McpError::internal_error(format!(
+            "Failed to register the official Tasks client surface: {error}"
+        ))
+    })?;
+    registry.freeze().map_err(|error| {
+        McpError::internal_error(format!(
+            "Failed to freeze the official Tasks client surface: {error}"
+        ))
+    })?;
+
+    let mut local = ExtensionLocalEnablement::default();
+    local.enable(task_extension.clone());
+    let client = ClientExtensionDiscovery {
+        extensions: BTreeMap::from([(task_extension.clone(), official_tasks_empty_settings())]),
+    };
+    let server = ServerExtensionDiscovery {
+        extensions: BTreeMap::from([(task_extension.clone(), server_settings)]),
+    };
+    let mut resolve_empty_settings =
+        |_descriptor: &fastmcp_protocol::ExtensionDescriptor,
+         _client: &ExtensionSettings,
+         _server: &ExtensionSettings| { Ok(official_tasks_empty_settings()) };
+    let negotiated = registry
+        .negotiate(
+            ProtocolEra::Modern2026,
+            &local,
+            &client,
+            &server,
+            &mut resolve_empty_settings,
+        )
+        .map_err(|_| {
+            McpError::invalid_params(
+                "io.modelcontextprotocol/tasks requires bilateral empty settings",
+            )
+        })?;
+    let admitted = if name == TASK_STATUS_NOTIFICATION {
+        negotiated
+            .admit_notification(
+                &registry,
+                ProtocolEra::Modern2026,
+                &task_extension,
+                name,
+                direction,
+            )
+            .map(|_| ())
+    } else {
+        negotiated
+            .admit_method(
+                &registry,
+                ProtocolEra::Modern2026,
+                &task_extension,
+                name,
+                direction,
+            )
+            .map(|_| ())
+    };
+    admitted.map_err(|_| {
+        McpError::invalid_params(
+            "Tasks surface is not admitted by the negotiated official extension",
+        )
+    })
+}
+
 fn final_log_level(level: LogLevel) -> LoggingLevel {
     match level {
         LogLevel::Debug => LoggingLevel::Debug,
@@ -4132,92 +4223,7 @@ impl Client {
                 "Modern Tasks requires the retained final server/discover response",
             )
         })?;
-        let capabilities = serde_json::to_value(discovery.capabilities()).map_err(|error| {
-            McpError::internal_error(format!(
-                "Failed to retain final Tasks capability discovery: {error}"
-            ))
-        })?;
-        let settings_value = capabilities
-            .get("extensions")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|extensions| extensions.get(fastmcp_protocol::TASKS_EXTENSION))
-            .cloned()
-            .ok_or_else(|| {
-                McpError::invalid_params(
-                    "Server did not declare io.modelcontextprotocol/tasks capability",
-                )
-            })?;
-        let server_settings = ExtensionSettings::new(settings_value).map_err(|_| {
-            McpError::invalid_params(
-                "Server io.modelcontextprotocol/tasks settings are not an admitted object",
-            )
-        })?;
-
-        let mut registry = ExtensionDescriptorRegistry::new();
-        let task_extension = register_official_tasks_extension(&mut registry).map_err(|error| {
-            McpError::internal_error(format!(
-                "Failed to register the official Tasks client surface: {error}"
-            ))
-        })?;
-        registry.freeze().map_err(|error| {
-            McpError::internal_error(format!(
-                "Failed to freeze the official Tasks client surface: {error}"
-            ))
-        })?;
-
-        let mut local = ExtensionLocalEnablement::default();
-        local.enable(task_extension.clone());
-        let client = ClientExtensionDiscovery {
-            extensions: BTreeMap::from([(task_extension.clone(), official_tasks_empty_settings())]),
-        };
-        let server = ServerExtensionDiscovery {
-            extensions: BTreeMap::from([(task_extension.clone(), server_settings)]),
-        };
-        let mut resolve_empty_settings =
-            |_descriptor: &fastmcp_protocol::ExtensionDescriptor,
-             _client: &ExtensionSettings,
-             _server: &ExtensionSettings| { Ok(official_tasks_empty_settings()) };
-        let negotiated = registry
-            .negotiate(
-                ProtocolEra::Modern2026,
-                &local,
-                &client,
-                &server,
-                &mut resolve_empty_settings,
-            )
-            .map_err(|_| {
-                McpError::invalid_params(
-                    "io.modelcontextprotocol/tasks requires bilateral empty settings",
-                )
-            })?;
-        let admitted = if method == TASK_STATUS_NOTIFICATION {
-            negotiated
-                .admit_notification(
-                    &registry,
-                    ProtocolEra::Modern2026,
-                    &task_extension,
-                    method,
-                    direction,
-                )
-                .map(|_| ())
-        } else {
-            negotiated
-                .admit_method(
-                    &registry,
-                    ProtocolEra::Modern2026,
-                    &task_extension,
-                    method,
-                    direction,
-                )
-                .map(|_| ())
-        };
-        admitted.map_err(|_| {
-            McpError::invalid_params(
-                "Tasks surface is not admitted by the negotiated official extension",
-            )
-        })?;
-
-        Ok(())
+        admit_final_tasks_discovery_surface(discovery, method, direction)
     }
 
     /// Sends one already-admitted final Tasks request and decodes its exact
@@ -10388,10 +10394,14 @@ mod tests {
              case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r request || exit 1; \
-             case \"$request\" in *subscriptions/listen*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"toolsListChanged\":true'*'\"taskIds\":[\"{task_id}\"]'*'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
+             case \"$request\" in *subscriptions/listen*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *'\"toolsListChanged\":true'*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *'\"taskIds\":[\"{task_id}\"]'*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) ;; *) exit 1 ;; esac; \
              printf '%s\\n' '{acknowledgement}'; \
              printf '%s\\n' '{task_notification}'; \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}' ;; *) exit 1 ;; esac"
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}'"
         )
     }
 

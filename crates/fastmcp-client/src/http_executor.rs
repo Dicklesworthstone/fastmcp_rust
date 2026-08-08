@@ -4,7 +4,7 @@
 //! negotiation, and the public response stream surface. It neither retries an
 //! MCP request nor follows redirects.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::poll_fn;
 use std::pin::Pin;
@@ -23,19 +23,23 @@ use fastmcp_protocol::methods::{
 use fastmcp_protocol::protocol_policy::{
     HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
 };
+use fastmcp_protocol::tasks_extension::{
+    TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY,
+    TaskStatusNotification as FinalTaskStatusNotification,
+};
 use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, CompleteResult, CoreDispatchError, CoreRequest, CoreResult,
     FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalNotificationError, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
     JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
     SERVER_DISCOVER, ServerDiscoverResult, ServerNotification, SubscriptionFilter,
-    decode_strict_jsonrpc_message,
+    decode_strict_jsonrpc_message, task_subscription_ids,
 };
 
 use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError};
 use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
-    ClientProtocolPlan,
+    ClientProtocolPlan, admit_final_tasks_discovery_surface,
 };
 
 /// Exact request headers required for a modern MCP JSON-RPC POST.
@@ -249,6 +253,7 @@ impl ModernHttpResponseStream {
             .map_err(ModernHttpSubscriptionListenError::Executor)?;
         let mut accepted_filter = None;
         let mut notifications = Vec::new();
+        let mut task_notifications = Vec::new();
 
         loop {
             let event = match stream.next_event(cx).await {
@@ -276,9 +281,48 @@ impl ModernHttpResponseStream {
                         request_id,
                         accepted_filter,
                         notifications,
+                        task_notifications,
                     );
                 }
                 JsonRpcMessage::Request(request) => {
+                    if request.id.is_none() && request.method == TASK_STATUS_NOTIFICATION {
+                        let Some(accepted_filter) = accepted_filter.as_ref() else {
+                            return Err(
+                                ModernHttpSubscriptionListenError::EventBeforeAcknowledgement,
+                            );
+                        };
+                        let accepted_task_ids = task_subscription_ids(accepted_filter)
+                            .ok()
+                            .flatten()
+                            .ok_or(ModernHttpSubscriptionListenError::EventOutsideAcceptedFilter)?;
+                        let notification: FinalTaskStatusNotification =
+                            serde_json::from_slice(event.as_bytes()).map_err(|_| {
+                                ModernHttpSubscriptionListenError::TaskNotificationAdmission
+                            })?;
+                        let subscription_id = notification
+                            .params
+                            .meta
+                            .as_ref()
+                            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                            .and_then(|value| {
+                                serde_json::from_value::<RequestId>(value.clone()).ok()
+                            });
+                        if subscription_id.as_ref() != Some(&request_id) {
+                            return Err(
+                                ModernHttpSubscriptionListenError::TaskEventSubscriptionIdMismatch,
+                            );
+                        }
+                        if !accepted_task_ids
+                            .iter()
+                            .any(|task_id| task_id == &notification.params.task.base().task_id)
+                        {
+                            return Err(
+                                ModernHttpSubscriptionListenError::TaskEventOutsideAcceptedFilter,
+                            );
+                        }
+                        task_notifications.push(notification);
+                        continue;
+                    }
                     let notification = ServerNotification::decode(&request)
                         .map_err(ModernHttpSubscriptionListenError::NotificationAdmission)?;
                     match notification {
@@ -479,6 +523,8 @@ pub struct ModernHttpSubscriptionListenCollector {
     pub accepted_filter: SubscriptionFilter,
     /// Request-owned typed notifications in received wire order.
     pub notifications: Vec<ServerNotification>,
+    /// Request-owned typed Tasks events admitted by the exact acknowledged IDs.
+    pub task_notifications: Vec<FinalTaskStatusNotification>,
     /// The final complete result terminating the subscription stream.
     pub terminal: CompleteResult<FinalSubscriptionsListenResult>,
 }
@@ -491,12 +537,16 @@ pub enum ModernHttpSubscriptionListenError {
     InvalidRequestId,
     /// Constructing or issuing the final `subscriptions/listen` request failed.
     Request(ModernHttpClientError),
+    /// The retained discovery response did not bilaterally admit Tasks.
+    TasksNegotiation,
     /// The response did not use the required SSE body lane or could not be read.
     Executor(ModernHttpExecutorError),
     /// An SSE event was not one strictly admitted JSON-RPC object.
     JsonRpcAdmission(JsonRpcAdmissionError),
     /// A server request was not one typed final server notification.
     NotificationAdmission(FinalNotificationError),
+    /// A `notifications/tasks` event did not match the exact Tasks wire type.
+    TaskNotificationAdmission,
     /// The server emitted a response for a request other than this listener.
     ResponseIdMismatch {
         /// The immutable ID assigned to the outgoing listen request.
@@ -547,6 +597,10 @@ pub enum ModernHttpSubscriptionListenError {
     EventBeforeAcknowledgement,
     /// A subscription event was outside the accepted filter.
     EventOutsideAcceptedFilter,
+    /// A Tasks event carried a subscription ID other than this listener's ID.
+    TaskEventSubscriptionIdMismatch,
+    /// A Tasks event named a task outside the acknowledged exact-ID set.
+    TaskEventOutsideAcceptedFilter,
     /// A final cancellation targeted another request instead of this listener.
     CancellationIdMismatch {
         /// The immutable ID assigned to the outgoing listen request.
@@ -572,6 +626,9 @@ impl fmt::Display for ModernHttpSubscriptionListenError {
                 formatter.write_str("subscriptions/listen requires a valid JSON-RPC request ID")
             }
             Self::Request(error) => error.fmt(formatter),
+            Self::TasksNegotiation => formatter.write_str(
+                "subscriptions/listen Tasks filter was not bilaterally negotiated",
+            ),
             Self::Executor(error) => error.fmt(formatter),
             Self::JsonRpcAdmission(error) => write!(
                 formatter,
@@ -580,6 +637,9 @@ impl fmt::Display for ModernHttpSubscriptionListenError {
             Self::NotificationAdmission(error) => write!(
                 formatter,
                 "subscriptions/listen SSE event was not a valid final server notification: {error}"
+            ),
+            Self::TaskNotificationAdmission => formatter.write_str(
+                "subscriptions/listen SSE event was not a valid Tasks notification",
             ),
             Self::ResponseIdMismatch { expected, actual } => write!(
                 formatter,
@@ -628,6 +688,12 @@ impl fmt::Display for ModernHttpSubscriptionListenError {
                 .write_str("subscriptions/listen received a subscription event before acknowledgement"),
             Self::EventOutsideAcceptedFilter => formatter
                 .write_str("subscriptions/listen received an event outside its accepted filter"),
+            Self::TaskEventSubscriptionIdMismatch => formatter.write_str(
+                "subscriptions/listen Tasks event named a different subscription",
+            ),
+            Self::TaskEventOutsideAcceptedFilter => formatter.write_str(
+                "subscriptions/listen Tasks event was outside its accepted taskIds filter",
+            ),
             Self::CancellationIdMismatch { expected, actual } => write!(
                 formatter,
                 "subscriptions/listen cancellation ID {actual:?} did not match request {expected:?}"
@@ -656,6 +722,8 @@ impl std::error::Error for ModernHttpSubscriptionListenError {
             Self::NotificationAdmission(error) => Some(error),
             Self::TerminalResult(error) => Some(error),
             Self::InvalidRequestId
+            | Self::TasksNegotiation
+            | Self::TaskNotificationAdmission
             | Self::ResponseIdMismatch { .. }
             | Self::RemoteError { .. }
             | Self::UnexpectedTerminalResult
@@ -670,6 +738,8 @@ impl std::error::Error for ModernHttpSubscriptionListenError {
             | Self::AcknowledgementExtensionFilterNotRequested
             | Self::EventBeforeAcknowledgement
             | Self::EventOutsideAcceptedFilter
+            | Self::TaskEventSubscriptionIdMismatch
+            | Self::TaskEventOutsideAcceptedFilter
             | Self::CancellationIdMismatch { .. }
             | Self::CallerCancelled { .. }
             | Self::Cancelled { .. }
@@ -699,6 +769,7 @@ fn collect_final_subscriptions_terminal(
     expected_id: RequestId,
     accepted_filter: Option<SubscriptionFilter>,
     notifications: Vec<ServerNotification>,
+    task_notifications: Vec<FinalTaskStatusNotification>,
 ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
     if response.id.as_ref() != Some(&expected_id) {
         return Err(ModernHttpSubscriptionListenError::ResponseIdMismatch {
@@ -736,6 +807,7 @@ fn collect_final_subscriptions_terminal(
         subscription_id,
         accepted_filter,
         notifications,
+        task_notifications,
         terminal,
     })
 }
@@ -820,11 +892,40 @@ fn validate_http_subscription_acknowledgement_filter(
         }
     }
 
+    let requested_task_ids = task_subscription_ids(requested).map_err(|_| {
+        ModernHttpSubscriptionListenError::AcknowledgementExtensionFilterNotRequested
+    })?;
+    let acknowledged_task_ids = task_subscription_ids(acknowledged).map_err(|_| {
+        ModernHttpSubscriptionListenError::AcknowledgementExtensionFilterNotRequested
+    })?;
+    match (requested_task_ids.as_ref(), acknowledged_task_ids.as_ref()) {
+        (None, Some(_)) => {
+            return Err(
+                ModernHttpSubscriptionListenError::AcknowledgementExtensionFilterNotRequested,
+            );
+        }
+        (Some(requested), Some(acknowledged)) => {
+            for (index, task_id) in acknowledged.iter().enumerate() {
+                if !requested.iter().any(|requested| requested == task_id)
+                    || acknowledged[..index]
+                        .iter()
+                        .any(|previous| previous == task_id)
+                {
+                    return Err(
+                        ModernHttpSubscriptionListenError::AcknowledgementExtensionFilterNotRequested,
+                    );
+                }
+            }
+        }
+        (Some(_), None) | (None, None) => {}
+    }
+
     if acknowledged.additional.iter().any(|(name, value)| {
-        requested
-            .additional
-            .get(name)
-            .is_none_or(|requested_value| requested_value != value)
+        name != TASK_SUBSCRIPTION_IDS_KEY
+            && requested
+                .additional
+                .get(name)
+                .is_none_or(|requested_value| requested_value != value)
     }) {
         return Err(ModernHttpSubscriptionListenError::AcknowledgementExtensionFilterNotRequested);
     }
@@ -1539,15 +1640,38 @@ impl ModernHttpClient {
         if request_id.validate().is_err() {
             return Err(ModernHttpSubscriptionListenError::InvalidRequestId);
         }
-        let response = self
-            .request(
-                cx,
-                SUBSCRIPTIONS_LISTEN,
-                serde_json::json!({ "notifications": notifications.clone() }),
-                Some(request_id.clone()),
+        let tasks_requested = task_subscription_ids(&notifications)
+            .map_err(|_| ModernHttpSubscriptionListenError::TasksNegotiation)?
+            .is_some();
+        let client_extensions = if tasks_requested {
+            admit_final_tasks_discovery_surface(
+                &self.server_discovery,
+                TASK_STATUS_NOTIFICATION,
+                fastmcp_protocol::ExtensionDirection::ServerToClient,
             )
+            .map_err(|_| ModernHttpSubscriptionListenError::TasksNegotiation)?;
+            Some(BTreeMap::from([(
+                fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+                serde_json::json!({}),
+            )]))
+        } else {
+            None
+        };
+        let request = build_modern_request_with_extensions(
+            &self.modern_post_target,
+            &self.client_info,
+            &self.client_capabilities,
+            SUBSCRIPTIONS_LISTEN,
+            serde_json::json!({ "notifications": notifications.clone() }),
+            Some(request_id.clone()),
+            client_extensions.as_ref(),
+        )
+        .map_err(ModernHttpSubscriptionListenError::Request)?;
+        let response = self
+            .executor
+            .execute(cx, &request)
             .await
-            .map_err(ModernHttpSubscriptionListenError::Request)?;
+            .map_err(ModernHttpSubscriptionListenError::Executor)?;
         response
             .collect_final_subscriptions_listen(cx, request_id, notifications, limits)
             .await
@@ -2125,6 +2249,26 @@ fn build_modern_request(
     parameters: serde_json::Value,
     request_id: Option<RequestId>,
 ) -> Result<ModernHttpRequest, ModernHttpClientError> {
+    build_modern_request_with_extensions(
+        target,
+        client_info,
+        client_capabilities,
+        method,
+        parameters,
+        request_id,
+        None,
+    )
+}
+
+fn build_modern_request_with_extensions(
+    target: &str,
+    client_info: &ClientInfo,
+    client_capabilities: &ClientCapabilities,
+    method: &str,
+    parameters: serde_json::Value,
+    request_id: Option<RequestId>,
+    client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+) -> Result<ModernHttpRequest, ModernHttpClientError> {
     validate_final_method(method, request_id.is_some())?;
     let mut parameters = parameters
         .as_object()
@@ -2143,8 +2287,19 @@ fn build_modern_request(
         .unwrap_or_default();
     let mut final_request_meta = FinalRequestMeta::new(client_capabilities.clone());
     final_request_meta.client_info = Some(client_info.clone());
-    let final_metadata = serde_json::to_value(final_request_meta)
+    let mut final_metadata = serde_json::to_value(final_request_meta)
         .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
+    if let Some(client_extensions) = client_extensions {
+        let capabilities = final_metadata
+            .as_object_mut()
+            .and_then(|metadata| metadata.get_mut("io.modelcontextprotocol/clientCapabilities"))
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or(ModernHttpClientError::RequestEncodingFailed)?;
+        capabilities.insert(
+            "extensions".to_owned(),
+            serde_json::Value::Object(client_extensions.clone().into_iter().collect()),
+        );
+    }
     let final_metadata = final_metadata
         .as_object()
         .ok_or(ModernHttpClientError::RequestEncodingFailed)?;
@@ -2514,6 +2669,10 @@ mod tests {
         br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#
     }
 
+    fn modern_tasks_discovery_body() -> &'static [u8] {
+        br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private"}}"#
+    }
+
     fn subscriptions_listen_sse_events(acknowledgement_id: i64) -> [String; 4] {
         [
             format!(
@@ -2523,6 +2682,90 @@ mod tests {
             "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}\n\n".to_owned(),
             "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2}}}\n\n".to_owned(),
         ]
+    }
+
+    fn run_public_http_tasks_subscription(
+        notification_task_id: &str,
+    ) -> Result<ModernHttpSubscriptionListenCollector, ClientHttpConnectionError> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind local Tasks subscriptions/listen listener");
+        let address = listener
+            .local_addr()
+            .expect("read local Tasks subscriptions/listen address");
+        let modern_target = format!("http://{address}/mcp");
+        let notification_task_id = notification_task_id.to_owned();
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept Tasks modern probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("Tasks modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                modern_tasks_discovery_body(),
+            );
+
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept Tasks subscriptions/listen request");
+            let request = read_request(&mut stream);
+            let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("Tasks subscriptions/listen request must be JSON-RPC");
+            assert_eq!(body["method"], "subscriptions/listen");
+            assert_eq!(body["params"]["notifications"]["taskIds"][0], "task-73");
+            assert_eq!(
+                body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    ["io.modelcontextprotocol/tasks"],
+                serde_json::json!({})
+            );
+
+            begin_chunked_sse(&mut stream);
+            for event in [
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2},\"notifications\":{\"toolsListChanged\":true,\"taskIds\":[\"task-73\"]}}}\n\n".to_owned(),
+                format!(
+                    "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tasks\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}},\"taskId\":\"{notification_task_id}\",\"status\":\"working\",\"createdAt\":\"2026-07-28T12:00:00.000Z\",\"lastUpdatedAt\":\"2026-07-28T12:00:00.000Z\",\"ttlMs\":null}}}}\n\n"
+                ),
+                "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2}}}\n\n".to_owned(),
+            ] {
+                write_chunked_sse_event(&mut stream, &event);
+            }
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("Tasks discovery selects final HTTP subscriptions/listen");
+        let mut filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        fastmcp_protocol::set_task_subscription_ids(
+            &mut filter,
+            vec![fastmcp_protocol::FinalTaskId::parse("task-73").expect("bounded HTTP task id")],
+        )
+        .expect("compose Tasks beside the HTTP core filter");
+        let result = runtime_block_on(connection.listen_subscriptions_typed(
+            &cx,
+            RequestId::Number(2),
+            filter,
+            SseLimits::new(2_048, 16_384, 16).expect("explicit SSE bounds are nonzero"),
+        ));
+        server.join().expect("Tasks HTTP server must join");
+        result
     }
 
     #[test]
@@ -2830,6 +3073,36 @@ mod tests {
         server
             .join()
             .expect("final subscriptions/listen server must join");
+    }
+
+    #[test]
+    fn public_http_tasks_subscription_collects_acknowledged_exact_task_id() {
+        let collector = run_public_http_tasks_subscription("task-73")
+            .expect("HTTP Tasks event must remain typed and request-owned");
+        assert_eq!(collector.accepted_filter.tools_list_changed, Some(true));
+        assert!(collector.notifications.is_empty());
+        assert_eq!(collector.task_notifications.len(), 1);
+        assert_eq!(
+            collector.task_notifications[0]
+                .params
+                .task
+                .base()
+                .task_id
+                .as_str(),
+            "task-73"
+        );
+    }
+
+    #[test]
+    fn public_http_tasks_subscription_rejects_one_field_unacknowledged_task_id() {
+        let error = run_public_http_tasks_subscription("task-74")
+            .expect_err("one changed taskId must fail the HTTP stream closed");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::SubscriptionsListen(
+                ModernHttpSubscriptionListenError::TaskEventOutsideAcceptedFilter
+            )
+        ));
     }
 
     #[test]
