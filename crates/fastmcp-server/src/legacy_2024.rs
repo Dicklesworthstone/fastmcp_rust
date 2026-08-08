@@ -351,6 +351,201 @@ pub struct Legacy2024ServerAdapter<H> {
     next_reverse_request_id: i64,
 }
 
+struct LiveLegacy2024Binding<H> {
+    binding: LegacyPeerBinding,
+    adapter: Legacy2024ServerAdapter<H>,
+}
+
+/// Bounded reusable host for exact-2024 peer lifecycles in one live server.
+///
+/// A transport consumer supplies an already authenticated, fresh
+/// [`LegacyPeerBinding`] for each connection or process generation, then uses
+/// this host for that binding's complete inbound, outbound, and close
+/// lifecycle. The host does not parse transport frames, select a protocol era,
+/// or manufacture bindings. Those responsibilities remain with its stdio or
+/// HTTP consumer.
+///
+/// Closing a binding releases its adapter-owned state and removes it from this
+/// live host. Callers must not reuse a closed binding: a transport generation
+/// is monotonically unique by contract, so a reconnect must supply a fresh
+/// [`LegacyPeerBinding`].
+pub struct Legacy2024LiveServerLifecycle<H, Factory> {
+    config: Legacy2024ServerConfig,
+    max_live_bindings: usize,
+    make_handler: Factory,
+    bindings: Vec<LiveLegacy2024Binding<H>>,
+}
+
+impl<H, Factory> Legacy2024LiveServerLifecycle<H, Factory>
+where
+    H: Legacy2024Handler,
+    Factory: FnMut(LegacyPeerBinding) -> H,
+{
+    /// Creates an empty, bounded host with frozen exact-2024 server values.
+    ///
+    /// The handler factory is called only after the live-binding capacity has
+    /// been reserved, and exactly once for each successfully installed peer.
+    pub fn new(
+        config: Legacy2024ServerConfig,
+        max_live_bindings: usize,
+        make_handler: Factory,
+    ) -> Result<Self, Legacy2024AdapterError> {
+        if max_live_bindings == 0 {
+            return Err(Legacy2024AdapterError::invalid_params(
+                "legacy live lifecycle requires a nonzero binding limit",
+            ));
+        }
+        initialize_result(&config)?;
+        Ok(Self {
+            config,
+            max_live_bindings,
+            make_handler,
+            bindings: Vec::new(),
+        })
+    }
+
+    /// Installs one fresh exact-2024 lifecycle for a transport-selected peer.
+    ///
+    /// No handler is created and no live state changes when the binding is
+    /// already active, the fixed live-binding limit is reached, or storage
+    /// cannot be reserved.
+    pub fn install(
+        &mut self,
+        binding: LegacyPeerBinding,
+    ) -> Result<&LegacyServerAdapterInstalledReceipt, Legacy2024AdapterError> {
+        if self.is_binding_live(binding) {
+            return Err(Legacy2024AdapterError::invalid_request(
+                "legacy peer binding already owns a live adapter lifecycle",
+            ));
+        }
+        if self.bindings.len() >= self.max_live_bindings {
+            return Err(Legacy2024AdapterError::invalid_request(
+                "legacy live lifecycle binding limit reached",
+            ));
+        }
+        self.bindings.try_reserve(1).map_err(|_| {
+            Legacy2024AdapterError::invalid_request(
+                "legacy live lifecycle cannot reserve binding state",
+            )
+        })?;
+
+        let adapter = Legacy2024ServerAdapter::install(
+            binding,
+            self.config.clone(),
+            (self.make_handler)(binding),
+        )?;
+        self.bindings.push(LiveLegacy2024Binding { binding, adapter });
+        Ok(self
+            .bindings
+            .last()
+            .expect("a successfully installed binding is retained")
+            .adapter
+            .installed_receipt())
+    }
+
+    /// Returns the number of currently live peer lifecycles.
+    #[must_use]
+    pub const fn active_binding_count(&self) -> usize {
+        self.bindings.len()
+    }
+
+    /// Returns the immutable maximum number of concurrent peer lifecycles.
+    #[must_use]
+    pub const fn max_live_bindings(&self) -> usize {
+        self.max_live_bindings
+    }
+
+    /// Returns whether a binding currently owns one live adapter lifecycle.
+    #[must_use]
+    pub fn is_binding_live(&self, binding: LegacyPeerBinding) -> bool {
+        self.bindings
+            .iter()
+            .any(|candidate| candidate.binding == binding)
+    }
+
+    /// Returns the immutable state view for one live peer lifecycle.
+    pub fn snapshot(
+        &self,
+        binding: LegacyPeerBinding,
+    ) -> Result<Legacy2024StateSnapshot, Legacy2024AdapterError> {
+        Ok(self.adapter(binding)?.snapshot())
+    }
+
+    /// Applies one complete client-to-server JSON value to its live adapter.
+    pub fn receive(
+        &mut self,
+        binding: LegacyPeerBinding,
+        wire: Value,
+    ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
+        self.adapter_mut(binding)?.receive(binding, wire)
+    }
+
+    /// Builds one capability-gated server-to-client request for a live peer.
+    pub fn make_reverse_request(
+        &mut self,
+        binding: LegacyPeerBinding,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
+        self.adapter_mut(binding)?
+            .make_reverse_request(binding, method, params)
+    }
+
+    /// Builds one capability-gated server-to-client notification for a live peer.
+    pub fn make_notification(
+        &self,
+        binding: LegacyPeerBinding,
+        method: &'static str,
+        params: Option<Value>,
+    ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
+        self.adapter(binding)?.make_notification(binding, method, params)
+    }
+
+    /// Closes one live binding, releases its owned state, and removes it.
+    ///
+    /// The returned snapshot is the terminal observation: its lifecycle is
+    /// `Closed`, its reservation count is zero, and its release count has
+    /// advanced exactly once. A failed close leaves the live binding intact.
+    pub fn close(
+        &mut self,
+        binding: LegacyPeerBinding,
+    ) -> Result<Legacy2024StateSnapshot, Legacy2024AdapterError> {
+        let index = self.binding_index(binding)?;
+        let terminal_snapshot = {
+            let adapter = &mut self.bindings[index].adapter;
+            adapter.close(binding)?;
+            adapter.snapshot()
+        };
+        self.bindings.swap_remove(index);
+        Ok(terminal_snapshot)
+    }
+
+    fn adapter(
+        &self,
+        binding: LegacyPeerBinding,
+    ) -> Result<&Legacy2024ServerAdapter<H>, Legacy2024AdapterError> {
+        let index = self.binding_index(binding)?;
+        Ok(&self.bindings[index].adapter)
+    }
+
+    fn adapter_mut(
+        &mut self,
+        binding: LegacyPeerBinding,
+    ) -> Result<&mut Legacy2024ServerAdapter<H>, Legacy2024AdapterError> {
+        let index = self.binding_index(binding)?;
+        Ok(&mut self.bindings[index].adapter)
+    }
+
+    fn binding_index(&self, binding: LegacyPeerBinding) -> Result<usize, Legacy2024AdapterError> {
+        self.bindings
+            .iter()
+            .position(|candidate| candidate.binding == binding)
+            .ok_or(Legacy2024AdapterError::invalid_request(
+                "legacy peer binding has no live adapter lifecycle",
+            ))
+    }
+}
+
 impl<H> Legacy2024ServerAdapter<H>
 where
     H: Legacy2024Handler,
