@@ -158,12 +158,13 @@ use fastmcp_core::{
     McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
-use fastmcp_protocol::common_types::Implementation;
+use fastmcp_protocol::common_types::{Implementation, LoggingLevel, OpenMetadata};
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, ExtensionNegotiationError, ExtensionSettingsCompatibilityResolver,
 };
 use fastmcp_protocol::methods::{
     Legacy2024ListChangedCapability, Legacy2024ResourcesCapability, Legacy2024ServerCapabilities,
+    SUBSCRIPTIONS_LISTEN,
 };
 use fastmcp_protocol::protocol_policy::{
     LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION, ModernVersionSupport, ProtocolEra,
@@ -178,11 +179,11 @@ use fastmcp_protocol::{
     FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, GetPromptParams,
     InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
     ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel,
-    LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES, OpenMetadata, ProgressMarker, Prompt,
-    ReadResourceParams, RequestId, Resource, ResourceTemplate, ResultMeta, SERVER_DISCOVER_METHOD,
-    SUBSCRIPTIONS_LISTEN, ServerCapabilities, ServerDiscoverCapabilities, ServerDiscoverRequest,
-    ServerDiscoverResult, ServerExtensionDiscovery, ServerInfo, ServerInstructions,
-    ServerNotification, SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
+    LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES, ProgressMarker, Prompt, ReadResourceParams,
+    RequestId, Resource, ResourceTemplate, ResultMeta, SERVER_DISCOVER_METHOD, ServerCapabilities,
+    ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
+    ServerExtensionDiscovery, ServerInfo, ServerInstructions, ServerNotification,
+    SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
     UnsubscribeResourceParams,
 };
 use legacy_2024::{
@@ -16688,7 +16689,7 @@ mod lib_unit_tests {
 
     #[test]
     fn final_subscription_rejects_request_scoped_message_without_delivery() {
-        use fastmcp_protocol::{FinalLogMessageParams, LoggingLevel};
+        use fastmcp_protocol::FinalLogMessageParams;
 
         let server = Server::new("final-subscription-rejection-test", "1.0.0").build();
         let registry = Arc::clone(&server.final_subscriptions);
