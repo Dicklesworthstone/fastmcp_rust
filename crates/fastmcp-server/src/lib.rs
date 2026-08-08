@@ -122,16 +122,23 @@ use std::any::Any;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use fastmcp_transport::http::{
-    HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpResponse, HttpStatus,
-    HttpTransport,
+    DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
+    DualEraHttpEndpointResponse, DualEraHttpLegacySseResponse, DualEraHttpSession,
+    DualEraHttpSseResponse, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
+    HttpResponse, HttpStatus, HttpTransport,
 };
 
+use asupersync::codec::Framed;
+use asupersync::http::h1::{Http1Codec, Method as Http1Method, Response as Http1Response};
+use asupersync::io::AsyncWriteExt;
+use asupersync::net::tcp::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
+use asupersync::stream::StreamExt;
 use asupersync::{Budget, CancelKind, Cx, RegionId, channel::mpsc as asupersync_mpsc};
 use fastmcp_console::banner::StartupBanner;
 use fastmcp_console::client::RequestResponseRenderer;
@@ -169,7 +176,6 @@ use legacy_2024::{
 
 const REDACTED_EXTENSION_PANIC_INCIDENT: &[u8] =
     b"fastmcp extension callback panicked; panic payload redacted\n";
-const UNQUALIFIED_HTTP_DIAGNOSTIC: &[u8] = b"fastmcp turnkey HTTP is unavailable: the sessionful legacy listener is quarantined until stateless per-request dispatch and request-owned cancellation are qualified\n";
 /// Server-local error code for a bounded resource-subscription admission
 /// failure. MCP does not currently assign a standard `ResourceExhausted` code.
 const RESOURCE_EXHAUSTED_ERROR_CODE: i32 = -32006;
@@ -190,17 +196,17 @@ static REDACTED_EXTENSION_PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Request-owned state retained until the exact legacy response reaches its
 /// stdio commit boundary.
-struct LiveLegacy2024ActiveRequest<'a> {
+struct LiveLegacy2024ActiveRequest {
     cancellation: McpRequestCancellation,
-    active_guard: ActiveRequestGuard<'a>,
+    active_guard: ActiveRequestGuard,
     budget: Budget,
 }
 
 /// Result of a live exact-2024 dispatch together with its still-active
 /// cancellation authority.
-struct LiveLegacy2024Dispatch<'a> {
+struct LiveLegacy2024Dispatch {
     result: McpResult<serde_json::Value>,
-    active_request: LiveLegacy2024ActiveRequest<'a>,
+    active_request: LiveLegacy2024ActiveRequest,
 }
 
 /// Bridges an admitted exact-2024 operation to the server's legacy result
@@ -210,7 +216,7 @@ struct LiveLegacy2024RuntimeHandler<'a> {
     cx: Cx,
     session_id: u64,
     session_principal: SessionPrincipalBinding,
-    active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest<'a>>>>,
+    active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
 }
 
 impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
@@ -235,6 +241,79 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
         let dispatch = self
             .server
             .dispatch_legacy_2024(&self.cx, self.session_id, &self.session_principal, &request)
+            .map_err(|error| {
+                Legacy2024HandlerError::with_code(
+                    i64::from(i32::from(error.code)),
+                    "legacy runtime handler rejected an admitted request",
+                )
+            })?;
+        let LiveLegacy2024Dispatch {
+            result,
+            active_request,
+        } = dispatch;
+        let mut retained = self
+            .active_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if retained.is_some() {
+            return Err(Legacy2024HandlerError::new(
+                "legacy runtime attempted to overlap exact request finalization",
+            ));
+        }
+        *retained = Some(active_request);
+        drop(retained);
+        result.map_err(|error| {
+            Legacy2024HandlerError::with_code(
+                i64::from(i32::from(error.code)),
+                "legacy runtime handler rejected an admitted request",
+            )
+        })
+    }
+}
+
+/// Owns a server reference for an exact-2024 HTTP session. The session updates
+/// the request context before every adapter call, while the adapter retains the
+/// lifecycle and original wire identity across independent HTTP requests.
+struct HttpLegacy2024RuntimeHandler {
+    server: Arc<Server>,
+    session_id: u64,
+    session_principal: SessionPrincipalBinding,
+    active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
+    request_cx: Arc<Mutex<Cx>>,
+}
+
+impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
+    fn handle_legacy_2024(
+        &mut self,
+        method: &'static str,
+        params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, Legacy2024HandlerError> {
+        self.handle_legacy_2024_with_request_id(&serde_json::json!(0), method, params)
+    }
+
+    fn handle_legacy_2024_with_request_id(
+        &mut self,
+        request_id: &serde_json::Value,
+        method: &'static str,
+        params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, Legacy2024HandlerError> {
+        let request_id = serde_json::from_value::<RequestId>(request_id.clone()).map_err(|_| {
+            Legacy2024HandlerError::new("legacy adapter supplied an invalid request ID")
+        })?;
+        let request = JsonRpcRequest::new(method, params.cloned(), request_id);
+        let request_cx = self
+            .request_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let dispatch = self
+            .server
+            .dispatch_legacy_2024(
+                &request_cx,
+                self.session_id,
+                &self.session_principal,
+                &request,
+            )
             .map_err(|error| {
                 Legacy2024HandlerError::with_code(
                     i64::from(i32::from(error.code)),
@@ -376,8 +455,8 @@ fn runtime_legacy_binding(generation: u64) -> LegacyPeerBinding {
     )
 }
 
-fn legacy_adapter_response(
-    adapter: &mut Legacy2024ServerAdapter<LiveLegacy2024RuntimeHandler<'_>>,
+fn legacy_adapter_response<H: Legacy2024Handler>(
+    adapter: &mut Legacy2024ServerAdapter<H>,
     binding: LegacyPeerBinding,
     request: &JsonRpcRequest,
 ) -> Result<Option<JsonRpcResponse>, Legacy2024AdapterError> {
@@ -396,20 +475,38 @@ fn legacy_adapter_response(
     }
 }
 
-fn take_live_legacy_active_request<'a>(
-    active_request: &Arc<Mutex<Option<LiveLegacy2024ActiveRequest<'a>>>>,
-) -> Option<LiveLegacy2024ActiveRequest<'a>> {
+/// Applies an exact legacy client response to the adapter that allocated its
+/// reverse-request ID. A response cannot produce peer output, so any other
+/// adapter result is a protocol failure.
+fn legacy_adapter_accept_response<H: Legacy2024Handler>(
+    adapter: &mut Legacy2024ServerAdapter<H>,
+    binding: LegacyPeerBinding,
+    response: &JsonRpcResponse,
+) -> bool {
+    let wire = match serde_json::to_value(response) {
+        Ok(wire) => wire,
+        Err(_) => return false,
+    };
+    matches!(
+        adapter.receive(binding, wire),
+        Ok(Legacy2024Outbound::NoResponse)
+    )
+}
+
+fn take_live_legacy_active_request(
+    active_request: &Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
+) -> Option<LiveLegacy2024ActiveRequest> {
     active_request
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
 }
 
-fn legacy_handled_response<'a>(
+fn legacy_handled_response(
     response: JsonRpcResponse,
-    active_request: Option<LiveLegacy2024ActiveRequest<'a>>,
+    active_request: Option<LiveLegacy2024ActiveRequest>,
     cx: &Cx,
-) -> HandledRequest<'a> {
+) -> HandledRequest {
     match active_request {
         Some(LiveLegacy2024ActiveRequest {
             cancellation,
@@ -551,6 +648,15 @@ struct QueuedDispatchRequest {
     request: JsonRpcRequest,
     era: ProtocolEra,
     serialized_bytes: usize,
+}
+
+enum QueuedDispatchMessage {
+    Request(QueuedDispatchRequest),
+    /// Exact-2024 client responses are serialized through the same adapter
+    /// that allocated their reverse-request IDs. Generic bidirectional
+    /// responses never enter this variant: they are consumed directly by the
+    /// generic pending-request registry.
+    LegacyResponse(JsonRpcResponse),
 }
 
 impl DispatchQueueState {
@@ -1113,6 +1219,12 @@ pub struct HttpServerConfig {
     pub max_connections: usize,
     /// Inner HTTP handler configuration (endpoint path, CORS, and body size).
     pub handler_config: HttpHandlerConfig,
+    /// GET path for the exact MCP 2024-11-05 SSE stream.
+    pub legacy_sse_path: String,
+    /// POST path advertised to an exact MCP 2024-11-05 SSE client.
+    pub legacy_message_path: String,
+    /// Maximum exact-2024 requests buffered for one live HTTP session.
+    pub legacy_request_capacity: usize,
 }
 
 // Legacy snapshot dispatch support retained privately while the public shared
@@ -1152,6 +1264,9 @@ impl Default for HttpServerConfig {
                 base_path: "/mcp".to_string(),
                 ..HttpHandlerConfig::default()
             },
+            legacy_sse_path: "/sse".to_string(),
+            legacy_message_path: "/messages".to_string(),
+            legacy_request_capacity: 64,
         }
     }
 }
@@ -1190,6 +1305,664 @@ impl HttpServerConfig {
         self.handler_config = config;
         self
     }
+
+    /// Sets the exact MCP 2024-11-05 SSE stream path.
+    #[must_use]
+    pub fn legacy_sse_path(mut self, path: impl Into<String>) -> Self {
+        self.legacy_sse_path = path.into();
+        self
+    }
+
+    /// Sets the exact MCP 2024-11-05 POST path advertised through SSE.
+    #[must_use]
+    pub fn legacy_message_path(mut self, path: impl Into<String>) -> Self {
+        self.legacy_message_path = path.into();
+        self
+    }
+
+    /// Sets the per-session exact-2024 request queue capacity.
+    #[must_use]
+    pub fn legacy_request_capacity(mut self, capacity: usize) -> Self {
+        self.legacy_request_capacity = capacity;
+        self
+    }
+}
+
+/// A live server composition over the transport's bounded dual-era HTTP endpoint.
+///
+/// Modern requests are dispatched immediately through the server's stateless
+/// surface. Exact MCP 2024-11-05 requests retain the transport-issued session
+/// identifier, lifecycle adapter, and SSE response stream for this one session.
+pub struct ServerHttpEndpoint {
+    server: Arc<Server>,
+    endpoint: DualEraHttpEndpoint,
+}
+
+/// A server-owned session opened through [`ServerHttpEndpoint`].
+pub struct ServerHttpSession {
+    server: Arc<Server>,
+    endpoint_session: DualEraHttpSession,
+    legacy_session: Session,
+    legacy_binding: LegacyPeerBinding,
+    legacy_adapter: Option<Legacy2024ServerAdapter<HttpLegacy2024RuntimeHandler>>,
+    legacy_active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
+    legacy_request_cx: Arc<Mutex<Cx>>,
+}
+
+/// A response emitted by [`ServerHttpSession::handle`].
+pub enum ServerHttpEndpointResponse {
+    /// A complete response, including modern JSON and legacy POST acknowledgement.
+    Immediate(HttpResponse),
+    /// A finite modern request-scoped SSE response body.
+    ModernSse(DualEraHttpSseResponse),
+    /// A live exact MCP 2024-11-05 SSE stream.
+    LegacySse(DualEraHttpLegacySseResponse),
+}
+
+type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<Mutex<ServerHttpSession>>>>>;
+
+/// Retains every connection child admitted by one live HTTP listener.
+///
+/// `TaskHandle` drop intentionally detaches in asupersync. The listener must
+/// therefore retain every handle until it has observed normal completion or
+/// explicitly requested cancellation and joined the child during shutdown.
+#[derive(Default)]
+struct HttpConnectionChildren {
+    tasks: Vec<asupersync::runtime::TaskHandle<()>>,
+}
+
+impl HttpConnectionChildren {
+    fn reap_finished(&mut self) {
+        let mut active = Vec::with_capacity(self.tasks.len());
+        for mut task in std::mem::take(&mut self.tasks) {
+            match task.try_join() {
+                Ok(None) => active.push(task),
+                Ok(Some(())) | Err(_) => {}
+            }
+        }
+        self.tasks = active;
+    }
+
+    async fn cancel_and_join(&mut self, cx: &Cx) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        for mut task in std::mem::take(&mut self.tasks) {
+            // TaskHandle::join is uninterruptible, so caller cancellation
+            // cannot detach a connection child between abort and drain.
+            let _ = task.join(cx).await;
+        }
+    }
+}
+
+/// A bound, caller-owned HTTP server lifecycle.
+///
+/// The listener and every accepted connection stay in the caller's [`Cx`]
+/// region. Dropping the lifecycle closes its listener; cancelling that region
+/// cancels the accept loop and all of its connection children together.
+pub struct BoundHttpServer {
+    listener: AsyncTcpListener,
+    endpoint: Arc<ServerHttpEndpoint>,
+    legacy_sessions: LiveHttpSessionRegistry,
+}
+
+impl BoundHttpServer {
+    /// Returns the address selected by the operating system for this listener.
+    pub fn local_addr(&self) -> McpResult<SocketAddr> {
+        self.listener.local_addr().map_err(|error| {
+            McpError::internal_error(format!("HTTP listener address unavailable: {error}"))
+        })
+    }
+
+    /// Accepts real HTTP/1.1 loopback or network connections until the caller
+    /// cancels the owning context.
+    pub async fn serve(self, cx: &Cx) -> McpResult<()> {
+        let connection_scope = cx.scope();
+        let mut connection_children = HttpConnectionChildren::default();
+        let result = 'listener: loop {
+            connection_children.reap_finished();
+            if cx.checkpoint().is_err() {
+                break Ok(());
+            }
+            #[cfg(test)]
+            lib_unit_tests::record_live_http_listener_wait();
+            let (stream, _peer_addr) = match self.listener.accept().await {
+                Ok(connection) => connection,
+                Err(_error) if cx.checkpoint().is_err() => break Ok(()),
+                Err(error) => {
+                    break Err(McpError::internal_error(format!(
+                        "HTTP listener accept failed: {error}"
+                    )));
+                }
+            };
+            let endpoint = Arc::clone(&self.endpoint);
+            let legacy_sessions = Arc::clone(&self.legacy_sessions);
+            let connection = cx
+                .spawn_in(&connection_scope, move |connection_cx| async move {
+                    serve_http_connection(&connection_cx, stream, endpoint, legacy_sessions).await;
+                })
+                .map_err(|error| {
+                    McpError::internal_error(format!(
+                        "HTTP connection task admission failed: {error}"
+                    ))
+                });
+            match connection {
+                Ok(connection) => connection_children.tasks.push(connection),
+                Err(error) => break Err(error),
+            }
+        };
+        connection_children.cancel_and_join(cx).await;
+        result
+    }
+}
+
+impl Server {
+    /// Consumes this server into a live dual-era HTTP endpoint.
+    ///
+    /// `legacy_origin` is used only for the exact MCP 2024-11-05 SSE endpoint
+    /// event. Modern Streamable HTTP remains at the configured MCP path.
+    pub fn into_http_endpoint(
+        self,
+        legacy_origin: impl Into<String>,
+    ) -> Result<ServerHttpEndpoint, DualEraHttpEndpointError> {
+        let server = Arc::new(self);
+        let mut config = DualEraHttpEndpointConfig::new(
+            server.http_config.legacy_sse_path.clone(),
+            server.http_config.legacy_message_path.clone(),
+            legacy_origin,
+        );
+        config.legacy_request_capacity = server.http_config.legacy_request_capacity;
+        let endpoint = DualEraHttpEndpoint::new(
+            HttpRequestHandler::with_config(server.http_config.handler_config.clone()),
+            config,
+        )?;
+        Ok(ServerHttpEndpoint { server, endpoint })
+    }
+
+    /// Binds the dual-era HTTP listener on the caller-owned [`Cx`].
+    ///
+    /// This performs only listener setup. Call [`BoundHttpServer::serve`] to
+    /// accept connections, or use [`Self::serve_http`] for the turnkey
+    /// lifecycle. The exact legacy SSE endpoint advertises this listener's
+    /// resolved local address, including a kernel-selected port.
+    pub async fn bind_http(self, cx: &Cx, addr: impl Into<String>) -> McpResult<BoundHttpServer> {
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        let listener = AsyncTcpListener::bind(addr.into()).await.map_err(|error| {
+            McpError::internal_error(format!("HTTP listener bind failed: {error}"))
+        })?;
+        let local_addr = listener.local_addr().map_err(|error| {
+            McpError::internal_error(format!("HTTP listener address unavailable: {error}"))
+        })?;
+        let endpoint = self
+            .into_http_endpoint(format!("http://{local_addr}"))
+            .map_err(|error| {
+                McpError::internal_error(format!("HTTP endpoint setup failed: {error}"))
+            })?;
+        Ok(BoundHttpServer {
+            listener,
+            endpoint: Arc::new(endpoint),
+            legacy_sessions: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// Binds and accepts a turnkey dual-era HTTP server on the caller's
+    /// context. This method never creates or owns an async runtime.
+    pub async fn serve_http(self, cx: &Cx, addr: impl Into<String>) -> McpResult<()> {
+        self.bind_http(cx, addr).await?.serve(cx).await
+    }
+}
+
+impl ServerHttpEndpoint {
+    /// Opens one independently bounded live HTTP session.
+    pub fn open_session(&self, cx: &Cx) -> Result<ServerHttpSession, DualEraHttpEndpointError> {
+        let endpoint_session = self.endpoint.open_session()?;
+        let legacy_session =
+            Session::new(self.server.info.clone(), self.server.capabilities.clone());
+        let legacy_binding = runtime_legacy_binding(legacy_session.id());
+        Ok(ServerHttpSession {
+            server: Arc::clone(&self.server),
+            endpoint_session,
+            legacy_session,
+            legacy_binding,
+            legacy_adapter: None,
+            legacy_active_request: Arc::new(Mutex::new(None)),
+            legacy_request_cx: Arc::new(Mutex::new(cx.clone())),
+        })
+    }
+}
+
+impl ServerHttpSession {
+    /// Returns the exact opaque session value required by the legacy POST URI.
+    #[must_use]
+    pub fn legacy_session_id(&self) -> &str {
+        self.endpoint_session.session_id()
+    }
+
+    /// Routes and dispatches one modern or exact-2024 HTTP request.
+    pub fn handle(
+        &mut self,
+        cx: &Cx,
+        request: HttpRequest,
+    ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
+        if request.path == self.server.http_config.health_path && request.method == HttpMethod::Get
+        {
+            return Ok(ServerHttpEndpointResponse::Immediate(
+                HttpResponse::ok().with_json(&serde_json::json!({"status": "ok"})),
+            ));
+        }
+
+        let is_modern = request.path == self.server.http_config.handler_config.base_path;
+        let is_legacy = request.path == self.server.http_config.legacy_sse_path
+            || request.path == self.server.http_config.legacy_message_path;
+        if (is_modern && matches!(self.server.protocol_policy, ProtocolPolicy::LegacyOnly))
+            || (is_legacy && matches!(self.server.protocol_policy, ProtocolPolicy::ModernOnly))
+        {
+            return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
+                HttpStatus::BAD_REQUEST,
+            )));
+        }
+        let endpoint_response = self.endpoint_session.handle(cx, request)?;
+        if is_modern {
+            return self.handle_modern(cx, endpoint_response);
+        }
+        self.handle_legacy(cx, endpoint_response)
+    }
+
+    fn handle_modern(
+        &mut self,
+        cx: &Cx,
+        endpoint_response: DualEraHttpEndpointResponse,
+    ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
+        let mut request = self.endpoint_session.recv_modern_request(cx)?;
+        remove_modern_protocol_metadata(&mut request);
+        let inbound = InboundRequestContext::new(
+            cx.clone(),
+            request_id_to_u64(request.id.as_ref()),
+            InboundRequestTransport::Http,
+        );
+        let response = self.server.dispatch_with_protocol_policy(
+            self.server.protocol_policy,
+            &inbound,
+            &request,
+        );
+
+        match endpoint_response {
+            DualEraHttpEndpointResponse::ModernJson(pending) => {
+                if let Some(response) = response {
+                    self.endpoint_session
+                        .send_modern_json_response(cx, response)?;
+                    let response = pending
+                        .try_response()?
+                        .expect("a committed modern JSON response must be retrievable");
+                    Ok(ServerHttpEndpointResponse::Immediate(response))
+                } else {
+                    Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
+                        HttpStatus::ACCEPTED,
+                    )))
+                }
+            }
+            DualEraHttpEndpointResponse::ModernSse(sse) => {
+                if let Some(response) = response {
+                    self.endpoint_session.send_modern_sse_response(
+                        cx,
+                        &sse.cancellation(),
+                        response,
+                    )?;
+                }
+                Ok(ServerHttpEndpointResponse::ModernSse(sse))
+            }
+            DualEraHttpEndpointResponse::Immediate(response) => {
+                debug_assert!(request.id.is_none());
+                Ok(ServerHttpEndpointResponse::Immediate(response))
+            }
+            DualEraHttpEndpointResponse::LegacySse(_) => {
+                unreachable!("the modern route cannot create a legacy SSE response")
+            }
+        }
+    }
+
+    fn handle_legacy(
+        &mut self,
+        cx: &Cx,
+        endpoint_response: DualEraHttpEndpointResponse,
+    ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
+        let response = match endpoint_response {
+            DualEraHttpEndpointResponse::LegacySse(sse) => {
+                return Ok(ServerHttpEndpointResponse::LegacySse(sse));
+            }
+            DualEraHttpEndpointResponse::Immediate(response) => response,
+            DualEraHttpEndpointResponse::ModernJson(_)
+            | DualEraHttpEndpointResponse::ModernSse(_) => {
+                unreachable!("the legacy route cannot create a modern response")
+            }
+        };
+
+        let Some(request) = self.endpoint_session.take_legacy_request() else {
+            return Ok(ServerHttpEndpointResponse::Immediate(response));
+        };
+
+        *self
+            .legacy_request_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cx.clone();
+        let adapter = match self.legacy_adapter.as_mut() {
+            Some(adapter) => adapter,
+            None => {
+                let adapter = Legacy2024ServerAdapter::install(
+                    self.legacy_binding,
+                    self.server.legacy_2024_server_config(),
+                    HttpLegacy2024RuntimeHandler {
+                        server: Arc::clone(&self.server),
+                        session_id: self.legacy_binding.generation(),
+                        session_principal: self.legacy_session.principal_binding(),
+                        active_request: Arc::clone(&self.legacy_active_request),
+                        request_cx: Arc::clone(&self.legacy_request_cx),
+                    },
+                )
+                .map_err(|error| {
+                    DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::other(
+                        error.to_string(),
+                    )))
+                })?;
+                self.legacy_adapter.insert(adapter)
+            }
+        };
+        let legacy_response = legacy_adapter_response(adapter, self.legacy_binding, &request)
+            .map_err(|error| {
+                DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::other(
+                    error.to_string(),
+                )))
+            })?;
+        let active_request = take_live_legacy_active_request(&self.legacy_active_request);
+        if request.method == "notifications/cancelled" && request.id.is_none() {
+            if let Ok(params) = parse_params::<CancelledParams>(request.params.clone()) {
+                self.server
+                    .handle_cancelled_notification(self.legacy_binding.generation(), params);
+            }
+        }
+        let Some(legacy_response) = legacy_response else {
+            return Ok(ServerHttpEndpointResponse::Immediate(response));
+        };
+        let handled = legacy_handled_response(legacy_response, active_request, cx);
+        handled
+            .send_with(&mut self.legacy_session, |response| {
+                self.endpoint_session
+                    .publish_legacy_message(&JsonRpcMessage::Response(response.clone()))
+                    .map(|_| ())
+                    .map_err(|error| TransportError::Io(std::io::Error::other(error.to_string())))
+            })
+            .map_err(DualEraHttpEndpointError::from)?;
+        Ok(ServerHttpEndpointResponse::Immediate(response))
+    }
+
+    /// Closes this session and releases its exact legacy lifecycle state.
+    pub fn close(&mut self) {
+        if let Some(adapter) = self.legacy_adapter.as_mut() {
+            let _ = adapter.close(self.legacy_binding);
+        }
+        self.endpoint_session.close();
+    }
+}
+
+fn h1_request_to_transport(
+    request: &asupersync::http::h1::Request,
+) -> Result<HttpRequest, HttpResponse> {
+    let method = match &request.method {
+        Http1Method::Get => HttpMethod::Get,
+        Http1Method::Post => HttpMethod::Post,
+        Http1Method::Put => HttpMethod::Put,
+        Http1Method::Delete => HttpMethod::Delete,
+        Http1Method::Options => HttpMethod::Options,
+        Http1Method::Head => HttpMethod::Head,
+        Http1Method::Patch => HttpMethod::Patch,
+        Http1Method::Connect | Http1Method::Trace | Http1Method::Extension(_) => {
+            return Err(HttpResponse::new(HttpStatus::METHOD_NOT_ALLOWED));
+        }
+    };
+    let (path, query) = request
+        .uri
+        .split_once('?')
+        .map_or((request.uri.as_str(), ""), |(path, query)| (path, query));
+    if !path.starts_with('/')
+        || path
+            .bytes()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+    {
+        return Err(HttpResponse::bad_request());
+    }
+    let mut transport = HttpRequest::new(method, path).with_body(request.body.clone());
+    for (name, value) in &request.headers {
+        if name
+            .bytes()
+            .chain(value.bytes())
+            .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+            || transport.headers.contains_key(&name.to_ascii_lowercase())
+        {
+            return Err(HttpResponse::bad_request());
+        }
+        transport = transport.with_header(name, value);
+    }
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            let Some((name, value)) = pair.split_once('=') else {
+                return Err(HttpResponse::bad_request());
+            };
+            if name.is_empty()
+                || name
+                    .bytes()
+                    .chain(value.bytes())
+                    .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+                || transport.query.contains_key(name)
+            {
+                return Err(HttpResponse::bad_request());
+            }
+            transport = transport.with_query(name, value);
+        }
+    }
+    Ok(transport)
+}
+
+fn h1_response(response: HttpResponse) -> Http1Response {
+    let mut h1 = Http1Response::new(response.status.0, "", response.body);
+    for (name, value) in response.headers {
+        h1 = h1.with_header(name, value);
+    }
+    h1
+}
+
+async fn send_h1_response(
+    framed: &mut Framed<AsyncTcpStream, Http1Codec>,
+    response: HttpResponse,
+) -> Result<(), ()> {
+    framed.send(h1_response(response)).map_err(|_| ())?;
+    std::future::poll_fn(|task_cx| framed.poll_close(task_cx))
+        .await
+        .map_err(|_| ())
+}
+
+fn legacy_sse_response_head(response: &HttpResponse) -> Result<Vec<u8>, ()> {
+    let mut head = format!("HTTP/1.1 {} OK\r\n", response.status.0).into_bytes();
+    for (name, value) in &response.headers {
+        if name
+            .bytes()
+            .chain(value.bytes())
+            .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+        {
+            return Err(());
+        }
+        head.extend_from_slice(name.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(b"transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
+    Ok(head)
+}
+
+async fn send_legacy_sse_stream(
+    cx: &Cx,
+    stream: &mut AsyncTcpStream,
+    mut response: DualEraHttpLegacySseResponse,
+) -> Result<(), ()> {
+    stream
+        .write_all(&legacy_sse_response_head(response.response())?)
+        .await
+        .map_err(|_| ())?;
+    stream.flush().await.map_err(|_| ())?;
+    while let Ok(event) = response.recv_event(cx) {
+        let bytes = event.to_bytes().map_err(|_| ())?;
+        let prefix = format!("{:X}\r\n", bytes.len());
+        stream.write_all(prefix.as_bytes()).await.map_err(|_| ())?;
+        stream.write_all(&bytes).await.map_err(|_| ())?;
+        stream.write_all(b"\r\n").await.map_err(|_| ())?;
+        stream.flush().await.map_err(|_| ())?;
+    }
+    let _ = stream.write_all(b"0\r\n\r\n").await;
+    let _ = stream.flush().await;
+    Ok(())
+}
+
+fn http_endpoint_response_to_static(cx: &Cx, response: ServerHttpEndpointResponse) -> HttpResponse {
+    match response {
+        ServerHttpEndpointResponse::Immediate(response) => response,
+        ServerHttpEndpointResponse::ModernSse(sse) => {
+            let mut response = sse.response().clone();
+            match sse
+                .recv_event(cx)
+                .and_then(|event| event.to_bytes().map_err(DualEraHttpEndpointError::from))
+            {
+                Ok(body) => response = response.with_body(body),
+                Err(_) => response = HttpResponse::internal_error(),
+            }
+            response
+        }
+        ServerHttpEndpointResponse::LegacySse(_) => HttpResponse::internal_error(),
+    }
+}
+
+fn dispatch_http_request(
+    cx: &Cx,
+    endpoint: &ServerHttpEndpoint,
+    legacy_sessions: &LiveHttpSessionRegistry,
+    request: HttpRequest,
+) -> HttpResponse {
+    let is_legacy_message = request.method == HttpMethod::Post
+        && request.path == endpoint.server.http_config.legacy_message_path;
+    if is_legacy_message {
+        let Some(session_id) = request.query.get("session_id") else {
+            return HttpResponse::new(HttpStatus::NOT_FOUND);
+        };
+        let session = legacy_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned();
+        let Some(session) = session else {
+            return HttpResponse::new(HttpStatus::NOT_FOUND);
+        };
+        let response = session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .handle(cx, request)
+            .map_err(|_| HttpResponse::bad_request());
+        return response.map_or_else(
+            |response| response,
+            |response| http_endpoint_response_to_static(cx, response),
+        );
+    }
+
+    let mut session = match endpoint.open_session(cx) {
+        Ok(session) => session,
+        Err(_) => return HttpResponse::internal_error(),
+    };
+    session
+        .handle(cx, request)
+        .map(|response| http_endpoint_response_to_static(cx, response))
+        .unwrap_or_else(|_| HttpResponse::bad_request())
+}
+
+async fn serve_http_connection(
+    cx: &Cx,
+    stream: AsyncTcpStream,
+    endpoint: Arc<ServerHttpEndpoint>,
+    legacy_sessions: LiveHttpSessionRegistry,
+) {
+    let http_config = &endpoint.server.http_config.handler_config;
+    let mut framed = Framed::new(
+        stream,
+        Http1Codec::new().max_body_size(http_config.max_body_size),
+    );
+    #[cfg(test)]
+    lib_unit_tests::record_live_http_connection_read_wait();
+    let Some(request) = framed.next().await else {
+        return;
+    };
+    let request = match request {
+        Ok(request) => request,
+        Err(_) => {
+            let _ = send_h1_response(&mut framed, HttpResponse::bad_request()).await;
+            return;
+        }
+    };
+    if !framed.read_buffer().is_empty() {
+        let _ = send_h1_response(&mut framed, HttpResponse::bad_request()).await;
+        return;
+    }
+    let request = match h1_request_to_transport(&request) {
+        Ok(request) => request,
+        Err(response) => {
+            let _ = send_h1_response(&mut framed, response).await;
+            return;
+        }
+    };
+
+    let is_legacy_sse = request.method == HttpMethod::Get
+        && request.path == endpoint.server.http_config.legacy_sse_path;
+    if !is_legacy_sse {
+        let response = dispatch_http_request(cx, &endpoint, &legacy_sessions, request);
+        let _ = send_h1_response(&mut framed, response).await;
+        return;
+    }
+
+    let mut session = match endpoint.open_session(cx) {
+        Ok(session) => session,
+        Err(_) => {
+            let _ = send_h1_response(&mut framed, HttpResponse::internal_error()).await;
+            return;
+        }
+    };
+    let session_id = session.legacy_session_id().to_owned();
+    let response = match session.handle(cx, request) {
+        Ok(ServerHttpEndpointResponse::LegacySse(response)) => response,
+        Ok(response) => {
+            let _ =
+                send_h1_response(&mut framed, http_endpoint_response_to_static(cx, response)).await;
+            return;
+        }
+        Err(_) => {
+            let _ = send_h1_response(&mut framed, HttpResponse::bad_request()).await;
+            return;
+        }
+    };
+    let session = Arc::new(Mutex::new(session));
+    legacy_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(session_id.clone(), Arc::clone(&session));
+    let mut stream = framed.into_inner();
+    let _ = send_legacy_sse_stream(cx, &mut stream, response).await;
+    let removed = legacy_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&session_id);
+    if let Some(session) = removed {
+        session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close();
+    }
 }
 
 /// An MCP server instance.
@@ -1220,7 +1993,7 @@ pub struct Server {
     /// Registered middleware.
     middleware: Arc<Vec<Box<dyn crate::Middleware>>>,
     /// Active requests by connection/session identity and JSON-RPC request ID.
-    active_requests: Mutex<HashMap<ActiveRequestKey, ActiveRequest>>,
+    active_requests: Arc<Mutex<HashMap<ActiveRequestKey, ActiveRequest>>>,
     /// Test-only legacy task manager retained while the task subsystem is
     /// rebuilt. It is absent from production library builds.
     #[cfg(test)]
@@ -1229,7 +2002,7 @@ pub struct Server {
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy selected by [`ServerBuilder`].
     protocol_policy: ProtocolPolicy,
-    /// Reserved HTTP configuration; public `run_http*` paths currently reject.
+    /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
 }
 
@@ -1681,7 +2454,7 @@ impl Server {
         session_id: u64,
         session_principal: &SessionPrincipalBinding,
         request: &JsonRpcRequest,
-    ) -> McpResult<LiveLegacy2024Dispatch<'_>> {
+    ) -> McpResult<LiveLegacy2024Dispatch> {
         let request_id = request
             .id
             .clone()
@@ -1693,7 +2466,7 @@ impl Server {
         // concurrently received notifications/cancelled frame targets the
         // exact legacy wire ID rather than an internal synthetic ID.
         let active_guard = ActiveRequestGuard::try_new(
-            &self.active_requests,
+            Arc::clone(&self.active_requests),
             session_id,
             request_id,
             cx.clone(),
@@ -2347,55 +3120,41 @@ impl Server {
     }
 
     // =========================================================================
-    // HTTP Server — fail-closed until stateless Streamable HTTP qualification
+    // HTTP Server — caller-owned asupersync HTTP/1.1 lifecycle
     // =========================================================================
 
-    /// Rejects use of the not-yet-qualified turnkey HTTP transport.
+    /// Runs the turnkey dual-era HTTP server on a caller-owned [`Cx`].
     ///
-    /// The previous listener shared one mutable legacy [`Session`] across all
-    /// accepted clients. That violates both client isolation and the stateless
-    /// MCP 2026-07-28 HTTP model. Until stateless per-request ingress and an
-    /// independently owned request execution context land, this method logs a
-    /// fixed diagnostic and exits with status 1 without binding a socket.
-    pub fn run_http(self, addr: impl Into<String>) -> ! {
-        self.reject_unqualified_http(addr.into(), false);
-        unreachable!("non-returning HTTP rejection must terminate the process")
+    /// This is an async lifecycle rather than a runtime constructor: callers
+    /// drive it from their existing asupersync region and retain cancellation,
+    /// deadlines, and task ownership throughout socket acceptance.
+    pub async fn run_http(self, cx: &Cx, addr: impl Into<String>) -> McpResult<()> {
+        self.serve_http(cx, addr).await
     }
 
-    /// Rejects use of the turnkey HTTP transport with a provided [`Cx`].
-    pub fn run_http_with_cx(self, _cx: &Cx, addr: impl Into<String>) -> ! {
-        self.reject_unqualified_http(addr.into(), false);
-        unreachable!("non-returning HTTP rejection must terminate the process")
+    /// Named compatibility entry point for callers that already pass a
+    /// context. It is exactly [`Self::run_http`] and never creates a runtime.
+    pub async fn run_http_with_cx(self, cx: &Cx, addr: impl Into<String>) -> McpResult<()> {
+        self.serve_http(cx, addr).await
     }
 
-    /// Reports the not-yet-qualified HTTP transport and returns without binding.
-    ///
-    /// Unlike [`run_http`](Self::run_http), this does **not** terminate the
-    /// process. It remains useful for embedding code that needs a fail-closed
-    /// probe while the stateless HTTP implementation is under construction.
-    pub fn run_http_returning(self, addr: impl Into<String>) {
-        self.reject_unqualified_http(addr.into(), true);
+    /// Returning form of [`Self::run_http`] for embedders that select the
+    /// shutdown boundary themselves.
+    pub async fn run_http_returning(self, cx: &Cx, addr: impl Into<String>) -> McpResult<()> {
+        self.serve_http(cx, addr).await
     }
 
-    /// Fail-closed probe with a custom [`Cx`]; no socket is bound.
-    pub fn run_http_returning_with_cx(self, _cx: &Cx, addr: impl Into<String>) {
-        self.reject_unqualified_http(addr.into(), true);
+    /// Returning form with an explicit caller-owned context.
+    pub async fn run_http_returning_with_cx(
+        self,
+        cx: &Cx,
+        addr: impl Into<String>,
+    ) -> McpResult<()> {
+        self.serve_http(cx, addr).await
     }
 
     fn configured_http_request_handler(&self) -> HttpRequestHandler {
         HttpRequestHandler::with_config(self.http_config.handler_config.clone())
-    }
-
-    /// Fails closed until the stateless MCP 2026-07-28 HTTP path is qualified.
-    fn reject_unqualified_http(self, _addr: String, returning: bool) {
-        // Rejection must not initialize or replace the embedding process's
-        // logger. The fixed direct diagnostic cannot be hidden by a logger
-        // filter and contains no caller- or peer-controlled bytes.
-        let _ = std::io::stderr().write_all(UNQUALIFIED_HTTP_DIAGNOSTIC);
-        if returning {
-            return;
-        }
-        std::process::exit(1);
     }
 
     /// Unwired legacy HTTP accept loop retained for extraction into LEG-02.
@@ -2954,7 +3713,7 @@ impl Server {
         let worker_failed = Arc::new(AtomicBool::new(false));
         let pending_requests = server.new_pending_requests_for_connection();
         let (dispatch_sender, mut dispatch_receiver) =
-            asupersync_mpsc::channel::<QueuedDispatchRequest>(MAX_DISPATCH_QUEUE_DEPTH);
+            asupersync_mpsc::channel::<QueuedDispatchMessage>(MAX_DISPATCH_QUEUE_DEPTH);
 
         let worker_server = Arc::clone(&server);
         let worker_send = Arc::clone(&send);
@@ -2982,7 +3741,7 @@ impl Server {
                     clean_exit = true;
                     break;
                 }
-                let queued_request = match dispatch_receiver.try_recv() {
+                let queued_message = match dispatch_receiver.try_recv() {
                     Ok(request) => request,
                     Err(asupersync_mpsc::RecvError::Empty) => {
                         if worker_queue_state.is_stopping() {
@@ -3000,9 +3759,30 @@ impl Server {
                         break;
                     }
                 };
+                let queued_request = match queued_message {
+                    QueuedDispatchMessage::LegacyResponse(response) => {
+                        let Some(adapter) = legacy_adapter.as_mut() else {
+                            break;
+                        };
+                        if !legacy_adapter_accept_response(adapter, legacy_binding, &response) {
+                            break;
+                        }
+                        continue;
+                    }
+                    QueuedDispatchMessage::Request(request) => request,
+                };
                 worker_queue_state.release_queued_bytes(queued_request.serialized_bytes);
                 let era = queued_request.era;
                 let request = queued_request.request;
+
+                // The hand-off from the receive queue to the worker is the
+                // linearization point for cancellation. Mark it before any
+                // further branch so a later cancellation targets an active
+                // request rather than silently cancelling a dequeued one.
+                let cancelled_before_dispatch = request
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| worker_queue_state.begin_dispatch(id));
 
                 if worker_queue_state.is_stopping() {
                     if let Some(id) = request.id.as_ref() {
@@ -3010,6 +3790,34 @@ impl Server {
                     }
                     clean_exit = true;
                     break;
+                }
+
+                if cancelled_before_dispatch {
+                    if let Some(id) = request.id.as_ref() {
+                        let cancelled = JsonRpcResponse::error(
+                            Some(id.clone()),
+                            JsonRpcError {
+                                code: McpErrorCode::RequestCancelled.into(),
+                                message: "Request cancelled before dispatch".to_string(),
+                                data: None,
+                            },
+                        );
+                        let mut send_guard = worker_send
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let send_result =
+                            send_guard(&worker_cx, &JsonRpcMessage::Response(cancelled));
+                        drop(send_guard);
+                        worker_queue_state.discard(id);
+                        if let Err(send_error) = send_result {
+                            if send_error.is_cancelled() {
+                                worker_queue_state.stop();
+                                clean_exit = true;
+                            }
+                            break;
+                        }
+                    }
+                    continue;
                 }
 
                 let start_time = Instant::now();
@@ -3200,7 +4008,23 @@ impl Server {
                         exit_code = 1;
                         break;
                     }
-                    if !pending_requests.route_response(&response) {
+                    if pending_requests.route_response(&response) {
+                        debug!(target: targets::SERVER, "Routed response to pending request");
+                    } else if matches!(negotiated_era, Some(ProtocolEra::Legacy2024)) {
+                        match dispatch_sender
+                            .try_send(QueuedDispatchMessage::LegacyResponse(response))
+                        {
+                            Ok(()) => {}
+                            Err(
+                                asupersync_mpsc::SendError::Full(_)
+                                | asupersync_mpsc::SendError::Disconnected(_)
+                                | asupersync_mpsc::SendError::Cancelled(_),
+                            ) => {
+                                exit_code = 1;
+                                break;
+                            }
+                        }
+                    } else {
                         debug!(target: targets::SERVER, "Received unmatched JSON-RPC response");
                     }
                 }
@@ -3379,13 +4203,17 @@ impl Server {
                     let serialized_bytes = serialized_bytes
                         .expect("a dispatch byte reservation requires a measured request");
 
-                    match dispatch_sender.try_send(QueuedDispatchRequest {
-                        request,
-                        era,
-                        serialized_bytes,
-                    }) {
+                    match dispatch_sender.try_send(QueuedDispatchMessage::Request(
+                        QueuedDispatchRequest {
+                            request,
+                            era,
+                            serialized_bytes,
+                        },
+                    )) {
                         Ok(()) => {}
-                        Err(asupersync_mpsc::SendError::Full(request)) => {
+                        Err(asupersync_mpsc::SendError::Full(QueuedDispatchMessage::Request(
+                            request,
+                        ))) => {
                             queue_state.release_queued_bytes(request.serialized_bytes);
                             if let Some(id) = request.request.id {
                                 queue_state.discard(&id);
@@ -3411,8 +4239,12 @@ impl Server {
                             }
                         }
                         Err(
-                            asupersync_mpsc::SendError::Disconnected(request)
-                            | asupersync_mpsc::SendError::Cancelled(request),
+                            asupersync_mpsc::SendError::Disconnected(
+                                QueuedDispatchMessage::Request(request),
+                            )
+                            | asupersync_mpsc::SendError::Cancelled(QueuedDispatchMessage::Request(
+                                request,
+                            )),
                         ) => {
                             queue_state.release_queued_bytes(request.serialized_bytes);
                             if let Some(id) = request.request.id {
@@ -3421,6 +4253,17 @@ impl Server {
                             exit_code = 1;
                             break;
                         }
+                        Err(
+                            asupersync_mpsc::SendError::Full(
+                                QueuedDispatchMessage::LegacyResponse(_),
+                            )
+                            | asupersync_mpsc::SendError::Disconnected(
+                                QueuedDispatchMessage::LegacyResponse(_),
+                            )
+                            | asupersync_mpsc::SendError::Cancelled(
+                                QueuedDispatchMessage::LegacyResponse(_),
+                            ),
+                        ) => unreachable!("only a request is sent on this queue path"),
                     }
                 }
             }
@@ -3737,9 +4580,19 @@ impl Server {
                     if response.validate().is_err() {
                         self.graceful_shutdown(1);
                     }
-                    // Route response to pending server-initiated request (bidirectional)
+                    // Generic server-initiated requests retain their existing
+                    // pending-request ownership. Only an unmatched response
+                    // on an exact-2024 connection belongs to the legacy
+                    // adapter's reverse-request lifecycle.
                     if pending_requests.route_response(&response) {
                         debug!(target: targets::SERVER, "Routed response to pending request");
+                    } else if matches!(negotiated_era, Some(ProtocolEra::Legacy2024)) {
+                        let Some(adapter) = legacy_adapter.as_mut() else {
+                            self.graceful_shutdown(1);
+                        };
+                        if !legacy_adapter_accept_response(adapter, legacy_binding, &response) {
+                            self.graceful_shutdown(1);
+                        }
                     } else {
                         let request_key = response.id.as_ref().map(request_id_log_key);
                         debug!(
@@ -4099,9 +4952,28 @@ impl Server {
                             "Received invalid JSON-RPC response",
                         ));
                     }
-                    // Route response to pending server-initiated request (bidirectional)
+                    // Preserve generic pending responses first; otherwise an
+                    // exact-2024 response completes the adapter-owned reverse
+                    // request for this one selected legacy connection.
                     if pending_requests.route_response(&response) {
                         debug!(target: targets::SERVER, "Routed response to pending request");
+                    } else if matches!(negotiated_era, Some(ProtocolEra::Legacy2024)) {
+                        let Some(adapter) = legacy_adapter.as_mut() else {
+                            self.graceful_shutdown_returning();
+                            return Err(server_run_error(
+                                "protocol",
+                                "legacy_adapter",
+                                "Legacy MCP 2024-11-05 adapter is unavailable for a client response",
+                            ));
+                        };
+                        if !legacy_adapter_accept_response(adapter, legacy_binding, &response) {
+                            self.graceful_shutdown_returning();
+                            return Err(server_run_error(
+                                "protocol",
+                                "legacy_adapter",
+                                "Legacy MCP 2024-11-05 adapter rejected a client response",
+                            ));
+                        }
                     } else {
                         let request_key = response.id.as_ref().map(request_id_log_key);
                         debug!(
@@ -4209,15 +5081,15 @@ impl Server {
         .map(|handled| handled.finalize_for_return(session))
     }
 
-    fn handle_request_from_dispatch_queue<'a>(
-        &'a self,
+    fn handle_request_from_dispatch_queue(
+        &self,
         cx: &Cx,
         session: &mut Session,
         request: JsonRpcRequest,
         notification_sender: &NotificationSender,
         request_sender: &bidirectional::RequestSender,
         queue_state: &DispatchQueueState,
-    ) -> Option<HandledRequest<'a>> {
+    ) -> Option<HandledRequest> {
         self.handle_request_internal(
             cx,
             session,
@@ -4229,8 +5101,8 @@ impl Server {
         )
     }
 
-    fn handle_request_internal<'a>(
-        &'a self,
+    fn handle_request_internal(
+        &self,
         cx: &Cx,
         session: &mut Session,
         request: JsonRpcRequest,
@@ -4238,7 +5110,7 @@ impl Server {
         request_sender: &bidirectional::RequestSender,
         dispatch_queue: Option<&DispatchQueueState>,
         transport_authorization: Option<&str>,
-    ) -> Option<HandledRequest<'a>> {
+    ) -> Option<HandledRequest> {
         let id = request.id.clone();
         let method = request.method.clone();
         let is_notification = id.is_none();
@@ -4321,7 +5193,7 @@ impl Server {
         let active_guard = match id.clone() {
             Some(request_id) => {
                 match ActiveRequestGuard::try_new(
-                    &self.active_requests,
+                    Arc::clone(&self.active_requests),
                     session.id(),
                     request_id.clone(),
                     request_cx.clone(),
@@ -4511,7 +5383,7 @@ impl Server {
         let active_guard = match id.clone() {
             Some(request_id) => {
                 match ActiveRequestGuard::try_new(
-                    &self.active_requests,
+                    Arc::clone(&self.active_requests),
                     session.id,
                     request_id.clone(),
                     request_cx.clone(),
@@ -6031,16 +6903,16 @@ impl ActiveRequest {
     }
 }
 
-struct ActiveRequestGuard<'a> {
-    map: &'a Mutex<HashMap<ActiveRequestKey, ActiveRequest>>,
+struct ActiveRequestGuard {
+    map: Arc<Mutex<HashMap<ActiveRequestKey, ActiveRequest>>>,
     key: ActiveRequestKey,
     cancellation: McpRequestCancellation,
     completion: Arc<RequestCompletion>,
 }
 
-impl<'a> ActiveRequestGuard<'a> {
+impl ActiveRequestGuard {
     fn try_new(
-        map: &'a Mutex<HashMap<ActiveRequestKey, ActiveRequest>>,
+        map: Arc<Mutex<HashMap<ActiveRequestKey, ActiveRequest>>>,
         session_id: u64,
         id: RequestId,
         cx: Cx,
@@ -6074,7 +6946,7 @@ impl<'a> ActiveRequestGuard<'a> {
     }
 }
 
-impl Drop for ActiveRequestGuard<'_> {
+impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
         {
             let mut guard = self
@@ -6115,10 +6987,10 @@ impl Drop for ActiveRequestGuard<'_> {
 /// but synchronous `Write`/`flush` remain fallible and cannot provide an atomic
 /// wire-commit primitive. A failed attempt therefore still rolls back reversible
 /// session mutations and is never counted as a sent response.
-struct HandledRequest<'a> {
+struct HandledRequest {
     response: JsonRpcResponse,
     cancellation: Option<McpRequestCancellation>,
-    _active_guard: Option<ActiveRequestGuard<'a>>,
+    _active_guard: Option<ActiveRequestGuard>,
     session_mutation_rollback: Option<SessionMutationRollback>,
     deferred_stats: Option<DeferredRequestStats>,
     commit_liveness: Option<CommitLiveness>,
@@ -6174,7 +7046,7 @@ impl DeferredRequestStats {
     }
 }
 
-impl<'a> HandledRequest<'a> {
+impl HandledRequest {
     fn untracked(response: JsonRpcResponse) -> Self {
         Self {
             response,
@@ -6189,7 +7061,7 @@ impl<'a> HandledRequest<'a> {
     fn tracked(
         response: JsonRpcResponse,
         cancellation: McpRequestCancellation,
-        active_guard: Option<ActiveRequestGuard<'a>>,
+        active_guard: Option<ActiveRequestGuard>,
         session_mutation_rollback: Option<SessionMutationRollback>,
         commit_cx: Cx,
         commit_budget: Budget,
@@ -6517,11 +7389,16 @@ fn create_notification_sender(fatal_output: Arc<AtomicBool>) -> NotificationSend
 #[cfg(test)]
 mod lib_unit_tests {
     use super::*;
+    use asupersync::io::AsyncReadExt;
+    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::runtime::reactor::create_reactor;
     use fastmcp_derive::tool;
     use fastmcp_protocol::{
         CallToolResult, CompletionValues, Content, FinalCompletionParams, LegacyCompletionParams,
     };
+    use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
     use std::sync::{Condvar, OnceLock};
     use std::thread;
     use std::time::Duration;
@@ -6535,6 +7412,8 @@ mod lib_unit_tests {
     static HTTP_OVERLAP_METRICS: OnceLock<HttpOverlapMetrics> = OnceLock::new();
     static HTTP_OVERLAP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     static HTTP_OVERLAP_CONTROL: OnceLock<HttpOverlapControl> = OnceLock::new();
+    static LIVE_HTTP_LISTENER_WAITS: AtomicUsize = AtomicUsize::new(0);
+    static LIVE_HTTP_CONNECTION_READ_WAITS: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug, Default)]
     struct HttpOverlapControlState {
@@ -6706,6 +7585,141 @@ mod lib_unit_tests {
 
     pub(super) fn record_http_session_lock_contention(session: usize) {
         http_overlap_control().record_lock_contention(session);
+    }
+
+    pub(super) fn record_live_http_listener_wait() {
+        LIVE_HTTP_LISTENER_WAITS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn record_live_http_connection_read_wait() {
+        LIVE_HTTP_CONNECTION_READ_WAITS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn live_http_listener_wait_count() -> usize {
+        LIVE_HTTP_LISTENER_WAITS.load(Ordering::Acquire)
+    }
+
+    fn live_http_connection_read_wait_count() -> usize {
+        LIVE_HTTP_CONNECTION_READ_WAITS.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_live_http_probe(cx: &Cx, before: usize, probe: fn() -> usize) {
+        while probe() <= before {
+            cx.checkpoint()
+                .expect("test caller context must remain live while awaiting HTTP probe");
+            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+        }
+    }
+
+    async fn wait_for_live_http_test_result<T>(receiver: Receiver<T>) -> T {
+        loop {
+            match receiver.try_recv() {
+                Ok(result) => return result,
+                Err(TryRecvError::Disconnected) => {
+                    panic!("live HTTP test task exited without reporting its result");
+                }
+                Err(TryRecvError::Empty) => {
+                    let cx = Cx::current()
+                        .expect("the test runtime must install an ambient Cx while polling");
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+            }
+        }
+    }
+
+    fn run_live_http_test<F, Fut>(operation: F)
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("live HTTP test reactor must initialize"))
+            .build()
+            .expect("live HTTP test runtime must initialize");
+        let (sender, receiver) = sync_channel(1);
+        runtime
+            .handle()
+            .try_spawn_with_cx(move |cx| async move {
+                let _ = sender.send(operation(cx).await);
+            })
+            .expect("live HTTP test task must be admitted");
+
+        let result = runtime.block_on(wait_for_live_http_test_result(receiver));
+        result.unwrap();
+    }
+
+    async fn live_http_exchange(address: SocketAddr, request: Vec<u8>) -> Result<Vec<u8>, String> {
+        let mut stream = AsyncTcpStream::connect(address)
+            .await
+            .map_err(|error| format!("live HTTP client connect failed: {error}"))?;
+        stream
+            .write_all(&request)
+            .await
+            .map_err(|error| format!("live HTTP client write failed: {error}"))?;
+        stream
+            .flush()
+            .await
+            .map_err(|error| format!("live HTTP client flush failed: {error}"))?;
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .map_err(|error| format!("live HTTP client read failed: {error}"))?;
+        Ok(response)
+    }
+
+    fn live_http_post(
+        path_and_query: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let mut request = format!(
+            "POST {path_and_query} HTTP/1.1\r\nHost: loopback\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in extra_headers {
+            request.push_str(name);
+            request.push_str(": ");
+            request.push_str(value);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        let mut request = request.into_bytes();
+        request.extend_from_slice(body);
+        request
+    }
+
+    fn live_http_response_body(response: &[u8]) -> Result<&[u8], String> {
+        response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|offset| &response[offset + 4..])
+            .ok_or_else(|| "live HTTP response omitted its header terminator".to_string())
+    }
+
+    async fn read_live_http_until(
+        stream: &mut AsyncTcpStream,
+        received: &mut Vec<u8>,
+        needle: &[u8],
+    ) -> Result<(), String> {
+        while !received
+            .windows(needle.len())
+            .any(|window| window == needle)
+        {
+            if received.len() > 64 * 1024 {
+                return Err("live HTTP SSE response exceeded the test bound".to_string());
+            }
+            let mut chunk = [0_u8; 2048];
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|error| format!("live HTTP SSE read failed: {error}"))?;
+            if read == 0 {
+                return Err("live HTTP SSE connection closed before expected event".to_string());
+            }
+            received.extend_from_slice(&chunk[..read]);
+        }
+        Ok(())
     }
 
     fn reset_http_overlap_metrics() {
@@ -8125,12 +9139,12 @@ mod lib_unit_tests {
 
     #[test]
     fn active_request_guard_removes_on_drop() {
-        let map = Mutex::new(HashMap::new());
+        let map = Arc::new(Mutex::new(HashMap::new()));
         let cx = Cx::for_testing();
         let id = RequestId::Number(1);
         {
-            let _guard =
-                ActiveRequestGuard::try_new(&map, 11, id.clone(), cx).expect("insert guard");
+            let _guard = ActiveRequestGuard::try_new(Arc::clone(&map), 11, id.clone(), cx)
+                .expect("insert guard");
             assert_eq!(map.lock().unwrap().len(), 1);
         }
         // After drop, the entry should be removed
@@ -8139,11 +9153,20 @@ mod lib_unit_tests {
 
     #[test]
     fn active_request_guard_rejects_duplicate_request_id() {
-        let map = Mutex::new(HashMap::new());
-        let first = ActiveRequestGuard::try_new(&map, 11, RequestId::Number(7), Cx::for_testing())
-            .expect("first request should register");
-        let duplicate =
-            ActiveRequestGuard::try_new(&map, 11, RequestId::Number(7), Cx::for_testing());
+        let map = Arc::new(Mutex::new(HashMap::new()));
+        let first = ActiveRequestGuard::try_new(
+            Arc::clone(&map),
+            11,
+            RequestId::Number(7),
+            Cx::for_testing(),
+        )
+        .expect("first request should register");
+        let duplicate = ActiveRequestGuard::try_new(
+            Arc::clone(&map),
+            11,
+            RequestId::Number(7),
+            Cx::for_testing(),
+        );
         assert!(
             duplicate.is_err(),
             "duplicate active request id must be rejected"
@@ -8154,11 +9177,21 @@ mod lib_unit_tests {
 
     #[test]
     fn active_request_guard_allows_same_request_id_in_distinct_sessions() {
-        let map = Mutex::new(HashMap::new());
-        let first = ActiveRequestGuard::try_new(&map, 11, RequestId::Number(7), Cx::for_testing())
-            .expect("first session should register");
-        let second = ActiveRequestGuard::try_new(&map, 12, RequestId::Number(7), Cx::for_testing())
-            .expect("second session may reuse the same wire request id");
+        let map = Arc::new(Mutex::new(HashMap::new()));
+        let first = ActiveRequestGuard::try_new(
+            Arc::clone(&map),
+            11,
+            RequestId::Number(7),
+            Cx::for_testing(),
+        )
+        .expect("first session should register");
+        let second = ActiveRequestGuard::try_new(
+            Arc::clone(&map),
+            12,
+            RequestId::Number(7),
+            Cx::for_testing(),
+        )
+        .expect("second session may reuse the same wire request id");
         assert_eq!(map.lock().unwrap().len(), 2);
         drop((first, second));
         assert!(map.lock().unwrap().is_empty());
@@ -8171,14 +9204,14 @@ mod lib_unit_tests {
         let second_cx = Cx::for_testing();
         let request_id = RequestId::Number(7);
         let first = ActiveRequestGuard::try_new(
-            &server.active_requests,
+            Arc::clone(&server.active_requests),
             11,
             request_id.clone(),
             first_cx.clone(),
         )
         .expect("first session should register");
         let second = ActiveRequestGuard::try_new(
-            &server.active_requests,
+            Arc::clone(&server.active_requests),
             12,
             request_id.clone(),
             second_cx.clone(),
@@ -8208,7 +9241,7 @@ mod lib_unit_tests {
         let server = Server::new("nonblocking-await-cleanup-test", "1.0.0").build();
         let request_id = RequestId::Number(41);
         let guard = ActiveRequestGuard::try_new(
-            &server.active_requests,
+            Arc::clone(&server.active_requests),
             11,
             request_id.clone(),
             Cx::for_testing(),
@@ -8239,7 +9272,7 @@ mod lib_unit_tests {
         let server = Server::new("duplicate-cancellation-state-test", "1.0.0").build();
         let request_id = RequestId::Number(42);
         let guard = ActiveRequestGuard::try_new(
-            &server.active_requests,
+            Arc::clone(&server.active_requests),
             11,
             request_id.clone(),
             Cx::for_testing(),
@@ -8485,7 +9518,7 @@ mod lib_unit_tests {
         let request_id = RequestId::String("commit-race".to_string());
         let request_cx = Cx::for_testing();
         let guard = ActiveRequestGuard::try_new(
-            &server.active_requests,
+            Arc::clone(&server.active_requests),
             session.id(),
             request_id.clone(),
             request_cx.clone(),
@@ -9665,6 +10698,586 @@ mod lib_unit_tests {
                 .as_ref()
                 .is_some_and(|result| result.get("resultType").is_none())
         );
+    }
+
+    #[test]
+    fn builder_http_endpoint_dispatches_a_modern_request_end_to_end() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("modern-http-endpoint", "1.0.0")
+            .build_http_endpoint("http://legacy.test")
+            .expect("builder must construct the configured dual-era endpoint");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("endpoint must open a bounded live session");
+        let request = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(serde_json::json!({
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                },
+            })),
+            201_i64,
+        );
+
+        let response = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_header("accept", "application/json")
+                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                    .with_header("mcp-method", SERVER_DISCOVER_METHOD)
+                    .with_body(
+                        serde_json::to_vec(&request)
+                            .expect("modern discovery request must serialize"),
+                    ),
+            )
+            .expect("modern request must be admitted and dispatched");
+        let ServerHttpEndpointResponse::Immediate(response) = response else {
+            panic!("modern JSON negotiation must produce an immediate HTTP response");
+        };
+        assert_eq!(response.status, HttpStatus::OK);
+        let response: JsonRpcResponse =
+            serde_json::from_slice(&response.body).expect("modern response must be JSON-RPC");
+        assert_eq!(response.id, Some(201_i64.into()));
+        assert!(response.error.is_none());
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result["serverInfo"]["name"].as_str()),
+            Some("modern-http-endpoint")
+        );
+    }
+
+    #[test]
+    fn live_http_loopback_dispatches_modern_json_over_a_real_socket() {
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("live-modern-http", "1.0.0")
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("live modern HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("live modern HTTP address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let request = JsonRpcRequest::new(
+                SERVER_DISCOVER_METHOD,
+                Some(serde_json::json!({
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    },
+                })),
+                801_i64,
+            );
+            let body = serde_json::to_vec(&request)
+                .map_err(|error| format!("modern wire request did not serialize: {error}"))?;
+            let request = live_http_post(
+                "/mcp",
+                &body,
+                &[
+                    ("Accept", "application/json"),
+                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                    ("Mcp-Method", SERVER_DISCOVER_METHOD),
+                ],
+            );
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let response = live_http_exchange(address, request).await;
+                    caller_cx.cancel_with(CancelKind::User, Some("modern loopback complete"));
+                    response
+                })
+                .map_err(|error| format!("modern loopback client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let response = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("modern loopback client failed: {error:?}"))??;
+            serve.map_err(|error| format!("modern loopback server failed: {error}"))?;
+
+            let response = std::str::from_utf8(&response)
+                .map_err(|error| format!("modern loopback response was not UTF-8: {error}"))?;
+            if !response.starts_with("HTTP/1.1 200") {
+                return Err(format!(
+                    "modern loopback response status was unexpected: {response}"
+                ));
+            }
+            let response: JsonRpcResponse = serde_json::from_slice(live_http_response_body(
+                response.as_bytes(),
+            )?)
+            .map_err(|error| format!("modern loopback JSON-RPC response was invalid: {error}"))?;
+            if response.id != Some(801_i64.into()) || response.error.is_some() {
+                return Err(format!(
+                    "modern loopback request was not dispatched: {response:?}"
+                ));
+            }
+            if response
+                .result
+                .as_ref()
+                .and_then(|result| result["serverInfo"]["name"].as_str())
+                != Some("live-modern-http")
+            {
+                return Err(format!(
+                    "modern loopback discovery result was unexpected: {response:?}"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_loopback_preserves_exact_legacy_sse_and_post_lifecycle() {
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("live-legacy-http", "1.0.0")
+                .tool(LiveRuntimeListedTool)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("live legacy HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("live legacy HTTP address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let mut stream = AsyncTcpStream::connect(address)
+                        .await
+                        .map_err(|error| format!("legacy SSE connect failed: {error}"))?;
+                    stream
+                        .write_all(
+                            b"GET /sse HTTP/1.1\r\nHost: loopback\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                        )
+                        .await
+                        .map_err(|error| format!("legacy SSE request write failed: {error}"))?;
+                    stream
+                        .flush()
+                        .await
+                        .map_err(|error| format!("legacy SSE request flush failed: {error}"))?;
+
+                    let mut received = Vec::new();
+                    let endpoint_prefix = format!(
+                        "data: http://{address}/messages?session_id="
+                    );
+                    read_live_http_until(&mut stream, &mut received, endpoint_prefix.as_bytes())
+                        .await?;
+                    let received_text = std::str::from_utf8(&received)
+                        .map_err(|error| format!("legacy SSE endpoint was not UTF-8: {error}"))?;
+                    let session_id = received_text
+                        .split_once(&endpoint_prefix)
+                        .and_then(|(_, remainder)| remainder.split_whitespace().next())
+                        .ok_or_else(|| "legacy SSE endpoint omitted its session identifier".to_string())?
+                        .to_owned();
+
+                    let initialize = JsonRpcRequest::new(
+                        "initialize",
+                        Some(serde_json::json!({
+                            "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "clientInfo": {"name": "loopback-legacy-client", "version": "1.0.0"},
+                        })),
+                        811_i64,
+                    );
+                    let initialized = JsonRpcRequest::notification("notifications/initialized", None);
+                    let call = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_runtime_listed_tool",
+                            "arguments": {},
+                        })),
+                        812_i64,
+                    );
+                    for message in [initialize, initialized] {
+                        let body = serde_json::to_vec(&message).map_err(|error| {
+                            format!("legacy loopback request did not serialize: {error}")
+                        })?;
+                        let response = live_http_exchange(
+                            address,
+                            live_http_post(
+                                &format!("/messages?session_id={session_id}"),
+                                &body,
+                                &[],
+                            ),
+                        )
+                        .await?;
+                        let response = std::str::from_utf8(&response).map_err(|error| {
+                            format!("legacy POST response was not UTF-8: {error}")
+                        })?;
+                        if !response.starts_with("HTTP/1.1 202") {
+                            return Err(format!("legacy POST was not accepted: {response}"));
+                        }
+                    }
+
+                    let call_body = serde_json::to_vec(&call).map_err(|error| {
+                        format!("legacy loopback tool request did not serialize: {error}")
+                    })?;
+                    let wrong_session = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/messages?session_id=wrong-session",
+                            &call_body,
+                            &[],
+                        ),
+                    )
+                    .await?;
+                    let wrong_session = std::str::from_utf8(&wrong_session).map_err(|error| {
+                        format!("wrong-session legacy response was not UTF-8: {error}")
+                    })?;
+                    if !wrong_session.starts_with("HTTP/1.1 404") {
+                        return Err(format!(
+                            "changing only the legacy session ID was not rejected: {wrong_session}"
+                        ));
+                    }
+
+                    let accepted = live_http_exchange(
+                        address,
+                        live_http_post(
+                            &format!("/messages?session_id={session_id}"),
+                            &call_body,
+                            &[],
+                        ),
+                    )
+                    .await?;
+                    let accepted = std::str::from_utf8(&accepted).map_err(|error| {
+                        format!("correct-session legacy response was not UTF-8: {error}")
+                    })?;
+                    if !accepted.starts_with("HTTP/1.1 202") {
+                        return Err(format!(
+                            "the unchanged exact legacy session did not accept the valid request: {accepted}"
+                        ));
+                    }
+
+                    read_live_http_until(&mut stream, &mut received, br#""id":812"#).await?;
+                    let received = std::str::from_utf8(&received)
+                        .map_err(|error| format!("legacy SSE response was not UTF-8: {error}"))?;
+                    if !received.contains(LEGACY_PROTOCOL_VERSION)
+                        || !received.contains("live runtime legacy adapter request 812")
+                        || received.contains("\"resultType\"")
+                    {
+                        return Err(format!("legacy SSE lifecycle was not exact: {received}"));
+                    }
+                    caller_cx.cancel_with(CancelKind::User, Some("legacy loopback complete"));
+                    Ok(())
+                })
+                .map_err(|error| format!("legacy loopback client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let client = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("legacy loopback client failed: {error:?}"))?;
+            serve.map_err(|error| format!("legacy loopback server failed: {error}"))?;
+            client
+        });
+    }
+
+    #[test]
+    fn live_http_cancellation_wakes_idle_listener_and_connection_read() {
+        run_live_http_test(|cx| async move {
+            let listener_wait_before = live_http_listener_wait_count();
+            let listener = Server::new("idle-listener-http", "1.0.0")
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("idle listener bind failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut canceller = cx
+                .spawn(move |canceller_cx| async move {
+                    wait_for_live_http_probe(
+                        &canceller_cx,
+                        listener_wait_before,
+                        live_http_listener_wait_count,
+                    )
+                    .await;
+                    caller_cx.cancel_with(CancelKind::User, Some("idle listener cancellation"));
+                })
+                .map_err(|error| format!("idle listener canceller admission failed: {error}"))?;
+            listener
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("idle listener serve failed: {error}"))?;
+            canceller
+                .join(&cx)
+                .await
+                .map_err(|error| format!("idle listener canceller failed: {error:?}"))?;
+            Ok(())
+        });
+
+        run_live_http_test(|cx| async move {
+            let read_wait_before = live_http_connection_read_wait_count();
+            let listener = Server::new("idle-connection-http", "1.0.0")
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("idle connection bind failed: {error}"))?;
+            let address = listener
+                .local_addr()
+                .map_err(|error| format!("idle connection address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |client_cx| async move {
+                    let mut stream = AsyncTcpStream::connect(address)
+                        .await
+                        .map_err(|error| format!("idle client connect failed: {error}"))?;
+                    stream
+                        .write_all(b"POST /mcp HTTP/1.1\r\nHost: loopback\r\n")
+                        .await
+                        .map_err(|error| format!("idle client partial write failed: {error}"))?;
+                    stream
+                        .flush()
+                        .await
+                        .map_err(|error| format!("idle client partial flush failed: {error}"))?;
+                    wait_for_live_http_probe(
+                        &client_cx,
+                        read_wait_before,
+                        live_http_connection_read_wait_count,
+                    )
+                    .await;
+                    caller_cx.cancel_with(CancelKind::User, Some("idle connection cancellation"));
+
+                    let mut byte = [0_u8; 1];
+                    match stream.read(&mut byte).await {
+                        Ok(0) | Err(_) => Ok(()),
+                        Ok(read) => Err(format!(
+                            "idle connection remained live after server cancellation ({read} byte response)"
+                        )),
+                    }
+                })
+                .map_err(|error| format!("idle connection client admission failed: {error}"))?;
+            listener
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("idle connection serve failed: {error}"))?;
+            client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("idle connection client failed: {error:?}"))??;
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn builder_http_endpoint_dispatches_exact_legacy_lifecycle_end_to_end() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("legacy-http-endpoint", "1.0.0")
+            .tool(LiveRuntimeListedTool)
+            .build_http_endpoint("http://legacy.test")
+            .expect("builder must construct the configured dual-era endpoint");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("endpoint must open a bounded live session");
+        let stream = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .expect("legacy SSE route must open");
+        let ServerHttpEndpointResponse::LegacySse(mut stream) = stream else {
+            panic!("legacy GET must open an exact SSE stream");
+        };
+        assert_eq!(
+            stream
+                .recv_event(&cx)
+                .expect("legacy stream must advertise its exact POST endpoint")
+                .data,
+            format!(
+                "http://legacy.test/messages?session_id={}",
+                session.legacy_session_id()
+            )
+        );
+
+        let post = |message: JsonRpcRequest| {
+            HttpRequest::new(HttpMethod::Post, "/messages")
+                .with_header("content-type", "application/json")
+                .with_query("session_id", session.legacy_session_id())
+                .with_body(serde_json::to_vec(&message).expect("legacy request must serialize"))
+        };
+        let initialize = JsonRpcRequest::new(
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "legacy-http-client", "version": "1.0.0"},
+            })),
+            211_i64,
+        );
+        let initialized = JsonRpcRequest::notification("notifications/initialized", None);
+        let call = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "live_runtime_listed_tool",
+                "arguments": {},
+            })),
+            212_i64,
+        );
+
+        for request in [initialize, initialized, call] {
+            let response = session
+                .handle(&cx, post(request))
+                .expect("advertised legacy POST must be dispatched");
+            let ServerHttpEndpointResponse::Immediate(response) = response else {
+                panic!("legacy POST acknowledgement must be immediate");
+            };
+            assert_eq!(response.status, HttpStatus::ACCEPTED);
+        }
+
+        let codec = Codec::new();
+        let initialize = stream
+            .recv_event(&cx)
+            .expect("legacy initialize response must stream over the open SSE session");
+        assert!(matches!(
+            codec
+                .decode_complete_message(initialize.data.as_bytes())
+                .expect("initialize event must remain JSON-RPC"),
+            JsonRpcMessage::Response(response)
+                if response.id == Some(211_i64.into())
+                    && response
+                        .result
+                        .as_ref()
+                        .and_then(|result| result["protocolVersion"].as_str())
+                        == Some(LEGACY_PROTOCOL_VERSION)
+        ));
+        let call = stream
+            .recv_event(&cx)
+            .expect("legacy tool response must stream over the exact SSE session");
+        assert!(matches!(
+            codec
+                .decode_complete_message(call.data.as_bytes())
+                .expect("tool event must remain JSON-RPC"),
+            JsonRpcMessage::Response(response)
+                if response.id == Some(212_i64.into())
+                    && response
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.get("resultType").is_none())
+        ));
+    }
+
+    #[test]
+    fn legacy_http_wrong_session_rejection_leaves_the_live_lifecycle_unchanged() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("legacy-http-wrong-session", "1.0.0")
+            .tool(LiveRuntimeListedTool)
+            .build_http_endpoint("http://legacy.test")
+            .expect("builder must construct the configured dual-era endpoint");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("endpoint must open a bounded live session");
+        let stream = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .expect("legacy SSE route must open");
+        let ServerHttpEndpointResponse::LegacySse(mut stream) = stream else {
+            panic!("legacy GET must open an exact SSE stream");
+        };
+        let _endpoint = stream
+            .recv_event(&cx)
+            .expect("legacy stream must advertise its exact POST endpoint");
+
+        let initialize = JsonRpcRequest::new(
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "legacy-http-client", "version": "1.0.0"},
+            })),
+            221_i64,
+        );
+        let initialize_response = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/messages")
+                    .with_header("content-type", "application/json")
+                    .with_query("session_id", session.legacy_session_id())
+                    .with_body(
+                        serde_json::to_vec(&initialize)
+                            .expect("legacy initialize request must serialize"),
+                    ),
+            )
+            .expect("correct-session initialize must dispatch");
+        assert!(matches!(
+            initialize_response,
+            ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::ACCEPTED
+        ));
+        let _initialize = stream
+            .recv_event(&cx)
+            .expect("initialize response must be streamed before lifecycle advance");
+        let initialized = JsonRpcRequest::notification("notifications/initialized", None);
+        let initialized_response = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/messages")
+                    .with_header("content-type", "application/json")
+                    .with_query("session_id", session.legacy_session_id())
+                    .with_body(
+                        serde_json::to_vec(&initialized)
+                            .expect("legacy initialized notification must serialize"),
+                    ),
+            )
+            .expect("correct-session initialized notification must dispatch");
+        assert!(matches!(
+            initialized_response,
+            ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::ACCEPTED
+        ));
+
+        let valid = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "live_runtime_listed_tool",
+                "arguments": {},
+            })),
+            222_i64,
+        );
+        let mut wrong_session = HttpRequest::new(HttpMethod::Post, "/messages")
+            .with_header("content-type", "application/json")
+            .with_query("session_id", session.legacy_session_id())
+            .with_body(serde_json::to_vec(&valid).expect("legacy tool request must serialize"));
+        wrong_session
+            .query
+            .insert("session_id".to_string(), "wrong-session".to_string());
+        let before = session
+            .legacy_adapter
+            .as_ref()
+            .expect("initialize installs the exact legacy adapter")
+            .snapshot();
+        let rejected = session
+            .handle(&cx, wrong_session)
+            .expect("wrong session must become an HTTP rejection");
+        assert!(matches!(
+            rejected,
+            ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::NOT_FOUND
+        ));
+        assert_eq!(
+            session
+                .legacy_adapter
+                .as_ref()
+                .expect("wrong session must not remove the adapter")
+                .snapshot(),
+            before,
+            "changing only the session ID must not mutate the live exact lifecycle"
+        );
+
+        let accepted = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/messages")
+                    .with_header("content-type", "application/json")
+                    .with_query("session_id", session.legacy_session_id())
+                    .with_body(
+                        serde_json::to_vec(&valid).expect("legacy tool request must serialize"),
+                    ),
+            )
+            .expect("the otherwise identical correct-session request must dispatch");
+        assert!(matches!(
+            accepted,
+            ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::ACCEPTED
+        ));
+        let call = stream
+            .recv_event(&cx)
+            .expect("the unchanged lifecycle must still dispatch the valid call");
+        assert!(matches!(
+            Codec::new()
+                .decode_complete_message(call.data.as_bytes())
+                .expect("valid call event must remain JSON-RPC"),
+            JsonRpcMessage::Response(response) if response.id == Some(222_i64.into())
+        ));
     }
 
     #[test]
@@ -11352,91 +12965,32 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn http_returning_server_fails_closed_without_runtime_or_lifecycle_hooks() {
+    fn http_bind_rejects_an_invalid_address_without_running_lifecycle_hooks() {
         let startup_called = Arc::new(AtomicBool::new(false));
         let shutdown_called = Arc::new(AtomicBool::new(false));
         let startup_observer = Arc::clone(&startup_called);
         let shutdown_observer = Arc::clone(&shutdown_called);
 
-        Server::new("http-fail-closed-test", "1.0.0")
-            .on_startup(move || {
-                startup_observer.store(true, Ordering::SeqCst);
-                Ok::<(), std::io::Error>(())
-            })
-            .on_shutdown(move || shutdown_observer.store(true, Ordering::SeqCst))
-            .build()
-            .run_http_returning("not-a-bindable-socket-address");
+        let cx = Cx::for_testing();
+        let result = block_on(
+            Server::new("http-bind-test", "1.0.0")
+                .on_startup(move || {
+                    startup_observer.store(true, Ordering::SeqCst);
+                    Ok::<(), std::io::Error>(())
+                })
+                .on_shutdown(move || shutdown_observer.store(true, Ordering::SeqCst))
+                .build()
+                .bind_http(&cx, "not-a-bindable-socket-address"),
+        );
+        let Err(error) = result else {
+            panic!("an invalid bind address must be rejected by the live listener");
+        };
 
         assert!(!startup_called.load(Ordering::SeqCst));
         assert!(!shutdown_called.load(Ordering::SeqCst));
-
-        Server::new("http-fail-closed-cx-test", "1.0.0")
-            .build()
-            .run_http_returning_with_cx(&Cx::for_testing(), "also-not-a-socket-address");
-    }
-
-    #[test]
-    fn http_nonreturning_rejection_child() {
-        match std::env::var("FASTMCP_HTTP_REJECTION_CHILD_MODE").as_deref() {
-            Ok("plain") => Server::new("http-reject-child", "1.0.0")
-                .build()
-                .run_http("not-a-socket-address"),
-            Ok("with-cx") => Server::new("http-reject-cx-child", "1.0.0")
-                .build()
-                .run_http_with_cx(&Cx::for_testing(), "not-a-socket-address"),
-            _ => {}
-        }
-    }
-
-    #[test]
-    fn http_nonreturning_entry_points_exit_one_with_fixed_diagnostic() {
-        let current_test_binary =
-            std::env::current_exe().expect("resolve current server test binary");
-
-        for mode in ["plain", "with-cx"] {
-            let mut child = std::process::Command::new(&current_test_binary)
-                .args([
-                    "--exact",
-                    "lib_unit_tests::http_nonreturning_rejection_child",
-                    "--nocapture",
-                ])
-                .env("FASTMCP_HTTP_REJECTION_CHILD_MODE", mode)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("spawn isolated HTTP rejection child");
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if child
-                    .try_wait()
-                    .expect("poll isolated HTTP rejection child")
-                    .is_some()
-                {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("HTTP rejection child for mode {mode:?} did not exit within 5 seconds");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let output = child
-                .wait_with_output()
-                .expect("collect isolated HTTP rejection child output");
-
-            assert_eq!(
-                output.status.code(),
-                Some(1),
-                "HTTP rejection child for mode {mode:?} did not exit 1: {output:?}"
-            );
-            assert!(
-                output
-                    .stderr
-                    .windows(UNQUALIFIED_HTTP_DIAGNOSTIC.len())
-                    .any(|window| window == UNQUALIFIED_HTTP_DIAGNOSTIC),
-                "HTTP rejection child for mode {mode:?} omitted fixed diagnostic: {output:?}"
-            );
-        }
+        assert!(
+            error.message.contains("HTTP listener bind failed"),
+            "the bind failure must report the live listener boundary: {error:?}"
+        );
     }
 }

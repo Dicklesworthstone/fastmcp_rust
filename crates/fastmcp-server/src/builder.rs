@@ -59,7 +59,7 @@ pub struct ServerBuilder {
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy for live stdio/runtime connections.
     protocol_policy: ProtocolPolicy,
-    /// Reserved HTTP configuration for the future qualified listener.
+    /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
 }
 
@@ -305,11 +305,7 @@ impl ServerBuilder {
         self
     }
 
-    /// Sets configuration reserved for the future qualified HTTP path.
-    ///
-    /// Public [`Server::run_http`](crate::Server::run_http) entry points
-    /// currently fail closed before binding and do not consume this
-    /// configuration.
+    /// Sets configuration for the live dual-era HTTP endpoint.
     ///
     /// # Example
     ///
@@ -324,6 +320,18 @@ impl ServerBuilder {
     pub fn http_config(mut self, config: HttpServerConfig) -> Self {
         self.http_config = config;
         self
+    }
+
+    /// Builds a live dual-era HTTP endpoint with an exact legacy SSE origin.
+    ///
+    /// The modern route remains at [`HttpServerConfig::mcp_path`], while the
+    /// exact MCP 2024-11-05 SSE route advertises `legacy_origin` plus the
+    /// configured legacy message path.
+    pub fn build_http_endpoint(
+        self,
+        legacy_origin: impl Into<String>,
+    ) -> Result<crate::ServerHttpEndpoint, fastmcp_transport::http::DualEraHttpEndpointError> {
+        self.build().into_http_endpoint(legacy_origin)
     }
 
     /// Registers a middleware.
@@ -1170,7 +1178,7 @@ impl ServerBuilder {
             lifespan: Mutex::new(Some(self.lifespan)),
             auth_provider: self.auth_provider,
             middleware: Arc::new(self.middleware),
-            active_requests: Mutex::new(HashMap::new()),
+            active_requests: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             task_manager: self.task_manager,
             max_bidirectional_requests_per_connection: self
