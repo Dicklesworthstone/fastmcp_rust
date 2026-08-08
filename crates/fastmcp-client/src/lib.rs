@@ -59,6 +59,11 @@ pub use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, HttpModernProbe, HttpProbeBody, ProtocolEra,
     ProtocolPolicy, ProtocolVersion,
 };
+pub use fastmcp_protocol::tasks_extension::{
+    CancelTaskResult as FinalCancelTaskResult, GetTaskResult as FinalGetTaskResult,
+    Task as FinalTask, TaskId as FinalTaskId, TaskInputResponses as FinalTaskInputResponses,
+    UpdateTaskResult as FinalUpdateTaskResult,
+};
 pub use fastmcp_protocol::{
     CallToolResult, CompleteResult, CoreResult, FinalCallToolResult,
     FinalCompletionArgument as CompletionArgument, FinalCompletionContext as CompletionContext,
@@ -79,7 +84,7 @@ pub use session::{ClientProtocolPlan, ClientProtocolPlanError, ClientSession};
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 #[cfg(target_os = "linux")]
 use std::io::Read as _;
 use std::io::Write as _;
@@ -100,8 +105,16 @@ use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sh
 use fastmcp_protocol::common_types::{
     ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
+use fastmcp_protocol::extensions::{
+    ExtensionLocalEnablement, official_tasks_empty_settings, register_official_tasks_extension,
+};
 use fastmcp_protocol::methods::{Final2026Peer, final_2026_07_28_method};
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
+use fastmcp_protocol::tasks_extension::{
+    CancelTaskParams as FinalCancelTaskParams, GetTaskParams as FinalGetTaskParams, TASK_CANCEL,
+    TASK_GET, TASK_UPDATE, TaskInputLedger, TaskRequestMeta,
+    UpdateTaskParams as FinalUpdateTaskParams,
+};
 use fastmcp_protocol::{
     CallToolParams, CancelTaskParams, CancelTaskResult, CancelledParams, ClientCapabilities,
     ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey, FINAL_SUBSCRIPTION_ID_META_KEY,
@@ -115,6 +128,10 @@ use fastmcp_protocol::{
     RequestMeta, Resource, ResourceTemplate, ServerCapabilities, ServerInfo, ServerNotification,
     SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo, TaskResult,
     TaskStatus, Tool, ToolAnnotations,
+};
+use fastmcp_protocol::{
+    ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionDirection, ExtensionSettings,
+    ServerExtensionDiscovery,
 };
 use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
 
@@ -4011,6 +4028,151 @@ impl Client {
         }
     }
 
+    /// Builds the exact final `_meta` object required by a Tasks request.
+    ///
+    /// Tasks has no legacy projection. The shared modern metadata builder
+    /// supplies the negotiated protocol version, caller capabilities, client
+    /// identity, and any selected final logging preference without broadening
+    /// the Tasks parameter shape.
+    fn final_task_request_meta(&self) -> McpResult<TaskRequestMeta> {
+        let params = self.with_modern_request_metadata(serde_json::json!({}))?;
+        let mut metadata = params
+            .get("_meta")
+            .cloned()
+            .ok_or_else(|| McpError::internal_error("Modern Tasks request metadata was omitted"))?;
+        let capabilities = metadata
+            .as_object_mut()
+            .and_then(|metadata| metadata.get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY))
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "Modern Tasks request metadata omitted final client capabilities",
+                )
+            })?;
+        capabilities.insert(
+            "extensions".to_owned(),
+            serde_json::Value::Object(serde_json::Map::from_iter([(
+                fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+                serde_json::json!({}),
+            )])),
+        );
+        let meta = serde_json::from_value(metadata).map_err(|error| {
+            McpError::internal_error(format!(
+                "Modern Tasks request metadata did not retain its final shape: {error}"
+            ))
+        })?;
+        Ok(TaskRequestMeta { meta })
+    }
+
+    /// Admits one official final Tasks method through bilateral empty-settings
+    /// negotiation before allocating a request ID or writing to the peer.
+    fn admit_final_tasks_method(&mut self, method: &str) -> McpResult<()> {
+        self.ensure_initialized()?;
+        if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
+            return Err(McpError::invalid_params(
+                "io.modelcontextprotocol/tasks is unavailable in exact MCP 2024-11-05",
+            ));
+        }
+
+        let discovery = self.server_discovery().ok_or_else(|| {
+            McpError::invalid_params(
+                "Modern Tasks requires the retained final server/discover response",
+            )
+        })?;
+        let capabilities = serde_json::to_value(discovery.capabilities()).map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to retain final Tasks capability discovery: {error}"
+            ))
+        })?;
+        let settings_value = capabilities
+            .get("extensions")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|extensions| extensions.get(fastmcp_protocol::TASKS_EXTENSION))
+            .cloned()
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Server did not declare io.modelcontextprotocol/tasks capability",
+                )
+            })?;
+        let server_settings = ExtensionSettings::new(settings_value).map_err(|_| {
+            McpError::invalid_params(
+                "Server io.modelcontextprotocol/tasks settings are not an admitted object",
+            )
+        })?;
+
+        let mut registry = ExtensionDescriptorRegistry::new();
+        let task_extension = register_official_tasks_extension(&mut registry).map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to register the official Tasks client surface: {error}"
+            ))
+        })?;
+        registry.freeze().map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to freeze the official Tasks client surface: {error}"
+            ))
+        })?;
+
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(task_extension.clone());
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(task_extension.clone(), official_tasks_empty_settings())]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([(task_extension.clone(), server_settings)]),
+        };
+        let mut resolve_empty_settings =
+            |_descriptor: &fastmcp_protocol::ExtensionDescriptor,
+             _client: &ExtensionSettings,
+             _server: &ExtensionSettings| { Ok(official_tasks_empty_settings()) };
+        let negotiated = registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolve_empty_settings,
+            )
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "io.modelcontextprotocol/tasks requires bilateral empty settings",
+                )
+            })?;
+        negotiated
+            .admit_method(
+                &registry,
+                ProtocolEra::Modern2026,
+                &task_extension,
+                method,
+                ExtensionDirection::ClientToServer,
+            )
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "Tasks method is not admitted by the negotiated official extension",
+                )
+            })?;
+
+        Ok(())
+    }
+
+    /// Sends one already-admitted final Tasks request and decodes its exact
+    /// result envelope. A malformed task response is a peer protocol
+    /// contradiction and terminates this connection.
+    fn send_final_task_request<P, R>(&mut self, method: &str, params: P) -> McpResult<R>
+    where
+        P: serde::Serialize,
+        R: serde::de::DeserializeOwned,
+    {
+        let params = serde_json::to_value(params).map_err(|error| {
+            McpError::internal_error(format!("Failed to serialize final Tasks request: {error}"))
+        })?;
+        let result = self.send_prepared_request(method, params)?;
+        serde_json::from_value(result).map_err(|_| {
+            self.terminate_connection(McpError::invalid_request(
+                "Peer response does not match the admitted final Tasks result",
+            ))
+        })
+    }
+
     /// Decodes a prepared supported-core request in the immutable selected era.
     ///
     /// Non-core methods continue through the ordinary response path. A core
@@ -5924,6 +6086,81 @@ impl Client {
             Err(error) => return Err(self.finish_committed_request_locally(&request_id, error)),
         };
         self.recv_subscription_listener(waiter, &core_request, &requested, deadlines)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Final Tasks extension
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Reads one task through the negotiated official Tasks extension.
+    ///
+    /// Exact MCP 2024-11-05 excludes extensions, so this rejects before a
+    /// request ID is allocated or any task bytes are written. Modern callers
+    /// must have a bilateral `io.modelcontextprotocol/tasks` declaration with
+    /// exactly empty settings in the retained discovery response.
+    pub fn get_task_final(&mut self, task_id: FinalTaskId) -> McpResult<FinalGetTaskResult> {
+        self.admit_final_tasks_method(TASK_GET)?;
+        let params = FinalGetTaskParams {
+            request: self.final_task_request_meta()?,
+            task_id: task_id.clone(),
+        };
+        let result: FinalGetTaskResult = self.send_final_task_request(TASK_GET, params)?;
+        if result.task.base().task_id != task_id {
+            return Err(self.terminate_connection(McpError::invalid_request(
+                "tasks/get response taskId does not match the requested final task",
+            )));
+        }
+        Ok(result)
+    }
+
+    /// Supplies responses for the exact input requests retained by a final
+    /// `input_required` task.
+    ///
+    /// Passing the returned [`FinalTask`] retains the task identifier and
+    /// request ledger as one correlated unit. The client rejects a non-input
+    /// task or a response key/kind contradiction before sending `tasks/update`.
+    pub fn update_task_final(
+        &mut self,
+        task: &FinalTask,
+        input_responses: FinalTaskInputResponses,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        self.admit_final_tasks_method(TASK_UPDATE)?;
+        let FinalTask::InputRequired {
+            base,
+            input_requests,
+        } = task
+        else {
+            return Err(McpError::invalid_params(
+                "tasks/update requires an input_required final task",
+            ));
+        };
+        let ledger = TaskInputLedger::from_requests(input_requests).map_err(|_| {
+            McpError::invalid_params("Final task input requests are not an admitted ledger")
+        })?;
+        ledger.validate_responses(&input_responses).map_err(|_| {
+            McpError::invalid_params(
+                "tasks/update inputResponses do not match the retained task input requests",
+            )
+        })?;
+        let params = FinalUpdateTaskParams {
+            request: self.final_task_request_meta()?,
+            task_id: base.task_id.clone(),
+            input_responses,
+        };
+        self.send_final_task_request(TASK_UPDATE, params)
+    }
+
+    /// Requests cancellation through the negotiated official Tasks extension.
+    ///
+    /// The exact final acknowledgement is intentionally empty; unlike the
+    /// stale custom task API, it must not invent a projected task snapshot.
+    pub fn cancel_task_final(&mut self, task_id: FinalTaskId) -> McpResult<FinalCancelTaskResult> {
+        self.admit_final_tasks_method(TASK_CANCEL)?;
+        let params = FinalCancelTaskParams {
+            request: self.final_task_request_meta()?,
+            task_id,
+        };
+        self.send_final_task_request(TASK_CANCEL, params)
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -10094,6 +10331,71 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_tasks_discovery_response(server_name: &str, settings: serde_json::Value) -> String {
+        let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+            &fastmcp_protocol::ServerBehaviorRegistry::default(),
+            std::collections::BTreeMap::from([(
+                fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+                settings,
+            )]),
+        )
+        .expect("Tasks discovery settings satisfy the generic extension envelope");
+        let result = ServerDiscoverResult::new(
+            capabilities,
+            ServerInfo {
+                name: server_name.to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let mut response = serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": 1,
+            "result": result,
+        });
+        response["result"]["supportedVersions"] = serde_json::json!([MODERN_PROTOCOL_VERSION]);
+        serde_json::to_string(&response)
+            .expect("Tasks discovery response serializes deterministically")
+    }
+
+    #[cfg(unix)]
+    fn modern_final_tasks_client_script(get_response: &str) -> String {
+        let discovery_response =
+            modern_tasks_discovery_response("tasks-modern-server", serde_json::json!({}));
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r get || exit 1; \
+             case \"$get\" in *'\"method\":\"tasks/get\"'*'\"taskId\":\"task-1\"'*'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
+             printf '%s\\n' '{get_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r update || exit 1; \
+             case \"$update\" in *'\"method\":\"tasks/update\"'*'\"taskId\":\"task-1\"'*'\"inputResponses\":{{}}'*'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r cancel || exit 1; \
+             case \"$cancel\" in *'\"method\":\"tasks/cancel\"'*'\"taskId\":\"task-1\"'*'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\"}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_final_tasks_get_client_script(get_response: &str) -> String {
+        let discovery_response =
+            modern_tasks_discovery_response("tasks-modern-server", serde_json::json!({}));
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r get || exit 1; \
+             case \"$get\" in *'\"method\":\"tasks/get\"'*'\"taskId\":\"task-1\"'*'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) \
+             printf '%s\\n' '{get_response}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
     fn modern_discovery_response_with_final_state(server_name: &str, cache_scope: &str) -> String {
         let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
             &fastmcp_protocol::ServerBehaviorRegistry::from_behaviors([
@@ -10384,6 +10686,126 @@ mod tests {
             Some(&serde_json::json!("retained"))
         );
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_tasks_final_get_update_cancel_positive() {
+        let script = modern_final_tasks_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-1","status":"input_required","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:00Z","ttlMs":null,"inputRequests":{}}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("Tasks-capable modern discovery initializes the client");
+        let task_id = FinalTaskId::parse("task-1").expect("typed final task ID");
+
+        let task = client
+            .get_task_final(task_id.clone())
+            .expect("the admitted final tasks/get response retains its task");
+        let FinalTask::InputRequired {
+            base,
+            input_requests,
+        } = &task.task
+        else {
+            panic!("the exact task result must retain input_required state");
+        };
+        assert_eq!(base.task_id, task_id);
+        assert!(input_requests.is_empty());
+
+        let acknowledgement = client
+            .update_task_final(&task.task, BTreeMap::new())
+            .expect("an empty response map matches the exact empty input ledger");
+        assert!(acknowledgement.meta.is_none());
+        assert!(acknowledgement.additional.is_empty());
+
+        let cancellation = client
+            .cancel_task_final(task_id)
+            .expect("the admitted final tasks/cancel acknowledgement is exact and empty");
+        assert!(cancellation.meta.is_none());
+        assert!(cancellation.additional.is_empty());
+        client.close().expect("modern Tasks client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_tasks_final_undeclared_capability_rejects_before_request_mutation() {
+        // This differs from the admitted Tasks discovery only by the absent
+        // `io.modelcontextprotocol/tasks` capability declaration.
+        let discovery =
+            modern_discovery_response("tasks-undeclared-server", &[MODERN_PROTOCOL_VERSION]);
+        let script = modern_public_client_script(&discovery);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes before the extension gate");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        let error = client
+            .get_task_final(FinalTaskId::parse("task-1").expect("typed final task ID"))
+            .expect_err("an undeclared extension cannot send tasks/get");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        client.close().expect("undeclared Tasks client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_tasks_final_nonempty_settings_reject_before_request_mutation() {
+        // This differs from the admitted Tasks discovery only by one setting;
+        // the official extension admits exactly the empty object.
+        let discovery = modern_tasks_discovery_response(
+            "tasks-settings-server",
+            serde_json::json!({
+                "mode": "unsupported"
+            }),
+        );
+        let script = modern_public_client_script(&discovery);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery retains extension settings before method admission");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        let error = client
+            .get_task_final(FinalTaskId::parse("task-1").expect("typed final task ID"))
+            .expect_err("nonempty official Tasks settings cannot admit tasks/get");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        client.close().expect("rejected Tasks settings cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_tasks_final_wrong_task_id_terminates_the_connection() {
+        // This differs from the admitted get response only in the returned
+        // taskId. A response for another opaque ID must not be accepted.
+        let script = modern_final_tasks_get_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-2","status":"input_required","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:00Z","ttlMs":null,"inputRequests":{}}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("Tasks-capable modern discovery initializes the client");
+
+        let error = client
+            .get_task_final(FinalTaskId::parse("task-1").expect("typed final task ID"))
+            .expect_err("a mismatched final task ID is a peer contradiction");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(!client.is_initialized());
+        client.close().expect("contradictory Tasks client cleanup");
     }
 
     #[cfg(unix)]
@@ -11724,6 +12146,26 @@ mod tests {
             .ping()
             .expect("legacy ping keeps its core acknowledgement and omits final metadata");
         client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_final_tasks_rejects_exact_legacy_before_request_mutation() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_public_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy initialization succeeds before final Tasks admission");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        let error = client
+            .get_task_final(FinalTaskId::parse("task-1").expect("typed final task ID"))
+            .expect_err("exact 2024-11-05 excludes the final Tasks extension");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        client.close().expect("legacy Tasks client cleanup");
     }
 
     #[cfg(unix)]
