@@ -137,7 +137,7 @@ use fastmcp_transport::http::{
 use asupersync::codec::Framed;
 use asupersync::http::h1::{Http1Codec, Method as Http1Method, Response as Http1Response};
 use asupersync::io::AsyncWriteExt;
-use asupersync::net::tcp::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
+use asupersync::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use asupersync::stream::StreamExt;
 use asupersync::{Budget, CancelKind, Cx, RegionId, channel::mpsc as asupersync_mpsc};
 use fastmcp_console::banner::StartupBanner;
@@ -1547,7 +1547,7 @@ impl BoundHttpServer {
 
         let connection_scope = cx.scope();
         let mut connection_children = HttpConnectionChildren::default();
-        let result = 'listener: loop {
+        let result = loop {
             connection_children.reap_finished();
             if cx.checkpoint().is_err() {
                 break Ok(());
@@ -2164,11 +2164,11 @@ async fn serve_http_connection(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&session_id);
     if let Some(session) = removed {
-        session
+        let mut session_guard = session
             .session
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .close();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        session_guard.close();
     }
 }
 
@@ -7140,6 +7140,7 @@ impl ActiveRequestGuard {
             return Err(id);
         }
         guard.insert(key.clone(), entry);
+        drop(guard);
         Ok(Self {
             map,
             key,

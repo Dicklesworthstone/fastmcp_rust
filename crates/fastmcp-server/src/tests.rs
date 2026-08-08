@@ -1706,7 +1706,7 @@ mod router_tests {
         let key = ActiveRequestKey::new(session_id, request_id.clone());
 
         let guard = ActiveRequestGuard::try_new(
-            &server.active_requests,
+            Arc::clone(&server.active_requests),
             session_id,
             request_id,
             cx.clone(),
@@ -1753,7 +1753,7 @@ mod router_tests {
             let ready = Arc::clone(&ready);
             let handle = thread::spawn(move || {
                 let _guard = ActiveRequestGuard::try_new(
-                    &server.active_requests,
+                    Arc::clone(&server.active_requests),
                     session_id,
                     request_id,
                     cx.clone(),
@@ -1808,7 +1808,7 @@ mod router_tests {
         let cx_for_worker = cx.clone();
         let worker = thread::spawn(move || {
             let _guard = ActiveRequestGuard::try_new(
-                &server_for_worker.active_requests,
+                Arc::clone(&server_for_worker.active_requests),
                 session_id,
                 request_id,
                 cx_for_worker,
