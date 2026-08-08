@@ -25,6 +25,8 @@
 
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::env;
+#[cfg(test)]
+use std::ffi::OsStr;
 use std::fs::{File, Metadata, Permissions};
 #[cfg(target_os = "linux")]
 use std::io::Seek as _;
@@ -38,19 +40,25 @@ use serde::{Deserialize, Serialize, Serializer};
 
 #[cfg(target_os = "linux")]
 use fastmcp_client::linux_process_group_has_live_member;
-use fastmcp_client::{Client, ListPageLimits, claude_desktop_config_path};
+use fastmcp_client::{
+    Client, ClientBuilder, ClientProtocolPlan, ListPageLimits, claude_desktop_config_path,
+};
 use fastmcp_console::console::{is_credential_key, redact_free_text_credentials_with};
 use fastmcp_core::McpResult;
 use fastmcp_protocol::TaskStatus;
+use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 
 const MAX_TEST_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 const MAX_TEST_ABSOLUTE_TIMEOUT_SECS: u64 = 15 * 60;
 const CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: &str = "fastmcpCleanupUnverified";
 const CLIENT_CLEANUP_DURATION_MS_DATA_KEY: &str = "cleanupDurationMs";
+const FASTMCP_PROTOCOL_POLICY_ENV: &str = "FASTMCP_PROTOCOL_POLICY";
 const CLI_PROTOCOL_STATUS_HELP: &str = concat!(
     "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
-    "Public PROTOCOL_VERSION remains 2024-11-05; ModernOnly, Auto, and LegacyOnly are ",
-    "planned/unverified policy modes, not executable CLI profiles. MCP 2025-11-25 is ",
+    "Public PROTOCOL_VERSION remains 2024-11-05; Auto, ModernOnly, and LegacyOnly are ",
+    "executable CLI protocol-policy selections. Inspect configures the shipped client; run ",
+    "passes the selected policy to launched FastMCP ServerBuilder targets, while arbitrary ",
+    "children may ignore it. This does not prove server support, aggregate conformance, or release readiness. MCP 2025-11-25 is ",
     "unsupported: it has no alias, compatibility profile, route, or diagnostic selection. ",
     "Help, inspect output, and examples are not conformance, runtime-readiness, maturity, ",
     "or release evidence. Machine-readable diagnostics are separate from human-facing ",
@@ -62,8 +70,10 @@ const CLI_PROTOCOL_STATUS_HELP: &str = concat!(
 /// change to producer text must fail admission until this contract is reviewed.
 const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = concat!(
     "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
-    "Public PROTOCOL_VERSION remains 2024-11-05; ModernOnly, Auto, and LegacyOnly are ",
-    "planned/unverified policy modes, not executable CLI profiles. MCP 2025-11-25 is ",
+    "Public PROTOCOL_VERSION remains 2024-11-05; Auto, ModernOnly, and LegacyOnly are ",
+    "executable CLI protocol-policy selections. Inspect configures the shipped client; run ",
+    "passes the selected policy to launched FastMCP ServerBuilder targets, while arbitrary ",
+    "children may ignore it. This does not prove server support, aggregate conformance, or release readiness. MCP 2025-11-25 is ",
     "unsupported: it has no alias, compatibility profile, route, or diagnostic selection. ",
     "Help, inspect output, and examples are not conformance, runtime-readiness, maturity, ",
     "or release evidence. Machine-readable diagnostics are separate from human-facing ",
@@ -95,9 +105,9 @@ enum CliDocumentationRefusal {
     ExpectedDisplayHelp,
     ProtocolStatusIsNotProvisional,
     UnexpectedPublicProtocolVersion,
-    ModernOnlyIsExecutable,
-    AutoIsExecutable,
-    LegacyOnlyIsExecutable,
+    ModernOnlyIsNotExecutable,
+    AutoIsNotExecutable,
+    LegacyOnlyIsNotExecutable,
     Mcp2025IsNotUnsupported,
     AggregateClaimTreatedAsEvidence,
     MissingStatusStanza,
@@ -118,12 +128,12 @@ impl CliDocumentationRefusal {
             Self::UnexpectedPublicProtocolVersion => {
                 "DOC-01 CLI contract has an unexpected public protocol version"
             }
-            Self::ModernOnlyIsExecutable => {
-                "DOC-01 CLI contract must not make ModernOnly executable"
+            Self::ModernOnlyIsNotExecutable => {
+                "DOC-01 CLI contract must keep ModernOnly executable"
             }
-            Self::AutoIsExecutable => "DOC-01 CLI contract must not make Auto executable",
-            Self::LegacyOnlyIsExecutable => {
-                "DOC-01 CLI contract must not make LegacyOnly executable"
+            Self::AutoIsNotExecutable => "DOC-01 CLI contract must keep Auto executable",
+            Self::LegacyOnlyIsNotExecutable => {
+                "DOC-01 CLI contract must keep LegacyOnly executable"
             }
             Self::Mcp2025IsNotUnsupported => {
                 "DOC-01 CLI contract must keep MCP 2025-11-25 unsupported"
@@ -166,9 +176,9 @@ struct CliDocumentationContract {
 const CLI_DOCUMENTATION_CONTRACT: CliDocumentationContract = CliDocumentationContract {
     protocol_2026_under_implementation: true,
     public_protocol_version: "2024-11-05",
-    modern_only_executable: false,
-    auto_executable: false,
-    legacy_only_executable: false,
+    modern_only_executable: true,
+    auto_executable: true,
+    legacy_only_executable: true,
     mcp_2025_unsupported: true,
     aggregate_claims_are_evidence: false,
 };
@@ -213,14 +223,14 @@ fn validate_cli_documentation_contract(
     if contract.public_protocol_version != "2024-11-05" {
         return Err(CliDocumentationRefusal::UnexpectedPublicProtocolVersion);
     }
-    if contract.modern_only_executable {
-        return Err(CliDocumentationRefusal::ModernOnlyIsExecutable);
+    if !contract.modern_only_executable {
+        return Err(CliDocumentationRefusal::ModernOnlyIsNotExecutable);
     }
-    if contract.auto_executable {
-        return Err(CliDocumentationRefusal::AutoIsExecutable);
+    if !contract.auto_executable {
+        return Err(CliDocumentationRefusal::AutoIsNotExecutable);
     }
-    if contract.legacy_only_executable {
-        return Err(CliDocumentationRefusal::LegacyOnlyIsExecutable);
+    if !contract.legacy_only_executable {
+        return Err(CliDocumentationRefusal::LegacyOnlyIsNotExecutable);
     }
     if !contract.mcp_2025_unsupported {
         return Err(CliDocumentationRefusal::Mcp2025IsNotUnsupported);
@@ -360,9 +370,9 @@ fn doc_01_b_positive() {
     let independently_authored_contract = CliDocumentationContract {
         protocol_2026_under_implementation: true,
         public_protocol_version: "2024-11-05",
-        modern_only_executable: false,
-        auto_executable: false,
-        legacy_only_executable: false,
+        modern_only_executable: true,
+        auto_executable: true,
+        legacy_only_executable: true,
         mcp_2025_unsupported: true,
         aggregate_claims_are_evidence: false,
     };
@@ -499,6 +509,10 @@ enum Commands {
         /// Environment variables (KEY=VALUE format).
         #[arg(long, short = 'e')]
         env: Vec<String>,
+
+        /// Protocol-policy selection for the launched server (auto, modern-only, legacy-only).
+        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::Auto)]
+        protocol_policy: CliProtocolPolicy,
     },
 
     /// Inspect an MCP server's capabilities.
@@ -520,6 +534,10 @@ enum Commands {
         /// Output file (default: stdout).
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
+
+        /// Protocol-policy selection for the client connection (auto, modern-only, legacy-only).
+        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::Auto)]
+        protocol_policy: CliProtocolPolicy,
     },
 
     /// Install server configuration into Claude Desktop or other clients.
@@ -670,6 +688,44 @@ enum Commands {
         #[command(subcommand)]
         action: TasksAction,
     },
+}
+
+/// Explicit dual-era selection for the executable CLI paths.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CliProtocolPolicy {
+    /// Probe modern support and fall back only for an admitted legacy refusal.
+    #[default]
+    Auto,
+    /// Require the current modern protocol path.
+    ModernOnly,
+    /// Require the exact 2024-11-05 legacy protocol path.
+    LegacyOnly,
+}
+
+impl CliProtocolPolicy {
+    const fn protocol_policy(self) -> ProtocolPolicy {
+        match self {
+            Self::Auto => ProtocolPolicy::Auto,
+            Self::ModernOnly => ProtocolPolicy::ModernOnly,
+            Self::LegacyOnly => ProtocolPolicy::LegacyOnly,
+        }
+    }
+
+    const fn server_launch_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ModernOnly => "modern-only",
+            Self::LegacyOnly => "legacy-only",
+        }
+    }
+}
+
+fn client_builder_for_protocol_policy(policy: CliProtocolPolicy) -> ClientBuilder {
+    Client::builder().protocol_plan(ClientProtocolPlan::stdio(policy.protocol_policy()))
+}
+
+fn apply_protocol_policy_to_server_launch(command: &mut Command, policy: CliProtocolPolicy) {
+    command.env(FASTMCP_PROTOCOL_POLICY_ENV, policy.server_launch_value());
 }
 
 /// Diagnostic probes for the quarantined pre-2026 custom task RPC model.
@@ -883,13 +939,15 @@ fn main() -> ExitCode {
             args,
             cwd,
             env,
-        } => cmd_run(&server, &args, cwd.as_deref(), &env),
+            protocol_policy,
+        } => cmd_run(&server, &args, cwd.as_deref(), &env, protocol_policy),
         Commands::Inspect {
             server,
             args,
             format,
             output,
-        } => cmd_inspect(&server, &args, format, output.as_deref()),
+            protocol_policy,
+        } => cmd_inspect(&server, &args, format, output.as_deref(), protocol_policy),
         Commands::Install {
             name,
             server,
@@ -1007,6 +1065,18 @@ fn parse_environment_assignments(entries: &[String]) -> McpResult<HashMap<String
         .collect()
 }
 
+fn reject_reserved_protocol_policy_environment(
+    env_vars: &HashMap<String, String>,
+) -> McpResult<()> {
+    if env_vars.contains_key(FASTMCP_PROTOCOL_POLICY_ENV) {
+        return Err(fastmcp_core::McpError::invalid_params(format!(
+            "{FASTMCP_PROTOCOL_POLICY_ENV} is controlled by --protocol-policy; remove it from --env"
+        )));
+    }
+
+    Ok(())
+}
+
 fn child_exit_error(subject: &str, code: Option<i32>) -> fastmcp_core::McpError {
     if let Some(code) = code {
         fastmcp_core::McpError::with_data(
@@ -1025,14 +1095,17 @@ fn cmd_run(
     args: &[String],
     cwd: Option<&std::path::Path>,
     env_vars: &[String],
+    protocol_policy: CliProtocolPolicy,
 ) -> McpResult<()> {
     let env_vars = parse_environment_assignments(env_vars)?;
+    reject_reserved_protocol_policy_environment(&env_vars)?;
     let mut cmd = Command::new(server);
     cmd.args(args)
         .envs(env_vars)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    apply_protocol_policy_to_server_launch(&mut cmd, protocol_policy);
 
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -5591,11 +5664,13 @@ fn cmd_inspect(
     args: &[String],
     format: InspectFormat,
     output: Option<&std::path::Path>,
+    protocol_policy: CliProtocolPolicy,
 ) -> McpResult<()> {
     let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     // Connect to the server
-    let mut client = Client::stdio(server, &args_refs)?;
+    let mut client =
+        client_builder_for_protocol_policy(protocol_policy).connect_stdio(server, &args_refs)?;
 
     // Gather server information
     let server_info = client.server_info().clone();
@@ -10266,11 +10341,13 @@ mod tests {
                     args,
                     cwd,
                     env,
+                    protocol_policy,
                 } => {
                     assert_eq!(server, "./my-server");
                     assert!(args.is_empty());
                     assert!(cwd.is_none());
                     assert!(env.is_empty());
+                    assert_eq!(protocol_policy, CliProtocolPolicy::Auto);
                 }
                 _ => unreachable!("Expected Run command"),
             }
@@ -10320,6 +10397,108 @@ mod tests {
                 }
                 _ => unreachable!("Expected Run command"),
             }
+        }
+
+        #[test]
+        fn protocol_policy_defaults_to_auto_for_run_and_inspect() {
+            let run = Cli::try_parse_from(["fastmcp", "run", "./server"])
+                .expect("run policy defaults to auto");
+            match run.command {
+                Commands::Run {
+                    protocol_policy, ..
+                } => assert_eq!(protocol_policy, CliProtocolPolicy::Auto),
+                _ => unreachable!("Expected Run command"),
+            }
+
+            let inspect = Cli::try_parse_from(["fastmcp", "inspect", "./server"])
+                .expect("inspect policy defaults to auto");
+            match inspect.command {
+                Commands::Inspect {
+                    protocol_policy, ..
+                } => assert_eq!(protocol_policy, CliProtocolPolicy::Auto),
+                _ => unreachable!("Expected Inspect command"),
+            }
+        }
+
+        #[test]
+        fn protocol_policy_choices_route_to_shipped_builders() {
+            for (argument, expected) in [
+                ("modern-only", ProtocolPolicy::ModernOnly),
+                ("legacy-only", ProtocolPolicy::LegacyOnly),
+            ] {
+                let cli = Cli::try_parse_from([
+                    "fastmcp",
+                    "inspect",
+                    "--protocol-policy",
+                    argument,
+                    "./server",
+                ])
+                .expect("exact protocol-policy choice parses");
+                let Commands::Inspect {
+                    protocol_policy, ..
+                } = cli.command
+                else {
+                    unreachable!("Expected Inspect command");
+                };
+                assert_eq!(protocol_policy.protocol_policy(), expected);
+                assert_eq!(
+                    client_builder_for_protocol_policy(protocol_policy)
+                        .selected_protocol_plan()
+                        .policy(),
+                    expected
+                );
+
+                let mut command = Command::new("server");
+                apply_protocol_policy_to_server_launch(&mut command, protocol_policy);
+                let launch_policy = command
+                    .get_envs()
+                    .find(|(key, _)| *key == OsStr::new(FASTMCP_PROTOCOL_POLICY_ENV))
+                    .and_then(|(_, value)| value.and_then(OsStr::to_str).map(str::to_owned));
+                assert_eq!(launch_policy.as_deref(), Some(argument));
+            }
+        }
+
+        #[test]
+        fn protocol_policy_launch_setting_overrides_conflicting_child_environment() {
+            let mut command = Command::new("server");
+            command.env(FASTMCP_PROTOCOL_POLICY_ENV, "legacy-only");
+            apply_protocol_policy_to_server_launch(&mut command, CliProtocolPolicy::ModernOnly);
+
+            let launch_policy = command
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new(FASTMCP_PROTOCOL_POLICY_ENV))
+                .and_then(|(_, value)| value.and_then(OsStr::to_str).map(str::to_owned));
+
+            assert_eq!(launch_policy.as_deref(), Some("modern-only"));
+        }
+
+        #[test]
+        fn reserved_protocol_policy_environment_is_refused_before_server_spawn() {
+            let env_vars = parse_environment_assignments(&[
+                "FASTMCP_PROTOCOL_POLICY=mcp-2025-11-25".to_owned(),
+            ])
+            .expect("the generic parser preserves the assignment for command-specific validation");
+
+            let error = reject_reserved_protocol_policy_environment(&env_vars)
+                .expect_err("the reserved launch setting must be rejected before spawning");
+
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+            assert_eq!(
+                error.message,
+                "FASTMCP_PROTOCOL_POLICY is controlled by --protocol-policy; remove it from --env"
+            );
+        }
+
+        #[test]
+        fn protocol_policy_rejects_invalid_choice() {
+            let result = Cli::try_parse_from([
+                "fastmcp",
+                "run",
+                "--protocol-policy",
+                "mcp-2025-11-25",
+                "./server",
+            ]);
+            assert!(result.is_err());
         }
 
         #[test]

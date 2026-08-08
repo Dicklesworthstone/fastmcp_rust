@@ -40,8 +40,8 @@ use fastmcp_transport::StdioTransport;
 use crate::{
     ChildGuard, ChildOwnership, Client, ClientHttpConnection, ClientHttpConnectionError,
     ClientHttpNegotiation, ClientHttpNegotiationError, ClientProtocolPlan, ClientSession,
-    ProcessGroupAnchor, RequestTimeoutPolicy, combine_operation_with_cleanup,
-    is_cleanup_unverified, resolve_stdio_command,
+    HttpClient, HttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy,
+    combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
 };
 
 /// Builder for configuring an MCP client.
@@ -332,6 +332,26 @@ impl ClientBuilder {
     ) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
         ClientHttpConnection::connect(cx, self.protocol_plan, self.client_info, self.capabilities)
             .await
+    }
+
+    /// Connects a ready high-level HTTP client using the current capability context.
+    ///
+    /// In addition to selecting the immutable HTTP era, this completes the
+    /// exact legacy initialization lifecycle when the plan selects SSE.
+    pub fn connect_http_client(self) -> Result<HttpClient, HttpClientError> {
+        block_on(async {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.connect_http_client_with_cx(&cx).await
+        })
+    }
+
+    /// Connects a ready high-level HTTP client with an explicit cancellation context.
+    ///
+    /// Modern clients are ready after `server/discover`; exact legacy clients
+    /// are ready only after `initialize` and `notifications/initialized` have
+    /// both completed on the admitted legacy routes.
+    pub async fn connect_http_client_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
+        HttpClient::connect(cx, self.protocol_plan, self.client_info, self.capabilities).await
     }
 
     /// Connects to a server via stdio subprocess.

@@ -12,7 +12,7 @@
 //!
 //! External references are never resolved through network or filesystem I/O.
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use regex::Regex;
 use serde_json::Value;
 use std::fmt;
@@ -566,10 +566,7 @@ fn validate_format_keyword(
     object: &serde_json::Map<String, Value>,
     path: &str,
 ) -> Result<(), SchemaAdmissionError> {
-    if object
-        .get("format")
-        .is_some_and(|value| !value.is_string())
-    {
+    if object.get("format").is_some_and(|value| !value.is_string()) {
         Err(SchemaAdmissionError::new(
             format!("{path}.format"),
             "format must be a string",
@@ -1551,7 +1548,11 @@ fn validate_format(
         _ => true,
     };
     if !valid {
-        push_error(errors, path, format!("string does not match format {format:?}"));
+        push_error(
+            errors,
+            path,
+            format!("string does not match format {format:?}"),
+        );
     }
 }
 
@@ -1663,9 +1664,10 @@ fn split_once_byte(bytes: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
 fn is_valid_uri_scheme(scheme: &str) -> bool {
     let bytes = scheme.as_bytes();
     bytes.first().is_some_and(u8::is_ascii_alphabetic)
-        && bytes.iter().skip(1).all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'-' | b'.')
-        })
+        && bytes
+            .iter()
+            .skip(1)
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'-' | b'.'))
 }
 
 fn is_valid_uri_reference_segment(segment: &str) -> bool {

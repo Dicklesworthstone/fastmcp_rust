@@ -26,8 +26,8 @@ use fastmcp_protocol::common_types::{
 use fastmcp_protocol::{
     CacheScope, CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy,
     DecodedResult, FinalCallToolResult, FinalCompletionParams, FinalGetPromptResult,
-    FinalPromptMessage, FinalReadResourceResult, Icon, JsonRpcRequest, LegacyCompletionParams,
-    InputRequiredResult, ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource,
+    FinalPromptMessage, FinalReadResourceResult, Icon, InputRequiredResult, JsonRpcRequest,
+    LegacyCompletionParams, ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource,
     ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations,
     decode_peer_result, encode_result,
 };
@@ -2063,7 +2063,10 @@ impl PromptHandler for MountedPromptHandler {
 mod tests {
     use super::*;
     use asupersync::Cx;
-    use std::sync::{Mutex, OnceLock, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn input_required_result(request_state: &str) -> InputRequiredResult {
         let input = format!(
@@ -2475,7 +2478,9 @@ mod tests {
             .call(&ctx, serde_json::json!({}))
             .expect("legacy handler result remains exact");
 
-        assert!(matches!(legacy.as_slice(), [Content::Text { text }] if text == "legacy projection"));
+        assert!(
+            matches!(legacy.as_slice(), [Content::Text { text }] if text == "legacy projection")
+        );
         assert_eq!(tool.legacy_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             encode_input_required(&tool.result),

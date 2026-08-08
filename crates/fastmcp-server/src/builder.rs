@@ -28,6 +28,25 @@ use crate::{
 /// Default request timeout in seconds.
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 
+/// Reserved launch setting written by `fastmcp run` for FastMCP server targets.
+const FASTMCP_PROTOCOL_POLICY_ENV: &str = "FASTMCP_PROTOCOL_POLICY";
+
+fn protocol_policy_from_server_launch_value(value: Option<&str>) -> Option<ProtocolPolicy> {
+    match value {
+        Some("auto") => Some(ProtocolPolicy::Auto),
+        Some("modern-only") => Some(ProtocolPolicy::ModernOnly),
+        Some("legacy-only") => Some(ProtocolPolicy::LegacyOnly),
+        Some(_) | None => None,
+    }
+}
+
+fn protocol_policy_from_server_launch_environment() -> ProtocolPolicy {
+    protocol_policy_from_server_launch_value(
+        std::env::var(FASTMCP_PROTOCOL_POLICY_ENV).ok().as_deref(),
+    )
+    .unwrap_or_default()
+}
+
 /// Builder for configuring an MCP server.
 pub struct ServerBuilder {
     info: ServerInfo,
@@ -107,7 +126,7 @@ impl ServerBuilder {
             strict_input_validation: false,
             max_bidirectional_requests_per_connection:
                 crate::bidirectional::DEFAULT_MAX_IN_FLIGHT_REQUESTS,
-            protocol_policy: ProtocolPolicy::Auto,
+            protocol_policy: protocol_policy_from_server_launch_environment(),
             http_config: HttpServerConfig::default(),
             extension_runtime: None,
             final_task_runtime: None,
@@ -1763,10 +1782,36 @@ mod tests {
     }
 
     #[test]
-    fn builder_protocol_policy_defaults_to_auto() {
-        let server = ServerBuilder::new("srv", "1.0").build();
+    fn explicit_builder_protocol_policy_overrides_launch_default() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .build();
 
         assert_eq!(server.protocol_policy(), ProtocolPolicy::Auto);
+    }
+
+    #[test]
+    fn server_launch_protocol_policy_values_decode_to_exact_eras() {
+        assert_eq!(
+            protocol_policy_from_server_launch_value(Some("auto")),
+            Some(ProtocolPolicy::Auto)
+        );
+        assert_eq!(
+            protocol_policy_from_server_launch_value(Some("modern-only")),
+            Some(ProtocolPolicy::ModernOnly)
+        );
+        assert_eq!(
+            protocol_policy_from_server_launch_value(Some("legacy-only")),
+            Some(ProtocolPolicy::LegacyOnly)
+        );
+    }
+
+    #[test]
+    fn server_launch_protocol_policy_rejects_unrecognized_value() {
+        assert_eq!(
+            protocol_policy_from_server_launch_value(Some("mcp-2025-11-25")),
+            None
+        );
     }
 
     // ── Fluent API setters ───────────────────────────────────────────

@@ -30,14 +30,14 @@ use fastmcp_protocol::{
     FinalListPromptsResult, FinalListResourceTemplatesResult, FinalListResourcesResult,
     FinalListToolsResult, FinalPrompt, FinalPromptArgument, FinalReadResourceParams,
     FinalReadResourceResult, FinalResource, FinalResourceTemplate, FinalTool, FinalToolAnnotations,
-    GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, JsonRpcRequest,
-    LegacyCompletionParams, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
-    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
-    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListToolsParams, ListToolsResult, MissingRequiredClientCapabilityError,
-    PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage, ReadResourceParams,
-    ReadResourceResult, Resource, ResourceContent, ResourceTemplate, ServerBehavior,
-    ServerBehaviorRegistry, Tool, validate, validate_strict,
+    GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, InputRequiredResult,
+    JsonRpcRequest, LegacyCompletionParams, LegacyCompletionResult, LegacyContent,
+    LegacyCoreRequest, LegacyPromptMessage, LegacyResourceContent, ListPromptsParams,
+    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult,
+    MissingRequiredClientCapabilityError, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage,
+    ReadResourceParams, ReadResourceResult, Resource, ResourceContent, ResourceTemplate,
+    ServerBehavior, ServerBehaviorRegistry, Tool, validate, validate_strict,
 };
 #[cfg(test)]
 use fastmcp_protocol::{
@@ -46,8 +46,8 @@ use fastmcp_protocol::{
 };
 
 use crate::handler::{
-    BidirectionalSenders, BoxFuture, FinalToolOutcome, ProgressNotificationSender, UriParams,
-    empty_final_result_meta, encode_final_complete_result,
+    BidirectionalSenders, BoxFuture, FinalMethodOutcome, FinalToolOutcome,
+    ProgressNotificationSender, UriParams, empty_final_result_meta, encode_final_complete_result,
 };
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
@@ -239,6 +239,19 @@ fn encode_final_tools_call_result(
     })
     .encode()
     .map_err(|error| McpError::internal_error(error.to_string()))?;
+    serde_json::from_str(&encoded).map_err(McpError::from)
+}
+
+/// Encodes a handler-authored final input-required result through the selected
+/// method's exact result-algebra branch without passing through a legacy
+/// complete projection.
+fn encode_final_input_required_result(
+    result: InputRequiredResult,
+    select: impl FnOnce(InputRequiredResult) -> FinalCoreResult,
+) -> McpResult<serde_json::Value> {
+    let encoded = CoreResult::Final(select(result))
+        .encode()
+        .map_err(|error| McpError::internal_error(error.to_string()))?;
     serde_json::from_str(&encoded).map_err(McpError::from)
 }
 
@@ -1855,6 +1868,14 @@ impl Router {
                     FinalToolOutcome::Complete(result) => {
                         encode_final_tools_call_result(Ok(result))?
                     }
+                    FinalToolOutcome::InputRequired(result) => {
+                        encode_final_input_required_result(result, |result| {
+                            FinalCoreResult::ToolsCallInputRequired {
+                                result,
+                                diagnostic: None,
+                            }
+                        })?
+                    }
                     FinalToolOutcome::CreateTask { status_message } => {
                         require_final_tasks_capability(&request_metadata)?;
                         let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
@@ -1935,8 +1956,8 @@ impl Router {
                         "modern resources/read dispatch selected another core request",
                     ));
                 };
-                encode_final_resources_read_result(
-                    self.handle_resources_read_final_in_request(
+                let outcome = self
+                    .handle_resources_read_final_in_request(
                         request_ctx,
                         request_cx,
                         params.clone(),
@@ -1944,8 +1965,20 @@ impl Router {
                         None,
                         None,
                     )
-                    .await,
-                )?
+                    .await?;
+                match outcome {
+                    FinalMethodOutcome::Complete(result) => {
+                        encode_final_resources_read_result(Ok(result))?
+                    }
+                    FinalMethodOutcome::InputRequired(result) => {
+                        encode_final_input_required_result(result, |result| {
+                            FinalCoreResult::ResourcesReadInputRequired {
+                                result,
+                                diagnostic: None,
+                            }
+                        })?
+                    }
+                }
             }
             "prompts/list" => {
                 let request =
@@ -1980,8 +2013,8 @@ impl Router {
                         "modern prompts/get dispatch selected another core request",
                     ));
                 };
-                encode_final_prompts_get_result(
-                    self.handle_prompts_get_final_in_request(
+                let outcome = self
+                    .handle_prompts_get_final_in_request(
                         request_ctx,
                         request_cx,
                         params,
@@ -1989,8 +2022,20 @@ impl Router {
                         None,
                         None,
                     )
-                    .await,
-                )?
+                    .await?;
+                match outcome {
+                    FinalMethodOutcome::Complete(result) => {
+                        encode_final_prompts_get_result(Ok(result))?
+                    }
+                    FinalMethodOutcome::InputRequired(result) => {
+                        encode_final_input_required_result(result, |result| {
+                            FinalCoreResult::PromptsGetInputRequired {
+                                result,
+                                diagnostic: None,
+                            }
+                        })?
+                    }
+                }
             }
             _ => return Err(McpError::method_not_found(&request.method)),
         };
@@ -2853,7 +2898,7 @@ impl Router {
         session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
-    ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
         let uri = params.uri.as_str();
         debug!(
             target: targets::HANDLER,
@@ -2896,12 +2941,14 @@ impl Router {
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
         let outcome =
             run_handler_in_request(&ctx, request_cx, effective_budget, "resource", |child_cx| {
-                resolved.handler.read_final_async_with_uri_in_request(
-                    &ctx,
-                    child_cx,
-                    uri,
-                    &resolved.params,
-                )
+                resolved
+                    .handler
+                    .read_final_outcome_async_with_uri_in_request(
+                        &ctx,
+                        child_cx,
+                        uri,
+                        &resolved.params,
+                    )
             })
             .await?;
 
@@ -3151,7 +3198,7 @@ impl Router {
         session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
-    ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+    ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
         debug!(
             target: targets::HANDLER,
             "getting final prompt; prompt_key={}; arguments_present={}",
@@ -3197,7 +3244,7 @@ impl Router {
         let arguments = params.arguments.unwrap_or_default().into_iter().collect();
         let outcome =
             run_handler_in_request(&ctx, request_cx, effective_budget, "prompt", |child_cx| {
-                handler.get_final_async_in_request(&ctx, child_cx, arguments)
+                handler.get_final_outcome_async_in_request(&ctx, child_cx, arguments)
             })
             .await?;
 
@@ -6064,6 +6111,128 @@ mod router_tests {
                 },
                 empty_final_result_meta()?,
             ))
+        }
+    }
+
+    fn input_required_result(request_state: &str) -> InputRequiredResult {
+        InputRequiredResult::new(
+            None,
+            Some(request_state.to_owned()),
+            empty_final_result_meta().expect("empty final metadata is valid"),
+        )
+        .expect("request state makes the final input-required result valid")
+    }
+
+    struct InputRequiredTool {
+        legacy_calls: Arc<AtomicUsize>,
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for InputRequiredTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "input-required-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Content::text("legacy tool result")])
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalToolOutcome::InputRequired(input_required_result(
+                "tool-retry-state",
+            )))
+        }
+    }
+
+    struct InputRequiredResource {
+        legacy_calls: Arc<AtomicUsize>,
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl ResourceHandler for InputRequiredResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "file:///input-required-resource".to_owned(),
+                name: "input-required-resource".to_owned(),
+                description: None,
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![ResourceContent {
+                uri: "file:///input-required-resource".to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                text: Some("legacy resource result".to_owned()),
+                blob: None,
+            }])
+        }
+
+        fn read_final_outcome(
+            &self,
+            _ctx: &McpContext,
+        ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalMethodOutcome::InputRequired(input_required_result(
+                "resource-retry-state",
+            )))
+        }
+    }
+
+    struct InputRequiredPrompt {
+        legacy_calls: Arc<AtomicUsize>,
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl PromptHandler for InputRequiredPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "input-required-prompt".to_owned(),
+                description: None,
+                arguments: Vec::new(),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        fn get_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalMethodOutcome::InputRequired(input_required_result(
+                "prompt-retry-state",
+            )))
         }
     }
 
@@ -10465,6 +10634,207 @@ mod router_tests {
             "the one-field rejection cannot alter the accepted final result"
         );
         assert_eq!(MACRO_DUAL_ERA_TOOL_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn public_final_dispatch_encodes_input_required_handler_outcomes() {
+        let tool_legacy_calls = Arc::new(AtomicUsize::new(0));
+        let tool_final_calls = Arc::new(AtomicUsize::new(0));
+        let resource_legacy_calls = Arc::new(AtomicUsize::new(0));
+        let resource_final_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_legacy_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_tool(InputRequiredTool {
+            legacy_calls: Arc::clone(&tool_legacy_calls),
+            final_calls: Arc::clone(&tool_final_calls),
+        });
+        router.add_resource(InputRequiredResource {
+            legacy_calls: Arc::clone(&resource_legacy_calls),
+            final_calls: Arc::clone(&resource_final_calls),
+        });
+        router.add_prompt(InputRequiredPrompt {
+            legacy_calls: Arc::clone(&prompt_legacy_calls),
+            final_calls: Arc::clone(&prompt_final_calls),
+        });
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 141, Budget::INFINITE, &state);
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+
+        let tool_request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "name": "input-required-tool",
+                "arguments": {},
+            })),
+            141_i64,
+        );
+        let tool_typed = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "tools/call",
+            tool_request.params.as_ref(),
+        )
+        .expect("final tools/call request decodes");
+        let tool_response = router
+            .dispatch_stateless(&request_ctx, &tool_request)
+            .expect("public final tools/call dispatch encodes input_required");
+        assert_eq!(tool_response["resultType"], "input_required");
+        assert_eq!(tool_response["requestState"], "tool-retry-state");
+        let tool_wire = serde_json::to_string(&tool_response).expect("tool response serializes");
+        assert!(matches!(
+            tool_typed.decode_result(&tool_wire),
+            Ok(CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }))
+                if result.request_state() == Some("tool-retry-state")
+        ));
+
+        let resource_request = JsonRpcRequest::new(
+            "resources/read",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "uri": "file:///input-required-resource",
+            })),
+            142_i64,
+        );
+        let resource_typed = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "resources/read",
+            resource_request.params.as_ref(),
+        )
+        .expect("final resources/read request decodes");
+        let resource_response = router
+            .dispatch_stateless(&request_ctx, &resource_request)
+            .expect("public final resources/read dispatch encodes input_required");
+        assert_eq!(resource_response["resultType"], "input_required");
+        assert_eq!(resource_response["requestState"], "resource-retry-state");
+        let resource_wire =
+            serde_json::to_string(&resource_response).expect("resource response serializes");
+        assert!(matches!(
+            resource_typed.decode_result(&resource_wire),
+            Ok(CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }))
+                if result.request_state() == Some("resource-retry-state")
+        ));
+
+        let prompt_request = JsonRpcRequest::new(
+            "prompts/get",
+            Some(serde_json::json!({
+                "_meta": metadata,
+                "name": "input-required-prompt",
+            })),
+            143_i64,
+        );
+        let prompt_typed = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "prompts/get",
+            prompt_request.params.as_ref(),
+        )
+        .expect("final prompts/get request decodes");
+        let prompt_response = router
+            .dispatch_stateless(&request_ctx, &prompt_request)
+            .expect("public final prompts/get dispatch encodes input_required");
+        assert_eq!(prompt_response["resultType"], "input_required");
+        assert_eq!(prompt_response["requestState"], "prompt-retry-state");
+        let prompt_wire =
+            serde_json::to_string(&prompt_response).expect("prompt response serializes");
+        assert!(matches!(
+            prompt_typed.decode_result(&prompt_wire),
+            Ok(CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }))
+                if result.request_state() == Some("prompt-retry-state")
+        ));
+
+        assert_eq!(tool_legacy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resource_legacy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(prompt_legacy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resource_final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn final_input_required_does_not_fallback_without_negotiation_metadata() {
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_tool(InputRequiredTool {
+            legacy_calls: Arc::clone(&legacy_calls),
+            final_calls: Arc::clone(&final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 144, Budget::INFINITE, &state);
+        let baseline = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "input-required-tool",
+                "arguments": {},
+            })),
+            144_i64,
+        );
+        let mut planted = baseline.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("tools/call parameters are an object")
+            .remove("_meta");
+
+        assert_eq!(baseline.method, planted.method);
+        assert_eq!(baseline.id, planted.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name")),
+            planted
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name")),
+            "negotiation metadata is the sole planted dimension"
+        );
+        let catalog_before = serde_json::to_vec(&router.tools()).expect("catalog serializes");
+        let planted_before = serde_json::to_vec(&planted).expect("request serializes");
+
+        let accepted = router
+            .dispatch_stateless(&request_ctx, &baseline)
+            .expect("negotiated final request is accepted");
+        assert_eq!(accepted["resultType"], "input_required");
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+        let error = router
+            .dispatch_stateless(&request_ctx, &planted)
+            .expect_err("one-field no-negotiation request is rejected instead of falling back");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            serde_json::to_vec(&planted).expect("rejected request serializes"),
+            planted_before,
+            "rejection cannot mutate caller-owned no-negotiation parameters"
+        );
+        assert_eq!(
+            serde_json::to_vec(&router.tools()).expect("catalog serializes"),
+            catalog_before,
+            "rejection cannot mutate the installed handler catalog"
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            router
+                .dispatch_stateless(&request_ctx, &baseline)
+                .expect("the negotiated baseline remains accepted after rejection"),
+            accepted,
+            "one-field no-negotiation rejection cannot alter the final input-required response"
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

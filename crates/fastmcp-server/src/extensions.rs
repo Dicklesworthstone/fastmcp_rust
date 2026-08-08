@@ -13,11 +13,13 @@ use std::marker::PhantomData;
 use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::extensions::{
     ExtensionDispatchError, ExtensionRegistryError, MAX_EXTENSION_MEMBER_NAME_BYTES,
-    NegotiatedExtensionSet, ServerExtensionDiscovery,
+    NegotiatedExtensionSet, ServerExtensionDiscovery, official_mcp_apps_empty_server_settings,
+    register_official_mcp_apps_extension,
 };
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     ExtensionDescriptorRegistry, ExtensionDirection, ExtensionId, ExtensionRegistryReceipt,
+    ExtensionSettings,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -115,6 +117,10 @@ pub enum ExtensionHandlerRegistrationError {
     DuplicateHandler(ExtensionHandlerKey),
     /// Server discovery metadata is already registered for this extension.
     DuplicateServerMetadata(ExtensionId),
+    /// The official MCP Apps descriptor and server marker are already installed.
+    OfficialMcpAppsAlreadyInstalled,
+    /// The protocol registry rejected official MCP Apps descriptor installation.
+    Registry(ExtensionRegistryError),
 }
 
 impl fmt::Display for ExtensionHandlerRegistrationError {
@@ -138,13 +144,35 @@ impl fmt::Display for ExtensionHandlerRegistrationError {
                 key.method()
             ),
             Self::DuplicateServerMetadata(id) => {
-                write!(formatter, "extension server metadata is already registered: {id}")
+                write!(
+                    formatter,
+                    "extension server metadata is already registered: {id}"
+                )
+            }
+            Self::OfficialMcpAppsAlreadyInstalled => {
+                formatter.write_str("official MCP Apps extension is already installed")
+            }
+            Self::Registry(error) => {
+                write!(formatter, "extension registry rejected install: {error}")
             }
         }
     }
 }
 
-impl std::error::Error for ExtensionHandlerRegistrationError {}
+impl std::error::Error for ExtensionHandlerRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Registry(error) => Some(error),
+            Self::Frozen
+            | Self::UnregisteredExtension(_)
+            | Self::EmptyMethodName
+            | Self::MethodNameTooLong(_)
+            | Self::DuplicateHandler(_)
+            | Self::DuplicateServerMetadata(_)
+            | Self::OfficialMcpAppsAlreadyInstalled => None,
+        }
+    }
+}
 
 /// Failure while looking up a registered extension handler.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -227,7 +255,7 @@ impl std::error::Error for ExtensionHandlerInvocationError {
 pub struct ExtensionHandlerRegistry {
     descriptor_registry: ExtensionDescriptorRegistry,
     handlers: BTreeMap<ExtensionHandlerKey, Box<dyn ErasedExtensionHandler>>,
-    server_metadata: BTreeMap<ExtensionId, fastmcp_protocol::ExtensionSettings>,
+    server_metadata: BTreeMap<ExtensionId, ExtensionSettings>,
     frozen: bool,
 }
 
@@ -297,7 +325,7 @@ impl ExtensionHandlerRegistry {
     pub fn register_server_metadata(
         &mut self,
         extension_id: ExtensionId,
-        settings: fastmcp_protocol::ExtensionSettings,
+        settings: ExtensionSettings,
     ) -> Result<(), ExtensionHandlerRegistrationError> {
         if self.frozen {
             return Err(ExtensionHandlerRegistrationError::Frozen);
@@ -315,6 +343,31 @@ impl ExtensionHandlerRegistry {
 
         self.server_metadata.insert(extension_id, settings);
         Ok(())
+    }
+
+    /// Installs the official MCP Apps descriptor and its exact empty server marker.
+    ///
+    /// MCP Apps has no client-to-server extension method, so its server-side
+    /// installation consists solely of the protocol descriptor and discovery
+    /// metadata. The resolver remains caller-owned and must preserve its
+    /// `ExtensionSettingsCompatibilityResolver::resolve_with_disposition`
+    /// result when this registry is installed into a live server runtime.
+    pub fn install_official_mcp_apps(
+        &mut self,
+    ) -> Result<ExtensionId, ExtensionHandlerRegistrationError> {
+        if self.frozen {
+            return Err(ExtensionHandlerRegistrationError::Frozen);
+        }
+        let id = fastmcp_protocol::official_mcp_apps_extension_id();
+        if self.descriptor_registry.descriptor(&id).is_some()
+            || self.server_metadata.contains_key(&id)
+        {
+            return Err(ExtensionHandlerRegistrationError::OfficialMcpAppsAlreadyInstalled);
+        }
+        register_official_mcp_apps_extension(&mut self.descriptor_registry)
+            .map_err(ExtensionHandlerRegistrationError::Registry)?;
+        self.register_server_metadata(id.clone(), official_mcp_apps_empty_server_settings())?;
+        Ok(id)
     }
 
     /// Registers one typed handler for an extension request method.
@@ -371,6 +424,22 @@ impl ExtensionHandlerRegistry {
         let receipt = self.descriptor_registry.freeze()?;
         self.frozen = true;
         Ok(receipt)
+    }
+
+    /// Freezes this registry and returns its matching discovery metadata.
+    ///
+    /// This is the preferred handoff to
+    /// [`ServerBuilder::extension_registry`](crate::ServerBuilder::extension_registry):
+    /// the returned receipt, metadata, and handler registry all share one
+    /// immutable descriptor revision.
+    pub fn freeze_with_server_discovery(
+        &mut self,
+    ) -> Result<(ExtensionRegistryReceipt, ServerExtensionDiscovery), ExtensionRegistryError> {
+        let receipt = self.freeze()?;
+        let discovery = self
+            .server_discovery()
+            .expect("registry is frozen immediately after a successful freeze");
+        Ok((receipt, discovery))
     }
 
     /// Returns the server discovery data bound to this frozen registry.
@@ -461,12 +530,11 @@ mod tests {
     use asupersync::Cx;
     use fastmcp_core::{McpContext, McpErrorCode, McpResult};
     use fastmcp_protocol::extensions::{
-        ClientExtensionDiscovery, ExtensionFallbackPolicy, ExtensionLocalEnablement,
-        ExtensionNegotiationResolver, ExtensionSettings, ExtensionSettingsSchema,
+        ClientExtensionDiscovery, ExtensionLocalEnablement, ExtensionSettings,
         ServerExtensionDiscovery, official_tasks_empty_settings, register_official_tasks_extension,
     };
     use fastmcp_protocol::protocol_policy::ProtocolEra;
-    use fastmcp_protocol::{ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionId};
+    use fastmcp_protocol::{ExtensionDescriptorRegistry, ExtensionId};
     use serde::{Deserialize, Serialize};
     use serde_json::json;
 
@@ -480,31 +548,6 @@ mod tests {
         let id = register_official_tasks_extension(&mut descriptors)
             .expect("official Tasks descriptor registers");
         (descriptors, id)
-    }
-
-    fn official_apps_metadata_descriptor() -> ExtensionDescriptor {
-        ExtensionDescriptor {
-            id: ExtensionId::parse("io.modelcontextprotocol/ui")
-                .expect("official Apps identifier is valid"),
-            client_settings: ExtensionSettingsSchema {
-                schema_id: "apps-2026-01-26-client-mime-types-v1".to_owned(),
-                codec_id: "apps-2026-01-26-client-mime-types-v1".to_owned(),
-            },
-            server_settings: ExtensionSettingsSchema {
-                schema_id: "fastmcp-2026-07-28-apps-empty-server-marker-v1".to_owned(),
-                codec_id: "fastmcp-2026-07-28-apps-empty-server-marker-v1".to_owned(),
-            },
-            resolver: ExtensionNegotiationResolver {
-                id: "fastmcp-apps-bilateral-resolver-v1".to_owned(),
-                version: 1,
-                fallback: ExtensionFallbackPolicy::ServerInactiveFallback,
-            },
-            method: None,
-            notification: None,
-            result_discriminator: None,
-            routing_headers: Vec::new(),
-            stdio_correlation: None,
-        }
     }
 
     #[derive(Deserialize)]
@@ -604,28 +647,29 @@ mod tests {
 
     #[test]
     fn official_apps_server_metadata_is_emitted_from_the_frozen_registry() {
-        let apps = official_apps_metadata_descriptor();
-        let apps_id = apps.id.clone();
-        let mut descriptors = ExtensionDescriptorRegistry::new();
-        descriptors
-            .register(apps)
-            .expect("the compile-linked official Apps descriptor registers");
+        let (descriptors, tasks_id) = tasks_descriptors();
         let mut handlers = ExtensionHandlerRegistry::new(descriptors);
-
-        handlers
-            .register_server_metadata(
-                apps_id.clone(),
-                ExtensionSettings::new(json!({}))
-                    .expect("the official Apps server marker is an object"),
-            )
-            .expect("the descriptor-bound official Apps marker registers");
-        let receipt = handlers.freeze().expect("Apps metadata registry freezes");
-        let discovery = handlers
-            .server_discovery()
-            .expect("frozen Apps metadata can enter server discovery");
+        let apps_id = handlers
+            .install_official_mcp_apps()
+            .expect("the official Apps descriptor and marker install alongside Tasks");
+        let (receipt, discovery) = handlers
+            .freeze_with_server_discovery()
+            .expect("Apps metadata registry freezes with matching discovery");
 
         assert_eq!(handlers.descriptor_registry().receipt(), Some(&receipt));
         assert_eq!(handlers.server_metadata_len(), 1);
+        assert!(
+            handlers
+                .descriptor_registry()
+                .descriptor(&tasks_id)
+                .is_some(),
+            "Apps installation preserves the already-registered Tasks descriptor"
+        );
+        assert_eq!(
+            handlers.descriptor_registry().descriptor(&apps_id),
+            Some(&fastmcp_protocol::official_mcp_apps_descriptor()),
+            "server discovery must use the protocol's official Apps descriptor"
+        );
         assert_eq!(
             discovery
                 .extensions
@@ -637,16 +681,30 @@ mod tests {
     }
 
     #[test]
+    fn official_apps_installation_duplicate_is_rejected_without_mutating_metadata() {
+        let mut handlers = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
+        let apps_id = handlers
+            .install_official_mcp_apps()
+            .expect("baseline official Apps installation succeeds");
+
+        assert_eq!(
+            handlers
+                .install_official_mcp_apps()
+                .expect_err("only the duplicate installation is rejected"),
+            ExtensionHandlerRegistrationError::OfficialMcpAppsAlreadyInstalled
+        );
+        assert_eq!(handlers.server_metadata_len(), 1);
+        assert_eq!(
+            handlers.descriptor_registry().descriptor(&apps_id),
+            Some(&fastmcp_protocol::official_mcp_apps_descriptor())
+        );
+    }
+
+    #[test]
     fn unnegotiated_extension_metadata_is_rejected_without_mutating_the_registry() {
-        let apps = official_apps_metadata_descriptor();
-        let apps_id = apps.id.clone();
-        let mut descriptors = ExtensionDescriptorRegistry::new();
-        descriptors
-            .register(apps)
-            .expect("the compile-linked official Apps descriptor registers");
+        let (descriptors, _) = tasks_descriptors();
         let mut handlers = ExtensionHandlerRegistry::new(descriptors);
-        let unnegotiated = ExtensionId::parse("com.example/unnegotiated-ui")
-            .expect("one different extension identifier is valid");
+        let unnegotiated = fastmcp_protocol::official_mcp_apps_extension_id();
         let marker = ExtensionSettings::new(json!({}))
             .expect("the unchanged official Apps server marker is an object");
 
@@ -658,7 +716,12 @@ mod tests {
             "only the extension identifier differs from the registered Apps metadata path"
         );
         assert_eq!(handlers.server_metadata_len(), 0);
-        assert!(handlers.descriptor_registry().descriptor(&apps_id).is_some());
+        assert!(
+            handlers
+                .descriptor_registry()
+                .descriptor(&unnegotiated)
+                .is_none()
+        );
 
         handlers.freeze().expect("unchanged registry still freezes");
         assert!(

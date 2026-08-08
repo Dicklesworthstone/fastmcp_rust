@@ -1247,7 +1247,9 @@ where
         operation: impl FnOnce(&mut SplitWsWriter<F>) -> Result<T, TransportError>,
     ) -> Result<T, TransportError> {
         let mut writer = self.inner.lock().map_err(|_| {
-            TransportError::Io(std::io::Error::other("WebSocket split writer lock poisoned"))
+            TransportError::Io(std::io::Error::other(
+                "WebSocket split writer lock poisoned",
+            ))
         })?;
         operation(&mut writer)
     }
@@ -1306,9 +1308,8 @@ where
         JsonRpcMessage::Request(request) => codec.encode_request(request)?,
         JsonRpcMessage::Response(response) => codec.encode_response(response)?,
     };
-    let text = String::from_utf8(bytes).map_err(|error| {
-        websocket_invalid_data(format!("Invalid UTF-8 in message: {error}"))
-    })?;
+    let text = String::from_utf8(bytes)
+        .map_err(|error| websocket_invalid_data(format!("Invalid UTF-8 in message: {error}")))?;
     writer.send_frame(&WsFrame::text(text.trim_end()))
 }
 
@@ -1374,7 +1375,9 @@ where
                             "Invalid UTF-8 in WebSocket text message: {error}"
                         )));
                     }
-                    return codec.decode_complete_message(&frame.payload).map_err(Into::into);
+                    return codec
+                        .decode_complete_message(&frame.payload)
+                        .map_err(Into::into);
                 }
 
                 *fragmented_text = true;
@@ -2168,7 +2171,8 @@ mod tests {
         )
         .into_split();
 
-        let JsonRpcMessage::Request(request) = server_recv.recv(&cx).expect("server split receive") else {
+        let JsonRpcMessage::Request(request) = server_recv.recv(&cx).expect("server split receive")
+        else {
             panic!("server split must preserve a client request");
         };
         assert_eq!(request.method, "server/split");
@@ -2192,7 +2196,9 @@ mod tests {
             .writer
             .clone();
         let mut client_reader = WsReader::new_client(Cursor::new(server_output));
-        let response = client_reader.read_frame().expect("unmasked server response");
+        let response = client_reader
+            .read_frame()
+            .expect("unmasked server response");
         assert_eq!(response.frame_type, WsFrameType::Text);
         assert_eq!(
             client_reader.read_frame().expect("server close").frame_type,
@@ -2206,10 +2212,12 @@ mod tests {
         )
         .into_split();
 
-        let JsonRpcMessage::Response(response) = client_recv.recv(&cx).expect("client split receive") else {
+        let JsonRpcMessage::Response(response) =
+            client_recv.recv(&cx).expect("client split receive")
+        else {
             panic!("client split must preserve a server response");
         };
-        assert_eq!(response.id, RequestId::Number(8));
+        assert_eq!(response.id, Some(RequestId::Number(8)));
         client_send
             .send(
                 &cx,
@@ -2256,14 +2264,16 @@ mod tests {
             ),
             Err(TransportError::Closed)
         ));
-        assert!(send_half
-            .writer
-            .inner
-            .lock()
-            .expect("server split writer lock")
-            .writer
-            .writer
-            .is_empty());
+        assert!(
+            send_half
+                .writer
+                .inner
+                .lock()
+                .expect("server split writer lock")
+                .writer
+                .writer
+                .is_empty()
+        );
     }
 
     #[test]

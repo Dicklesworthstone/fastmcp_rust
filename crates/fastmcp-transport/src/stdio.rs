@@ -48,6 +48,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::fd::AsFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::time::Duration;
 use std::time::Instant;
@@ -60,7 +62,10 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
 use crate::async_io::{AsyncLineReader, AsyncStdout, BoundedLineReadError};
-use crate::{Codec, CodecError, SendPermit, Transport, TransportError, TwoPhaseTransport};
+use crate::{
+    Codec, CodecError, SendPermit, Transport, TransportError, TransportRecvHalf, TransportSendHalf,
+    TwoPhaseTransport,
+};
 
 #[cfg(unix)]
 const STDIO_READINESS_POLL_SLICE: Duration = Duration::from_millis(10);
@@ -119,6 +124,46 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
             line_buffer: Vec::with_capacity(4096),
             closed: false,
         }
+    }
+
+    /// Separates NDJSON ingress from independently owned stdout egress.
+    ///
+    /// The receive half retains the exact bounded reader and codec state of
+    /// this transport. Its private sink is never used for application output;
+    /// the returned send half exclusively owns the supplied writer, allowing a
+    /// request-owned child to commit a response while the owner remains in a
+    /// blocking receive operation.
+    #[must_use]
+    pub fn into_split(self) -> (StdioRecvHalf<R>, StdioSendHalf<W>) {
+        let Self {
+            reader,
+            writer,
+            codec,
+            line_buffer,
+            closed,
+        } = self;
+        let mut send_codec = Codec::new();
+        send_codec.set_max_message_size(codec.max_message_size());
+        let terminal = Arc::new(AtomicBool::new(closed));
+
+        (
+            StdioRecvHalf {
+                transport: StdioTransport {
+                    reader,
+                    writer: Some(std::io::sink()),
+                    codec,
+                    line_buffer,
+                    closed,
+                },
+                terminal: Arc::clone(&terminal),
+            },
+            StdioSendHalf {
+                writer,
+                codec: send_codec,
+                closed,
+                terminal,
+            },
+        )
     }
 
     /// Returns whether this transport has entered a terminal state.
@@ -765,6 +810,200 @@ impl<R: Read, W: Write> Transport for StdioTransport<R, W> {
     }
 }
 
+/// Independently owned bounded NDJSON receive half for stdio transport.
+pub struct StdioRecvHalf<R> {
+    // Reuse the complete reader implementation with an inert private sink so
+    // the framing limits, partial-frame terminal behavior, and checkpoints
+    // remain identical to `StdioTransport::recv`.
+    transport: StdioTransport<R, std::io::Sink>,
+    terminal: Arc<AtomicBool>,
+}
+
+impl<R> StdioRecvHalf<R> {
+    /// Returns whether either split half has entered a terminal state.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
+    }
+}
+
+impl<R: Read> TransportRecvHalf for StdioRecvHalf<R> {
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        if self.is_closed() {
+            return Err(TransportError::Closed);
+        }
+
+        let result = self.transport.recv(cx);
+        if self.transport.is_closed() {
+            self.terminal.store(true, Ordering::Release);
+        }
+        if self.is_closed() && result.is_ok() {
+            return Err(TransportError::Closed);
+        }
+        result
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.terminal.store(true, Ordering::Release);
+        self.transport.close()
+    }
+}
+
+/// Independently owned NDJSON send half for stdio transport.
+pub struct StdioSendHalf<W> {
+    writer: Option<W>,
+    codec: Codec,
+    closed: bool,
+    terminal: Arc<AtomicBool>,
+}
+
+impl<W: Write> StdioSendHalf<W> {
+    fn mark_closed(&mut self) {
+        self.closed = true;
+        self.terminal.store(true, Ordering::Release);
+    }
+
+    /// Returns whether either split half has entered a terminal state.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed || self.terminal.load(Ordering::Acquire)
+    }
+
+    /// Reserves this split sender for one cancellation-preflighted frame.
+    pub fn reserve_send(&mut self, cx: &Cx) -> Result<StdioSendPermit<'_, W>, TransportError> {
+        if self.is_closed() || self.writer.is_none() {
+            return Err(TransportError::Closed);
+        }
+        stdio_checkpoint(cx)?;
+        Ok(StdioSendPermit { send_half: self })
+    }
+
+    fn write_encoded(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        let result = {
+            let writer = self.writer.as_mut().ok_or(TransportError::Closed)?;
+            writer.write_all(bytes).and_then(|()| writer.flush())
+        };
+        if let Err(error) = result {
+            self.mark_closed();
+            return Err(TransportError::Io(error));
+        }
+        Ok(())
+    }
+}
+
+/// A committed split-send reservation that performs no additional checkpoint.
+pub struct StdioSendPermit<'a, W> {
+    send_half: &'a mut StdioSendHalf<W>,
+}
+
+impl<W: Write> StdioSendPermit<'_, W> {
+    /// Commits one JSON-RPC message after the reservation preflight.
+    pub fn send(self, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if self.send_half.is_closed() {
+            return Err(TransportError::Closed);
+        }
+        let bytes = match message {
+            JsonRpcMessage::Request(request) => self.send_half.codec.encode_request(request)?,
+            JsonRpcMessage::Response(response) => self.send_half.codec.encode_response(response)?,
+        };
+        self.send_half.write_encoded(&bytes)
+    }
+
+    /// Commits one request after the reservation preflight.
+    pub fn send_request(self, request: &JsonRpcRequest) -> Result<(), TransportError> {
+        if self.send_half.is_closed() {
+            return Err(TransportError::Closed);
+        }
+        let bytes = self.send_half.codec.encode_request(request)?;
+        self.send_half.write_encoded(&bytes)
+    }
+
+    /// Commits one response after the reservation preflight.
+    pub fn send_response(self, response: &JsonRpcResponse) -> Result<(), TransportError> {
+        if self.send_half.is_closed() {
+            return Err(TransportError::Closed);
+        }
+        let bytes = self.send_half.codec.encode_response(response)?;
+        self.send_half.write_encoded(&bytes)
+    }
+}
+
+#[cfg(unix)]
+impl<W: Write + AsFd> StdioSendHalf<W> {
+    fn try_write_atomic_control(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        if self.is_closed() {
+            return Err(TransportError::Closed);
+        }
+        if bytes.len() > STDIO_ATOMIC_CONTROL_FRAME_MAX {
+            return Err(TransportError::ControlFrameTooLarge {
+                size: bytes.len(),
+                max: STDIO_ATOMIC_CONTROL_FRAME_MAX,
+            });
+        }
+
+        let result = (|| {
+            let writer = self.writer.as_mut().ok_or(TransportError::Closed)?;
+            let original_flags =
+                fcntl_getfl(&*writer).map_err(|error| TransportError::Io(error.into()))?;
+            fcntl_setfl(&*writer, original_flags | OFlags::NONBLOCK)
+                .map_err(|error| TransportError::Io(error.into()))?;
+
+            let write_result = rustix::io::write(&*writer, bytes);
+            let restore_result = fcntl_setfl(&*writer, original_flags);
+            match (write_result, restore_result) {
+                (Ok(written), Ok(())) if written == bytes.len() => Ok(()),
+                (Ok(_), Ok(())) => Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "stdio control frame was not written atomically",
+                ))),
+                (Err(error), _) => Err(TransportError::Io(error.into())),
+                (Ok(_), Err(error)) => Err(TransportError::Io(error.into())),
+            }
+        })();
+        if result.is_err() {
+            self.mark_closed();
+        }
+        result
+    }
+}
+
+#[cfg(unix)]
+impl StdioSendHalf<std::process::ChildStdin> {
+    /// Attempts one bounded, atomic control write without a request checkpoint.
+    pub fn try_send_control_message(
+        &mut self,
+        message: &JsonRpcMessage,
+    ) -> Result<(), TransportError> {
+        let bytes = match message {
+            JsonRpcMessage::Request(request) => self.codec.encode_request(request)?,
+            JsonRpcMessage::Response(response) => self.codec.encode_response(response)?,
+        };
+        self.try_write_atomic_control(&bytes)
+    }
+}
+
+impl<W: Write + Send> TransportSendHalf for StdioSendHalf<W> {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.reserve_send(cx)?.send(message)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        if self.is_closed() {
+            self.mark_closed();
+            drop(self.writer.take());
+            return Ok(());
+        }
+        self.mark_closed();
+        let Some(mut writer) = self.writer.take() else {
+            return Ok(());
+        };
+
+        let flush_result = writer.flush();
+        drop(writer);
+        flush_result.map_err(TransportError::Io)
+    }
+}
+
 /// Helper to create request/response without cloning for internal use.
 impl<R: Read, W: Write> StdioTransport<R, W> {
     /// Send a request directly (avoids clone in trait method).
@@ -1051,6 +1290,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(unix)]
+    use std::sync::{Mutex, mpsc};
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     #[cfg(unix)]
@@ -1102,6 +1343,50 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[cfg(unix)]
+    struct GatedReader {
+        inner: UnixStream,
+        started: mpsc::Sender<()>,
+        continue_read: mpsc::Receiver<()>,
+        first_read: bool,
+    }
+
+    #[cfg(unix)]
+    impl Read for GatedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.first_read {
+                self.first_read = true;
+                self.started
+                    .send(())
+                    .map_err(|_| std::io::Error::other("gated reader start receiver dropped"))?;
+                self.continue_read
+                    .recv()
+                    .map_err(|_| std::io::Error::other("gated reader continuation dropped"))?;
+            }
+            self.inner.read(buffer)
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    #[cfg(unix)]
+    impl Write for SharedWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let mut output = self
+                .0
+                .lock()
+                .map_err(|_| std::io::Error::other("shared writer lock poisoned"))?;
+            output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
@@ -1998,6 +2283,202 @@ mod tests {
         let request = JsonRpcRequest::new("test/method", None, 1i64);
         let result = transport.send_request_direct(&cx, &request);
         assert!(matches!(result, Err(TransportError::Cancelled)));
+    }
+
+    #[test]
+    fn stdio_split_halves_preserve_full_duplex_bounded_ndjson() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}\n\
+                      {\"jsonrpc\":\"2.0\",\"result\":{\"accepted\":true},\"id\":2}\n";
+        let mut output = Vec::new();
+        let cx = Cx::for_testing();
+
+        {
+            let transport = StdioTransport::new(Cursor::new(input.to_vec()), &mut output);
+            let (mut recv_half, mut send_half) = transport.into_split();
+
+            let JsonRpcMessage::Request(request) = recv_half.recv(&cx).expect("split request")
+            else {
+                panic!("expected inbound request");
+            };
+            assert_eq!(request.method, "tools/list");
+
+            send_half
+                .send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        fastmcp_protocol::RequestId::Number(1),
+                        serde_json::json!({"tools": []}),
+                    )),
+                )
+                .expect("split response");
+
+            let JsonRpcMessage::Response(response) = recv_half.recv(&cx).expect("split response")
+            else {
+                panic!("expected inbound response");
+            };
+            assert_eq!(response.id, Some(fastmcp_protocol::RequestId::Number(2)));
+        }
+
+        let mut output_reader = StdioTransport::new(Cursor::new(output), Vec::new());
+        let JsonRpcMessage::Response(response) = output_reader
+            .recv(&Cx::for_testing())
+            .expect("bounded split output")
+        else {
+            panic!("expected split output response");
+        };
+        assert_eq!(response.id, Some(fastmcp_protocol::RequestId::Number(1)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_split_send_commits_while_recv_is_blocked() {
+        let (mut peer, reader) = UnixStream::pair().expect("create split peer");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = SharedWriter(Arc::clone(&output));
+        let transport = StdioTransport::new(
+            GatedReader {
+                inner: reader,
+                started: started_tx,
+                continue_read: continue_rx,
+                first_read: false,
+            },
+            writer,
+        );
+        let (mut recv_half, mut send_half) = transport.into_split();
+
+        let receive = std::thread::spawn(move || recv_half.recv(&Cx::for_testing()));
+        started_rx
+            .recv()
+            .expect("receive half must block before ingress is released");
+
+        send_half
+            .send(
+                &Cx::for_testing(),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(1),
+                    serde_json::json!({"committed": true}),
+                )),
+            )
+            .expect("split response must commit while receive is blocked");
+
+        continue_tx.send(()).expect("release blocked split receive");
+        peer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":2}\n")
+            .expect("write split ingress");
+        let JsonRpcMessage::Request(request) = receive
+            .join()
+            .expect("split receive thread must not panic")
+            .expect("split ingress request")
+        else {
+            panic!("expected split ingress request");
+        };
+        assert_eq!(request.id, Some(fastmcp_protocol::RequestId::Number(2)));
+
+        let bytes = output.lock().expect("shared split output lock").clone();
+        let mut output_reader = StdioTransport::new(Cursor::new(bytes), Vec::new());
+        assert!(matches!(
+            output_reader.recv(&Cx::for_testing()),
+            Ok(JsonRpcMessage::Response(_))
+        ));
+    }
+
+    #[test]
+    fn stdio_split_send_rejects_after_close_without_writing() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}\n";
+        let mut output = Vec::new();
+        let cx = Cx::for_testing();
+
+        {
+            let transport = StdioTransport::new(Cursor::new(input.to_vec()), &mut output);
+            let (mut recv_half, mut send_half) = transport.into_split();
+
+            assert!(matches!(
+                recv_half.recv(&cx),
+                Ok(JsonRpcMessage::Request(_))
+            ));
+            send_half.close().expect("close split writer");
+            assert!(matches!(
+                send_half.send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        fastmcp_protocol::RequestId::Number(1),
+                        serde_json::json!({"tools": []}),
+                    )),
+                ),
+                Err(TransportError::Closed)
+            ));
+        }
+
+        assert!(output.is_empty(), "closed send half must not write a frame");
+    }
+
+    #[test]
+    fn stdio_split_reserve_send_commits_after_preflight_cancellation() {
+        let mut output = Vec::new();
+        let cx = Cx::for_testing();
+
+        {
+            let transport = StdioTransport::new(Cursor::new(Vec::new()), &mut output);
+            let (_recv_half, mut send_half) = transport.into_split();
+            let permit = send_half.reserve_send(&cx).expect("reserve split response");
+            cx.set_cancel_requested(true);
+
+            permit
+                .send_response(&JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(7),
+                    serde_json::json!({"committed": true}),
+                ))
+                .expect("reserved split response must commit without another checkpoint");
+        }
+
+        let mut output_reader = StdioTransport::new(Cursor::new(output), Vec::new());
+        let JsonRpcMessage::Response(response) = output_reader
+            .recv(&Cx::for_testing())
+            .expect("reserved split output")
+        else {
+            panic!("expected reserved split response");
+        };
+        assert_eq!(response.id, Some(fastmcp_protocol::RequestId::Number(7)));
+    }
+
+    #[test]
+    fn stdio_split_terminal_state_propagates_between_halves() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}\n";
+        let writer = DropAwareWriter {
+            dropped: Arc::new(AtomicBool::new(false)),
+            fail_flush: true,
+            bytes: Vec::new(),
+        };
+        let transport = StdioTransport::new(Cursor::new(input.to_vec()), writer);
+        let (mut recv_half, mut send_half) = transport.into_split();
+
+        let error = send_half
+            .send(
+                &Cx::for_testing(),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(1),
+                    serde_json::json!({"tools": []}),
+                )),
+            )
+            .expect_err("failed split write must be terminal");
+        assert!(matches!(error, TransportError::Io(_)));
+        assert!(send_half.is_closed());
+        assert!(recv_half.is_closed());
+        assert!(matches!(
+            recv_half.recv(&Cx::for_testing()),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn stdio_split_preserves_codec_limit_for_outbound_commit() {
+        let mut transport = StdioTransport::new(Cursor::new(Vec::new()), Vec::new());
+        transport.codec.set_max_message_size(128);
+        let (recv_half, send_half) = transport.into_split();
+
+        assert_eq!(recv_half.transport.codec.max_message_size(), 128);
+        assert_eq!(send_half.codec.max_message_size(), 128);
     }
 
     #[test]

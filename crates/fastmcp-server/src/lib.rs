@@ -161,10 +161,11 @@ use fastmcp_core::{
 use fastmcp_protocol::common_types::{Implementation, OpenMetadata};
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, ExtensionNegotiationError, ExtensionSettingsCompatibilityResolver,
+    ExtensionSettingsResolution,
 };
 use fastmcp_protocol::methods::{
     Legacy2024ListChangedCapability, Legacy2024ResourcesCapability, Legacy2024ServerCapabilities,
-    SUBSCRIPTIONS_LISTEN,
+    SUBSCRIPTIONS_LISTEN, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
     LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION, ModernVersionSupport, ProtocolEra,
@@ -174,15 +175,16 @@ use fastmcp_protocol::tasks_extension::{
     TaskStatusNotification as FinalTaskStatusNotification, set_task_subscription_ids,
 };
 use fastmcp_protocol::{
-    CallToolParams, CancelledParams, ClientExtensionDiscovery, CompleteResult, CoreResult,
-    CorrelationKey, DiscoveryCacheHints, ExtensionDescriptor, ExtensionDescriptorRegistry,
-    ExtensionId, ExtensionRegistryError, ExtensionRegistryReceipt, ExtensionSettings,
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SERVER_INFO_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
-    FinalCoreResult, FinalSubscriptionsAcknowledgedNotificationParams,
-    FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, GetPromptParams,
-    InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel,
-    LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+    CallToolParams, CancelledParams, ClientExtensionDiscovery, CompleteResult, CoreRequest,
+    CoreResult, CorrelationKey, DiscoveryCacheHints, ExtensionDescriptor,
+    ExtensionDescriptorRegistry, ExtensionId, ExtensionRegistryError, ExtensionRegistryReceipt,
+    ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SERVER_INFO_META_KEY,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult,
+    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
+    FinalSubscriptionsListenResult, GetPromptParams, InitializeParams, JsonRpcError,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
+    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
+    MAX_SERVER_INSTRUCTIONS_BYTES, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
     MissingRequiredClientCapabilityError, ProgressMarker, Prompt, ReadResourceParams, RequestId,
     Resource, ResourceTemplate, ResultMeta, SERVER_DISCOVER_METHOD, ServerCapabilities,
     ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
@@ -316,6 +318,15 @@ impl ExtensionSettingsCompatibilityResolver for BoxedExtensionSettingsResolver {
         server: &ExtensionSettings,
     ) -> Result<ExtensionSettings, ExtensionNegotiationError> {
         self.0.resolve(descriptor, client, server)
+    }
+
+    fn resolve_with_disposition(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettingsResolution, ExtensionNegotiationError> {
+        self.0.resolve_with_disposition(descriptor, client, server)
     }
 }
 
@@ -793,6 +804,54 @@ fn modern_protocol_version(request: &JsonRpcRequest) -> Option<&str> {
         .as_str()
 }
 
+/// Decodes an active final core request before middleware can short-circuit
+/// normal dispatch. Unknown methods remain eligible for extension fallback.
+fn decode_final_core_request_for_middleware(
+    request: &JsonRpcRequest,
+) -> McpResult<Option<CoreRequest>> {
+    if request.id.is_none() || final_2026_07_28_method(&request.method).is_none() {
+        return Ok(None);
+    }
+
+    CoreRequest::decode(
+        ProtocolEra::Modern2026,
+        &request.method,
+        request.params.as_ref(),
+    )
+    .map(Some)
+    .map_err(|error| McpError::invalid_params(error.to_string()))
+}
+
+/// Re-admits a middleware-produced final core response through the request's
+/// exact result algebra and returns its canonical wire representation.
+fn validate_final_core_middleware_response(
+    core_request: Option<&CoreRequest>,
+    request: &JsonRpcRequest,
+    value: serde_json::Value,
+) -> McpResult<serde_json::Value> {
+    let Some(core_request) = core_request else {
+        return Ok(value);
+    };
+
+    if core_request.method() != SERVER_DISCOVER_METHOD && value.get("resultType").is_none() {
+        return Err(McpError::internal_error(
+            "middleware response omits the required final result discriminator",
+        ));
+    }
+
+    let response_id = request.id.clone().ok_or_else(|| {
+        McpError::internal_error("final core middleware response is missing a request id")
+    })?;
+    let response = JsonRpcResponse::success(response_id, value);
+    let result = core_request.decode_response(&response).map_err(|_| {
+        McpError::internal_error("middleware response violates the final result contract")
+    })?;
+    let encoded = result.encode().map_err(|_| {
+        McpError::internal_error("middleware response violates the final result contract")
+    })?;
+    serde_json::from_str(&encoded).map_err(McpError::from)
+}
+
 fn is_exact_legacy_initialize(request: &JsonRpcRequest) -> bool {
     request.method == "initialize"
         && request
@@ -959,6 +1018,7 @@ fn is_request_only_method(method: &str) -> bool {
             | "initialize"
             | "ping"
             | "logging/setLevel"
+            | "completion/complete"
             | "tools/list"
             | "tools/call"
             | "resources/list"
@@ -3886,6 +3946,16 @@ impl Server {
             ));
         }
 
+        let final_core_request = match decode_final_core_request_for_middleware(request) {
+            Ok(request) => request,
+            Err(error) => {
+                if let Some(stats) = &self.stats {
+                    stats.record_request(&method, started_at.elapsed(), false);
+                }
+                return response_for_error(error);
+            }
+        };
+
         let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
         let result: McpResult<serde_json::Value> = (|| {
             for middleware in self.middleware.iter() {
@@ -3918,6 +3988,13 @@ impl Server {
         let result = match result {
             Ok(value) => self
                 .apply_middleware_response(&entered_middleware, &request_ctx, request, value)
+                .and_then(|value| {
+                    validate_final_core_middleware_response(
+                        final_core_request.as_ref(),
+                        request,
+                        value,
+                    )
+                })
                 .map_err(|error| {
                     self.apply_middleware_error(&entered_middleware, &request_ctx, request, error)
                 }),
@@ -4035,6 +4112,11 @@ impl Server {
             ));
         }
 
+        let final_core_request = match decode_final_core_request_for_middleware(&request) {
+            Ok(request) => request,
+            Err(error) => return response_for_error(error),
+        };
+
         let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
         let mut middleware_result = None;
         for middleware in self.middleware.iter() {
@@ -4096,6 +4178,13 @@ impl Server {
         let result = match result {
             Ok(value) => self
                 .apply_middleware_response(&entered_middleware, &request_ctx, &request, value)
+                .and_then(|value| {
+                    validate_final_core_middleware_response(
+                        final_core_request.as_ref(),
+                        &request,
+                        value,
+                    )
+                })
                 .map_err(|error| {
                     self.apply_middleware_error(&entered_middleware, &request_ctx, &request, error)
                 }),
@@ -4719,16 +4808,18 @@ impl Server {
     /// shutdown hook; running a hook concurrently with a live handler would
     /// violate the hook's quiescence contract.
     pub async fn run_stdio_with_cx(self, cx: &Cx) -> ! {
-        let mut pump = match cx.spawn_blocking(move |pump_cx| self.run_stdio_pump(&pump_cx)) {
-            Ok(pump) => pump,
-            Err(error) => {
-                error!(
-                    target: targets::SERVER,
-                    "Could not admit the stdio pump into the caller runtime: {error}"
-                );
-                std::process::exit(1);
-            }
-        };
+        let dispatch_cx = cx.clone();
+        let mut pump =
+            match cx.spawn_blocking(move |pump_cx| self.run_stdio_pump(&pump_cx, &dispatch_cx)) {
+                Ok(pump) => pump,
+                Err(error) => {
+                    error!(
+                        target: targets::SERVER,
+                        "Could not admit the stdio pump into the caller runtime: {error}"
+                    );
+                    std::process::exit(1);
+                }
+            };
         let exit_code = match pump.join(cx).await {
             Ok(exit_code) => exit_code,
             Err(error) => {
@@ -4742,7 +4833,7 @@ impl Server {
         std::process::exit(exit_code)
     }
 
-    fn run_stdio_pump(self, cx: &Cx) -> i32 {
+    fn run_stdio_pump(self, cx: &Cx, dispatch_cx: &Cx) -> i32 {
         // Initialize rich logging first, before any log output
         self.init_rich_logging();
 
@@ -4761,8 +4852,9 @@ impl Server {
         {
             let receive_fatal_output = Arc::clone(&fatal_notification_output);
             let send_fatal_output = Arc::clone(&fatal_notification_output);
-            self.run_loop(
+            self.run_loop_with_dispatch_cx(
                 cx,
+                dispatch_cx,
                 move |cx, worker_failed| {
                     transport.recv_until_or_stopped(cx, None, || {
                         if receive_fatal_output.load(Ordering::Acquire) {
@@ -4794,8 +4886,9 @@ impl Server {
         {
             let receive_fatal_output = Arc::clone(&fatal_notification_output);
             let send_fatal_output = Arc::clone(&fatal_notification_output);
-            self.run_loop(
+            self.run_loop_with_dispatch_cx(
                 cx,
+                dispatch_cx,
                 move |cx, worker_failed| {
                     if receive_fatal_output.load(Ordering::Acquire) {
                         worker_failed.store(true, Ordering::Release);
@@ -4955,20 +5048,42 @@ impl Server {
         R: TransportRecvHalf + Send + 'static,
         S: TransportSendHalf + 'static,
     {
+        self.run_split_transport_returning_with_dispatch_cx(cx, cx, recv_half, send_half)
+    }
+
+    /// Runs independently owned receive and send halves with an explicit
+    /// caller-owned context for modern request dispatch.
+    ///
+    /// A split receive pump may itself be placed on the caller's blocking
+    /// pool. In that arrangement `pump_cx` owns ingress cancellation, while
+    /// `dispatch_cx` must remain the runtime context that owns the blocking
+    /// pool used by concurrent modern request children.
+    pub fn run_split_transport_returning_with_dispatch_cx<R, S>(
+        self,
+        pump_cx: &Cx,
+        dispatch_cx: &Cx,
+        recv_half: R,
+        send_half: S,
+    ) -> McpResult<()>
+    where
+        R: TransportRecvHalf + Send + 'static,
+        S: TransportSendHalf + 'static,
+    {
         self.init_rich_logging();
         let recv_half = SharedRecvHalf::new(recv_half);
         let send_half = SharedSendHalf::new(send_half);
         let notification_failure = Arc::new(AtomicBool::new(false));
         let notification_sender = create_split_transport_notification_sender(
             send_half.clone(),
-            cx.clone(),
+            pump_cx.clone(),
             Arc::clone(&notification_failure),
         );
 
         let recv_for_run = recv_half.clone();
         let send_for_run = send_half.clone();
-        let run_result = self.run_loop_returning(
-            cx,
+        let run_result = self.run_loop_returning_with_dispatch_cx(
+            pump_cx,
+            dispatch_cx,
             move |cx, _worker_failed| recv_for_run.recv(cx),
             move |cx, message| send_for_run.send(cx, message),
             notification_sender,
@@ -4984,7 +5099,7 @@ impl Server {
         combine_split_transport_results(run_result, recv_close, send_close)
     }
 
-    fn run_split_transport_with_label<R, S>(
+    async fn run_split_transport_with_label<R, S>(
         self,
         cx: &Cx,
         recv_half: R,
@@ -4995,29 +5110,41 @@ impl Server {
         R: TransportRecvHalf + Send + 'static,
         S: TransportSendHalf + 'static,
     {
-        self.init_rich_logging();
-        let recv_half = SharedRecvHalf::new(recv_half);
-        let send_half = SharedSendHalf::new(send_half);
-        let connection_failure = Arc::new(AtomicBool::new(false));
-        let notification_sender = create_split_transport_notification_sender(
-            send_half.clone(),
-            cx.clone(),
-            Arc::clone(&connection_failure),
-        );
-
-        let recv_for_run = recv_half.clone();
-        let send_for_run = send_half.clone();
-        let mut exit_code = self.run_loop(
-            cx,
-            move |cx, _worker_failed| recv_for_run.recv(cx),
-            move |cx, message| send_for_run.send(cx, message),
-            notification_sender,
-            connection_failure,
-            transport_label,
-        );
-        if recv_half.close().is_err() || send_half.close().is_err() {
-            exit_code = 1;
-        }
+        let dispatch_cx = cx.clone();
+        let mut pump = match cx.spawn_blocking(move |pump_cx| {
+            self.run_split_transport_returning_with_dispatch_cx(
+                &pump_cx,
+                &dispatch_cx,
+                recv_half,
+                send_half,
+            )
+        }) {
+            Ok(pump) => pump,
+            Err(error) => {
+                error!(
+                    target: targets::SERVER,
+                    "Could not admit the {transport_label} split transport pump into the caller runtime: {error}"
+                );
+                std::process::exit(1);
+            }
+        };
+        let exit_code = match pump.join(cx).await {
+            Ok(Ok(())) => 0,
+            Ok(Err(error)) => {
+                error!(
+                    target: targets::SERVER,
+                    "{transport_label} split transport pump failed: {error}"
+                );
+                1
+            }
+            Err(error) => {
+                error!(
+                    target: targets::SERVER,
+                    "Caller-owned {transport_label} split transport pump ended without a final status: {error:?}"
+                );
+                1
+            }
+        };
         std::process::exit(exit_code)
     }
 
@@ -5058,11 +5185,12 @@ impl Server {
         block_on(async move {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
             self.run_split_transport_with_label(&cx, recv_half, send_half, "sse")
+                .await
         })
     }
 
     /// Runs the server using SSE transport with a provided Cx.
-    pub fn run_sse_with_cx<W, R>(
+    pub async fn run_sse_with_cx<W, R>(
         self,
         cx: &Cx,
         writer: W,
@@ -5076,6 +5204,7 @@ impl Server {
         let (recv_half, send_half) =
             SseServerTransport::new(writer, request_source, endpoint_url).into_split();
         self.run_split_transport_with_label(cx, recv_half, send_half, "sse")
+            .await
     }
 
     /// Runs the server using WebSocket transport with a testing Cx.
@@ -5579,8 +5708,34 @@ impl Server {
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
-        self.run_loop_pump_with_policy(
+        self.run_loop_with_dispatch_cx(
             cx,
+            cx,
+            recv,
+            send,
+            notification_sender,
+            connection_failure,
+            transport_label,
+        )
+    }
+
+    fn run_loop_with_dispatch_cx<R, S>(
+        self,
+        pump_cx: &Cx,
+        dispatch_cx: &Cx,
+        recv: R,
+        send: S,
+        notification_sender: NotificationSender,
+        connection_failure: Arc<AtomicBool>,
+        transport_label: &'static str,
+    ) -> i32
+    where
+        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
+        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
+    {
+        self.run_loop_pump_with_policy(
+            pump_cx,
+            dispatch_cx,
             recv,
             send,
             notification_sender,
@@ -5614,8 +5769,34 @@ impl Server {
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
-        match self.run_loop_pump_with_policy(
+        self.run_loop_returning_with_dispatch_cx(
             cx,
+            cx,
+            move |cx, worker_failed| recv(cx, worker_failed),
+            send,
+            notification_sender,
+            connection_failure,
+            transport_label,
+        )
+    }
+
+    fn run_loop_returning_with_dispatch_cx<R, S>(
+        self,
+        pump_cx: &Cx,
+        dispatch_cx: &Cx,
+        mut recv: R,
+        send: S,
+        notification_sender: NotificationSender,
+        connection_failure: Option<Arc<AtomicBool>>,
+        transport_label: &'static str,
+    ) -> McpResult<()>
+    where
+        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
+        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
+    {
+        match self.run_loop_pump_with_policy(
+            pump_cx,
+            dispatch_cx,
             move |cx, worker_failed| recv(cx, worker_failed),
             send,
             notification_sender,
@@ -5648,6 +5829,7 @@ impl Server {
     {
         self.run_loop_pump_with_policy(
             cx,
+            cx,
             recv,
             send,
             notification_sender,
@@ -5662,6 +5844,7 @@ impl Server {
     fn run_loop_pump_with_policy<R, S>(
         self,
         cx: &Cx,
+        dispatch_cx: &Cx,
         mut recv: R,
         send: S,
         _notification_sender: NotificationSender,
@@ -6239,7 +6422,7 @@ impl Server {
                         let request_send = Arc::clone(&send);
                         let request_renderer = traffic_renderer.clone();
                         let request = request;
-                        let submitted = cx.spawn_blocking(move |request_cx| {
+                        let submitted = dispatch_cx.spawn_blocking(move |request_cx| {
                             let mut reservation = reservation;
                             reservation.begin();
                             let dispatched = std::panic::catch_unwind(
@@ -9788,6 +9971,46 @@ mod lib_unit_tests {
     static LIVE_HTTP_LISTENER_WAITS: AtomicUsize = AtomicUsize::new(0);
     static LIVE_HTTP_CONNECTION_READ_WAITS: AtomicUsize = AtomicUsize::new(0);
 
+    #[test]
+    fn boxed_extension_settings_resolver_preserves_inactive_disposition() {
+        struct InactiveResolver;
+
+        impl ExtensionSettingsCompatibilityResolver for InactiveResolver {
+            fn resolve(
+                &mut self,
+                descriptor: &ExtensionDescriptor,
+                _client: &ExtensionSettings,
+                _server: &ExtensionSettings,
+            ) -> Result<ExtensionSettings, ExtensionNegotiationError> {
+                Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                    descriptor.id.to_string(),
+                ))
+            }
+
+            fn resolve_with_disposition(
+                &mut self,
+                _descriptor: &ExtensionDescriptor,
+                _client: &ExtensionSettings,
+                _server: &ExtensionSettings,
+            ) -> Result<ExtensionSettingsResolution, ExtensionNegotiationError> {
+                Ok(ExtensionSettingsResolution::Inactive)
+            }
+        }
+
+        let settings = ExtensionSettings::new(serde_json::json!({}))
+            .expect("empty extension settings must be valid");
+        let mut resolver = BoxedExtensionSettingsResolver(Box::new(InactiveResolver));
+        let disposition = resolver
+            .resolve_with_disposition(
+                &fastmcp_protocol::extensions::official_mcp_apps_descriptor(),
+                &settings,
+                &settings,
+            )
+            .expect("boxed resolver must retain an inactive disposition");
+
+        assert_eq!(disposition, ExtensionSettingsResolution::Inactive);
+    }
+
     #[derive(Debug, Default)]
     struct HttpOverlapControlState {
         enabled: bool,
@@ -10034,9 +10257,11 @@ mod lib_unit_tests {
         runtime
             .handle()
             .try_spawn_with_cx(move |cx| async move {
+                let dispatch_cx = cx.clone();
                 let result = match cx.spawn_blocking(move |pump_cx| {
                     server.run_loop_pump_with_policy(
                         &pump_cx,
+                        &dispatch_cx,
                         recv,
                         move |_send_cx, message| {
                             responses.record(message.clone());
@@ -10078,8 +10303,14 @@ mod lib_unit_tests {
         runtime
             .handle()
             .try_spawn_with_cx(move |cx| async move {
+                let dispatch_cx = cx.clone();
                 let result = match cx.spawn_blocking(move |pump_cx| {
-                    server.run_split_transport_returning_with_cx(&pump_cx, recv, send)
+                    server.run_split_transport_returning_with_dispatch_cx(
+                        &pump_cx,
+                        &dispatch_cx,
+                        recv,
+                        send,
+                    )
                 }) {
                     Ok(mut pump) => pump
                         .join(&cx)
@@ -10426,6 +10657,80 @@ mod lib_unit_tests {
             Some(i32::from(McpErrorCode::InvalidRequest))
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn final_core_middleware_short_circuit_cannot_bypass_request_admission() {
+        struct ShortCircuitMiddleware;
+
+        impl Middleware for ShortCircuitMiddleware {
+            fn on_request(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+            ) -> McpResult<MiddlewareDecision> {
+                Ok(MiddlewareDecision::Respond(serde_json::json!({})))
+            }
+        }
+
+        let server = Server::new("final-core-short-circuit", "1.0.0")
+            .middleware(ShortCircuitMiddleware)
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 72, InboundRequestTransport::Memory);
+        let request = JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 72_i64);
+
+        let response = server
+            .dispatch_stateless(&inbound, &request)
+            .expect("a malformed final request with an id receives an error response");
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InvalidParams))
+        );
+        assert!(response.result.is_none());
+    }
+
+    #[test]
+    fn final_core_middleware_rejects_one_field_result_type_mutation() {
+        struct ResultTypeMutationMiddleware;
+
+        impl Middleware for ResultTypeMutationMiddleware {
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+                mut response: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                assert_eq!(response["resultType"], "complete");
+                response["resultType"] = serde_json::json!("input_required");
+                Ok(response)
+            }
+        }
+
+        let server = Server::new("final-core-result-type", "1.0.0")
+            .middleware(ResultTypeMutationMiddleware)
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 73, InboundRequestTransport::Memory);
+        let request = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            73_i64,
+        );
+
+        let response = server
+            .dispatch_stateless(&inbound, &request)
+            .expect("a malformed middleware result with an id receives an error response");
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InternalError))
+        );
+        assert!(response.result.is_none());
     }
 
     #[test]
@@ -13208,10 +13513,12 @@ mod lib_unit_tests {
         let notification_failure = Arc::new(AtomicBool::new(false));
         let failure_from_receive = Arc::clone(&notification_failure);
 
+        let cx = Cx::for_testing();
         let exit_code = Server::new("notification-eof-race-test", "1.0.0")
             .build()
             .run_loop_pump_with_policy(
-                &Cx::for_testing(),
+                &cx,
+                &cx,
                 move |_receive_cx, _worker_failed| {
                     // Model notification output failing immediately after a
                     // stop-aware receiver's final predicate check but before
@@ -13336,6 +13643,33 @@ mod lib_unit_tests {
             _ctx: &McpContext,
             params: LegacyCompletionParams,
         ) -> McpResult<CompletionValues> {
+            Ok(CompletionValues {
+                values: vec![format!("legacy:{}", params.argument.value)],
+                total: Some(1),
+                has_more: Some(false),
+            })
+        }
+
+        fn complete_final(
+            &self,
+            _ctx: &McpContext,
+            _params: FinalCompletionParams,
+        ) -> McpResult<CompletionValues> {
+            Err(McpError::method_not_found("completion/complete"))
+        }
+    }
+
+    struct CountingLegacyCompletionHandler {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CompletionHandler for CountingLegacyCompletionHandler {
+        fn complete_legacy(
+            &self,
+            _ctx: &McpContext,
+            params: LegacyCompletionParams,
+        ) -> McpResult<CompletionValues> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
             Ok(CompletionValues {
                 values: vec![format!("legacy:{}", params.argument.value)],
                 total: Some(1),
@@ -14320,6 +14654,70 @@ mod lib_unit_tests {
                 .result
                 .as_ref()
                 .is_some_and(|result| result.get("resultType").is_none())
+        );
+    }
+
+    #[test]
+    fn live_runtime_rejects_completion_notification_without_invoking_handler() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let completion_params = serde_json::json!({
+            "ref": {"type": "ref/prompt", "name": "deploy"},
+            "argument": {"name": "environment", "value": "sta"},
+        });
+
+        Server::new("live-legacy-completion-id", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .completion_handler(CountingLegacyCompletionHandler {
+                calls: Arc::clone(&calls),
+            })
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyScriptTransport {
+                    inbound: std::collections::VecDeque::from([
+                        exact_legacy_initialize_request(63, serde_json::json!("1.0.0")),
+                        JsonRpcMessage::Request(JsonRpcRequest::notification(
+                            "notifications/initialized",
+                            None,
+                        )),
+                        JsonRpcMessage::Request(JsonRpcRequest::notification(
+                            "completion/complete",
+                            Some(completion_params.clone()),
+                        )),
+                        JsonRpcMessage::Request(JsonRpcRequest::new(
+                            "completion/complete",
+                            Some(completion_params),
+                            64_i64,
+                        )),
+                    ]),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .expect("the rejected notification must leave the valid request executable");
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        let sent = sent
+            .lock()
+            .expect("completion notification sent-message mutex must not be poisoned");
+        let [
+            JsonRpcMessage::Response(initialize),
+            JsonRpcMessage::Response(completion),
+        ] = sent.as_slice()
+        else {
+            panic!("only initialize and the ID-bearing completion may emit responses");
+        };
+        assert_eq!(initialize.id, Some(63_i64.into()));
+        assert_eq!(completion.id, Some(64_i64.into()));
+        assert_eq!(
+            completion
+                .result
+                .as_ref()
+                .and_then(|result| result["completion"]["values"].as_array())
+                .and_then(|values| values.first())
+                .and_then(serde_json::Value::as_str),
+            Some("legacy:sta")
         );
     }
 

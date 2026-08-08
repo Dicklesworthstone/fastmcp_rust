@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use fastmcp_core::sha256_bounded;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::methods::{final_2026_07_28_method, legacy_2024_11_05_method};
@@ -48,6 +49,62 @@ pub const OFFICIAL_TASKS_METHODS: [&str; 3] = ["tasks/get", "tasks/update", "tas
 pub const OFFICIAL_TASKS_NOTIFICATION: &str = "notifications/tasks";
 /// Official Tasks `tools/call` result discriminator.
 pub const OFFICIAL_TASKS_RESULT_DISCRIMINATOR: &str = "task";
+
+/// Official MCP Apps extension identifier.
+pub const OFFICIAL_MCP_APPS_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
+/// MCP Apps HTML resource MIME type required for activation.
+pub const MCP_APPS_HTML_MIME_TYPE: &str = "text/html;profile=mcp-app";
+/// Stable MCP Apps client settings schema identity.
+pub const MCP_APPS_CLIENT_SETTINGS_SCHEMA_ID: &str = "apps-2026-01-26-client-mime-types-v1";
+/// Stable MCP Apps server empty-marker schema identity.
+pub const MCP_APPS_SERVER_SETTINGS_SCHEMA_ID: &str =
+    "fastmcp-2026-07-28-apps-empty-server-marker-v1";
+/// Stable MCP Apps bilateral compatibility resolver identity.
+pub const MCP_APPS_NEGOTIATION_RESOLVER_ID: &str = "fastmcp-apps-bilateral-resolver-v1";
+/// Stable MCP Apps activation predicate identity.
+pub const MCP_APPS_ACTIVATION_PREDICATE_ID: &str = "fastmcp-2026-07-28-apps-bilateral-mime-v1";
+/// Maximum MIME types retained in one MCP Apps client advertisement.
+pub const MAX_MCP_APPS_MIME_TYPES: usize = 128;
+/// Maximum UTF-8 bytes in one MCP Apps MIME type.
+pub const MAX_MCP_APPS_MIME_TYPE_BYTES: usize = 512;
+
+/// MCP Apps View-to-Host request method names.
+pub const MCP_APPS_OPEN_LINK_METHOD: &str = "ui/open-link";
+/// MCP Apps View-to-Host request method name.
+pub const MCP_APPS_DOWNLOAD_FILE_METHOD: &str = "ui/download-file";
+/// MCP Apps View-to-Host request method name.
+pub const MCP_APPS_MESSAGE_METHOD: &str = "ui/message";
+/// MCP Apps View-to-Host request method name.
+pub const MCP_APPS_UPDATE_MODEL_CONTEXT_METHOD: &str = "ui/update-model-context";
+/// MCP Apps Host-to-View request method name.
+pub const MCP_APPS_RESOURCE_TEARDOWN_METHOD: &str = "ui/resource-teardown";
+/// MCP Apps View-to-Host request method name.
+pub const MCP_APPS_INITIALIZE_METHOD: &str = "ui/initialize";
+/// MCP Apps View-to-Host request method name.
+pub const MCP_APPS_REQUEST_DISPLAY_MODE_METHOD: &str = "ui/request-display-mode";
+
+/// MCP Apps notification method names.
+pub const MCP_APPS_SANDBOX_PROXY_READY_NOTIFICATION: &str = "ui/notifications/sandbox-proxy-ready";
+/// MCP Apps notification method name.
+pub const MCP_APPS_SANDBOX_RESOURCE_READY_NOTIFICATION: &str =
+    "ui/notifications/sandbox-resource-ready";
+/// MCP Apps notification method name.
+pub const MCP_APPS_SIZE_CHANGED_NOTIFICATION: &str = "ui/notifications/size-changed";
+/// MCP Apps notification method name.
+pub const MCP_APPS_TOOL_INPUT_NOTIFICATION: &str = "ui/notifications/tool-input";
+/// MCP Apps notification method name.
+pub const MCP_APPS_TOOL_INPUT_PARTIAL_NOTIFICATION: &str = "ui/notifications/tool-input-partial";
+/// MCP Apps notification method name.
+pub const MCP_APPS_TOOL_RESULT_NOTIFICATION: &str = "ui/notifications/tool-result";
+/// MCP Apps notification method name.
+pub const MCP_APPS_TOOL_CANCELLED_NOTIFICATION: &str = "ui/notifications/tool-cancelled";
+/// MCP Apps notification method name.
+pub const MCP_APPS_HOST_CONTEXT_CHANGED_NOTIFICATION: &str =
+    "ui/notifications/host-context-changed";
+/// MCP Apps notification method name.
+pub const MCP_APPS_REQUEST_TEARDOWN_NOTIFICATION: &str = "ui/notifications/request-teardown";
+/// MCP Apps notification method name.
+pub const MCP_APPS_INITIALIZED_NOTIFICATION: &str = "ui/notifications/initialized";
 
 /// A validated extension identifier, preserving its exact wire spelling.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -150,6 +207,230 @@ pub fn official_tasks_empty_settings() -> ExtensionSettings {
     ExtensionSettings(Map::new())
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpAppsClientSettingsWire {
+    mime_types: Vec<String>,
+}
+
+/// Strict, ordered MCP Apps client capability settings.
+///
+/// The wire object is deliberately closed and requires `mimeTypes`. Its array
+/// preserves peer order and schema-valid duplicates exactly; support is granted
+/// solely by the presence of the exact HTML profile MIME type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpAppsClientSettings {
+    mime_types: Vec<String>,
+}
+
+impl McpAppsClientSettings {
+    /// Validates ordered client-advertised MIME types without normalizing them.
+    pub fn new(mime_types: Vec<String>) -> Result<Self, ExtensionRegistryError> {
+        if mime_types.len() > MAX_MCP_APPS_MIME_TYPES
+            || mime_types
+                .iter()
+                .any(|mime_type| mime_type.len() > MAX_MCP_APPS_MIME_TYPE_BYTES)
+        {
+            return Err(ExtensionRegistryError::SettingsTooLarge);
+        }
+
+        // The typed limit is not permitted to bypass the generic discovery
+        // bound. `to_extension_settings` relies on this validation when it
+        // constructs the private generic settings value directly.
+        validate_settings_map(&mcp_apps_client_settings_map(&mime_types))?;
+        Ok(Self { mime_types })
+    }
+
+    /// Decodes the closed MCP Apps client settings object.
+    pub fn from_extension_settings(
+        settings: &ExtensionSettings,
+    ) -> Result<Self, ExtensionRegistryError> {
+        let wire = serde_json::from_value::<McpAppsClientSettingsWire>(Value::Object(
+            settings.as_object().clone(),
+        ))
+        .map_err(|_| ExtensionRegistryError::SettingsCodecRejected)?;
+        Self::new(wire.mime_types)
+    }
+
+    /// Returns advertised MIME types in their exact peer-supplied order.
+    #[must_use]
+    pub fn mime_types(&self) -> &[String] {
+        &self.mime_types
+    }
+
+    /// Returns whether this host advertises the required MCP Apps HTML profile.
+    #[must_use]
+    pub fn supports_mcp_apps_html(&self) -> bool {
+        self.mime_types
+            .iter()
+            .any(|mime_type| mime_type == MCP_APPS_HTML_MIME_TYPE)
+    }
+
+    /// Re-encodes the validated settings without changing order or duplicates.
+    pub fn to_extension_settings(&self) -> ExtensionSettings {
+        ExtensionSettings(mcp_apps_client_settings_map(&self.mime_types))
+    }
+}
+
+fn mcp_apps_client_settings_map(mime_types: &[String]) -> Map<String, Value> {
+    let mut map = Map::new();
+    map.insert(
+        "mimeTypes".to_owned(),
+        Value::Array(mime_types.iter().cloned().map(Value::String).collect()),
+    );
+    map
+}
+
+/// Returns the exact empty MCP Apps server settings marker.
+#[must_use]
+pub fn official_mcp_apps_empty_server_settings() -> ExtensionSettings {
+    ExtensionSettings(Map::new())
+}
+
+/// Returns the validated identifier for the official MCP Apps extension.
+#[must_use]
+pub fn official_mcp_apps_extension_id() -> ExtensionId {
+    ExtensionId::parse(OFFICIAL_MCP_APPS_EXTENSION_ID)
+        .expect("the fixed official MCP Apps identifier satisfies the extension grammar")
+}
+
+/// Returns the descriptor for MCP Apps capability negotiation.
+///
+/// Apps bridge methods belong to the host/View postMessage channel, not the
+/// client/server extension-dispatch surface. This descriptor therefore owns
+/// only the bilateral capability settings contract.
+#[must_use]
+pub fn official_mcp_apps_descriptor() -> ExtensionDescriptor {
+    ExtensionDescriptor {
+        id: official_mcp_apps_extension_id(),
+        client_settings: ExtensionSettingsSchema {
+            schema_id: MCP_APPS_CLIENT_SETTINGS_SCHEMA_ID.to_owned(),
+            codec_id: MCP_APPS_CLIENT_SETTINGS_SCHEMA_ID.to_owned(),
+        },
+        server_settings: ExtensionSettingsSchema {
+            schema_id: MCP_APPS_SERVER_SETTINGS_SCHEMA_ID.to_owned(),
+            codec_id: MCP_APPS_SERVER_SETTINGS_SCHEMA_ID.to_owned(),
+        },
+        resolver: ExtensionNegotiationResolver {
+            id: MCP_APPS_NEGOTIATION_RESOLVER_ID.to_owned(),
+            version: 1,
+            fallback: ExtensionFallbackPolicy::InactiveOnEitherPeer,
+        },
+        method: None,
+        notification: None,
+        result_discriminator: None,
+        routing_headers: Vec::new(),
+        stdio_correlation: None,
+    }
+}
+
+/// Registers the MCP Apps capability descriptor.
+///
+/// Registration never activates Apps. The local gates, exact empty server
+/// marker, and a current client MIME advertisement must all be present before
+/// [`resolve_official_mcp_apps_settings`] can activate it.
+pub fn register_official_mcp_apps_extension(
+    registry: &mut ExtensionDescriptorRegistry,
+) -> Result<ExtensionId, ExtensionRegistryError> {
+    let id = official_mcp_apps_extension_id();
+    registry.register(official_mcp_apps_descriptor())?;
+    Ok(id)
+}
+
+/// Typed MCP Apps compatibility resolver that delegates every non-Apps
+/// descriptor to its supplied fallback.
+///
+/// One frozen registry may contain Apps alongside Tasks or private extensions.
+/// This wrapper consumes only the official Apps descriptor, so callers can
+/// compose it with their existing resolver rather than replacing it.
+#[derive(Clone, Debug)]
+pub struct McpAppsNegotiationResolver<R = OfficialTasksNegotiationResolver> {
+    fallback: R,
+}
+
+impl<R> McpAppsNegotiationResolver<R> {
+    /// Wraps an existing resolver with the official MCP Apps settings rules.
+    #[must_use]
+    pub const fn with_fallback(fallback: R) -> Self {
+        Self { fallback }
+    }
+}
+
+/// Resolves the official Tasks descriptor when Apps and Tasks share a registry.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OfficialTasksNegotiationResolver;
+
+/// Returns the standalone typed resolver used by the official MCP Apps descriptor.
+///
+/// Use [`McpAppsNegotiationResolver::with_fallback`] when the registry also
+/// contains private descriptors. The default fallback resolves official Tasks.
+#[must_use]
+pub const fn official_mcp_apps_negotiation_resolver() -> McpAppsNegotiationResolver {
+    McpAppsNegotiationResolver::with_fallback(OfficialTasksNegotiationResolver)
+}
+
+/// Resolves a bilateral MCP Apps capability without comparing asymmetric peer objects.
+///
+/// On success, the effective settings retain the client's exact validated
+/// `mimeTypes` array. Missing peer advertisements take the descriptor's
+/// ordinary inactive fallback; malformed present settings reject negotiation.
+pub fn resolve_official_mcp_apps_settings(
+    descriptor: &ExtensionDescriptor,
+    client: &ExtensionSettings,
+    server: &ExtensionSettings,
+) -> Result<ExtensionSettingsResolution, ExtensionNegotiationError> {
+    if descriptor.id.as_str() != OFFICIAL_MCP_APPS_EXTENSION_ID
+        || descriptor.client_settings.schema_id != MCP_APPS_CLIENT_SETTINGS_SCHEMA_ID
+        || descriptor.client_settings.codec_id != MCP_APPS_CLIENT_SETTINGS_SCHEMA_ID
+        || descriptor.server_settings.schema_id != MCP_APPS_SERVER_SETTINGS_SCHEMA_ID
+        || descriptor.server_settings.codec_id != MCP_APPS_SERVER_SETTINGS_SCHEMA_ID
+        || descriptor.resolver.id != MCP_APPS_NEGOTIATION_RESOLVER_ID
+        || descriptor.resolver.version != 1
+        || descriptor.resolver.fallback != ExtensionFallbackPolicy::InactiveOnEitherPeer
+    {
+        return Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+            descriptor.id.to_string(),
+        ));
+    }
+    if !server.as_object().is_empty() {
+        return Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+            descriptor.id.to_string(),
+        ));
+    }
+    let client = McpAppsClientSettings::from_extension_settings(client).map_err(|_| {
+        ExtensionNegotiationError::SettingsCompatibilityRejected(descriptor.id.to_string())
+    })?;
+    if !client.supports_mcp_apps_html() {
+        return Ok(ExtensionSettingsResolution::Inactive);
+    }
+    Ok(ExtensionSettingsResolution::Active(
+        client.to_extension_settings(),
+    ))
+}
+
+fn resolve_official_tasks_settings(
+    descriptor: &ExtensionDescriptor,
+    client: &ExtensionSettings,
+    server: &ExtensionSettings,
+) -> Result<ExtensionSettings, ExtensionNegotiationError> {
+    if descriptor.id.as_str() != OFFICIAL_TASKS_EXTENSION_ID
+        || descriptor.client_settings.schema_id != OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID
+        || descriptor.client_settings.codec_id != OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID
+        || descriptor.server_settings.schema_id != OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID
+        || descriptor.server_settings.codec_id != OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID
+        || descriptor.resolver.id != OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID
+        || descriptor.resolver.version != 1
+        || descriptor.resolver.fallback != ExtensionFallbackPolicy::RejectOneSided
+    {
+        return Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+            descriptor.id.to_string(),
+        ));
+    }
+    enforce_official_tasks_empty_settings(&descriptor.id, client)?;
+    enforce_official_tasks_empty_settings(&descriptor.id, server)?;
+    Ok(official_tasks_empty_settings())
+}
+
 fn validate_settings_map(map: &Map<String, Value>) -> Result<(), ExtensionRegistryError> {
     if map.len() > MAX_EXTENSION_SETTINGS_ENTRIES {
         return Err(ExtensionRegistryError::SettingsTooManyEntries);
@@ -244,6 +525,8 @@ pub enum ExtensionFallbackPolicy {
     ServerInactiveFallback,
     /// A missing server advertisement selects the descriptor's inactive fallback.
     ClientInactiveFallback,
+    /// Either missing peer advertisement selects the descriptor's inactive fallback.
+    InactiveOnEitherPeer,
 }
 
 /// Stable, total settings compatibility resolver metadata.
@@ -611,6 +894,8 @@ pub enum ExtensionInactiveReason {
     ServerInactiveFallback,
     /// The registered fallback was selected after the server omitted support.
     ClientInactiveFallback,
+    /// Both peers advertised valid settings, but the typed resolver selected an inactive fallback.
+    SettingsInactiveFallback,
 }
 
 /// Normalized typed settings produced by a descriptor's compatibility resolver.
@@ -772,6 +1057,15 @@ impl fmt::Display for ExtensionNegotiationError {
 
 impl std::error::Error for ExtensionNegotiationError {}
 
+/// The activation outcome selected by a typed settings compatibility resolver.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExtensionSettingsResolution {
+    /// Compatible settings activate the extension for this exchange.
+    Active(ExtensionSettings),
+    /// Valid settings select the descriptor's ordinary inactive fallback.
+    Inactive,
+}
+
 /// A typed compatibility resolver selected by a frozen descriptor ID/version.
 ///
 /// This protocol-only seam deliberately accepts no server or client runtime
@@ -785,6 +1079,21 @@ pub trait ExtensionSettingsCompatibilityResolver {
         client: &ExtensionSettings,
         server: &ExtensionSettings,
     ) -> Result<ExtensionSettings, ExtensionNegotiationError>;
+
+    /// Resolves settings and may select an ordinary inactive fallback.
+    ///
+    /// Existing resolvers that only implement [`Self::resolve`] remain active
+    /// on success. Descriptors with a valid non-activating setting profile can
+    /// override this method without treating that profile as malformed.
+    fn resolve_with_disposition(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettingsResolution, ExtensionNegotiationError> {
+        self.resolve(descriptor, client, server)
+            .map(ExtensionSettingsResolution::Active)
+    }
 }
 
 impl<F> ExtensionSettingsCompatibilityResolver for F
@@ -802,6 +1111,56 @@ where
         server: &ExtensionSettings,
     ) -> Result<ExtensionSettings, ExtensionNegotiationError> {
         self(descriptor, client, server)
+    }
+}
+
+impl ExtensionSettingsCompatibilityResolver for OfficialTasksNegotiationResolver {
+    fn resolve(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettings, ExtensionNegotiationError> {
+        if descriptor.id.as_str() == OFFICIAL_TASKS_EXTENSION_ID {
+            resolve_official_tasks_settings(descriptor, client, server)
+        } else {
+            Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                descriptor.id.to_string(),
+            ))
+        }
+    }
+}
+
+impl<R> ExtensionSettingsCompatibilityResolver for McpAppsNegotiationResolver<R>
+where
+    R: ExtensionSettingsCompatibilityResolver,
+{
+    fn resolve(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettings, ExtensionNegotiationError> {
+        match self.resolve_with_disposition(descriptor, client, server)? {
+            ExtensionSettingsResolution::Active(settings) => Ok(settings),
+            ExtensionSettingsResolution::Inactive => Err(
+                ExtensionNegotiationError::SettingsCompatibilityRejected(descriptor.id.to_string()),
+            ),
+        }
+    }
+
+    fn resolve_with_disposition(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettingsResolution, ExtensionNegotiationError> {
+        if descriptor.id.as_str() == OFFICIAL_MCP_APPS_EXTENSION_ID {
+            resolve_official_mcp_apps_settings(descriptor, client, server)
+        } else {
+            self.fallback
+                .resolve_with_disposition(descriptor, client, server)
+        }
     }
 }
 
@@ -1159,25 +1518,36 @@ impl ExtensionDescriptorRegistry {
                 (Some(client), Some(server)) => {
                     enforce_official_tasks_empty_settings(id, client)?;
                     enforce_official_tasks_empty_settings(id, server)?;
-                    let effective = resolver.resolve(descriptor, client, server)?;
-                    enforce_official_tasks_empty_settings(id, &effective)?;
-                    let fingerprint = effective_settings_fingerprint(descriptor, &effective)?;
-                    active.insert(
-                        id.clone(),
-                        NegotiatedExtension {
-                            id: id.clone(),
-                            effective_settings: EffectiveExtensionSettings {
-                                settings: effective,
-                                fingerprint,
-                            },
-                        },
-                    );
+                    match resolver.resolve_with_disposition(descriptor, client, server)? {
+                        ExtensionSettingsResolution::Active(effective) => {
+                            enforce_official_tasks_empty_settings(id, &effective)?;
+                            let fingerprint =
+                                effective_settings_fingerprint(descriptor, &effective)?;
+                            active.insert(
+                                id.clone(),
+                                NegotiatedExtension {
+                                    id: id.clone(),
+                                    effective_settings: EffectiveExtensionSettings {
+                                        settings: effective,
+                                        fingerprint,
+                                    },
+                                },
+                            );
+                        }
+                        ExtensionSettingsResolution::Inactive => {
+                            inactive.insert(
+                                id.clone(),
+                                ExtensionInactiveReason::SettingsInactiveFallback,
+                            );
+                        }
+                    }
                 }
                 (None, None) => {
                     inactive.insert(id.clone(), ExtensionInactiveReason::NotAdvertised);
                 }
                 (None, Some(_)) => match descriptor.resolver.fallback {
-                    ExtensionFallbackPolicy::ServerInactiveFallback => {
+                    ExtensionFallbackPolicy::ServerInactiveFallback
+                    | ExtensionFallbackPolicy::InactiveOnEitherPeer => {
                         inactive
                             .insert(id.clone(), ExtensionInactiveReason::ServerInactiveFallback);
                     }
@@ -1190,7 +1560,8 @@ impl ExtensionDescriptorRegistry {
                     }
                 },
                 (Some(_), None) => match descriptor.resolver.fallback {
-                    ExtensionFallbackPolicy::ClientInactiveFallback => {
+                    ExtensionFallbackPolicy::ClientInactiveFallback
+                    | ExtensionFallbackPolicy::InactiveOnEitherPeer => {
                         inactive
                             .insert(id.clone(), ExtensionInactiveReason::ClientInactiveFallback);
                     }
@@ -1798,6 +2169,240 @@ mod tests {
                 "io.modelcontextprotocol/tasks_".to_owned()
             )),
             "only the terminal non-alphanumeric name byte changes from the admitted official key"
+        );
+    }
+
+    #[test]
+    fn apps_01_official_descriptor_negotiation_round_trip_positive() {
+        let client_wire = json!({
+            "mimeTypes": [
+                MCP_APPS_HTML_MIME_TYPE,
+                "application/vnd.example.dashboard+json",
+                MCP_APPS_HTML_MIME_TYPE,
+            ],
+        });
+        let client_settings = ExtensionSettings::new(client_wire.clone())
+            .expect("the ordered, duplicated MCP Apps MIME advertisement is generic JSON");
+        let decoded = McpAppsClientSettings::from_extension_settings(&client_settings)
+            .expect("the required closed client settings object decodes");
+        assert_eq!(
+            decoded.to_extension_settings().into_value(),
+            client_wire,
+            "the typed MCP Apps codec preserves peer MIME ordering and duplicates"
+        );
+        assert!(decoded.supports_mcp_apps_html());
+
+        let mut registry = ExtensionDescriptorRegistry::new();
+        let id = register_official_mcp_apps_extension(&mut registry)
+            .expect("the official MCP Apps descriptor registers");
+        let descriptor = registry
+            .descriptor(&id)
+            .expect("registered MCP Apps descriptor remains available before freeze");
+        assert_eq!(descriptor.id.as_str(), OFFICIAL_MCP_APPS_EXTENSION_ID);
+        assert_eq!(
+            descriptor.client_settings.schema_id,
+            MCP_APPS_CLIENT_SETTINGS_SCHEMA_ID
+        );
+        assert_eq!(
+            descriptor.server_settings.schema_id,
+            MCP_APPS_SERVER_SETTINGS_SCHEMA_ID
+        );
+        assert_eq!(descriptor.resolver.id, MCP_APPS_NEGOTIATION_RESOLVER_ID);
+        assert_eq!(
+            descriptor.resolver.fallback,
+            ExtensionFallbackPolicy::InactiveOnEitherPeer
+        );
+        assert!(descriptor.method.is_none());
+        assert!(descriptor.notification.is_none());
+        registry.freeze().expect("MCP Apps registry freezes");
+
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(id.clone(), client_settings)]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([(id.clone(), official_mcp_apps_empty_server_settings())]),
+        };
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(id.clone());
+        let mut resolver = official_mcp_apps_negotiation_resolver();
+        let negotiated = registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            )
+            .expect("the exact bilateral MCP Apps settings activate the descriptor");
+
+        assert_eq!(
+            MCP_APPS_ACTIVATION_PREDICATE_ID,
+            "fastmcp-2026-07-28-apps-bilateral-mime-v1"
+        );
+        assert_eq!(
+            negotiated
+                .active(&id)
+                .expect("the enabled bilateral MCP Apps descriptor is active")
+                .effective_settings()
+                .settings()
+                .clone()
+                .into_value(),
+            client_wire,
+            "negotiation retains the same validated client settings object"
+        );
+    }
+
+    #[test]
+    fn apps_01_typed_mime_settings_cannot_bypass_generic_value_bound() {
+        let oversized = vec!["x".repeat(MAX_MCP_APPS_MIME_TYPE_BYTES); MAX_MCP_APPS_MIME_TYPES];
+
+        assert_eq!(
+            McpAppsClientSettings::new(oversized),
+            Err(ExtensionRegistryError::SettingsTooLarge),
+            "the typed Apps constructor must enforce the generic per-value discovery bound"
+        );
+    }
+
+    #[test]
+    fn apps_01_typed_resolver_negotiates_apps_and_tasks_together() {
+        let mut registry = ExtensionDescriptorRegistry::new();
+        let tasks = register_official_tasks_extension(&mut registry)
+            .expect("the official Tasks descriptor registers");
+        let apps = register_official_mcp_apps_extension(&mut registry)
+            .expect("the official MCP Apps descriptor registers");
+        registry.freeze().expect("official descriptors freeze");
+
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([
+                (tasks.clone(), official_tasks_empty_settings()),
+                (
+                    apps.clone(),
+                    ExtensionSettings::new(json!({"mimeTypes": [MCP_APPS_HTML_MIME_TYPE]}))
+                        .expect("bounded Apps client settings"),
+                ),
+            ]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([
+                (tasks.clone(), official_tasks_empty_settings()),
+                (apps.clone(), official_mcp_apps_empty_server_settings()),
+            ]),
+        };
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(tasks.clone());
+        local.enable(apps.clone());
+        let mut resolver = official_mcp_apps_negotiation_resolver();
+
+        let negotiated = registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            )
+            .expect("the supplied resolver supports the official descriptor set");
+
+        assert!(negotiated.active(&tasks).is_some());
+        assert!(negotiated.active(&apps).is_some());
+    }
+
+    #[test]
+    fn apps_01_other_valid_mime_type_selects_inactive_fallback() {
+        let mut registry = ExtensionDescriptorRegistry::new();
+        let id = register_official_mcp_apps_extension(&mut registry)
+            .expect("the official MCP Apps descriptor registers");
+        registry.freeze().expect("MCP Apps registry freezes");
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(
+                id.clone(),
+                ExtensionSettings::new(json!({"mimeTypes": ["text/plain"]}))
+                    .expect("a closed client settings object with another MIME type is valid"),
+            )]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([(id.clone(), official_mcp_apps_empty_server_settings())]),
+        };
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(id.clone());
+        let mut resolver = official_mcp_apps_negotiation_resolver();
+
+        let negotiated = registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            )
+            .expect("valid client settings without the Apps HTML MIME choose fallback");
+
+        assert!(negotiated.active(&id).is_none());
+        assert_eq!(
+            negotiated.inactive_reason(&id),
+            Some(ExtensionInactiveReason::SettingsInactiveFallback)
+        );
+    }
+
+    #[test]
+    fn apps_01_official_descriptor_legacy_era_one_field_negative() {
+        let client_wire = json!({"mimeTypes": [MCP_APPS_HTML_MIME_TYPE]});
+        let client_settings =
+            ExtensionSettings::new(client_wire.clone()).expect("valid MCP Apps client settings");
+        let mut registry = ExtensionDescriptorRegistry::new();
+        let id = register_official_mcp_apps_extension(&mut registry)
+            .expect("the official MCP Apps descriptor registers");
+        registry.freeze().expect("MCP Apps registry freezes");
+        let client = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(id.clone(), client_settings)]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([(id.clone(), official_mcp_apps_empty_server_settings())]),
+        };
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(id.clone());
+        let resolver_calls = std::cell::Cell::new(0);
+        let mut resolver = |descriptor: &ExtensionDescriptor,
+                            client: &ExtensionSettings,
+                            server: &ExtensionSettings| {
+            resolver_calls.set(resolver_calls.get() + 1);
+            match resolve_official_mcp_apps_settings(descriptor, client, server)? {
+                ExtensionSettingsResolution::Active(settings) => Ok(settings),
+                ExtensionSettingsResolution::Inactive => {
+                    Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                        descriptor.id.to_string(),
+                    ))
+                }
+            }
+        };
+
+        registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            )
+            .expect("the modern baseline activates MCP Apps");
+        assert_eq!(resolver_calls.get(), 1);
+
+        assert_eq!(
+            registry.negotiate(
+                ProtocolEra::Legacy2024,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            ),
+            Err(ExtensionNegotiationError::LegacyProtocolExcluded),
+            "changing only the protocol era rejects MCP Apps before resolver execution"
+        );
+        assert_eq!(resolver_calls.get(), 1);
+        assert_eq!(
+            client.extensions[&id].clone().into_value(),
+            client_wire,
+            "the rejected legacy-era negotiation cannot mutate the accepted modern wire"
         );
     }
 

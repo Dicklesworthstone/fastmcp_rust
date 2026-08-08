@@ -100,6 +100,8 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::Once;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -146,13 +148,14 @@ pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<&str>
 
 /// Handler for a server-initiated `sampling/createMessage` request.
 pub type SamplingRequestHandler =
-    Box<dyn FnMut(CreateMessageParams) -> McpResult<CreateMessageResult>>;
+    Box<dyn FnMut(CreateMessageParams) -> McpResult<CreateMessageResult> + Send>;
 
 /// Handler for a server-initiated `roots/list` request.
-pub type RootsRequestHandler = Box<dyn FnMut(ListRootsParams) -> McpResult<ListRootsResult>>;
+pub type RootsRequestHandler = Box<dyn FnMut(ListRootsParams) -> McpResult<ListRootsResult> + Send>;
 
 /// Handler for a server-initiated `elicitation/create` request.
-pub type ElicitationRequestHandler = Box<dyn FnMut(ElicitRequestParams) -> McpResult<ElicitResult>>;
+pub type ElicitationRequestHandler =
+    Box<dyn FnMut(ElicitRequestParams) -> McpResult<ElicitResult> + Send>;
 
 /// Configurable handlers for reverse requests received from a live MCP server.
 #[derive(Default)]
@@ -177,7 +180,7 @@ impl ReverseRequestHandlers {
     #[must_use]
     pub fn with_sampling_create_message<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(CreateMessageParams) -> McpResult<CreateMessageResult> + 'static,
+        F: FnMut(CreateMessageParams) -> McpResult<CreateMessageResult> + Send + 'static,
     {
         self.sampling_create_message = Some(Box::new(handler));
         self
@@ -187,7 +190,7 @@ impl ReverseRequestHandlers {
     #[must_use]
     pub fn with_roots_list<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(ListRootsParams) -> McpResult<ListRootsResult> + 'static,
+        F: FnMut(ListRootsParams) -> McpResult<ListRootsResult> + Send + 'static,
     {
         self.roots_list = Some(Box::new(handler));
         self
@@ -197,7 +200,7 @@ impl ReverseRequestHandlers {
     #[must_use]
     pub fn with_elicitation_create<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(ElicitRequestParams) -> McpResult<ElicitResult> + 'static,
+        F: FnMut(ElicitRequestParams) -> McpResult<ElicitResult> + Send + 'static,
     {
         self.elicitation_create = Some(Box::new(handler));
         self
@@ -3510,11 +3513,260 @@ where
     .map_err(|_| McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR))
 }
 
+/// A ready dual-era HTTP MCP client.
+///
+/// This composes the policy-bound HTTP connection with the legacy lifecycle
+/// required after an SSE fallback. Modern connections are ready after their
+/// successful `server/discover` probe; legacy connections are ready only once
+/// this type has completed `initialize` and `notifications/initialized`.
+pub struct HttpClient {
+    connection: ClientHttpConnection,
+    client_info: ClientInfo,
+    client_capabilities: ClientCapabilities,
+    server_info: ServerInfo,
+    legacy_server_capabilities: Option<ServerCapabilities>,
+    next_id: AtomicU64,
+}
+
+/// Errors raised while composing a ready public HTTP client.
+#[derive(Debug)]
+pub enum HttpClientError {
+    /// The policy-bound HTTP connection could not be established or used.
+    Connection(ClientHttpConnectionError),
+    /// A modern discovery response omitted its required server identity.
+    ModernDiscoveryMissingServerInfo,
+    /// The legacy initialization response carried a JSON-RPC error.
+    LegacyInitializationRejected,
+    /// The legacy initialization response had no result payload.
+    LegacyInitializationMissingResult,
+    /// The legacy initialization result did not have the exact required shape.
+    LegacyInitializationInvalidResult,
+    /// The legacy peer selected a protocol version other than 2024-11-05.
+    LegacyInitializationUnsupportedProtocolVersion { actual: String },
+    /// The HTTP request-ID space was exhausted.
+    RequestIdExhausted,
+}
+
+impl std::fmt::Display for HttpClientError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connection(error) => error.fmt(formatter),
+            Self::ModernDiscoveryMissingServerInfo => {
+                formatter.write_str("modern server/discover response has no server identity")
+            }
+            Self::LegacyInitializationRejected => {
+                formatter.write_str("legacy initialize request was rejected")
+            }
+            Self::LegacyInitializationMissingResult => {
+                formatter.write_str("legacy initialize response has no result")
+            }
+            Self::LegacyInitializationInvalidResult => {
+                formatter.write_str("legacy initialize response has an invalid result")
+            }
+            Self::LegacyInitializationUnsupportedProtocolVersion { actual } => write!(
+                formatter,
+                "legacy initialize selected unsupported protocol version {actual}"
+            ),
+            Self::RequestIdExhausted => {
+                formatter.write_str("HTTP client request IDs are exhausted")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HttpClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connection(error) => Some(error),
+            Self::ModernDiscoveryMissingServerInfo
+            | Self::LegacyInitializationRejected
+            | Self::LegacyInitializationMissingResult
+            | Self::LegacyInitializationInvalidResult
+            | Self::LegacyInitializationUnsupportedProtocolVersion { .. }
+            | Self::RequestIdExhausted => None,
+        }
+    }
+}
+
+impl HttpClient {
+    /// Connects one immutable HTTP plan and completes the selected era's
+    /// required lifecycle before exposing the client.
+    pub async fn connect(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+    ) -> Result<Self, HttpClientError> {
+        let mut connection = ClientHttpConnection::connect(
+            cx,
+            protocol_plan,
+            client_info.clone(),
+            client_capabilities.clone(),
+        )
+        .await
+        .map_err(HttpClientError::Connection)?;
+
+        let (server_info, legacy_server_capabilities) = match connection.selected_protocol_era() {
+            ProtocolEra::Modern2026 => {
+                let server_info = connection
+                    .server_discovery()
+                    .and_then(ServerDiscoverResult::server_info)
+                    .cloned()
+                    .ok_or(HttpClientError::ModernDiscoveryMissingServerInfo)?;
+                (server_info, None)
+            }
+            ProtocolEra::Legacy2024 => {
+                let parameters = serde_json::to_value(InitializeParams {
+                    protocol_version: PROTOCOL_VERSION.to_owned(),
+                    capabilities: client_capabilities.clone(),
+                    client_info: client_info.clone(),
+                })
+                .map_err(|_| HttpClientError::LegacyInitializationInvalidResult)?;
+                let response = connection
+                    .request(cx, "initialize", parameters, RequestId::Number(1))
+                    .await
+                    .map_err(HttpClientError::Connection)?;
+                let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) = response
+                else {
+                    return Err(HttpClientError::LegacyInitializationInvalidResult);
+                };
+                if response.error.is_some() {
+                    return Err(HttpClientError::LegacyInitializationRejected);
+                }
+                let value = response
+                    .result
+                    .ok_or(HttpClientError::LegacyInitializationMissingResult)?;
+                let initialization = serde_json::from_value::<InitializeResult>(value)
+                    .map_err(|_| HttpClientError::LegacyInitializationInvalidResult)?;
+                if initialization.protocol_version != PROTOCOL_VERSION {
+                    return Err(
+                        HttpClientError::LegacyInitializationUnsupportedProtocolVersion {
+                            actual: initialization.protocol_version,
+                        },
+                    );
+                }
+                connection
+                    .notify(cx, "notifications/initialized", None)
+                    .await
+                    .map_err(HttpClientError::Connection)?;
+                (
+                    initialization.server_info,
+                    Some(initialization.capabilities),
+                )
+            }
+        };
+
+        Ok(Self {
+            connection,
+            client_info,
+            client_capabilities,
+            server_info,
+            legacy_server_capabilities,
+            next_id: AtomicU64::new(2),
+        })
+    }
+
+    /// Returns the negotiated protocol era.
+    #[must_use]
+    pub const fn selected_protocol_era(&self) -> ProtocolEra {
+        self.connection.selected_protocol_era()
+    }
+
+    /// Returns the immutable policy and endpoints used to create this client.
+    #[must_use]
+    pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
+        self.connection.protocol_plan()
+    }
+
+    /// Returns the identity advertised during connection setup.
+    #[must_use]
+    pub const fn client_info(&self) -> &ClientInfo {
+        &self.client_info
+    }
+
+    /// Returns the capabilities advertised during connection setup.
+    #[must_use]
+    pub const fn client_capabilities(&self) -> &ClientCapabilities {
+        &self.client_capabilities
+    }
+
+    /// Returns the server identity admitted by discovery or initialization.
+    #[must_use]
+    pub const fn server_info(&self) -> &ServerInfo {
+        &self.server_info
+    }
+
+    /// Returns exact legacy capabilities when the selected peer is legacy.
+    #[must_use]
+    pub const fn legacy_server_capabilities(&self) -> Option<&ServerCapabilities> {
+        self.legacy_server_capabilities.as_ref()
+    }
+
+    /// Returns the exact modern discovery result when the selected peer is modern.
+    #[must_use]
+    pub fn server_discovery(&self) -> Option<&ServerDiscoverResult> {
+        self.connection.server_discovery()
+    }
+
+    /// Returns the underlying policy-bound HTTP transport.
+    #[must_use]
+    pub const fn connection(&self) -> &ClientHttpConnection {
+        &self.connection
+    }
+
+    /// Returns mutable access to the underlying policy-bound HTTP transport.
+    pub fn connection_mut(&mut self) -> &mut ClientHttpConnection {
+        &mut self.connection
+    }
+
+    /// Consumes the high-level wrapper and returns its transport.
+    #[must_use]
+    pub fn into_connection(self) -> ClientHttpConnection {
+        self.connection
+    }
+
+    fn next_request_id(&self) -> Result<RequestId, HttpClientError> {
+        let id = self
+            .next_id
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                (id < i64::MAX as u64).then_some(id + 1)
+            })
+            .map_err(|_| HttpClientError::RequestIdExhausted)?;
+        Ok(RequestId::Number(id as i64))
+    }
+
+    /// Sends one request with the next client-owned JSON-RPC request ID.
+    pub async fn request(
+        &mut self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+    ) -> Result<ClientHttpResponse, HttpClientError> {
+        let request_id = self.next_request_id()?;
+        self.connection
+            .request(cx, method, parameters, request_id)
+            .await
+            .map_err(HttpClientError::Connection)
+    }
+
+    /// Sends one notification through the selected HTTP era.
+    pub async fn notify(
+        &mut self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: Option<serde_json::Value>,
+    ) -> Result<(), HttpClientError> {
+        self.connection
+            .notify(cx, method, parameters)
+            .await
+            .map_err(HttpClientError::Connection)
+    }
+}
+
 /// An MCP client instance.
 ///
-/// Clients are built using [`ClientBuilder`] and currently own a stdio
-/// subprocess transport. SSE and WebSocket codecs remain lower-level
-/// integration surfaces rather than connection modes of this type.
+/// Clients are built using [`ClientBuilder`] and own a stdio subprocess
+/// transport. Use [`HttpClient`] for policy-bound HTTP composition.
 pub struct Client {
     /// The subprocess running the MCP server.
     child: Option<Child>,
@@ -3918,6 +4170,28 @@ impl Client {
     #[must_use]
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
+    }
+
+    /// Connects a ready high-level HTTP client from an immutable protocol plan.
+    ///
+    /// This is the HTTP counterpart to [`Self::stdio_with_protocol_plan`].
+    /// The returned [`HttpClient`] owns policy selection and completes the
+    /// legacy lifecycle before allowing ordinary application requests.
+    pub fn http(protocol_plan: ClientProtocolPlan) -> Result<HttpClient, HttpClientError> {
+        ClientBuilder::new()
+            .protocol_plan(protocol_plan)
+            .connect_http_client()
+    }
+
+    /// Connects a ready high-level HTTP client with an explicit cancellation context.
+    pub async fn http_with_cx(
+        protocol_plan: ClientProtocolPlan,
+        cx: &Cx,
+    ) -> Result<HttpClient, HttpClientError> {
+        ClientBuilder::new()
+            .protocol_plan(protocol_plan)
+            .connect_http_client_with_cx(cx)
+            .await
     }
 
     /// Creates a client from its component parts.
@@ -7956,31 +8230,31 @@ mod tests {
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sampling\":%s,\"roots\":%s,\"elicitation\":%s}}\\n' \
             \"$sampling_ok\" \"$roots_ok\" \"$elicitation_ok\"; exec sleep 2";
         let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
-        let sampling_calls = std::rc::Rc::new(std::cell::Cell::new(0));
-        let roots_calls = std::rc::Rc::new(std::cell::Cell::new(0));
-        let elicitation_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let sampling_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let roots_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let elicitation_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let handlers = ReverseRequestHandlers::new()
             .with_sampling_create_message({
-                let sampling_calls = std::rc::Rc::clone(&sampling_calls);
+                let sampling_calls = std::sync::Arc::clone(&sampling_calls);
                 move |params| {
-                    sampling_calls.set(sampling_calls.get() + 1);
+                    sampling_calls.fetch_add(1, Ordering::Relaxed);
                     assert_eq!(params.max_tokens, 9);
                     Ok(CreateMessageResult::text("handled", "handler-model"))
                 }
             })
             .with_roots_list({
-                let roots_calls = std::rc::Rc::clone(&roots_calls);
+                let roots_calls = std::sync::Arc::clone(&roots_calls);
                 move |_params| {
-                    roots_calls.set(roots_calls.get() + 1);
+                    roots_calls.fetch_add(1, Ordering::Relaxed);
                     Ok(ListRootsResult::new(vec![fastmcp_protocol::Root::new(
                         "file:///workspace",
                     )]))
                 }
             })
             .with_elicitation_create({
-                let elicitation_calls = std::rc::Rc::clone(&elicitation_calls);
+                let elicitation_calls = std::sync::Arc::clone(&elicitation_calls);
                 move |params| {
-                    elicitation_calls.set(elicitation_calls.get() + 1);
+                    elicitation_calls.fetch_add(1, Ordering::Relaxed);
                     assert_eq!(params.message(), "approval");
                     Ok(ElicitResult::decline())
                 }
@@ -7995,9 +8269,9 @@ mod tests {
             result,
             serde_json::json!({"sampling": true, "roots": true, "elicitation": true})
         );
-        assert_eq!(sampling_calls.get(), 1);
-        assert_eq!(roots_calls.get(), 1);
-        assert_eq!(elicitation_calls.get(), 1);
+        assert_eq!(sampling_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(roots_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(elicitation_calls.load(Ordering::Relaxed), 1);
         assert!(client.is_initialized());
         assert!(!client.transport.is_closed());
         client.close().expect("client cleanup");
@@ -8019,21 +8293,21 @@ mod tests {
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sampling\":%s,\"rootsMissing\":%s,\"elicitation\":%s}}\\n' \
             \"$sampling_ok\" \"$roots_missing\" \"$elicitation_ok\"; exec sleep 2";
         let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
-        let sampling_calls = std::rc::Rc::new(std::cell::Cell::new(0));
-        let roots_calls = std::rc::Rc::new(std::cell::Cell::new(0));
-        let elicitation_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let sampling_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let roots_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let elicitation_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let handlers = ReverseRequestHandlers::new()
             .with_sampling_create_message({
-                let sampling_calls = std::rc::Rc::clone(&sampling_calls);
+                let sampling_calls = std::sync::Arc::clone(&sampling_calls);
                 move |_params| {
-                    sampling_calls.set(sampling_calls.get() + 1);
+                    sampling_calls.fetch_add(1, Ordering::Relaxed);
                     Ok(CreateMessageResult::text("handled", "handler-model"))
                 }
             })
             .with_elicitation_create({
-                let elicitation_calls = std::rc::Rc::clone(&elicitation_calls);
+                let elicitation_calls = std::sync::Arc::clone(&elicitation_calls);
                 move |_params| {
-                    elicitation_calls.set(elicitation_calls.get() + 1);
+                    elicitation_calls.fetch_add(1, Ordering::Relaxed);
                     Ok(ElicitResult::decline())
                 }
             });
@@ -8047,13 +8321,13 @@ mod tests {
             result,
             serde_json::json!({"sampling": true, "rootsMissing": true, "elicitation": true})
         );
-        assert_eq!(sampling_calls.get(), 1);
+        assert_eq!(sampling_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
-            roots_calls.get(),
+            roots_calls.load(Ordering::Relaxed),
             0,
             "missing handler must leave state unchanged"
         );
-        assert_eq!(elicitation_calls.get(), 1);
+        assert_eq!(elicitation_calls.load(Ordering::Relaxed), 1);
         assert!(client.is_initialized());
         assert!(!client.transport.is_closed());
         assert_eq!(client.responses.pending_len(), 0);

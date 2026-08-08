@@ -56,8 +56,31 @@ pub use extensions::{
     ExtensionDiscovery, ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId,
     ExtensionMethodDescriptor, ExtensionNegotiationResolver, ExtensionNotificationDescriptor,
     ExtensionRegistryError, ExtensionRegistryReceipt, ExtensionRoutingHeaderDescriptor,
-    ExtensionSettings, ExtensionSettingsSchema, MAX_EXTENSION_DESCRIPTORS, MAX_EXTENSION_ID_BYTES,
-    MAX_EXTENSION_REGISTRY_CANONICAL_BYTES, ServerExtensionDiscovery, StdioCorrelationDescriptor,
+    ExtensionSettings, ExtensionSettingsCompatibilityResolver, ExtensionSettingsResolution,
+    ExtensionSettingsSchema, MAX_EXTENSION_DESCRIPTORS, MAX_EXTENSION_ID_BYTES,
+    MAX_EXTENSION_REGISTRY_CANONICAL_BYTES, MAX_EXTENSION_SETTINGS_ENTRIES,
+    MAX_EXTENSION_SETTINGS_KEY_BYTES, MAX_EXTENSION_SETTINGS_NESTING,
+    MAX_EXTENSION_SETTINGS_VALUE_BYTES, MAX_MCP_APPS_MIME_TYPE_BYTES, MAX_MCP_APPS_MIME_TYPES,
+    MCP_APPS_ACTIVATION_PREDICATE_ID, MCP_APPS_CLIENT_SETTINGS_SCHEMA_ID,
+    MCP_APPS_DOWNLOAD_FILE_METHOD, MCP_APPS_HOST_CONTEXT_CHANGED_NOTIFICATION,
+    MCP_APPS_HTML_MIME_TYPE, MCP_APPS_INITIALIZE_METHOD, MCP_APPS_INITIALIZED_NOTIFICATION,
+    MCP_APPS_MESSAGE_METHOD, MCP_APPS_NEGOTIATION_RESOLVER_ID, MCP_APPS_OPEN_LINK_METHOD,
+    MCP_APPS_REQUEST_DISPLAY_MODE_METHOD, MCP_APPS_REQUEST_TEARDOWN_NOTIFICATION,
+    MCP_APPS_RESOURCE_TEARDOWN_METHOD, MCP_APPS_SANDBOX_PROXY_READY_NOTIFICATION,
+    MCP_APPS_SANDBOX_RESOURCE_READY_NOTIFICATION, MCP_APPS_SERVER_SETTINGS_SCHEMA_ID,
+    MCP_APPS_SIZE_CHANGED_NOTIFICATION, MCP_APPS_TOOL_CANCELLED_NOTIFICATION,
+    MCP_APPS_TOOL_INPUT_NOTIFICATION, MCP_APPS_TOOL_INPUT_PARTIAL_NOTIFICATION,
+    MCP_APPS_TOOL_RESULT_NOTIFICATION, MCP_APPS_UPDATE_MODEL_CONTEXT_METHOD, McpAppsClientSettings,
+    McpAppsNegotiationResolver, OFFICIAL_MCP_APPS_EXTENSION_ID,
+    OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID, OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID,
+    OFFICIAL_TASKS_EXTENSION_ID, OFFICIAL_TASKS_METHODS, OFFICIAL_TASKS_NOTIFICATION,
+    OFFICIAL_TASKS_RESULT_DISCRIMINATOR, OfficialTasksNegotiationResolver,
+    ServerExtensionDiscovery, StdioCorrelationDescriptor, official_mcp_apps_descriptor,
+    official_mcp_apps_empty_server_settings, official_mcp_apps_extension_id,
+    official_mcp_apps_negotiation_resolver, official_tasks_descriptor,
+    official_tasks_empty_settings, official_tasks_extension_id,
+    register_official_mcp_apps_extension, register_official_tasks_extension,
+    resolve_official_mcp_apps_settings,
 };
 pub use jsonrpc::{
     ClientIngressFailureScope, CorrelationKey, JSONRPC_VERSION, JsonRpcAdmissionError,
@@ -81,7 +104,10 @@ pub use protocol_version::{
     admit_final_http_request, admit_final_request, validate_final_protocol_version,
 };
 pub use result::*;
-pub use schema::{ValidationError, ValidationResult, validate, validate_strict};
+pub use schema::{
+    AdmittedSchema, FinalCoreResultType, SchemaAdmissionError, ValidationError, ValidationResult,
+    admit_final_schema, validate, validate_final_core_result, validate_strict,
+};
 pub use server_discovery::{
     DiscoveryCacheHints, MAX_SERVER_INSTRUCTIONS_BYTES, SERVER_DISCOVER_METHOD,
     SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior, ServerBehaviorRegistry,

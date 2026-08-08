@@ -1325,6 +1325,18 @@ impl ClientHttpConnection {
         }
     }
 
+    /// Returns the exact discovery result that selected the modern era.
+    ///
+    /// Exact legacy HTTP sessions use `initialize` rather than
+    /// `server/discover`, so they deliberately have no counterpart here.
+    #[must_use]
+    pub fn server_discovery(&self) -> Option<&ServerDiscoverResult> {
+        match self {
+            Self::Modern(client) => Some(client.server_discovery()),
+            Self::LegacySse(_) => None,
+        }
+    }
+
     /// Sends one active client request through the selected transport.
     ///
     /// Modern requests execute as one stateless final POST. Exact legacy
@@ -3648,7 +3660,7 @@ mod tests {
     }
 
     #[test]
-    fn public_http_connection_auto_falls_back_to_fresh_exact_legacy_lifecycle() {
+    fn public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local Auto fallback listener");
         let address = listener
             .local_addr()
@@ -3697,7 +3709,7 @@ mod tests {
             );
             let initialize = serde_json::from_slice::<serde_json::Value>(&initialize_request.body)
                 .expect("legacy initialize POST must be JSON-RPC");
-            assert_eq!(initialize["id"], 2);
+            assert_eq!(initialize["id"], 1);
             assert_eq!(initialize["method"], "initialize");
             assert_eq!(initialize["params"]["protocolVersion"], "2024-11-05");
             assert!(initialize["params"].get("_meta").is_none());
@@ -3727,7 +3739,7 @@ mod tests {
         });
 
         let cx = Cx::for_request();
-        let mut connection = runtime_block_on(
+        let client = runtime_block_on(
             ClientBuilder::new()
                 .client_info("public-http-client", "1.0.0")
                 .protocol_plan(plan(
@@ -3736,35 +3748,71 @@ mod tests {
                     &message_target,
                     ProtocolPolicy::Auto,
                 ))
-                .connect_http_with_cx(&cx),
+                .connect_http_client_with_cx(&cx),
         )
-        .expect("the recognized modern refusal opens the exact fresh legacy transport");
-        assert_eq!(connection.selected_protocol_era(), ProtocolEra::Legacy2024);
-
-        let response = runtime_block_on(connection.request(
-            &cx,
-            "initialize",
-            serde_json::json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "public-http-client", "version": "1.0.0" },
-            }),
-            RequestId::Number(2),
-        ))
-        .expect(
-            "Auto fallback posts exact legacy initialize then awaits its correlated SSE response",
-        );
-        let ClientHttpResponse::Legacy(message) = response else {
-            panic!("recognized modern refusal must keep the public connection on legacy SSE");
-        };
-        let fastmcp_protocol::JsonRpcMessage::Response(response) = message else {
-            panic!("the buffered exact legacy lifecycle reply must be JSON-RPC");
-        };
-        assert_eq!(response.id, Some(RequestId::Number(2)));
-
-        runtime_block_on(connection.notify(&cx, "notifications/initialized", None))
-            .expect("the public fallback path sends the exact id-free lifecycle notification");
+        .expect("the public client completes the exact fresh legacy lifecycle");
+        assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
+        assert_eq!(client.server_info().name, "legacy-server");
+        assert!(client.legacy_server_capabilities().is_some());
+        assert!(client.server_discovery().is_none());
         server.join().expect("Auto fallback server must join");
+    }
+
+    #[test]
+    fn public_http_client_rejects_only_a_legacy_initialize_version_mismatch() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind local legacy-version listener");
+        let address = listener
+            .local_addr()
+            .expect("read local legacy-version address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            let (mut initialize_post, _) = listener
+                .accept()
+                .expect("accept exact legacy initialize POST");
+            let initialize_request = read_request(&mut initialize_post);
+            let initialize = serde_json::from_slice::<serde_json::Value>(&initialize_request.body)
+                .expect("legacy initialize POST must be JSON-RPC");
+            assert_eq!(initialize["id"], 1);
+            assert_eq!(initialize["method"], "initialize");
+            write_response(&mut initialize_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}\n\n",
+            );
+            finish_chunked_sse(&mut sse);
+        });
+
+        let cx = Cx::for_request();
+        let error = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    "http://127.0.0.1:9/mcp",
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::LegacyOnly,
+                ))
+                .connect_http_client_with_cx(&cx),
+        )
+        .err()
+        .expect("only the selected legacy initialize version is incompatible");
+        assert!(matches!(
+            error,
+            crate::HttpClientError::LegacyInitializationUnsupportedProtocolVersion { actual }
+                if actual == "2026-07-28"
+        ));
+        server.join().expect("legacy-version server must join");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
+    ProtocolVersionError,
 };
 use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, ServerCapabilities, ServerDiscoverResult, ServerInfo,
@@ -112,12 +113,33 @@ impl ClientProtocolPlan {
     }
 }
 
-/// Reserved error type for protocol-plan validation.
-///
-/// Stdio supports each declared [`ProtocolPolicy`] directly, so no stdio
-/// policy is rejected before process creation.
+/// Rejection for a protocol plan that contradicts an already negotiated era.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientProtocolPlanError {}
+pub enum ClientProtocolPlanError {
+    /// The plan's immutable policy forbids the era selected by the handshake.
+    IncompatibleSelectedEra {
+        /// The era selected by the completed handshake.
+        selected_era: ProtocolEra,
+        /// The policy that does not permit the selected era.
+        policy: ProtocolPolicy,
+    },
+}
+
+impl std::fmt::Display for ClientProtocolPlanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompatibleSelectedEra {
+                selected_era,
+                policy,
+            } => write!(
+                formatter,
+                "protocol policy {policy:?} does not permit negotiated era {selected_era:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClientProtocolPlanError {}
 
 /// Client-side session state.
 #[derive(Debug)]
@@ -146,7 +168,36 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
+    /// Creates a session only when the negotiated protocol version is supported.
+    ///
+    /// Callers completing a handshake must use this constructor so an
+    /// unsupported wire spelling cannot create a session or select an era.
+    pub fn try_new(
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        server_info: ServerInfo,
+        server_capabilities: ServerCapabilities,
+        protocol_version: String,
+    ) -> Result<Self, ProtocolVersionError> {
+        ProtocolVersion::parse(&protocol_version)?;
+        Ok(Self::new(
+            client_info,
+            client_capabilities,
+            server_info,
+            server_capabilities,
+            protocol_version,
+        ))
+    }
+
     /// Creates a new client session after successful initialization.
+    ///
+    /// An empty version is reserved for pre-initialization placeholder state.
+    /// Any nonempty version must be one of the two exact supported revisions.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a nonempty unsupported version. Prefer [`Self::try_new`]
+    /// when the version was received from a peer.
     #[must_use]
     pub fn new(
         client_info: ClientInfo,
@@ -155,24 +206,50 @@ impl ClientSession {
         server_capabilities: ServerCapabilities,
         protocol_version: String,
     ) -> Self {
+        let selected_era = if protocol_version.is_empty() {
+            None
+        } else {
+            Some(
+                ProtocolVersion::parse(&protocol_version)
+                    .expect("negotiated sessions require a supported protocol version")
+                    .era(),
+            )
+        };
         Self {
             client_info,
             client_capabilities,
             server_info,
             server_capabilities,
             server_discovery: None,
-            selected_era: ProtocolVersion::parse(&protocol_version)
-                .ok()
-                .map(ProtocolVersion::era),
+            selected_era,
             protocol_version,
-            protocol_plan: ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            // A peer-selected era must never rewrite the pre-connect policy.
+            protocol_plan: ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
         }
     }
 
-    #[must_use]
-    pub fn with_protocol_plan(mut self, protocol_plan: ClientProtocolPlan) -> Self {
+    /// Applies a plan only when it admits the already negotiated era.
+    pub fn try_with_protocol_plan(
+        mut self,
+        protocol_plan: ClientProtocolPlan,
+    ) -> Result<Self, ClientProtocolPlanError> {
+        self.validate_protocol_plan(&protocol_plan)?;
         self.protocol_plan = protocol_plan;
-        self
+        Ok(self)
+    }
+
+    /// Applies a plan that admits the already negotiated era.
+    ///
+    /// Prefer [`Self::try_with_protocol_plan`] when the plan comes from an
+    /// external caller or configuration source.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `protocol_plan` forbids the era selected by this session.
+    #[must_use]
+    pub fn with_protocol_plan(self, protocol_plan: ClientProtocolPlan) -> Self {
+        self.try_with_protocol_plan(protocol_plan)
+            .expect("protocol plan must admit the negotiated era")
     }
 
     pub(crate) fn with_server_discovery(mut self, server_discovery: ServerDiscoverResult) -> Self {
@@ -181,7 +258,26 @@ impl ClientSession {
     }
 
     pub(crate) fn set_protocol_plan(&mut self, protocol_plan: ClientProtocolPlan) {
+        self.validate_protocol_plan(&protocol_plan)
+            .expect("protocol plan must admit the negotiated era");
         self.protocol_plan = protocol_plan;
+    }
+
+    fn validate_protocol_plan(
+        &self,
+        protocol_plan: &ClientProtocolPlan,
+    ) -> Result<(), ClientProtocolPlanError> {
+        let Some(selected_era) = self.selected_era else {
+            return Ok(());
+        };
+        if protocol_plan.policy().permits(selected_era.version()) {
+            Ok(())
+        } else {
+            Err(ClientProtocolPlanError::IncompatibleSelectedEra {
+                selected_era,
+                policy: protocol_plan.policy(),
+            })
+        }
     }
 
     /// Returns the client info.
@@ -227,8 +323,7 @@ impl ClientSession {
 
     /// Returns the immutable era selected by the successful handshake.
     ///
-    /// Placeholder sessions used before initialization, and sessions built
-    /// from an unsupported wire spelling, have no selected era.
+    /// Placeholder sessions used before initialization have no selected era.
     #[must_use]
     pub const fn selected_era(&self) -> Option<ProtocolEra> {
         self.selected_era
@@ -243,9 +338,10 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastmcp_protocol::protocol_policy::{LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION};
     use fastmcp_protocol::{PromptsCapability, ResourcesCapability, ToolsCapability};
 
-    fn test_session() -> ClientSession {
+    fn test_session_with_protocol_version(protocol_version: &str) -> ClientSession {
         ClientSession::new(
             ClientInfo {
                 name: "test-client".to_string(),
@@ -268,8 +364,12 @@ mod tests {
                 logging: None,
                 tasks: None,
             },
-            "2024-11-05".to_string(),
+            protocol_version.to_owned(),
         )
+    }
+
+    fn test_session() -> ClientSession {
+        test_session_with_protocol_version(LEGACY_PROTOCOL_VERSION)
     }
 
     #[test]
@@ -312,7 +412,74 @@ mod tests {
     #[test]
     fn session_protocol_version() {
         let session = test_session();
-        assert_eq!(session.protocol_version(), "2024-11-05");
+        assert_eq!(session.protocol_version(), LEGACY_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn session_default_protocol_plan_remains_auto_after_era_selection() {
+        let modern = test_session_with_protocol_version(MODERN_PROTOCOL_VERSION);
+        let legacy = test_session();
+
+        assert_eq!(modern.selected_era(), Some(ProtocolEra::Modern2026));
+        assert_eq!(legacy.selected_era(), Some(ProtocolEra::Legacy2024));
+        assert_eq!(modern.protocol_plan().policy(), ProtocolPolicy::Auto);
+        assert_eq!(legacy.protocol_plan().policy(), ProtocolPolicy::Auto);
+    }
+
+    #[test]
+    fn session_rejects_plan_that_forbids_the_negotiated_era() {
+        let error = test_session()
+            .try_with_protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+            .expect_err("a modern-only plan cannot be applied to a legacy session");
+
+        assert_eq!(
+            error,
+            ClientProtocolPlanError::IncompatibleSelectedEra {
+                selected_era: ProtocolEra::Legacy2024,
+                policy: ProtocolPolicy::ModernOnly,
+            }
+        );
+    }
+
+    #[test]
+    fn session_accepts_auto_plan_for_the_negotiated_era() {
+        let session = test_session()
+            .try_with_protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::Auto))
+            .expect("auto admits the selected legacy era");
+
+        assert_eq!(session.selected_era(), Some(ProtocolEra::Legacy2024));
+        assert_eq!(session.protocol_plan().policy(), ProtocolPolicy::Auto);
+    }
+
+    #[test]
+    fn session_try_new_rejects_unsupported_protocol_version() {
+        let error = ClientSession::try_new(
+            ClientInfo {
+                name: "test-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            ServerInfo {
+                name: "test-server".to_string(),
+                version: "2.0.0".to_string(),
+            },
+            ServerCapabilities::default(),
+            "2025-11-25".to_string(),
+        )
+        .expect_err("unsupported versions must not construct a negotiated session");
+
+        assert_eq!(
+            error,
+            ProtocolVersionError::UnsupportedVersion {
+                received: "2025-11-25".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "negotiated sessions require a supported protocol version")]
+    fn session_new_rejects_unsupported_protocol_version() {
+        let _ = test_session_with_protocol_version("2025-11-25");
     }
 
     #[test]

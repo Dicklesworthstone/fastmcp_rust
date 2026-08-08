@@ -2118,10 +2118,7 @@ mod async_handler_expansion_tests {
         )
         .to_string();
         assert!(prompt.contains("fn get_async_in_request"), "{prompt}");
-        assert!(
-            prompt.contains("fn get_final_async_in_request"),
-            "{prompt}"
-        );
+        assert!(prompt.contains("fn get_final_async_in_request"), "{prompt}");
     }
 
     #[test]
