@@ -22,6 +22,11 @@ use fastmcp_rust::{
     AuthContext, McpContext, McpErrorCode, McpResult, PromptMessage, Role, StaticTokenVerifier,
     TokenAuthProvider,
 };
+#[cfg(unix)]
+use fastmcp_rust::{
+    Client, ClientProtocolPlan, CompletionParams, CompletionReference, Cx, FinalCompletionArgument,
+    ProtocolEra, ProtocolPolicy,
+};
 use serde_json::json;
 
 // ============================================================================
@@ -1157,4 +1162,154 @@ fn e2e_custom_client_info() {
     let init = client.initialize().unwrap();
     // Initialization should succeed with custom client info
     assert!(init.capabilities.tools.is_some());
+}
+
+// ============================================================================
+// Public facade dual-era stdio negotiation
+// ============================================================================
+
+#[cfg(unix)]
+fn facade_final_stdio_peer_script() -> &'static str {
+    "IFS= read -r discovery || exit 1; \
+     case \"$discovery\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+     printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{},\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"facade-final\",\"version\":\"1.0.0\"}},\"ttlMs\":0,\"cacheScope\":\"private\"}}' ;; *) exit 1 ;; esac; \
+     IFS= read -r ping || exit 1; \
+     case \"$ping\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+     printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac; \
+     exec sleep 2"
+}
+
+#[cfg(unix)]
+fn facade_auto_fallback_stdio_peer_script() -> &'static str {
+    "IFS= read -r first || exit 1; \
+     case \"$first\" in \
+     *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+     printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}'; \
+     exit 0 ;; \
+     *initialize*2024-11-05*) \
+     printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"facade-legacy\",\"version\":\"1.0.0\"}}}'; \
+     IFS= read -r lifecycle || exit 1; \
+     case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+     IFS= read -r ping || exit 1; \
+     case \"$ping\" in *ping*io.modelcontextprotocol/protocolVersion*|*ping*io.modelcontextprotocol/clientCapabilities*) exit 1 ;; \
+     *ping*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac ;; \
+     *) exit 1 ;; esac; \
+     exec sleep 2"
+}
+
+#[cfg(unix)]
+fn facade_legacy_cross_era_rejection_stdio_peer_script() -> &'static str {
+    "IFS= read -r initialize || exit 1; \
+     case \"$initialize\" in *initialize*2024-11-05*) \
+     printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"facade-legacy\",\"version\":\"1.0.0\"}}}' ;; *) exit 1 ;; esac; \
+     IFS= read -r lifecycle || exit 1; \
+     case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+     IFS= read -r next || exit 1; \
+     case \"$next\" in *completion/complete*) exit 1 ;; \
+     *ping*io.modelcontextprotocol/protocolVersion*|*ping*io.modelcontextprotocol/clientCapabilities*) exit 1 ;; \
+     *ping*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac; \
+     exec sleep 2"
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_auto_selects_final_when_supported() {
+    let mut client = Client::stdio_with_protocol_plan_with_cx(
+        "sh",
+        &["-c", facade_final_stdio_peer_script()],
+        ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+        Cx::for_request(),
+    )
+    .expect("the public Auto stdio client selects the final discovery peer");
+
+    assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+    assert_eq!(
+        client.selected_protocol_era(),
+        Some(ProtocolEra::Modern2026),
+        "Auto selects final instead of projecting a supported final peer into legacy"
+    );
+    assert_eq!(
+        client.protocol_version(),
+        fastmcp_rust::modern::PROTOCOL_VERSION
+    );
+    assert!(
+        client.server_discovery().is_some(),
+        "the final discovery result remains available on the public client"
+    );
+    client
+        .ping()
+        .expect("the selected final stdio transport remains usable");
+    client.close().expect("final stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_auto_falls_back_to_fresh_exact_legacy_transport() {
+    let mut client = Client::stdio_with_protocol_plan_with_cx(
+        "sh",
+        &["-c", facade_auto_fallback_stdio_peer_script()],
+        ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+        Cx::for_request(),
+    )
+    .expect("a recognized final refusal authorizes a fresh exact-legacy stdio connection");
+
+    assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+    assert_eq!(
+        client.selected_protocol_era(),
+        Some(ProtocolEra::Legacy2024),
+        "the refusal process exits before the exact legacy lifecycle begins"
+    );
+    assert_eq!(
+        client.protocol_version(),
+        fastmcp_rust::legacy_2024::PROTOCOL_VERSION
+    );
+    assert!(
+        client.server_discovery().is_none(),
+        "an exact legacy session cannot inherit final discovery state"
+    );
+    client
+        .ping()
+        .expect("the fresh exact legacy stdio transport remains usable");
+    client.close().expect("legacy stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_rejects_final_only_completion_without_legacy_state_change() {
+    let mut client = Client::stdio_with_protocol_plan_with_cx(
+        "sh",
+        &["-c", facade_legacy_cross_era_rejection_stdio_peer_script()],
+        ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+        Cx::for_request(),
+    )
+    .expect("the public exact legacy stdio client initializes");
+
+    let era_before_rejection = client.selected_protocol_era();
+    let version_before_rejection = client.protocol_version().to_owned();
+    // This differs from a representable 2024 completion only by the final
+    // prompt title. The peer rejects any completion frame, proving the client
+    // refuses it locally before allocating legacy request state or bytes.
+    let rejection = match client.complete(CompletionParams {
+        reference: CompletionReference::PromptWithTitle {
+            name: "deploy".to_owned(),
+            title: "Deploy application".to_owned(),
+        },
+        argument: FinalCompletionArgument {
+            name: "environment".to_owned(),
+            value: "sta".to_owned(),
+        },
+        context: None,
+    }) {
+        Ok(_) => panic!("the final-only completion title must not cross into exact legacy"),
+        Err(error) => error,
+    };
+
+    assert_eq!(rejection.code, McpErrorCode::InvalidParams);
+    assert!(client.is_initialized());
+    assert_eq!(client.selected_protocol_era(), era_before_rejection);
+    assert_eq!(client.protocol_version(), version_before_rejection);
+    client
+        .ping()
+        .expect("the rejected final-only payload leaves the legacy transport and state usable");
+    client.close().expect("legacy stdio client cleanup");
 }
