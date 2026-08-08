@@ -1,7 +1,7 @@
-//! Compile-fail tests for procedural macros using trybuild.
+//! Downstream compile tests for the facade and procedural macros using trybuild.
 //!
-//! These tests verify that macros produce clear compile errors
-//! for invalid usage patterns.
+//! These tests verify both facade consumers that must compile and macros that
+//! produce clear compile errors for invalid usage patterns.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ fn compile_fail_tests() {
     if std::env::var_os(TRYBUILD_WORKER_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
         let tests = trybuild::TestCases::new();
         tests.compile_fail("tests/trybuild/*.rs");
+        tests.pass("tests/trybuild_pass/facade_dual_era_consumer.rs");
         return;
     }
 
