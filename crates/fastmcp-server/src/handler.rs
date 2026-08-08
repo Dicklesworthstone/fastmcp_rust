@@ -20,8 +20,9 @@ use fastmcp_core::{
     SessionState,
 };
 use fastmcp_protocol::{
-    Content, Icon, JsonRpcRequest, ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource,
-    ResourceContent, ResourceTemplate, Tool, ToolAnnotations,
+    Content, CoreResultDiscriminatorPolicy, DecodedResult, Icon, JsonRpcRequest, ProgressMarker,
+    ProgressParams, Prompt, PromptMessage, Resource, ResourceContent, ResourceTemplate,
+    ResultPeerEra, Tool, ToolAnnotations, decode_peer_result, encode_result,
 };
 
 // ============================================================================
@@ -227,6 +228,50 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// URI template parameters extracted from a matched resource URI.
 pub type UriParams = HashMap<String, String>;
+
+/// Encodes a router-produced modern success through the final result contract.
+///
+/// Legacy dispatch continues to serialize its method-specific result structs
+/// directly. The stateless router, by contrast, calls this helper after a
+/// shipped handler has completed so every successful modern response carries
+/// the explicit `resultType: "complete"` discriminator and is admitted by the
+/// same bounded protocol codec used for peer results. Method-specific payloads
+/// may not pre-populate the discriminator; only this boundary selects it.
+pub(crate) fn encode_final_complete_result<T: serde::Serialize>(
+    payload: T,
+) -> McpResult<serde_json::Value> {
+    let serde_json::Value::Object(mut members) = serde_json::to_value(payload).map_err(McpError::from)? else {
+        return Err(McpError::internal_error(
+            "modern complete result payload must serialize as an object",
+        ));
+    };
+
+    if members.contains_key("resultType") {
+        return Err(McpError::internal_error(
+            "modern complete result payload must not select a result type",
+        ));
+    }
+    members.insert(
+        "resultType".to_string(),
+        serde_json::Value::String("complete".to_string()),
+    );
+
+    let encoded = serde_json::to_string(&members).map_err(McpError::from)?;
+    let (decoded, diagnostic) = decode_peer_result(
+        &encoded,
+        ResultPeerEra::Modern,
+        &CoreResultDiscriminatorPolicy,
+    )
+    .map_err(|_| McpError::internal_error("modern complete result violates the final contract"))?;
+
+    if diagnostic.is_some() || !matches!(decoded, DecodedResult::Complete(_)) {
+        return Err(McpError::internal_error(
+            "modern complete result violates the final contract",
+        ));
+    }
+
+    serde_json::from_str(&encode_result(&decoded)).map_err(McpError::from)
+}
 
 /// Handler for a tool.
 ///
@@ -836,6 +881,53 @@ mod tests {
     use super::*;
     use asupersync::Cx;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn handler_final_complete_contract_positive() {
+        let payload = serde_json::json!({
+            "content": [{"type": "text", "text": "shipped handler result"}],
+            "isError": false,
+        });
+
+        let encoded = encode_final_complete_result(payload.clone())
+            .expect("a complete handler payload is admitted by the final result contract");
+
+        assert_eq!(encoded.get("resultType"), Some(&serde_json::json!("complete")));
+        assert_eq!(encoded.get("content"), payload.get("content"));
+        assert_eq!(encoded.get("isError"), payload.get("isError"));
+    }
+
+    #[test]
+    fn handler_final_complete_contract_planted_negative() {
+        let baseline = serde_json::json!({
+            "content": [{"type": "text", "text": "shipped handler result"}],
+            "isError": false,
+        });
+        let mut planted = baseline.clone();
+        planted
+            .as_object_mut()
+            .expect("complete payload is an object")
+            .insert("resultType".to_string(), serde_json::json!("input_required"));
+
+        assert_eq!(
+            baseline.get("content"),
+            planted.get("content"),
+            "the discriminator is the sole planted dimension"
+        );
+        assert_eq!(baseline.get("isError"), planted.get("isError"));
+        let planted_before = planted.clone();
+
+        encode_final_complete_result(baseline)
+            .expect("the baseline must remain a valid complete payload");
+        let error = encode_final_complete_result(planted.clone())
+            .expect_err("a handler cannot preselect a different final result discriminator");
+
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+        assert_eq!(
+            planted, planted_before,
+            "the rejected payload remains unchanged for callers that retry or log it"
+        );
+    }
 
     fn custom_icon() -> &'static Icon {
         static ICON: OnceLock<Icon> = OnceLock::new();

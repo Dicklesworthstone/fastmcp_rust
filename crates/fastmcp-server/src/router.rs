@@ -30,7 +30,10 @@ use fastmcp_protocol::{
     ListTasksResult, SubmitTaskParams, SubmitTaskResult,
 };
 
-use crate::handler::{BidirectionalSenders, BoxFuture, ProgressNotificationSender, UriParams};
+use crate::handler::{
+    BidirectionalSenders, BoxFuture, ProgressNotificationSender, UriParams,
+    encode_final_complete_result,
+};
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
 
@@ -199,12 +202,12 @@ fn parse_stateless_params_or_default<T: serde::de::DeserializeOwned + Default>(
     }
 }
 
-/// Converts a completed handler result to its JSON-RPC value while preserving
-/// the original typed [`McpError`] on refusal.
+/// Converts a completed stateless handler result through the final result
+/// contract while preserving the original typed [`McpError`] on refusal.
 fn encode_stateless_handler_result<T: serde::Serialize>(
     result: McpResult<T>,
 ) -> McpResult<serde_json::Value> {
-    serde_json::to_value(result?).map_err(McpError::from)
+    encode_final_complete_result(result?)
 }
 
 fn encode_cursor_offset(offset: usize) -> String {
@@ -1108,8 +1111,10 @@ impl Router {
     /// This is the modern server-side routing seam. It deliberately has no
     /// `Session` argument: list results come from the immutable router catalog,
     /// and handler invocations receive a fresh state bag that cannot be shared
-    /// with another request or connection. State-bearing lifecycle methods stay
-    /// on the legacy adapter rather than acquiring accidental modern semantics.
+    /// with another request or connection. Every successful response is
+    /// re-emitted through the final complete-result contract. State-bearing
+    /// lifecycle methods and exact 2024-11-05 wire results stay on the legacy
+    /// adapter rather than acquiring accidental modern semantics.
     pub(crate) fn dispatch_stateless(
         &self,
         request_ctx: &McpContext,
@@ -1121,11 +1126,10 @@ impl Router {
 
         let params = request.params.clone();
         let result = match request.method.as_str() {
-            "ping" => serde_json::json!({}),
+            "ping" => encode_stateless_handler_result(Ok(serde_json::json!({})))?,
             "tools/list" => {
                 let params = parse_stateless_params_or_default(params)?;
-                serde_json::to_value(self.handle_tools_list(request_ctx, params, None)?)
-                    .map_err(McpError::from)?
+                encode_stateless_handler_result(self.handle_tools_list(request_ctx, params, None))?
             }
             "tools/call" => {
                 let params = parse_stateless_params(params)?;
@@ -1139,17 +1143,15 @@ impl Router {
             }
             "resources/list" => {
                 let params = parse_stateless_params_or_default(params)?;
-                serde_json::to_value(self.handle_resources_list(request_ctx, params, None)?)
-                    .map_err(McpError::from)?
+                encode_stateless_handler_result(self.handle_resources_list(request_ctx, params, None))?
             }
             "resources/templates/list" => {
                 let params = parse_stateless_params_or_default(params)?;
-                serde_json::to_value(self.handle_resource_templates_list(
+                encode_stateless_handler_result(self.handle_resource_templates_list(
                     request_ctx,
                     params,
                     None,
-                )?)
-                .map_err(McpError::from)?
+                ))?
             }
             "resources/read" => {
                 let params = parse_stateless_params(params)?;
@@ -1163,8 +1165,7 @@ impl Router {
             }
             "prompts/list" => {
                 let params = parse_stateless_params_or_default(params)?;
-                serde_json::to_value(self.handle_prompts_list(request_ctx, params, None)?)
-                    .map_err(McpError::from)?
+                encode_stateless_handler_result(self.handle_prompts_list(request_ctx, params, None))?
             }
             "prompts/get" => {
                 let params = parse_stateless_params(params)?;
@@ -7904,6 +7905,115 @@ mod router_tests {
             .handle_tasks_get(&request_ctx, params, Some(&shared))
             .unwrap_err();
         assert!(err.message.contains("not found"));
+    }
+
+    #[test]
+    fn srv_01_srv_04_modern_shipped_handler_uses_final_complete_contract() {
+        let mut router = Router::new();
+        router.add_tool(NamedTool::new("final-contract-tool"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 91, Budget::INFINITE, &state);
+
+        let legacy = router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "final-contract-tool".to_string(),
+                    arguments: Some(serde_json::json!({})),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("the legacy adapter still invokes the registered handler");
+        let legacy_wire = serde_json::to_value(&legacy).expect("legacy result serializes");
+        assert!(
+            legacy_wire.get("resultType").is_none(),
+            "the exact legacy result shape remains unchanged"
+        );
+
+        let modern = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "final-contract-tool",
+                        "arguments": {},
+                    })),
+                    91_i64,
+                ),
+            )
+            .expect("the modern router invokes the same installed handler");
+
+        assert_eq!(modern.get("resultType"), Some(&serde_json::json!("complete")));
+        assert_eq!(modern.get("content"), legacy_wire.get("content"));
+        assert_eq!(modern.get("isError"), legacy_wire.get("isError"));
+    }
+
+    #[test]
+    fn srv_01_srv_04_modern_shipped_handler_planted_negative_is_non_mutating() {
+        let mut router = Router::new();
+        router.add_tool(NamedTool::new("final-contract-tool"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 92, Budget::INFINITE, &state);
+        let baseline = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "final-contract-tool",
+                "arguments": {},
+            })),
+            92_i64,
+        );
+        let mut planted = baseline.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("tools/call parameters are an object")
+            .insert("name".to_string(), serde_json::json!("missing-final-contract-tool"));
+
+        assert_eq!(baseline.method, planted.method);
+        assert_eq!(baseline.id, planted.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("arguments")),
+            planted
+                .params
+                .as_ref()
+                .and_then(|params| params.get("arguments")),
+            "the handler name is the only planted dimension"
+        );
+        let catalog_before = serde_json::to_vec(&router.tools()).expect("catalog serializes");
+        let planted_before = serde_json::to_vec(&planted).expect("request serializes");
+
+        let baseline_result = router
+            .dispatch_stateless(&request_ctx, &baseline)
+            .expect("the baseline invokes the registered handler");
+        assert_eq!(
+            baseline_result.get("resultType"),
+            Some(&serde_json::json!("complete"))
+        );
+
+        let error = router
+            .dispatch_stateless(&request_ctx, &planted)
+            .expect_err("only the unregistered handler name is refused");
+        assert_eq!(error.code, McpErrorCode::MethodNotFound);
+        assert_eq!(
+            serde_json::to_vec(&planted).expect("rejected request serializes"),
+            planted_before,
+            "typed refusal cannot mutate caller-owned input"
+        );
+        assert_eq!(
+            serde_json::to_vec(&router.tools()).expect("catalog serializes"),
+            catalog_before,
+            "typed refusal cannot mutate the installed handler catalog"
+        );
     }
 
     #[test]
