@@ -22,7 +22,9 @@
 #![allow(dead_code)]
 
 use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
-use fastmcp_protocol::FinalCallToolResult;
+use fastmcp_protocol::{
+    FinalCallToolResult, LegacyContent, LegacyPromptMessage, LegacyResourceContent,
+};
 use fastmcp_rust::{
     CompleteResult, Content, ContentBlock, Cx, GetPromptResult, Implementation, JsonSchema,
     LabConfig, LabRuntime, McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler,
@@ -30,7 +32,7 @@ use fastmcp_rust::{
     ToolHandler, prompt, resource, tool,
 };
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 
 fn test_ctx() -> McpContext {
@@ -1242,12 +1244,14 @@ fn final_result_meta() -> ResultMeta {
 fn final_resource_payload(text: &str) -> CompleteResult<ReadResourceResult> {
     CompleteResult::new(
         ReadResourceResult {
-            contents: vec![ResourceContent {
+            contents: vec![LegacyResourceContent::Text {
                 uri: "final://resource/content".to_string(),
+                text: text.to_string(),
                 mime_type: Some("application/json".to_string()),
-                text: Some(text.to_string()),
-                blob: None,
+                additional: BTreeMap::new(),
             }],
+            meta: None,
+            additional: BTreeMap::new(),
         },
         final_result_meta(),
     )
@@ -1931,12 +1935,17 @@ fn final_prompt_payload(text: &str) -> CompleteResult<GetPromptResult> {
     CompleteResult::new(
         GetPromptResult {
             description: Some("final prompt metadata is projected by the modern layer".to_string()),
-            messages: vec![PromptMessage {
+            messages: vec![LegacyPromptMessage {
                 role: Role::Assistant,
-                content: Content::Text {
+                content: LegacyContent::Text {
                     text: text.to_string(),
+                    annotations: None,
+                    additional: BTreeMap::new(),
                 },
+                additional: BTreeMap::new(),
             }],
+            meta: None,
+            additional: BTreeMap::new(),
         },
         final_result_meta(),
     )

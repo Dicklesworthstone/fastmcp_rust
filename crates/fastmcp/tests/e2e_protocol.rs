@@ -16,6 +16,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use fastmcp_protocol::{LegacyContent, LegacyResourceContent};
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
     AuthContext, McpContext, McpErrorCode, McpResult, PromptMessage, Role, StaticTokenVerifier,
@@ -363,10 +364,10 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
     let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
     assert!(!call.is_error);
     assert!(
-        matches!(call.content.first(), Some(Content::Text { .. })),
+        matches!(call.content.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = call.content.first() else {
+    let Some(LegacyContent::Text { text, .. }) = call.content.first() else {
         return;
     };
     assert_eq!(text, "Hello, Ada!");
@@ -383,10 +384,10 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
 
     let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
     assert!(
-        matches!(call.content.first(), Some(Content::Text { .. })),
+        matches!(call.content.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = call.content.first() else {
+    let Some(LegacyContent::Text { text, .. }) = call.content.first() else {
         return;
     };
     let auth_json: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -476,10 +477,10 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
     trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
     let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
     assert!(
-        matches!(call.content.first(), Some(Content::Text { .. })),
+        matches!(call.content.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = call.content.first() else {
+    let Some(LegacyContent::Text { text, .. }) = call.content.first() else {
         return;
     };
     let auth_json: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -578,10 +579,10 @@ fn e2e_call_tool_greeting() {
     assert_eq!(result.len(), 1);
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "Hello, Alice!");
@@ -598,10 +599,10 @@ fn e2e_call_tool_calculator_add() {
     assert_eq!(result.len(), 1);
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "30");
@@ -620,10 +621,10 @@ fn e2e_call_tool_calculator_multiply() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "42");
@@ -642,10 +643,10 @@ fn e2e_call_tool_calculator_divide() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "25");
@@ -728,10 +729,19 @@ fn e2e_read_text_resource() {
 
     let contents = client.read_resource("file:///test/sample.txt").unwrap();
     assert_eq!(contents.len(), 1);
-    assert_eq!(contents[0].uri, "file:///test/sample.txt");
-    assert_eq!(contents[0].mime_type.as_deref(), Some("text/plain"));
+    let LegacyResourceContent::Text {
+        uri,
+        mime_type,
+        text,
+        ..
+    } = &contents[0]
+    else {
+        panic!("text resource must use exact legacy text resource content");
+    };
+    assert_eq!(uri, "file:///test/sample.txt");
+    assert_eq!(mime_type.as_deref(), Some("text/plain"));
     assert!(
-        contents[0].text.as_ref().unwrap().contains("Hello, World!"),
+        text.contains("Hello, World!"),
         "Text content should contain greeting"
     );
 }
@@ -745,11 +755,16 @@ fn e2e_read_json_resource() {
         .read_resource("file:///config/settings.json")
         .unwrap();
     assert_eq!(contents.len(), 1);
-    assert_eq!(contents[0].mime_type.as_deref(), Some("application/json"));
+    let LegacyResourceContent::Text {
+        mime_type, text, ..
+    } = &contents[0]
+    else {
+        panic!("JSON resource must use exact legacy text resource content");
+    };
+    assert_eq!(mime_type.as_deref(), Some("application/json"));
 
     // Parse the JSON content to verify structure
-    let json_text = contents[0].text.as_ref().unwrap();
-    let config: serde_json::Value = serde_json::from_str(json_text).unwrap();
+    let config: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(config.get("version").unwrap(), "1.0.0");
     assert_eq!(config.get("max_connections").unwrap(), 100);
 }
@@ -816,10 +831,10 @@ fn e2e_get_prompt_greeting() {
         return;
     };
     assert!(
-        matches!(&first.content, Content::Text { .. }),
+        matches!(&first.content, LegacyContent::Text { .. }),
         "expected text content"
     );
-    let Content::Text { text } = &first.content else {
+    let LegacyContent::Text { text, .. } = &first.content else {
         return;
     };
     assert!(
@@ -846,10 +861,10 @@ fn e2e_get_prompt_code_review() {
         return;
     };
     assert!(
-        matches!(&first.content, Content::Text { .. }),
+        matches!(&first.content, LegacyContent::Text { .. }),
         "expected text content"
     );
-    let Content::Text { text } = &first.content else {
+    let LegacyContent::Text { text, .. } = &first.content else {
         return;
     };
     assert!(text.contains("rust"), "Should mention language");
@@ -921,10 +936,10 @@ fn e2e_full_workflow() {
         .call_tool("greeting", json!({"name": "E2E"}))
         .unwrap();
     assert!(
-        matches!(greeting.first(), Some(Content::Text { .. })),
+        matches!(greeting.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = greeting.first() else {
+    let Some(LegacyContent::Text { text, .. }) = greeting.first() else {
         return;
     };
     assert_eq!(text, "Hello, E2E!");
@@ -935,7 +950,10 @@ fn e2e_full_workflow() {
 
     // Step 5: Read a resource
     let content = client.read_resource("file:///test/sample.txt").unwrap();
-    assert!(content[0].text.as_ref().unwrap().contains("Hello"));
+    assert!(matches!(
+        content.first(),
+        Some(LegacyResourceContent::Text { text, .. }) if text.contains("Hello")
+    ));
 
     // Step 6: List prompts
     let prompts = client.list_prompts().unwrap();
@@ -958,10 +976,10 @@ fn e2e_multiple_tool_calls() {
         let name = format!("User{i}");
         let result = client.call_tool("greeting", json!({"name": name})).unwrap();
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert_eq!(text, &format!("Hello, {name}!"));
@@ -981,10 +999,10 @@ fn e2e_mixed_operations() {
         .call_tool("calculator", json!({"a": 2, "b": 3, "operation": "add"}))
         .unwrap();
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "5");
@@ -1013,10 +1031,10 @@ fn e2e_mixed_operations() {
         )
         .unwrap();
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "5");
