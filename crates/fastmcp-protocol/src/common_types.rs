@@ -916,15 +916,49 @@ fn valid_lower_hex(value: &str, length: usize) -> bool {
 }
 
 /// A peer cancellation request identifier.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CancellationRequestId {
     /// String JSON-RPC identifier.
     String(String),
-    /// Mathematical integer JSON-RPC identifier.
+    /// Canonically spelled signed 64-bit JSON-RPC integer identifier.
     Integer(i64),
-    /// Mathematical JSON-RPC integer outside the signed 64-bit range.
+    /// Mathematical JSON-RPC integer whose original numeric lexeme must be retained.
     IntegerExact(JsonInteger),
+}
+
+impl Serialize for CancellationRequestId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::String(value) => value.serialize(serializer),
+            Self::Integer(value) => value.serialize(serializer),
+            Self::IntegerExact(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CancellationRequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::String(value) => Ok(Self::String(value)),
+            Value::Number(value) => {
+                let integer =
+                    JsonInteger::try_from_number(value).map_err(serde::de::Error::custom)?;
+                match integer.as_str().parse::<i64>() {
+                    Ok(value) if integer.as_str() == value.to_string() => Ok(Self::Integer(value)),
+                    _ => Ok(Self::IntegerExact(integer)),
+                }
+            }
+            _ => Err(serde::de::Error::custom(
+                "cancellation request ID must be a string or mathematical integer",
+            )),
+        }
+    }
 }
 
 /// A bounded peer-provided cancellation reason that deliberately has no raw string accessor,
@@ -2105,18 +2139,8 @@ impl FinalCommonTypesSchema {
         let request_id = params
             .get("requestId")
             .ok_or(CommonTypeError::Invalid("cancellation request ID"))?;
-        let request_id = match request_id {
-            Value::String(value) => CancellationRequestId::String(value.clone()),
-            Value::Number(value) => {
-                let integer = JsonInteger::try_from_number(value.clone())
-                    .map_err(|_| CommonTypeError::Invalid("cancellation request ID"))?;
-                match integer.as_str().parse::<i64>() {
-                    Ok(value) => CancellationRequestId::Integer(value),
-                    Err(_) => CancellationRequestId::IntegerExact(integer),
-                }
-            }
-            _ => return Err(CommonTypeError::Invalid("cancellation request ID")),
-        };
+        let request_id = serde_json::from_value::<CancellationRequestId>(request_id.clone())
+            .map_err(|_| CommonTypeError::Invalid("cancellation request ID"))?;
         let reason = match params.get("reason") {
             None => None,
             Some(Value::String(value)) => Some(value.clone()),
@@ -2652,6 +2676,54 @@ mod tests {
         assert_eq!(
             accepted, baseline,
             "the one-key rejection cannot mutate retained wire state"
+        );
+    }
+
+    #[test]
+    fn cancellation_request_id_preserves_integer_lexemes_and_rejects_fractional_values() {
+        let accepted: Value = serde_json::from_str(
+            r#"{"method":"notifications/cancelled","params":{"requestId":-0}}"#,
+        )
+        .expect("negative-zero cancellation wire parses");
+        FinalCommonTypesSchema::validate(CommonWireDirection::Notification, &accepted)
+            .expect("a schema-valid negative-zero cancellation ID is admitted");
+        let typed: CancellationRequestId =
+            serde_json::from_value(accepted["params"]["requestId"].clone())
+                .expect("negative-zero cancellation ID decodes");
+        assert!(matches!(
+            &typed,
+            CancellationRequestId::IntegerExact(value) if value.as_str() == "-0"
+        ));
+        assert_eq!(
+            serde_json::to_value(&typed).expect("negative-zero ID re-encodes"),
+            accepted["params"]["requestId"].clone(),
+            "typed cancellation ID serialization preserves the exact negative-zero lexeme"
+        );
+
+        let baseline = accepted.clone();
+        let mut planted = accepted.clone();
+        planted
+            .get_mut("params")
+            .and_then(Value::as_object_mut)
+            .expect("cancellation parameter object")
+            .insert(
+                "requestId".to_owned(),
+                serde_json::from_str("-0.5").expect("fractional JSON value parses"),
+            );
+        assert_eq!(
+            FinalCommonTypesSchema::validate(CommonWireDirection::Notification, &planted),
+            Err(CommonTypeError::Invalid("cancellation request ID")),
+            "changing only requestId to a fractional value rejects cancellation"
+        );
+        assert!(
+            serde_json::from_value::<CancellationRequestId>(planted["params"]["requestId"].clone())
+                .is_err(),
+            "typed cancellation ID decoding rejects the same fractional field"
+        );
+        assert_eq!(
+            serde_json::to_value(&typed).expect("accepted ID remains serializable"),
+            baseline["params"]["requestId"].clone(),
+            "fractional rejection cannot mutate the admitted cancellation ID"
         );
     }
 
