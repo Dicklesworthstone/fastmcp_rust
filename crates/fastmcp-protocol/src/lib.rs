@@ -48,6 +48,7 @@ pub mod protocol_version;
 mod result;
 pub mod schema;
 mod server_discovery;
+pub mod tasks_extension;
 mod types;
 
 pub use extensions::{
@@ -87,6 +88,7 @@ pub use server_discovery::{
     ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult, ServerDiscoveryError,
     ServerInstructionError, ServerInstructions,
 };
+pub use tasks_extension::*;
 pub use types::*;
 
 // The FND-03 contract freezes unqualified `cargo test -- --exact` IDs. Keep

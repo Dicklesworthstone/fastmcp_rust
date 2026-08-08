@@ -729,6 +729,400 @@ pub enum FinalInputRequiredResultType {
     InputRequired,
 }
 
+/// A final MRTR descriptor embedded in a Task, without a JSON-RPC envelope.
+///
+/// Task input requests are correlated exclusively by their containing map
+/// key.  Consequently these descriptors deliberately omit `jsonrpc`, `id`,
+/// and the outer request `_meta` capability object.
+#[derive(Debug, Clone)]
+pub enum FinalEmbeddedInputRequest {
+    /// A final sampling descriptor.
+    Sampling(FinalEmbeddedCreateMessageParams),
+    /// A roots-list descriptor.
+    Roots(FinalEmbeddedRootsListParams),
+    /// A form or URL elicitation descriptor.
+    Elicitation(FinalEmbeddedElicitationParams),
+}
+
+impl FinalEmbeddedInputRequest {
+    /// Returns the response kind that may answer this descriptor.
+    #[must_use]
+    pub const fn response_kind(&self) -> FinalEmbeddedInputKind {
+        match self {
+            Self::Sampling(_) => FinalEmbeddedInputKind::Sampling,
+            Self::Roots(_) => FinalEmbeddedInputKind::Roots,
+            Self::Elicitation(FinalEmbeddedElicitationParams::Form(_)) => {
+                FinalEmbeddedInputKind::FormElicitation
+            }
+            Self::Elicitation(FinalEmbeddedElicitationParams::Url(_)) => {
+                FinalEmbeddedInputKind::UrlElicitation
+            }
+        }
+    }
+}
+
+impl Serialize for FinalEmbeddedInputRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut object = serde_json::Map::new();
+        match self {
+            Self::Sampling(params) => {
+                object.insert(
+                    "method".to_owned(),
+                    Value::String("sampling/createMessage".to_owned()),
+                );
+                object.insert(
+                    "params".to_owned(),
+                    serde_json::to_value(params).map_err(serde::ser::Error::custom)?,
+                );
+            }
+            Self::Roots(params) => {
+                object.insert("method".to_owned(), Value::String("roots/list".to_owned()));
+                if !params.is_empty() {
+                    object.insert(
+                        "params".to_owned(),
+                        serde_json::to_value(params).map_err(serde::ser::Error::custom)?,
+                    );
+                }
+            }
+            Self::Elicitation(params) => {
+                object.insert(
+                    "method".to_owned(),
+                    Value::String("elicitation/create".to_owned()),
+                );
+                object.insert(
+                    "params".to_owned(),
+                    serde_json::to_value(params).map_err(serde::ser::Error::custom)?,
+                );
+            }
+        }
+        Value::Object(object).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FinalEmbeddedInputRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let (method, params) =
+            take_embedded_request_members(value).map_err(serde::de::Error::custom)?;
+        match method.as_str() {
+            "sampling/createMessage" => {
+                let params = params.ok_or_else(|| {
+                    serde::de::Error::custom("sampling descriptor requires params")
+                })?;
+                serde_json::from_value(params)
+                    .map(Self::Sampling)
+                    .map_err(serde::de::Error::custom)
+            }
+            "roots/list" => {
+                let params = params.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                let params: FinalEmbeddedRootsListParams =
+                    serde_json::from_value(params).map_err(serde::de::Error::custom)?;
+                params.validate().map_err(serde::de::Error::custom)?;
+                Ok(Self::Roots(params))
+            }
+            "elicitation/create" => {
+                let params = params.ok_or_else(|| {
+                    serde::de::Error::custom("elicitation descriptor requires params")
+                })?;
+                serde_json::from_value(params)
+                    .map(Self::Elicitation)
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Err(serde::de::Error::custom(
+                "unsupported embedded input method",
+            )),
+        }
+    }
+}
+
+fn take_embedded_request_members(value: Value) -> Result<(String, Option<Value>), &'static str> {
+    let Value::Object(mut members) = value else {
+        return Err("embedded input request must be an object");
+    };
+    let method = members
+        .remove("method")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or("embedded input request requires a string method")?;
+    let params = members.remove("params");
+    if members.is_empty() {
+        Ok((method, params))
+    } else {
+        Err("embedded input request has unknown envelope members")
+    }
+}
+
+/// The selected final MRTR response kind for one Task map key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalEmbeddedInputKind {
+    /// A sampling response.
+    Sampling,
+    /// A roots-list response.
+    Roots,
+    /// A form-elicitation response.
+    FormElicitation,
+    /// A URL-elicitation response.
+    UrlElicitation,
+}
+
+/// Exact final parameters for an embedded sampling descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalEmbeddedCreateMessageParams {
+    /// Sampling conversation.
+    pub messages: Vec<crate::types::FinalSamplingMessage>,
+    /// Requested maximum token count.
+    #[serde(rename = "maxTokens")]
+    pub max_tokens: i64,
+    /// Optional system prompt.
+    #[serde(
+        rename = "systemPrompt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub system_prompt: Option<String>,
+    /// Optional sampling temperature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Optional stopping sequences.
+    #[serde(
+        rename = "stopSequences",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stop_sequences: Option<Vec<String>>,
+    /// Optional model-selection preferences.
+    #[serde(
+        rename = "modelPreferences",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_preferences: Option<crate::types::ModelPreferences>,
+    /// Optional requested MCP context inclusion.
+    #[serde(
+        rename = "includeContext",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub include_context: Option<IncludeContext>,
+    /// Optional provider-specific metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, Value>>,
+    /// Optional tools the model may call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<crate::types::FinalTool>>,
+    /// Optional tool-selection controls.
+    #[serde(
+        rename = "toolChoice",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tool_choice: Option<crate::types::FinalToolChoice>,
+}
+
+/// Bounded generic metadata permitted on an embedded roots descriptor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalEmbeddedRootsListParams {
+    /// Generic inert metadata. It cannot carry final request authority.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+impl FinalEmbeddedRootsListParams {
+    fn is_empty(&self) -> bool {
+        self.meta.is_none()
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        let Some(meta) = &self.meta else {
+            return Ok(());
+        };
+        if meta.entries().contains_key(FINAL_PROTOCOL_VERSION_META_KEY)
+            || meta
+                .entries()
+                .contains_key(FINAL_CLIENT_CAPABILITIES_META_KEY)
+        {
+            return Err("embedded roots metadata cannot carry outer request authority");
+        }
+        Ok(())
+    }
+}
+
+/// Exact final parameters for an embedded elicitation descriptor.
+#[derive(Debug, Clone, Serialize)]
+pub enum FinalEmbeddedElicitationParams {
+    /// In-band form elicitation.
+    Form(FinalEmbeddedFormElicitationParams),
+    /// External URL elicitation.
+    Url(FinalEmbeddedUrlElicitationParams),
+}
+
+impl<'de> Deserialize<'de> for FinalEmbeddedElicitationParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let mode = value
+            .as_object()
+            .and_then(|members| members.get("mode"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("elicitation descriptor requires mode"))?;
+        match mode {
+            "form" => serde_json::from_value(value)
+                .map(Self::Form)
+                .map_err(serde::de::Error::custom),
+            "url" => serde_json::from_value(value)
+                .map(Self::Url)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom("unsupported elicitation mode")),
+        }
+    }
+}
+
+/// Form elicitation request parameters without an outer request envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalEmbeddedFormElicitationParams {
+    /// Exact form discriminator.
+    pub mode: ElicitMode,
+    /// User-facing request text.
+    pub message: String,
+    /// Requested form schema.
+    #[serde(rename = "requestedSchema")]
+    pub requested_schema: ElicitRequestedSchema,
+}
+
+/// URL elicitation request parameters without legacy elicitation identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalEmbeddedUrlElicitationParams {
+    /// Exact URL discriminator.
+    pub mode: ElicitMode,
+    /// User-facing request text.
+    pub message: String,
+    /// Structurally admitted external URL.
+    pub url: AbsoluteUri,
+}
+
+/// A final MRTR result payload embedded in a Task, without a JSON-RPC envelope.
+#[derive(Debug, Clone)]
+pub enum FinalEmbeddedInputResponse {
+    /// Sampling result payload.
+    Sampling(FinalCreateMessageResult),
+    /// Roots-list result payload.
+    Roots(FinalEmbeddedRootsListResult),
+    /// Elicitation result payload. The request ledger determines form versus URL.
+    Elicitation(FinalEmbeddedElicitationResult),
+}
+
+impl FinalEmbeddedInputResponse {
+    /// Returns whether this response can answer the supplied descriptor kind.
+    #[must_use]
+    pub fn matches_kind(&self, kind: FinalEmbeddedInputKind) -> bool {
+        match (self, kind) {
+            (Self::Sampling(_), FinalEmbeddedInputKind::Sampling)
+            | (Self::Roots(_), FinalEmbeddedInputKind::Roots) => true,
+            (Self::Elicitation(response), FinalEmbeddedInputKind::FormElicitation) => {
+                response.valid_for_form()
+            }
+            (Self::Elicitation(response), FinalEmbeddedInputKind::UrlElicitation) => {
+                response.valid_for_url()
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Serialize for FinalEmbeddedInputResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Sampling(response) => response.serialize(serializer),
+            Self::Roots(response) => response.serialize(serializer),
+            Self::Elicitation(response) => response.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FinalEmbeddedInputResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("embedded input response must be an object"))?;
+        if object.contains_key("jsonrpc")
+            || object.contains_key("id")
+            || object.contains_key("result")
+        {
+            return Err(serde::de::Error::custom(
+                "embedded input response cannot be a JSON-RPC envelope",
+            ));
+        }
+        if object.contains_key("model") || object.contains_key("role") {
+            return serde_json::from_value(value)
+                .map(Self::Sampling)
+                .map_err(serde::de::Error::custom);
+        }
+        if object.contains_key("roots") {
+            return serde_json::from_value(value)
+                .map(Self::Roots)
+                .map_err(serde::de::Error::custom);
+        }
+        if object.contains_key("action") {
+            return serde_json::from_value(value)
+                .map(Self::Elicitation)
+                .map_err(serde::de::Error::custom);
+        }
+        Err(serde::de::Error::custom(
+            "unsupported embedded input response",
+        ))
+    }
+}
+
+/// Exact roots-list result payload embedded in a Task input response map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalEmbeddedRootsListResult {
+    /// Roots supplied by the client.
+    pub roots: Vec<Root>,
+}
+
+/// Exact elicitation response payload embedded in a Task input response map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalEmbeddedElicitationResult {
+    /// User action.
+    pub action: ElicitAction,
+    /// Optional submitted form data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<BTreeMap<String, ElicitContentValue>>,
+}
+
+impl FinalEmbeddedElicitationResult {
+    fn valid_for_form(&self) -> bool {
+        match self.action {
+            ElicitAction::Accept => self.content.is_some(),
+            ElicitAction::Decline | ElicitAction::Cancel => self.content.is_none(),
+        }
+    }
+
+    fn valid_for_url(&self) -> bool {
+        self.content.is_none()
+    }
+}
+
 /// Final `tools/list` result payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalListToolsResult {
