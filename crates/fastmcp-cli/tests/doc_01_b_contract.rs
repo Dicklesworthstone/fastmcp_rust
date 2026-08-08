@@ -220,7 +220,7 @@ fn doc_01_b_public_binary_positive() {
     );
     assert_eq!(
         validate_public_root_help_bytes(
-            b"FastMCP CLI - Run, inspect, and install MCP servers. Protocol status: altered"
+            b"CLI tooling for FastMCP - run, inspect, and install MCP servers Protocol status: altered"
         ),
         Err(PublicHelpRefusal::AlteredStatusStanza)
     );
@@ -260,6 +260,10 @@ fn doc_01_b_public_binary_positive() {
 #[test]
 fn doc_01_b_public_binary_planted_negative() {
     let long_help = fastmcp_output("--help");
+    assert_eq!(
+        evaluate_public_root_help(&long_help, PROVISIONAL_PUBLIC_HELP_ORACLE),
+        Ok(())
+    );
     let baseline = PublicHelpCandidate {
         oracle: PROVISIONAL_PUBLIC_HELP_ORACLE,
         stdout: long_help.stdout.clone(),
@@ -291,6 +295,15 @@ fn doc_01_b_public_binary_planted_negative() {
         );
     }
     let long_help_after_rejection = fastmcp_output("--help");
+    assert_eq!(
+        long_help_after_rejection.status, long_help.status,
+        "a rejected oracle mutation must not alter the real binary's exit status"
+    );
+    assert_eq!(
+        long_help_after_rejection.stderr.as_slice(),
+        long_help.stderr.as_slice(),
+        "a rejected oracle mutation must not alter the real binary's stderr"
+    );
     assert_eq!(
         long_help_after_rejection.stdout.as_slice(),
         accepted_before
