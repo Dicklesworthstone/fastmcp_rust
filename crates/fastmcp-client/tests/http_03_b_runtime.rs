@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp_client::http_executor::{
-    ModernHttpClient, ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpResponseKind,
+    LegacySseHttpClientError, ModernHttpClient, ModernHttpClientError, ModernHttpConnectOutcome,
+    ModernHttpResponseKind,
 };
 use fastmcp_client::sse::{SseEndOfStream, SseLimits};
 use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan, ProtocolEra, ProtocolPolicy};
-use fastmcp_protocol::{ClientCapabilities, ClientInfo, RequestId};
+use fastmcp_protocol::{ClientCapabilities, ClientInfo, JsonRpcMessage, JsonRpcRequest, RequestId};
 
 #[derive(Debug)]
 struct CapturedHttpRequest {
@@ -28,15 +29,21 @@ fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-fn plan(target: &str, policy: ProtocolPolicy) -> ClientProtocolPlan {
-    let target = CanonicalHttpUrl::parse(target).expect("local modern target must be canonical");
-    let legacy_sse = CanonicalHttpUrl::parse("http://127.0.0.1:9/legacy-sse")
-        .expect("legacy test target must be canonical");
-    let legacy_message = CanonicalHttpUrl::parse("http://127.0.0.1:9/legacy-message")
-        .expect("legacy test target must be canonical");
+fn plan(
+    modern_target: &str,
+    legacy_sse_target: &str,
+    legacy_message_target: &str,
+    policy: ProtocolPolicy,
+) -> ClientProtocolPlan {
+    let modern_target =
+        CanonicalHttpUrl::parse(modern_target).expect("local modern target must be canonical");
+    let legacy_sse =
+        CanonicalHttpUrl::parse(legacy_sse_target).expect("legacy SSE target must be canonical");
+    let legacy_message = CanonicalHttpUrl::parse(legacy_message_target)
+        .expect("legacy message target must be canonical");
     ClientProtocolPlan::http(
         policy,
-        (!matches!(policy, ProtocolPolicy::LegacyOnly)).then_some(target),
+        (!matches!(policy, ProtocolPolicy::LegacyOnly)).then_some(modern_target),
         (!matches!(policy, ProtocolPolicy::ModernOnly)).then_some(legacy_sse),
         (!matches!(policy, ProtocolPolicy::ModernOnly)).then_some(legacy_message),
         "credential-partition-http-03".to_owned(),
@@ -73,9 +80,12 @@ fn read_request(stream: &mut TcpStream) -> CapturedHttpRequest {
     let content_length = head
         .lines()
         .find_map(|line| line.strip_prefix("Content-Length: "))
-        .expect("native POST must have Content-Length")
-        .parse::<usize>()
-        .expect("Content-Length must be numeric");
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("Content-Length must be numeric")
+        })
+        .unwrap_or(0);
     while wire.len() < head_end.saturating_add(content_length) {
         let read = stream
             .read(&mut buffer)
@@ -93,6 +103,7 @@ fn read_request(stream: &mut TcpStream) -> CapturedHttpRequest {
 fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
     let reason = match status {
         200 => "OK",
+        202 => "Accepted",
         401 => "Unauthorized",
         404 => "Not Found",
         _ => "Test Response",
@@ -158,7 +169,7 @@ fn http_03_b_runtime_positive() {
             &mut probe,
             200,
             "application/json",
-            br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
         );
 
         let (mut normal, _) = listener.accept().expect("accept normal modern request");
@@ -179,7 +190,12 @@ fn http_03_b_runtime_positive() {
     let cx = Cx::for_request();
     let outcome = runtime_block_on(ModernHttpClient::connect(
         &cx,
-        plan(&target, ProtocolPolicy::Auto),
+        plan(
+            &target,
+            "http://127.0.0.1:9/legacy-sse",
+            "http://127.0.0.1:9/legacy-message",
+            ProtocolPolicy::Auto,
+        ),
         client_info(),
         ClientCapabilities::default(),
     ))
@@ -189,6 +205,10 @@ fn http_03_b_runtime_positive() {
         .into_modern()
         .expect("recognized modern probe must return a ready modern client");
     assert_eq!(client.modern_post_target(), target);
+    assert_eq!(
+        client.server_discovery().supported_versions(),
+        ["2026-07-28"]
+    );
 
     let response = runtime_block_on(client.request(
         &cx,
@@ -233,31 +253,85 @@ fn http_03_b_runtime_positive() {
         .local_addr()
         .expect("read fallback listener address");
     let fallback_target = format!("http://{fallback_address}/mcp");
+    let fallback_sse_target = format!("http://{fallback_address}/legacy-sse");
+    let fallback_message_target = format!("http://{fallback_address}/legacy-message?session=one");
     let fallback_server = thread::spawn(move || {
-        let (mut stream, _) = fallback_listener.accept().expect("accept disposable probe");
-        let captured = read_request(&mut stream);
-        write_response(&mut stream, 404, "text/plain", b"");
-        captured
+        let (mut probe, _) = fallback_listener.accept().expect("accept disposable probe");
+        let probe_request = read_request(&mut probe);
+        write_response(&mut probe, 404, "text/plain", b"");
+
+        let (mut sse, _) = fallback_listener.accept().expect("accept legacy SSE GET");
+        let sse_request = read_request(&mut sse);
+        let sse_body = format!(
+            "event: endpoint\ndata: http://{fallback_address}/legacy-message?session=one\n\nevent: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"legacy\":true}}}}\n\n"
+        );
+        write_response(&mut sse, 200, "text/event-stream", sse_body.as_bytes());
+
+        let (mut post, _) = fallback_listener
+            .accept()
+            .expect("accept advertised legacy POST");
+        let post_request = read_request(&mut post);
+        write_response(&mut post, 202, "application/json", b"");
+        (probe_request, sse_request, post_request)
     });
 
     let fallback = runtime_block_on(ModernHttpClient::connect(
         &cx,
-        plan(&fallback_target, ProtocolPolicy::Auto),
+        plan(
+            &fallback_target,
+            &fallback_sse_target,
+            &fallback_message_target,
+            ProtocolPolicy::Auto,
+        ),
         client_info(),
         ClientCapabilities::default(),
     ))
-    .expect("the configured 404 empty refusal must authorize one legacy observation");
-    assert!(matches!(
-        fallback,
-        ModernHttpConnectOutcome::LegacySseFallbackAuthorized(_)
-    ));
-    assert_eq!(fallback.selected_era(), None);
-    assert_final_metadata(
-        &fallback_server
-            .join()
-            .expect("fallback native HTTP server must join"),
-        "server/discover",
+    .expect("the configured 404 empty refusal must open the exact legacy SSE client");
+    assert_eq!(fallback.selected_era(), Some(ProtocolEra::Legacy2024));
+    let mut legacy = fallback
+        .into_legacy_sse()
+        .expect("recognized refusal must return the opened legacy client");
+    assert_eq!(
+        legacy.configured_message_post_target(),
+        fallback_message_target
     );
+    assert_eq!(
+        legacy.advertised_message_post_target(),
+        fallback_message_target
+    );
+    runtime_block_on(legacy.send(
+        &cx,
+        &JsonRpcMessage::Request(JsonRpcRequest::new(
+            "initialize",
+            Some(serde_json::json!({"protocolVersion": "2024-11-05"})),
+            RequestId::Number(7),
+        )),
+    ))
+    .expect("legacy client must POST to its advertised endpoint");
+    let legacy_message = runtime_block_on(legacy.next_message(&cx))
+        .expect("legacy message event must be strict JSON-RPC")
+        .expect("legacy SSE must provide a message event");
+    assert_eq!(
+        serde_json::to_value(legacy_message).expect("JSON-RPC message is serializable")["result"]["legacy"],
+        true
+    );
+
+    let (probe, sse, post) = fallback_server
+        .join()
+        .expect("fallback native HTTP server must join");
+    assert_final_metadata(&probe, "server/discover");
+    assert!(sse.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+    assert!(sse.head.contains("Accept: text/event-stream\r\n"));
+    assert!(!sse.head.contains("MCP-Protocol-Version:"));
+    assert!(
+        post.head
+            .starts_with("POST /legacy-message?session=one HTTP/1.1\r\n")
+    );
+    assert!(post.head.contains("Content-Type: application/json\r\n"));
+    assert!(!post.head.contains("MCP-Protocol-Version:"));
+    let posted: serde_json::Value =
+        serde_json::from_slice(&post.body).expect("legacy POST must contain JSON-RPC");
+    assert_eq!(posted["method"], "initialize");
 }
 
 #[test]

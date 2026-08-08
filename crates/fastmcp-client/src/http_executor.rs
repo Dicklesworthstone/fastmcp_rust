@@ -1579,8 +1579,9 @@ fn contains_header_control(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpExecutorError,
-        ModernHttpResponseKind, validate_response_head,
+        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpClientError,
+        ModernHttpExecutorError, ModernHttpResponseKind, decode_modern_discovery_response,
+        validate_response_head,
     };
 
     #[test]
@@ -1627,6 +1628,20 @@ mod tests {
         assert!(matches!(
             validate_response_head(200, &rejected_headers),
             Err(ModernHttpExecutorError::UnsupportedContentEncoding)
+        ));
+    }
+
+    #[test]
+    fn modern_connect_requires_the_exact_typed_discovery_result() {
+        let exact = br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#;
+        let admitted = decode_modern_discovery_response(exact)
+            .expect("the exact final discovery result must be retained");
+        assert_eq!(admitted.supported_versions(), ["2026-07-28"]);
+
+        let planted = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        assert!(matches!(
+            decode_modern_discovery_response(planted),
+            Err(ModernHttpClientError::InvalidDiscoveryResponse)
         ));
     }
 }
