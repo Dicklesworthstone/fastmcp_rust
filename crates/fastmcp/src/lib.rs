@@ -511,18 +511,17 @@ pub mod legacy_2024 {
     };
     pub use fastmcp_protocol::{
         CallToolParams, CallToolResult, CancelledParams, ClientCapabilities, ClientInfo,
-        CompletionValues, Content, GetPromptParams, GetPromptResult, InitializeParams,
-        InitializeResult, JsonRpcMessage, JsonRpcRequest, LegacyCompletionArgument,
-        LegacyCompletionParams, LegacyCompletionReference, LegacyCompletionResult, LegacyContent,
-        LegacyCoreRequest, LegacyCoreResult, LegacyEmptyResult, LegacyMetadata,
-        LegacyOpaqueMetadata, LegacyPromptMessage, LegacyResourceContent, ListPromptsParams,
-        ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
-        ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel,
-        LogMessageParams, PROTOCOL_VERSION, ProgressMarker, ProgressParams, Prompt, PromptArgument,
-        PromptMessage, ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource,
-        ResourceContent, ResourceTemplate, ResourceUpdatedNotificationParams, ServerCapabilities,
-        ServerInfo, SetLogLevelParams, SubscribeResourceParams, Tool, ToolAnnotations,
-        UnsubscribeResourceParams,
+        CompletionValues, GetPromptParams, GetPromptResult, InitializeParams, InitializeResult,
+        JsonRpcMessage, JsonRpcRequest, LegacyCompletionArgument, LegacyCompletionParams,
+        LegacyCompletionReference, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
+        LegacyCoreResult, LegacyEmptyResult, LegacyMetadata, LegacyOpaqueMetadata,
+        LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
+        ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
+        ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel, LogMessageParams,
+        PROTOCOL_VERSION, ProgressMarker, ProgressParams, Prompt, PromptArgument,
+        ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource, ResourceTemplate,
+        ResourceUpdatedNotificationParams, ServerCapabilities, ServerInfo, SetLogLevelParams,
+        SubscribeResourceParams, Tool, ToolAnnotations, UnsubscribeResourceParams,
     };
     pub use fastmcp_server::legacy_2024::{
         LEGACY_2024_MAX_ADAPTER_RESERVATIONS, Legacy2024AdapterError, Legacy2024Handler,
@@ -753,6 +752,37 @@ mod tests {
         let _: Option<legacy_2024::Legacy2024Lifecycle> = None;
         let _: Option<legacy_2024::LegacySseHttpClient> = None;
         let _: Option<legacy_2024::LegacySseMessagePost> = None;
+    }
+
+    #[test]
+    fn exact_legacy_result_item_vocabulary_matches_result_fields() {
+        use super::legacy_2024;
+
+        fn call_tool_items(result: legacy_2024::CallToolResult) -> Vec<legacy_2024::LegacyContent> {
+            result.content
+        }
+
+        fn read_resource_items(
+            result: legacy_2024::ReadResourceResult,
+        ) -> Vec<legacy_2024::LegacyResourceContent> {
+            result.contents
+        }
+
+        fn get_prompt_items(
+            result: legacy_2024::GetPromptResult,
+        ) -> Vec<legacy_2024::LegacyPromptMessage> {
+            result.messages
+        }
+
+        let _: fn(legacy_2024::CallToolResult) -> Vec<legacy_2024::LegacyContent> = call_tool_items;
+        let _: fn(legacy_2024::ReadResourceResult) -> Vec<legacy_2024::LegacyResourceContent> =
+            read_resource_items;
+        let _: fn(legacy_2024::GetPromptResult) -> Vec<legacy_2024::LegacyPromptMessage> =
+            get_prompt_items;
+
+        let _: Option<super::Content> = None;
+        let _: Option<super::ResourceContent> = None;
+        let _: Option<super::PromptMessage> = None;
     }
 
     #[test]
