@@ -102,7 +102,9 @@ pub enum ResultDecodeErrorKind {
     InvalidKnownMember,
     /// `resultType` was explicit `null` or another non-string value.
     InvalidDiscriminator,
-    /// `input_required` had neither `input` nor `request`.
+    /// A modern result omitted its required `resultType` discriminator.
+    MissingDiscriminator,
+    /// `input_required` had neither `inputRequests` nor `requestState`.
     MissingInputRequest,
     /// A deferred extension was rejected by the supplied discriminator policy.
     RejectedExtension,
@@ -277,7 +279,11 @@ fn result_raw_admission_error(error: RawJsonAdmissionError) -> ResultDecodeError
 /// Result metadata common to complete and input-required results.
 #[derive(Debug, Clone)]
 pub struct ResultMeta {
-    /// SDK-created successful results carry a server identity by default.
+    /// Compatibility view of a locally authored server identity.
+    ///
+    /// Final encoding moves this identity into
+    /// `_meta.io.modelcontextprotocol/serverInfo`; it is never emitted as a
+    /// top-level result member.
     pub server_info: Option<Implementation>,
     meta: Option<OpenMetadata>,
     exact_meta: Option<ExactJsonObject>,
@@ -287,11 +293,19 @@ impl ResultMeta {
     /// Creates metadata for a locally constructed successful result.
     #[must_use]
     pub fn server_generated(server_info: Implementation) -> Self {
+        let value = serde_json::to_value(server_info)
+            .expect("final implementation identity always serializes");
+        let metadata = OpenMetadata::try_from_entries([(
+            "io.modelcontextprotocol/serverInfo".to_owned(),
+            value,
+        )])
+        .expect("final implementation identity is valid result metadata");
         Self {
-            server_info: Some(server_info),
+            server_info: None,
             meta: None,
             exact_meta: None,
         }
+        .with_metadata(metadata)
     }
 
     /// Attaches final common metadata without synthesizing it when absent.
@@ -314,6 +328,15 @@ impl ResultMeta {
         MetadataView {
             object: self.exact_meta.as_ref(),
         }
+    }
+
+    /// Decodes the final server identity from its reserved metadata location.
+    pub fn final_server_info(&self) -> Result<Option<Implementation>, ResultDecodeError> {
+        self.meta.as_ref().map_or(Ok(None), |metadata| {
+            metadata.server_info().map_err(|_| {
+                ResultDecodeError::new(ResultDecodeErrorKind::InvalidKnownMember, "$._meta")
+            })
+        })
     }
 }
 
@@ -596,8 +619,10 @@ pub trait CompleteResultPayload: Sized {
 /// A typed core `input_required` result with inert open siblings.
 #[derive(Debug, Clone)]
 pub struct InputRequiredResult {
-    /// Request/input supplied by the server. At least one is always present.
-    pub input_or_request: ExactJsonValue,
+    /// Final input requests supplied by the server, when present.
+    input_requests: Option<ExactJsonObject>,
+    /// Opaque state supplied for the final retry, when present.
+    request_state: Option<String>,
     /// Common result metadata.
     pub meta: ResultMeta,
     /// Open siblings, including standard names from another composition.
@@ -605,15 +630,36 @@ pub struct InputRequiredResult {
 }
 
 impl InputRequiredResult {
-    /// Creates an input-required result. Its safe encoding never emits cache or
-    /// pagination hints.
-    #[must_use]
-    pub fn new(input_or_request: ExactJsonValue, meta: ResultMeta) -> Self {
-        Self {
-            input_or_request,
+    /// Creates an input-required result using final retry members only.
+    pub fn new(
+        input_requests: Option<ExactJsonObject>,
+        request_state: Option<String>,
+        meta: ResultMeta,
+    ) -> Result<Self, ResultDecodeError> {
+        if input_requests.is_none() && request_state.is_none() {
+            return Err(ResultDecodeError::new(
+                ResultDecodeErrorKind::MissingInputRequest,
+                "$",
+            ));
+        }
+        Ok(Self {
+            input_requests,
+            request_state,
             meta,
             extras: UnknownResultMembers::default(),
-        }
+        })
+    }
+
+    /// Returns final input requests without converting their exact members.
+    #[must_use]
+    pub fn input_requests(&self) -> Option<&ExactJsonObject> {
+        self.input_requests.as_ref()
+    }
+
+    /// Returns the opaque final retry state, if supplied.
+    #[must_use]
+    pub fn request_state(&self) -> Option<&str> {
+        self.request_state.as_deref()
     }
 }
 
@@ -741,12 +787,11 @@ impl From<ProtocolEra> for ResultPeerEra {
     }
 }
 
-/// Bounded diagnostics produced while preserving interoperable peer input.
+/// Bounded diagnostics reserved for optional legacy peer compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultPeerDiagnostic {
-    /// A modern peer omitted `resultType`; it is decoded as `complete` but
-    /// remains nonconformant to the final wire requirement.
-    ModernPeerOmittedResultType,
+    /// A legacy peer used a compatibility result shape.
+    LegacyCompatibilityShape,
 }
 
 /// Core or deferred result decoded from a peer envelope.
@@ -762,9 +807,9 @@ pub enum DecodedResult {
 
 /// Decodes one peer result through the public result codec.
 ///
-/// An absent discriminator defaults to `complete` for either peer era. Explicit
-/// null and non-string discriminators are rejected instead of conflating them
-/// with absence.
+/// A final peer must provide `resultType`. An absent discriminator defaults to
+/// `complete` only for the legacy era. Explicit null and non-string
+/// discriminators are rejected instead of conflating them with absence.
 pub fn decode_peer_result(
     input: &str,
     era: ResultPeerEra,
@@ -772,11 +817,13 @@ pub fn decode_peer_result(
 ) -> Result<(DecodedResult, Option<ResultPeerDiagnostic>), ResultDecodeError> {
     let mut members = parse_exact_result_object(input)?;
     let result_type = match members.get("resultType") {
-        None => (
-            "complete".to_owned(),
-            (era == ResultPeerEra::Modern)
-                .then_some(ResultPeerDiagnostic::ModernPeerOmittedResultType),
-        ),
+        None if era == ResultPeerEra::Legacy => ("complete".to_owned(), None),
+        None => {
+            return Err(ResultDecodeError::new(
+                ResultDecodeErrorKind::MissingDiscriminator,
+                "$.resultType",
+            ));
+        }
         Some(ExactJsonValue::String(value)) => (value.clone(), None),
         Some(_) => {
             return Err(ResultDecodeError::new(
@@ -785,6 +832,12 @@ pub fn decode_peer_result(
             ));
         }
     };
+    if members.get("serverInfo").is_some() {
+        return Err(ResultDecodeError::new(
+            ResultDecodeErrorKind::InvalidKnownMember,
+            "$.serverInfo",
+        ));
+    }
     match policy.decide(&result_type.0) {
         ResultDiscriminatorDecision::Rejected => {
             return Err(ResultDecodeError::rejected_extension(RawResultEnvelope {
@@ -817,19 +870,45 @@ pub fn decode_peer_result(
             result_type.1,
         )),
         "input_required" => {
-            let input_or_request = members
-                .take("input")
-                .or_else(|| members.take("request"))
-                .ok_or_else(|| {
-                    ResultDecodeError::new(ResultDecodeErrorKind::MissingInputRequest, "$")
-                })?;
+            if members.get("input").is_some() {
+                return Err(ResultDecodeError::new(
+                    ResultDecodeErrorKind::InvalidKnownMember,
+                    "$.input",
+                ));
+            }
+            if members.get("request").is_some() {
+                return Err(ResultDecodeError::new(
+                    ResultDecodeErrorKind::InvalidKnownMember,
+                    "$.request",
+                ));
+            }
+            let input_requests = match members.take("inputRequests") {
+                None => None,
+                Some(ExactJsonValue::Object(value)) => Some(value),
+                Some(_) => {
+                    return Err(ResultDecodeError::new(
+                        ResultDecodeErrorKind::InvalidKnownMember,
+                        "$.inputRequests",
+                    ));
+                }
+            };
+            let request_state = match members.take("requestState") {
+                None => None,
+                Some(ExactJsonValue::String(value)) => Some(value),
+                Some(_) => {
+                    return Err(ResultDecodeError::new(
+                        ResultDecodeErrorKind::InvalidKnownMember,
+                        "$.requestState",
+                    ));
+                }
+            };
+            let input_required = InputRequiredResult::new(input_requests, request_state, meta)?;
             Ok((
                 DecodedResult::InputRequired(InputRequiredResult {
-                    input_or_request,
-                    meta,
                     extras: UnknownResultMembers {
                         members: members.members,
                     },
+                    ..input_required
                 }),
                 result_type.1,
             ))
@@ -941,16 +1020,14 @@ fn decode_result_meta(members: &mut ExactJsonObject) -> Result<ResultMeta, Resul
             ));
         }
     };
-    let server_info = match members.take("serverInfo") {
-        None => None,
-        Some(value) => Some(
-            serde_json::from_value(exact_json_to_serde(&value)?).map_err(|_| {
-                ResultDecodeError::new(ResultDecodeErrorKind::InvalidKnownMember, "$.serverInfo")
-            })?,
-        ),
-    };
+    if members.get("serverInfo").is_some() {
+        return Err(ResultDecodeError::new(
+            ResultDecodeErrorKind::InvalidKnownMember,
+            "$.serverInfo",
+        ));
+    }
     Ok(ResultMeta {
-        server_info,
+        server_info: None,
         meta,
         exact_meta,
     })
@@ -978,10 +1055,18 @@ pub fn encode_result(result: &DecodedResult) -> String {
                 value: ExactJsonValue::String("input_required".to_owned()),
             });
             append_result_meta(&mut members, &input_required.meta);
-            members.push(ExactJsonMember {
-                name: "input".to_owned(),
-                value: input_required.input_or_request.clone(),
-            });
+            if let Some(input_requests) = &input_required.input_requests {
+                members.push(ExactJsonMember {
+                    name: "inputRequests".to_owned(),
+                    value: ExactJsonValue::Object(input_requests.clone()),
+                });
+            }
+            if let Some(request_state) = &input_required.request_state {
+                members.push(ExactJsonMember {
+                    name: "requestState".to_owned(),
+                    value: ExactJsonValue::String(request_state.clone()),
+                });
+            }
             members.extend(input_required.extras.members.clone());
         }
         DecodedResult::Deferred(deferred) => return encode_exact_object(&deferred.members),
@@ -1024,25 +1109,30 @@ pub fn encode_complete_result(
 }
 
 fn append_result_meta(members: &mut Vec<ExactJsonMember>, meta: &ResultMeta) {
-    if let Some(value) = &meta.meta {
+    let mut exact_meta = meta.exact_meta.clone();
+    if let Some(server_info) = &meta.server_info {
+        let exact_server_info = exact_json_from_serde_unchecked(
+            &serde_json::to_value(server_info)
+                .expect("final implementation identity always serializes"),
+        );
+        let object = exact_meta.get_or_insert_with(ExactJsonObject::default);
+        if object.get("io.modelcontextprotocol/serverInfo").is_none() {
+            object.members.push(ExactJsonMember {
+                name: "io.modelcontextprotocol/serverInfo".to_owned(),
+                value: exact_server_info,
+            });
+        }
+    }
+    if let Some(exact_meta) = exact_meta {
         members.push(ExactJsonMember {
             name: "_meta".to_owned(),
-            value: meta.exact_meta.as_ref().map_or_else(
-                || {
-                    let object = value.entries().clone().into_iter().collect();
-                    exact_json_from_serde_unchecked(&serde_json::Value::Object(object))
-                },
-                |exact| ExactJsonValue::Object(exact.clone()),
-            ),
+            value: ExactJsonValue::Object(exact_meta),
         });
-    }
-    if let Some(server_info) = &meta.server_info {
+    } else if let Some(value) = &meta.meta {
+        let object = value.entries().clone().into_iter().collect();
         members.push(ExactJsonMember {
-            name: "serverInfo".to_owned(),
-            value: exact_json_from_serde_unchecked(
-                &serde_json::to_value(server_info)
-                    .expect("final implementation identity always serializes"),
-            ),
+            name: "_meta".to_owned(),
+            value: exact_json_from_serde_unchecked(&serde_json::Value::Object(object)),
         });
     }
 }
@@ -1440,7 +1530,7 @@ mod tests {
 
     #[test]
     fn result_unit_a_positive_round_trip() {
-        let source = r#"{"resultType":"complete","_meta":{"trace":true},"serverInfo":{"name":"FastMCP","version":"0.1"},"first":{"integer":123456789012345678901234567890,"decimal":1.20e+4,"nil":null,"array":[false,"text"]},"second":{"nested":{"ok":true}}}"#;
+        let source = r#"{"resultType":"complete","_meta":{"trace":true,"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"first":{"integer":123456789012345678901234567890,"decimal":1.20e+4,"nil":null,"array":[false,"text"]},"second":{"nested":{"ok":true}}}"#;
         let (decoded, diagnostic) = decode_peer_result(
             source,
             ResultPeerEra::Modern,
@@ -1451,17 +1541,18 @@ mod tests {
         let DecodedResult::Complete(complete) = decoded else {
             panic!("complete result");
         };
-        assert_eq!(
-            complete
-                .meta
-                .server_info
-                .as_ref()
-                .map(|info| info.name.as_str()),
-            Some("FastMCP")
-        );
+        assert!(complete.meta.server_info.is_none());
         assert!(matches!(
             complete.meta.metadata().get("trace"),
             Some(ExactJsonValue::Bool(true))
+        ));
+        assert!(matches!(
+            complete
+                .meta
+                .metadata()
+                .get("io.modelcontextprotocol/serverInfo"),
+            Some(ExactJsonValue::Object(server_info))
+                if server_info.get("name") == Some(&ExactJsonValue::String("FastMCP".to_owned()))
         ));
         let extras = complete.extras.members();
         assert_eq!(
@@ -1490,6 +1581,130 @@ mod tests {
             Some(&ExactJsonValue::Number("1.20e+4".to_owned()))
         );
         assert_eq!(encode_result(&DecodedResult::Complete(complete)), source);
+    }
+
+    #[test]
+    fn final_results_require_result_type_and_reject_top_level_server_info() {
+        let accepted = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"extension":true}"#;
+        let (baseline, diagnostic) = decode_peer_result(
+            accepted,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("final result with a metadata serverInfo is admitted");
+        assert_eq!(diagnostic, None);
+
+        let missing = r#"{"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"extension":true}"#;
+        let error = decode_peer_result(
+            missing,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect_err("only the required final resultType is absent");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::MissingDiscriminator);
+        assert_eq!(error.path(), "$.resultType");
+
+        let wrong_type = r#"{"resultType":false,"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"extension":true}"#;
+        let error = decode_peer_result(
+            wrong_type,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect_err("only resultType changes from a string to a boolean");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidDiscriminator);
+        assert_eq!(error.path(), "$.resultType");
+
+        let top_level_server_info = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"serverInfo":{"name":"legacy-location","version":"0.1"},"extension":true}"#;
+        let error = decode_peer_result(
+            top_level_server_info,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect_err("final serverInfo is never admitted as a top-level result member");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
+        assert_eq!(error.path(), "$.serverInfo");
+
+        let (reaccepted, _) = decode_peer_result(
+            accepted,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("rejections do not mutate final result admission");
+        assert_eq!(encode_result(&baseline), accepted);
+        assert_eq!(encode_result(&reaccepted), accepted);
+    }
+
+    #[test]
+    fn locally_authored_final_server_info_encodes_only_in_metadata() {
+        let server_info =
+            Implementation::try_new("FastMCP", "0.1").expect("valid final implementation identity");
+        let result = DecodedResult::Complete(CompleteResult::new(
+            ExactJsonObject::default(),
+            ResultMeta::server_generated(server_info),
+        ));
+        let encoded = encode_result(&result);
+        assert_eq!(
+            encoded,
+            r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}}}"#
+        );
+        let wire: serde_json::Value =
+            serde_json::from_str(&encoded).expect("final result encoding is JSON");
+        assert!(wire.get("serverInfo").is_none());
+    }
+
+    #[test]
+    fn final_input_required_uses_retry_members_not_legacy_input() {
+        let accepted = r#"{"resultType":"input_required","inputRequests":{"consent":{"type":"form"}},"requestState":"retry-7"}"#;
+        let (decoded, diagnostic) = decode_peer_result(
+            accepted,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("final retry result is admitted");
+        assert_eq!(diagnostic, None);
+        let DecodedResult::InputRequired(input_required) = &decoded else {
+            panic!("input-required result");
+        };
+        assert_eq!(input_required.request_state(), Some("retry-7"));
+        assert!(matches!(
+            input_required
+                .input_requests()
+                .and_then(|requests| requests.get("consent")),
+            Some(ExactJsonValue::Object(_))
+        ));
+        assert_eq!(encode_result(&decoded), accepted);
+
+        let missing = r#"{"resultType":"input_required"}"#;
+        let error = decode_peer_result(
+            missing,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect_err("input-required needs a retry member");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::MissingInputRequest);
+        assert_eq!(error.path(), "$");
+
+        let wrong_type =
+            r#"{"resultType":"input_required","inputRequests":[],"requestState":"retry-7"}"#;
+        let error = decode_peer_result(
+            wrong_type,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect_err("inputRequests must be an object");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
+        assert_eq!(error.path(), "$.inputRequests");
+
+        let legacy_input =
+            r#"{"resultType":"input_required","input":{"type":"form"},"requestState":"retry-7"}"#;
+        let error = decode_peer_result(
+            legacy_input,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect_err("the obsolete input field is not admitted in final input-required results");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
+        assert_eq!(error.path(), "$.input");
     }
 
     #[test]

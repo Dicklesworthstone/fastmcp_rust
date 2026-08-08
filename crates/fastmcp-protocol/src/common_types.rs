@@ -614,6 +614,14 @@ impl OpenMetadata {
         self.typed_implementation("io.modelcontextprotocol/clientInfo")
     }
 
+    /// Decodes the self-reported server identity from final result metadata.
+    ///
+    /// Final result envelopes carry this only under
+    /// `io.modelcontextprotocol/serverInfo` in `_meta`.
+    pub fn server_info(&self) -> Result<Option<Implementation>, CommonTypeError> {
+        self.typed_implementation("io.modelcontextprotocol/serverInfo")
+    }
+
     /// Reads the exact optional logging-level metadata value.
     pub fn log_level(&self) -> Result<Option<LoggingLevel>, CommonTypeError> {
         self.0
@@ -1047,7 +1055,7 @@ pub struct ResourceLink {
     /// Optional link annotations.
     pub annotations: Option<Annotations>,
     /// Optional raw size of the resource in bytes.
-    pub size: Option<f64>,
+    pub size: Option<u64>,
     /// Preserved open metadata.
     pub meta: Option<OpenMetadata>,
 }
@@ -1112,7 +1120,7 @@ struct ResourceLinkWire {
     #[serde(default)]
     annotations: Option<Annotations>,
     #[serde(default)]
-    size: Option<f64>,
+    size: Option<u64>,
     #[serde(rename = "_meta", default)]
     meta: Option<OpenMetadata>,
 }
@@ -1314,7 +1322,7 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<Annotations>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        size: Option<f64>,
+        size: Option<u64>,
         #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
         meta: Option<OpenMetadata>,
     },
@@ -1370,7 +1378,7 @@ enum ContentBlockWire {
         #[serde(default)]
         annotations: Option<Annotations>,
         #[serde(default)]
-        size: Option<f64>,
+        size: Option<u64>,
         #[serde(rename = "_meta", default)]
         meta: Option<OpenMetadata>,
     },
@@ -2130,7 +2138,7 @@ mod tests {
             description: Some("Raw quarterly figures".to_owned()),
             mime_type: Some("text/markdown".to_owned()),
             annotations: Some(annotations.clone()),
-            size: Some(4096.0),
+            size: Some(4096),
             meta: Some(metadata.clone()),
         };
         let resource_link_wire = serde_json::to_value(&resource_link).expect("resource link");
@@ -2164,7 +2172,7 @@ mod tests {
             description: Some("Raw quarterly figures".to_owned()),
             mime_type: Some("text/markdown".to_owned()),
             annotations: Some(annotations),
-            size: Some(4096.0),
+            size: Some(4096),
             meta: Some(metadata),
         };
         let content_wire = serde_json::to_value(&content).expect("content wire");
@@ -2215,6 +2223,47 @@ mod tests {
         assert_eq!(
             accepted, baseline,
             "the rejected one-field legacy size spelling cannot mutate final wire state"
+        );
+    }
+
+    #[test]
+    fn final_resource_link_size_is_an_optional_integer() {
+        let accepted = json!({
+            "type": "resource_link",
+            "name": "report",
+            "uri": "https://example.test/reports/q3",
+            "size": 4096
+        });
+        let resource_link: ResourceLink = serde_json::from_value(accepted.clone())
+            .expect("integer resource-link size is admitted");
+        assert_eq!(resource_link.size, Some(4096));
+        assert_eq!(
+            serde_json::to_value(&resource_link).expect("integer resource-link size encodes"),
+            accepted
+        );
+
+        let missing = json!({
+            "type": "resource_link",
+            "name": "report",
+            "uri": "https://example.test/reports/q3"
+        });
+        let missing_size: ResourceLink =
+            serde_json::from_value(missing.clone()).expect("resource-link size is optional");
+        assert_eq!(missing_size.size, None);
+        assert_eq!(
+            serde_json::to_value(missing_size).expect("absent size remains absent"),
+            missing
+        );
+
+        let wrong_type = json!({
+            "type": "resource_link",
+            "name": "report",
+            "uri": "https://example.test/reports/q3",
+            "size": 4096.5
+        });
+        assert!(
+            serde_json::from_value::<ResourceLink>(wrong_type).is_err(),
+            "a fractional resource-link size is not an integer"
         );
     }
 
