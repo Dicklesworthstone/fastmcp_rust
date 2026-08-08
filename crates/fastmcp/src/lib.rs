@@ -283,6 +283,7 @@ pub use fastmcp_transport::{
     HttpResponseRepresentation, HttpStatus, ModernHttpRequestAdmission, StdioTransport,
     StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
     StreamableHttpResponseStream, StreamableHttpTransport, Transport, TransportError,
+    TransportRecvHalf, TransportSendHalf,
 };
 
 // Re-export transport modules
@@ -527,8 +528,8 @@ pub mod modern {
         Codec, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
         HttpResponse, HttpResponseRepresentation, HttpStatus, ModernHttpRequestAdmission,
         StdioTransport, StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
-        StreamableHttpResponseStream, StreamableHttpTransport, Transport, TransportError, http,
-        memory,
+        StreamableHttpResponseStream, StreamableHttpTransport, Transport, TransportError,
+        TransportRecvHalf, TransportSendHalf, http, memory,
     };
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -740,6 +741,8 @@ pub mod prelude {
         TokenAuthProvider,
         TokenVerifier,
         Tool,
+        TransportRecvHalf,
+        TransportSendHalf,
         auto,
         cancelled,
         err,
