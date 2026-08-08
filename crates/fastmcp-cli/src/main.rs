@@ -602,9 +602,9 @@ enum Commands {
         /// Non-resettable per-request absolute timeout in seconds (1-900).
         ///
         /// Starts when initialization or a later MCP request is committed. It
-        /// does not bound the whole CLI or subprocess lifetime. Non-Unix
-        /// child-pipe reads remain frame-boundary-only; blocking child-stdin
-        /// writes cannot be preempted by these timers.
+        /// does not bound the whole CLI or subprocess lifetime. On Unix child
+        /// stdio, the request timers bound silent and partial-frame reads;
+        /// blocking child-stdin writes cannot be preempted by these timers.
         #[arg(
             long,
             default_value_t = 120,

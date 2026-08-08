@@ -829,7 +829,11 @@ fn e2e_cli_test_help() {
     assert!(normalized.contains("The current connectivity probes do not attach progress tokens"));
     assert!(normalized.contains("peer traffic does not reset their idle timers."));
     assert!(normalized.contains("It does not bound the whole CLI or subprocess lifetime."));
-    assert!(normalized.contains("Non-Unix child-pipe reads remain frame-boundary-only"));
+    assert!(normalized.contains(
+        "This command is currently Unix-only: other platforms fail before spawning because no Job Object equivalent is implemented yet."
+    ));
+    assert!(normalized
+        .contains("On Unix child stdio, the request timers bound silent and partial-frame reads;"));
     assert!(normalized.contains("blocking child-stdin writes cannot be preempted"));
 }
 
