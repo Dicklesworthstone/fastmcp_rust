@@ -4190,19 +4190,32 @@ impl Client {
                     "io.modelcontextprotocol/tasks requires bilateral empty settings",
                 )
             })?;
-        negotiated
-            .admit_method(
-                &registry,
-                ProtocolEra::Modern2026,
-                &task_extension,
-                method,
-                direction,
-            )
-            .map_err(|_| {
-                McpError::invalid_params(
-                    "Tasks method is not admitted by the negotiated official extension",
+        let admitted = if method == TASK_STATUS_NOTIFICATION {
+            negotiated
+                .admit_notification(
+                    &registry,
+                    ProtocolEra::Modern2026,
+                    &task_extension,
+                    method,
+                    direction,
                 )
-            })?;
+                .map(|_| ())
+        } else {
+            negotiated
+                .admit_method(
+                    &registry,
+                    ProtocolEra::Modern2026,
+                    &task_extension,
+                    method,
+                    direction,
+                )
+                .map(|_| ())
+        };
+        admitted.map_err(|_| {
+            McpError::invalid_params(
+                "Tasks surface is not admitted by the negotiated official extension",
+            )
+        })?;
 
         Ok(())
     }
