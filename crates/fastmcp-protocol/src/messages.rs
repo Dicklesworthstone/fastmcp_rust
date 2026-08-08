@@ -2,10 +2,14 @@
 //!
 //! Request and response types for the MCP methods currently implemented here.
 
+use std::collections::BTreeMap;
+
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 
 use crate::jsonrpc::RequestId;
+use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
 use crate::types::{
     ClientCapabilities, ClientInfo, Content, Prompt, PromptMessage, Resource, ResourceContent,
     ResourceTemplate, ServerCapabilities, ServerInfo, Tool,
@@ -61,6 +65,72 @@ pub struct RequestMeta {
     // Avoid UBS "hardcoded secrets" heuristics while keeping the on-the-wire name.
     #[serde(rename = "progressTo\x6ben", skip_serializing_if = "Option::is_none")]
     pub progress_marker: Option<ProgressMarker>,
+}
+
+// ============================================================================
+// Final per-request metadata
+// ============================================================================
+
+/// `_meta` key carrying the protocol version on every final request.
+pub const FINAL_PROTOCOL_VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// `_meta` key carrying the client capabilities on every final request.
+pub const FINAL_CLIENT_CAPABILITIES_META_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+
+/// `_meta` key carrying optional client identity on a final request.
+pub const FINAL_CLIENT_INFO_META_KEY: &str = "io.modelcontextprotocol/clientInfo";
+
+/// `_meta` key carrying optional server identity on a final response.
+pub const FINAL_SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
+
+/// Required final metadata carried in the `_meta` object of every request.
+///
+/// The protocol version and client capabilities are intentionally distinct
+/// from legacy [`RequestMeta`]. Final request admission validates the version
+/// against the HTTP header before using the advertised capabilities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalRequestMeta {
+    /// The exact protocol revision selected for this request.
+    #[serde(rename = "io.modelcontextprotocol/protocolVersion")]
+    pub protocol_version: String,
+    /// Capabilities advertised by the request's client.
+    #[serde(rename = "io.modelcontextprotocol/clientCapabilities")]
+    pub client_capabilities: ClientCapabilities,
+    /// Optional client identity supplied on this request.
+    #[serde(
+        rename = "io.modelcontextprotocol/clientInfo",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub client_info: Option<ClientInfo>,
+    /// Additional metadata retained without granting protocol capability.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional_metadata: BTreeMap<String, Value>,
+}
+
+impl FinalRequestMeta {
+    /// Creates canonical metadata for the exact final protocol version.
+    #[must_use]
+    pub fn new(client_capabilities: ClientCapabilities) -> Self {
+        Self {
+            protocol_version: FINAL_PROTOCOL_VERSION.to_owned(),
+            client_capabilities,
+            client_info: None,
+            additional_metadata: BTreeMap::new(),
+        }
+    }
+
+    /// Returns the protocol header/body mirror for final request admission.
+    #[must_use]
+    pub fn version_metadata<'a>(
+        &'a self,
+        header_version: Option<&'a str>,
+    ) -> RequestVersionMetadata<'a> {
+        RequestVersionMetadata {
+            header_version,
+            body_version: Some(&self.protocol_version),
+        }
+    }
 }
 
 // ============================================================================
@@ -1231,6 +1301,40 @@ mod tests {
         };
         let value = serde_json::to_value(&meta).expect("serialize");
         assert_eq!(value[PROGRESS_MARKER_KEY], "progress_value_test_2");
+    }
+
+    #[test]
+    fn final_request_meta_preserves_namespaced_capabilities_and_inert_metadata() {
+        let mut meta = FinalRequestMeta::new(ClientCapabilities {
+            roots: Some(crate::types::RootsCapability { list_changed: true }),
+            ..ClientCapabilities::default()
+        });
+        meta.additional_metadata
+            .insert("example.com/trace".to_owned(), serde_json::json!(null));
+
+        let wire = serde_json::to_value(&meta).expect("final metadata serializes");
+        assert_eq!(
+            wire[FINAL_PROTOCOL_VERSION_META_KEY],
+            FINAL_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            wire[FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"]["listChanged"],
+            true
+        );
+        assert_eq!(wire["example.com/trace"], serde_json::json!(null));
+
+        let round_trip: FinalRequestMeta =
+            serde_json::from_value(wire).expect("final metadata deserializes");
+        assert_eq!(
+            round_trip
+                .version_metadata(Some(FINAL_PROTOCOL_VERSION))
+                .body_version,
+            Some(FINAL_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            round_trip.additional_metadata.get("example.com/trace"),
+            Some(&serde_json::json!(null))
+        );
     }
 
     // ========================================================================

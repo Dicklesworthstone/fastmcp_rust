@@ -14,6 +14,12 @@ use serde_json::Value;
 /// The only legacy MCP wire version represented by this isolated surface.
 pub const LEGACY_2024_11_05_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Final stateless server-discovery request.
+///
+/// This aliases the discovery module's exact wire literal so method dispatch
+/// and public protocol consumers share one source of truth.
+pub const SERVER_DISCOVER: &str = crate::server_discovery::SERVER_DISCOVER_METHOD;
+
 /// SHA-256 of the pinned official 2024-11-05 JSON schema.
 pub const LEGACY_2024_11_05_SCHEMA_SHA256: &str =
     "61cea2392d4f284092d09bc84b9ac488c0d5618ac2b38a56942fc5b99fd960ce";
@@ -1316,6 +1322,7 @@ mod tests {
         // NOT bare `initialized`. https://modelcontextprotocol.io/specification
         assert_eq!(INITIALIZE, "initialize");
         assert_eq!(NOTIFICATIONS_INITIALIZED, "notifications/initialized");
+        assert_eq!(SERVER_DISCOVER, "server/discover");
 
         assert_eq!(TOOLS_LIST, "tools/list");
         assert_eq!(TOOLS_CALL, "tools/call");

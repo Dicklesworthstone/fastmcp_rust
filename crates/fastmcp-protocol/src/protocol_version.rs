@@ -7,6 +7,8 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::ClientCapabilities;
+
 /// The final protocol version implemented by this narrow modern surface.
 pub const FINAL_PROTOCOL_VERSION: &str = "2026-07-28";
 
@@ -15,6 +17,12 @@ pub const SUPPORTED_FINAL_PROTOCOL_VERSIONS: &[&str] = &[FINAL_PROTOCOL_VERSION]
 
 /// The HTTP header that mirrors the body's protocol-version metadata.
 pub const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
+
+/// The HTTP header that mirrors the JSON-RPC request method.
+pub const MCP_METHOD_HEADER: &str = "Mcp-Method";
+
+/// The HTTP header that mirrors a method-specific tool, resource, or prompt name.
+pub const MCP_NAME_HEADER: &str = "Mcp-Name";
 
 /// The final MCP JSON-RPC code for malformed, missing, or mismatched headers.
 pub const HEADER_MISMATCH_ERROR_CODE: i32 = -32020;
@@ -207,6 +215,19 @@ pub struct MissingRequiredClientCapabilityError {
 }
 
 impl MissingRequiredClientCapabilityError {
+    /// Constructs the error from the exact typed client-capabilities object.
+    ///
+    /// This is the safe local constructor for a capability-gated final request:
+    /// it serializes the standard typed shape without accepting a separately
+    /// assembled peer-data object.
+    pub fn from_client_capabilities(
+        required_capabilities: &ClientCapabilities,
+    ) -> Result<Self, RequiredCapabilitiesError> {
+        let required_capabilities = serde_json::to_value(required_capabilities)
+            .map_err(|_| RequiredCapabilitiesError::Encoding)?;
+        Self::new(required_capabilities)
+    }
+
     /// Constructs the error from the exact required-capabilities object.
     ///
     /// Flattened diagnostic paths deliberately do not enter peer-facing data;
@@ -472,6 +493,8 @@ mod tests {
             FINAL_PROTOCOL_VERSION
         );
         assert_eq!(MCP_PROTOCOL_VERSION_HEADER, "MCP-Protocol-Version");
+        assert_eq!(MCP_METHOD_HEADER, "Mcp-Method");
+        assert_eq!(MCP_NAME_HEADER, "Mcp-Name");
     }
 
     #[test]
@@ -623,6 +646,17 @@ mod tests {
                     "sampling": {"context": {}}
                 }
             })
+        );
+
+        let typed_missing =
+            MissingRequiredClientCapabilityError::from_client_capabilities(&ClientCapabilities {
+                roots: Some(crate::RootsCapability { list_changed: true }),
+                ..ClientCapabilities::default()
+            })
+            .expect("typed capabilities serialize as a bounded required-capabilities object");
+        assert_eq!(
+            typed_missing.canonical_error_data(),
+            json!({"requiredCapabilities": {"roots": {"listChanged": true}}})
         );
     }
 }

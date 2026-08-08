@@ -68,6 +68,17 @@ pub use jsonrpc::{
     dispose_raw_jsonrpc_failure,
 };
 pub use messages::*;
+pub use methods::SERVER_DISCOVER;
+pub use protocol_version::{
+    FINAL_PROTOCOL_VERSION, FinalHttpRequestMetadata, FinalProtocolVersion, FinalRequestAdmission,
+    HEADER_MISMATCH_ERROR_CODE, HeaderMismatchError, HeaderMismatchReason,
+    MAX_REQUIRED_CAPABILITIES_ERROR_DATA_BYTES, MCP_METHOD_HEADER, MCP_NAME_HEADER,
+    MCP_PROTOCOL_VERSION_HEADER, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+    MissingRequiredClientCapabilityError, ProtocolVersionError, RequestAdmissionError,
+    RequestVersionMetadata, RequiredCapabilitiesError, SUPPORTED_FINAL_PROTOCOL_VERSIONS,
+    UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnsupportedProtocolVersionError,
+    admit_final_http_request, admit_final_request, validate_final_protocol_version,
+};
 pub use result::*;
 pub use schema::{ValidationError, ValidationResult, validate, validate_strict};
 pub use server_discovery::{
@@ -103,4 +114,81 @@ fn fnd_03_era_classification_positive() {
 #[test]
 fn fnd_03_era_classification_planted_negative() {
     protocol_policy::tests::fnd_03_era_classification_planted_negative();
+}
+
+#[cfg(test)]
+#[test]
+fn prt_03_i_positive() {
+    let required_capabilities = ClientCapabilities {
+        roots: Some(RootsCapability { list_changed: true }),
+        ..ClientCapabilities::default()
+    };
+    let metadata = FinalRequestMeta::new(required_capabilities.clone());
+    let admission = admit_final_http_request(FinalHttpRequestMetadata {
+        version: metadata.version_metadata(Some(FINAL_PROTOCOL_VERSION)),
+        header_method: Some(SERVER_DISCOVER),
+        body_method: Some(SERVER_DISCOVER),
+        header_name: None,
+        body_name: None,
+    })
+    .expect("canonical final metadata and server discovery must be admitted");
+    let missing =
+        MissingRequiredClientCapabilityError::from_client_capabilities(&required_capabilities)
+            .expect("typed required capabilities must encode as final error data");
+
+    assert_eq!(FINAL_PROTOCOL_VERSION, "2026-07-28");
+    assert_eq!(SERVER_DISCOVER, SERVER_DISCOVER_METHOD);
+    assert_eq!(MCP_PROTOCOL_VERSION_HEADER, "MCP-Protocol-Version");
+    assert_eq!(MCP_METHOD_HEADER, "Mcp-Method");
+    assert_eq!(MCP_NAME_HEADER, "Mcp-Name");
+    assert_eq!(
+        admission.protocol_version().as_str(),
+        FINAL_PROTOCOL_VERSION
+    );
+    assert_eq!(missing.http_status(), 400);
+    assert_eq!(
+        missing.jsonrpc_error_code(),
+        MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE
+    );
+    assert_eq!(
+        missing.canonical_error_data(),
+        serde_json::json!({"requiredCapabilities": {"roots": {"listChanged": true}}})
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn prt_03_i_planted_negative() {
+    let metadata = FinalRequestMeta::new(ClientCapabilities {
+        roots: Some(RootsCapability { list_changed: true }),
+        ..ClientCapabilities::default()
+    });
+    let wire_before = serde_json::to_value(&metadata).expect("metadata serializes");
+    let error = admit_final_http_request(FinalHttpRequestMetadata {
+        version: metadata.version_metadata(Some("2025-11-25")),
+        header_method: Some(SERVER_DISCOVER),
+        body_method: Some(SERVER_DISCOVER),
+        header_name: None,
+        body_name: None,
+    })
+    .expect_err("changing only the protocol header must reject the request");
+
+    assert!(
+        matches!(&error, RequestAdmissionError::HeaderMismatch(_)),
+        "a mismatched version mirror must precede unsupported-version classification"
+    );
+    let RequestAdmissionError::HeaderMismatch(error) = error else {
+        return;
+    };
+    assert_eq!(
+        error.reason(),
+        HeaderMismatchReason::HeaderBodyVersionMismatch
+    );
+    assert_eq!(error.http_status(), 400);
+    assert_eq!(error.jsonrpc_error_code(), HEADER_MISMATCH_ERROR_CODE);
+    assert_eq!(error.canonical_error_data(), None);
+    assert_eq!(
+        serde_json::to_value(&metadata).expect("metadata remains serializable"),
+        wire_before
+    );
 }
