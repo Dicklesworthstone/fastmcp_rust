@@ -100,16 +100,16 @@ use fastmcp_protocol::methods::{Final2026Peer, final_2026_07_28_method};
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancelledParams,
-    ClientCapabilities, ClientInfo, Content, CoreDispatchError, CoreRequest, CorrelationKey,
+    ClientCapabilities, ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey,
     FinalLogMessageParams, FinalProgressNotificationParams, FinalRequestMeta, GetPromptParams,
     GetTaskParams, GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION,
-    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
-    ListResourceTemplatesParams, ListResourcesParams, ListTasksParams, ListTasksResult,
-    ListToolsParams, LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt,
-    PromptArgument, PromptMessage, ReadResourceParams, RequestId, RequestMeta, Resource,
-    ResourceContent, ResourceTemplate, ServerCapabilities, ServerInfo, ServerNotification,
-    SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo, TaskResult,
-    TaskStatus, Tool, ToolAnnotations,
+    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent,
+    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListResourceTemplatesParams,
+    ListResourcesParams, ListTasksParams, ListTasksResult, ListToolsParams, LogLevel,
+    LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, ReadResourceParams,
+    RequestId, RequestMeta, Resource, ResourceTemplate, ServerCapabilities, ServerInfo,
+    ServerNotification, SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo,
+    TaskResult, TaskStatus, Tool, ToolAnnotations,
 };
 use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
 
@@ -1816,9 +1816,32 @@ fn final_prompt_to_legacy(prompt: fastmcp_protocol::FinalPrompt) -> McpResult<Pr
     })
 }
 
+/// Re-homes final open fields in the exact legacy shape.
+///
+/// Legacy content has no typed metadata member: its schema permits `_meta` as
+/// one of the flattened open members. Preserve it under that original wire
+/// name, and reject only a manually-constructed contradictory value that
+/// would otherwise overwrite it.
+fn final_open_fields_to_legacy(
+    field: &str,
+    meta: Option<fastmcp_protocol::OpenMetadata>,
+    mut additional: std::collections::BTreeMap<String, serde_json::Value>,
+) -> McpResult<std::collections::BTreeMap<String, serde_json::Value>> {
+    let Some(meta) = meta else {
+        return Ok(additional);
+    };
+    if additional.contains_key("_meta") {
+        return Err(final_projection_error(field));
+    }
+    let encoded_meta =
+        serde_json::to_value(meta).map_err(|_| final_projection_error("metadata serialization"))?;
+    additional.insert("_meta".to_owned(), encoded_meta);
+    Ok(additional)
+}
+
 fn final_resource_content_to_legacy(
     resource: EmbeddedResourceContents,
-) -> McpResult<ResourceContent> {
+) -> McpResult<LegacyResourceContent> {
     match resource {
         EmbeddedResourceContents::Text {
             uri,
@@ -1826,85 +1849,82 @@ fn final_resource_content_to_legacy(
             mime_type,
             meta,
             additional,
-        } => {
-            ensure_absent_final_field("resource metadata", meta)?;
-            ensure_empty_final_fields("resource extension fields", &additional)?;
-            Ok(ResourceContent {
-                uri: uri.as_str().to_owned(),
-                mime_type,
-                text: Some(text),
-                blob: None,
-            })
-        }
+        } => Ok(LegacyResourceContent::Text {
+            uri: uri.as_str().to_owned(),
+            mime_type,
+            text,
+            additional: final_open_fields_to_legacy(
+                "conflicting resource _meta field",
+                meta,
+                additional,
+            )?,
+        }),
         EmbeddedResourceContents::Blob {
             uri,
             blob,
             mime_type,
             meta,
             additional,
-        } => {
-            ensure_absent_final_field("resource metadata", meta)?;
-            ensure_empty_final_fields("resource extension fields", &additional)?;
-            Ok(ResourceContent {
-                uri: uri.as_str().to_owned(),
-                mime_type,
-                text: None,
-                blob: Some(blob),
-            })
-        }
+        } => Ok(LegacyResourceContent::Blob {
+            uri: uri.as_str().to_owned(),
+            mime_type,
+            blob,
+            additional: final_open_fields_to_legacy(
+                "conflicting resource _meta field",
+                meta,
+                additional,
+            )?,
+        }),
     }
 }
 
-fn final_content_to_legacy(content: ContentBlock) -> McpResult<Content> {
+fn final_content_to_legacy(content: ContentBlock) -> McpResult<LegacyContent> {
     match content {
         ContentBlock::Text {
             text,
             annotations,
             meta,
             additional,
-        } => {
-            ensure_absent_final_field("content annotations", annotations)?;
-            ensure_absent_final_field("content metadata", meta)?;
-            ensure_empty_final_fields("content extension fields", &additional)?;
-            Ok(Content::Text { text })
-        }
+        } => Ok(LegacyContent::Text {
+            text,
+            annotations,
+            additional: final_open_fields_to_legacy(
+                "conflicting content _meta field",
+                meta,
+                additional,
+            )?,
+        }),
         ContentBlock::Image {
             data,
             mime_type,
             annotations,
             meta,
             additional,
-        } => {
-            ensure_absent_final_field("content annotations", annotations)?;
-            ensure_absent_final_field("content metadata", meta)?;
-            ensure_empty_final_fields("content extension fields", &additional)?;
-            Ok(Content::Image { data, mime_type })
-        }
-        ContentBlock::Audio {
+        } => Ok(LegacyContent::Image {
             data,
             mime_type,
             annotations,
-            meta,
-            additional,
-        } => {
-            ensure_absent_final_field("content annotations", annotations)?;
-            ensure_absent_final_field("content metadata", meta)?;
-            ensure_empty_final_fields("content extension fields", &additional)?;
-            Ok(Content::Audio { data, mime_type })
-        }
+            additional: final_open_fields_to_legacy(
+                "conflicting content _meta field",
+                meta,
+                additional,
+            )?,
+        }),
+        ContentBlock::Audio { .. } => Err(final_projection_error("audio content")),
         ContentBlock::Resource {
             resource,
             annotations,
             meta,
             additional,
-        } => {
-            ensure_absent_final_field("content annotations", annotations)?;
-            ensure_absent_final_field("content metadata", meta)?;
-            ensure_empty_final_fields("content extension fields", &additional)?;
-            Ok(Content::Resource {
-                resource: final_resource_content_to_legacy(resource)?,
-            })
-        }
+        } => Ok(LegacyContent::Resource {
+            resource: final_resource_content_to_legacy(resource)?,
+            annotations,
+            additional: final_open_fields_to_legacy(
+                "conflicting content _meta field",
+                meta,
+                additional,
+            )?,
+        }),
         ContentBlock::ResourceLink { .. } => Err(final_projection_error("resource_link content")),
     }
 }
@@ -2033,13 +2053,15 @@ fn convenience_tool_call(result: CoreResult) -> McpResult<CallToolResult> {
                     .map(final_content_to_legacy)
                     .collect::<McpResult<Vec<_>>>()?,
                 is_error,
+                meta: None,
+                additional: std::collections::BTreeMap::new(),
             })
         }
         _ => Err(unexpected_convenience_result("tools/call")),
     }
 }
 
-fn convenience_resource_read(result: CoreResult) -> McpResult<Vec<ResourceContent>> {
+fn convenience_resource_read(result: CoreResult) -> McpResult<Vec<LegacyResourceContent>> {
     match result {
         CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => Ok(result.contents),
         CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => {
@@ -2058,7 +2080,7 @@ fn convenience_resource_read(result: CoreResult) -> McpResult<Vec<ResourceConten
     }
 }
 
-fn convenience_prompt_get(result: CoreResult) -> McpResult<Vec<PromptMessage>> {
+fn convenience_prompt_get(result: CoreResult) -> McpResult<Vec<LegacyPromptMessage>> {
     match result {
         CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => Ok(result.messages),
         CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) => {
@@ -2070,9 +2092,10 @@ fn convenience_prompt_get(result: CoreResult) -> McpResult<Vec<PromptMessage>> {
             messages
                 .into_iter()
                 .map(|message| {
-                    Ok(PromptMessage {
+                    Ok(LegacyPromptMessage {
                         role: message.role,
                         content: final_content_to_legacy(message.content)?,
+                        additional: std::collections::BTreeMap::new(),
                     })
                 })
                 .collect()
@@ -4535,7 +4558,7 @@ impl Client {
         &mut self,
         name: &str,
         arguments: serde_json::Value,
-    ) -> McpResult<Vec<Content>> {
+    ) -> McpResult<Vec<LegacyContent>> {
         self.ensure_initialized()?;
         let result = convenience_tool_call(self.call_tool_typed(name, arguments)?)?;
 
@@ -4545,7 +4568,7 @@ impl Client {
                 .content
                 .first()
                 .and_then(|c| match c {
-                    Content::Text { text } => Some(text.clone()),
+                    LegacyContent::Text { text, .. } => Some(text.clone()),
                     _ => None,
                 })
                 .unwrap_or_else(|| "Tool execution failed".to_string());
@@ -4574,7 +4597,7 @@ impl Client {
         name: &str,
         arguments: serde_json::Value,
         on_progress: ProgressCallback<'_>,
-    ) -> McpResult<Vec<Content>> {
+    ) -> McpResult<Vec<LegacyContent>> {
         self.ensure_initialized()?;
         // Validate before allocating the ID that is also exposed as the
         // progress token. The inner request path validates again immediately
@@ -4609,7 +4632,7 @@ impl Client {
                 .content
                 .first()
                 .and_then(|c| match c {
-                    Content::Text { text } => Some(text.clone()),
+                    LegacyContent::Text { text, .. } => Some(text.clone()),
                     _ => None,
                 })
                 .unwrap_or_else(|| "Tool execution failed".to_string());
@@ -5120,7 +5143,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the resource cannot be read.
-    pub fn read_resource(&mut self, uri: &str) -> McpResult<Vec<ResourceContent>> {
+    pub fn read_resource(&mut self, uri: &str) -> McpResult<Vec<LegacyResourceContent>> {
         self.ensure_initialized()?;
         convenience_resource_read(self.read_resource_typed(uri)?)
     }
@@ -5223,7 +5246,7 @@ impl Client {
         &mut self,
         name: &str,
         arguments: std::collections::HashMap<String, String>,
-    ) -> McpResult<Vec<PromptMessage>> {
+    ) -> McpResult<Vec<LegacyPromptMessage>> {
         self.ensure_initialized()?;
         convenience_prompt_get(self.get_prompt_typed(name, arguments)?)
     }
@@ -9450,7 +9473,7 @@ mod tests {
          IFS= read -r request || exit 1; \
          case \"$request\" in *tools/call*) ;; *) exit 1 ;; esac; \
          case \"$request\" in *io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
-         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"legacy result\"}],\"isError\":false}}' ;; esac; \
+         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"legacy result\",\"annotations\":{\"audience\":[\"user\"]},\"_meta\":{\"io.fastmcp.legacy\":true},\"io.fastmcp.extension\":{\"kept\":true}}],\"isError\":false,\"_meta\":{\"io.fastmcp.result\":true},\"io.fastmcp.resultExtension\":{\"kept\":true}}}' ;; esac; \
          exec sleep 2"
     }
 
@@ -9703,7 +9726,7 @@ mod tests {
             .expect("the convenience API projects final content instead of decoding it as legacy");
         assert!(matches!(
             content.as_slice(),
-            [Content::Text { text }] if text == "convenience result"
+            [LegacyContent::Text { text, .. }] if text == "convenience result"
         ));
         client.close().expect("modern client cleanup");
     }
@@ -10076,62 +10099,112 @@ mod tests {
     }
 
     #[test]
-    fn clt_01_final_content_projection_rejects_expanded_common_type_fields() {
+    fn clt_01_final_content_projection_preserves_legacy_open_fields() {
         let representable = serde_json::json!({
             "type": "text",
             "text": "representable",
+            "annotations": {"audience": ["user"]},
+            "_meta": {"io.fastmcp.retained": true},
+            "io.fastmcp.extension": {"retained": true},
         });
-        assert!(
-            final_content_to_legacy(
-                serde_json::from_value::<ContentBlock>(representable.clone())
-                    .expect("representable final content parses"),
-            )
-            .is_ok()
+        let projected = final_content_to_legacy(
+            serde_json::from_value::<ContentBlock>(representable.clone())
+                .expect("representable final content parses"),
+        )
+        .expect("legacy content preserves all representable open fields");
+        assert_eq!(
+            serde_json::to_value(projected).expect("projected text re-encodes"),
+            representable
         );
-
-        for (field, value) in [
-            ("annotations", serde_json::json!({"audience":["user"]})),
-            ("_meta", serde_json::json!({"io.fastmcp.retained":true})),
-            ("io.fastmcp.extension", serde_json::json!("retained")),
-        ] {
-            let mut lossy = representable.clone();
-            lossy[field] = value;
-            let error = final_content_to_legacy(
-                serde_json::from_value::<ContentBlock>(lossy)
-                    .expect("one final-only content field still parses"),
-            )
-            .expect_err("one unrepresentable final content field must fail closed");
-            assert_eq!(error.code, McpErrorCode::InvalidRequest);
-        }
 
         let embedded_representable = serde_json::json!({
             "type": "resource",
+            "annotations": {"audience": ["assistant"]},
+            "_meta": {"io.fastmcp.retained": true},
+            "io.fastmcp.extension": {"retained": true},
             "resource": {
                 "uri": "file:///embedded.txt",
                 "text": "representable",
+                "_meta": {"io.fastmcp.retained": true},
+                "io.fastmcp.extension": {"retained": true},
             },
         });
-        assert!(
-            final_content_to_legacy(
-                serde_json::from_value::<ContentBlock>(embedded_representable.clone())
-                    .expect("representable embedded resource parses"),
-            )
-            .is_ok()
+        let projected = final_content_to_legacy(
+            serde_json::from_value::<ContentBlock>(embedded_representable.clone())
+                .expect("representable embedded resource parses"),
+        )
+        .expect("legacy resource content preserves all representable open fields");
+        assert_eq!(
+            serde_json::to_value(projected).expect("projected resource re-encodes"),
+            embedded_representable
         );
 
-        for (field, value) in [
-            ("_meta", serde_json::json!({"io.fastmcp.retained":true})),
-            ("io.fastmcp.extension", serde_json::json!("retained")),
-        ] {
-            let mut lossy = embedded_representable.clone();
-            lossy["resource"][field] = value;
-            let error = final_content_to_legacy(
-                serde_json::from_value::<ContentBlock>(lossy)
-                    .expect("one final-only embedded resource field still parses"),
-            )
-            .expect_err("embedded final-only fields must fail closed");
-            assert_eq!(error.code, McpErrorCode::InvalidRequest);
-        }
+        let mut unsupported = serde_json::json!({
+            "type": "image",
+            "data": "AA==",
+            "mimeType": "image/png",
+            "annotations": {"audience": ["user"]},
+            "_meta": {"io.fastmcp.retained": true},
+            "io.fastmcp.extension": {"retained": true},
+        });
+        unsupported["type"] = serde_json::json!("audio");
+        let error = final_content_to_legacy(
+            serde_json::from_value::<ContentBlock>(unsupported)
+                .expect("changing only the content kind still parses as final content"),
+        )
+        .expect_err("an exact legacy result cannot represent final audio content");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn leg_03_convenience_results_retain_exact_nested_open_fields() {
+        let resource = LegacyResourceContent::Text {
+            uri: "file:///legacy.txt".to_owned(),
+            text: "legacy resource".to_owned(),
+            mime_type: Some("text/plain".to_owned()),
+            additional: std::collections::BTreeMap::from([
+                ("_meta".to_owned(), serde_json::json!({"vendor": true})),
+                (
+                    "io.fastmcp.extension".to_owned(),
+                    serde_json::json!({"retained": true}),
+                ),
+            ]),
+        };
+        let resources = convenience_resource_read(CoreResult::Legacy(
+            LegacyCoreResult::ResourcesRead(fastmcp_protocol::ReadResourceResult {
+                contents: vec![resource.clone()],
+                meta: None,
+                additional: std::collections::BTreeMap::new(),
+            }),
+        ))
+        .expect("legacy resource convenience result retains its exact resource shape");
+        assert_eq!(resources, vec![resource]);
+
+        let message = LegacyPromptMessage {
+            role: fastmcp_protocol::Role::User,
+            content: LegacyContent::Text {
+                text: "legacy prompt".to_owned(),
+                annotations: None,
+                additional: std::collections::BTreeMap::from([(
+                    "_meta".to_owned(),
+                    serde_json::json!({"vendor": true}),
+                )]),
+            },
+            additional: std::collections::BTreeMap::from([(
+                "io.fastmcp.extension".to_owned(),
+                serde_json::json!({"retained": true}),
+            )]),
+        };
+        let messages = convenience_prompt_get(CoreResult::Legacy(LegacyCoreResult::PromptsGet(
+            fastmcp_protocol::GetPromptResult {
+                description: None,
+                messages: vec![message.clone()],
+                meta: None,
+                additional: std::collections::BTreeMap::new(),
+            },
+        )))
+        .expect("legacy prompt convenience result retains its exact message shape");
+        assert_eq!(messages, vec![message]);
     }
 
     #[cfg(unix)]
@@ -10661,6 +10734,17 @@ mod tests {
         };
         assert!(!result.is_error);
         assert_eq!(result.content.len(), 1);
+        assert_eq!(
+            result
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("io.fastmcp.result")),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            result.additional.get("io.fastmcp.resultExtension"),
+            Some(&serde_json::json!({"kept": true}))
+        );
         client.close().expect("legacy client cleanup");
     }
 
@@ -10680,8 +10764,21 @@ mod tests {
             .expect("the convenience API retains the exact legacy result shape");
         assert!(matches!(
             content.as_slice(),
-            [Content::Text { text }] if text == "legacy result"
+            [LegacyContent::Text { text, .. }] if text == "legacy result"
         ));
+        let encoded = serde_json::to_value(content).expect("legacy content re-encodes exactly");
+        assert_eq!(
+            encoded[0]["annotations"]["audience"],
+            serde_json::json!(["user"])
+        );
+        assert_eq!(
+            encoded[0]["_meta"]["io.fastmcp.legacy"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            encoded[0]["io.fastmcp.extension"],
+            serde_json::json!({"kept": true})
+        );
         client.close().expect("legacy client cleanup");
     }
 
