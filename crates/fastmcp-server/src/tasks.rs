@@ -31,7 +31,8 @@
 //! task_manager.cancel(&task_id, Some("User requested"))?;
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -39,8 +40,9 @@ use std::sync::{Arc, RwLock};
 use asupersync::Budget;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 use asupersync::{CancelKind, Cx};
+use base64::Engine as _;
 use fastmcp_core::logging::{debug, info, targets, warn};
-use fastmcp_core::{McpError, McpResult};
+use fastmcp_core::{McpError, McpResult, draw_security_identifier};
 use fastmcp_protocol::{
     JsonRpcRequest, TaskId, TaskInfo, TaskResult, TaskStatus, TaskStatusNotificationParams,
 };

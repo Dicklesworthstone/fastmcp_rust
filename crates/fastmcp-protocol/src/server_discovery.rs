@@ -9,7 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::Error as _,
+    ser::SerializeMap,
+};
 use serde_json::Value;
 
 use crate::{ServerInfo, protocol_version::FINAL_PROTOCOL_VERSION};
@@ -31,6 +35,9 @@ pub const MAX_DISCOVERY_EXTENSION_NAME_BYTES: usize = 256;
 
 /// Maximum JSON bytes in an enabled extension setting value.
 pub const MAX_DISCOVERY_EXTENSION_VALUE_BYTES: usize = 16 * 1024;
+
+/// Reserved result-metadata key that identifies the responding server.
+pub const SERVER_DISCOVER_SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 
 /// The typed empty `params` object for a `server/discover` request.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -156,24 +163,65 @@ impl fmt::Display for ServerInstructionError {
 
 impl Error for ServerInstructionError {}
 
-/// Cache directives scoped exclusively to the `cacheHints` discovery field.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// A strict cache scope received from or emitted on the discovery wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DiscoveryCacheScope {
+    Public,
+    Private,
+}
+
+impl<'de> Deserialize<'de> for DiscoveryCacheScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "public" => Ok(Self::Public),
+            "private" => Ok(Self::Private),
+            _ => Err(D::Error::custom("cacheScope must be `public` or `private`")),
+        }
+    }
+}
+
+/// Required final caching hints for a `server/discover` result.
+///
+/// Safe local construction is intentionally limited to the private scope.
+/// A public cache scope is peer provenance admitted only while decoding an
+/// already-received wire result; it is not a general authority grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct DiscoveryCacheHints {
-    max_age_seconds: u32,
+    #[serde(rename = "ttlMs")]
+    ttl_ms: u64,
+    #[serde(rename = "cacheScope")]
+    scope: DiscoveryCacheScope,
 }
 
 impl DiscoveryCacheHints {
-    /// Creates a discovery cache directive with the supplied nonnegative TTL.
+    /// Creates a server-generated, private cache hint with a nonnegative TTL
+    /// in milliseconds.
     #[must_use]
-    pub const fn with_max_age_seconds(max_age_seconds: u32) -> Self {
-        Self { max_age_seconds }
+    pub const fn private_ttl_ms(ttl_ms: u64) -> Self {
+        Self {
+            ttl_ms,
+            scope: DiscoveryCacheScope::Private,
+        }
     }
 
-    /// Returns the cache TTL in seconds.
+    /// Returns the cache TTL in milliseconds.
     #[must_use]
-    pub const fn max_age_seconds(self) -> u32 {
-        self.max_age_seconds
+    pub const fn ttl_ms(self) -> u64 {
+        self.ttl_ms
+    }
+
+    /// Returns whether this was an admitted public peer cache hint.
+    #[must_use]
+    pub const fn is_public(self) -> bool {
+        matches!(self.scope, DiscoveryCacheScope::Public)
+    }
+
+    const fn from_peer_wire(ttl_ms: u64, scope: DiscoveryCacheScope) -> Self {
+        Self { ttl_ms, scope }
     }
 }
 
@@ -198,7 +246,7 @@ struct ResourcesCapability {
 }
 
 /// Typed capability shape derived from an installed behavior registry.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServerDiscoverCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,6 +261,37 @@ pub struct ServerDiscoverCapabilities {
     prompts: Option<ListCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     extensions: Option<BTreeMap<String, Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServerDiscoverCapabilitiesWire {
+    logging: Option<EmptyCapability>,
+    completions: Option<EmptyCapability>,
+    tools: Option<ListCapability>,
+    resources: Option<ResourcesCapability>,
+    prompts: Option<ListCapability>,
+    extensions: Option<BTreeMap<String, Value>>,
+}
+
+impl<'de> Deserialize<'de> for ServerDiscoverCapabilities {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ServerDiscoverCapabilitiesWire::deserialize(deserializer)?;
+        if let Some(extensions) = wire.extensions.as_ref() {
+            validate_extensions(extensions).map_err(D::Error::custom)?;
+        }
+        Ok(Self {
+            logging: wire.logging,
+            completions: wire.completions,
+            tools: wire.tools,
+            resources: wire.resources,
+            prompts: wire.prompts,
+            extensions: wire.extensions,
+        })
+    }
 }
 
 impl ServerDiscoverCapabilities {
