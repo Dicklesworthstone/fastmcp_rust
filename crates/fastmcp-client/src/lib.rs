@@ -4087,7 +4087,7 @@ impl Client {
         params: serde_json::Value,
     ) -> McpResult<serde_json::Value> {
         let mut params = self.with_modern_request_metadata(params)?;
-        let mut metadata = params
+        let metadata = params
             .get_mut("_meta")
             .ok_or_else(|| McpError::internal_error("Modern Tasks request metadata was omitted"))?;
         let capabilities = metadata
