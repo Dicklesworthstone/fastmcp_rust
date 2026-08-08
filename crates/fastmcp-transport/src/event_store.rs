@@ -15,6 +15,7 @@
 //! - **Per-stream event limits**: Prevents unbounded memory growth
 //! - **Global retention limits**: Bounds streams, identifier bytes, and retained payload bytes
 //! - **Cursor-based resumption**: Replay events from any point using event IDs
+//! - **Bounded replay pages**: Stream-local resumption with explicit event and payload caps
 //! - **Thread-safe**: Safe for concurrent access from multiple handlers
 //!
 //! # Example
@@ -37,8 +38,11 @@
 //!     .store_event(stream_id, Some(serde_json::json!({"method": "test"})))
 //!     .expect("event fits configured retention limits");
 //!
-//! // Replay events after a specific ID
-//! let events = store.get_events_after(stream_id, None); // Get all events
+//! // Replay one bounded page and retain its cursor for the next request.
+//! let page = store
+//!     .replay_bounded(stream_id, None)
+//!     .expect("fresh stream replay is admitted");
+//! let events = page.events();
 //! ```
 
 use std::collections::{HashMap, VecDeque};
@@ -586,6 +590,70 @@ impl StreamEvents {
         }
     }
 
+    /// Returns one bounded, stream-local page after an exclusive retained cursor.
+    fn replay_bounded(
+        &self,
+        after_id: Option<&str>,
+        max_events: usize,
+        max_payload_bytes: usize,
+    ) -> Result<ReplayBatch, EventStoreError> {
+        let start_index = match after_id {
+            Some(id) => self
+                .index
+                .get(id)
+                .map(|index| index.saturating_add(1))
+                .ok_or(EventStoreError::ReplayCursorNotRetained)?,
+            None => 0,
+        };
+
+        let available = self.events.len().saturating_sub(start_index);
+        let mut events = Vec::with_capacity(available.min(max_events));
+        let mut next_after_id = after_id.map(str::to_owned);
+        let mut payload_bytes = 0;
+
+        for event in self.events.iter().skip(start_index) {
+            if events.len() == max_events {
+                return Ok(ReplayBatch {
+                    events,
+                    next_after_id,
+                    payload_bytes,
+                    complete: false,
+                });
+            }
+
+            let next_payload_bytes = payload_bytes.checked_add(event.payload_bytes).ok_or(
+                EventStoreError::ReplayEventPayloadTooLarge {
+                    max_bytes: max_payload_bytes,
+                },
+            )?;
+            if next_payload_bytes > max_payload_bytes {
+                if events.is_empty() {
+                    return Err(EventStoreError::ReplayEventPayloadTooLarge {
+                        max_bytes: max_payload_bytes,
+                    });
+                }
+
+                return Ok(ReplayBatch {
+                    events,
+                    next_after_id,
+                    payload_bytes,
+                    complete: false,
+                });
+            }
+
+            payload_bytes = next_payload_bytes;
+            next_after_id = Some(event.entry.id.clone());
+            events.push(event.entry.clone());
+        }
+
+        Ok(ReplayBatch {
+            events,
+            next_after_id,
+            payload_bytes,
+            complete: true,
+        })
+    }
+
     /// Finds the stream ID for a given event ID.
     fn contains(&self, event_id: &str) -> bool {
         self.index.contains_key(event_id)
@@ -792,6 +860,64 @@ impl EventStore {
         }
     }
 
+    /// Returns one bounded replay page for a single named stream.
+    ///
+    /// `after_id` is exclusive. A supplied cursor must still be retained by
+    /// `stream_id`; this method never searches another stream and never falls
+    /// back to the retained beginning after expiry or eviction. Pass the
+    /// returned [`ReplayBatch::next_after_id`] to resume a partial page.
+    ///
+    /// The returned page is bounded by both
+    /// [`EventStoreConfig::max_replay_events`] and
+    /// [`EventStoreConfig::max_replay_payload_bytes`]. It is an immutable
+    /// snapshot taken while the store lock is held, so callers can stream or
+    /// otherwise consume it after this method returns without holding the
+    /// store lock.
+    ///
+    /// This is a retention primitive only. HTTP and subscription consumers
+    /// remain responsible for authenticating and authorizing the named stream,
+    /// applying their own protocol framing, and deciding whether resumption is
+    /// available for a request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream ID or cursor exceeds its configured
+    /// bounds, the cursor is not retained by this stream, or the first eligible
+    /// event cannot fit in an otherwise empty replay page.
+    pub fn replay_bounded(
+        &self,
+        stream_id: &str,
+        after_id: Option<&str>,
+    ) -> Result<ReplayBatch, EventStoreError> {
+        if stream_id.len() > self.config.max_stream_id_bytes {
+            return Err(EventStoreError::StreamIdTooLong {
+                max_bytes: self.config.max_stream_id_bytes,
+            });
+        }
+        if after_id.is_some_and(|id| id.len() > self.config.max_replay_cursor_bytes) {
+            return Err(EventStoreError::ReplayCursorTooLong {
+                max_bytes: self.config.max_replay_cursor_bytes,
+            });
+        }
+
+        let mut streams = self
+            .streams
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        Self::cleanup_streams(&mut streams, self.config.ttl);
+
+        match streams.get(stream_id) {
+            Some(stream) => stream.replay_bounded(
+                after_id,
+                self.config.max_replay_events,
+                self.config.max_replay_payload_bytes,
+            ),
+            None if after_id.is_some() => Err(EventStoreError::ReplayCursorNotRetained),
+            None => Ok(ReplayBatch::empty()),
+        }
+    }
+
     /// Replays events after a specific event ID using a callback.
     ///
     /// This is the primary method for SSE resumption. When a client reconnects
@@ -919,6 +1045,9 @@ impl EventStore {
             max_stream_id_bytes: self.config.max_stream_id_bytes,
             max_event_payload_bytes: self.config.max_event_payload_bytes,
             max_total_event_payload_bytes: self.config.max_total_event_payload_bytes,
+            max_replay_events: self.config.max_replay_events,
+            max_replay_payload_bytes: self.config.max_replay_payload_bytes,
+            max_replay_cursor_bytes: self.config.max_replay_cursor_bytes,
             ttl: self.config.ttl,
         }
     }
@@ -943,6 +1072,12 @@ pub struct EventStoreStats {
     pub max_event_payload_bytes: usize,
     /// Configured maximum compact-JSON bytes retained across all events.
     pub max_total_event_payload_bytes: usize,
+    /// Configured maximum events returned by one replay page.
+    pub max_replay_events: usize,
+    /// Configured maximum compact-JSON bytes returned by one replay page.
+    pub max_replay_payload_bytes: usize,
+    /// Configured maximum replay cursor byte length.
+    pub max_replay_cursor_bytes: usize,
     /// Configured TTL.
     pub ttl: Option<Duration>,
 }
@@ -1026,6 +1161,201 @@ mod tests {
         // Get events after id3 (should return nothing)
         let events = store.get_events_after("stream1", Some(&id3));
         assert!(events.is_empty());
+    }
+
+    fn bounded_replay_fixture() -> (EventStore, EventId, EventId, EventId, EventId) {
+        let store = EventStore::with_config(
+            EventStoreConfig::no_expiry()
+                .max_events(3)
+                .max_replay_events(2)
+                .max_replay_payload_bytes(2),
+        )
+        .unwrap();
+
+        let id1 = store.store_event("subscription", Some(serde_json::json!(1))).unwrap();
+        let id2 = store.store_event("subscription", Some(serde_json::json!(2))).unwrap();
+        let id3 = store.store_event("subscription", Some(serde_json::json!(3))).unwrap();
+        let id4 = store.store_event("subscription", Some(serde_json::json!(4))).unwrap();
+
+        (store, id1, id2, id3, id4)
+    }
+
+    #[test]
+    fn bounded_replay_resumes_from_a_retained_stream_cursor() {
+        let (store, _evicted_id, retained_id, id3, id4) = bounded_replay_fixture();
+
+        let batch = store
+            .replay_bounded("subscription", Some(&retained_id))
+            .expect("retained stream cursor must resume the later events");
+
+        assert_eq!(
+            batch
+                .events()
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![id3.as_str(), id4.as_str()]
+        );
+        assert_eq!(batch.payload_bytes(), 2);
+        assert_eq!(batch.next_after_id(), Some(id4.as_str()));
+        assert!(batch.is_complete());
+    }
+
+    #[test]
+    fn bounded_replay_rejects_an_evicted_cursor_without_mutating_retained_state() {
+        let (store, evicted_id, retained_id, id3, id4) = bounded_replay_fixture();
+        let before_event_ids = store
+            .get_events_after("subscription", None)
+            .into_iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>();
+        let before_stats = store.stats();
+
+        let error = store
+            .replay_bounded("subscription", Some(&evicted_id))
+            .expect_err("an evicted cursor must never fall back to the retained beginning");
+
+        assert_eq!(error, EventStoreError::ReplayCursorNotRetained);
+        assert_eq!(
+            store
+                .get_events_after("subscription", None)
+                .into_iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            before_event_ids
+        );
+        assert_eq!(store.stats().total_events, before_stats.total_events);
+        assert_eq!(
+            store.stats().total_event_payload_bytes,
+            before_stats.total_event_payload_bytes
+        );
+
+        let retained = store
+            .replay_bounded("subscription", Some(&retained_id))
+            .expect("only the cursor differs from the admitted retained resumption");
+        assert_eq!(
+            retained
+                .into_events()
+                .into_iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec![id3, id4]
+        );
+    }
+
+    #[test]
+    fn bounded_replay_rejects_a_cursor_from_another_stream_without_mutation() {
+        let store = EventStore::with_config(EventStoreConfig::no_expiry()).unwrap();
+        let target_cursor = store.store_event("target", Some(serde_json::json!(1))).unwrap();
+        let target_tail = store.store_event("target", Some(serde_json::json!(2))).unwrap();
+        let foreign_cursor = store.store_event("other", Some(serde_json::json!(3))).unwrap();
+        let before_event_ids = store
+            .get_events_after("target", None)
+            .into_iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>();
+
+        let error = store
+            .replay_bounded("target", Some(&foreign_cursor))
+            .expect_err("a stream-local replay must reject a cursor from another stream");
+
+        assert_eq!(error, EventStoreError::ReplayCursorNotRetained);
+        assert_eq!(
+            store
+                .get_events_after("target", None)
+                .into_iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            before_event_ids
+        );
+
+        let resumed = store
+            .replay_bounded("target", Some(&target_cursor))
+            .expect("the admitted cursor differs only by belonging to the requested stream");
+        assert_eq!(
+            resumed
+                .into_events()
+                .into_iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec![target_tail]
+        );
+    }
+
+    #[test]
+    fn bounded_replay_pages_a_snapshot_without_skipping_the_tail() {
+        let store = EventStore::with_config(
+            EventStoreConfig::no_expiry()
+                .max_replay_events(3)
+                .max_replay_payload_bytes(2),
+        )
+        .unwrap();
+        let id1 = store.store_event("subscription", Some(serde_json::json!(1))).unwrap();
+        let id2 = store.store_event("subscription", Some(serde_json::json!(2))).unwrap();
+        let id3 = store.store_event("subscription", Some(serde_json::json!(3))).unwrap();
+
+        let first = store
+            .replay_bounded("subscription", None)
+            .expect("initial bounded page must be admitted");
+        assert_eq!(
+            first
+                .events()
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![id1.as_str(), id2.as_str()]
+        );
+        assert_eq!(first.payload_bytes(), 2);
+        assert!(!first.is_complete());
+
+        let second = store
+            .replay_bounded("subscription", first.next_after_id())
+            .expect("the page cursor must resume at the first unreturned event");
+        assert_eq!(
+            second
+                .into_events()
+                .into_iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec![id3]
+        );
+        assert!(second.is_complete());
+    }
+
+    #[test]
+    fn bounded_replay_rejects_an_oversize_first_event_without_skipping_it() {
+        let store = EventStore::with_config(
+            EventStoreConfig::no_expiry()
+                .max_event_payload_bytes(2)
+                .max_replay_payload_bytes(1),
+        )
+        .unwrap();
+        let event_id = store
+            .store_event("subscription", Some(serde_json::json!(42)))
+            .unwrap();
+        let before_event_ids = store
+            .get_events_after("subscription", None)
+            .into_iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>();
+
+        let error = store
+            .replay_bounded("subscription", None)
+            .expect_err("an oversize first event must not be skipped to make a page fit");
+
+        assert_eq!(
+            error,
+            EventStoreError::ReplayEventPayloadTooLarge { max_bytes: 1 }
+        );
+        assert_eq!(
+            store
+                .get_events_after("subscription", None)
+                .into_iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            before_event_ids
+        );
+        assert_eq!(before_event_ids, vec![event_id]);
     }
 
     #[test]
@@ -1256,6 +1586,9 @@ mod tests {
             .max_stream_id_bytes(128)
             .max_event_payload_bytes(4096)
             .max_total_event_payload_bytes(8192)
+            .max_replay_events(12)
+            .max_replay_payload_bytes(2048)
+            .max_replay_cursor_bytes(64)
             .ttl(Duration::from_secs(300));
 
         assert_eq!(config.max_events_per_stream, 50);
@@ -1263,6 +1596,9 @@ mod tests {
         assert_eq!(config.max_stream_id_bytes, 128);
         assert_eq!(config.max_event_payload_bytes, 4096);
         assert_eq!(config.max_total_event_payload_bytes, 8192);
+        assert_eq!(config.max_replay_events, 12);
+        assert_eq!(config.max_replay_payload_bytes, 2048);
+        assert_eq!(config.max_replay_cursor_bytes, 64);
         assert_eq!(config.ttl, Some(Duration::from_secs(300)));
 
         let config = config.no_ttl();
@@ -1297,6 +1633,18 @@ mod tests {
             (
                 "max_total_event_payload_bytes",
                 EventStoreConfig::default().max_total_event_payload_bytes(0),
+            ),
+            (
+                "max_replay_events",
+                EventStoreConfig::default().max_replay_events(0),
+            ),
+            (
+                "max_replay_payload_bytes",
+                EventStoreConfig::default().max_replay_payload_bytes(0),
+            ),
+            (
+                "max_replay_cursor_bytes",
+                EventStoreConfig::default().max_replay_cursor_bytes(0),
             ),
         ];
 
@@ -1460,6 +1808,15 @@ mod tests {
             config.max_total_event_payload_bytes,
             DEFAULT_MAX_TOTAL_EVENT_PAYLOAD_BYTES
         );
+        assert_eq!(config.max_replay_events, DEFAULT_MAX_REPLAY_EVENTS);
+        assert_eq!(
+            config.max_replay_payload_bytes,
+            DEFAULT_MAX_REPLAY_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            config.max_replay_cursor_bytes,
+            DEFAULT_MAX_REPLAY_CURSOR_BYTES
+        );
         assert_eq!(config.ttl, Some(Duration::from_secs(DEFAULT_TTL_SECS)));
     }
 
@@ -1556,6 +1913,15 @@ mod tests {
         assert_eq!(
             stats.max_total_event_payload_bytes,
             DEFAULT_MAX_TOTAL_EVENT_PAYLOAD_BYTES
+        );
+        assert_eq!(stats.max_replay_events, DEFAULT_MAX_REPLAY_EVENTS);
+        assert_eq!(
+            stats.max_replay_payload_bytes,
+            DEFAULT_MAX_REPLAY_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            stats.max_replay_cursor_bytes,
+            DEFAULT_MAX_REPLAY_CURSOR_BYTES
         );
         assert!(stats.ttl.is_none());
     }
