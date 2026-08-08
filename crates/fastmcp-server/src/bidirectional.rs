@@ -609,6 +609,17 @@ impl TransportSamplingSender {
     }
 }
 
+fn canonical_legacy_sampling_stop_reason(
+    stop_reason: Option<&str>,
+) -> McpResult<SamplingStopReason> {
+    match stop_reason {
+        None | Some("endTurn") => Ok(SamplingStopReason::EndTurn),
+        Some("stopSequence") => Ok(SamplingStopReason::StopSequence),
+        Some("maxTokens") => Ok(SamplingStopReason::MaxTokens),
+        Some(_) => Err(McpError::internal_error(RESPONSE_PAYLOAD_ERROR)),
+    }
+}
+
 impl SamplingSender for TransportSamplingSender {
     fn create_message(
         &self,
@@ -673,11 +684,7 @@ impl SamplingSender for TransportSamplingSender {
                     }
                 },
                 model: result.model,
-                stop_reason: match result.stop_reason {
-                    fastmcp_protocol::StopReason::EndTurn => SamplingStopReason::EndTurn,
-                    fastmcp_protocol::StopReason::StopSequence => SamplingStopReason::StopSequence,
-                    fastmcp_protocol::StopReason::MaxTokens => SamplingStopReason::MaxTokens,
-                },
+                stop_reason: canonical_legacy_sampling_stop_reason(result.stop_reason.as_deref())?,
             })
         })
     }
@@ -3087,6 +3094,47 @@ mod tests {
         assert_eq!(result.text, "Hello world");
         assert_eq!(result.model, "test-model");
         assert!(matches!(result.stop_reason, SamplingStopReason::EndTurn));
+    }
+
+    #[test]
+    fn transport_sampling_sender_defaults_an_absent_legacy_stop_reason_to_end_turn() {
+        let sender = make_sender_with_responder(|_| {
+            serde_json::json!({
+                "content": {"type": "text", "text": "legacy completion"},
+                "role": "assistant",
+                "model": "legacy-model"
+            })
+        });
+        let sampling = TransportSamplingSender::new(sender);
+
+        let result = fastmcp_core::block_on(SamplingSender::create_message(
+            &sampling,
+            SamplingRequest::prompt("Hi", 10),
+        ))
+        .expect("an exact legacy response may omit stopReason");
+
+        assert_eq!(result.stop_reason, SamplingStopReason::EndTurn);
+    }
+
+    #[test]
+    fn transport_sampling_sender_rejects_an_open_legacy_stop_reason() {
+        let sender = make_sender_with_responder(|_| {
+            serde_json::json!({
+                "content": {"type": "text", "text": "legacy completion"},
+                "role": "assistant",
+                "model": "legacy-model",
+                "stopReason": "provider_safety_limit"
+            })
+        });
+        let sampling = TransportSamplingSender::new(sender);
+
+        let error = fastmcp_core::block_on(SamplingSender::create_message(
+            &sampling,
+            SamplingRequest::prompt("Hi", 10),
+        ))
+        .expect_err("an open stopReason cannot be represented by the core result enum");
+
+        assert_eq!(error.message, RESPONSE_PAYLOAD_ERROR);
     }
 
     #[test]
