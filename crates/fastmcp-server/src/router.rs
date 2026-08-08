@@ -1868,7 +1868,7 @@ impl Router {
                     self.handle_resources_read_final_in_request(
                         request_ctx,
                         request_cx,
-                        params,
+                        params.clone(),
                         SessionState::new(),
                         None,
                         None,
@@ -10550,10 +10550,10 @@ mod router_tests {
                 None,
             )
             .expect("legacy resource requests retain their exact handler path");
-        assert_eq!(
-            legacy.contents[0].text.as_deref(),
-            Some("legacy resource result")
-        );
+        let [LegacyResourceContent::Text { text, .. }] = legacy.contents.as_slice() else {
+            panic!("legacy resource result retains its exact text variant");
+        };
+        assert_eq!(text, "legacy resource result");
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
         assert_eq!(final_calls.load(Ordering::SeqCst), 0);
 
