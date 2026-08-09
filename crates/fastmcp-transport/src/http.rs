@@ -4061,6 +4061,36 @@ impl DualEraHttpLegacySseResponse {
     ///
     /// Once the session or this response body closes, the method returns
     /// [`TransportError::Closed`].
+    /// Non-blocking variant of [`Self::recv_event`]: returns `Ok(None)` when
+    /// no event is ready, so async pumps can poll between yields without
+    /// parking a blocking thread per live stream.
+    pub fn try_recv_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<SseEvent>, DualEraHttpEndpointError> {
+        http_checkpoint(cx)?;
+        if !self.active.load(Ordering::Acquire) {
+            return Err(DualEraHttpEndpointError::Transport(TransportError::Closed));
+        }
+        if let Some(event) = self.initial_events.pop_front() {
+            return Ok(Some(event));
+        }
+        match self.receiver.try_recv() {
+            Ok(message) => {
+                let previous = self.pending.fetch_sub(1, Ordering::AcqRel);
+                debug_assert!(previous > 0, "legacy SSE live-event count underflow");
+                Ok(Some(SseEvent::message(message.data)))
+            }
+            Err(mpsc::RecvError::Empty) => Ok(None),
+            Err(mpsc::RecvError::Disconnected) => {
+                Err(DualEraHttpEndpointError::Transport(TransportError::Closed))
+            }
+            Err(mpsc::RecvError::Cancelled) => Err(DualEraHttpEndpointError::Transport(
+                TransportError::Cancelled,
+            )),
+        }
+    }
+
     pub fn recv_event(&mut self, cx: &Cx) -> Result<SseEvent, DualEraHttpEndpointError> {
         http_checkpoint(cx)?;
         if !self.active.load(Ordering::Acquire) {
