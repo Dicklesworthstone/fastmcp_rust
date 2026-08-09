@@ -61,6 +61,71 @@ struct HttpServerFixture {
     join: Option<JoinHandle<()>>,
 }
 
+/// Retains a just-spawned fixture until the ready handshake succeeds and it
+/// can be transferred into `HttpServerFixture`.
+struct HttpServerStartupGuard {
+    shutdown: Option<mpsc::SyncSender<()>>,
+    finished: Option<mpsc::Receiver<Result<(), String>>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl HttpServerStartupGuard {
+    fn into_parts(
+        mut self,
+    ) -> (
+        mpsc::SyncSender<()>,
+        mpsc::Receiver<Result<(), String>>,
+        Option<JoinHandle<()>>,
+    ) {
+        (
+            self.shutdown
+                .take()
+                .expect("startup guard retains shutdown"),
+            self.finished
+                .take()
+                .expect("startup guard retains completion"),
+            self.join.take(),
+        )
+    }
+
+    fn resume_thread_panic_if_finished(&mut self) {
+        let Some(handle) = self.join.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let handle = self
+            .join
+            .take()
+            .expect("finished startup thread retains its join handle");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+impl Drop for HttpServerStartupGuard {
+    fn drop(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
+        let Some(shutdown) = self.shutdown.as_ref() else {
+            return;
+        };
+        let Some(finished) = self.finished.as_ref() else {
+            return;
+        };
+        let settlement = settle_http_server(shutdown, finished, &mut self.join);
+        if settlement.is_err() && self.join.is_some() {
+            eprintln!(
+                "public HTTP server startup left a live unjoinable thread after bounded settlement"
+            );
+            std::process::abort();
+        }
+    }
+}
+
 impl HttpServerFixture {
     fn spawn() -> Self {
         Self::spawn_with_middleware(None)
@@ -70,7 +135,7 @@ impl HttpServerFixture {
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
-        let mut join = Some(thread::spawn(move || {
+        let join = Some(thread::spawn(move || {
             let ready_for_spawn_failure = ready_tx.clone();
             let finished_for_spawn_failure = finished_tx.clone();
             let (task_done_tx, task_done_rx) = mpsc::channel::<()>();
@@ -185,27 +250,29 @@ impl HttpServerFixture {
             });
         }));
 
+        let startup = HttpServerStartupGuard {
+            shutdown: Some(shutdown_tx),
+            finished: Some(finished_rx),
+            join,
+        };
         let address = match ready_rx.recv_timeout(HTTP_SERVER_STARTUP_BOUND) {
             Ok(Ok(address)) => address,
-            Ok(Err(error)) => {
-                let settlement = settle_http_server(&shutdown_tx, &finished_rx, &mut join);
-                panic!(
-                    "public HTTP server failed to start: {error}; {settlement:?} after thread settlement"
-                );
+            Ok(Err(error)) => panic!("public HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("public HTTP server startup readiness channel disconnected")
             }
             Err(error) => {
                 drop(ready_rx);
-                let settlement = settle_http_server(&shutdown_tx, &finished_rx, &mut join);
-                panic!(
-                    "public HTTP server startup exceeded its bound: {error}; {settlement:?} after thread settlement"
-                );
+                panic!("public HTTP server startup exceeded its bound: {error}");
             }
         };
+        let (shutdown, finished, join) = startup.into_parts();
 
         Self {
             address,
-            shutdown: shutdown_tx,
-            finished: finished_rx,
+            shutdown,
+            finished,
             join,
         }
     }
@@ -229,10 +296,12 @@ impl Drop for HttpServerFixture {
         if self.join.is_none() {
             return;
         }
-        let settlement = self.settle();
-        if !std::thread::panicking() {
-            settlement
-                .unwrap_or_else(|error| panic!("public HTTP server fixture drop failed: {error}"));
+        if let Err(error) = self.settle() {
+            eprintln!("public HTTP server fixture drop failed: {error}");
+            // A `JoinHandle` dropped after a failed bounded settlement detaches
+            // a live server. Aborting is fail-closed in both normal and panic
+            // unwinding paths, after shutdown has already been requested.
+            std::process::abort();
         }
     }
 }
@@ -263,9 +332,10 @@ fn settle_http_server_with_bound(
     let completion = finished
         .recv_timeout(completion_bound)
         .map_err(|error| format!("public HTTP server teardown exceeded its bound: {error}"));
+    let join_result = join_finished_thread(join, completion_bound, "HTTP server");
     let completion = completion?;
     completion.map_err(|error| format!("public HTTP server teardown failed: {error}"))?;
-    join_finished_thread(join, completion_bound, "HTTP server")
+    join_result
 }
 
 fn join_finished_thread(
@@ -339,6 +409,102 @@ fn e2e_http_fixture_planted_teardown_timeout_retains_owner_for_controlled_retry(
     .expect("the released server settles without detaching its owner");
     assert!(joined.load(Ordering::SeqCst));
     assert!(server.is_none(), "settlement joins the retained owner");
+}
+
+#[test]
+fn e2e_http_fixture_reported_teardown_failure_still_joins_owner() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let joined = Arc::new(AtomicBool::new(false));
+    let joined_by_server = Arc::clone(&joined);
+    let mut server = Some(thread::spawn(move || {
+        shutdown_rx
+            .recv()
+            .expect("the bounded settlement path sends one shutdown signal");
+        joined_by_server.store(true, Ordering::SeqCst);
+        let _ = finished_tx.send(Err("planted server failure".to_owned()));
+    }));
+
+    let settlement = settle_http_server_with_bound(
+        &shutdown_tx,
+        &finished_rx,
+        &mut server,
+        HTTP_SERVER_TEARDOWN_BOUND,
+    );
+
+    assert!(matches!(settlement, Err(error) if error.contains("planted server failure")));
+    assert!(joined.load(Ordering::SeqCst));
+    assert!(
+        server.is_none(),
+        "a reported server failure still joins its owner instead of detaching it"
+    );
+}
+
+#[test]
+fn e2e_http_startup_guard_preserves_planted_startup_error() {
+    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let startup = HttpServerStartupGuard {
+        shutdown: Some(shutdown_tx),
+        finished: Some(finished_rx),
+        join: Some(thread::spawn(move || {
+            shutdown_rx
+                .recv()
+                .expect("startup guard requests bounded shutdown");
+            let _ = finished_tx.send(Err("planted startup failure".to_owned()));
+        })),
+    };
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _startup = startup;
+        panic!("original startup diagnostic");
+    }))
+    .expect_err("the enclosing startup failure must propagate");
+    assert_eq!(
+        *panic
+            .downcast::<&str>()
+            .expect("the original startup diagnostic is retained"),
+        "original startup diagnostic"
+    );
+}
+
+#[test]
+fn e2e_http_startup_guard_resumes_planted_pre_readiness_panic() {
+    let (shutdown_tx, _shutdown_rx) = mpsc::sync_channel::<()>(1);
+    let (_finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let mut startup = HttpServerStartupGuard {
+        shutdown: Some(shutdown_tx),
+        finished: Some(finished_rx),
+        join: Some(thread::spawn(|| panic!("planted pre-readiness panic"))),
+    };
+    let deadline = Instant::now() + HTTP_SERVER_TEARDOWN_BOUND;
+    while !startup
+        .join
+        .as_ref()
+        .expect("startup guard retains the spawned thread")
+        .is_finished()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the planted pre-readiness panic finishes within the bound"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        startup.resume_thread_panic_if_finished();
+    }))
+    .expect_err("the original pre-readiness panic must be resumed");
+    assert_eq!(
+        *panic
+            .downcast::<&str>()
+            .expect("the original pre-readiness panic is retained"),
+        "planted pre-readiness panic"
+    );
+    assert!(startup.join.is_none());
 }
 
 fn plan(addr: SocketAddr, policy: ProtocolPolicy) -> ClientProtocolPlan {
@@ -514,6 +680,44 @@ enum OverlapWorkerCompletion {
     Legacy(Result<serde_json::Value, String>),
 }
 
+/// Owns the planted stalled worker through both the deadline observation and
+/// panic unwinding. Dropping it releases the worker before a bounded join.
+struct StalledOverlapWorker {
+    release: mpsc::SyncSender<()>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl StalledOverlapWorker {
+    fn release(&self) {
+        match self.release.try_send(()) {
+            Ok(())
+            | Err(mpsc::TrySendError::Full(()))
+            | Err(mpsc::TrySendError::Disconnected(())) => {}
+        }
+    }
+
+    fn settle(&mut self) -> Result<(), String> {
+        self.release();
+        join_finished_thread(
+            &mut self.join,
+            HTTP_SERVER_TEARDOWN_BOUND,
+            "stalled overlap worker",
+        )
+    }
+}
+
+impl Drop for StalledOverlapWorker {
+    fn drop(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
+        if let Err(error) = self.settle() {
+            eprintln!("stalled overlap worker settlement failed: {error}");
+            std::process::abort();
+        }
+    }
+}
+
 /// Collects the two request outcomes within a deadline. Every caller must
 /// then drive the workers to completion and join their retained owners.
 fn collect_overlap_worker_results(
@@ -560,12 +764,15 @@ fn e2e_overlap_worker_timeout_releases_fixture_teardown() {
     let (completed_tx, completed_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
     let stalled_completed_tx = completed_tx.clone();
-    let mut stalled_worker = Some(thread::spawn(move || {
-        release_rx
-            .recv()
-            .expect("the test releases the single stalled worker after its deadline");
-        let _ = stalled_completed_tx.send(OverlapWorkerCompletion::Modern(Ok(json!({}))));
-    }));
+    let mut stalled_worker = StalledOverlapWorker {
+        release: release_tx,
+        join: Some(thread::spawn(move || {
+            release_rx
+                .recv()
+                .expect("the test releases the single stalled worker after its deadline");
+            let _ = stalled_completed_tx.send(OverlapWorkerCompletion::Modern(Ok(json!({}))));
+        })),
+    };
 
     completed_tx
         .send(OverlapWorkerCompletion::Legacy(Ok(json!({}))))
@@ -582,20 +789,15 @@ fn e2e_overlap_worker_timeout_releases_fixture_teardown() {
         "the unchanged legacy worker completion is retained"
     );
 
-    release_tx
-        .send(())
-        .expect("the stalled worker remains controllable after the timeout");
+    stalled_worker.release();
     let completion = completed_rx
         .recv_timeout(HTTP_SERVER_TEARDOWN_BOUND)
         .expect("the released worker reports completion within its bounded cleanup window");
     assert!(matches!(completion, OverlapWorkerCompletion::Modern(Ok(_))));
-    join_finished_thread(
-        &mut stalled_worker,
-        HTTP_SERVER_TEARDOWN_BOUND,
-        "stalled overlap worker",
-    )
-    .expect("the released worker joins without detaching");
-    assert!(stalled_worker.is_none());
+    stalled_worker
+        .settle()
+        .expect("the released worker joins without detaching");
+    assert!(stalled_worker.join.is_none());
     let teardown = server.settle();
     teardown.expect("the bounded fixture teardown runs after a worker completion timeout");
 }

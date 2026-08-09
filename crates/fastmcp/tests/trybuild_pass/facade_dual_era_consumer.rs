@@ -3,9 +3,8 @@
 use std::collections::BTreeMap;
 
 use fastmcp_rust::{
-    ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, CompletionContext,
-    CompletionHandler, CompletionParams, CompletionReference, SubscriptionFilter, auto,
-    legacy_2024, modern, tool,
+    CompletionContext, CompletionHandler, CompletionParams, CompletionReference,
+    SubscriptionFilter, auto, legacy_2024, modern, tool,
 };
 
 #[tool(tasks)]
@@ -111,20 +110,16 @@ mod prelude_client_completion_input_reachability {
     }
 }
 
-fn assert_client_http_and_subscription_exports(
-    connection: ClientHttpConnection,
-    response: ClientHttpResponse,
-    error: ClientHttpConnectionError,
-) {
-    fn accepts_modern_connection(_connection: modern::ClientHttpConnection) {}
-    fn accepts_modern_error(_error: modern::ClientHttpConnectionError) {}
-
-    accepts_modern_connection(connection);
-    accepts_modern_error(error);
-    match response {
-        modern::ClientHttpResponse::Modern(_) | modern::ClientHttpResponse::Legacy(_) => {}
-    }
-
+fn assert_client_http_and_subscription_exports() {
+    let _ = modern::HttpClient::connect;
+    let _ = modern::HttpClient::call_tool_outcome;
+    let _ = modern::HttpClient::listen_subscriptions;
+    let _ = modern::HttpClient::get_task;
+    let _ = modern::HttpClient::update_task;
+    let _ = modern::HttpClient::cancel_task;
+    let _ = modern::Server::bind_http;
+    let _ = modern::Server::serve_http;
+    let _ = modern::HttpServer::serve;
     let _: modern::SubscriptionFilter = SubscriptionFilter {
         tools_list_changed: Some(true),
         ..SubscriptionFilter::default()
@@ -174,11 +169,8 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
         &str,
         auto::JsonValue,
     ) -> auto::McpResult<auto::FinalCallToolResult> = auto::Client::call_tool_final;
-    let _: fn(
-        &mut modern::Client,
-        &str,
-        modern::JsonValue,
-    ) -> modern::McpResult<modern::FinalReadResourceResult> = modern::Client::read_resource_final;
+    let _: fn(&mut modern::Client, &str) -> modern::McpResult<modern::FinalReadResourceResult> =
+        modern::Client::read_resource;
 
     let auto_builder = auto::client_builder();
     assert_eq!(
@@ -205,8 +197,8 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
     let _: Option<auto::ClientHttpConnection> = None;
     let _: Option<auto::ModernHttpSubscriptionListenCollector> = None;
     let _: Option<auto::SseLimits> = None;
-    let _: Option<modern::ModernHttpClient> = None;
-    let _: Option<modern::ServerHttpEndpoint> = None;
+    let _: Option<modern::HttpClient> = None;
+    let _: Option<modern::HttpServer> = None;
 }
 
 fn assert_modern_companion_facade_exports() {
@@ -214,8 +206,6 @@ fn assert_modern_companion_facade_exports() {
     let _: modern::FinalArguments<String> = modern::FinalArguments::ExplicitNull;
     let _: modern::FinalArguments<String> = modern::FinalArguments::Value("modern".to_owned());
 
-    let _: fn(&[u8], usize) -> Result<modern::JsonRpcMessage, modern::JsonRpcAdmissionError> =
-        modern::decode_strict_jsonrpc_message;
     let _: fn(usize) -> modern::McpResult<modern::InMemoryFinalTaskStore> =
         modern::InMemoryFinalTaskStore::new;
     let _: usize = modern::DEFAULT_IN_MEMORY_FINAL_TASKS;
@@ -245,7 +235,6 @@ fn assert_modern_companion_facade_exports() {
     let _: u32 = modern::MAX_RESOURCE_READ_DEPTH;
     let _: u32 = modern::MAX_TOOL_CALL_DEPTH;
     let _: Option<modern::McpContextLeaseGuard> = None;
-    let _: Option<modern::McpRequestCancellation> = None;
     let _: Option<modern::NoOpElicitationSender> = None;
     let _: Option<modern::NoOpNotificationSender> = None;
     let _: Option<modern::NoOpSamplingSender> = None;
@@ -501,16 +490,11 @@ fn assert_modern_directional_notification_exports() {
 }
 
 fn assert_lossless_dual_era_product_paths() {
-    let policy = modern::ProtocolPolicy::ModernOnly;
-    let plan = modern::ClientProtocolPlan::stdio(policy);
-    assert_eq!(plan.policy(), policy);
-    assert_eq!(modern::PROTOCOL_VERSION, "2026-07-28");
     assert_eq!(
-        modern::ProtocolVersion::parse(modern::PROTOCOL_VERSION)
-            .expect("modern version must parse")
-            .era(),
-        modern::ProtocolEra::Modern2026
+        modern::client_builder().protocol_policy(),
+        modern::ModernOnly
     );
+    assert_eq!(modern::PROTOCOL_VERSION, "2026-07-28");
 
     let discovery = modern::ServerDiscoverRequest::default();
     assert!(
@@ -582,13 +566,19 @@ fn assert_lossless_dual_era_product_paths() {
         .validate()
         .expect("facade final input-required result must validate");
 
-    let (client_transport, _server_transport) =
-        fastmcp_rust::memory::create_memory_transport_pair();
-    let executor = modern::RequestExecutor::with_result_peer_era(
-        client_transport,
-        modern::ResultPeerEra::Modern,
-    );
-    let _ = executor;
+    let final_template = modern::FinalResourceTemplate {
+        uri_template: "resource://cities/{name}".to_owned(),
+        name: "city".to_owned(),
+        title: Some("City".to_owned()),
+        description: Some("A city resource".to_owned()),
+        icons: None,
+        mime_type: Some("application/json".to_owned()),
+        annotations: None,
+        meta: None,
+    };
+    let _: modern::Server = modern::server_builder("final-only", "1.0.0")
+        .resource_template(final_template)
+        .build();
 
     let partition = legacy_2024::LegacyAuthenticatedPeerPartition::from_authenticated_transport(
         [9_u8; legacy_2024::LegacyAuthenticatedPeerPartition::BYTE_LEN],

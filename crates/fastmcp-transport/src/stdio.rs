@@ -833,7 +833,7 @@ pub struct StdioRecvHalf<R> {
     terminal: Arc<AtomicBool>,
 }
 
-impl<R> StdioRecvHalf<R> {
+impl<R: Read> StdioRecvHalf<R> {
     /// Returns the exact frame decoded by the immediately preceding receive.
     ///
     /// The slice remains valid only until the next receive. It allows a

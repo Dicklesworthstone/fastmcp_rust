@@ -631,7 +631,6 @@ fn assert_dual_era_facade_surface() {
     let _: Option<modern::ContentBlock> = None;
     let _: Option<modern::ExtensionDescriptorRegistry> = None;
     let _: Option<modern::ServerDiscoverResult> = None;
-    let _: Option<modern::InboundRequestContext> = None;
     let final_meta = modern::FinalRequestMeta::new(modern::ClientCapabilities::default());
     assert_eq!(final_meta.protocol_version, modern::PROTOCOL_VERSION);
     let _: Option<modern::ClientInfo> = None;
@@ -654,13 +653,10 @@ fn assert_dual_era_facade_surface() {
     let _: Option<modern::FinalEmptyResult> = None;
     let _: Option<modern::FinalCoreRequest> = None;
     let _: Option<modern::FinalCoreResult> = None;
-    let _: Option<modern::CoreRequest> = None;
-    let _: Option<modern::CoreResult> = None;
-    let _: Option<modern::CoreDispatchError> = None;
-    let _: Option<modern::ModernHttpClient> = None;
-    let _: Option<modern::ModernHttpConnectOutcome> = None;
+    let _: Option<modern::HttpClient> = None;
+    let _: Option<modern::HttpClientConnectError> = None;
+    let _: Option<modern::HttpServer> = None;
     let _: Option<modern::ModernHttpClientError> = None;
-    let _: Option<modern::ModernHttpSseResponseStream> = None;
     let final_completion = modern::FinalCompletionParams {
         meta: modern::OpenMetadata::default(),
         reference: modern::FinalCompletionReference::Prompt {
@@ -715,7 +711,7 @@ fn assert_dual_era_facade_surface() {
     let uri = modern::AbsoluteUri::parse("https://mcp.example.test/final")
         .expect("facade final common types compile");
     assert_eq!(uri.as_str(), "https://mcp.example.test/final");
-    assert_eq!(ProtocolPolicy::ModernOnly, modern::ProtocolPolicy::ModernOnly);
+    assert_eq!(modern::client_builder().protocol_policy(), modern::ModernOnly);
 }
 
 fn assert_legacy_sse_method_signatures(
@@ -740,8 +736,7 @@ fn assert_prelude_dual_era_surface() {
     let _: Option<modern::FinalCallToolParams> = None;
     let _: Option<modern::ClientInfo> = None;
     let _: Option<modern::RequestId> = None;
-    let _: Option<modern::CoreRequest> = None;
-    let _: Option<modern::ModernHttpClient> = None;
+    let _: Option<modern::HttpClient> = None;
     let _: Option<modern::MrtrExchangeRegistry> = None;
     let _: Option<modern::FinalCompletionParams> = None;
     let _: Option<modern::FinalCompletionResult> = None;

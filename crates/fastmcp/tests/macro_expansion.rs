@@ -281,9 +281,9 @@ fn facade_only_dual_era_apps_and_subscription_surfaces_compile() {
 fn facade_only_typed_proxy_catalogs_compile_for_legacy_and_final_eras() {
     use fastmcp_rust::{
         CoreResult, FinalPrompt, FinalResource, FinalResourceTemplate, FinalTool, JsonValue,
-        McpContext, McpResult, Prompt, ProxyClient, ProxyPromptCatalog, ProxyResourceCatalog,
-        ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, ProtocolEra, Resource,
-        ResourceTemplate, Tool,
+        McpContext, McpResult, Prompt, ProtocolEra, ProxyClient, ProxyPromptCatalog,
+        ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
+        Resource, ResourceTemplate, Tool,
     };
 
     let legacy = ProxyTypedCatalog {
@@ -300,9 +300,7 @@ fn facade_only_typed_proxy_catalogs_compile_for_legacy_and_final_eras() {
     let final_catalog = ProxyTypedCatalog {
         tools: ProxyToolCatalog::Final(Vec::<FinalTool>::new()),
         resources: ProxyResourceCatalog::Final(Vec::<FinalResource>::new()),
-        resource_templates: ProxyResourceTemplateCatalog::Final(
-            Vec::<FinalResourceTemplate>::new(),
-        ),
+        resource_templates: ProxyResourceTemplateCatalog::Final(Vec::<FinalResourceTemplate>::new()),
         prompts: ProxyPromptCatalog::Final(Vec::<FinalPrompt>::new()),
     };
     assert_eq!(

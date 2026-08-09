@@ -114,18 +114,43 @@ fn system_prompt_handler() -> Vec<PromptMessage> {
 // Helper: build full workflow server
 // ============================================================================
 
+const MEMORY_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(2);
+
+/// Owns memory-transport server threads until their paired clients close.
+///
+/// Declare this before the client owners so normal and unwinding drops close
+/// the client transports before this bounded settlement runs. A server that
+/// does not stop within the bound aborts the test process rather than silently
+/// detaching a live server thread.
 struct ThreadJoins(Vec<JoinHandle<()>>);
 
 impl ThreadJoins {
     fn new(handles: Vec<JoinHandle<()>>) -> Self {
         Self(handles)
     }
+
+    fn push(&mut self, handle: JoinHandle<()>) {
+        self.0.push(handle);
+    }
 }
 
 impl Drop for ThreadJoins {
     fn drop(&mut self) {
+        let deadline = Instant::now() + MEMORY_SERVER_TEARDOWN_BOUND;
+        while self.0.iter().any(|handle| !handle.is_finished()) {
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "memory-transport server teardown exceeded its bounded settlement window"
+                );
+                std::process::abort();
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
         for handle in self.0.drain(..) {
-            assert!(handle.join().is_ok(), "server thread panicked");
+            if handle.join().is_err() {
+                eprintln!("memory-transport server thread panicked during settlement");
+                std::process::abort();
+            }
         }
     }
 }
@@ -135,6 +160,67 @@ where
     T: Send + 'static,
 {
     std::thread::spawn(f)
+}
+
+fn join_thread_with_bound<T>(handle: JoinHandle<T>, owner: &str) -> std::thread::Result<T> {
+    let deadline = Instant::now() + MEMORY_SERVER_TEARDOWN_BOUND;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            eprintln!("{owner} exceeded its bounded settlement window");
+            std::process::abort();
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.join()
+}
+
+/// Retains every concurrent test worker until all of them have crossed a
+/// bounded join. If one worker panics, the remaining owners still settle
+/// before that first panic is resumed.
+struct WorkerJoins<T>(Vec<JoinHandle<T>>);
+
+impl<T> WorkerJoins<T> {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn push(&mut self, handle: JoinHandle<T>) {
+        self.0.push(handle);
+    }
+
+    fn join_all(mut self, owner: &str) -> Vec<T> {
+        let mut values = Vec::with_capacity(self.0.len());
+        let mut first_panic = None;
+        for handle in self.0.drain(..) {
+            match join_thread_with_bound(handle, owner) {
+                Ok(value) => values.push(value),
+                Err(payload) if first_panic.is_none() => first_panic = Some(payload),
+                Err(_) => {}
+            }
+        }
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
+        }
+        values
+    }
+}
+
+impl<T> Drop for WorkerJoins<T> {
+    fn drop(&mut self) {
+        let mut first_panic = None;
+        for handle in self.0.drain(..) {
+            match join_thread_with_bound(handle, "concurrent E2E worker") {
+                Ok(_) => {}
+                Err(payload) if first_panic.is_none() => first_panic = Some(payload),
+                Err(_) => {}
+            }
+        }
+        if !std::thread::panicking() {
+            if let Some(payload) = first_panic {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
 }
 
 struct TestHarness {
@@ -780,12 +866,77 @@ struct FinalTasksHttpFixture {
     join: Option<JoinHandle<()>>,
 }
 
+/// Retains the spawned final-Tasks server until readiness has succeeded and
+/// ownership can move into the fixture returned to the test.
+struct FinalTasksHttpStartupGuard {
+    shutdown: Option<mpsc::SyncSender<()>>,
+    finished: Option<mpsc::Receiver<Result<(), String>>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl FinalTasksHttpStartupGuard {
+    fn into_parts(
+        mut self,
+    ) -> (
+        mpsc::SyncSender<()>,
+        mpsc::Receiver<Result<(), String>>,
+        Option<JoinHandle<()>>,
+    ) {
+        (
+            self.shutdown
+                .take()
+                .expect("startup guard retains shutdown"),
+            self.finished
+                .take()
+                .expect("startup guard retains completion"),
+            self.join.take(),
+        )
+    }
+
+    fn resume_thread_panic_if_finished(&mut self) {
+        let Some(handle) = self.join.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let handle = self
+            .join
+            .take()
+            .expect("finished startup thread retains its join handle");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+impl Drop for FinalTasksHttpStartupGuard {
+    fn drop(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
+        let Some(shutdown) = self.shutdown.as_ref() else {
+            return;
+        };
+        let Some(finished) = self.finished.as_ref() else {
+            return;
+        };
+        let settlement = settle_final_tasks_http_server(shutdown, finished, &mut self.join);
+        if settlement.is_err() && self.join.is_some() {
+            eprintln!(
+                "final Tasks HTTP server startup left a live unjoinable thread after bounded settlement"
+            );
+            std::process::abort();
+        }
+    }
+}
+
 impl FinalTasksHttpFixture {
     fn spawn(server: Server, runner: AuthorizedTaskServiceRunner) -> Self {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
-        let mut join = Some(thread::spawn(move || {
+        let join = Some(thread::spawn(move || {
             let (task_done_tx, task_done_rx) = mpsc::channel();
             let (server_cx_tx, server_cx_rx) = mpsc::sync_channel(1);
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -893,14 +1044,25 @@ impl FinalTasksHttpFixture {
                 }
             });
         }));
-        let address = ready_rx
-            .recv_timeout(FINAL_TASKS_E2E_BOUND)
-            .expect("final Tasks E2E server starts within its bound")
-            .expect("final Tasks E2E server starts successfully");
+        let startup = FinalTasksHttpStartupGuard {
+            shutdown: Some(shutdown_tx),
+            finished: Some(finished_rx),
+            join,
+        };
+        let address = match ready_rx.recv_timeout(FINAL_TASKS_E2E_BOUND) {
+            Ok(Ok(address)) => address,
+            Ok(Err(error)) => panic!("final Tasks E2E server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("final Tasks E2E server startup readiness channel disconnected")
+            }
+            Err(error) => panic!("final Tasks E2E server startup exceeded its bound: {error}"),
+        };
+        let (shutdown, finished, join) = startup.into_parts();
         Self {
             address,
-            shutdown: shutdown_tx,
-            finished: finished_rx,
+            shutdown,
+            finished,
             join,
         }
     }
@@ -928,15 +1090,8 @@ impl FinalTasksHttpFixture {
     }
 
     fn shutdown(mut self) {
-        let _ = self.shutdown.try_send(());
-        let outcome = self
-            .finished
-            .recv_timeout(FINAL_TASKS_E2E_BOUND)
-            .expect("final Tasks E2E server stops within its bound")
-            .expect("final Tasks E2E server stops cleanly");
-        join_final_tasks_thread(&mut self.join)
-            .expect("final Tasks E2E server exits within its bounded settlement window");
-        drop(outcome);
+        settle_final_tasks_http_server(&self.shutdown, &self.finished, &mut self.join)
+            .unwrap_or_else(|error| panic!("final Tasks E2E server teardown failed: {error}"));
     }
 }
 
@@ -945,16 +1100,30 @@ impl Drop for FinalTasksHttpFixture {
         if self.join.is_none() {
             return;
         }
-        let _ = self.shutdown.try_send(());
-        let outcome = self
-            .finished
-            .recv_timeout(FINAL_TASKS_E2E_BOUND)
-            .expect("final Tasks E2E server stops within its bound")
-            .expect("final Tasks E2E server stops cleanly");
-        join_final_tasks_thread(&mut self.join)
-            .expect("final Tasks E2E server exits within its bounded settlement window");
-        drop(outcome);
+        if let Err(error) =
+            settle_final_tasks_http_server(&self.shutdown, &self.finished, &mut self.join)
+        {
+            eprintln!("final Tasks HTTP server fixture drop failed: {error}");
+            std::process::abort();
+        }
     }
+}
+
+fn settle_final_tasks_http_server(
+    shutdown: &mpsc::SyncSender<()>,
+    finished: &mpsc::Receiver<Result<(), String>>,
+    join: &mut Option<JoinHandle<()>>,
+) -> Result<(), String> {
+    match shutdown.try_send(()) {
+        Ok(()) | Err(mpsc::TrySendError::Full(())) | Err(mpsc::TrySendError::Disconnected(())) => {}
+    }
+    let outcome = finished
+        .recv_timeout(FINAL_TASKS_E2E_BOUND)
+        .map_err(|error| format!("final Tasks E2E server teardown exceeded its bound: {error}"));
+    let join_result = join_final_tasks_thread(join);
+    let outcome = outcome?;
+    outcome.map_err(|error| format!("final Tasks E2E server teardown failed: {error}"))?;
+    join_result
 }
 
 fn join_final_tasks_thread(join: &mut Option<JoinHandle<()>>) -> Result<(), String> {
@@ -975,6 +1144,70 @@ fn join_final_tasks_thread(join: &mut Option<JoinHandle<()>>) -> Result<(), Stri
         }
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+#[test]
+fn workflow_final_tasks_startup_guard_preserves_planted_startup_error() {
+    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let startup = FinalTasksHttpStartupGuard {
+        shutdown: Some(shutdown_tx),
+        finished: Some(finished_rx),
+        join: Some(thread::spawn(move || {
+            shutdown_rx
+                .recv()
+                .expect("startup guard requests bounded shutdown");
+            let _ = finished_tx.send(Err("planted startup failure".to_owned()));
+        })),
+    };
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _startup = startup;
+        panic!("original startup diagnostic");
+    }))
+    .expect_err("the enclosing startup failure must propagate");
+    assert_eq!(
+        *panic
+            .downcast::<&str>()
+            .expect("the original startup diagnostic is retained"),
+        "original startup diagnostic"
+    );
+}
+
+#[test]
+fn workflow_final_tasks_startup_guard_resumes_planted_pre_readiness_panic() {
+    let (shutdown_tx, _shutdown_rx) = mpsc::sync_channel::<()>(1);
+    let (_finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let mut startup = FinalTasksHttpStartupGuard {
+        shutdown: Some(shutdown_tx),
+        finished: Some(finished_rx),
+        join: Some(thread::spawn(|| panic!("planted pre-readiness panic"))),
+    };
+    let deadline = Instant::now() + FINAL_TASKS_E2E_BOUND;
+    while !startup
+        .join
+        .as_ref()
+        .expect("startup guard retains the spawned thread")
+        .is_finished()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the planted pre-readiness panic finishes within the bound"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        startup.resume_thread_panic_if_finished();
+    }))
+    .expect_err("the original pre-readiness panic must be resumed");
+    assert_eq!(
+        *panic
+            .downcast::<&str>()
+            .expect("the original pre-readiness panic is retained"),
+        "planted pre-readiness panic"
+    );
+    assert!(startup.join.is_none());
 }
 
 struct E2eFinalTaskSupervisor {
@@ -1277,7 +1510,7 @@ fn workflow_concurrent_clients_isolation() {
     use fastmcp_transport::memory::create_memory_transport_pair;
 
     // Create multiple client-server transport pairs
-    let mut server_handles = Vec::new();
+    let mut server_joins = ThreadJoins::new(Vec::new());
     let mut clients_and_servers = Vec::new();
 
     for client_num in 0..3 {
@@ -1293,7 +1526,7 @@ fn workflow_concurrent_clients_isolation() {
         let handle = spawn_thread(move || {
             server.run_transport(server_transport);
         });
-        server_handles.push(handle);
+        server_joins.push(handle);
 
         let client = TestClient::new(client_transport)
             .with_client_info(format!("client-{}", client_num), "1.0.0");
@@ -1347,8 +1580,8 @@ fn workflow_concurrent_clients_isolation() {
         );
     }
 
-    let _joins = ThreadJoins::new(server_handles);
     drop(clients_and_servers);
+    drop(server_joins);
 }
 
 #[test]
@@ -1357,7 +1590,7 @@ fn workflow_concurrent_interleaved_operations() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let operation_counter = Arc::new(AtomicUsize::new(0));
-    let mut handles = Vec::new();
+    let mut workers = WorkerJoins::new();
 
     for client_num in 0..4 {
         let counter = Arc::clone(&operation_counter);
@@ -1406,17 +1639,11 @@ fn workflow_concurrent_interleaved_operations() {
             client_num
         });
 
-        handles.push(handle);
+        workers.push(handle);
     }
 
     // Wait for all threads to complete
-    let mut completed_clients = Vec::new();
-    for handle in handles {
-        let Ok(client_num) = handle.join() else {
-            return;
-        };
-        completed_clients.push(client_num);
-    }
+    let completed_clients = workers.join_all("interleaved client worker");
 
     // Verify all clients completed
     assert_eq!(completed_clients.len(), 4);
@@ -1432,7 +1659,7 @@ fn workflow_concurrent_no_crosstalk() {
     use std::thread;
 
     let results = Arc::new(Mutex::new(Vec::new()));
-    let mut handles = Vec::new();
+    let mut workers = WorkerJoins::new();
 
     for client_num in 0..3 {
         let results = Arc::clone(&results);
@@ -1482,13 +1709,11 @@ fn workflow_concurrent_no_crosstalk() {
                 .push((client_num, value.clone(), retrieved));
         });
 
-        handles.push(handle);
+        workers.push(handle);
     }
 
     // Wait for all threads
-    for handle in handles {
-        assert!(handle.join().is_ok(), "thread panicked");
-    }
+    workers.join_all("crosstalk client worker");
 
     // Verify each client got its own value back
     let results = results.lock().unwrap();
@@ -1568,18 +1793,17 @@ fn workflow_concurrent_session_state_persistence() {
 fn workflow_concurrent_stress_test() {
     use fastmcp_transport::memory::create_memory_transport_pair;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
 
     const NUM_CLIENTS: usize = 5;
     const OPS_PER_CLIENT: usize = 10;
 
     let success_count = Arc::new(AtomicUsize::new(0));
-    let mut handles = Vec::new();
+    let mut workers = WorkerJoins::new();
 
     for client_num in 0..NUM_CLIENTS {
         let success = Arc::clone(&success_count);
 
-        let handle = thread::spawn(move || {
+        let handle = spawn_thread(move || {
             let (client_transport, server_transport) = create_memory_transport_pair();
 
             let server = Server::new("stress-server", "1.0.0")
@@ -1588,9 +1812,10 @@ fn workflow_concurrent_stress_test() {
                 .tool(SessionGetHandler)
                 .build();
 
-            thread::spawn(move || {
+            let server_handle = spawn_thread(move || {
                 server.run_transport(server_transport);
             });
+            let _server_join = ThreadJoins::new(vec![server_handle]);
 
             let mut client = TestClient::new(client_transport);
             if client.initialize().is_err() {
@@ -1617,13 +1842,11 @@ fn workflow_concurrent_stress_test() {
             }
         });
 
-        handles.push(handle);
+        workers.push(handle);
     }
 
     // Wait for all threads
-    for handle in handles {
-        let _ = handle.join();
-    }
+    workers.join_all("stress client worker");
 
     // Verify most operations succeeded
     let total_success = success_count.load(Ordering::SeqCst);
@@ -1669,12 +1892,26 @@ fn session_initialization_stores_server_info() {
 #[test]
 fn session_capabilities_reflect_server_handlers() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     // Server with only tools
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("tools-only", "1.0.0").tool(EchoTool).build();
-    thread::spawn(move || server.run_transport(server_transport));
+    let server_handle = spawn_thread(move || server.run_transport(server_transport));
+
+    // Server with only resources
+    let (client_transport2, server_transport2) = create_memory_transport_pair();
+    let server2 = Server::new("resources-only", "1.0.0")
+        .resource(StatusResource)
+        .build();
+    let server_handle2 = spawn_thread(move || server2.run_transport(server_transport2));
+
+    // Server with only prompts
+    let (client_transport3, server_transport3) = create_memory_transport_pair();
+    let server3 = Server::new("prompts-only", "1.0.0")
+        .prompt(HelpPromptPrompt)
+        .build();
+    let server_handle3 = spawn_thread(move || server3.run_transport(server_transport3));
+    let _server_joins = ThreadJoins::new(vec![server_handle, server_handle2, server_handle3]);
 
     let mut client = TestClient::new(client_transport);
     client.initialize().unwrap();
@@ -1684,13 +1921,6 @@ fn session_capabilities_reflect_server_handlers() {
     assert!(caps.resources.is_none());
     assert!(caps.prompts.is_none());
 
-    // Server with only resources
-    let (client_transport2, server_transport2) = create_memory_transport_pair();
-    let server2 = Server::new("resources-only", "1.0.0")
-        .resource(StatusResource)
-        .build();
-    thread::spawn(move || server2.run_transport(server_transport2));
-
     let mut client2 = TestClient::new(client_transport2);
     client2.initialize().unwrap();
 
@@ -1698,13 +1928,6 @@ fn session_capabilities_reflect_server_handlers() {
     assert!(caps2.tools.is_none());
     assert!(caps2.resources.is_some());
     assert!(caps2.prompts.is_none());
-
-    // Server with only prompts
-    let (client_transport3, server_transport3) = create_memory_transport_pair();
-    let server3 = Server::new("prompts-only", "1.0.0")
-        .prompt(HelpPromptPrompt)
-        .build();
-    thread::spawn(move || server3.run_transport(server_transport3));
 
     let mut client3 = TestClient::new(client_transport3);
     client3.initialize().unwrap();
@@ -1731,11 +1954,11 @@ fn session_protocol_version_negotiated() {
 #[test]
 fn session_operations_fail_before_init() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("test-server", "1.0.0").tool(EchoTool).build();
-    thread::spawn(move || server.run_transport(server_transport));
+    let server_handle = spawn_thread(move || server.run_transport(server_transport));
+    let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client = TestClient::new(client_transport);
 
@@ -1754,11 +1977,11 @@ fn session_operations_fail_before_init() {
 #[test]
 fn session_close_graceful() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("close-test", "1.0.0").tool(EchoTool).build();
-    thread::spawn(move || server.run_transport(server_transport));
+    let server_handle = spawn_thread(move || server.run_transport(server_transport));
+    let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client = TestClient::new(client_transport);
     client.initialize().unwrap();
@@ -1779,7 +2002,6 @@ fn session_close_graceful() {
 #[test]
 fn session_state_isolated_per_client() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     // Create two separate client-server pairs
     let (client_a_transport, server_a_transport) = create_memory_transport_pair();
@@ -1795,8 +2017,9 @@ fn session_state_isolated_per_client() {
         .tool(SessionGetHandler)
         .build();
 
-    thread::spawn(move || server_a.run_transport(server_a_transport));
-    thread::spawn(move || server_b.run_transport(server_b_transport));
+    let server_a_handle = spawn_thread(move || server_a.run_transport(server_a_transport));
+    let server_b_handle = spawn_thread(move || server_b.run_transport(server_b_transport));
+    let _server_joins = ThreadJoins::new(vec![server_a_handle, server_b_handle]);
 
     let mut client_a = TestClient::new(client_a_transport);
     let mut client_b = TestClient::new(client_b_transport);
@@ -1869,13 +2092,13 @@ fn session_reinitialize_fails() {
 #[test]
 fn session_tracks_client_info() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("client-info-test", "1.0.0")
         .tool(EchoTool)
         .build();
-    thread::spawn(move || server.run_transport(server_transport));
+    let server_handle = spawn_thread(move || server.run_transport(server_transport));
+    let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client =
         TestClient::new(client_transport).with_client_info("custom-client-name", "2.5.0");
@@ -1898,8 +2121,8 @@ fn session_multiple_clients_independent_lifecycle() {
     use fastmcp_transport::memory::create_memory_transport_pair;
 
     // Create multiple independent client-server pairs
+    let mut server_joins = ThreadJoins::new(Vec::new());
     let mut clients = Vec::new();
-    let mut server_handles = Vec::new();
 
     for i in 0..3 {
         let (client_transport, server_transport) = create_memory_transport_pair();
@@ -1911,14 +2134,12 @@ fn session_multiple_clients_independent_lifecycle() {
                 .run_transport_returning(server_transport)
                 .expect("lifecycle server loop");
         });
-        server_handles.push(handle);
+        server_joins.push(handle);
 
         let client = TestClient::new(client_transport)
             .with_client_info(format!("lifecycle-client-{}", i), "1.0.0");
         clients.push((i, client));
     }
-
-    let _joins = ThreadJoins::new(server_handles);
 
     // Initialize clients in order
     for (i, client) in &mut clients {
@@ -3002,13 +3223,13 @@ fn resource_metadata_preserved() {
 #[test]
 fn resource_read_before_init_fails() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("test", "1.0.0")
         .resource(PlainTextResource)
         .build();
-    thread::spawn(move || server.run_transport(server_transport));
+    let server_handle = spawn_thread(move || server.run_transport(server_transport));
+    let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client = TestClient::new(client_transport);
 
