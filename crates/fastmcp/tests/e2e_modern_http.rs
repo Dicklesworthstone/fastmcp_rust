@@ -1,42 +1,31 @@
 //! Public modern HTTP round trip: shipped client against shipped server.
 //!
-//! Both ends of these tests are real shipped surfaces — the turnkey
+//! Both ends of these tests are real shipped-facade surfaces — the turnkey
 //! `Server::bind_http`/`serve` lifecycle on one side and
-//! `ModernHttpClient::connect`/`request` on the other — joined over one real
-//! localhost socket. No scripted peer, no fixture transcript, no mock
-//! stands in for either endpoint.
+//! `auto::client_builder()` connection lifecycle on the other — joined over
+//! one real localhost socket. No scripted peer, fixture transcript, mock, or
+//! direct FastMCP component-crate import stands in for either endpoint.
 //!
 //! What this proves (and only this): the shipped dual-era HTTP server and
-//! the shipped HTTP clients can complete era negotiation and a round trip
-//! against each other — modern discovery plus `tools/call` over whichever
-//! JSON or request-scoped SSE lane the server selects, the `Auto` policy
-//! selecting the modern era against a live modern server without touching a
-//! legacy path, and the exact 2024-11-05 HTTP+SSE lane completing
-//! `initialize` through the server's session-scoped advertised message
-//! endpoint. It is not an aggregate MCP 2026-07-28 conformance claim.
+//! facade clients can complete Auto classification and a round trip against
+//! each other — modern discovery plus `ping` over the live modern lane,
+//! then exact 2024-11-05 HTTP+SSE fallback after an eligible live modern-route
+//! refusal. It is not an aggregate MCP 2026-07-28 conformance claim.
 
 use std::net::SocketAddr;
 use std::sync::mpsc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use asupersync::Cx;
+use asupersync::CancelKind;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::reactor::create_reactor;
-use fastmcp_client::http_executor::{
-    ModernHttpClient, ModernHttpResponseKind, ModernHttpResponseStream,
+use fastmcp_rust::{
+    auto, CanonicalHttpUrl, ClientHttpConnection, ClientHttpResponse, ClientProtocolPlan, Cx,
+    JsonRpcMessage, ModernHttpResponseKind, ModernHttpResponseStream, ProtocolEra,
+    ProtocolPolicy, RequestId, Server, SseLimits,
 };
-use fastmcp_client::sse::SseLimits;
-use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan, ProtocolEra, ProtocolPolicy};
-use fastmcp_protocol::{ClientCapabilities, ClientInfo, JsonRpcMessage, JsonRpcRequest, RequestId};
-use fastmcp_rust::{McpContext, ServerBuilder, tool};
 use serde_json::json;
-
-/// Echoes back the input, proving handler dispatch crossed the wire.
-#[tool(name = "echo", version = "1.0.0", annotations(read_only, idempotent))]
-fn echo_tool(_ctx: &McpContext, message: String) -> String {
-    message
-}
 
 fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
     RuntimeBuilder::current_thread()
@@ -45,70 +34,179 @@ fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Binds the real turnkey server on an ephemeral port and serves it from a
-/// detached acceptor thread for the remainder of the test process.
+const HTTP_SERVER_STARTUP_BOUND: Duration = Duration::from_secs(2);
+const HTTP_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(2);
+
+/// Owns one real public HTTP server composition and proves its teardown.
 ///
-/// The server-side runtime mirrors the shipped live-HTTP harness: listener
-/// I/O needs a real reactor, dispatch needs blocking worker threads, and the
-/// serving context must be minted by that runtime. (The first execution of
-/// this suite proved a bare runtime with a detached `Cx::for_request` makes
-/// `serve` bail instantly, closing kernel-backlogged connections before any
-/// response headers.)
-fn spawn_echo_server() -> SocketAddr {
-    let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
-    thread::spawn(move || {
-        let runtime = RuntimeBuilder::current_thread()
-            .with_reactor(create_reactor().expect("server reactor initializes"))
-            .blocking_threads(4, 64)
-            .build()
-            .expect("server runtime builds");
-        let (done_tx, done_rx) = mpsc::channel::<()>();
-        runtime
-            .handle()
-            .try_spawn_with_cx(move |cx| async move {
-                let server = ServerBuilder::new("e2e-modern-http", "1.0.0")
-                    .tool(EchoTool)
-                    .build();
-                let bound = server
-                    .bind_http(&cx, "127.0.0.1:0")
-                    .await
-                    .expect("turnkey server binds an ephemeral port");
-                addr_tx
-                    .send(bound.local_addr().expect("bound address is known"))
-                    .expect("address channel delivers");
-                let _ = bound.serve(&cx).await;
-                let _ = done_tx.send(());
-            })
-            .expect("server task is admitted");
-        // Drive the runtime so the accept loop and per-connection children
-        // actually poll; the thread stays parked here for the remainder of
-        // the test process.
-        runtime.block_on(async move {
-            loop {
-                match done_rx.try_recv() {
-                    Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
-                    Err(mpsc::TryRecvError::Empty) => {
-                        let cx = Cx::current().expect("server runtime installs an ambient Cx");
-                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
-                    }
-                }
-            }
-        });
-    });
-    addr_rx
-        .recv()
-        .expect("server thread reports its bound address")
+/// The fixture deliberately uses the minimal `Server::new(...).build()`
+/// composition published in the facade examples, rather than a test-local
+/// handler. Its only client request is `ping`, which every shipped server
+/// implements without a bespoke test tool.
+struct HttpServerFixture {
+    address: SocketAddr,
+    shutdown: Cx,
+    finished: mpsc::Receiver<Result<(), String>>,
+    join: Option<JoinHandle<()>>,
 }
 
-fn client_info() -> ClientInfo {
-    ClientInfo {
-        name: "e2e-modern-http-client".to_owned(),
-        version: "1.0.0".to_owned(),
+impl HttpServerFixture {
+    fn spawn() -> Self {
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(SocketAddr, Cx), String>>(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+        let join = thread::spawn(move || {
+            let ready_for_spawn_failure = ready_tx.clone();
+            let finished_for_spawn_failure = finished_tx.clone();
+            let (task_done_tx, task_done_rx) = mpsc::channel::<()>();
+            let runtime = RuntimeBuilder::current_thread()
+                .with_reactor(create_reactor().expect("server reactor initializes"))
+                .blocking_threads(4, 64)
+                .build()
+                .expect("server runtime builds");
+            let server_task = runtime.handle().try_spawn_with_cx(move |cx| async move {
+                let outcome = async {
+                    let bound = match Server::new("facade-http-example", "1.0.0")
+                        .protocol_policy(ProtocolPolicy::Auto)
+                        .build()
+                        .bind_http(&cx, "127.0.0.1:0")
+                        .await
+                    {
+                        Ok(bound) => bound,
+                        Err(error) => {
+                            let message = format!("facade HTTP server bind failed: {error}");
+                            let _ = ready_tx.send(Err(message.clone()));
+                            return Err(message);
+                        }
+                    };
+                    let address = match bound.local_addr() {
+                        Ok(address) => address,
+                        Err(error) => {
+                            let message = format!("facade HTTP server address failed: {error}");
+                            let _ = ready_tx.send(Err(message.clone()));
+                            return Err(message);
+                        }
+                    };
+                    if ready_tx.send(Ok((address, cx.clone()))).is_err() {
+                        cx.cancel_with(
+                            CancelKind::User,
+                            Some("HTTP E2E startup receiver went away"),
+                        );
+                        return Err("HTTP E2E startup receiver went away".to_owned());
+                    }
+                    bound
+                        .serve(&cx)
+                        .await
+                        .map_err(|error| format!("facade HTTP server stopped unexpectedly: {error}"))
+                }
+                .await;
+                let _ = finished_tx.send(outcome);
+                let _ = task_done_tx.send(());
+            });
+            if let Err(error) = server_task {
+                let message = format!("facade HTTP server task was not admitted: {error}");
+                let _ = ready_for_spawn_failure.send(Err(message.clone()));
+                let _ = finished_for_spawn_failure.send(Err(message));
+                return;
+            }
+            runtime.block_on(async move {
+                loop {
+                    match task_done_rx.try_recv() {
+                        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            let cx = Cx::current().expect("server runtime installs an ambient Cx");
+                            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                        }
+                    }
+                }
+            });
+        });
+
+        let (address, shutdown) = match ready_rx.recv_timeout(HTTP_SERVER_STARTUP_BOUND) {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(error)) => {
+                let _ = finished_rx.recv_timeout(HTTP_SERVER_TEARDOWN_BOUND);
+                let _ = join.join();
+                panic!("public HTTP server failed to start: {error}");
+            }
+            Err(error) => {
+                let completed = finished_rx
+                    .recv_timeout(HTTP_SERVER_TEARDOWN_BOUND)
+                    .is_ok();
+                if completed {
+                    let _ = join.join();
+                }
+                panic!("public HTTP server startup exceeded its bound: {error}");
+            }
+        };
+
+        Self {
+            address,
+            shutdown,
+            finished: finished_rx,
+            join: Some(join),
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn shutdown(mut self) {
+        self.shutdown.cancel_with(
+            CancelKind::User,
+            Some("HTTP E2E fixture teardown requested"),
+        );
+        let outcome = self
+            .finished
+            .recv_timeout(HTTP_SERVER_TEARDOWN_BOUND)
+            .unwrap_or_else(|error| panic!("public HTTP server teardown exceeded its bound: {error}"));
+        self.join
+            .take()
+            .expect("HTTP server fixture retains its join handle")
+            .join()
+            .expect("HTTP server thread must not panic during teardown");
+        outcome.unwrap_or_else(|error| panic!("public HTTP server teardown failed: {error}"));
+    }
+}
+
+impl Drop for HttpServerFixture {
+    fn drop(&mut self) {
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        self.shutdown.cancel_with(
+            CancelKind::User,
+            Some("HTTP E2E fixture drop requested"),
+        );
+        match self.finished.recv_timeout(HTTP_SERVER_TEARDOWN_BOUND) {
+            Ok(_) => {
+                let join_result = join.join();
+                if !std::thread::panicking() {
+                    join_result.expect("HTTP server thread must not panic during fixture drop");
+                }
+            }
+            Err(error) if !std::thread::panicking() => {
+                panic!("public HTTP server fixture drop exceeded its teardown bound: {error}");
+            }
+            Err(_) => {}
+        }
     }
 }
 
 fn plan(addr: SocketAddr, policy: ProtocolPolicy) -> ClientProtocolPlan {
-    let modern_target = CanonicalHttpUrl::parse(&format!("http://{addr}/mcp"))
+    plan_with_modern_post_path(addr, policy, "/mcp")
+}
+
+/// Builds one immutable public endpoint plan while allowing the Auto probe to
+/// target a live server route that is intentionally not mounted as modern.
+/// This lets the fallback test observe the real 404 response required by the
+/// public negotiation contract without substituting a scripted HTTP peer.
+fn plan_with_modern_post_path(
+    addr: SocketAddr,
+    policy: ProtocolPolicy,
+    modern_post_path: &str,
+) -> ClientProtocolPlan {
+    let modern_target = CanonicalHttpUrl::parse(&format!("http://{addr}{modern_post_path}"))
         .expect("local modern target must be canonical");
     let legacy_sse = CanonicalHttpUrl::parse(&format!("http://{addr}/sse"))
         .expect("legacy SSE target must be canonical");
@@ -127,6 +225,34 @@ fn plan(addr: SocketAddr, policy: ProtocolPolicy) -> ClientProtocolPlan {
         0,
     )
     .expect("the complete HTTP plan must be accepted")
+}
+
+/// Performs the exact public 2024-11-05 initialization lifecycle over the
+/// Auto-selected legacy connection and returns its correlated response.
+fn initialize_exact_legacy_http(
+    cx: &Cx,
+    connection: &mut ClientHttpConnection,
+    request_id: i64,
+) -> serde_json::Value {
+    let response = runtime_block_on(connection.request(
+        cx,
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "e2e-legacy-http-client", "version": "1.0.0"}
+        }),
+        RequestId::Number(request_id),
+    ))
+    .expect("legacy initialize POSTs to the live Auto-selected message endpoint");
+    let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) = response else {
+        panic!("the Auto-selected legacy connection must return a legacy JSON-RPC response");
+    };
+    let document = serde_json::to_value(response).expect("legacy initialize response reserializes");
+
+    runtime_block_on(connection.notify(cx, "notifications/initialized", None))
+        .expect("the exact legacy lifecycle acknowledgement uses the selected live endpoint");
+    document
 }
 
 /// Consumes whichever response lane the real server selected and returns the
@@ -165,157 +291,106 @@ fn final_response_document(cx: &Cx, response: ModernHttpResponseStream) -> serde
 }
 
 #[test]
-fn modern_only_round_trip_reaches_the_shipped_tool() {
-    let addr = spawn_echo_server();
+fn e2e_public_http_auto_selects_modern_on_the_shipped_facade_server() {
+    let server = HttpServerFixture::spawn();
     let cx = Cx::for_request();
+    let builder = auto::client_builder()
+        .client_info("e2e-modern-http-client", "1.0.0")
+        .protocol_plan(plan(server.address(), ProtocolPolicy::Auto));
+    assert_eq!(builder.selected_protocol_plan().policy(), ProtocolPolicy::Auto);
 
-    let outcome = runtime_block_on(ModernHttpClient::connect(
-        &cx,
-        plan(addr, ProtocolPolicy::ModernOnly),
-        client_info(),
-        ClientCapabilities::default(),
-    ))
-    .expect("the shipped client connects to the shipped server");
-    assert_eq!(outcome.selected_era(), Some(ProtocolEra::Modern2026));
-    let client = outcome
-        .into_modern()
-        .expect("modern-only negotiation yields a modern client");
+    let mut client = runtime_block_on(builder.connect_http_client_with_cx(&cx))
+        .expect("the public Auto facade client completes live modern discovery");
+    assert_eq!(
+        client.selected_protocol_era(),
+        ProtocolEra::Modern2026,
+        "a live modern discovery response must never downgrade Auto"
+    );
+    assert_eq!(client.protocol_plan().policy(), ProtocolPolicy::Auto);
     assert!(
-        client
-            .server_discovery()
-            .supported_versions()
-            .iter()
-            .any(|version| version == "2026-07-28"),
-        "live discovery must advertise the final protocol revision"
+        client.server_discovery().is_some(),
+        "modern selection exposes the public discovery result"
+    );
+    assert_eq!(
+        client.connection().protocol_version(),
+        fastmcp_rust::modern::PROTOCOL_VERSION,
+        "the public HTTP connection reports the exact modern negotiated version"
     );
 
     let response = runtime_block_on(client.request(
         &cx,
-        "tools/call",
-        json!({"name": "echo", "arguments": {"message": "round trip e2e"}}),
-        Some(RequestId::Number(2)),
+        "ping",
+        json!({}),
     ))
-    .expect("tools/call crosses the real socket");
+    .expect("the Auto-selected modern connection serves requests");
+    let ClientHttpResponse::Modern(response) = response else {
+        panic!("the selected modern HTTP client must retain the modern response lane");
+    };
     let document = final_response_document(&cx, response);
-
-    assert_eq!(document["jsonrpc"], json!("2.0"));
     assert_eq!(document["id"], json!(2));
     assert!(
         document.get("error").is_none(),
-        "echo must not fail: {document}"
+        "ping over the Auto-selected connection must not fail: {document}"
     );
-    let result = document
-        .get("result")
-        .expect("terminal response carries a result");
-    assert!(
-        serde_json::to_string(result)
-            .expect("result reserializes")
-            .contains("round trip e2e"),
-        "the echoed text must round-trip through the live handler: {result}"
-    );
+    drop(client);
+    server.shutdown();
 }
 
 #[test]
-fn auto_policy_selects_the_modern_era_against_the_live_server() {
-    let addr = spawn_echo_server();
+fn e2e_public_http_auto_falls_back_to_exact_legacy_on_live_eligible_refusal() {
+    let server = HttpServerFixture::spawn();
     let cx = Cx::for_request();
 
-    let outcome = runtime_block_on(ModernHttpClient::connect(
-        &cx,
-        plan(addr, ProtocolPolicy::Auto),
-        client_info(),
-        ClientCapabilities::default(),
-    ))
-    .expect("Auto negotiation completes against the live server");
+    // `/modern-unavailable` is a real but unmounted route on the shipped
+    // server. Its live 404 is an eligible Auto fallback signal; the complete
+    // legacy SSE and message targets remain explicitly configured.
+    let builder = auto::client_builder()
+        .client_info("e2e-legacy-http-client", "1.0.0")
+        .protocol_plan(plan_with_modern_post_path(
+            server.address(),
+            ProtocolPolicy::Auto,
+            "/modern-unavailable",
+        ));
+    assert_eq!(builder.selected_protocol_plan().policy(), ProtocolPolicy::Auto);
+    let mut connection = runtime_block_on(builder.connect_http_with_cx(&cx))
+        .expect("an eligible live modern-route refusal opens the exact legacy lane");
     assert_eq!(
-        outcome.selected_era(),
-        Some(ProtocolEra::Modern2026),
-        "a live modern discovery response must never downgrade Auto"
+        connection.selected_protocol_era(),
+        ProtocolEra::Legacy2024,
+        "Auto must expose exact legacy selection only after its eligible live refusal"
     );
-    let client = outcome
-        .into_modern()
-        .expect("Auto against a modern server yields the modern client");
-
-    // One request proves the negotiated connection is actually usable.
-    let response = runtime_block_on(client.request(
-        &cx,
-        "tools/call",
-        json!({"name": "echo", "arguments": {"message": "auto era"}}),
-        Some(RequestId::Number(3)),
-    ))
-    .expect("the Auto-selected modern connection serves requests");
-    let document = final_response_document(&cx, response);
-    assert_eq!(document["id"], json!(3));
+    assert_eq!(connection.protocol_plan().policy(), ProtocolPolicy::Auto);
     assert!(
-        document.get("error").is_none(),
-        "echo over the Auto-selected connection must not fail: {document}"
-    );
-}
-
-#[test]
-fn legacy_only_initialize_round_trips_against_the_same_shipped_server() {
-    let addr = spawn_echo_server();
-    let cx = Cx::for_request();
-
-    // The same turnkey server serves the exact 2024-11-05 HTTP+SSE lane:
-    // its SSE stream advertises a session-scoped message endpoint that the
-    // shipped legacy client must admit as the configured resource.
-    let outcome = runtime_block_on(ModernHttpClient::connect(
-        &cx,
-        plan(addr, ProtocolPolicy::LegacyOnly),
-        client_info(),
-        ClientCapabilities::default(),
-    ))
-    .expect("legacy-only connect opens the shipped legacy SSE lane");
-    assert_eq!(outcome.selected_era(), Some(ProtocolEra::Legacy2024));
-    let mut legacy = outcome
-        .into_legacy_sse()
-        .expect("legacy-only negotiation yields the legacy client");
-    assert!(
-        legacy
-            .advertised_message_post_target()
-            .starts_with(legacy.configured_message_post_target()),
-        "the advertised endpoint extends the configured resource"
-    );
-
-    runtime_block_on(legacy.send(
-        &cx,
-        &JsonRpcMessage::Request(JsonRpcRequest::new(
-            "initialize",
-            Some(json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "e2e-legacy-http-client", "version": "1.0.0"}
-            })),
-            RequestId::Number(11),
-        )),
-    ))
-    .expect("legacy initialize POSTs to the advertised session endpoint");
-
-    let mut initialize_response = None;
-    for _ in 0..8 {
-        match runtime_block_on(legacy.next_message(&cx))
-            .expect("legacy SSE messages decode as strict JSON-RPC")
-        {
-            Some(message) => {
-                let value = serde_json::to_value(message).expect("legacy message reserializes");
-                if value.get("id") == Some(&json!(11)) {
-                    initialize_response = Some(value);
-                    break;
-                }
-            }
-            None => break,
-        }
-    }
-    let document =
-        initialize_response.expect("the live legacy lane delivered the initialize response");
-    assert!(
-        document.get("error").is_none(),
-        "legacy initialize must not fail: {document}"
+        connection.server_discovery().is_none(),
+        "exact legacy fallback cannot expose modern discovery state"
     );
     assert_eq!(
-        document["result"]["protocolVersion"],
-        json!("2024-11-05"),
-        "the legacy lane must negotiate the exact 2024-11-05 revision"
+        connection.protocol_version(),
+        fastmcp_rust::legacy_2024::PROTOCOL_VERSION,
+        "the public HTTP connection reports the exact legacy negotiated version"
     );
+
+    let document = initialize_exact_legacy_http(&cx, &mut connection, 17);
+    assert!(
+        document.get("error").is_none(),
+        "exact legacy initialize after Auto fallback must not fail: {document}"
+    );
+    assert_eq!(
+        document["result"]["serverInfo"]["name"],
+        json!("facade-http-example"),
+        "the legacy initialization result comes from the shipped facade server composition"
+    );
+    let ping = runtime_block_on(connection.request(
+        &cx,
+        "ping",
+        json!({}),
+        RequestId::Number(18),
+    ))
+    .expect("the initialized exact-legacy fallback remains usable");
+    let ClientHttpResponse::Legacy(JsonRpcMessage::Response(ping)) = ping else {
+        panic!("the exact-legacy fallback must answer ping through its legacy response lane");
+    };
+    assert!(ping.error.is_none(), "legacy ping must not fail: {ping:?}");
+    drop(connection);
+    server.shutdown();
 }

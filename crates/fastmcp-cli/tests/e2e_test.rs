@@ -21,6 +21,163 @@ const STATIC_MCP_SERVER_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/static_mcp_server.sh"
 );
+const INSPECT_PROTOCOL_WIRE_PREFIX: &str = "FASTMCP_E2E_WIRE ";
+
+const MODERN_INSPECT_FIXTURE: &str = r#"
+emit_wire() {
+    printf 'FASTMCP_E2E_WIRE %s\n' "$1" >&2
+}
+
+is_exact_modern_discovery() {
+    case "$1" in
+        *'"method":"server/discover"'*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) ;;
+        *) return 1 ;;
+    esac
+}
+
+while IFS= read -r request; do
+    emit_wire "$request"
+    is_exact_modern_discovery "$request" || exit 1
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"serverInfo":{"name":"modern-inspect-server","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}'
+done
+"#;
+
+const LEGACY_FALLBACK_INSPECT_FIXTURE: &str = r#"
+emit_wire() {
+    printf 'FASTMCP_E2E_WIRE %s\n' "$1" >&2
+}
+
+require_no_final_metadata() {
+    case "$1" in
+        *'io.modelcontextprotocol/protocolVersion'*|*'io.modelcontextprotocol/clientCapabilities'*|*'io.modelcontextprotocol/clientInfo'*|*'io.modelcontextprotocol/serverInfo'*|*'io.modelcontextprotocol/subscriptionId'*)
+            return 1
+            ;;
+    esac
+}
+
+is_exact_modern_discovery() {
+    case "$1" in
+        *'"method":"server/discover"'*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) ;;
+        *) return 1 ;;
+    esac
+}
+
+is_exact_legacy_initialize() {
+    printf '%s\n' "$1" | grep -Eq '^\{"jsonrpc":"2\.0","method":"initialize","params":\{"protocolVersion":"2024-11-05","capabilities":\{\},"clientInfo":\{"name":"[^"]*","version":"[^"]*"\}\},"id":[0-9]+\}$' || return 1
+    require_no_final_metadata "$1"
+}
+
+is_exact_legacy_initialized_notification() {
+    case "$1" in
+        *'"method":"notifications/initialized"'*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *'"id":'*|*'"params":'*) return 1 ;;
+    esac
+    require_no_final_metadata "$1"
+}
+
+respond() {
+    printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$request_id" "$1"
+}
+
+respond_method_not_found() {
+    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$request_id"
+}
+
+require_request_id() {
+    request_id=$(printf '%s\n' "$1" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+    case "$request_id" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+}
+
+state=awaiting_initialize
+while IFS= read -r request; do
+    emit_wire "$request"
+
+    case "$state" in
+        awaiting_initialize)
+            require_request_id "$request" || exit 1
+            case "$request" in
+                *'"method":"server/discover"'*)
+                    is_exact_modern_discovery "$request" || exit 1
+                    respond_method_not_found
+                    exit 0
+                    ;;
+                *'"method":"initialize"'*)
+                    is_exact_legacy_initialize "$request" || exit 1
+                    respond '{"protocolVersion":"2024-11-05","capabilities":{"tools":{},"resources":{},"prompts":{}},"serverInfo":{"name":"legacy-inspect-server","version":"1.0.0"}}'
+                    state=awaiting_initialized_notification
+                    ;;
+                *) exit 1 ;;
+            esac
+            ;;
+        awaiting_initialized_notification)
+            is_exact_legacy_initialized_notification "$request" || exit 1
+            state=operating
+            ;;
+        operating)
+            require_request_id "$request" || exit 1
+            require_no_final_metadata "$request" || exit 1
+            case "$request" in
+                *'"method":"tools/list"'*)
+                    respond '{"tools":[]}'
+                    ;;
+                *'"method":"resources/list"'*)
+                    respond '{"resources":[]}'
+                    ;;
+                *'"method":"resources/templates/list"'*)
+                    respond '{"resourceTemplates":[]}'
+                    ;;
+                *'"method":"prompts/list"'*)
+                    respond '{"prompts":[]}'
+                    ;;
+                *) exit 1 ;;
+            esac
+            ;;
+        *) exit 1 ;;
+    esac
+done
+"#;
+
+const LEGACY_PLANTED_INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"}},"id":1}"#;
+const LEGACY_PLANTED_REPEATED_INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"}},"id":2}"#;
+const LEGACY_PLANTED_TOOLS_LIST_REQUEST: &str =
+    r#"{"jsonrpc":"2.0","method":"tools/list","params":{},"id":2}"#;
+
+const UNAUTHORIZED_DISCOVERY_REJECTION_INSPECT_FIXTURE: &str = r#"
+emit_wire() {
+    printf 'FASTMCP_E2E_WIRE %s\n' "$1" >&2
+}
+
+is_exact_modern_discovery() {
+    case "$1" in
+        *'"method":"server/discover"'*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) ;;
+        *) return 1 ;;
+    esac
+}
+
+while IFS= read -r request; do
+    emit_wire "$request"
+    is_exact_modern_discovery "$request" || exit 1
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"final discovery rejected"}}'
+    exit 0
+done
+"#;
 
 fn fastmcp_bin() -> String {
     env!("CARGO_BIN_EXE_fastmcp").to_string()
@@ -30,6 +187,204 @@ fn stdout_str(output: &Output) -> String {
     std::str::from_utf8(&output.stdout)
         .expect("fastmcp test stdout must be valid UTF-8")
         .to_owned()
+}
+
+fn stderr_str(output: &Output) -> String {
+    std::str::from_utf8(&output.stderr)
+        .expect("fastmcp test stderr must be valid UTF-8")
+        .to_owned()
+}
+
+fn observed_protocol_wire(output: &Output) -> Vec<serde_json::Value> {
+    stderr_str(output)
+        .lines()
+        .filter_map(|line| line.strip_prefix(INSPECT_PROTOCOL_WIRE_PREFIX))
+        .map(|request| {
+            serde_json::from_str(request)
+                .unwrap_or_else(|error| panic!("fixture must record valid JSON-RPC wire: {error}"))
+        })
+        .collect()
+}
+
+fn request_method(request: &serde_json::Value) -> &str {
+    request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .expect("recorded wire message must have a method")
+}
+
+fn assert_no_final_metadata(request: &serde_json::Value) {
+    let encoded = serde_json::to_string(request).expect("recorded wire must serialize");
+    for final_metadata_key in [
+        "io.modelcontextprotocol/protocolVersion",
+        "io.modelcontextprotocol/clientCapabilities",
+        "io.modelcontextprotocol/clientInfo",
+        "io.modelcontextprotocol/serverInfo",
+        "io.modelcontextprotocol/subscriptionId",
+    ] {
+        assert!(
+            !encoded.contains(final_metadata_key),
+            "legacy wire must not carry {final_metadata_key}"
+        );
+    }
+}
+
+fn assert_exact_modern_discovery_request(request: &serde_json::Value) {
+    assert_eq!(request["jsonrpc"], "2.0");
+    assert_eq!(request_method(request), "server/discover");
+    let metadata = request["params"]["_meta"]
+        .as_object()
+        .expect("modern discovery must carry request metadata");
+    assert_eq!(
+        metadata["io.modelcontextprotocol/protocolVersion"],
+        "2026-07-28"
+    );
+    assert!(
+        metadata
+            .get("io.modelcontextprotocol/clientCapabilities")
+            .is_some(),
+        "modern discovery must carry final client capabilities"
+    );
+    assert!(
+        metadata
+            .get("io.modelcontextprotocol/clientInfo")
+            .is_some(),
+        "modern discovery must carry final client info"
+    );
+}
+
+fn assert_exact_legacy_initialize_request(request: &serde_json::Value) {
+    assert_eq!(request["jsonrpc"], "2.0");
+    assert_eq!(request_method(request), "initialize");
+    let params = request["params"]
+        .as_object()
+        .expect("legacy initialize must carry params");
+    assert_eq!(
+        params.len(),
+        3,
+        "legacy initialize must contain exactly its three legacy fields"
+    );
+    assert_eq!(
+        params
+            .get("protocolVersion")
+            .and_then(serde_json::Value::as_str),
+        Some("2024-11-05"),
+        "legacy initialize must carry the exact protocol version string"
+    );
+    assert!(
+        params
+            .get("capabilities")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|capabilities| capabilities.is_empty()),
+        "legacy initialize must carry exactly the empty legacy capabilities object"
+    );
+    let client_info = params
+        .get("clientInfo")
+        .and_then(serde_json::Value::as_object)
+        .expect("legacy initialize clientInfo must be an object");
+    assert_eq!(
+        client_info.len(),
+        2,
+        "legacy clientInfo must contain only name and version"
+    );
+    assert!(
+        client_info
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "legacy clientInfo.name must be a string"
+    );
+    assert!(
+        client_info
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "legacy clientInfo.version must be a string"
+    );
+    assert!(
+        !params.contains_key("_meta"),
+        "legacy initialize must not carry final metadata"
+    );
+    assert_no_final_metadata(request);
+}
+
+fn assert_exact_legacy_initialized_notification_request(request: &serde_json::Value) {
+    assert_eq!(request["jsonrpc"], "2.0");
+    assert_eq!(request_method(request), "notifications/initialized");
+    assert!(
+        request.get("id").is_none(),
+        "legacy initialized notification must not have an ID"
+    );
+    assert!(
+        request.get("params").is_none(),
+        "legacy initialized notification must not have params"
+    );
+    assert_no_final_metadata(request);
+}
+
+fn assert_exact_legacy_operating_request(request: &serde_json::Value) {
+    assert_eq!(request["jsonrpc"], "2.0");
+    assert!(
+        matches!(
+            request_method(request),
+            "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+        ),
+        "legacy inspect must issue only operating list requests after initialization"
+    );
+    assert_no_final_metadata(request);
+}
+
+fn assert_no_legacy_initialize(wire: &[serde_json::Value]) {
+    assert!(
+        wire.iter()
+            .all(|request| request_method(request) != "initialize"),
+        "a failed modern negotiation must not send a legacy initialize request"
+    );
+}
+
+fn assert_modern_negotiation_wire(wire: &[serde_json::Value]) {
+    assert_eq!(
+        wire.len(),
+        1,
+        "modern inspect must send exactly one discovery request"
+    );
+    assert_exact_modern_discovery_request(&wire[0]);
+}
+
+fn assert_legacy_lifecycle_wire(wire: &[serde_json::Value]) {
+    assert_eq!(
+        wire.iter().map(request_method).collect::<Vec<_>>(),
+        vec![
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ],
+        "legacy inspect must run initialize, notification, then its operating requests exactly once"
+    );
+    assert_exact_legacy_initialize_request(&wire[0]);
+    assert_exact_legacy_initialized_notification_request(&wire[1]);
+    for request in &wire[2..] {
+        assert_exact_legacy_operating_request(request);
+    }
+}
+
+fn assert_legacy_negotiation_wire(wire: &[serde_json::Value]) {
+    assert_legacy_lifecycle_wire(wire);
+}
+
+fn assert_auto_legacy_fallback_wire(wire: &[serde_json::Value]) {
+    assert_eq!(
+        request_method(
+            wire.first()
+                .expect("Auto fallback must record a modern discovery request"),
+        ),
+        "server/discover"
+    );
+    assert_exact_modern_discovery_request(&wire[0]);
+    assert_legacy_lifecycle_wire(&wire[1..]);
 }
 
 #[derive(Debug)]
@@ -552,6 +907,33 @@ fn run_cli(args: &[&str]) -> Output {
     })
 }
 
+fn inspect_protocol_fixture(policy: &str, format: &str, fixture: &str) -> Output {
+    run_cli(&[
+        "inspect",
+        "--protocol-policy",
+        policy,
+        "--format",
+        format,
+        "/bin/sh",
+        "--",
+        "-c",
+        fixture,
+    ])
+}
+
+fn run_legacy_fixture_with_requests(requests: &[&str]) -> Output {
+    let input = format!("{}\n", requests.join("\n"));
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("printf '%s' \"$1\" | /bin/sh -c \"$2\"")
+        .arg("legacy-lifecycle-fixture")
+        .arg(&input)
+        .arg(LEGACY_FALLBACK_INSPECT_FIXTURE);
+    run_with_deadline(command, Duration::from_secs(10))
+        .expect("legacy lifecycle fixture must exit after its input closes")
+}
+
 #[cfg(unix)]
 #[test]
 fn e2e_test_json_report_against_static_protocol_fixture() {
@@ -610,6 +992,200 @@ fn e2e_test_json_report_against_static_protocol_fixture() {
         );
     }
     assert!(json.get("total_duration_ms").is_some());
+}
+
+#[test]
+fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
+    for (case_name, policy, fixture, expected_version, expected_era, assert_wire) in [
+        (
+            "modern-only",
+            "modern-only",
+            MODERN_INSPECT_FIXTURE,
+            "2026-07-28",
+            "modern-2026",
+            assert_modern_negotiation_wire as fn(&[serde_json::Value]),
+        ),
+        (
+            "auto-modern",
+            "auto",
+            MODERN_INSPECT_FIXTURE,
+            "2026-07-28",
+            "modern-2026",
+            assert_modern_negotiation_wire,
+        ),
+        (
+            "legacy-only",
+            "legacy-only",
+            LEGACY_FALLBACK_INSPECT_FIXTURE,
+            "2024-11-05",
+            "legacy-2024",
+            assert_legacy_negotiation_wire,
+        ),
+        (
+            "auto-legacy-fallback",
+            "auto",
+            LEGACY_FALLBACK_INSPECT_FIXTURE,
+            "2024-11-05",
+            "legacy-2024",
+            assert_auto_legacy_fallback_wire,
+        ),
+    ] {
+        let text_output = inspect_protocol_fixture(policy, "text", fixture);
+        assert!(
+            text_output.status.success(),
+            "{policy} inspect text should succeed, stderr: {}",
+            stderr_str(&text_output)
+        );
+        let expected_text = format!(
+            "Protocol: policy={policy} version={expected_version} era={expected_era}"
+        );
+        let text = stdout_str(&text_output);
+        assert_eq!(
+            text
+                .lines()
+                .find(|line| line.starts_with("Protocol: ")),
+            Some(expected_text.as_str()),
+            "{case_name} text inspect must emit the selected protocol triad exactly"
+        );
+        assert_wire(&observed_protocol_wire(&text_output));
+
+        let json_output = inspect_protocol_fixture(policy, "json", fixture);
+        assert!(
+            json_output.status.success(),
+            "{policy} inspect JSON should succeed, stderr: {}",
+            stderr_str(&json_output)
+        );
+        let json: serde_json::Value = serde_json::from_str(&stdout_str(&json_output))
+            .expect("inspect output should be JSON");
+        assert_eq!(json["protocol"]["policy"], policy);
+        assert_eq!(json["protocol"]["version"], expected_version);
+        assert_eq!(json["protocol"]["era"], expected_era);
+        assert_wire(&observed_protocol_wire(&json_output));
+    }
+}
+
+#[test]
+fn e2e_legacy_lifecycle_fixture_planted_negative_rejects_list_before_initialized() {
+    let output = run_legacy_fixture_with_requests(&[
+        LEGACY_PLANTED_INITIALIZE_REQUEST,
+        LEGACY_PLANTED_TOOLS_LIST_REQUEST,
+    ]);
+    assert!(
+        !output.status.success(),
+        "legacy fixture must reject an operating list request before notifications/initialized"
+    );
+    let wire = observed_protocol_wire(&output);
+    assert_eq!(
+        wire.iter().map(request_method).collect::<Vec<_>>(),
+        vec!["initialize", "tools/list"],
+        "planted pre-initialization list must be the rejected observed wire"
+    );
+    assert_exact_legacy_initialize_request(&wire[0]);
+    assert_exact_legacy_operating_request(&wire[1]);
+}
+
+#[test]
+fn e2e_legacy_lifecycle_fixture_planted_negative_rejects_repeated_initialize() {
+    let output = run_legacy_fixture_with_requests(&[
+        LEGACY_PLANTED_INITIALIZE_REQUEST,
+        LEGACY_PLANTED_REPEATED_INITIALIZE_REQUEST,
+    ]);
+    assert!(
+        !output.status.success(),
+        "legacy fixture must reject a repeated initialize before notifications/initialized"
+    );
+    let wire = observed_protocol_wire(&output);
+    assert_eq!(
+        wire.iter().map(request_method).collect::<Vec<_>>(),
+        vec!["initialize", "initialize"],
+        "planted repeated initialization must be the rejected observed wire"
+    );
+    assert_exact_legacy_initialize_request(&wire[0]);
+    assert_exact_legacy_initialize_request(&wire[1]);
+}
+
+#[test]
+fn e2e_legacy_initialize_fixture_planted_negatives_reject_malformed_shapes() {
+    for (case_name, malformed_initialize) in [
+        (
+            "null protocolVersion",
+            r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":null,"capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"}},"id":1}"#,
+        ),
+        (
+            "wrong protocolVersion",
+            r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"}},"id":1}"#,
+        ),
+        (
+            "non-object capabilities",
+            r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":[],"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"}},"id":1}"#,
+        ),
+        (
+            "null clientInfo name",
+            r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":null,"version":"1.0.0"}},"id":1}"#,
+        ),
+        (
+            "numeric clientInfo version",
+            r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":1}},"id":1}"#,
+        ),
+        (
+            "extra clientInfo field",
+            r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0","extra":true}},"id":1}"#,
+        ),
+        (
+            "extra legacy parameter",
+            r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"},"extra":true},"id":1}"#,
+        ),
+        (
+            "final-only metadata",
+            r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}},"id":1}"#,
+        ),
+    ] {
+        let output = run_legacy_fixture_with_requests(&[malformed_initialize]);
+        assert!(
+            !output.status.success(),
+            "legacy fixture must reject {case_name}"
+        );
+        let wire = observed_protocol_wire(&output);
+        assert_eq!(
+            wire.len(),
+            1,
+            "rejected {case_name} must be the only observed wire request"
+        );
+        let expected: serde_json::Value =
+            serde_json::from_str(malformed_initialize).expect("planted initialize must be JSON");
+        assert_eq!(
+            wire[0], expected,
+            "fixture must reject the actual malformed {case_name} request"
+        );
+    }
+}
+
+#[test]
+fn e2e_cli_inspect_modern_only_planted_negative_never_falls_back_to_legacy() {
+    let output = inspect_protocol_fixture("modern-only", "text", LEGACY_FALLBACK_INSPECT_FIXTURE);
+    assert!(
+        !output.status.success(),
+        "ModernOnly must reject a legacy-only peer instead of silently falling back"
+    );
+    let wire = observed_protocol_wire(&output);
+    assert_modern_negotiation_wire(&wire);
+    assert_no_legacy_initialize(&wire);
+}
+
+#[test]
+fn e2e_cli_inspect_auto_planted_negative_rejects_unauthorized_discovery_failure() {
+    let output = inspect_protocol_fixture(
+        "auto",
+        "json",
+        UNAUTHORIZED_DISCOVERY_REJECTION_INSPECT_FIXTURE,
+    );
+    assert!(
+        !output.status.success(),
+        "Auto must not fall back on a discovery error outside the authorized legacy class"
+    );
+    let wire = observed_protocol_wire(&output);
+    assert_modern_negotiation_wire(&wire);
+    assert_no_legacy_initialize(&wire);
 }
 
 #[cfg(target_os = "linux")]

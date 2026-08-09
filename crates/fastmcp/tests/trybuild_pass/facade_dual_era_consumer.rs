@@ -198,6 +198,149 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
     let _: Option<modern::ServerHttpEndpoint> = None;
 }
 
+fn assert_modern_companion_facade_exports() {
+    let _: modern::FinalArguments<String> = modern::FinalArguments::Absent;
+    let _: modern::FinalArguments<String> = modern::FinalArguments::ExplicitNull;
+    let _: modern::FinalArguments<String> = modern::FinalArguments::Value("modern".to_owned());
+
+    let _: fn(&[u8], usize) -> Result<modern::JsonRpcMessage, modern::JsonRpcAdmissionError> =
+        modern::decode_strict_jsonrpc_message;
+    let _: fn(usize) -> modern::McpResult<modern::InMemoryFinalTaskStore> =
+        modern::InMemoryFinalTaskStore::new;
+    let _: usize = modern::DEFAULT_IN_MEMORY_FINAL_TASKS;
+
+    let _: Option<modern::FinalCacheStats> = None;
+    let _: Option<modern::FinalTaskAcceptedInput> = None;
+    let _: Option<modern::FinalTaskInitialWork> = None;
+    let _: Option<std::sync::Arc<dyn modern::FinalTaskRetentionAuthority>> = None;
+    let _: Option<modern::FinalTaskSnapshot> = None;
+    let _: Option<modern::FinalTaskSupervisorFuture<'static>> = None;
+    let _: Option<modern::FinalTaskSupervisorHandoff> = None;
+    let _: Option<modern::FinalTaskWorkDescriptor> = None;
+    let _: Option<std::sync::Arc<dyn modern::ApplicationTaskSupervisor>> = None;
+    let _: Option<modern::AuthorizedTaskServiceRunner> = None;
+    let _: Option<modern::PendingRequests> = None;
+    let _: Option<modern::RequestSender> = None;
+    let _: Option<modern::TransportElicitationSender> = None;
+    let _: Option<modern::TransportRootsProvider> = None;
+    let _: Option<modern::TransportSamplingSender> = None;
+
+    let _: Option<modern::ClientCapabilityInfo> = None;
+    let _: Option<modern::ElicitationAction> = None;
+    let _: Option<modern::ElicitationMode> = None;
+    let _: Option<modern::ElicitationRequest> = None;
+    let _: Option<modern::ElicitationResponse> = None;
+    let _: Option<std::sync::Arc<dyn modern::ElicitationSender>> = None;
+    let _: u32 = modern::MAX_RESOURCE_READ_DEPTH;
+    let _: u32 = modern::MAX_TOOL_CALL_DEPTH;
+    let _: Option<modern::McpContextLeaseGuard> = None;
+    let _: Option<modern::McpRequestCancellation> = None;
+    let _: Option<modern::NoOpElicitationSender> = None;
+    let _: Option<modern::NoOpNotificationSender> = None;
+    let _: Option<modern::NoOpSamplingSender> = None;
+    let _: Option<std::sync::Arc<dyn modern::NotificationSender>> = None;
+    let _: Option<modern::ProgressReporter> = None;
+    let _: Option<modern::ResourceContentItem> = None;
+    let _: Option<modern::ResourceReadResult> = None;
+    let _: Option<std::sync::Arc<dyn modern::ResourceReader>> = None;
+    let _: Option<modern::SamplingRequest> = None;
+    let _: Option<modern::SamplingRequestMessage> = None;
+    let _: Option<modern::SamplingResponse> = None;
+    let _: Option<modern::SamplingRole> = None;
+    let _: Option<std::sync::Arc<dyn modern::SamplingSender>> = None;
+    let _: Option<modern::SamplingStopReason> = None;
+    let _: Option<modern::ServerCapabilityInfo> = None;
+    let _: Option<modern::ToolCallResult> = None;
+    let _: Option<std::sync::Arc<dyn modern::ToolCaller>> = None;
+    let _: Option<modern::ToolContentItem> = None;
+
+    let _: Option<fastmcp_rust::FinalCacheStats> = None;
+    let _: fastmcp_rust::FinalArguments<String> = fastmcp_rust::FinalArguments::Absent;
+    let _: fastmcp_rust::FinalArguments<String> = fastmcp_rust::FinalArguments::ExplicitNull;
+    let _: fastmcp_rust::FinalArguments<String> =
+        fastmcp_rust::FinalArguments::Value("root".to_owned());
+    let _: Option<fastmcp_rust::FinalTaskAcceptedInput> = None;
+    let _: Option<fastmcp_rust::FinalTaskInitialWork> = None;
+    let _: Option<std::sync::Arc<dyn fastmcp_rust::FinalTaskRetentionAuthority>> = None;
+    let _: Option<fastmcp_rust::FinalTaskSnapshot> = None;
+    let _: Option<fastmcp_rust::FinalTaskSupervisorFuture<'static>> = None;
+    let _: Option<fastmcp_rust::FinalTaskSupervisorHandoff> = None;
+    let _: Option<fastmcp_rust::FinalTaskWorkDescriptor> = None;
+    let _: Option<std::sync::Arc<dyn fastmcp_rust::ApplicationTaskSupervisor>> = None;
+    let _: Option<fastmcp_rust::AuthorizedTaskServiceRunner> = None;
+    let _: Option<fastmcp_rust::InMemoryFinalTaskStore> = None;
+    let _: Option<fastmcp_rust::PendingRequests> = None;
+    let _: Option<fastmcp_rust::RequestSender> = None;
+    let _: Option<fastmcp_rust::TransportElicitationSender> = None;
+    let _: Option<fastmcp_rust::TransportRootsProvider> = None;
+    let _: Option<fastmcp_rust::TransportSamplingSender> = None;
+    let _: Option<std::sync::Arc<dyn fastmcp_rust::ContextNotificationSender>> = None;
+    let _: fn(
+        &[u8],
+        usize,
+    ) -> Result<fastmcp_rust::JsonRpcMessage, fastmcp_rust::JsonRpcAdmissionError> =
+        fastmcp_rust::decode_strict_jsonrpc_message;
+}
+
+mod prelude_companion_facade_reachability {
+    use fastmcp_rust::prelude::*;
+
+    pub(super) fn assert_reachable() {
+        let _: FinalArguments<String> = FinalArguments::Absent;
+        let _: FinalArguments<String> = FinalArguments::ExplicitNull;
+        let _: FinalArguments<String> = FinalArguments::Value("prelude".to_owned());
+
+        let _: fn(&[u8], usize) -> Result<JsonRpcMessage, JsonRpcAdmissionError> =
+            decode_strict_jsonrpc_message;
+        let _: fn(usize) -> McpResult<InMemoryFinalTaskStore> = InMemoryFinalTaskStore::new;
+        let _: usize = DEFAULT_IN_MEMORY_FINAL_TASKS;
+
+        let _: Option<FinalCacheStats> = None;
+        let _: Option<FinalTaskAcceptedInput> = None;
+        let _: Option<FinalTaskInitialWork> = None;
+        let _: Option<std::sync::Arc<dyn FinalTaskRetentionAuthority>> = None;
+        let _: Option<FinalTaskSnapshot> = None;
+        let _: Option<FinalTaskSupervisorFuture<'static>> = None;
+        let _: Option<FinalTaskSupervisorHandoff> = None;
+        let _: Option<FinalTaskWorkDescriptor> = None;
+        let _: Option<std::sync::Arc<dyn ApplicationTaskSupervisor>> = None;
+        let _: Option<AuthorizedTaskServiceRunner> = None;
+        let _: Option<PendingRequests> = None;
+        let _: Option<RequestSender> = None;
+        let _: Option<TransportElicitationSender> = None;
+        let _: Option<TransportRootsProvider> = None;
+        let _: Option<TransportSamplingSender> = None;
+        let _: Option<ClientCapabilityInfo> = None;
+        let _: Option<ElicitationAction> = None;
+        let _: Option<ElicitationMode> = None;
+        let _: Option<ElicitationRequest> = None;
+        let _: Option<ElicitationResponse> = None;
+        let _: Option<std::sync::Arc<dyn ElicitationSender>> = None;
+        let _: u32 = MAX_RESOURCE_READ_DEPTH;
+        let _: u32 = MAX_TOOL_CALL_DEPTH;
+        let _: Option<McpContextLeaseGuard> = None;
+        let _: Option<McpRequestCancellation> = None;
+        let _: Option<NoOpElicitationSender> = None;
+        let _: Option<NoOpNotificationSender> = None;
+        let _: Option<NoOpSamplingSender> = None;
+        let _: Option<std::sync::Arc<dyn ContextNotificationSender>> = None;
+        let _: Option<ProgressReporter> = None;
+        let _: Option<ResourceContentItem> = None;
+        let _: Option<ResourceReadResult> = None;
+        let _: Option<std::sync::Arc<dyn ResourceReader>> = None;
+        let _: Option<SamplingRequest> = None;
+        let _: Option<SamplingRequestMessage> = None;
+        let _: Option<SamplingResponse> = None;
+        let _: Option<SamplingRole> = None;
+        let _: Option<std::sync::Arc<dyn SamplingSender>> = None;
+        let _: Option<SamplingStopReason> = None;
+        let _: Option<ServerCapabilityInfo> = None;
+        let _: Option<ToolCallResult> = None;
+        let _: Option<std::sync::Arc<dyn ToolCaller>> = None;
+        let _: Option<ToolContentItem> = None;
+    }
+}
+
 mod prelude_final_typed_and_http_reachability {
     use std::collections::HashMap;
 
@@ -504,6 +647,8 @@ fn main() {
     let _ = assert_client_http_and_subscription_exports;
     prelude_client_http_and_subscription_reachability::assert_reachable();
     assert_final_typed_client_and_dual_era_http_surface();
+    assert_modern_companion_facade_exports();
+    prelude_companion_facade_reachability::assert_reachable();
     prelude_final_typed_and_http_reachability::assert_reachable();
     assert_dual_era_completion_exports();
     assert_root_directional_notification_exports();
