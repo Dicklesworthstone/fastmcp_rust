@@ -5209,7 +5209,7 @@ mod tests {
         });
 
         let cx = Cx::for_request();
-        let connection = runtime_block_on(
+        let mut connection = runtime_block_on(
             ClientBuilder::new()
                 .mcp_apps(
                     McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
@@ -5756,9 +5756,9 @@ mod tests {
         let modern_target = format!("http://{address}/mcp");
         let server = thread::spawn(move || {
             let (mut probe, _) = listener.accept().expect("accept modern discovery probe");
-            let probe = read_request(&mut probe);
+            let probe_request = read_request(&mut probe);
             assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&probe.body)
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
                     .expect("modern discovery probe is JSON-RPC")["method"],
                 "server/discover"
             );
@@ -6665,25 +6665,26 @@ mod tests {
         let wake_counter = Arc::new(CountingWake::default());
         let waker = Waker::from(Arc::clone(&wake_counter));
         let mut task_context = Context::from_waker(&waker);
-        let mut next_event = std::pin::pin!(stream.next_event(&cx));
-        assert!(matches!(
-            next_event.as_mut().poll(&mut task_context),
-            Poll::Pending
-        ));
+        {
+            let mut next_event = std::pin::pin!(stream.next_event(&cx));
+            assert!(matches!(
+                next_event.as_mut().poll(&mut task_context),
+                Poll::Pending
+            ));
 
-        cx.cancel_with(
-            CancelKind::User,
-            Some("cancel the owned modern SSE response"),
-        );
-        assert!(
-            wake_counter.0.load(Ordering::SeqCst) > 0,
-            "Cx cancellation must wake the already-pending quiet response body"
-        );
-        assert!(matches!(
-            next_event.as_mut().poll(&mut task_context),
-            Poll::Ready(Err(ModernHttpExecutorError::Cancelled))
-        ));
-        drop(next_event);
+            cx.cancel_with(
+                CancelKind::User,
+                Some("cancel the owned modern SSE response"),
+            );
+            assert!(
+                wake_counter.0.load(Ordering::SeqCst) > 0,
+                "Cx cancellation must wake the already-pending quiet response body"
+            );
+            assert!(matches!(
+                next_event.as_mut().poll(&mut task_context),
+                Poll::Ready(Err(ModernHttpExecutorError::Cancelled))
+            ));
+        }
         assert!(stream.response.is_none());
         assert!(stream.parser.is_none());
         assert!(stream.pending_events.is_empty());
@@ -6746,25 +6747,26 @@ mod tests {
         let wake_counter = Arc::new(CountingWake::default());
         let waker = Waker::from(Arc::clone(&wake_counter));
         let mut task_context = Context::from_waker(&waker);
-        let mut next_message = std::pin::pin!(client.next_message(&cx));
-        assert!(matches!(
-            next_message.as_mut().poll(&mut task_context),
-            Poll::Pending
-        ));
+        {
+            let mut next_message = std::pin::pin!(client.next_message(&cx));
+            assert!(matches!(
+                next_message.as_mut().poll(&mut task_context),
+                Poll::Pending
+            ));
 
-        cx.cancel_with(
-            CancelKind::User,
-            Some("cancel the owned exact legacy SSE response"),
-        );
-        assert!(
-            wake_counter.0.load(Ordering::SeqCst) > 0,
-            "Cx cancellation must wake the already-pending quiet legacy response body"
-        );
-        assert!(matches!(
-            next_message.as_mut().poll(&mut task_context),
-            Poll::Ready(Err(LegacySseHttpClientError::Cancelled))
-        ));
-        drop(next_message);
+            cx.cancel_with(
+                CancelKind::User,
+                Some("cancel the owned exact legacy SSE response"),
+            );
+            assert!(
+                wake_counter.0.load(Ordering::SeqCst) > 0,
+                "Cx cancellation must wake the already-pending quiet legacy response body"
+            );
+            assert!(matches!(
+                next_message.as_mut().poll(&mut task_context),
+                Poll::Ready(Err(LegacySseHttpClientError::Cancelled))
+            ));
+        }
         assert!(client.stream.response.is_none());
         assert!(client.stream.pending_events.is_empty());
 

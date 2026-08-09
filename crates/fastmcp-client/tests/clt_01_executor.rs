@@ -346,13 +346,11 @@ fn canonical_terminal_id_tombstone_prevents_reuse_and_late_duplicate_aba() {
             RequestId::Integer("301e0".to_owned()),
         )
     };
-    assert_eq!(
-        executor
-            .execute(&cx, same_canonical_request())
-            .expect_err("unconsumed terminal outcome retains its canonical ID")
-            .code,
-        McpErrorCode::InvalidRequest,
-    );
+    let unconsumed_error = match executor.execute(&cx, same_canonical_request()) {
+        Err(error) => error,
+        Ok(_) => panic!("unconsumed terminal outcome retains its canonical ID"),
+    };
+    assert_eq!(unconsumed_error.code, McpErrorCode::InvalidRequest);
     assert_eq!(
         executor
             .wait(&cx, &mut completed)
@@ -360,13 +358,11 @@ fn canonical_terminal_id_tombstone_prevents_reuse_and_late_duplicate_aba() {
             .id,
         Some(RequestId::Integer("301e0".to_owned())),
     );
-    assert_eq!(
-        executor
-            .execute(&cx, same_canonical_request())
-            .expect_err("consumption cannot reopen the canonical ID before expiry")
-            .code,
-        McpErrorCode::InvalidRequest,
-    );
+    let consumed_error = match executor.execute(&cx, same_canonical_request()) {
+        Err(error) => error,
+        Ok(_) => panic!("consumption cannot reopen the canonical ID before expiry"),
+    };
+    assert_eq!(consumed_error.code, McpErrorCode::InvalidRequest);
 
     let mut adjacent = executor
         .execute(&cx, request(302))

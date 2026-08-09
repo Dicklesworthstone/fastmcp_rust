@@ -1145,7 +1145,7 @@ mod tests {
         let mut resolver = official_mcp_apps_negotiation_resolver();
         let receipt = registry
             .negotiate(
-                fastmcp_protocol::ProtocolEra::Modern2026,
+                fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026,
                 &local,
                 &client,
                 &server,
@@ -1240,7 +1240,8 @@ mod tests {
                     arguments: None,
                 }),
                 McpAppsViewRequest::ResourceRead(fastmcp_protocol::McpAppsResourceReadParams {
-                    uri: fastmcp_protocol::AbsoluteUri::parse("ui://view/resource").unwrap(),
+                    uri: fastmcp_protocol::common_types::AbsoluteUri::parse("ui://view/resource")
+                        .unwrap(),
                 }),
                 McpAppsViewRequest::ResourcesList(fastmcp_protocol::McpAppsListParams::default()),
                 McpAppsViewRequest::ResourceTemplatesList(

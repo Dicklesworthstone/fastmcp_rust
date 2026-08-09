@@ -9318,7 +9318,12 @@ mod tests {
 
         state.fail_connection(failure.clone());
 
-        assert_eq!(state.terminal_error(), Some(failure));
+        let terminal = state
+            .terminal_error()
+            .expect("terminal callback failure is retained");
+        assert_eq!(terminal.code, failure.code);
+        assert_eq!(terminal.message, failure.message);
+        assert_eq!(terminal.data, failure.data);
         assert!(
             cancellation.is_cancel_requested(),
             "a terminal write failure cancels every outstanding callback"
@@ -10409,8 +10414,7 @@ mod tests {
             .register(request_id.clone())
             .expect("register cancellation owner");
         client
-            .transport
-            .send(&client.cx, &JsonRpcMessage::Request(request))
+            .send_to_server(&JsonRpcMessage::Request(request))
             .expect("commit request before public cancellation");
 
         client
@@ -10478,15 +10482,11 @@ mod tests {
             .register(request_id.clone())
             .expect("register modern cancellation owner");
         client
-            .transport
-            .send(
-                &client.cx,
-                &JsonRpcMessage::Request(JsonRpcRequest::new(
-                    "test/cancel",
-                    Some(serde_json::json!({})),
-                    20,
-                )),
-            )
+            .send_to_server(&JsonRpcMessage::Request(JsonRpcRequest::new(
+                "test/cancel",
+                Some(serde_json::json!({})),
+                20,
+            )))
             .expect("commit request before modern cancellation");
         client
             .cancel_request(request_id, Some("stop".to_owned()))
@@ -10560,8 +10560,7 @@ mod tests {
             .register(request_id.clone())
             .expect("register oversized-cancellation owner");
         client
-            .transport
-            .send(&client.cx, &JsonRpcMessage::Request(request))
+            .send_to_server(&JsonRpcMessage::Request(request))
             .expect("commit request before oversized cancellation");
 
         let error = client
@@ -11366,8 +11365,7 @@ mod tests {
             .register(request_id.clone())
             .expect("register committed request");
         client
-            .transport
-            .send(&client.cx, &JsonRpcMessage::Request(request))
+            .send_to_server(&JsonRpcMessage::Request(request))
             .expect("commit request before expiring its stored context");
         let deadlines = RequestDeadlines::start_at(client.timeout_policy, Instant::now()).unwrap();
         client.cx = Cx::for_testing_with_budget(
@@ -11399,8 +11397,7 @@ mod tests {
             .register(request_id)
             .expect("register committed request");
         client
-            .transport
-            .send(&client.cx, &JsonRpcMessage::Request(request))
+            .send_to_server(&JsonRpcMessage::Request(request))
             .expect("commit request before cancelling its stored context");
         let deadlines = RequestDeadlines::start_at(client.timeout_policy, Instant::now()).unwrap();
         client.cx.set_cancel_requested(true);
@@ -11440,8 +11437,7 @@ mod tests {
             .register(request_id)
             .expect("register committed progress request");
         client
-            .transport
-            .send(&client.cx, &JsonRpcMessage::Request(request))
+            .send_to_server(&JsonRpcMessage::Request(request))
             .expect("commit progress request before cancelling its stored context");
         let timeout_policy = client.timeout_policy;
         let deadlines = RequestDeadlines::start_at(timeout_policy, Instant::now()).unwrap();
@@ -11553,10 +11549,12 @@ mod tests {
             .try_response()
             .expect_err("the expired owner receives its timeout");
         assert_eq!(waiter_error.message, timeout.message);
-        let evidence = client
-            .transport
-            .recv_until(&client.cx, Some(Instant::now() + Duration::from_secs(2)))
-            .expect("the peer observes both bounded control frames");
+        let (evidence, _) = recv_child_transport(
+            &mut client.transport,
+            &client.cx,
+            Some(Instant::now() + Duration::from_secs(2)),
+        )
+        .expect("the peer observes both bounded control frames");
         let JsonRpcMessage::Response(evidence) = evidence else {
             panic!("expected scripted evidence response");
         };
@@ -16829,8 +16827,8 @@ mod tests {
         assert_eq!(result.completion.values, vec!["staging".to_owned()]);
         assert_eq!(
             result.completion.total,
-            Some(JsonInteger::from(1_i64)),
-            "legacy completion total remains an explicit JSON integer"
+            Some(1),
+            "legacy completion total remains a legacy machine integer"
         );
         assert_eq!(result.completion.has_more, Some(false));
         client.close().expect("legacy client cleanup");
