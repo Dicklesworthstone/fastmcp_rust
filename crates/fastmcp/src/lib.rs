@@ -170,6 +170,14 @@ pub use fastmcp_protocol::{
     ToolAnnotations, ToolsCapability, UnsubscribeResourceParams, decode_strict_jsonrpc_message,
 };
 
+pub use fastmcp_protocol::{
+    MAX_URI_TEMPLATE_BYTES, MAX_URI_TEMPLATE_COMPOSITE_ITEMS,
+    MAX_URI_TEMPLATE_EXPANSION_OUTPUT_BYTES, MAX_URI_TEMPLATE_EXPRESSIONS, MAX_URI_TEMPLATE_PARTS,
+    MAX_URI_TEMPLATE_PREFIX_LENGTH, MAX_URI_TEMPLATE_VALUE_BYTES,
+    MAX_URI_TEMPLATE_VARIABLE_NAME_BYTES, MAX_URI_TEMPLATE_VARIABLES_PER_EXPRESSION, TemplateValue,
+    TemplateValues, UriTemplate, UriTemplateError, UriTemplateExpansionLimits,
+    UriTemplateExpression, UriTemplateModifier, UriTemplateOperator, UriTemplatePart,
+};
 pub use fastmcp_protocol::{common_types, extensions, methods, protocol_policy};
 // Final common wire vocabulary. `FinalAbsoluteUri` avoids colliding with the
 // established core URI type; `modern::AbsoluteUri` retains the exact name.
@@ -189,12 +197,12 @@ pub use fastmcp_protocol::common_types::{
 // Final typed core dispatch, result vocabulary, and bounded exact-JSON helpers.
 pub use fastmcp_protocol::methods::Final2026Peer;
 pub use fastmcp_protocol::{
-    CacheScope, CacheTtl, CacheableResult, ClientNotification, CompleteResult,
-    CompleteResultPayload, CoreDispatchError, CoreRequest, CoreResult,
-    CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonMember, ExactJsonObject, ExactJsonValue,
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
-    FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY, FinalArguments,
-    FinalCallToolParams, FinalCallToolResult, FinalCancelledNotificationParams,
+    CacheScope, CacheTtl, CacheableResult, CancellationSender, CancellationWireCodecError,
+    CancellationWireMessage, ClientNotification, CompleteResult, CompleteResultPayload,
+    CoreDispatchError, CoreRequest, CoreResult, CoreResultDiscriminatorPolicy, DecodedResult,
+    ExactJsonMember, ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY,
+    FinalArguments, FinalCallToolParams, FinalCallToolResult, FinalCancelledNotificationParams,
     FinalCompletionArgument, FinalCompletionContext, FinalCompletionParams,
     FinalCompletionReference, FinalCompletionResult, FinalCoreRequest, FinalCoreResult,
     FinalCreateMessageInputRequiredResult, FinalCreateMessageParams, FinalCreateMessageResult,
@@ -354,8 +362,8 @@ pub use fastmcp_server::{
     PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog,
     ProxyClient, RequestSender, ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint,
     ServerHttpEndpointResponse, ServerHttpSession, ServerStats, Session, StaticTokenVerifier,
-    StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolHandler, TrafficVerbosity,
-    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler,
+    TrafficVerbosity, TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
     create_context_with_progress, create_context_with_progress_and_senders,
 };
 pub use fastmcp_server::{
@@ -452,7 +460,8 @@ pub mod auto {
     pub use fastmcp_protocol::{
         AdmittedSchema, ClientCapabilities, ClientInfo, FinalCallToolResult, FinalCancelTaskResult,
         FinalCoreResultType, FinalGetPromptResult, FinalGetTaskResult, FinalReadResourceResult,
-        FinalTaskId, RequestId, SchemaAdmissionError, ValidationError, ValidationResult,
+        FinalTaskId, RequestId, SchemaAdmissionError, TemplateValue, TemplateValues, UriTemplate,
+        UriTemplateError, UriTemplateExpansionLimits, ValidationError, ValidationResult,
         admit_final_schema, validate_final_core_result,
     };
     pub use fastmcp_protocol::{schema, tasks_extension};
@@ -566,7 +575,8 @@ pub mod modern {
     pub use fastmcp_protocol::schema::FINAL_JSON_SCHEMA_DIALECT;
     pub use fastmcp_protocol::tasks_extension::TASK_UPDATE;
     pub use fastmcp_protocol::{
-        AdmittedSchema, CacheScope, CacheTtl, CacheableResult, ClientCapabilities, ClientInfo,
+        AdmittedSchema, CacheScope, CacheTtl, CacheableResult, CancellationSender,
+        CancellationWireCodecError, CancellationWireMessage, ClientCapabilities, ClientInfo,
         ClientNotification, CompleteResult, CompleteResultPayload, CompleteTaskResult,
         CompletionValues, CoreDispatchError, CoreRequest, CoreResult,
         CoreResultDiscriminatorPolicy, CreateTaskResult, DecodedResult, DiscoveryCacheHints,
@@ -614,9 +624,11 @@ pub mod modern {
         TaskDuration as FinalTaskDuration, TaskInputLedger as FinalTaskInputLedger,
         TaskInputRequests as FinalTaskInputRequests, TaskMethodRequest as FinalTaskMethodRequest,
         TaskRequestMeta as FinalTaskRequestMeta, TaskTimestamp as FinalTaskTimestamp,
-        TaskWireError, TypedCompleteMembers, UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE,
-        UnknownResultMembers, UnsupportedProtocolVersionError,
-        UpdateTaskParams as FinalUpdateTaskParams, ValidationError, ValidationResult,
+        TaskWireError, TemplateValue, TemplateValues, TypedCompleteMembers,
+        UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnknownResultMembers,
+        UnsupportedProtocolVersionError, UpdateTaskParams as FinalUpdateTaskParams, UriTemplate,
+        UriTemplateError, UriTemplateExpansionLimits, UriTemplateExpression, UriTemplateModifier,
+        UriTemplateOperator, UriTemplatePart, ValidationError, ValidationResult,
         admit_final_http_request, admit_final_request, admit_final_schema, decode_peer_result,
         decode_peer_result_for_era, decode_typed_complete, encode_complete_result, encode_result,
         exact_json_from_serde, exact_json_to_serde, parse_exact_json, set_task_subscription_ids,
@@ -653,8 +665,8 @@ pub mod modern {
         InboundRequestTransport, LifespanHooks, LoggingConfig, Middleware, MiddlewareDecision,
         MountResult, ProgressNotificationSender, PromptHandler, ResourceHandler, Router, Server,
         ServerBuilder, ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession,
-        ShutdownHook, StartupHook, TagFilters, ToolHandler, create_context_with_progress,
-        create_context_with_progress_and_senders,
+        ShutdownHook, StartupHook, TagFilters, ToolErrorKind, ToolHandler,
+        create_context_with_progress, create_context_with_progress_and_senders,
     };
     pub use fastmcp_transport as transport;
     pub use fastmcp_transport::http::{
@@ -708,9 +720,10 @@ pub mod legacy_2024 {
         ProtocolPolicy, ProtocolVersion,
     };
     pub use fastmcp_protocol::{
-        CallToolParams, CallToolResult, CancelledParams, ClientCapabilities, ClientInfo,
-        CompletionValues, GetPromptParams, GetPromptResult, InitializeParams, InitializeResult,
-        JsonRpcMessage, JsonRpcRequest, LegacyCompletionArgument, LegacyCompletionParams,
+        CallToolParams, CallToolResult, CancellationSender, CancellationWireCodecError,
+        CancellationWireMessage, CancelledParams, ClientCapabilities, ClientInfo, CompletionValues,
+        GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage,
+        JsonRpcRequest, LegacyCompletionArgument, LegacyCompletionParams,
         LegacyCompletionReference, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
         LegacyCoreResult, LegacyEmptyResult, LegacyMetadata, LegacyOpaqueMetadata,
         LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
@@ -765,6 +778,9 @@ pub mod prelude {
         BoundHttpServer,
         // Client
         BoundedListPage,
+        CancellationSender,
+        CancellationWireCodecError,
+        CancellationWireMessage,
         CanonicalHttpUrl,
         Client,
         ClientBuilder,
@@ -920,12 +936,17 @@ pub mod prelude {
         SubscriptionFilter,
         SubscriptionListenCollector,
         TASK_UPDATE,
+        TemplateValue,
+        TemplateValues,
         TokenAuthProvider,
         TokenVerifier,
         Tool,
         TransportRecvHalf,
         TransportSendHalf,
         TwoPhaseTransport,
+        UriTemplate,
+        UriTemplateError,
+        UriTemplateExpansionLimits,
         ValidationError,
         ValidationResult,
         admit_final_schema,
@@ -978,6 +999,32 @@ mod tests {
         assert_eq!(policy.idle_timeout(), Duration::from_secs(2));
         assert_eq!(policy.absolute_timeout(), Duration::from_secs(5));
         assert_ne!(RequestTimeoutSource::Idle, RequestTimeoutSource::Absolute);
+    }
+
+    #[test]
+    fn facade_reexports_rfc6570_and_era_selected_cancellation_types() {
+        use super::{
+            CancellationWireMessage, TemplateValue, TemplateValues, UriTemplate, auto, legacy_2024,
+            modern, prelude,
+        };
+
+        let template = UriTemplate::parse("https://example.test/{path}{?query}")
+            .expect("facade URI template parses");
+        let mut values = TemplateValues::new();
+        values.insert("path".to_owned(), TemplateValue::scalar("reports/2026"));
+        values.insert("query".to_owned(), TemplateValue::scalar("open"));
+        assert_eq!(
+            template.expand(&values).expect("facade template expands"),
+            "https://example.test/reports%2F2026?query=open"
+        );
+
+        let _: Option<modern::UriTemplate> = None;
+        let _: Option<auto::UriTemplate> = None;
+        let _: Option<prelude::UriTemplate> = None;
+        let _: Option<CancellationWireMessage> = None;
+        let _: Option<modern::CancellationWireMessage> = None;
+        let _: Option<legacy_2024::CancellationWireMessage> = None;
+        let _: Option<prelude::CancellationWireMessage> = None;
     }
 
     #[test]
