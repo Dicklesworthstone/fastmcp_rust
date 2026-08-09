@@ -757,11 +757,13 @@ impl ServerBuilder {
                 .add_final_tool_with_behavior(handler, self.on_duplicate)
             {
                 Ok(()) => {}
-                Err(error) => log::error!(
-                    target: "fastmcp_rust::builder",
-                    "Failed to register exact-final proxied tool; code={:?}",
-                    error.code
-                ),
+                Err(error) => {
+                    log::error!(
+                        target: "fastmcp_rust::builder",
+                        "Failed to register exact-final proxied tool; code={:?}",
+                        error.code
+                    );
+                }
             }
         }
 
@@ -2004,7 +2006,9 @@ mod tests {
             tools: vec![Tool {
                 name: "test_tool".to_string(),
                 description: Some("proxied tool".to_string()),
-                input_schema: serde_json::json!({}),
+                // Final projection of a proxied legacy tool requires an
+                // object-typed input schema.
+                input_schema: serde_json::json!({"type": "object"}),
                 output_schema: None,
                 icon: None,
                 version: None,

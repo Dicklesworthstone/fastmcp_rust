@@ -2683,6 +2683,18 @@ impl ToolHandler for ProxyToolHandler {
         self.client
             .call_tool_final(ctx, &self.external_name, arguments)
     }
+
+    fn final_tool_error_structured_content(
+        &self,
+        _kind: crate::handler::ToolErrorKind,
+    ) -> Option<serde_json::Value> {
+        // A proxy cannot consult the upstream for framework-authored error
+        // shapes. The empty object is offered for both closed kinds and
+        // registration still validates it against the tool's declared
+        // outputSchema, so schemas that cannot accept it keep rejecting
+        // fail-closed.
+        Some(serde_json::json!({}))
+    }
 }
 
 pub(crate) struct ProxyResourceHandler {
