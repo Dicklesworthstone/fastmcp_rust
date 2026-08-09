@@ -17947,53 +17947,117 @@ mod lib_unit_tests {
         let phase = Arc::new(AtomicUsize::new(0));
         let phase_for_receive = Arc::clone(&phase);
         let control_for_receive = Arc::clone(&control);
-        let cx = Cx::for_testing();
-        let exit_code = Server::new("stdio-modern-worker-shutdown-test", "1.0.0")
+        let server = Server::new("stdio-modern-worker-shutdown-test", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
             .tool(NonQuiescentModernTool {
                 control: Arc::clone(&control),
             })
             .on_shutdown(move || shutdown_observer.store(true, Ordering::Release))
+            .build();
+        // The modern dispatch arm admits requests through spawn_blocking, so
+        // the pump must run under a runtime with blocking threads; a bare
+        // testing Cx rejects every modern dispatch before the tool starts.
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("stdio pump reactor must initialize"))
+            .blocking_threads(4, MAX_DISPATCH_QUEUE_DEPTH)
             .build()
-            .run_loop_pump_with_policy(
-                &cx,
-                &cx,
-                move |_receive_cx, _worker_failed| match phase_for_receive
-                    .fetch_add(1, Ordering::AcqRel)
-                {
-                    0 => Ok(modern_discovery_opening_request()),
-                    1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
-                        "tools/call",
-                        Some(serde_json::json!({
-                            "name": "non_quiescent_modern_tool",
-                            "arguments": {},
-                            "_meta": {
-                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                            },
-                        })),
-                        710_i64,
-                    ))),
-                    2 if control_for_receive.wait_for_started(Duration::from_secs(2)) => {
-                        Err(TransportError::Closed)
+            .expect("stdio pump runtime must initialize");
+        let (sender, receiver) = sync_channel(1);
+        runtime
+            .handle()
+            .try_spawn_with_cx(move |cx| async move {
+                let dispatch_cx = cx.clone();
+                let pump_sender = sender.clone();
+                // The pump reports its exit code through the channel from the
+                // blocking closure itself rather than via join(): joining the
+                // pump task can park forever while the deliberately
+                // non-quiescent modern child still occupies its blocking
+                // thread, and the harness only needs the exit code.
+                if let Err(error) = cx.spawn_blocking(move |pump_cx| {
+                    let code = server.run_loop_pump_with_policy(
+                        &pump_cx,
+                        &dispatch_cx,
+                        move |_receive_cx, _worker_failed| match phase_for_receive
+                            .fetch_add(1, Ordering::AcqRel)
+                        {
+                            0 => Ok(modern_discovery_opening_request()),
+                            1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "tools/call",
+                                Some(serde_json::json!({
+                                    "name": "non_quiescent_modern_tool",
+                                    "arguments": {},
+                                    "_meta": {
+                                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                                    },
+                                })),
+                                710_i64,
+                            ))),
+                            2 if control_for_receive.wait_for_started(Duration::from_secs(2)) => {
+                                Err(TransportError::Closed)
+                            }
+                            2 => Err(TransportError::Timeout),
+                            _ => Err(TransportError::Closed),
+                        },
+                        move |_send_cx, _message| Ok(()),
+                        Arc::new(|_| {}),
+                        "stdio-modern-test",
+                        true,
+                        None,
+                        true,
+                    );
+                    let _ = pump_sender.send(Ok(code));
+                }) {
+                    let _ = sender.send(Err(format!("stdio pump admission failed: {error}")));
+                }
+            })
+            .expect("stdio pump task must be admitted");
+        // The pump legitimately holds several bounded worker-shutdown windows
+        // (5s each) before detaching the non-quiescent child, so the result
+        // wait must exceed their sum; the shared live-HTTP helper's 2s bound
+        // is far too tight here.
+        let pump_result: Result<Result<i32, String>, String> = runtime.block_on(async {
+            let cx = Cx::current().expect("the test runtime installs an ambient Cx");
+            let deadline = cx.now().saturating_add_nanos(30_000_000_000);
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => break Ok(result),
+                    Err(TryRecvError::Disconnected) => {
+                        break Err("stdio pump task exited without reporting its result".to_owned());
                     }
-                    2 => Err(TransportError::Timeout),
-                    _ => Err(TransportError::Closed),
-                },
-                move |_send_cx, _message| Ok(()),
-                Arc::new(|_| {}),
-                "stdio-modern-test",
-                true,
-                None,
-                true,
-            );
+                    Err(TryRecvError::Empty) => {
+                        if asupersync::time::timeout_at(
+                            deadline,
+                            asupersync::time::sleep(cx.now(), Duration::from_millis(5)),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break Err("stdio pump did not settle within its bound".to_owned());
+                        }
+                    }
+                }
+            }
+        });
 
-        assert_eq!(exit_code, 1);
-        assert!(control.has_started());
-        assert!(!control.has_finished());
-        assert!(!shutdown_called.load(Ordering::Acquire));
+        // Capture the pre-release observations, then release the parked tool
+        // BEFORE any panic: a failed assert (or a pump timeout) would
+        // otherwise unwind into the runtime drop, which joins the
+        // still-parked blocking thread forever.
+        let started = control.has_started();
+        let finished_before_release = control.has_finished();
+        let shutdown_before_release = shutdown_called.load(Ordering::Acquire);
         control.release();
-        assert!(control.wait_for_finished(Duration::from_secs(2)));
+        let finished_after_release = control.wait_for_finished(Duration::from_secs(2));
+
+        let exit_code = pump_result
+            .expect("stdio pump must report a result")
+            .expect("stdio pump must complete");
+        assert_eq!(exit_code, 1);
+        assert!(started);
+        assert!(!finished_before_release);
+        assert!(!shutdown_before_release);
+        assert!(finished_after_release);
     }
 
     #[test]
