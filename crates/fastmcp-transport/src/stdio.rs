@@ -834,6 +834,14 @@ pub struct StdioRecvHalf<R> {
 }
 
 impl<R> StdioRecvHalf<R> {
+    /// Returns whether either split half has entered a terminal state.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
+    }
+}
+
+impl<R: Read> StdioRecvHalf<R> {
     /// Returns the exact frame decoded by the immediately preceding receive.
     ///
     /// The slice remains valid only until the next receive. It allows a
@@ -842,12 +850,6 @@ impl<R> StdioRecvHalf<R> {
     #[must_use]
     pub fn last_received_frame(&self) -> Option<&[u8]> {
         self.transport.last_received_frame()
-    }
-
-    /// Returns whether either split half has entered a terminal state.
-    #[must_use]
-    pub fn is_closed(&self) -> bool {
-        self.terminal.load(Ordering::Acquire)
     }
 }
 
