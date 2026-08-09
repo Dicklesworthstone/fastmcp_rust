@@ -569,14 +569,19 @@ pub struct TaskBase {
     pub poll_interval_ms: Option<TaskDuration>,
 }
 
-struct RequiredTaskTtl(Option<TaskDuration>);
+/// Outer `None` marks an omitted `ttlMs` field; inner `None` is an explicit
+/// JSON null (unlimited TTL). Serde's missing-field fallback resolves through
+/// `deserialize_option`, so a bare `Option` carrier cannot tell omission from
+/// null — the `default` branch below is the only path an absent field takes.
+#[derive(Default)]
+struct RequiredTaskTtl(Option<Option<TaskDuration>>);
 
 impl<'de> Deserialize<'de> for RequiredTaskTtl {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        Option::<TaskDuration>::deserialize(deserializer).map(Self)
+        Option::<TaskDuration>::deserialize(deserializer).map(|value| Self(Some(value)))
     }
 }
 
@@ -612,7 +617,7 @@ struct TaskBaseWire {
     created_at: TaskTimestamp,
     #[serde(rename = "lastUpdatedAt")]
     last_updated_at: TaskTimestamp,
-    #[serde(rename = "ttlMs")]
+    #[serde(rename = "ttlMs", default)]
     ttl_ms: RequiredTaskTtl,
     #[serde(rename = "pollIntervalMs", default)]
     poll_interval_ms: OptionalTaskField<TaskDuration>,
@@ -630,7 +635,9 @@ impl<'de> Deserialize<'de> for TaskBase {
             status_message: wire.status_message.0,
             created_at: wire.created_at,
             last_updated_at: wire.last_updated_at,
-            ttl_ms: wire.ttl_ms.0,
+            ttl_ms: wire.ttl_ms.0.ok_or_else(|| {
+                D::Error::custom("task requires an explicit ttlMs member; use null for unlimited")
+            })?,
             poll_interval_ms: wire.poll_interval_ms.0,
         })
     }
