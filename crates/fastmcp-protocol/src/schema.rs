@@ -6,7 +6,8 @@
 //! - Type checking (string, number, integer, boolean, object, array, null)
 //! - Required field validation
 //! - Enum validation
-//! - Property, pattern-property, dependency, and property-name validation
+//! - Property, pattern-property, dependency, property-name, and
+//!   unevaluated-property validation
 //! - Items, tuple, and contains validation for arrays
 //! - Local `$defs`/`$ref`, composition, and conditional applicators
 //!
@@ -130,7 +131,7 @@ impl AdmittedSchema {
     /// Validates an instance using this admitted schema.
     #[must_use]
     pub fn validate(&self, value: &Value) -> ValidationResult {
-        validate(&self.schema, value)
+        validate_admitted_final_schema(&self.schema, value)
     }
 }
 
@@ -367,6 +368,7 @@ fn validate_final_schema_node(
 
     for keyword in [
         "additionalProperties",
+        "unevaluatedProperties",
         "items",
         "contains",
         "not",
@@ -610,12 +612,26 @@ fn validate_format_keyword(
 /// assert!(validate(&schema, &invalid).is_err());
 /// ```
 pub fn validate(schema: &Value, value: &Value) -> ValidationResult {
+    validate_with_schema_features(schema, value, false)
+}
+
+/// Validates an instance with the final-schema vocabulary accepted by
+/// [`admit_final_schema`].
+fn validate_admitted_final_schema(schema: &Value, value: &Value) -> ValidationResult {
+    validate_with_schema_features(schema, value, true)
+}
+
+fn validate_with_schema_features(
+    schema: &Value,
+    value: &Value,
+    enforce_unevaluated_properties: bool,
+) -> ValidationResult {
     let mut errors = Vec::new();
     let mut instance_nodes = 0;
     if !validate_instance_bounds(value, "root", 0, &mut instance_nodes, &mut errors) {
         return Err(errors);
     }
-    let mut context = ValidationContext::new(schema);
+    let mut context = ValidationContext::new(schema, enforce_unevaluated_properties);
     validate_internal(schema, value, "root", &mut errors, &mut context);
     if context.work_exhausted
         && !errors
@@ -710,6 +726,7 @@ fn make_strict_schema(schema: &Value) -> Value {
 
             for keyword in [
                 "additionalProperties",
+                "unevaluatedProperties",
                 "items",
                 "contains",
                 "not",
@@ -746,16 +763,18 @@ struct ValidationContext<'a> {
     reference_depth: usize,
     remaining_work: usize,
     work_exhausted: bool,
+    enforce_unevaluated_properties: bool,
 }
 
 impl<'a> ValidationContext<'a> {
-    const fn new(root_schema: &'a Value) -> Self {
+    const fn new(root_schema: &'a Value, enforce_unevaluated_properties: bool) -> Self {
         Self {
             root_schema,
             schema_depth: 0,
             reference_depth: 0,
             remaining_work: MAX_SCHEMA_VALIDATION_WORK,
             work_exhausted: false,
+            enforce_unevaluated_properties,
         }
     }
 
@@ -1274,6 +1293,10 @@ fn validate_object(
         }
     }
 
+    if context.enforce_unevaluated_properties {
+        validate_unevaluated_properties(schema, value, obj, path, errors, context);
+    }
+
     // Check minProperties/maxProperties
     if let Some(min) = schema
         .get("minProperties")
@@ -1296,6 +1319,208 @@ fn validate_object(
                 errors,
                 path,
                 format!("object must have at most {max} properties"),
+            );
+        }
+    }
+}
+
+/// Applies the Draft 2020-12 `unevaluatedProperties` keyword after every
+/// sibling applicator has had an opportunity to evaluate object members.
+fn validate_unevaluated_properties(
+    schema: &serde_json::Map<String, Value>,
+    value: &Value,
+    obj: &serde_json::Map<String, Value>,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'_>,
+) {
+    let Some(unevaluated_schema) = schema.get("unevaluatedProperties") else {
+        return;
+    };
+
+    let mut evaluated = std::collections::HashSet::with_capacity(obj.len());
+    mark_evaluated_object_properties(
+        schema,
+        value,
+        obj,
+        path,
+        false,
+        &mut evaluated,
+        errors,
+        context,
+    );
+
+    for (key, member) in obj {
+        if !evaluated.contains(key) {
+            validate_internal(
+                unevaluated_schema,
+                member,
+                &format!("{path}.{key}"),
+                errors,
+                context,
+            );
+        }
+    }
+}
+
+/// Marks the object members evaluated by a successful schema application.
+///
+/// `unevaluatedProperties` consumes all remaining members when it belongs to
+/// a successful nested applicator. The outer invocation leaves its own keyword
+/// out of the annotation set so that it can validate those remaining members.
+fn mark_evaluated_object_properties(
+    schema: &serde_json::Map<String, Value>,
+    value: &Value,
+    obj: &serde_json::Map<String, Value>,
+    path: &str,
+    include_unevaluated_properties: bool,
+    evaluated: &mut std::collections::HashSet<String>,
+    errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'_>,
+) {
+    if !context.consume_work() {
+        push_error(errors, path, "schema validation work limit exceeded");
+        return;
+    }
+
+    let properties = schema.get("properties").and_then(Value::as_object);
+    let patterns = compile_pattern_properties(schema, path, errors);
+    for key in obj.keys() {
+        let matched_property = properties.is_some_and(|properties| properties.contains_key(key));
+        let matched_pattern = patterns.iter().any(|(pattern, _)| pattern.is_match(key));
+        if matched_property || matched_pattern || schema.contains_key("additionalProperties") {
+            evaluated.insert(key.clone());
+        }
+    }
+
+    if include_unevaluated_properties && schema.contains_key("unevaluatedProperties") {
+        evaluated.extend(obj.keys().cloned());
+    }
+
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        if !context.enter_reference() {
+            push_error(errors, path, "local schema reference depth limit exceeded");
+        } else {
+            let root_schema = context.root_schema;
+            match resolve_local_reference(root_schema, reference) {
+                Ok(target) if branch_is_valid(target, value, path, context) => {
+                    if let Some(target) = target.as_object() {
+                        mark_evaluated_object_properties(
+                            target,
+                            value,
+                            obj,
+                            path,
+                            true,
+                            evaluated,
+                            errors,
+                            context,
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(message) => push_error(errors, path, message),
+            }
+            context.leave_reference();
+        }
+    }
+
+    if let Some(dependent_schemas) = schema.get("dependentSchemas").and_then(Value::as_object) {
+        for (trigger, dependent_schema) in dependent_schemas {
+            if obj.contains_key(trigger)
+                && branch_is_valid(dependent_schema, value, path, context)
+                && let Some(dependent_schema) = dependent_schema.as_object()
+            {
+                mark_evaluated_object_properties(
+                    dependent_schema,
+                    value,
+                    obj,
+                    path,
+                    true,
+                    evaluated,
+                    errors,
+                    context,
+                );
+            }
+        }
+    }
+
+    mark_composition_evaluated_properties(
+        schema, "allOf", value, obj, path, evaluated, errors, context,
+    );
+    mark_composition_evaluated_properties(
+        schema, "anyOf", value, obj, path, evaluated, errors, context,
+    );
+
+    if let Some(subschemas) = bounded_subschemas(schema, "oneOf", path, errors) {
+        let matching: Vec<_> = subschemas
+            .iter()
+            .filter(|subschema| branch_is_valid(subschema, value, path, context))
+            .collect();
+        if matching.len() == 1 && let Some(subschema) = matching[0].as_object() {
+            mark_evaluated_object_properties(
+                subschema,
+                value,
+                obj,
+                path,
+                true,
+                evaluated,
+                errors,
+                context,
+            );
+        }
+    }
+
+    if let Some(condition) = schema.get("if") {
+        let branch = if branch_is_valid(condition, value, path, context) {
+            "then"
+        } else {
+            "else"
+        };
+        if let Some(subschema) = schema.get(branch)
+            && branch_is_valid(subschema, value, path, context)
+            && let Some(subschema) = subschema.as_object()
+        {
+            mark_evaluated_object_properties(
+                subschema,
+                value,
+                obj,
+                path,
+                true,
+                evaluated,
+                errors,
+                context,
+            );
+        }
+    }
+}
+
+/// Merges annotations from every successful `allOf` or `anyOf` branch.
+fn mark_composition_evaluated_properties(
+    schema: &serde_json::Map<String, Value>,
+    keyword: &str,
+    value: &Value,
+    obj: &serde_json::Map<String, Value>,
+    path: &str,
+    evaluated: &mut std::collections::HashSet<String>,
+    errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'_>,
+) {
+    let Some(subschemas) = bounded_subschemas(schema, keyword, path, errors) else {
+        return;
+    };
+    for subschema in subschemas {
+        if branch_is_valid(subschema, value, path, context)
+            && let Some(subschema) = subschema.as_object()
+        {
+            mark_evaluated_object_properties(
+                subschema,
+                value,
+                obj,
+                path,
+                true,
+                evaluated,
+                errors,
+                context,
             );
         }
     }
@@ -2012,6 +2237,60 @@ mod tests {
                 ]
             })
         );
+    }
+
+    fn bounded_draft_2020_12_unevaluated_properties_schema() -> AdmittedSchema {
+        admit_final_schema(json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "allOf": [{
+                "properties": {
+                    "label": {"type": "string"}
+                },
+                "required": ["label"]
+            }],
+            "unevaluatedProperties": false
+        }))
+        .expect("the bounded unevaluated-properties schema admits")
+    }
+
+    #[test]
+    fn bounded_draft_2020_12_unevaluated_properties_positive() {
+        let schema = bounded_draft_2020_12_unevaluated_properties_schema();
+        let accepted = json!({"label": "ready"});
+
+        schema
+            .validate(&accepted)
+            .expect("a property evaluated by a successful allOf branch remains accepted");
+        assert_eq!(accepted, json!({"label": "ready"}));
+    }
+
+    #[test]
+    fn bounded_draft_2020_12_unevaluated_properties_planted_negative() {
+        let schema = bounded_draft_2020_12_unevaluated_properties_schema();
+        let accepted = json!({"label": "ready"});
+        let mut planted = accepted.clone();
+        planted["unexpected"] = json!(true);
+
+        let errors = schema.validate(&planted).expect_err(
+            "adding only an unevaluated property must be rejected by the false schema",
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "root.unexpected");
+        assert_eq!(errors[0].message, "schema rejects all values");
+        assert_eq!(accepted, json!({"label": "ready"}));
+    }
+
+    #[test]
+    fn raw_validate_preserves_legacy_unevaluated_properties_behavior() {
+        let legacy_schema = json!({
+            "type": "object",
+            "unevaluatedProperties": false
+        });
+        let legacy_instance = json!({"legacy": true});
+
+        assert!(validate(&legacy_schema, &legacy_instance).is_ok());
+        assert_eq!(legacy_instance, json!({"legacy": true}));
     }
 
     fn final_schema_format_schema() -> AdmittedSchema {

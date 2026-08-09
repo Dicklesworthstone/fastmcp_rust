@@ -1523,6 +1523,21 @@ impl ExtensionDescriptorRegistry {
             .or_else(|| self.additional_methods.get(id)?.get(name))
     }
 
+    /// Returns the descriptor for one extension-owned request method.
+    ///
+    /// This includes the primary descriptor method and every additional method
+    /// registered for the same extension capability. Server handler registries
+    /// use it to reject handler configurations that could never be admitted at
+    /// request dispatch.
+    #[must_use]
+    pub fn method_descriptor(
+        &self,
+        id: &ExtensionId,
+        name: &str,
+    ) -> Option<&ExtensionMethodDescriptor> {
+        self.method(id, name)
+    }
+
     /// Returns the frozen descriptors in deterministic identifier order.
     #[must_use]
     pub fn descriptors(&self) -> impl ExactSizeIterator<Item = &ExtensionDescriptor> {

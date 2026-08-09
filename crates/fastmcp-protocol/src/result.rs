@@ -828,11 +828,17 @@ impl From<ProtocolEra> for ResultPeerEra {
     }
 }
 
-/// Bounded diagnostics reserved for optional legacy peer compatibility.
+/// Bounded diagnostics reserved for peer-result compatibility handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultPeerDiagnostic {
     /// A legacy peer used a compatibility result shape.
     LegacyCompatibilityShape,
+    /// A modern peer omitted the required final `resultType` discriminator.
+    ///
+    /// The peer result still decodes as a complete result for the pinned
+    /// compatibility rule, but locally authored modern results always emit the
+    /// discriminator explicitly.
+    ModernMissingResultType,
 }
 
 /// Core or deferred result decoded from a peer envelope.
@@ -848,9 +854,12 @@ pub enum DecodedResult {
 
 /// Decodes one peer result through the public result codec.
 ///
-/// A final peer must provide `resultType`. An absent discriminator defaults to
-/// `complete` only for the legacy era. Explicit null and non-string
-/// discriminators are rejected instead of conflating them with absence.
+/// A final peer must provide `resultType`, but peer ingestion preserves the
+/// pinned compatibility rule by decoding an absent discriminator as
+/// `complete` in either era. A modern omission receives a bounded diagnostic;
+/// locally authored modern results still emit `resultType: "complete"`.
+/// Explicit null and non-string discriminators are rejected instead of
+/// conflating them with absence.
 pub fn decode_peer_result(
     input: &str,
     era: ResultPeerEra,
@@ -859,12 +868,10 @@ pub fn decode_peer_result(
     let mut members = parse_exact_result_object(input)?;
     let result_type = match members.get("resultType") {
         None if era == ResultPeerEra::Legacy => ("complete".to_owned(), None),
-        None => {
-            return Err(ResultDecodeError::new(
-                ResultDecodeErrorKind::MissingDiscriminator,
-                "$.resultType",
-            ));
-        }
+        None => (
+            "complete".to_owned(),
+            Some(ResultPeerDiagnostic::ModernMissingResultType),
+        ),
         Some(ExactJsonValue::String(value)) => (value.clone(), None),
         Some(_) => {
             return Err(ResultDecodeError::new(
@@ -1631,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn final_results_require_result_type_and_reject_top_level_server_info() {
+    fn final_result_discriminator_compatibility_preserves_exact_wire_and_legacy_behavior() {
         let accepted = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"extension":true}"#;
         let (baseline, diagnostic) = decode_peer_result(
             accepted,
@@ -1642,24 +1649,38 @@ mod tests {
         assert_eq!(diagnostic, None);
 
         let missing = r#"{"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"extension":true}"#;
-        let error = decode_peer_result(
+        let (modern_compatibility, diagnostic) = decode_peer_result(
             missing,
             ResultPeerEra::Modern,
             &CoreResultDiscriminatorPolicy,
         )
-        .expect_err("only the required final resultType is absent");
-        assert_eq!(error.kind(), ResultDecodeErrorKind::MissingDiscriminator);
-        assert_eq!(error.path(), "$.resultType");
+        .expect(
+            "a modern peer omission follows the pinned complete-result compatibility rule",
+        );
+        assert_eq!(
+            diagnostic,
+            Some(ResultPeerDiagnostic::ModernMissingResultType)
+        );
+        assert_eq!(encode_result(&modern_compatibility), accepted);
 
-        let wrong_type = r#"{"resultType":false,"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"extension":true}"#;
+        let wrong_type = r#"{"resultType":null,"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"extension":true}"#;
         let error = decode_peer_result(
             wrong_type,
             ResultPeerEra::Modern,
             &CoreResultDiscriminatorPolicy,
         )
-        .expect_err("only resultType changes from a string to a boolean");
+        .expect_err("only resultType changes from the exact wire string to null");
         assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidDiscriminator);
         assert_eq!(error.path(), "$.resultType");
+
+        let (legacy_compatibility, diagnostic) = decode_peer_result(
+            missing,
+            ResultPeerEra::Legacy,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("the existing legacy compatibility behavior remains unchanged");
+        assert_eq!(diagnostic, None);
+        assert_eq!(encode_result(&legacy_compatibility), accepted);
 
         let top_level_server_info = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"serverInfo":{"name":"legacy-location","version":"0.1"},"extension":true}"#;
         let error = decode_peer_result(
