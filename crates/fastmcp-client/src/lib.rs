@@ -44,6 +44,7 @@ mod cache;
 mod execution;
 pub mod http_auth;
 pub mod http_executor;
+pub mod mcp_apps;
 pub mod mcp_config;
 mod negotiation;
 mod session;
@@ -80,13 +81,19 @@ pub use fastmcp_protocol::{
     ElicitRequestParams, ElicitResult, FinalCallToolResult,
     FinalCompletionArgument as CompletionArgument, FinalCompletionContext as CompletionContext,
     FinalCompletionReference as CompletionReference, FinalCoreResult, FinalGetPromptResult,
-    FinalReadResourceResult, FinalSubscriptionsListenResult, GetPromptResult, LegacyCoreResult,
-    ListRootsParams, ListRootsResult, ReadResourceResult, SubscriptionFilter,
+    FinalReadResourceResult, FinalSubscriptionsListenResult, GetPromptResult, InputRequiredResult,
+    LegacyCoreResult, ListRootsParams, ListRootsResult, ReadResourceResult, SubscriptionFilter,
 };
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, LegacySseHttpClient,
     LegacySseHttpClientError, ModernHttpClient, ModernHttpClientError, ModernHttpResponseStream,
-    ModernHttpSubscriptionListenCollector,
+    ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenEvent,
+    ModernHttpSubscriptionListener,
+};
+pub use mcp_apps::{
+    McpAppsBridgeTransport, McpAppsHost, McpAppsHostConfiguration, McpAppsHostError,
+    McpAppsHostPolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
+    mcp_apps_in_memory_pair,
 };
 pub use mcp_config::claude_desktop_config_path;
 pub use negotiation::{
@@ -117,11 +124,11 @@ use std::time::{Duration, Instant};
 
 use asupersync::{Cx, channel::oneshot};
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sha256_bounded};
+#[cfg(test)]
+use fastmcp_protocol::common_types::JsonInteger;
 use fastmcp_protocol::common_types::{
     ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
-#[cfg(test)]
-use fastmcp_protocol::common_types::JsonInteger;
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, OFFICIAL_TASKS_RESULT_DISCRIMINATOR, official_tasks_empty_settings,
     register_official_tasks_extension,
@@ -134,21 +141,20 @@ use fastmcp_protocol::tasks_extension::{
     TaskRequestMeta, UpdateTaskParams as FinalUpdateTaskParams,
 };
 use fastmcp_protocol::{
-    CallToolParams, CancelTaskParams, CancelTaskResult, CancellationSender,
-    CancellationWireMessage, CancelledParams, ClientCapabilities, ClientInfo, CoreDispatchError,
-    CoreRequest, CorrelationKey, FINAL_CLIENT_CAPABILITIES_META_KEY,
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams, FinalCoreRequest,
-    FinalLogMessageParams, FinalProgressNotificationParams, FinalRequestMeta,
-    FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams, GetTaskParams,
-    GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION, JsonRpcError,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyPromptMessage,
-    LegacyResourceContent, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
-    ListTasksParams, ListTasksResult, ListToolsParams, LogLevel, LogMessageParams,
+    CallToolParams, CancellationSender, CancellationWireMessage, CancelledParams,
+    ClientCapabilities, ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
+    FinalCancelledNotificationParams, FinalCoreRequest, FinalLogMessageParams,
+    FinalProgressNotificationParams, FinalRequestMeta,
+    FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams, InitializeParams,
+    InitializeResult, JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, LegacyContent, LegacyPromptMessage, LegacyResourceContent, ListPromptsParams,
+    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
     PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, ReadResourceParams, RequestId,
-    RequestMeta, Resource, ResourceTemplate, ServerCapabilities, ServerInfo, ServerNotification,
-    RootsCapability, SamplingCapability, SetLogLevelParams, SubmitTaskParams, SubmitTaskResult,
-    TaskId, TaskInfo, TaskResult, TaskStatus, Tool, ToolAnnotations,
-    decode_strict_jsonrpc_response, task_subscription_ids,
+    RequestMeta, Resource, ResourceTemplate, RootsCapability, SamplingCapability,
+    ServerCapabilities, ServerInfo, ServerNotification, SetLogLevelParams, SubscribeResourceParams,
+    Tool, ToolAnnotations, UnsubscribeResourceParams, decode_strict_jsonrpc_response,
+    task_subscription_ids,
 };
 use fastmcp_protocol::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionDirection, ExtensionSettings,
@@ -197,13 +203,12 @@ impl ReverseRequestCancellation {
     }
 
     fn record_response_sent(&self) {
-        let previous = self
-            .0
-            .compare_exchange(
-                REVERSE_CALLBACK_OPEN,
-                REVERSE_CALLBACK_RESPONSE_SENT,
-                Ordering::AcqRel,
-                Ordering::Acquire);
+        let previous = self.0.compare_exchange(
+            REVERSE_CALLBACK_OPEN,
+            REVERSE_CALLBACK_RESPONSE_SENT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         debug_assert!(
             previous.is_ok(),
             "only an elected open callback can record a response write"
@@ -420,6 +425,98 @@ pub enum FinalToolCallOutcome {
     Task(fastmcp_protocol::CreateTaskResult),
     /// The tool requires client input before it can complete.
     InputRequired(fastmcp_protocol::InputRequiredResult),
+}
+
+/// Responses supplied to one final model-request tool retry (MRTR).
+///
+/// Keys must name input requests from the immediately preceding
+/// `input_required` result. Values remain JSON because the peer owns the
+/// individual embedded-request schemas.
+pub type MrtrInputResponses = BTreeMap<String, serde_json::Value>;
+
+/// Maximum input responses accepted for one bounded MRTR retry.
+///
+/// The public retry helpers issue at most one retry. A later
+/// `input_required` result is returned to the caller rather than retried.
+pub const MAX_MRTR_INPUT_RESPONSES: usize = 128;
+
+fn mrtr_retry_parameters(
+    mut parameters: serde_json::Value,
+    input_required: &InputRequiredResult,
+    input_responses: MrtrInputResponses,
+) -> McpResult<serde_json::Value> {
+    if input_responses.len() > MAX_MRTR_INPUT_RESPONSES {
+        return Err(McpError::invalid_params(format!(
+            "MRTR inputResponses must not exceed {MAX_MRTR_INPUT_RESPONSES} entries",
+        )));
+    }
+
+    let input_requests = input_required.input_requests();
+    if input_requests.is_none() && !input_responses.is_empty() {
+        return Err(McpError::invalid_params(
+            "MRTR inputResponses require peer inputRequests",
+        ));
+    }
+    if let Some(input_requests) = input_requests {
+        for key in input_responses.keys() {
+            if !input_requests
+                .members()
+                .iter()
+                .any(|request| request.name == *key)
+            {
+                return Err(McpError::invalid_params(
+                    "MRTR inputResponses contain a key not requested by the peer",
+                ));
+            }
+        }
+    }
+    if input_responses.is_empty() && input_required.request_state().is_none() {
+        return Err(McpError::invalid_params(
+            "MRTR retry requires inputResponses or requestState",
+        ));
+    }
+
+    let parameters = parameters
+        .as_object_mut()
+        .ok_or_else(|| McpError::internal_error("MRTR retry parameters must remain an object"))?;
+    if !input_responses.is_empty() {
+        parameters.insert(
+            "inputResponses".to_owned(),
+            serde_json::to_value(input_responses).map_err(|error| {
+                McpError::internal_error(format!(
+                    "MRTR inputResponses could not serialize: {error}"
+                ))
+            })?,
+        );
+    }
+    if let Some(request_state) = input_required.request_state() {
+        parameters.insert(
+            "requestState".to_owned(),
+            serde_json::Value::String(request_state.to_owned()),
+        );
+    }
+    Ok(serde_json::Value::Object(parameters.clone()))
+}
+
+fn mrtr_input_required_for_method<'a>(
+    method: &str,
+    result: &'a CoreResult,
+) -> Option<&'a InputRequiredResult> {
+    match (method, result) {
+        (
+            "tools/call",
+            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }),
+        )
+        | (
+            "resources/read",
+            CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }),
+        )
+        | (
+            "prompts/get",
+            CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }),
+        ) => Some(result),
+        _ => None,
+    }
 }
 
 fn subscription_listener_protocol_error(message: &'static str) -> McpError {
@@ -726,13 +823,10 @@ fn legacy_log_level(level: LoggingLevel) -> McpResult<LogLevel> {
     }
 }
 
-const MIN_TASK_POLL_INTERVAL: Duration = Duration::from_millis(1);
-const MAX_LOCAL_TASK_POLL_INTERVAL: Duration = Duration::from_mins(5);
 const DEFAULT_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CLIENT_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_CLIENT_ABSOLUTE_TIMEOUT: Duration = Duration::from_mins(15);
-const MAX_TASK_POLL_CANCEL_SLICE: Duration = Duration::from_millis(10);
 const DIRECT_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const DIRECT_CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const OWNED_PROCESS_GROUP_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -911,114 +1005,6 @@ impl RequestDeadlines {
         })?;
         Ok(())
     }
-}
-
-/// Validates the caller-configured local fallback interval.
-///
-/// This ceiling must not be applied to a future valid server-provided
-/// `pollIntervalMs`: the MCP 2026-07-28 plan requires that value to remain a
-/// minimum delay. The current public task model does not yet carry that field.
-fn validate_task_poll_interval(interval: Duration) -> McpResult<Duration> {
-    if !(MIN_TASK_POLL_INTERVAL..=MAX_LOCAL_TASK_POLL_INTERVAL).contains(&interval) {
-        return Err(McpError::invalid_params(
-            "Local task poll interval must be between 1 millisecond and 5 minutes",
-        ));
-    }
-    Ok(interval)
-}
-
-fn validate_task_info(task: &TaskInfo) -> McpResult<()> {
-    if let Some(progress) = task.progress
-        && (!progress.is_finite() || !(0.0..=1.0).contains(&progress))
-    {
-        return Err(McpError::invalid_request(
-            "Task progress must be finite and between 0.0 and 1.0",
-        ));
-    }
-    if task.status == TaskStatus::Pending && task.started_at.is_some() {
-        return Err(McpError::invalid_request(
-            "A pending task cannot have a start timestamp",
-        ));
-    }
-    if task.status.is_active() && task.completed_at.is_some() {
-        return Err(McpError::invalid_request(
-            "A non-terminal task cannot have a completion timestamp",
-        ));
-    }
-    // The current task implementation stores a cancellation reason in
-    // `error`, so Cancelled joins Failed as an admitted error-bearing state.
-    if matches!(
-        task.status,
-        TaskStatus::Pending | TaskStatus::Running | TaskStatus::Completed
-    ) && task.error.is_some()
-    {
-        return Err(McpError::invalid_request(
-            "Task error details contradict the task status",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_task_result(task: &TaskInfo, result: &TaskResult) -> McpResult<()> {
-    if result.id != task.id {
-        return Err(McpError::invalid_request(
-            "Task result ID does not match its task",
-        ));
-    }
-    if !task.status.is_terminal() {
-        return Err(McpError::invalid_request(
-            "A task result was returned for a non-terminal task",
-        ));
-    }
-    let expected_success = task.status == TaskStatus::Completed;
-    if result.success != expected_success {
-        return Err(McpError::invalid_request(
-            "Task result success contradicts the task status",
-        ));
-    }
-    if result.success && result.error.is_some() {
-        return Err(McpError::invalid_request(
-            "A successful task result cannot contain an error",
-        ));
-    }
-    if !result.success && result.data.is_some() {
-        return Err(McpError::invalid_request(
-            "An unsuccessful task result cannot contain success data",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_get_task_result(requested_id: &TaskId, result: &GetTaskResult) -> McpResult<()> {
-    if &result.task.id != requested_id {
-        return Err(McpError::invalid_request(
-            "tasks/get response task ID does not match the requested task",
-        ));
-    }
-    validate_task_info(&result.task)?;
-
-    let Some(task_result) = result.result.as_ref() else {
-        if result.task.status == TaskStatus::Completed {
-            return Err(McpError::invalid_request(
-                "tasks/get omitted the result of a completed task",
-            ));
-        }
-        return Ok(());
-    };
-    validate_task_result(&result.task, task_result)
-}
-
-fn validate_cancel_task_result(requested_id: &TaskId, result: &CancelTaskResult) -> McpResult<()> {
-    if &result.task.id != requested_id {
-        return Err(McpError::invalid_request(
-            "tasks/cancel response task ID does not match the requested task",
-        ));
-    }
-    validate_task_info(&result.task)?;
-    // Cancellation acknowledgement is eventual, not proof of terminal state.
-    // Work may remain active or race to another terminal outcome after the
-    // peer accepts the cancellation request.
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2079,15 +2065,11 @@ fn invalid_notification_request_response(request: &JsonRpcRequest) -> Option<Jso
 }
 
 fn server_request_response(request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
-    let id = request.id.clone()?;
+    if request.id.is_none() {
+        return None;
+    }
     if request.method.starts_with("notifications/") {
         return invalid_notification_request_response(request);
-    }
-    if request.method == "ping" {
-        return Some(JsonRpcMessage::Response(JsonRpcResponse::success(
-            id,
-            serde_json::json!({}),
-        )));
     }
     method_not_found_response(request)
 }
@@ -2171,7 +2153,9 @@ impl ReverseCallbackState {
             .lock()
             .map_err(|_| McpError::internal_error("Client reverse callback registry failed"))?;
         if self.closing.load(Ordering::Acquire) {
-            return Err(McpError::internal_error("Client reverse callback dispatcher is closed"));
+            return Err(McpError::internal_error(
+                "Client reverse callback dispatcher is closed",
+            ));
         }
         if active.len() >= MAX_QUEUED_REVERSE_CALLBACKS {
             return Err(McpError::internal_error(
@@ -2299,7 +2283,6 @@ struct ReverseCallbackPool {
 /// codec's normal bounded frame limit therefore applies to full MCP sampling
 /// and roots results. A failed write is terminal because framing disposition
 /// is no longer recoverable.
-#[cfg(unix)]
 fn commit_reverse_callback_response(
     state: &ReverseCallbackState,
     request_id: &RequestId,
@@ -2316,22 +2299,11 @@ fn commit_reverse_callback_response(
     Ok(true)
 }
 
-#[cfg(not(unix))]
-fn commit_reverse_callback_response(
-    _state: &ReverseCallbackState,
-    _request_id: &RequestId,
-    _response_sender: &Arc<Mutex<StdioSendHalf<ChildStdin>>>,
-    _cx: &Cx,
-    _cancellation: &ReverseRequestCancellation,
-    _response: &JsonRpcMessage,
-) -> Result<bool, TransportError> {
-    Err(TransportError::Closed)
-}
-
 impl ReverseCallbackPool {
     fn new(response_sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>, cx: Cx) -> Self {
         let state = Arc::new(ReverseCallbackState::default());
-        let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_REVERSE_CALLBACKS);
+        let (sender, receiver) =
+            mpsc::sync_channel::<ReverseCallbackJob>(MAX_QUEUED_REVERSE_CALLBACKS);
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(MAX_REVERSE_CALLBACK_WORKERS);
         for _ in 0..MAX_REVERSE_CALLBACK_WORKERS {
@@ -2339,43 +2311,45 @@ impl ReverseCallbackPool {
             let worker_receiver = Arc::clone(&receiver);
             let worker_sender = Arc::clone(&response_sender);
             let worker_cx = cx.clone();
-            workers.push(std::thread::spawn(move || loop {
-                let job = match worker_receiver
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .recv()
-                {
-                    Ok(job) => job,
-                    Err(_) => return,
-                };
-                if worker_state.closing.load(Ordering::Acquire)
-                    || job.cancellation.is_cancel_requested()
-                {
-                    worker_state.complete(&job.request_id);
-                    continue;
-                }
-                let response = (job.invoke)();
-                if worker_state.closing.load(Ordering::Acquire) {
-                    worker_state.complete(&job.request_id);
-                    continue;
-                }
-                match commit_reverse_callback_response(
-                    &worker_state,
-                    &job.request_id,
-                    &worker_sender,
-                    &worker_cx,
-                    &job.cancellation,
-                    &response,
-                ) {
-                    Ok(false) => {
+            workers.push(std::thread::spawn(move || {
+                loop {
+                    let job = match worker_receiver
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .recv()
+                    {
+                        Ok(job) => job,
+                        Err(_) => return,
+                    };
+                    if worker_state.closing.load(Ordering::Acquire)
+                        || job.cancellation.is_cancel_requested()
+                    {
                         worker_state.complete(&job.request_id);
                         continue;
                     }
-                    Ok(true) => {}
-                    Err(error) => {
-                        worker_state.fail_connection(transport_error_to_mcp(error));
+                    let response = (job.invoke)();
+                    if worker_state.closing.load(Ordering::Acquire) {
                         worker_state.complete(&job.request_id);
-                        return;
+                        continue;
+                    }
+                    match commit_reverse_callback_response(
+                        &worker_state,
+                        &job.request_id,
+                        &worker_sender,
+                        &worker_cx,
+                        &job.cancellation,
+                        &response,
+                    ) {
+                        Ok(false) => {
+                            worker_state.complete(&job.request_id);
+                            continue;
+                        }
+                        Ok(true) => {}
+                        Err(error) => {
+                            worker_state.fail_connection(transport_error_to_mcp(error));
+                            worker_state.complete(&job.request_id);
+                            return;
+                        }
                     }
                 }
             }));
@@ -2411,7 +2385,9 @@ impl ReverseCallbackPool {
         };
         let Some(sender) = self.sender.as_ref() else {
             self.state.complete(&request_id);
-            return Err(McpError::internal_error("Client reverse callback dispatcher is closed"));
+            return Err(McpError::internal_error(
+                "Client reverse callback dispatcher is closed",
+            ));
         };
         match sender.try_send(job) {
             Ok(()) => Ok(()),
@@ -2423,7 +2399,9 @@ impl ReverseCallbackPool {
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 self.state.complete(&request_id);
-                Err(McpError::internal_error("Client reverse callback dispatcher is closed"))
+                Err(McpError::internal_error(
+                    "Client reverse callback dispatcher is closed",
+                ))
             }
         }
     }
@@ -2504,7 +2482,7 @@ fn live_server_request_dispatch(
         return invalid_notification_request_response(request)
             .map(LiveServerRequestDispatch::Immediate);
     }
-    if request.method == "ping" {
+    if request.method == "ping" && selected_era == Some(ProtocolEra::Legacy2024) {
         return Some(LiveServerRequestDispatch::Immediate(
             JsonRpcMessage::Response(JsonRpcResponse::success(id, serde_json::json!({}))),
         ));
@@ -2515,7 +2493,10 @@ fn live_server_request_dispatch(
     // either method merely because a caller configured legacy callbacks on the
     // client object.
     if selected_era != Some(ProtocolEra::Legacy2024)
-        && matches!(request.method.as_str(), "sampling/createMessage" | "roots/list")
+        && matches!(
+            request.method.as_str(),
+            "sampling/createMessage" | "roots/list"
+        )
     {
         return method_not_found_response(request).map(LiveServerRequestDispatch::Immediate);
     }
@@ -2526,14 +2507,24 @@ fn live_server_request_dispatch(
                 Ok(params) => callbacks
                     .dispatch(id.clone(), params, Arc::clone(handler))
                     .map_or_else(
-                        |error| LiveServerRequestDispatch::Immediate(reverse_request_response(id, Err(error))),
+                        |error| {
+                            LiveServerRequestDispatch::Immediate(reverse_request_response::<
+                                CreateMessageResult,
+                            >(
+                                id, Err(error)
+                            ))
+                        },
                         |_| LiveServerRequestDispatch::CallbackAdmitted,
                     ),
                 Err(error) => {
-                    LiveServerRequestDispatch::Immediate(reverse_request_response(id, Err(error)))
+                    LiveServerRequestDispatch::Immediate(reverse_request_response::<
+                        CreateMessageResult,
+                    >(id, Err(error)))
                 }
             },
-            None => LiveServerRequestDispatch::Immediate(reverse_request_response(
+            None => LiveServerRequestDispatch::Immediate(reverse_request_response::<
+                CreateMessageResult,
+            >(
                 id,
                 Err(McpError::method_not_found("sampling/createMessage")),
             )),
@@ -2543,17 +2534,27 @@ fn live_server_request_dispatch(
                 Ok(params) => callbacks
                     .dispatch(id.clone(), params, Arc::clone(handler))
                     .map_or_else(
-                        |error| LiveServerRequestDispatch::Immediate(reverse_request_response(id, Err(error))),
+                        |error| {
+                            LiveServerRequestDispatch::Immediate(reverse_request_response::<
+                                ListRootsResult,
+                            >(
+                                id, Err(error)
+                            ))
+                        },
                         |_| LiveServerRequestDispatch::CallbackAdmitted,
                     ),
                 Err(error) => {
-                    LiveServerRequestDispatch::Immediate(reverse_request_response(id, Err(error)))
+                    LiveServerRequestDispatch::Immediate(
+                        reverse_request_response::<ListRootsResult>(id, Err(error)),
+                    )
                 }
             },
-            None => LiveServerRequestDispatch::Immediate(reverse_request_response(
-                id,
-                Err(McpError::method_not_found("roots/list")),
-            )),
+            None => {
+                LiveServerRequestDispatch::Immediate(reverse_request_response::<ListRootsResult>(
+                    id,
+                    Err(McpError::method_not_found("roots/list")),
+                ))
+            }
         },
         _ => return method_not_found_response(request).map(LiveServerRequestDispatch::Immediate),
     };
@@ -2569,6 +2570,28 @@ enum ServerNotificationKind {
 enum ModernServerNotification {
     Progress(FinalProgressNotificationParams),
     Retained,
+}
+
+fn raw_notification_params_from_frame(frame: &[u8]) -> McpResult<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct RawNotificationEnvelope {
+        #[serde(default)]
+        params: Option<Box<serde_json::value::RawValue>>,
+    }
+
+    serde_json::from_slice::<RawNotificationEnvelope>(frame)
+        .map(|envelope| envelope.params.map(|params| params.get().to_owned()))
+        .map_err(|_| McpError::invalid_request("Client could not retain raw notification params"))
+}
+
+fn decode_final_server_notification(
+    request: &JsonRpcRequest,
+    raw_params: Option<&str>,
+) -> Result<ServerNotification, fastmcp_protocol::FinalNotificationError> {
+    match raw_params {
+        Some(raw_params) => ServerNotification::decode_with_raw_params(request, raw_params),
+        None => ServerNotification::decode(request),
+    }
 }
 
 fn server_notification_kind(request: &JsonRpcRequest) -> Option<ServerNotificationKind> {
@@ -3204,6 +3227,26 @@ fn send_child_server_response_during_receive(
         .map_err(transport_error_to_mcp)
 }
 
+#[cfg(unix)]
+fn send_initializing_child_server_response(
+    transport: &mut StdioTransport<ChildStdout, ChildStdin>,
+    _cx: &Cx,
+    message: &JsonRpcMessage,
+) -> McpResult<()> {
+    transport
+        .try_send_control_message(message)
+        .map_err(transport_error_to_mcp)
+}
+
+#[cfg(not(unix))]
+fn send_initializing_child_server_response(
+    transport: &mut StdioTransport<ChildStdout, ChildStdin>,
+    cx: &Cx,
+    message: &JsonRpcMessage,
+) -> McpResult<()> {
+    transport.send(cx, message).map_err(transport_error_to_mcp)
+}
+
 fn initialize_child_transport(
     transport: &mut StdioTransport<ChildStdout, ChildStdin>,
     cx: &Cx,
@@ -3232,14 +3275,15 @@ fn initialize_child_transport(
     let deadlines = RequestDeadlines::start_at(timeout_policy, committed_at)?;
 
     let response = loop {
-        let (message, received_at) =
-            recv_initializing_child_transport(transport, cx, Some(deadlines.next()))
-            .map_err(|error| match error {
-                TransportError::ReceiveDeadlineExceeded => {
-                    request_timeout_error(deadlines.next_kind())
-                }
-                other => transport_error_to_mcp(other),
-            })?;
+        let (message, received_at) = recv_initializing_child_transport(
+            transport,
+            cx,
+            Some(deadlines.next()),
+        )
+        .map_err(|error| match error {
+            TransportError::ReceiveDeadlineExceeded => request_timeout_error(deadlines.next_kind()),
+            other => transport_error_to_mcp(other),
+        })?;
         if let Some(source) = deadlines.expired_at(received_at) {
             return Err(request_timeout_error(source));
         }
@@ -3251,7 +3295,7 @@ fn initialize_child_transport(
             }
             JsonRpcMessage::Request(request) => {
                 if let Some(response) = server_request_response(&request) {
-                    send_child_server_response_during_receive(transport, cx, &response)?;
+                    send_initializing_child_server_response(transport, cx, &response)?;
                 }
             }
         }
@@ -4057,20 +4101,6 @@ fn invoke_tool_progress_callback(
     .map_err(|_| McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR))
 }
 
-fn invoke_task_progress_callback<F>(
-    callback: &mut F,
-    progress: f64,
-    message: Option<&str>,
-) -> McpResult<()>
-where
-    F: FnMut(f64, Option<&str>),
-{
-    catch_client_callback_unwind(|| {
-        callback(progress, message);
-    })
-    .map_err(|_| McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR))
-}
-
 /// A ready dual-era HTTP MCP client.
 ///
 /// This composes the policy-bound HTTP connection with the legacy lifecycle
@@ -4149,6 +4179,99 @@ impl std::error::Error for HttpClientError {
             | Self::LegacyInitializationUnsupportedProtocolVersion { .. }
             | Self::RequestIdExhausted => None,
             Self::CoreResult(error) => Some(error),
+        }
+    }
+}
+
+/// A live final HTTP subscription listener bound to one [`HttpClient`] cache.
+///
+/// Each accepted catalog or resource event advances the owning client's cache
+/// generation before [`Self::next_event`] returns it. The listener holds the
+/// cache borrow for its lifetime, so callers cannot issue a cacheable request
+/// against the same client between receiving an event and observing its
+/// invalidation.
+pub struct HttpSubscriptionListener<'client> {
+    listener: ModernHttpSubscriptionListener,
+    final_result_cache: &'client mut FinalResultCache,
+}
+
+impl HttpSubscriptionListener<'_> {
+    /// Returns the JSON-RPC request ID that owns this listener.
+    #[must_use]
+    pub const fn request_id(&self) -> &RequestId {
+        self.listener.request_id()
+    }
+
+    /// Returns the acknowledged filter once the first stream record is admitted.
+    #[must_use]
+    pub const fn accepted_filter(&self) -> Option<&SubscriptionFilter> {
+        self.listener.accepted_filter()
+    }
+
+    /// Returns the current cache counters while this listener owns the cache.
+    #[must_use]
+    pub const fn final_result_cache_stats(&self) -> FinalCacheStats {
+        self.final_result_cache.stats()
+    }
+
+    /// Reads one live subscription record and immediately invalidates accepted
+    /// catalog or resource result sets before yielding that record.
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ModernHttpSubscriptionListenEvent>, HttpClientError> {
+        let event = self.listener.next_event(cx).await.map_err(|error| {
+            HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(error))
+        })?;
+        if let Some(ModernHttpSubscriptionListenEvent::Notification(notification)) = event.as_ref()
+        {
+            self.final_result_cache
+                .invalidate_notification(notification);
+        }
+        Ok(event)
+    }
+
+    /// Collects the remaining live records into the established terminal record.
+    pub async fn collect(
+        mut self,
+        cx: &Cx,
+    ) -> Result<ModernHttpSubscriptionListenCollector, HttpClientError> {
+        let mut notifications = Vec::new();
+        let mut task_notifications = Vec::new();
+
+        loop {
+            let event = self.next_event(cx).await?.ok_or_else(|| {
+                HttpClientError::CoreResult(McpError::invalid_request(
+                    "HTTP subscriptions listener ended after its terminal result",
+                ))
+            })?;
+            match event {
+                ModernHttpSubscriptionListenEvent::Acknowledged { .. } => {}
+                ModernHttpSubscriptionListenEvent::Notification(notification) => {
+                    notifications.push(notification);
+                }
+                ModernHttpSubscriptionListenEvent::TaskNotification(notification) => {
+                    task_notifications.push(notification);
+                }
+                ModernHttpSubscriptionListenEvent::Terminal {
+                    subscription_id,
+                    result: terminal,
+                } => {
+                    let accepted_filter =
+                        self.listener.accepted_filter().cloned().ok_or_else(|| {
+                            HttpClientError::CoreResult(McpError::invalid_request(
+                                "HTTP subscriptions listener terminated before acknowledgement",
+                            ))
+                        })?;
+                    return Ok(ModernHttpSubscriptionListenCollector {
+                        subscription_id,
+                        accepted_filter,
+                        notifications,
+                        task_notifications,
+                        terminal,
+                    });
+                }
+            }
         }
     }
 }
@@ -4258,6 +4381,32 @@ impl HttpClient {
     #[must_use]
     pub fn mcp_apps_active(&self) -> bool {
         self.connection.mcp_apps_active()
+    }
+
+    /// Starts one browser-agnostic Apps Host for a negotiated modern connection.
+    /// The embedder owns the View carrier and rendering policy.
+    pub fn mcp_apps_host<T, P>(
+        &self,
+        transport: T,
+        configuration: McpAppsHostConfiguration,
+        policy: P,
+    ) -> Result<McpAppsHost<T, P>, McpAppsHostError>
+    where
+        T: McpAppsBridgeTransport,
+        P: McpAppsHostPolicy,
+    {
+        if !self.mcp_apps_active() {
+            return Err(McpAppsHostError::NotNegotiated);
+        }
+        let activation_proof = mcp_apps::McpAppsActivationProof::from_bilateral_activation(
+            self.mcp_apps_active(),
+        )?;
+        Ok(McpAppsHost::new_negotiated(
+            transport,
+            configuration,
+            policy,
+            activation_proof,
+        ))
     }
 
     /// Returns the immutable policy and endpoints used to create this client.
@@ -4441,49 +4590,143 @@ impl HttpClient {
         Ok(result)
     }
 
-    /// Collects one typed final HTTP subscription stream and invalidates this
-    /// client's bounded complete-result cache for each accepted catalog or
-    /// resource-change event before returning the collector.
+    /// Calls a tool and, only when its first final result requires input,
+    /// performs one MRTR retry with caller-supplied responses.
     ///
-    /// The returned collector still retains the exact ordered notifications.
-    /// Only admitted `tools/list_changed`, `resources/list_changed`,
-    /// `prompts/list_changed`, and `resource_updated` events alter local
-    /// cache generations; progress and log events remain cache-neutral.
+    /// This emits at most two requests. Exact MCP 2024-11-05 results and
+    /// final complete or Tasks results are returned without invoking
+    /// `respond`. A second `input_required` result is returned rather than
+    /// retried again.
+    pub async fn call_tool_with_mrtr_retry<F>(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: serde_json::Value,
+        respond: F,
+    ) -> Result<CoreResult, HttpClientError>
+    where
+        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        let parameters = serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        });
+        let result = self
+            .request_final_core(cx, "tools/call", parameters.clone())
+            .await?;
+        let Some(input_required) = mrtr_input_required_for_method("tools/call", &result) else {
+            return Ok(result);
+        };
+        let retry = mrtr_retry_parameters(parameters, input_required, respond(input_required)?)
+            .map_err(HttpClientError::CoreResult)?;
+        self.request_final_core(cx, "tools/call", retry).await
+    }
+
+    /// Reads a resource and, only when its first final result requires input,
+    /// performs one MRTR retry with caller-supplied responses.
+    ///
+    /// This emits at most two requests; see [`Self::call_tool_with_mrtr_retry`]
+    /// for the terminal-result behavior.
+    pub async fn read_resource_with_mrtr_retry<F>(
+        &mut self,
+        cx: &Cx,
+        uri: &str,
+        respond: F,
+    ) -> Result<CoreResult, HttpClientError>
+    where
+        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        let parameters = serde_json::json!({ "uri": uri });
+        let result = self
+            .request_final_core(cx, "resources/read", parameters.clone())
+            .await?;
+        let Some(input_required) = mrtr_input_required_for_method("resources/read", &result) else {
+            return Ok(result);
+        };
+        let retry = mrtr_retry_parameters(parameters, input_required, respond(input_required)?)
+            .map_err(HttpClientError::CoreResult)?;
+        self.request_final_core(cx, "resources/read", retry).await
+    }
+
+    /// Gets a prompt and, only when its first final result requires input,
+    /// performs one MRTR retry with caller-supplied responses.
+    ///
+    /// This emits at most two requests; see [`Self::call_tool_with_mrtr_retry`]
+    /// for the terminal-result behavior.
+    pub async fn get_prompt_with_mrtr_retry<F>(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        respond: F,
+    ) -> Result<CoreResult, HttpClientError>
+    where
+        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        let mut parameters = serde_json::json!({ "name": name });
+        if !arguments.is_empty() {
+            let parameters = parameters.as_object_mut().ok_or_else(|| {
+                HttpClientError::CoreResult(McpError::internal_error(
+                    "MRTR prompt parameters must remain an object",
+                ))
+            })?;
+            parameters.insert(
+                "arguments".to_owned(),
+                serde_json::to_value(arguments).map_err(|error| {
+                    HttpClientError::CoreResult(McpError::internal_error(format!(
+                        "MRTR prompt arguments could not serialize: {error}"
+                    )))
+                })?,
+            );
+        }
+        let result = self
+            .request_final_core(cx, "prompts/get", parameters.clone())
+            .await?;
+        let Some(input_required) = mrtr_input_required_for_method("prompts/get", &result) else {
+            return Ok(result);
+        };
+        let retry = mrtr_retry_parameters(parameters, input_required, respond(input_required)?)
+            .map_err(HttpClientError::CoreResult)?;
+        self.request_final_core(cx, "prompts/get", retry).await
+    }
+
+    /// Opens a live final HTTP subscription listener.
+    ///
+    /// Accepted catalog and resource events invalidate their result sets before
+    /// the listener yields them. Progress, log, and Tasks notifications remain
+    /// cache-neutral.
+    pub async fn open_subscriptions_listener(
+        &mut self,
+        cx: &Cx,
+        notifications: SubscriptionFilter,
+        limits: sse::SseLimits,
+    ) -> Result<HttpSubscriptionListener<'_>, HttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        let request_id = self.next_request_id()?;
+        let listener = self
+            .connection
+            .open_subscriptions_listener(cx, request_id, notifications, limits)
+            .await
+            .map_err(HttpClientError::Connection)?;
+        Ok(HttpSubscriptionListener {
+            listener,
+            final_result_cache: &mut self.final_result_cache,
+        })
+    }
+
+    /// Collects one typed final HTTP subscription stream.
     pub async fn listen_subscriptions_typed(
         &mut self,
         cx: &Cx,
         notifications: SubscriptionFilter,
         limits: sse::SseLimits,
     ) -> Result<ModernHttpSubscriptionListenCollector, HttpClientError> {
-        if cx.checkpoint().is_err() {
-            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
-        }
-        let request_id = self.next_request_id()?;
-        let collector = self
-            .connection
-            .listen_subscriptions_typed(cx, request_id, notifications, limits)
+        self.open_subscriptions_listener(cx, notifications, limits)
+            .await?
+            .collect(cx)
             .await
-            .map_err(HttpClientError::Connection)?;
-        self.apply_final_cache_subscription_invalidations(&collector.notifications);
-        Ok(collector)
-    }
-
-    fn apply_final_cache_subscription_invalidations(
-        &mut self,
-        notifications: &[ServerNotification],
-    ) {
-        for notification in notifications {
-            if matches!(
-                notification,
-                ServerNotification::ResourcesListChanged(_)
-                    | ServerNotification::ToolsListChanged(_)
-                    | ServerNotification::PromptsListChanged(_)
-                    | ServerNotification::ResourceUpdated(_)
-            ) {
-                self.final_result_cache
-                    .invalidate_notification(notification);
-            }
-        }
     }
 
     fn core_request_parameters(
@@ -4666,6 +4909,9 @@ pub struct Client {
     responses: ResponseRegistry,
     /// Exact non-progress notifications received from a modern server.
     final_server_notifications: VecDeque<ServerNotification>,
+    /// Exact progress notifications received from a modern server without
+    /// converting their JSON numbers to legacy `f64` values.
+    final_progress_notifications: VecDeque<FinalProgressNotificationParams>,
     /// Bounded final complete-result cache scoped to this client connection.
     final_result_cache: FinalResultCache,
     /// Bounded compatibility diagnostics for immediately-stale peer TTLs.
@@ -4985,7 +5231,8 @@ impl Client {
 
         let (transport, response_sender) = transport.into_split();
         let response_sender = Arc::new(Mutex::new(response_sender));
-        let reverse_callback_pool = ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
+        let reverse_callback_pool =
+            ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
 
         // Create a temporary client for initialization
         let mut client = Self {
@@ -5013,6 +5260,7 @@ impl Client {
             next_id: AtomicU64::new(1),
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            final_progress_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
             final_cache_ttl_diagnostics: VecDeque::new(),
             last_core_result_receipt: None,
@@ -5121,7 +5369,8 @@ impl Client {
     ) -> Self {
         let (transport, response_sender) = transport.into_split();
         let response_sender = Arc::new(Mutex::new(response_sender));
-        let reverse_callback_pool = ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
+        let reverse_callback_pool =
+            ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
         Self {
             child: Some(child),
             group_anchor,
@@ -5136,6 +5385,7 @@ impl Client {
             next_id: AtomicU64::new(2), // Start at 2 since initialize used 1
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            final_progress_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
             final_cache_ttl_diagnostics: VecDeque::new(),
             last_core_result_receipt: None,
@@ -5182,7 +5432,8 @@ impl Client {
     ) -> Self {
         let (transport, response_sender) = transport.into_split();
         let response_sender = Arc::new(Mutex::new(response_sender));
-        let reverse_callback_pool = ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
+        let reverse_callback_pool =
+            ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
         Self {
             child: Some(child),
             group_anchor,
@@ -5197,6 +5448,7 @@ impl Client {
             next_id: AtomicU64::new(1), // Start at 1 since initialize hasn't happened
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            final_progress_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
             final_cache_ttl_diagnostics: VecDeque::new(),
             last_core_result_receipt: None,
@@ -5350,42 +5602,6 @@ impl Client {
         self.initialized.load(Ordering::SeqCst)
     }
 
-    fn checkpoint_task_poll(&mut self) -> McpResult<()> {
-        if self.cx.checkpoint().is_err() {
-            return Err(self.terminate_connection(McpError::request_cancelled()));
-        }
-        Ok(())
-    }
-
-    /// Performs a bounded blocking wait at this client's synchronous stdio
-    /// host boundary.
-    ///
-    /// The short slices are intentional: the pinned runtime does not expose a
-    /// public cancellation-waker bridge for an arbitrary stored `Cx`. Each
-    /// slice therefore re-enters the authoritative client context checkpoint
-    /// instead of consulting an unrelated ambient runtime.
-    fn wait_for_next_task_poll(&mut self, interval: Duration) -> McpResult<()> {
-        self.checkpoint_task_poll()?;
-        let interval = validate_task_poll_interval(interval)?;
-        let deadline = Instant::now().checked_add(interval).ok_or_else(|| {
-            McpError::invalid_params("Task poll interval exceeds the monotonic clock range")
-        })?;
-
-        loop {
-            self.checkpoint_task_poll()?;
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return self.checkpoint_task_poll();
-            }
-
-            let mut slice = remaining.min(MAX_TASK_POLL_CANCEL_SLICE);
-            if let Some(until_budget_deadline) = self.cx.budget().remaining_time(self.cx.now()) {
-                slice = slice.min(until_budget_deadline);
-            }
-            std::thread::park_timeout(slice);
-        }
-    }
-
     /// Returns the server info after initialization.
     #[must_use]
     pub fn server_info(&self) -> &ServerInfo {
@@ -5396,6 +5612,32 @@ impl Client {
     #[must_use]
     pub const fn mcp_apps_active(&self) -> bool {
         self.session.mcp_apps_active()
+    }
+
+    /// Starts one browser-agnostic Apps Host after successful Apps negotiation.
+    /// This never alters the MCP client/server RPC dispatcher.
+    pub fn mcp_apps_host<T, P>(
+        &self,
+        transport: T,
+        configuration: McpAppsHostConfiguration,
+        policy: P,
+    ) -> Result<McpAppsHost<T, P>, McpAppsHostError>
+    where
+        T: McpAppsBridgeTransport,
+        P: McpAppsHostPolicy,
+    {
+        if !self.mcp_apps_active() {
+            return Err(McpAppsHostError::NotNegotiated);
+        }
+        let activation_proof = mcp_apps::McpAppsActivationProof::from_bilateral_activation(
+            self.mcp_apps_active(),
+        )?;
+        Ok(McpAppsHost::new_negotiated(
+            transport,
+            configuration,
+            policy,
+            activation_proof,
+        ))
     }
 
     /// Returns the server capabilities after initialization.
@@ -5435,14 +5677,24 @@ impl Client {
         self.session.selected_era()
     }
 
-    /// Drains final server notifications received during modern requests.
+    /// Drains non-progress final server notifications received during modern requests.
     ///
-    /// Progress notifications remain request-scoped and are delivered only to
-    /// the progress callback. Exact 2024-11-05 sessions never retain values in
-    /// this queue.
+    /// Use [`Self::take_final_progress_notifications`] to retrieve final
+    /// progress values without legacy `f64` conversion. Exact 2024-11-05
+    /// sessions never retain values in either queue.
     #[must_use]
     pub fn take_final_server_notifications(&mut self) -> Vec<ServerNotification> {
         self.final_server_notifications.drain(..).collect()
+    }
+
+    /// Drains exact final progress notifications received during modern requests.
+    ///
+    /// The returned [`FinalProgressNotificationParams`] preserve the original
+    /// JSON-number lexemes, so values such as `1e400` remain observable even
+    /// though the legacy [`ProgressCallback`] accepts only finite `f64` values.
+    #[must_use]
+    pub fn take_final_progress_notifications(&mut self) -> Vec<FinalProgressNotificationParams> {
+        self.final_progress_notifications.drain(..).collect()
     }
 
     /// Returns whether final complete-result caching is enabled for this client.
@@ -5515,7 +5767,10 @@ impl Client {
     /// Non-empty exact-2024 callback handlers must be configured through
     /// [`ClientBuilder::reverse_request_handlers`] before initialization so
     /// the advertised capabilities and callable methods cannot diverge.
-    pub fn set_reverse_request_handlers(&mut self, handlers: ReverseRequestHandlers) -> McpResult<()> {
+    pub fn set_reverse_request_handlers(
+        &mut self,
+        handlers: ReverseRequestHandlers,
+    ) -> McpResult<()> {
         if !handlers.is_empty() {
             return Err(McpError::invalid_params(
                 "Configure reverse request handlers with ClientBuilder before initialization",
@@ -5617,28 +5872,9 @@ impl Client {
     /// Returns an error when initialization, transport, envelope validation,
     /// or the server's ping response fails.
     pub fn ping(&mut self) -> McpResult<()> {
-        self.ensure_initialized()?;
-        match self.session.selected_era() {
-            Some(ProtocolEra::Modern2026) => {
-                // Final `ping` is an ordinary JSON-RPC request, not a core
-                // request/result-algebra member. It still carries final
-                // request metadata, but its acknowledgement must not be
-                // decoded through `FinalCoreResult`.
-                let params = self.prepare_request_parameters(serde_json::json!({}))?;
-                let _: serde_json::Value = self.send_prepared_request("ping", params)?.result;
-                Ok(())
-            }
-            Some(ProtocolEra::Legacy2024) => {
-                // Retain the exact legacy core admission and acknowledgement
-                // decoding path. In particular, this must never gain final
-                // request metadata just because a modern peer supports it.
-                let _: serde_json::Value = self.send_request("ping", serde_json::json!({}))?;
-                Ok(())
-            }
-            None => Err(McpError::internal_error(
-                "Client has no negotiated protocol era for ping",
-            )),
-        }
+        self.require_legacy_exact_result_session("ping")?;
+        let _: serde_json::Value = self.send_request("ping", serde_json::json!({}))?;
+        Ok(())
     }
 
     /// Generates the next request ID.
@@ -5920,9 +6156,11 @@ impl Client {
             return Ok(Some(ModernServerNotification::Retained));
         }
 
-        let notification = ServerNotification::decode(request).map_err(|error| {
-            McpError::invalid_request(format!("Invalid final server notification: {error}"))
-        })?;
+        let raw_params = self.last_received_raw_notification_params(request)?;
+        let notification = decode_final_server_notification(request, raw_params.as_deref())
+            .map_err(|error| {
+                McpError::invalid_request(format!("Invalid final server notification: {error}"))
+            })?;
 
         // Advance the matching generation before exposing the notification or
         // accepting a late fetch completion. A fetch captures its generation
@@ -5947,7 +6185,30 @@ impl Client {
             return Ok(Some(ModernServerNotification::Retained));
         };
 
+        if self.final_progress_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+            return Err(McpError::invalid_request(
+                FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+            ));
+        }
+        self.final_progress_notifications.push_back(progress.clone());
+
         Ok(Some(ModernServerNotification::Progress(progress)))
+    }
+
+    fn last_received_raw_notification_params(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> McpResult<Option<String>> {
+        if request.method != "notifications/progress" {
+            return Ok(None);
+        }
+        let frame = self.transport.last_received_frame().ok_or_else(|| {
+            McpError::invalid_request("Client lost the raw final progress notification frame")
+        })?;
+        let raw_params = raw_notification_params_from_frame(frame)?.ok_or_else(|| {
+            McpError::invalid_request("Final progress notification is missing raw params")
+        })?;
+        Ok(Some(raw_params))
     }
 
     /// Sends a request and waits for response.
@@ -7013,7 +7274,21 @@ impl Client {
                     }
 
                     if is_final_server_notification_method(&request) {
-                        let notification = match ServerNotification::decode(&request) {
+                        let raw_params = match self.last_received_raw_notification_params(&request)
+                        {
+                            Ok(raw_params) => raw_params,
+                            Err(_) => {
+                                return Err(self.terminate_connection(
+                                    subscription_listener_protocol_error(
+                                        "Subscription listener lost raw final notification params",
+                                    ),
+                                ));
+                            }
+                        };
+                        let notification = match decode_final_server_notification(
+                            &request,
+                            raw_params.as_deref(),
+                        ) {
                             Ok(notification) => notification,
                             Err(_) => {
                                 return Err(self.terminate_connection(
@@ -7330,6 +7605,35 @@ impl Client {
             meta: None,
         };
         self.send_typed_core_request("tools/call", params)
+    }
+
+    /// Calls a tool and, only when its first final result requires input,
+    /// performs one MRTR retry with caller-supplied responses.
+    ///
+    /// This emits at most two requests. Exact MCP 2024-11-05 results and
+    /// final complete or Tasks results are returned without invoking
+    /// `respond`. A second `input_required` result is returned rather than
+    /// retried again.
+    pub fn call_tool_with_mrtr_retry<F>(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+        respond: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        let retry_parameters = serde_json::json!({
+            "name": name,
+            "arguments": arguments.clone(),
+        });
+        let result = self.call_tool_typed(name, arguments)?;
+        let Some(input_required) = mrtr_input_required_for_method("tools/call", &result) else {
+            return Ok(result);
+        };
+        let retry =
+            mrtr_retry_parameters(retry_parameters, input_required, respond(input_required)?)?;
+        self.send_typed_core_request("tools/call", retry)
     }
 
     /// Calls a final tool with the official Tasks result surface enabled.
@@ -7669,6 +7973,7 @@ impl Client {
     ) -> McpResult<ReceivedJsonRpcResponse> {
         let expected_id = waiter.id.clone();
         let mut last_progress = None;
+        let mut last_final_progress = None;
 
         loop {
             if let Some(response) = waiter.try_response()? {
@@ -7749,26 +8054,46 @@ impl Client {
                     }
                     match self.retain_modern_server_notification(&request) {
                         Ok(Some(ModernServerNotification::Progress(progress))) => {
-                            if progress.progress.is_finite()
-                                && progress.total.is_none_or(f64::is_finite)
-                                && last_progress.is_none_or(|last| progress.progress > last)
+                            if last_final_progress
+                                .as_ref()
+                                .is_none_or(|last| progress.progress.cmp(last).is_gt())
                                 && progress.progress_token == *expected_marker
                             {
-                                if invoke_tool_progress_callback(
-                                    &mut *on_progress,
-                                    progress.progress,
-                                    progress.total,
-                                    progress.message.as_deref(),
-                                )
-                                .is_err()
+                                last_final_progress = Some(progress.progress.clone());
+                                let callback_progress = progress
+                                    .progress
+                                    .as_str()
+                                    .parse::<f64>()
+                                    .ok()
+                                    .filter(|value| value.is_finite());
+                                let callback_total =
+                                    progress.total.as_ref().map_or(Some(None), |total| {
+                                        total
+                                            .as_str()
+                                            .parse::<f64>()
+                                            .ok()
+                                            .filter(|value| value.is_finite())
+                                            .map(Some)
+                                    });
+                                if let (Some(callback_progress), Some(callback_total)) =
+                                    (callback_progress, callback_total)
                                 {
-                                    let error =
-                                        McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR);
-                                    return Err(
-                                        self.finish_committed_request_locally(&expected_id, error)
-                                    );
+                                    if invoke_tool_progress_callback(
+                                        &mut *on_progress,
+                                        callback_progress,
+                                        callback_total,
+                                        progress.message.as_deref(),
+                                    )
+                                    .is_err()
+                                    {
+                                        let error =
+                                            McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR);
+                                        return Err(self.finish_committed_request_locally(
+                                            &expected_id,
+                                            error,
+                                        ));
+                                    }
                                 }
-                                last_progress = Some(progress.progress);
                                 if timeout_policy.reset_idle_on_matching_progress
                                     && let Err(error) = deadlines.reset_idle_at(received_at)
                                 {
@@ -8084,6 +8409,29 @@ impl Client {
         )
     }
 
+    /// Reads a resource and, only when its first final result requires input,
+    /// performs one MRTR retry with caller-supplied responses.
+    ///
+    /// This emits at most two requests; see [`Self::call_tool_with_mrtr_retry`]
+    /// for the terminal-result behavior.
+    pub fn read_resource_with_mrtr_retry<F>(
+        &mut self,
+        uri: &str,
+        respond: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        let retry_parameters = serde_json::json!({ "uri": uri });
+        let result = self.read_resource_typed(uri)?;
+        let Some(input_required) = mrtr_input_required_for_method("resources/read", &result) else {
+            return Ok(result);
+        };
+        let retry =
+            mrtr_retry_parameters(retry_parameters, input_required, respond(input_required)?)?;
+        self.send_typed_core_request("resources/read", retry)
+    }
+
     /// Reads a resource and returns its exact MCP 2026-07-28 result payload.
     ///
     /// This retains final cache directives and resource open fields without a
@@ -8118,6 +8466,36 @@ impl Client {
             CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => Ok(result),
             _ => Err(unexpected_convenience_result("resources/read")),
         }
+    }
+
+    /// Subscribes to one resource through the exact MCP 2024-11-05 method.
+    ///
+    /// This legacy method has no final-era equivalent. A modern session is
+    /// rejected before serializing parameters, allocating an ID, or sending.
+    pub fn subscribe_resource_legacy(&mut self, uri: &str) -> McpResult<()> {
+        self.require_legacy_exact_result_session("resources/subscribe")?;
+        let _: serde_json::Value = self.send_request(
+            "resources/subscribe",
+            SubscribeResourceParams {
+                uri: uri.to_owned(),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Ends one resource subscription through the exact MCP 2024-11-05 method.
+    ///
+    /// This legacy method has no final-era equivalent. A modern session is
+    /// rejected before serializing parameters, allocating an ID, or sending.
+    pub fn unsubscribe_resource_legacy(&mut self, uri: &str) -> McpResult<()> {
+        self.require_legacy_exact_result_session("resources/unsubscribe")?;
+        let _: serde_json::Value = self.send_request(
+            "resources/unsubscribe",
+            UnsubscribeResourceParams {
+                uri: uri.to_owned(),
+            },
+        )?;
+        Ok(())
     }
 
     /// Reads a resource by URI.
@@ -8235,6 +8613,43 @@ impl Client {
             meta: None,
         };
         self.send_typed_core_request("prompts/get", params)
+    }
+
+    /// Gets a prompt and, only when its first final result requires input,
+    /// performs one MRTR retry with caller-supplied responses.
+    ///
+    /// This emits at most two requests; see [`Self::call_tool_with_mrtr_retry`]
+    /// for the terminal-result behavior.
+    pub fn get_prompt_with_mrtr_retry<F>(
+        &mut self,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        respond: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        let mut retry_parameters = serde_json::json!({ "name": name });
+        if !arguments.is_empty() {
+            let parameters = retry_parameters.as_object_mut().ok_or_else(|| {
+                McpError::internal_error("MRTR prompt parameters must remain an object")
+            })?;
+            parameters.insert(
+                "arguments".to_owned(),
+                serde_json::to_value(&arguments).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "MRTR prompt arguments could not serialize: {error}"
+                    ))
+                })?,
+            );
+        }
+        let result = self.get_prompt_typed(name, arguments)?;
+        let Some(input_required) = mrtr_input_required_for_method("prompts/get", &result) else {
+            return Ok(result);
+        };
+        let retry =
+            mrtr_retry_parameters(retry_parameters, input_required, respond(input_required)?)?;
+        self.send_typed_core_request("prompts/get", retry)
     }
 
     /// Gets a prompt and returns its exact MCP 2026-07-28 result payload.
@@ -8478,278 +8893,6 @@ impl Client {
         self.send_final_task_request(TASK_CANCEL, params)
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Task Management (Docket/SEP-1686)
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// Submits a background task for execution.
-    ///
-    /// # Arguments
-    ///
-    /// * `task_type` - The type of task to execute (e.g., "data_export", "batch_process")
-    /// * `input` - Task parameters as JSON
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the server doesn't support tasks, the request fails,
-    /// or the server returns a contradictory task snapshot. A contradictory
-    /// peer snapshot terminates the connection.
-    pub fn submit_task(
-        &mut self,
-        task_type: &str,
-        input: serde_json::Value,
-    ) -> McpResult<TaskInfo> {
-        self.ensure_initialized()?;
-        let params = SubmitTaskParams {
-            task_type: task_type.to_string(),
-            params: Some(input),
-        };
-        let result: SubmitTaskResult = self.send_request("tasks/submit", params)?;
-        if let Err(error) = validate_task_info(&result.task) {
-            return Err(self.terminate_connection(error));
-        }
-        Ok(result.task)
-    }
-
-    /// Lists tasks with optional status filter.
-    ///
-    /// # Arguments
-    ///
-    /// * `status` - Optional filter by task status
-    /// * `cursor` - Optional pagination cursor from previous response
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the server doesn't support tasks, the request fails,
-    /// or any returned task snapshot is contradictory. A contradictory peer
-    /// snapshot terminates the connection.
-    pub fn list_tasks(
-        &mut self,
-        status: Option<TaskStatus>,
-        cursor: Option<&str>,
-        limit: Option<u32>,
-    ) -> McpResult<ListTasksResult> {
-        self.ensure_initialized()?;
-        let params = ListTasksParams {
-            cursor: cursor.map(ToString::to_string),
-            limit,
-            status,
-        };
-        let result: ListTasksResult = self.send_request("tasks/list", params)?;
-        if let Some(error) = result
-            .tasks
-            .iter()
-            .find_map(|task| validate_task_info(task).err())
-        {
-            return Err(self.terminate_connection(error));
-        }
-        Ok(result)
-    }
-
-    /// Lists all tasks by following pagination cursors until exhaustion.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any request fails.
-    pub fn list_tasks_all(&mut self, status: Option<TaskStatus>) -> McpResult<Vec<TaskInfo>> {
-        self.ensure_initialized()?;
-        let mut all = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut budget = PaginationBudget::new();
-
-        loop {
-            budget.begin_page()?;
-            let result = self.list_tasks(status, cursor.as_deref(), Some(200))?;
-            budget.account_page(&result.tasks)?;
-            all.extend(result.tasks);
-            cursor = budget.admit_next_cursor(result.next_cursor)?;
-            if cursor.is_none() {
-                break;
-            }
-        }
-
-        Ok(all)
-    }
-
-    /// Gets detailed information about a specific task.
-    ///
-    /// # Arguments
-    ///
-    /// * `task_id` - The task ID to retrieve
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the task is not found, the request fails, or the
-    /// response contradicts the requested task or its terminal result. A
-    /// contradictory peer response terminates the connection.
-    pub fn get_task(&mut self, task_id: &str) -> McpResult<GetTaskResult> {
-        self.ensure_initialized()?;
-        let requested_id = TaskId::from_string(task_id);
-        let params = GetTaskParams {
-            id: requested_id.clone(),
-        };
-        let result = self.send_request("tasks/get", params)?;
-        if let Err(error) = validate_get_task_result(&requested_id, &result) {
-            return Err(self.terminate_connection(error));
-        }
-        Ok(result)
-    }
-
-    /// Cancels a running or pending task.
-    ///
-    /// # Arguments
-    ///
-    /// * `task_id` - The task ID to cancel
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the task cannot be cancelled, is already complete,
-    /// or the acknowledgement is contradictory. An accepted acknowledgement
-    /// is eventual and does not prove that the returned snapshot is terminal.
-    /// A contradictory peer acknowledgement terminates the connection.
-    pub fn cancel_task(&mut self, task_id: &str) -> McpResult<TaskInfo> {
-        self.cancel_task_with_reason(task_id, None)
-    }
-
-    /// Cancels a running or pending task with an optional reason.
-    ///
-    /// # Arguments
-    ///
-    /// * `task_id` - The task ID to cancel
-    /// * `reason` - Optional reason for the cancellation
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the task cannot be cancelled, is already complete,
-    /// or the acknowledgement is contradictory. An accepted acknowledgement
-    /// is eventual and does not prove that the returned snapshot is terminal.
-    /// A contradictory peer acknowledgement terminates the connection.
-    pub fn cancel_task_with_reason(
-        &mut self,
-        task_id: &str,
-        reason: Option<&str>,
-    ) -> McpResult<TaskInfo> {
-        self.ensure_initialized()?;
-        let requested_id = TaskId::from_string(task_id);
-        let params = CancelTaskParams {
-            id: requested_id.clone(),
-            reason: reason.map(ToString::to_string),
-        };
-        let result: CancelTaskResult = self.send_request("tasks/cancel", params)?;
-        if let Err(error) = validate_cancel_task_result(&requested_id, &result) {
-            return Err(self.terminate_connection(error));
-        }
-        if !result.cancelled {
-            return Err(McpError::invalid_request(
-                "Server did not accept the task cancellation request",
-            ));
-        }
-        Ok(result.task)
-    }
-
-    /// Waits for a task to complete by polling.
-    ///
-    /// This method polls the server at the specified interval until the task
-    /// reaches a terminal state (completed, failed, or cancelled).
-    ///
-    /// # Arguments
-    ///
-    /// * `task_id` - The task ID to wait for
-    /// * `poll_interval` - Local fallback between polls, from 1 ms through 5 minutes
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the local interval is outside the documented range
-    /// or polling or response validation fails. Failed and cancelled tasks are
-    /// returned as successful method outcomes with [`TaskResult::success`] set
-    /// to `false`.
-    pub fn wait_for_task(
-        &mut self,
-        task_id: &str,
-        poll_interval: Duration,
-    ) -> McpResult<TaskResult> {
-        let poll_interval = validate_task_poll_interval(poll_interval)?;
-        loop {
-            let result = self.get_task(task_id)?;
-
-            // Check if task is complete
-            if result.task.status.is_terminal() {
-                // If task has a result, return it
-                if let Some(task_result) = result.result {
-                    return Ok(task_result);
-                }
-
-                // Failed and cancelled tasks may carry only TaskInfo error details.
-                return Ok(TaskResult {
-                    id: result.task.id,
-                    success: false,
-                    data: None,
-                    error: result.task.error,
-                });
-            }
-
-            self.wait_for_next_task_poll(poll_interval)?;
-        }
-    }
-
-    /// Waits for a task with progress callback.
-    ///
-    /// Similar to `wait_for_task` but also provides progress information via callback.
-    ///
-    /// # Arguments
-    ///
-    /// * `task_id` - The task ID to wait for
-    /// * `poll_interval` - Local fallback between polls, from 1 ms through 5 minutes
-    /// * `on_progress` - Callback invoked with progress updates
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the local interval is outside the documented range
-    /// or polling, callback execution, or response validation fails. Failed
-    /// and cancelled tasks are returned as successful method outcomes with
-    /// [`TaskResult::success`] set to `false`.
-    pub fn wait_for_task_with_progress<F>(
-        &mut self,
-        task_id: &str,
-        poll_interval: Duration,
-        mut on_progress: F,
-    ) -> McpResult<TaskResult>
-    where
-        F: FnMut(f64, Option<&str>),
-    {
-        let poll_interval = validate_task_poll_interval(poll_interval)?;
-        loop {
-            let result = self.get_task(task_id)?;
-
-            // Report progress if available
-            if let Some(progress) = result.task.progress {
-                invoke_task_progress_callback(
-                    &mut on_progress,
-                    progress,
-                    result.task.message.as_deref(),
-                )?;
-            }
-
-            // Check if task is complete
-            if result.task.status.is_terminal() {
-                // If task has a result, return it
-                if let Some(task_result) = result.result {
-                    return Ok(task_result);
-                }
-
-                // Failed and cancelled tasks may carry only TaskInfo error details.
-                return Ok(TaskResult {
-                    id: result.task.id,
-                    success: false,
-                    data: None,
-                    error: result.task.error,
-                });
-            }
-
-            self.wait_for_next_task_poll(poll_interval)?;
-        }
-    }
-
     /// Closes the client connection and verifies bounded subprocess cleanup.
     ///
     /// Drop remains a best-effort safety net. Callers that need to prove that
@@ -8891,15 +9034,13 @@ mod tests {
             let _writer = worker_turn
                 .lock()
                 .expect("writer election lock remains valid");
+            let claimed =
+                worker_state.claim_response_if_open(&worker_request_id, &worker_cancellation);
+            if claimed {
+                worker_writes.fetch_add(1, Ordering::AcqRel);
+            }
             result_sender
-                .send(
-                    worker_state
-                        .send_if_open(&worker_request_id, &worker_cancellation, || {
-                            worker_writes.fetch_add(1, Ordering::AcqRel);
-                            Ok(())
-                        })
-                        .expect("test response send is successful"),
-                )
+                .send(claimed)
                 .expect("callback worker reports its terminal election");
         });
 
@@ -8938,26 +9079,25 @@ mod tests {
         let worker_cancellation = cancellation.clone();
 
         let worker = std::thread::spawn(move || {
-            worker_state
-                .send_if_open(&worker_request_id, &worker_cancellation, || {
-                    // This marks the modelled atomic write as committed before
-                    // permitting the reader to attempt its cancellation.
-                    write_started_sender
-                        .send(())
-                        .expect("test observes the committed write");
-                    release_write_receiver
-                        .recv()
-                        .expect("test releases the atomic write model");
-                    Ok(())
-                })
-                .expect("test response send is successful")
+            let claimed =
+                worker_state.claim_response_if_open(&worker_request_id, &worker_cancellation);
+            // The response is linearly elected before the potentially blocked
+            // protocol-sized write permits cancellation processing to race it.
+            write_started_sender
+                .send(())
+                .expect("test observes the committed response claim");
+            release_write_receiver
+                .recv()
+                .expect("test releases the protocol-sized write model");
+            claimed
         });
         write_started_receiver
             .recv()
             .expect("test observes the response write election");
         let cancel_state = Arc::clone(&state);
         let cancel_request_id = request_id.clone();
-        let cancellation_attempt = std::thread::spawn(move || cancel_state.cancel(&cancel_request_id));
+        let cancellation_attempt =
+            std::thread::spawn(move || cancel_state.cancel(&cancel_request_id));
         release_write_sender
             .send(())
             .expect("test completes the atomic write model");
@@ -8975,20 +9115,57 @@ mod tests {
         assert!(!cancellation.is_cancel_requested());
     }
 
-    fn task_info(id: &str, status: TaskStatus) -> TaskInfo {
-        TaskInfo {
-            id: TaskId::from_string(id),
-            task_type: "test".to_string(),
-            status,
-            progress: None,
-            message: None,
-            created_at: "2026-08-01T00:00:00Z".to_string(),
-            started_at: None,
-            completed_at: status
-                .is_terminal()
-                .then(|| "2026-08-01T00:00:01Z".to_string()),
-            error: None,
+    #[test]
+    fn unrecoverable_reverse_callback_write_failure_is_connection_terminal() {
+        let state = ReverseCallbackState::default();
+        let request_id = RequestId::Number(41);
+        let cancellation = state
+            .admit(&request_id)
+            .expect("callback is live before its write fails");
+        let failure =
+            McpError::internal_error("reverse callback write backpressure is unrecoverable");
+
+        state.fail_connection(failure.clone());
+
+        assert_eq!(state.terminal_error(), Some(failure));
+        assert!(
+            cancellation.is_cancel_requested(),
+            "a terminal write failure cancels every outstanding callback"
+        );
+        assert!(
+            state.admit(&RequestId::Number(42)).is_err(),
+            "a terminal write failure rejects all later callback admission"
+        );
+    }
+
+    #[test]
+    fn reverse_callback_admission_has_a_fixed_backpressure_bound() {
+        let state = ReverseCallbackState::default();
+        let mut admitted = Vec::new();
+        for id in 0..MAX_QUEUED_REVERSE_CALLBACKS {
+            admitted.push(
+                state
+                    .admit(&RequestId::Number(
+                        i64::try_from(id).expect("small test ID"),
+                    ))
+                    .expect("admission remains available through the exact bound"),
+            );
         }
+
+        let error = state
+            .admit(&RequestId::Number(
+                i64::try_from(MAX_QUEUED_REVERSE_CALLBACKS).expect("small overflow test ID"),
+            ))
+            .expect_err("one callback beyond the bound is rejected without queue growth");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(error.message, "Client reverse callback capacity exceeded");
+        state.cancel_all();
+        assert!(
+            admitted
+                .iter()
+                .all(ReverseRequestCancellation::is_cancel_requested),
+            "shutdown cancellation reaches every bounded admission"
+        );
     }
 
     #[cfg(unix)]
@@ -9173,20 +9350,31 @@ mod tests {
                 .contains("cached")
         );
 
-        let collected = http_test_runtime_block_on(client.listen_subscriptions_typed(
-            &cx,
-            SubscriptionFilter {
-                tools_list_changed: Some(true),
-                ..SubscriptionFilter::default()
-            },
-            sse::SseLimits::new(1_024, 8_192, 16).expect("explicit SSE bounds are nonzero"),
-        ));
+        let filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        let limits =
+            sse::SseLimits::new(1_024, 8_192, 16).expect("explicit SSE bounds are nonzero");
         if acknowledges_tools_list_changes {
-            let collector = collected.expect("accepted HTTP change event is returned");
+            let listener =
+                http_test_runtime_block_on(client.open_subscriptions_listener(&cx, filter, limits))
+                    .expect("public HTTP listener opens");
+            let mut listener = listener;
             assert!(matches!(
-                collector.notifications.as_slice(),
-                [ServerNotification::ToolsListChanged(None)]
+                http_test_runtime_block_on(listener.next_event(&cx))
+                    .expect("listener acknowledgement is accepted"),
+                Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })
             ));
+            assert!(matches!(
+                http_test_runtime_block_on(listener.next_event(&cx))
+                    .expect("accepted HTTP change event is yielded live"),
+                Some(ModernHttpSubscriptionListenEvent::Notification(
+                    ServerNotification::ToolsListChanged(None)
+                ))
+            ));
+            assert_eq!(listener.final_result_cache_stats().invalidations, 1);
+            drop(listener);
             let refreshed_result = http_test_runtime_block_on(client.request_final_core(
                 &cx,
                 "tools/list",
@@ -9203,13 +9391,25 @@ mod tests {
             assert_eq!(client.final_result_cache_stats().fills, 2);
             assert_eq!(client.final_result_cache_stats().invalidations, 1);
         } else {
-            let error = collected.expect_err("one omitted accepted-filter field rejects the event");
+            let listener =
+                http_test_runtime_block_on(client.open_subscriptions_listener(&cx, filter, limits))
+                    .expect("public HTTP listener opens before the planted filter mismatch");
+            let mut listener = listener;
+            assert!(matches!(
+                http_test_runtime_block_on(listener.next_event(&cx))
+                    .expect("empty acknowledgement itself is admitted"),
+                Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+            ));
+            let error = http_test_runtime_block_on(listener.next_event(&cx))
+                .expect_err("one omitted accepted-filter field rejects the event");
             assert!(matches!(
                 error,
                 HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(
                     http_executor::ModernHttpSubscriptionListenError::EventOutsideAcceptedFilter
                 ))
             ));
+            assert_eq!(listener.final_result_cache_stats().invalidations, 0);
+            drop(listener);
             let cached_result = http_test_runtime_block_on(client.request_final_core(
                 &cx,
                 "tools/list",
@@ -9655,7 +9855,9 @@ mod tests {
         let mut initialized = make_closed_client(true);
         assert!(initialized.is_initialized());
         assert!(initialized.response_sender.lock().is_ok());
-        initialized.close().expect("initialized constructor cleanup");
+        initialized
+            .close()
+            .expect("initialized constructor cleanup");
 
         let mut uninitialized = make_closed_client(false);
         assert!(!uninitialized.is_initialized());
@@ -10522,7 +10724,10 @@ mod tests {
             Duration::from_secs(2),
             handlers,
         );
-        assert_eq!(client.selected_protocol_era(), Some(ProtocolEra::Legacy2024));
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(ProtocolEra::Legacy2024)
+        );
 
         let result: serde_json::Value = client
             .send_request("test/reverse-handlers", serde_json::json!({}))
@@ -10543,11 +10748,7 @@ mod tests {
     fn reverse_callback_cancellation_after_handler_lock_prevents_invocation() {
         let invoked = Arc::new(AtomicBool::new(false));
         let handler: Arc<
-            Mutex<
-                Box<
-                    dyn FnMut(ReverseRequestCancellation, ()) -> McpResult<()> + Send,
-                >,
-            >,
+            Mutex<Box<dyn FnMut(ReverseRequestCancellation, ()) -> McpResult<()> + Send>>,
         > = Arc::new(Mutex::new(Box::new({
             let invoked = Arc::clone(&invoked);
             move |_cancellation, ()| {
@@ -10555,7 +10756,9 @@ mod tests {
                 Ok(())
             }
         })));
-        let handler_lock = handler.lock().expect("hold the handler before worker acquisition");
+        let handler_lock = handler
+            .lock()
+            .expect("hold the handler before worker acquisition");
         let cancellation = ReverseRequestCancellation::new();
         let worker_handler = Arc::clone(&handler);
         let worker_cancellation = cancellation.clone();
@@ -10589,11 +10792,10 @@ mod tests {
             IFS= read -r ping; \
             case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":3'*) ping_ok=true;; *) ping_ok=false;; esac; \
             printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"aligned\":%s}}\\n' \"$ping_ok\"; exec sleep 2";
-        let handlers = ReverseRequestHandlers::new().with_sampling_create_message(
-            |_cancellation, _params| {
+        let handlers =
+            ReverseRequestHandlers::new().with_sampling_create_message(|_cancellation, _params| {
                 Ok(CreateMessageResult::text("x".repeat(2_048), "large-model"))
-            },
-        );
+            });
         let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
             script,
             Duration::from_secs(2),
@@ -10647,7 +10849,10 @@ mod tests {
         while !started.load(Ordering::Acquire) && Instant::now() < start_deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(started.load(Ordering::Acquire), "callback must be running before shutdown");
+        assert!(
+            started.load(Ordering::Acquire),
+            "callback must be running before shutdown"
+        );
 
         let close_started = Instant::now();
         let error = client
@@ -10845,14 +11050,13 @@ mod tests {
             \"$sampling_ok\" \"$roots_missing\"; exec sleep 2";
         let sampling_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let roots_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let handlers = ReverseRequestHandlers::new()
-            .with_sampling_create_message({
-                let sampling_calls = std::sync::Arc::clone(&sampling_calls);
-                move |_cancellation, _params| {
-                    sampling_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(CreateMessageResult::text("handled", "handler-model"))
-                }
-            });
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+            let sampling_calls = std::sync::Arc::clone(&sampling_calls);
+            move |_cancellation, _params| {
+                sampling_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(CreateMessageResult::text("handled", "handler-model"))
+            }
+        });
         let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
             script,
             Duration::from_secs(2),
@@ -11341,7 +11545,7 @@ mod tests {
     }
 
     #[test]
-    fn server_ping_request_receives_success_response() {
+    fn initializing_server_ping_request_is_not_serviced_before_era_selection() {
         let request = JsonRpcRequest::new("ping", None, "server-ping");
         let response = server_request_response(&request).expect("ping request has an ID");
         let JsonRpcMessage::Response(response) = response else {
@@ -11352,8 +11556,11 @@ mod tests {
             response.id,
             Some(RequestId::String("server-ping".to_string()))
         );
-        assert_eq!(response.result, Some(serde_json::json!({})));
-        assert!(response.error.is_none());
+        assert!(response.result.is_none());
+        assert!(matches!(
+            response.error,
+            Some(error) if error.code == i32::from(McpErrorCode::MethodNotFound)
+        ));
     }
 
     #[test]
@@ -11618,6 +11825,41 @@ mod tests {
         ] {
             assert!(parse_valid_client_progress(&invalid, None).is_none());
         }
+    }
+
+    #[test]
+    fn modern_progress_ingress_retains_decimal_and_exponent_lexemes() {
+        let frame = br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"exact","progress":1.20e+4,"total":12000.0}}"#;
+        let request: JsonRpcRequest =
+            serde_json::from_slice(frame).expect("modern progress frame decodes structurally");
+        let raw_params = raw_notification_params_from_frame(frame)
+            .expect("client retains the exact notification params source")
+            .expect("modern progress has params");
+        let notification = decode_final_server_notification(&request, Some(&raw_params))
+            .expect("exact decimal and exponent progress are admitted on client ingress");
+        let ServerNotification::Progress(params) = notification else {
+            panic!("modern progress frame selects the exact final progress branch");
+        };
+        assert_eq!(params.progress.as_str(), "1.20e+4");
+        assert_eq!(
+            params.total.as_ref().map(|total| total.as_str()),
+            Some("12000.0")
+        );
+    }
+
+    #[test]
+    fn modern_progress_ingress_rejects_total_below_progress() {
+        let frame = br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"exact","progress":1.20e+4,"total":11999.0}}"#;
+        let request: JsonRpcRequest = serde_json::from_slice(frame)
+            .expect("one-variable over-total frame decodes structurally");
+        let raw_params = raw_notification_params_from_frame(frame)
+            .expect("client retains the exact notification params source")
+            .expect("modern progress has params");
+
+        assert!(
+            decode_final_server_notification(&request, Some(&raw_params)).is_err(),
+            "changing only total below progress rejects modern final progress on ingress"
+        );
     }
 
     #[test]
@@ -11998,19 +12240,6 @@ mod tests {
         assert_eq!(callback_error.message, PROGRESS_CALLBACK_PANIC_ERROR);
         assert!(!callback_error.message.contains(panic_canary));
         assert!(!callback_error.message.chars().any(char::is_control));
-    }
-
-    #[test]
-    fn panicked_task_progress_callback_returns_fixed_safe_error() {
-        let panic_canary = "TASK-PROGRESS-PANIC-SECRET\n";
-        let mut callback = |_progress: f64, _message: Option<&str>| {
-            panic!("{panic_canary}");
-        };
-        let error = invoke_task_progress_callback(&mut callback, 0.25, Some("peer message"))
-            .expect_err("callback panic must be contained");
-        assert_eq!(error.message, PROGRESS_CALLBACK_PANIC_ERROR);
-        assert!(!error.message.contains(panic_canary));
-        assert!(!error.message.contains("peer message"));
     }
 
     // ========================================
@@ -12626,379 +12855,6 @@ mod tests {
     }
 
     #[test]
-    fn local_task_poll_interval_has_explicit_bounds() {
-        assert!(validate_task_poll_interval(Duration::ZERO).is_err());
-        assert!(validate_task_poll_interval(Duration::from_nanos(1)).is_err());
-        assert_eq!(
-            validate_task_poll_interval(MIN_TASK_POLL_INTERVAL).unwrap(),
-            MIN_TASK_POLL_INTERVAL
-        );
-        assert_eq!(
-            validate_task_poll_interval(Duration::from_millis(25)).unwrap(),
-            Duration::from_millis(25)
-        );
-        assert_eq!(
-            validate_task_poll_interval(MAX_LOCAL_TASK_POLL_INTERVAL).unwrap(),
-            MAX_LOCAL_TASK_POLL_INTERVAL
-        );
-        assert!(
-            validate_task_poll_interval(MAX_LOCAL_TASK_POLL_INTERVAL + Duration::from_nanos(1))
-                .is_err()
-        );
-        assert!(validate_task_poll_interval(Duration::MAX).is_err());
-    }
-
-    #[test]
-    fn invalid_local_poll_interval_is_rejected_before_a_task_request() {
-        let mut client = make_closed_client(true);
-
-        let error = client
-            .wait_for_task("task", Duration::ZERO)
-            .expect_err("zero would permit a busy polling loop");
-
-        assert_eq!(error.code, McpErrorCode::InvalidParams);
-        assert_eq!(client.next_id.load(Ordering::SeqCst), 2);
-        assert!(client.is_initialized());
-        assert!(client.responses.terminal_error().is_none());
-    }
-
-    #[test]
-    fn task_info_validation_rejects_semantic_contradictions() {
-        for invalid_progress in [f64::NAN, f64::INFINITY, -0.01, 1.01] {
-            let mut task = task_info("task", TaskStatus::Running);
-            task.progress = Some(invalid_progress);
-            assert!(validate_task_info(&task).is_err());
-        }
-
-        let mut pending_with_start = task_info("task", TaskStatus::Pending);
-        pending_with_start.started_at = Some("2026-08-01T00:00:01Z".to_string());
-        assert!(validate_task_info(&pending_with_start).is_err());
-
-        let mut active_with_completion = task_info("task", TaskStatus::Running);
-        active_with_completion.completed_at = Some("2026-08-01T00:00:01Z".to_string());
-        assert!(validate_task_info(&active_with_completion).is_err());
-
-        let mut completed_with_error = task_info("task", TaskStatus::Completed);
-        completed_with_error.error = Some("contradictory failure".to_string());
-        assert!(validate_task_info(&completed_with_error).is_err());
-
-        let mut failed_with_error = task_info("task", TaskStatus::Failed);
-        failed_with_error.error = Some("failed".to_string());
-        assert!(validate_task_info(&failed_with_error).is_ok());
-
-        let mut cancelled_with_reason = task_info("task", TaskStatus::Cancelled);
-        cancelled_with_reason.error = Some("cancelled by caller".to_string());
-        assert!(validate_task_info(&cancelled_with_reason).is_ok());
-    }
-
-    #[test]
-    fn task_result_validation_rejects_payload_status_contradictions() {
-        let completed = task_info("task", TaskStatus::Completed);
-        let success_with_error = TaskResult {
-            id: completed.id.clone(),
-            success: true,
-            data: None,
-            error: Some("contradictory error".to_string()),
-        };
-        assert!(validate_task_result(&completed, &success_with_error).is_err());
-
-        let failed = task_info("task", TaskStatus::Failed);
-        let failure_with_data = TaskResult {
-            id: failed.id.clone(),
-            success: false,
-            data: Some(serde_json::json!({"partial": true})),
-            error: Some("failed".to_string()),
-        };
-        assert!(validate_task_result(&failed, &failure_with_data).is_err());
-
-        let mut cancelled = task_info("task", TaskStatus::Cancelled);
-        cancelled.error = Some("cancelled by caller".to_string());
-        let cancelled_result = TaskResult {
-            id: cancelled.id.clone(),
-            success: false,
-            data: None,
-            error: Some("cancelled by caller".to_string()),
-        };
-        assert!(validate_task_result(&cancelled, &cancelled_result).is_ok());
-    }
-
-    #[test]
-    fn get_task_validation_rejects_cross_task_and_contradictory_results() {
-        let requested = TaskId::from_string("requested");
-        let wrong_task = GetTaskResult {
-            task: task_info("different", TaskStatus::Completed),
-            result: None,
-        };
-        assert!(validate_get_task_result(&requested, &wrong_task).is_err());
-
-        let wrong_result = GetTaskResult {
-            task: task_info("requested", TaskStatus::Completed),
-            result: Some(TaskResult {
-                id: TaskId::from_string("different"),
-                success: true,
-                data: None,
-                error: None,
-            }),
-        };
-        assert!(validate_get_task_result(&requested, &wrong_result).is_err());
-
-        let premature_result = GetTaskResult {
-            task: task_info("requested", TaskStatus::Running),
-            result: Some(TaskResult {
-                id: requested.clone(),
-                success: true,
-                data: None,
-                error: None,
-            }),
-        };
-        assert!(validate_get_task_result(&requested, &premature_result).is_err());
-
-        let contradictory_success = GetTaskResult {
-            task: task_info("requested", TaskStatus::Failed),
-            result: Some(TaskResult {
-                id: requested.clone(),
-                success: true,
-                data: None,
-                error: Some("failed".to_string()),
-            }),
-        };
-        assert!(validate_get_task_result(&requested, &contradictory_success).is_err());
-
-        let completed_without_result = GetTaskResult {
-            task: task_info("requested", TaskStatus::Completed),
-            result: None,
-        };
-        assert!(validate_get_task_result(&requested, &completed_without_result).is_err());
-
-        let failed_without_result = GetTaskResult {
-            task: task_info("requested", TaskStatus::Failed),
-            result: None,
-        };
-        assert!(validate_get_task_result(&requested, &failed_without_result).is_ok());
-
-        let valid = GetTaskResult {
-            task: task_info("requested", TaskStatus::Cancelled),
-            result: Some(TaskResult {
-                id: requested.clone(),
-                success: false,
-                data: None,
-                error: Some("cancelled".to_string()),
-            }),
-        };
-        assert!(validate_get_task_result(&requested, &valid).is_ok());
-    }
-
-    #[test]
-    fn cancel_task_validation_correlates_id_without_inventing_finality() {
-        let requested = TaskId::from_string("requested");
-        let wrong_task = CancelTaskResult {
-            cancelled: true,
-            task: task_info("different", TaskStatus::Cancelled),
-        };
-        assert!(validate_cancel_task_result(&requested, &wrong_task).is_err());
-
-        let false_acknowledgement = CancelTaskResult {
-            cancelled: false,
-            task: task_info("requested", TaskStatus::Running),
-        };
-        assert!(validate_cancel_task_result(&requested, &false_acknowledgement).is_ok());
-
-        let already_cancelled = CancelTaskResult {
-            cancelled: false,
-            task: task_info("requested", TaskStatus::Cancelled),
-        };
-        assert!(validate_cancel_task_result(&requested, &already_cancelled).is_ok());
-
-        let eventual_acknowledgement = CancelTaskResult {
-            cancelled: true,
-            task: task_info("requested", TaskStatus::Running),
-        };
-        assert!(validate_cancel_task_result(&requested, &eventual_acknowledgement).is_ok());
-
-        let accepted = CancelTaskResult {
-            cancelled: true,
-            task: task_info("requested", TaskStatus::Cancelled),
-        };
-        assert!(validate_cancel_task_result(&requested, &accepted).is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn get_task_protocol_violation_terminates_the_connection() {
-        let response = JsonRpcMessage::Response(JsonRpcResponse::success(
-            RequestId::Number(2),
-            serde_json::to_value(GetTaskResult {
-                task: task_info("requested", TaskStatus::Completed),
-                result: None,
-            })
-            .expect("serialize invalid tasks/get result"),
-        ));
-        let mut client = make_scripted_initialized_client(response);
-
-        let error = client
-            .get_task("requested")
-            .expect_err("a completed task without its result must fail closed");
-
-        assert_eq!(error.code, McpErrorCode::InvalidRequest);
-        assert!(!client.is_initialized());
-        assert!(client.child.is_none());
-        assert!(client.responses.terminal_error().is_some());
-        let later = client
-            .get_task("requested")
-            .expect_err("a protocol violation permanently closes the connection");
-        assert_eq!(later.code, error.code);
-        assert_eq!(later.message, error.message);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn accepted_task_cancellation_does_not_invent_terminal_state() {
-        let response = JsonRpcMessage::Response(JsonRpcResponse::success(
-            RequestId::Number(2),
-            serde_json::to_value(CancelTaskResult {
-                cancelled: true,
-                task: task_info("requested", TaskStatus::Running),
-            })
-            .expect("serialize invalid tasks/cancel result"),
-        ));
-        let mut client = make_scripted_initialized_client(response);
-
-        let task = client
-            .cancel_task("requested")
-            .expect("an eventual acknowledgement may retain a running snapshot");
-
-        assert_eq!(task.status, TaskStatus::Running);
-        assert!(client.is_initialized());
-        assert!(client.child.is_some());
-        assert!(client.responses.terminal_error().is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rejected_task_cancellation_is_an_error_without_closing_the_connection() {
-        let response = JsonRpcMessage::Response(JsonRpcResponse::success(
-            RequestId::Number(2),
-            serde_json::to_value(CancelTaskResult {
-                cancelled: false,
-                task: task_info("requested", TaskStatus::Running),
-            })
-            .expect("serialize rejected tasks/cancel result"),
-        ));
-        let mut client = make_scripted_initialized_client(response);
-
-        let error = client
-            .cancel_task("requested")
-            .expect_err("a rejected cancellation cannot be returned as success");
-
-        assert_eq!(error.code, McpErrorCode::InvalidRequest);
-        assert!(client.is_initialized());
-        assert!(client.child.is_some());
-        assert!(client.responses.terminal_error().is_none());
-    }
-
-    #[test]
-    fn task_poll_wait_observes_preexisting_cancellation() {
-        let mut client = make_closed_client(true);
-        client.cx.set_cancel_requested(true);
-
-        let error = client
-            .wait_for_next_task_poll(Duration::ZERO)
-            .expect_err("a cancelled client must not enter the polling delay");
-
-        assert_eq!(error.code, McpErrorCode::RequestCancelled);
-        assert!(!client.is_initialized());
-        assert!(client.child.is_none());
-        assert!(client.responses.terminal_error().is_some());
-    }
-
-    #[test]
-    fn task_poll_wait_observes_all_stored_context_budget_exhaustion() {
-        for budget in [
-            asupersync::Budget::new().with_poll_quota(0),
-            asupersync::Budget::new().with_cost_quota(0),
-        ] {
-            let cx = Cx::for_testing_with_budget(budget);
-            let mut client = make_closed_client_with_cx(true, cx);
-
-            let error = client
-                .wait_for_next_task_poll(Duration::from_secs(1))
-                .expect_err("an exhausted client context must reject polling");
-
-            assert_eq!(error.code, McpErrorCode::RequestCancelled);
-            assert!(!client.is_initialized());
-            assert!(client.child.is_none());
-            assert!(client.responses.terminal_error().is_some());
-        }
-    }
-
-    #[test]
-    fn task_poll_wait_caps_wall_blocking_to_stored_context_deadline() {
-        let clock = Cx::for_testing();
-        let deadline = clock.now().saturating_add_nanos(20_000_000);
-        let cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(deadline));
-        let mut client = make_closed_client_with_cx(true, cx);
-        let started = Instant::now();
-
-        let error = client
-            .wait_for_next_task_poll(Duration::from_secs(1))
-            .expect_err("the client deadline must interrupt a longer poll interval");
-
-        assert_eq!(error.code, McpErrorCode::RequestCancelled);
-        assert!(started.elapsed() < Duration::from_millis(500));
-        assert!(!client.is_initialized());
-    }
-
-    #[test]
-    fn task_poll_wait_observes_cross_thread_client_cancellation() {
-        let cx = Cx::for_testing();
-        let canceller = cx.clone();
-        let mut client = make_closed_client_with_cx(true, cx);
-        let thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            canceller.set_cancel_requested(true);
-        });
-        let started = Instant::now();
-
-        let error = client
-            .wait_for_next_task_poll(Duration::from_secs(1))
-            .expect_err("client cancellation must interrupt the poll wait");
-
-        thread.join().expect("canceller thread");
-        assert_eq!(error.code, McpErrorCode::RequestCancelled);
-        assert!(started.elapsed() < Duration::from_millis(500));
-        assert!(!client.is_initialized());
-    }
-
-    #[test]
-    fn task_poll_wait_ignores_unrelated_ambient_context() {
-        let mut client = make_closed_client_with_cx(true, Cx::for_testing());
-        let ambient = Cx::for_testing();
-        ambient.set_cancel_requested(true);
-        let _ambient_guard = Cx::set_current(Some(ambient));
-
-        client
-            .wait_for_next_task_poll(Duration::from_millis(1))
-            .expect("only the stored client context controls polling");
-
-        assert!(client.is_initialized());
-        assert!(client.child.is_some());
-    }
-
-    #[test]
-    fn out_of_policy_task_poll_interval_is_non_terminal_input_error() {
-        let mut client = make_closed_client(true);
-
-        let error = client
-            .wait_for_next_task_poll(Duration::MAX)
-            .expect_err("an excessive local fallback interval must be rejected");
-
-        assert_eq!(error.code, McpErrorCode::InvalidParams);
-        assert!(client.is_initialized());
-        assert!(client.child.is_some());
-        assert!(client.responses.terminal_error().is_none());
-    }
-
-    #[test]
     fn client_close_wakes_registered_waiter_before_transport_teardown() {
         let mut client = make_closed_client(true);
         let mut waiter = client
@@ -13208,45 +13064,6 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("name".to_string(), "world".to_string());
         assert!(client.get_prompt("greeting", args).is_err());
-
-        assert!(
-            client
-                .submit_task("data_export", serde_json::json!({"batch": 1}))
-                .is_err()
-        );
-        assert!(
-            client
-                .list_tasks(Some(TaskStatus::Running), Some("c1"), Some(10))
-                .is_err()
-        );
-        assert!(client.list_tasks_all(None).is_err());
-        assert!(client.get_task("task-1").is_err());
-        assert!(client.cancel_task("task-1").is_err());
-        assert!(
-            client
-                .cancel_task_with_reason("task-1", Some("no longer needed"))
-                .is_err()
-        );
-        assert!(
-            client
-                .wait_for_task("task-1", Duration::from_millis(1))
-                .is_err()
-        );
-
-        let mut task_progress = Vec::new();
-        let mut on_task_progress = |p: f64, msg: Option<&str>| {
-            task_progress.push((p, msg.map(ToString::to_string)));
-        };
-        assert!(
-            client
-                .wait_for_task_with_progress(
-                    "task-1",
-                    Duration::from_millis(1),
-                    &mut on_task_progress
-                )
-                .is_err()
-        );
-        assert!(task_progress.is_empty());
     }
 
     #[test]
@@ -13560,6 +13377,24 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_mrtr_retry_client_script(method: &str, complete_result: &str) -> String {
+        let discovery_response =
+            modern_discovery_response("mrtr-retry-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r initial || exit 1; \
+             case \"$initial\" in *{method}*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"input_required\",\"inputRequests\":{{\"roots\":{{\"method\":\"roots/list\"}}}},\"requestState\":\"retry-1\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r retry || exit 1; \
+             case \"$retry\" in *{method}*'\"inputResponses\":{{\"roots\":{{\"roots\":[]}}}}'*'\"requestState\":\"retry-1\"'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{complete_result}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
     fn modern_progress_client_script(call_response: &str) -> String {
         let discovery_response =
             modern_discovery_response("progress-modern-server", &[MODERN_PROTOCOL_VERSION]);
@@ -13587,6 +13422,25 @@ mod tests {
              case \"$request\" in *tools/call*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{notification}'; \
              printf '%s\\n' '{call_response}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_reverse_ping_client_script() -> String {
+        let discovery_response =
+            modern_discovery_response("reverse-ping-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r call || exit 1; \
+             case \"$call\" in *tools/call*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":\"server-ping\",\"method\":\"ping\"}}'; \
+             IFS= read -r reverse_response || exit 1; \
+             case \"$reverse_response\" in *'\"id\":\"server-ping\"'*'\"code\":-32601'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"reverse ping rejected\"}}],\"isError\":false}}}}' ;; *) exit 1 ;; esac \
+             ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -13907,6 +13761,38 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn legacy_reverse_ping_client_script() -> &'static str {
+        "IFS= read -r first || exit 1; \
+         case \"$first\" in *initialize*2024-11-05*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-reverse-ping-server\",\"version\":\"1.0.0\"}}}' ;; *) exit 1 ;; esac; \
+         IFS= read -r lifecycle || exit 1; \
+         case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+         IFS= read -r client_ping || exit 1; \
+         case \"$client_ping\" in *ping*io.modelcontextprotocol/*|*ping*io.modelcontextprotocol/clientCapabilities*) exit 1 ;; \
+         *ping*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"server-ping\",\"method\":\"ping\"}'; ;; *) exit 1 ;; esac; \
+         IFS= read -r reverse_response || exit 1; \
+         case \"$reverse_response\" in *'\"id\":\"server-ping\"'*'\"result\":{}'*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac; \
+         exec sleep 2"
+    }
+
+    #[cfg(unix)]
+    fn legacy_resource_subscription_client_script() -> &'static str {
+        "IFS= read -r first || exit 1; \
+         case \"$first\" in *initialize*2024-11-05*) \
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-resource-subscriptions\",\"version\":\"1.0.0\"}}}' ;; *) exit 1 ;; esac; \
+         IFS= read -r lifecycle || exit 1; \
+         case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+         IFS= read -r subscribe || exit 1; \
+         case \"$subscribe\" in *resources/subscribe*'\"uri\":\"resource://test\"'*io.modelcontextprotocol/*) exit 1 ;; \
+         *resources/subscribe*'\"uri\":\"resource://test\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac; \
+         IFS= read -r unsubscribe || exit 1; \
+         case \"$unsubscribe\" in *resources/unsubscribe*'\"uri\":\"resource://test\"'*io.modelcontextprotocol/*) exit 1 ;; \
+         *resources/unsubscribe*'\"uri\":\"resource://test\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}' ;; *) exit 1 ;; esac; \
+         exec sleep 2"
+    }
+
+    #[cfg(unix)]
     fn legacy_typed_call_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in *initialize*2024-11-05*) \
@@ -14077,15 +13963,12 @@ mod tests {
             Some(ProtocolEra::Modern2026)
         );
         assert_eq!(client.protocol_version(), MODERN_PROTOCOL_VERSION);
-        client
-            .ping()
-            .expect("modern execution sends per-request metadata after discovery");
         client.close().expect("modern client cleanup");
     }
 
     #[cfg(unix)]
     #[test]
-    fn clt_01_modern_ping_is_not_a_core_request() {
+    fn clt_01_modern_ping_rejects_before_request_mutation() {
         let modern_result =
             modern_discovery_response("modern-ping-server", &[MODERN_PROTOCOL_VERSION]);
         let script = modern_public_client_script(&modern_result);
@@ -14097,9 +13980,32 @@ mod tests {
         )
         .expect("modern discovery initializes the client");
 
-        client
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+        let error = client
             .ping()
-            .expect("the bare JSON-RPC acknowledgement must not decode as a final core result");
+            .expect_err("ping belongs exclusively to exact MCP 2024-11-05");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        assert!(client.is_initialized());
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_modern_server_ping_is_rejected_during_public_request() {
+        let script = modern_reverse_ping_client_script();
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+
+        let content = client
+            .call_tool("echo", serde_json::json!({"text": "reverse ping"}))
+            .expect("the modern peer observes method-not-found before its complete response");
+        assert_eq!(content.len(), 1);
         client.close().expect("modern client cleanup");
     }
 
@@ -14367,6 +14273,103 @@ mod tests {
             .expect_err("one changed result discriminator must fail the connection closed");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(!client.is_initialized());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_mrtr_retry_replays_tools_resources_and_prompts_once() {
+        let responses =
+            || BTreeMap::from([("roots".to_owned(), serde_json::json!({ "roots": [] }))]);
+
+        let script = modern_mrtr_retry_client_script(
+            "tools/call",
+            r#"{"resultType":"complete","content":[],"isError":false}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the MRTR tool client");
+        assert!(matches!(
+            client
+                .call_tool_with_mrtr_retry("retry-tool", serde_json::json!({}), |_| {
+                    Ok(responses())
+                })
+                .expect("one final input-required tool result is retried once"),
+            CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+        ));
+        client.close().expect("MRTR tool client cleanup");
+
+        let script = modern_mrtr_retry_client_script(
+            "resources/read",
+            r#"{"resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the MRTR resource client");
+        assert!(matches!(
+            client
+                .read_resource_with_mrtr_retry("file:///retry.txt", |_| Ok(responses()))
+                .expect("one final input-required resource result is retried once"),
+            CoreResult::Final(FinalCoreResult::ResourcesRead { .. })
+        ));
+        client.close().expect("MRTR resource client cleanup");
+
+        let script = modern_mrtr_retry_client_script(
+            "prompts/get",
+            r#"{"resultType":"complete","messages":[]}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the MRTR prompt client");
+        assert!(matches!(
+            client
+                .get_prompt_with_mrtr_retry("retry-prompt", HashMap::new(), |_| Ok(responses()))
+                .expect("one final input-required prompt result is retried once"),
+            CoreResult::Final(FinalCoreResult::PromptsGet { .. })
+        ));
+        client.close().expect("MRTR prompt client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_mrtr_retry_rejects_one_unrequested_response_key_before_retry() {
+        let script = modern_mrtr_retry_client_script(
+            "tools/call",
+            r#"{"resultType":"complete","content":[],"isError":false}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes before the planted MRTR response key");
+
+        let error = client
+            .call_tool_with_mrtr_retry("retry-tool", serde_json::json!({}), |_| {
+                Ok(BTreeMap::from([(
+                    "other".to_owned(),
+                    serde_json::json!({ "roots": [] }),
+                )]))
+            })
+            .expect_err("changing only the response key rejects the retry before a second request");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            error.message,
+            "MRTR inputResponses contain a key not requested by the peer"
+        );
+        client.close().expect("planted MRTR response-key cleanup");
     }
 
     #[cfg(unix)]
@@ -15732,10 +15735,9 @@ mod tests {
         };
         assert!(diagnostic.is_none());
         assert_eq!(result.payload.completion.values, vec!["staging".to_owned()]);
-        let expected_total = serde_json::from_str::<JsonInteger>(
-            "922337203685477580812345678901234567890",
-        )
-        .expect("arbitrary-precision completion total is an exact JSON integer");
+        let expected_total =
+            serde_json::from_str::<JsonInteger>("922337203685477580812345678901234567890")
+                .expect("arbitrary-precision completion total is an exact JSON integer");
         assert_eq!(result.payload.completion.total, Some(expected_total));
         assert_eq!(result.payload.completion.has_more, Some(false));
         client.close().expect("modern client cleanup");
@@ -15876,6 +15878,78 @@ mod tests {
             vec![(0.5, Some(1.0), Some("modern progress".to_owned()))]
         );
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_final_progress_queue_preserves_decimal_exponent_positive() {
+        let script = modern_server_notification_client_script(
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":2,"progress":1e400,"total":1e401,"message":"exact progress"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the public client");
+        let mut legacy_progress = Vec::new();
+        let mut on_progress = |progress: f64, total: Option<f64>, message: Option<&str>| {
+            legacy_progress.push((progress, total, message.map(ToOwned::to_owned)));
+        };
+
+        client
+            .call_tool_with_progress(
+                "echo",
+                serde_json::json!({"text": "exact progress"}),
+                &mut on_progress,
+            )
+            .expect("an exact final progress value does not lose its following response");
+        assert!(
+            legacy_progress.is_empty(),
+            "the legacy f64 callback must not receive an unrepresentable value"
+        );
+
+        let progress = client.take_final_progress_notifications();
+        assert!(matches!(
+            progress.as_slice(),
+            [params]
+                if params.progress.as_str() == "1e400"
+                    && params.total.as_ref().is_some_and(|total| total.as_str() == "1e401")
+                    && params.message.as_deref() == Some("exact progress")
+        ));
+        assert!(client.take_final_progress_notifications().is_empty());
+        client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_final_progress_queue_rejects_total_below_progress() {
+        // This differs from the accepted exact-progress frame only in `total`.
+        let script = modern_server_notification_client_script(
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":2,"progress":1e400,"total":9e399,"message":"exact progress"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("same modern discovery initializes the public client");
+        let mut on_progress = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {};
+
+        let error = client
+            .call_tool_with_progress(
+                "echo",
+                serde_json::json!({"text": "exact progress"}),
+                &mut on_progress,
+            )
+            .expect_err("final progress greater than its total must fail the public request");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(client.take_final_progress_notifications().is_empty());
+        assert!(!client.is_initialized());
     }
 
     #[cfg(unix)]
@@ -16243,6 +16317,77 @@ mod tests {
             .ping()
             .expect("legacy ping keeps its core acknowledgement and omits final metadata");
         client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_server_ping_succeeds_during_public_request() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_reverse_ping_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy initialization succeeds before the reverse ping request");
+
+        client
+            .ping()
+            .expect("a selected exact legacy session acknowledges server-originated ping");
+        client.close().expect("legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_resource_subscriptions_use_the_exact_legacy_request_path() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_resource_subscription_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy initialization succeeds before resource subscription requests");
+
+        client
+            .subscribe_resource_legacy("resource://test")
+            .expect("exact legacy resources/subscribe omits final metadata");
+        client
+            .unsubscribe_resource_legacy("resource://test")
+            .expect("exact legacy resources/unsubscribe omits final metadata");
+        client
+            .close()
+            .expect("legacy resource subscription cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leg_03_resource_subscriptions_reject_modern_before_request_mutation() {
+        let discovery = modern_discovery_response(
+            "modern-resource-subscriptions-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        let script = modern_public_client_script(&discovery);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes before legacy resource rejection");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        for operation in [
+            Client::subscribe_resource_legacy,
+            Client::unsubscribe_resource_legacy,
+        ] {
+            let error = operation(&mut client, "resource://test")
+                .expect_err("a legacy resource subscription must not send in the modern era");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+            assert!(client.is_initialized());
+        }
+        client
+            .close()
+            .expect("modern resource subscription cleanup");
     }
 
     #[cfg(unix)]

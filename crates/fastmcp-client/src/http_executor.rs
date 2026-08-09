@@ -14,30 +14,29 @@ use std::time::Instant;
 use asupersync::Cx;
 use asupersync::bytes::Buf;
 use asupersync::channel::oneshot;
-use asupersync::http::{Body, Frame};
 use asupersync::http::h1::http_client::ClientIo;
 use asupersync::http::h1::{
     ClientError, ClientStreamingResponse, HttpClient, Method, RedirectPolicy, RetryPolicy,
 };
+use asupersync::http::{Body, Frame};
 use fastmcp_protocol::extensions::{
     ExtensionDirection, McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID,
     OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
 };
 use fastmcp_protocol::methods::{
-    Final2026Direction, Final2026EnvelopeKind, PROMPTS_GET, RESOURCES_READ, SUBSCRIPTIONS_LISTEN,
-    TOOLS_CALL, final_2026_07_28_method,
+    Final2026Direction, Final2026EnvelopeKind, NOTIFICATIONS_PROGRESS, PROMPTS_GET, RESOURCES_READ,
+    SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
 };
 use fastmcp_protocol::tasks_extension::{
     CancelTaskParams as FinalCancelTaskParams, CancelTaskResult as FinalCancelTaskResult,
-    GetTaskParams as FinalGetTaskParams, GetTaskResult as FinalGetTaskResult,
-    Task as FinalTask, TaskId as FinalTaskId, TaskInputLedger,
-    TaskInputResponses as FinalTaskInputResponses, TaskMethodRequest, TaskRequestMeta,
+    GetTaskParams as FinalGetTaskParams, GetTaskResult as FinalGetTaskResult, TASK_CANCEL,
+    TASK_GET, TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY, TASK_UPDATE, Task as FinalTask,
+    TaskId as FinalTaskId, TaskInputLedger, TaskInputResponses as FinalTaskInputResponses,
+    TaskMethodRequest, TaskRequestMeta, TaskStatusNotification as FinalTaskStatusNotification,
     UpdateTaskParams as FinalUpdateTaskParams, UpdateTaskResult as FinalUpdateTaskResult,
-    TASK_CANCEL, TASK_GET, TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY, TASK_UPDATE,
-    TaskStatusNotification as FinalTaskStatusNotification,
 };
 use fastmcp_protocol::{
     CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo, CompleteResult,
@@ -61,6 +60,32 @@ use crate::{
 pub const MODERN_MCP_ACCEPT: &str = "application/json, text/event-stream";
 pub const MODERN_MCP_ACCEPT_ENCODING: &str = "identity";
 pub const MODERN_MCP_CONTENT_TYPE: &str = "application/json";
+
+fn raw_final_notification_params(
+    request: &JsonRpcRequest,
+    frame: &[u8],
+) -> Result<Option<String>, FinalNotificationError> {
+    if request.method != NOTIFICATIONS_PROGRESS {
+        return Ok(None);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RawNotificationEnvelope {
+        #[serde(default)]
+        params: Option<Box<serde_json::value::RawValue>>,
+    }
+
+    serde_json::from_slice::<RawNotificationEnvelope>(frame)
+        .map_err(|_| FinalNotificationError::InvalidParams {
+            method: NOTIFICATIONS_PROGRESS.to_owned(),
+        })?
+        .params
+        .map(|params| params.get().to_owned())
+        .ok_or(FinalNotificationError::InvalidParams {
+            method: NOTIFICATIONS_PROGRESS.to_owned(),
+        })
+        .map(Some)
+}
 
 /// Maximum response bytes retained while classifying a disposable modern probe.
 pub const MAX_MODERN_HTTP_PROBE_BODY_BYTES: usize = 64 * 1024;
@@ -305,13 +330,43 @@ impl ModernHttpResponseStream {
         })
     }
 
-    /// Consumes a final `subscriptions/listen` SSE response until its exact
-    /// complete terminal result.
+    /// Converts this response into a live final `subscriptions/listen` listener.
     ///
     /// Every dispatched SSE `data` payload must be one strictly admitted
     /// JSON-RPC message. The listener binds both acknowledgement and terminal
-    /// result IDs to `request_id`, retains typed notifications in wire order,
-    /// and refuses EOF or cancellation in place of a complete result.
+    /// result IDs to `request_id`, and refuses EOF or cancellation in place of
+    /// a complete result.
+    pub fn into_final_subscriptions_listener(
+        self,
+        request_id: RequestId,
+        requested: SubscriptionFilter,
+        limits: SseLimits,
+    ) -> Result<ModernHttpSubscriptionListener, ModernHttpSubscriptionListenError> {
+        if request_id.validate().is_err() {
+            return Err(ModernHttpSubscriptionListenError::InvalidRequestId);
+        }
+        let core_request = final_subscriptions_listen_core_request(&requested)?;
+        let maximum_jsonrpc_bytes = limits.max_event_bytes();
+        let stream = self
+            .into_sse_stream(limits)
+            .map_err(ModernHttpSubscriptionListenError::Executor)?;
+        Ok(ModernHttpSubscriptionListener {
+            stream,
+            core_request,
+            request_id,
+            requested,
+            accepted_filter: None,
+            maximum_jsonrpc_bytes,
+            terminal_received: false,
+        })
+    }
+
+    /// Consumes a final `subscriptions/listen` SSE response until its exact
+    /// complete terminal result.
+    ///
+    /// This is the terminal-collector convenience wrapper over
+    /// [`Self::into_final_subscriptions_listener`]. Callers that need each
+    /// accepted event as it arrives should retain the returned listener instead.
     pub async fn collect_final_subscriptions_listen(
         self,
         cx: &Cx,
@@ -319,153 +374,9 @@ impl ModernHttpResponseStream {
         requested: SubscriptionFilter,
         limits: SseLimits,
     ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
-        if request_id.validate().is_err() {
-            return Err(ModernHttpSubscriptionListenError::InvalidRequestId);
-        }
-        let core_request = final_subscriptions_listen_core_request(&requested)?;
-        let maximum_jsonrpc_bytes = limits.max_event_bytes();
-        let mut stream = self
-            .into_sse_stream(limits)
-            .map_err(ModernHttpSubscriptionListenError::Executor)?;
-        let mut accepted_filter = None;
-        let mut notifications = Vec::new();
-        let mut task_notifications = Vec::new();
-
-        loop {
-            let event = match stream.next_event(cx).await {
-                Ok(Some(event)) => event,
-                Ok(None) => {
-                    return Err(ModernHttpSubscriptionListenError::EndOfStream {
-                        framing: stream.end_of_stream(),
-                    });
-                }
-                Err(ModernHttpExecutorError::Cancelled) => {
-                    return Err(ModernHttpSubscriptionListenError::CallerCancelled {
-                        request_id: request_id.clone(),
-                    });
-                }
-                Err(error) => return Err(ModernHttpSubscriptionListenError::Executor(error)),
-            };
-            let message = decode_strict_jsonrpc_message(event.as_bytes(), maximum_jsonrpc_bytes)
-                .map_err(ModernHttpSubscriptionListenError::JsonRpcAdmission)?;
-
-            match message {
-                JsonRpcMessage::Response(response) => {
-                    let admission =
-                        decode_strict_jsonrpc_response(event.as_bytes(), maximum_jsonrpc_bytes)
-                            .map_err(ModernHttpSubscriptionListenError::JsonRpcAdmission)?;
-                    if admission.response() != &response {
-                        return Err(ModernHttpSubscriptionListenError::JsonRpcAdmission(
-                            JsonRpcAdmissionError::InvalidEnvelope,
-                        ));
-                    }
-                    let (_, raw_result) = admission.into_parts();
-                    return collect_final_subscriptions_terminal(
-                        &core_request,
-                        response,
-                        raw_result.as_deref(),
-                        request_id,
-                        accepted_filter,
-                        notifications,
-                        task_notifications,
-                    );
-                }
-                JsonRpcMessage::Request(request) => {
-                    if request.id.is_none() && request.method == TASK_STATUS_NOTIFICATION {
-                        let Some(accepted_filter) = accepted_filter.as_ref() else {
-                            return Err(
-                                ModernHttpSubscriptionListenError::EventBeforeAcknowledgement,
-                            );
-                        };
-                        let accepted_task_ids = task_subscription_ids(accepted_filter)
-                            .ok()
-                            .flatten()
-                            .ok_or(ModernHttpSubscriptionListenError::EventOutsideAcceptedFilter)?;
-                        let notification: FinalTaskStatusNotification =
-                            serde_json::from_slice(event.as_bytes()).map_err(|_| {
-                                ModernHttpSubscriptionListenError::TaskNotificationAdmission
-                            })?;
-                        let subscription_id = notification
-                            .params
-                            .meta
-                            .as_ref()
-                            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
-                            .and_then(|value| {
-                                serde_json::from_value::<RequestId>(value.clone()).ok()
-                            });
-                        if !subscription_id.as_ref().is_some_and(|subscription_id| {
-                            subscription_id.correlates_with(&request_id)
-                        }) {
-                            return Err(
-                                ModernHttpSubscriptionListenError::TaskEventSubscriptionIdMismatch,
-                            );
-                        }
-                        if !accepted_task_ids
-                            .iter()
-                            .any(|task_id| task_id == &notification.params.task.base().task_id)
-                        {
-                            return Err(
-                                ModernHttpSubscriptionListenError::TaskEventOutsideAcceptedFilter,
-                            );
-                        }
-                        task_notifications.push(notification);
-                        continue;
-                    }
-                    let notification = ServerNotification::decode(&request)
-                        .map_err(ModernHttpSubscriptionListenError::NotificationAdmission)?;
-                    match notification {
-                        ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
-                            if accepted_filter.is_some() {
-                                return Err(
-                                    ModernHttpSubscriptionListenError::DuplicateAcknowledgement,
-                                );
-                            }
-                            validate_http_subscription_acknowledgement(
-                                &request_id,
-                                &requested,
-                                &acknowledgement,
-                            )?;
-                            accepted_filter = Some(acknowledgement.notifications);
-                        }
-                        ServerNotification::Cancelled(_) => {
-                            return Err(
-                                ModernHttpSubscriptionListenError::ServerCancellationOnHttp,
-                            );
-                        }
-                        notification @ (ServerNotification::ResourcesListChanged(_)
-                        | ServerNotification::ToolsListChanged(_)
-                        | ServerNotification::PromptsListChanged(_)
-                        | ServerNotification::ResourceUpdated(_)) => {
-                            let Some(accepted_filter) = accepted_filter.as_ref() else {
-                                return Err(
-                                    ModernHttpSubscriptionListenError::EventBeforeAcknowledgement,
-                                );
-                            };
-                            validate_http_subscription_notification_filter(
-                                &notification,
-                                accepted_filter,
-                            )?;
-                            notifications.push(notification);
-                        }
-                        ServerNotification::Progress(_) | ServerNotification::Message(_) => {
-                            // `subscriptions/listen` admits only the categories
-                            // explicitly established by its first acknowledgement.
-                            // Progress and log notifications belong to the
-                            // request-scoped response stream of the request that
-                            // opted into them; they are never subscription events.
-                            if accepted_filter.is_none() {
-                                return Err(
-                                    ModernHttpSubscriptionListenError::EventBeforeAcknowledgement,
-                                );
-                            }
-                            return Err(
-                                ModernHttpSubscriptionListenError::EventOutsideAcceptedFilter,
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        self.into_final_subscriptions_listener(request_id, requested, limits)?
+            .collect(cx)
+            .await
     }
 
     /// Reads a finite response body into memory under an explicit caller bound.
@@ -520,6 +431,267 @@ impl ModernHttpResponseStream {
         }
 
         Ok(bytes)
+    }
+}
+
+/// One accepted record from a live final HTTP `subscriptions/listen` response.
+#[derive(Debug, Clone)]
+pub enum ModernHttpSubscriptionListenEvent {
+    /// The server acknowledged an exact subset of the requested filter.
+    Acknowledged {
+        /// The exact filter accepted for the rest of this stream.
+        accepted_filter: SubscriptionFilter,
+    },
+    /// An acknowledged catalog or resource change notification.
+    Notification(ServerNotification),
+    /// An acknowledged official Tasks status notification.
+    TaskNotification(FinalTaskStatusNotification),
+    /// The complete result terminating this subscription stream.
+    Terminal {
+        /// The subscription ID encoded in the correlated terminal result.
+        subscription_id: RequestId,
+        /// The terminal complete result.
+        result: CompleteResult<FinalSubscriptionsListenResult>,
+    },
+}
+
+/// A live, request-owned final HTTP `subscriptions/listen` response stream.
+#[derive(Debug)]
+pub struct ModernHttpSubscriptionListener {
+    stream: ModernHttpSseResponseStream,
+    core_request: CoreRequest,
+    request_id: RequestId,
+    requested: SubscriptionFilter,
+    accepted_filter: Option<SubscriptionFilter>,
+    maximum_jsonrpc_bytes: usize,
+    terminal_received: bool,
+}
+
+impl ModernHttpSubscriptionListener {
+    /// Returns the JSON-RPC request ID that owns this listener.
+    #[must_use]
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    /// Returns the acknowledged filter once the first stream record is admitted.
+    #[must_use]
+    pub const fn accepted_filter(&self) -> Option<&SubscriptionFilter> {
+        self.accepted_filter.as_ref()
+    }
+
+    /// Reads and validates one record from this live listener.
+    ///
+    /// `None` is returned only after the terminal record was already yielded.
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ModernHttpSubscriptionListenEvent>, ModernHttpSubscriptionListenError> {
+        if self.terminal_received {
+            return Ok(None);
+        }
+
+        loop {
+            let event = match self.stream.next_event(cx).await {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    return Err(ModernHttpSubscriptionListenError::EndOfStream {
+                        framing: self.stream.end_of_stream(),
+                    });
+                }
+                Err(ModernHttpExecutorError::Cancelled) => {
+                    return Err(ModernHttpSubscriptionListenError::CallerCancelled {
+                        request_id: self.request_id.clone(),
+                    });
+                }
+                Err(error) => return Err(ModernHttpSubscriptionListenError::Executor(error)),
+            };
+            let message =
+                decode_strict_jsonrpc_message(event.as_bytes(), self.maximum_jsonrpc_bytes)
+                    .map_err(ModernHttpSubscriptionListenError::JsonRpcAdmission)?;
+
+            match message {
+                JsonRpcMessage::Response(response) => {
+                    let admission = decode_strict_jsonrpc_response(
+                        event.as_bytes(),
+                        self.maximum_jsonrpc_bytes,
+                    )
+                    .map_err(ModernHttpSubscriptionListenError::JsonRpcAdmission)?;
+                    if admission.response() != &response {
+                        return Err(ModernHttpSubscriptionListenError::JsonRpcAdmission(
+                            JsonRpcAdmissionError::InvalidEnvelope,
+                        ));
+                    }
+                    let (_, raw_result) = admission.into_parts();
+                    let (subscription_id, result) = decode_final_subscriptions_terminal(
+                        &self.core_request,
+                        response,
+                        raw_result.as_deref(),
+                        self.request_id.clone(),
+                    )?;
+                    if self.accepted_filter.is_none() {
+                        return Err(
+                            ModernHttpSubscriptionListenError::TerminalBeforeAcknowledgement,
+                        );
+                    }
+                    self.terminal_received = true;
+                    return Ok(Some(ModernHttpSubscriptionListenEvent::Terminal {
+                        subscription_id,
+                        result,
+                    }));
+                }
+                JsonRpcMessage::Request(request) => {
+                    if request.id.is_none() && request.method == TASK_STATUS_NOTIFICATION {
+                        let Some(accepted_filter) = self.accepted_filter.as_ref() else {
+                            return Err(
+                                ModernHttpSubscriptionListenError::EventBeforeAcknowledgement,
+                            );
+                        };
+                        let accepted_task_ids = task_subscription_ids(accepted_filter)
+                            .ok()
+                            .flatten()
+                            .ok_or(ModernHttpSubscriptionListenError::EventOutsideAcceptedFilter)?;
+                        let notification: FinalTaskStatusNotification =
+                            serde_json::from_slice(event.as_bytes()).map_err(|_| {
+                                ModernHttpSubscriptionListenError::TaskNotificationAdmission
+                            })?;
+                        let subscription_id = notification
+                            .params
+                            .meta
+                            .as_ref()
+                            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                            .and_then(|value| {
+                                serde_json::from_value::<RequestId>(value.clone()).ok()
+                            });
+                        if !subscription_id.as_ref().is_some_and(|subscription_id| {
+                            subscription_id.correlates_with(&self.request_id)
+                        }) {
+                            return Err(
+                                ModernHttpSubscriptionListenError::TaskEventSubscriptionIdMismatch,
+                            );
+                        }
+                        if !accepted_task_ids
+                            .iter()
+                            .any(|task_id| task_id == &notification.params.task.base().task_id)
+                        {
+                            return Err(
+                                ModernHttpSubscriptionListenError::TaskEventOutsideAcceptedFilter,
+                            );
+                        }
+                        return Ok(Some(ModernHttpSubscriptionListenEvent::TaskNotification(
+                            notification,
+                        )));
+                    }
+                    let raw_params = raw_final_notification_params(&request, event.as_bytes())
+                        .map_err(ModernHttpSubscriptionListenError::NotificationAdmission)?;
+                    let notification = match raw_params.as_deref() {
+                        Some(raw_params) => {
+                            ServerNotification::decode_with_raw_params(&request, raw_params)
+                        }
+                        None => ServerNotification::decode(&request),
+                    }
+                    .map_err(ModernHttpSubscriptionListenError::NotificationAdmission)?;
+                    match notification {
+                        ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
+                            if self.accepted_filter.is_some() {
+                                return Err(
+                                    ModernHttpSubscriptionListenError::DuplicateAcknowledgement,
+                                );
+                            }
+                            validate_http_subscription_acknowledgement(
+                                &self.request_id,
+                                &self.requested,
+                                &acknowledgement,
+                            )?;
+                            let accepted_filter = acknowledgement.notifications;
+                            self.accepted_filter = Some(accepted_filter.clone());
+                            return Ok(Some(ModernHttpSubscriptionListenEvent::Acknowledged {
+                                accepted_filter,
+                            }));
+                        }
+                        ServerNotification::Cancelled(_) => {
+                            return Err(
+                                ModernHttpSubscriptionListenError::ServerCancellationOnHttp,
+                            );
+                        }
+                        notification @ (ServerNotification::ResourcesListChanged(_)
+                        | ServerNotification::ToolsListChanged(_)
+                        | ServerNotification::PromptsListChanged(_)
+                        | ServerNotification::ResourceUpdated(_)) => {
+                            let Some(accepted_filter) = self.accepted_filter.as_ref() else {
+                                return Err(
+                                    ModernHttpSubscriptionListenError::EventBeforeAcknowledgement,
+                                );
+                            };
+                            validate_http_subscription_notification_filter(
+                                &notification,
+                                accepted_filter,
+                            )?;
+                            return Ok(Some(ModernHttpSubscriptionListenEvent::Notification(
+                                notification,
+                            )));
+                        }
+                        ServerNotification::Progress(_) | ServerNotification::Message(_) => {
+                            // `subscriptions/listen` admits only the categories
+                            // explicitly established by its first acknowledgement.
+                            // Progress and log notifications belong to the
+                            // request-scoped response stream of the request that
+                            // opted into them; they are never subscription events.
+                            if self.accepted_filter.is_none() {
+                                return Err(
+                                    ModernHttpSubscriptionListenError::EventBeforeAcknowledgement,
+                                );
+                            }
+                            return Err(
+                                ModernHttpSubscriptionListenError::EventOutsideAcceptedFilter,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collects this live listener into the terminal compatibility record.
+    pub async fn collect(
+        mut self,
+        cx: &Cx,
+    ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
+        let mut notifications = Vec::new();
+        let mut task_notifications = Vec::new();
+
+        loop {
+            let Some(event) = self.next_event(cx).await? else {
+                return Err(ModernHttpSubscriptionListenError::EndOfStream {
+                    framing: self.stream.end_of_stream(),
+                });
+            };
+            match event {
+                ModernHttpSubscriptionListenEvent::Acknowledged { .. } => {}
+                ModernHttpSubscriptionListenEvent::Notification(notification) => {
+                    notifications.push(notification);
+                }
+                ModernHttpSubscriptionListenEvent::TaskNotification(notification) => {
+                    task_notifications.push(notification);
+                }
+                ModernHttpSubscriptionListenEvent::Terminal {
+                    subscription_id,
+                    result: terminal,
+                } => {
+                    let accepted_filter = self
+                        .accepted_filter
+                        .clone()
+                        .ok_or(ModernHttpSubscriptionListenError::TerminalBeforeAcknowledgement)?;
+                    return Ok(ModernHttpSubscriptionListenCollector {
+                        subscription_id,
+                        accepted_filter,
+                        notifications,
+                        task_notifications,
+                        terminal,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -888,15 +1060,15 @@ fn final_subscriptions_listen_core_request(
     .map_err(ModernHttpSubscriptionListenError::TerminalResult)
 }
 
-fn collect_final_subscriptions_terminal(
+fn decode_final_subscriptions_terminal(
     core_request: &CoreRequest,
     response: JsonRpcResponse,
     result_source: Option<&str>,
     expected_id: RequestId,
-    accepted_filter: Option<SubscriptionFilter>,
-    notifications: Vec<ServerNotification>,
-    task_notifications: Vec<FinalTaskStatusNotification>,
-) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
+) -> Result<
+    (RequestId, CompleteResult<FinalSubscriptionsListenResult>),
+    ModernHttpSubscriptionListenError,
+> {
     if !response
         .id
         .as_ref()
@@ -936,16 +1108,7 @@ fn collect_final_subscriptions_terminal(
             actual: subscription_id,
         });
     }
-    let Some(accepted_filter) = accepted_filter else {
-        return Err(ModernHttpSubscriptionListenError::TerminalBeforeAcknowledgement);
-    };
-    Ok(ModernHttpSubscriptionListenCollector {
-        subscription_id,
-        accepted_filter,
-        notifications,
-        task_notifications,
-        terminal,
-    })
+    Ok((subscription_id, terminal))
 }
 
 fn validate_http_subscription_acknowledgement(
@@ -1522,6 +1685,7 @@ impl ClientHttpConnection {
         client_capabilities: ClientCapabilities,
         mcp_apps_settings: Option<McpAppsClientSettings>,
     ) -> Result<Self, ClientHttpConnectionError> {
+        let legacy_client_capabilities = client_capabilities.clone();
         match ModernHttpClient::connect_with_mcp_apps(
             cx,
             protocol_plan,
@@ -1536,6 +1700,9 @@ impl ClientHttpConnection {
             ModernHttpConnectOutcome::LegacySse(client) => Ok(Self::LegacySse {
                 client,
                 negotiated_protocol_version: None,
+                client_capabilities: legacy_client_capabilities,
+                reverse_request_handlers: ReverseRequestHandlers::new(),
+                cancelled_response_ids: VecDeque::new(),
             }),
         }
     }
@@ -1623,6 +1790,32 @@ impl ClientHttpConnection {
         }
     }
 
+    /// Configures exact MCP 2024-11-05 reverse-request handlers on this raw
+    /// HTTP connection.
+    ///
+    /// The supplied handlers must exactly match the client capabilities that
+    /// were retained for the legacy `initialize` request. Configure this before
+    /// issuing that request: a ready [`crate::HttpClient`] has already completed
+    /// initialization and therefore cannot safely change this callable surface.
+    pub fn set_legacy_reverse_request_handlers(
+        &mut self,
+        handlers: ReverseRequestHandlers,
+    ) -> fastmcp_core::McpResult<()> {
+        let Self::LegacySse {
+            client_capabilities,
+            reverse_request_handlers,
+            ..
+        } = self
+        else {
+            return Err(fastmcp_core::McpError::invalid_params(
+                "exact MCP 2024-11-05 reverse request handlers require the legacy HTTP transport",
+            ));
+        };
+        handlers.validate_legacy_capabilities(client_capabilities)?;
+        *reverse_request_handlers = handlers;
+        Ok(())
+    }
+
     /// Sends one active client request through the selected transport.
     ///
     /// Modern requests execute as one stateless final POST. Exact legacy
@@ -1642,8 +1835,24 @@ impl ClientHttpConnection {
                 .await
                 .map(ClientHttpResponse::Modern)
                 .map_err(ClientHttpConnectionError::Modern),
-            Self::LegacySse { client, .. } => {
+            Self::LegacySse {
+                client,
+                client_capabilities,
+                reverse_request_handlers,
+                cancelled_response_ids,
+                ..
+            } => {
                 reject_final_only_legacy_request_metadata(&parameters)?;
+                if cancelled_response_ids
+                    .iter()
+                    .any(|cancelled_id| cancelled_id.correlates_with(&request_id))
+                {
+                    return Err(
+                        ClientHttpConnectionError::LegacyCancelledRequestStillDraining {
+                            request_id,
+                        },
+                    );
+                }
                 let request = JsonRpcRequest::new(method, Some(parameters), request_id.clone());
                 client
                     .send(cx, &JsonRpcMessage::Request(request))
@@ -1661,19 +1870,63 @@ impl ClientHttpConnection {
                     })?;
                     match message {
                         JsonRpcMessage::Request(notification) if notification.is_notification() => {
+                            if matching_legacy_request_cancellation(&notification, &request_id) {
+                                if cancelled_response_ids.len()
+                                    >= MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS
+                                {
+                                    return Err(
+                                        ClientHttpConnectionError::LegacyCancelledResponseQueueFull,
+                                    );
+                                }
+                                cancelled_response_ids.push_back(request_id.clone());
+                                return Err(ClientHttpConnectionError::LegacyRequestCancelled {
+                                    request_id,
+                                });
+                            }
                             client.queue_notification(notification).map_err(|_| {
                                 ClientHttpConnectionError::LegacyNotificationQueueFull
                             })?;
                         }
-                        JsonRpcMessage::Request(_) => {
-                            return Err(ClientHttpConnectionError::LegacyUnexpectedMessage {
-                                request_id,
-                            });
+                        JsonRpcMessage::Request(server_request) => {
+                            let response = legacy_http_server_request_response(
+                                client_capabilities,
+                                reverse_request_handlers,
+                                &server_request,
+                            )
+                            .ok_or_else(|| {
+                                ClientHttpConnectionError::LegacyUnexpectedMessage {
+                                    request_id: request_id.clone(),
+                                }
+                            })?;
+                            client
+                                .send(cx, &response)
+                                .await
+                                .map_err(ClientHttpConnectionError::Legacy)?;
                         }
                         JsonRpcMessage::Response(response) => {
-                            if !response.id.as_ref().is_some_and(|response_id| {
-                                response_id.correlates_with(&request_id)
+                            if response.id.as_ref().is_some_and(|response_id| {
+                                cancelled_response_ids
+                                    .iter()
+                                    .any(|cancelled_id| cancelled_id.correlates_with(response_id))
                             }) {
+                                let response_id = response
+                                    .id
+                                    .as_ref()
+                                    .expect("response ID was checked before removing tombstone");
+                                let position = cancelled_response_ids
+                                    .iter()
+                                    .position(|cancelled_id| {
+                                        cancelled_id.correlates_with(response_id)
+                                    })
+                                    .expect("checked tombstone remains present until removal");
+                                cancelled_response_ids.remove(position);
+                                continue;
+                            }
+                            if !response
+                                .id
+                                .as_ref()
+                                .is_some_and(|response_id| response_id.correlates_with(&request_id))
+                            {
                                 return Err(ClientHttpConnectionError::LegacyResponseIdMismatch {
                                     expected: request_id,
                                     actual: response.id,
@@ -1795,9 +2048,11 @@ impl ClientHttpConnection {
                         JsonRpcAdmissionError::InvalidEnvelope,
                     ));
                 }
-                if !response.id.as_ref().is_some_and(|response_id| {
-                    response_id.correlates_with(&request_id)
-                }) {
+                if !response
+                    .id
+                    .as_ref()
+                    .is_some_and(|response_id| response_id.correlates_with(&request_id))
+                {
                     return Err(ClientHttpConnectionError::ResponseIdMismatch {
                         expected: request_id,
                         actual: response.id,
@@ -1809,12 +2064,31 @@ impl ClientHttpConnection {
         }
     }
 
-    /// Opens and consumes one typed final `subscriptions/listen` HTTP stream.
+    /// Opens one live final `subscriptions/listen` HTTP stream.
     ///
     /// This operation is unavailable once the immutable connection plan has
     /// selected exact MCP 2024-11-05. Modern streams require one explicit SSE
     /// parser bound so the caller, rather than ambient transport state, fixes
     /// response framing limits.
+    pub async fn open_subscriptions_listener(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        notifications: SubscriptionFilter,
+        limits: SseLimits,
+    ) -> Result<ModernHttpSubscriptionListener, ClientHttpConnectionError> {
+        match self {
+            Self::Modern(client) => client
+                .open_subscriptions_listener(cx, request_id, notifications, limits)
+                .await
+                .map_err(ClientHttpConnectionError::SubscriptionsListen),
+            Self::LegacySse { .. } => {
+                Err(ClientHttpConnectionError::SubscriptionsListenRequiresModern)
+            }
+        }
+    }
+
+    /// Opens one live final `subscriptions/listen` HTTP stream.
     pub async fn listen_subscriptions_typed(
         &self,
         cx: &Cx,
@@ -1822,15 +2096,11 @@ impl ClientHttpConnection {
         notifications: SubscriptionFilter,
         limits: SseLimits,
     ) -> Result<ModernHttpSubscriptionListenCollector, ClientHttpConnectionError> {
-        match self {
-            Self::Modern(client) => client
-                .listen_subscriptions_typed(cx, request_id, notifications, limits)
-                .await
-                .map_err(ClientHttpConnectionError::SubscriptionsListen),
-            Self::LegacySse { .. } => {
-                Err(ClientHttpConnectionError::SubscriptionsListenRequiresModern)
-            }
-        }
+        self.open_subscriptions_listener(cx, request_id, notifications, limits)
+            .await?
+            .collect(cx)
+            .await
+            .map_err(ClientHttpConnectionError::SubscriptionsListen)
     }
 
     /// Reads one task through the official final Tasks extension.
@@ -1850,9 +2120,9 @@ impl ClientHttpConnection {
                 .get_task_final(cx, request_id, task_id, maximum_response_bytes)
                 .await
                 .map_err(ClientHttpConnectionError::Modern),
-            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalTasksRequiresModern {
-                method: TASK_GET,
-            }),
+            Self::LegacySse { .. } => {
+                Err(ClientHttpConnectionError::FinalTasksRequiresModern { method: TASK_GET })
+            }
         }
     }
 
@@ -1972,6 +2242,79 @@ impl ClientHttpConnection {
                     .map_err(ClientHttpConnectionError::Legacy)
             }
         }
+    }
+}
+
+/// Returns whether this exact legacy server cancellation is valid and owns the
+/// application request currently awaiting an SSE response.
+fn matching_legacy_request_cancellation(
+    notification: &JsonRpcRequest,
+    active_request_id: &RequestId,
+) -> bool {
+    let Ok(CancellationWireMessage::Legacy2024 { params, .. }) = CancellationWireMessage::decode(
+        ProtocolEra::Legacy2024,
+        CancellationSender::Server,
+        notification,
+    ) else {
+        return false;
+    };
+    params.request_id.correlates_with(active_request_id)
+}
+
+/// Produces the exact legacy response to one server-initiated request received
+/// while a client HTTP request owns the shared SSE reader.
+///
+/// The configured callback must match the capability retained for legacy
+/// initialization. Sampling and roots are never serviced merely because a
+/// handler exists; elicitation remains unavailable in exact MCP 2024-11-05.
+fn legacy_http_server_request_response(
+    client_capabilities: &ClientCapabilities,
+    handlers: &ReverseRequestHandlers,
+    request: &JsonRpcRequest,
+) -> Option<JsonRpcMessage> {
+    let request_id = request.id.clone()?;
+    if request.method.starts_with("notifications/") {
+        return crate::invalid_notification_request_response(request);
+    }
+    if request.method == "ping" {
+        return Some(JsonRpcMessage::Response(JsonRpcResponse::success(
+            request_id,
+            serde_json::json!({}),
+        )));
+    }
+
+    match request.method.as_str() {
+        "sampling/createMessage" if client_capabilities.sampling.is_some() => {
+            let Some(handler) = handlers.sampling_create_message.as_ref() else {
+                return crate::method_not_found_response(request);
+            };
+            let result = crate::decode_reverse_request_params(request).and_then(|params| {
+                crate::invoke_locked_reverse_request_handler(
+                    handler,
+                    ReverseRequestCancellation::new(),
+                    params,
+                )
+            });
+            Some(crate::reverse_request_response(request_id, result))
+        }
+        "roots/list" if client_capabilities.roots.is_some() => {
+            let Some(handler) = handlers.roots_list.as_ref() else {
+                return crate::method_not_found_response(request);
+            };
+            let result = crate::decode_reverse_request_params(request).and_then(|params| {
+                crate::invoke_locked_reverse_request_handler(
+                    handler,
+                    ReverseRequestCancellation::new(),
+                    params,
+                )
+            });
+            Some(crate::reverse_request_response(request_id, result))
+        }
+        // Exact 2024-11-05 never admitted elicitation. In particular, do not
+        // infer it from a newer capability accidentally supplied to this raw
+        // HTTP connector.
+        "elicitation/create" => crate::method_not_found_response(request),
+        _ => crate::method_not_found_response(request),
     }
 }
 
@@ -2163,7 +2506,10 @@ impl fmt::Display for ModernHttpClientError {
                 "final HTTP {method} was not bilaterally admitted by the official Tasks extension"
             ),
             Self::InvalidTasksRequestId { method } => {
-                write!(formatter, "final HTTP {method} requires a valid JSON-RPC request ID")
+                write!(
+                    formatter,
+                    "final HTTP {method} requires a valid JSON-RPC request ID"
+                )
             }
             Self::TasksRequestEncoding { method } => {
                 write!(formatter, "final HTTP {method} request encoding failed")
@@ -2435,16 +2781,15 @@ impl ModernHttpClient {
     /// Opens and consumes one typed final `subscriptions/listen` HTTP stream.
     ///
     /// The request is emitted with the same immutable final metadata as every
-    /// other modern HTTP request. The returned collector contains the exact
-    /// acknowledgement filter, ordered typed notifications, and complete
-    /// terminal result only after every stream frame passes strict admission.
-    pub async fn listen_subscriptions_typed(
+    /// other modern HTTP request. Each later listener event has passed strict
+    /// admission and acknowledgement-filter validation.
+    pub async fn open_subscriptions_listener(
         &self,
         cx: &Cx,
         request_id: RequestId,
         notifications: SubscriptionFilter,
         limits: SseLimits,
-    ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
+    ) -> Result<ModernHttpSubscriptionListener, ModernHttpSubscriptionListenError> {
         if request_id.validate().is_err() {
             return Err(ModernHttpSubscriptionListenError::InvalidRequestId);
         }
@@ -2482,8 +2827,20 @@ impl ModernHttpClient {
             .execute(cx, &request)
             .await
             .map_err(ModernHttpSubscriptionListenError::Executor)?;
-        response
-            .collect_final_subscriptions_listen(cx, request_id, notifications, limits)
+        response.into_final_subscriptions_listener(request_id, notifications, limits)
+    }
+
+    /// Opens and consumes one typed final `subscriptions/listen` HTTP stream.
+    pub async fn listen_subscriptions_typed(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        notifications: SubscriptionFilter,
+        limits: SseLimits,
+    ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
+        self.open_subscriptions_listener(cx, request_id, notifications, limits)
+            .await?
+            .collect(cx)
             .await
     }
 
@@ -2550,9 +2907,11 @@ impl ModernHttpClient {
             ));
         }
         let (_, result_source) = admission.into_parts();
-        if !response.id.as_ref().is_some_and(|response_id| {
-            response_id.correlates_with(&request_id)
-        }) {
+        if !response
+            .id
+            .as_ref()
+            .is_some_and(|response_id| response_id.correlates_with(&request_id))
+        {
             return Err(ModernHttpClientError::ResponseIdMismatch {
                 expected: request_id,
                 actual: response.id,
@@ -2716,13 +3075,11 @@ impl ModernHttpClient {
                 task_id,
             },
         );
-        let wire = TaskMethodRequest::decode_cancel(
-            serde_json::to_value(wire).map_err(|_| {
-                ModernHttpClientError::TasksRequestEncoding {
-                    method: TASK_CANCEL,
-                }
-            })?,
-        )
+        let wire = TaskMethodRequest::decode_cancel(serde_json::to_value(wire).map_err(|_| {
+            ModernHttpClientError::TasksRequestEncoding {
+                method: TASK_CANCEL,
+            }
+        })?)
         .map_err(|_| ModernHttpClientError::TasksRequestEncoding {
             method: TASK_CANCEL,
         })?;
@@ -2749,8 +3106,7 @@ impl ModernHttpClient {
     fn prepare_final_tasks_method(
         &self,
         method: &'static str,
-    ) -> Result<(TaskRequestMeta, BTreeMap<String, serde_json::Value>), ModernHttpClientError>
-    {
+    ) -> Result<(TaskRequestMeta, BTreeMap<String, serde_json::Value>), ModernHttpClientError> {
         if !self
             .server_discovery
             .supported_versions()
@@ -2770,11 +3126,9 @@ impl ModernHttpClient {
             fastmcp_protocol::TASKS_EXTENSION.to_owned(),
             serde_json::json!({}),
         )]);
-        let client_extensions = merge_client_extensions(
-            self.active_mcp_apps_settings(),
-            Some(&tasks_extension),
-        )
-        .ok_or(ModernHttpClientError::TasksRequestEncoding { method })?;
+        let client_extensions =
+            merge_client_extensions(self.active_mcp_apps_settings(), Some(&tasks_extension))
+                .ok_or(ModernHttpClientError::TasksRequestEncoding { method })?;
         let mut final_metadata = FinalRequestMeta::new(self.client_capabilities.clone());
         final_metadata.client_info = Some(self.client_info.clone());
         let mut metadata = serde_json::to_value(final_metadata)
@@ -2828,27 +3182,31 @@ impl ModernHttpClient {
             .read_to_end(cx, maximum_response_bytes)
             .await
             .map_err(ModernHttpClientError::Executor)?;
-        let message = decode_strict_jsonrpc_message(&body, maximum_response_bytes).map_err(|error| {
-            ModernHttpClientError::InvalidTasksJsonRpcResponse { method, error }
-        })?;
+        let message =
+            decode_strict_jsonrpc_message(&body, maximum_response_bytes).map_err(|error| {
+                ModernHttpClientError::InvalidTasksJsonRpcResponse { method, error }
+            })?;
         let JsonRpcMessage::Response(response) = message else {
             return Err(ModernHttpClientError::InvalidTasksJsonRpcResponse {
                 method,
                 error: JsonRpcAdmissionError::InvalidEnvelope,
             });
         };
-        let admission = decode_strict_jsonrpc_response(&body, maximum_response_bytes).map_err(
-            |error| ModernHttpClientError::InvalidTasksJsonRpcResponse { method, error },
-        )?;
+        let admission =
+            decode_strict_jsonrpc_response(&body, maximum_response_bytes).map_err(|error| {
+                ModernHttpClientError::InvalidTasksJsonRpcResponse { method, error }
+            })?;
         if admission.response() != &response {
             return Err(ModernHttpClientError::InvalidTasksJsonRpcResponse {
                 method,
                 error: JsonRpcAdmissionError::InvalidEnvelope,
             });
         }
-        if !response.id.as_ref().is_some_and(|response_id| {
-            response_id.correlates_with(&request_id)
-        }) {
+        if !response
+            .id
+            .as_ref()
+            .is_some_and(|response_id| response_id.correlates_with(&request_id))
+        {
             return Err(ModernHttpClientError::TasksResponseIdMismatch {
                 method,
                 expected: request_id,
@@ -3822,9 +4180,11 @@ fn decode_modern_discovery_response(
     if admission.response() != &response {
         return Err(ModernHttpClientError::InvalidDiscoveryResponse);
     }
-    if !response.id.as_ref().is_some_and(|response_id| {
-        response_id.correlates_with(&RequestId::Number(1))
-    }) {
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|response_id| response_id.correlates_with(&RequestId::Number(1)))
+    {
         return Err(ModernHttpClientError::InvalidDiscoveryResponse);
     }
     if response.error.is_some() {
@@ -3972,10 +4332,10 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use asupersync::runtime::RuntimeBuilder;
-    use asupersync::{CancelKind, Cx};
     use asupersync::bytes::Bytes;
     use asupersync::http::Frame;
+    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::{CancelKind, Cx};
     use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
     use fastmcp_protocol::protocol_policy::{LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION};
     use fastmcp_protocol::{
@@ -3993,7 +4353,7 @@ mod tests {
     use crate::sse::SseLimits;
     use crate::{
         CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, FinalToolCallOutcome, ProtocolEra,
-        ProtocolPolicy,
+        ProtocolPolicy, ReverseRequestHandlers,
     };
 
     #[derive(Debug)]
@@ -4549,9 +4909,11 @@ mod tests {
         request_id: i64,
     ) -> serde_json::Value {
         assert!(request.head.contains(&format!("Mcp-Method: {method}\r\n")));
-        assert!(request
-            .head
-            .contains("MCP-Protocol-Version: 2026-07-28\r\n"));
+        assert!(
+            request
+                .head
+                .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+        );
         let body = serde_json::from_slice::<serde_json::Value>(&request.body)
             .expect("Tasks lifecycle request must be JSON-RPC");
         assert_eq!(body["id"], request_id);
@@ -4561,15 +4923,13 @@ mod tests {
             "2026-07-28"
         );
         assert_eq!(
-            body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
-                ["extensions"],
+            body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
             serde_json::json!({"io.modelcontextprotocol/tasks": {}})
         );
         body
     }
 
-    fn run_public_http_tasks_lifecycle(
-    ) -> Result<
+    fn run_public_http_tasks_lifecycle() -> Result<
         (
             fastmcp_protocol::FinalGetTaskResult,
             fastmcp_protocol::FinalUpdateTaskResult,
@@ -4577,8 +4937,8 @@ mod tests {
         ),
         ClientHttpConnectionError,
     > {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .expect("bind local Tasks lifecycle HTTP listener");
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind local Tasks lifecycle HTTP listener");
         let address = listener
             .local_addr()
             .expect("read local Tasks lifecycle HTTP address");
@@ -4599,11 +4959,8 @@ mod tests {
             );
 
             let (mut get, _) = listener.accept().expect("accept tasks/get request");
-            let get = assert_public_http_tasks_lifecycle_request(
-                read_request(&mut get),
-                "tasks/get",
-                2,
-            );
+            let get =
+                assert_public_http_tasks_lifecycle_request(read_request(&mut get), "tasks/get", 2);
             assert_eq!(get["params"]["taskId"], "task-73");
             write_response(
                 &mut get,
@@ -4655,8 +5012,8 @@ mod tests {
                 .connect_http_with_cx(&cx),
         )
         .expect("Tasks discovery selects final HTTP lifecycle methods");
-        let task_id = fastmcp_protocol::FinalTaskId::parse("task-73")
-            .expect("bounded Tasks lifecycle ID");
+        let task_id =
+            fastmcp_protocol::FinalTaskId::parse("task-73").expect("bounded Tasks lifecycle ID");
         let result = (|| {
             let get = runtime_block_on(connection.get_task_final(
                 &cx,
@@ -4681,7 +5038,9 @@ mod tests {
         })();
         assert_eq!(connection.selected_protocol_era(), ProtocolEra::Modern2026);
         assert_eq!(connection.protocol_version(), Some(MODERN_PROTOCOL_VERSION));
-        server.join().expect("Tasks lifecycle HTTP server must join");
+        server
+            .join()
+            .expect("Tasks lifecycle HTTP server must join");
         result
     }
 
@@ -5618,7 +5977,10 @@ mod tests {
         let (get, update, cancel) = run_public_http_tasks_lifecycle()
             .expect("typed HTTP Tasks lifecycle must retain all three final responses");
         assert_eq!(get.task.base().task_id.as_str(), "task-73");
-        assert!(matches!(get.task, fastmcp_protocol::FinalTask::InputRequired { .. }));
+        assert!(matches!(
+            get.task,
+            fastmcp_protocol::FinalTask::InputRequired { .. }
+        ));
         assert!(update.meta.is_none());
         assert!(update.additional.is_empty());
         assert!(cancel.meta.is_none());
@@ -5627,8 +5989,8 @@ mod tests {
 
     #[test]
     fn public_http_tasks_get_rejects_absent_capability_without_post() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .expect("bind local absent-Tasks HTTP listener");
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind local absent-Tasks HTTP listener");
         let address = listener
             .local_addr()
             .expect("read local absent-Tasks HTTP address");
@@ -5692,8 +6054,8 @@ mod tests {
 
     #[test]
     fn public_http_tasks_lifecycle_rejects_legacy_before_message_post() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .expect("bind local legacy Tasks-negative listener");
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind local legacy Tasks-negative listener");
         let address = listener
             .local_addr()
             .expect("read local legacy Tasks-negative address");
@@ -5903,10 +6265,12 @@ mod tests {
             4_096,
         ))
         .expect("legacy request posts then waits for its exact SSE response");
-        assert!(response
-            .id
-            .as_ref()
-            .is_some_and(|response_id| response_id.correlates_with(&RequestId::Number(2))));
+        assert!(
+            response
+                .id
+                .as_ref()
+                .is_some_and(|response_id| response_id.correlates_with(&RequestId::Number(2)))
+        );
         runtime_block_on(connection.notify(
             &cx,
             "notifications/cancelled",
@@ -6429,6 +6793,436 @@ mod tests {
         assert_eq!(notification.method, "notifications/progress");
         assert!(connection.take_legacy_notification().is_none());
         server.join().expect("legacy request server must join");
+    }
+
+    #[test]
+    fn legacy_http_request_services_authorized_reverse_calls_and_rejects_elicitation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy reverse listener");
+        let address = listener
+            .local_addr()
+            .expect("read legacy reverse listener address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
+        let server = thread::spawn(move || -> Result<bool, String> {
+            listener
+                .set_nonblocking(true)
+                .map_err(|error| format!("make legacy reverse listener nonblocking: {error}"))?;
+            let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+            let Some(mut sse) = accept_legacy_test_peer(&listener, &stop_rx, deadline)? else {
+                return Ok(false);
+            };
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            let Some(mut application_post) =
+                accept_legacy_test_peer(&listener, &stop_rx, deadline)?
+            else {
+                return Ok(false);
+            };
+            let application = serde_json::from_slice::<serde_json::Value>(
+                &read_request(&mut application_post).body,
+            )
+            .map_err(|error| format!("decode application request: {error}"))?;
+            assert_eq!(application["id"], 71);
+            assert_eq!(application["method"], "ping");
+            write_response(&mut application_post, 202, "application/json", b"");
+
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":81,\"params\":{\"messages\":[],\"maxTokens\":9}}\n\n",
+            );
+            let Some(mut sampling_post) = accept_legacy_test_peer(&listener, &stop_rx, deadline)?
+            else {
+                return Ok(false);
+            };
+            let sampling =
+                serde_json::from_slice::<serde_json::Value>(&read_request(&mut sampling_post).body)
+                    .map_err(|error| format!("decode sampling reply: {error}"))?;
+            assert_eq!(sampling["id"], 81);
+            assert_eq!(sampling["result"]["model"], "legacy-http-handler");
+            write_response(&mut sampling_post, 202, "application/json", b"");
+
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"roots/list\",\"id\":82,\"params\":{}}\n\n",
+            );
+            let Some(mut roots_post) = accept_legacy_test_peer(&listener, &stop_rx, deadline)?
+            else {
+                return Ok(false);
+            };
+            let roots =
+                serde_json::from_slice::<serde_json::Value>(&read_request(&mut roots_post).body)
+                    .map_err(|error| format!("decode roots reply: {error}"))?;
+            assert_eq!(roots["id"], 82);
+            assert_eq!(roots["result"]["roots"][0]["uri"], "file:///workspace");
+            write_response(&mut roots_post, 202, "application/json", b"");
+
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"elicitation/create\",\"id\":83,\"params\":{}}\n\n",
+            );
+            let Some(mut elicitation_post) =
+                accept_legacy_test_peer(&listener, &stop_rx, deadline)?
+            else {
+                return Ok(false);
+            };
+            let elicitation = serde_json::from_slice::<serde_json::Value>(
+                &read_request(&mut elicitation_post).body,
+            )
+            .map_err(|error| format!("decode elicitation rejection: {error}"))?;
+            assert_eq!(elicitation["id"], 83);
+            assert_eq!(elicitation["error"]["code"], -32601);
+            write_response(&mut elicitation_post, 202, "application/json", b"");
+
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":71,\"result\":{\"first\":true}}\n\n",
+            );
+            let Some(mut follow_up_post) = accept_legacy_test_peer(&listener, &stop_rx, deadline)?
+            else {
+                return Ok(false);
+            };
+            let follow_up = serde_json::from_slice::<serde_json::Value>(
+                &read_request(&mut follow_up_post).body,
+            )
+            .map_err(|error| format!("decode follow-up request: {error}"))?;
+            assert_eq!(follow_up["id"], 72);
+            assert_eq!(follow_up["method"], "ping");
+            write_response(&mut follow_up_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":72,\"result\":{\"followUp\":true}}\n\n",
+            );
+            finish_chunked_sse(&mut sse);
+            Ok(true)
+        });
+
+        let capabilities = ClientCapabilities {
+            sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            roots: Some(fastmcp_protocol::RootsCapability {
+                list_changed: false,
+            }),
+            ..ClientCapabilities::default()
+        };
+        let handlers = ReverseRequestHandlers::new()
+            .with_sampling_create_message(|_cancellation, _params| {
+                Ok(crate::CreateMessageResult::text(
+                    "handled over legacy HTTP",
+                    "legacy-http-handler",
+                ))
+            })
+            .with_roots_list(|_cancellation, _params| {
+                Ok(crate::ListRootsResult::new(vec![
+                    fastmcp_protocol::Root::new("file:///workspace"),
+                ]))
+            });
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                "http://127.0.0.1:9/mcp",
+                &sse_target,
+                &message_target,
+                ProtocolPolicy::LegacyOnly,
+            ),
+            ClientInfo {
+                name: "legacy-http-reverse-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            capabilities,
+        ))
+        .expect("bounded legacy SSE connection opens");
+        connection
+            .set_legacy_reverse_request_handlers(handlers)
+            .expect("handlers and retained legacy capabilities match");
+
+        let first = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(71),
+            4_096,
+        ));
+        let follow_up = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(72),
+            4_096,
+        ));
+        signal_legacy_test_peer_stop(&stop_tx);
+        let served = server
+            .join()
+            .expect("legacy reverse server must join")
+            .expect("legacy reverse server exchange must remain bounded");
+
+        assert!(
+            served,
+            "bounded legacy reverse peer must serve the exchange"
+        );
+        assert_eq!(
+            first
+                .expect("correlated application response follows reverse replies")
+                .id,
+            Some(RequestId::Number(71))
+        );
+        assert_eq!(
+            follow_up
+                .expect("follow-up remains aligned after reverse request replies")
+                .id,
+            Some(RequestId::Number(72))
+        );
+    }
+
+    #[test]
+    fn legacy_http_matching_cancellation_discards_late_response_before_follow_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy cancellation listener");
+        let address = listener
+            .local_addr()
+            .expect("read legacy cancellation listener address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
+        let server = thread::spawn(move || -> Result<bool, String> {
+            listener.set_nonblocking(true).map_err(|error| {
+                format!("make legacy cancellation listener nonblocking: {error}")
+            })?;
+            let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+            let Some(mut sse) = accept_legacy_test_peer(&listener, &stop_rx, deadline)? else {
+                return Ok(false);
+            };
+            let _ = read_request(&mut sse);
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            let Some(mut cancelled_post) = accept_legacy_test_peer(&listener, &stop_rx, deadline)?
+            else {
+                return Ok(false);
+            };
+            let cancelled = serde_json::from_slice::<serde_json::Value>(
+                &read_request(&mut cancelled_post).body,
+            )
+            .map_err(|error| format!("decode cancelled application request: {error}"))?;
+            assert_eq!(cancelled["id"], 91);
+            write_response(&mut cancelled_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":91}}\n\n",
+            );
+
+            let Some(mut follow_up_post) = accept_legacy_test_peer(&listener, &stop_rx, deadline)?
+            else {
+                return Ok(false);
+            };
+            let follow_up = serde_json::from_slice::<serde_json::Value>(
+                &read_request(&mut follow_up_post).body,
+            )
+            .map_err(|error| format!("decode cancellation follow-up request: {error}"))?;
+            assert_eq!(follow_up["id"], 92);
+            write_response(&mut follow_up_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":91,\"result\":{\"late\":true}}\n\n",
+            );
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":92,\"result\":{\"followUp\":true}}\n\n",
+            );
+            finish_chunked_sse(&mut sse);
+            Ok(true)
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                "http://127.0.0.1:9/mcp",
+                &sse_target,
+                &message_target,
+                ProtocolPolicy::LegacyOnly,
+            ),
+            ClientInfo {
+                name: "legacy-http-cancellation-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("bounded legacy cancellation connection opens");
+        let cancelled = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(91),
+            4_096,
+        ));
+        let follow_up = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(92),
+            4_096,
+        ));
+        signal_legacy_test_peer_stop(&stop_tx);
+        let served = server
+            .join()
+            .expect("legacy cancellation server must join")
+            .expect("legacy cancellation server exchange must remain bounded");
+
+        assert!(
+            served,
+            "bounded legacy cancellation peer must serve the exchange"
+        );
+        assert!(matches!(
+            cancelled,
+            Err(ClientHttpConnectionError::LegacyRequestCancelled {
+                request_id: RequestId::Number(91)
+            })
+        ));
+        assert_eq!(
+            follow_up
+                .expect("late cancelled response is discarded before follow-up")
+                .id,
+            Some(RequestId::Number(92))
+        );
+    }
+
+    #[test]
+    fn legacy_http_foreign_cancellation_is_retained_without_cancelling_active_request() {
+        // This differs from the admitted cancellation case only in the
+        // notification requestId: 102 names no active request.
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind legacy foreign-cancel listener");
+        let address = listener
+            .local_addr()
+            .expect("read legacy foreign-cancel listener address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
+        let server = thread::spawn(move || -> Result<bool, String> {
+            listener.set_nonblocking(true).map_err(|error| {
+                format!("make legacy foreign-cancel listener nonblocking: {error}")
+            })?;
+            let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+            let Some(mut sse) = accept_legacy_test_peer(&listener, &stop_rx, deadline)? else {
+                return Ok(false);
+            };
+            let _ = read_request(&mut sse);
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            let Some(mut application_post) =
+                accept_legacy_test_peer(&listener, &stop_rx, deadline)?
+            else {
+                return Ok(false);
+            };
+            let application = serde_json::from_slice::<serde_json::Value>(
+                &read_request(&mut application_post).body,
+            )
+            .map_err(|error| format!("decode foreign-cancel application request: {error}"))?;
+            assert_eq!(application["id"], 101);
+            write_response(&mut application_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":102}}\n\n",
+            );
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":101,\"result\":{\"active\":true}}\n\n",
+            );
+
+            let Some(mut follow_up_post) = accept_legacy_test_peer(&listener, &stop_rx, deadline)?
+            else {
+                return Ok(false);
+            };
+            let follow_up = serde_json::from_slice::<serde_json::Value>(
+                &read_request(&mut follow_up_post).body,
+            )
+            .map_err(|error| format!("decode foreign-cancel follow-up request: {error}"))?;
+            assert_eq!(follow_up["id"], 103);
+            write_response(&mut follow_up_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":103,\"result\":{\"followUp\":true}}\n\n",
+            );
+            finish_chunked_sse(&mut sse);
+            Ok(true)
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                "http://127.0.0.1:9/mcp",
+                &sse_target,
+                &message_target,
+                ProtocolPolicy::LegacyOnly,
+            ),
+            ClientInfo {
+                name: "legacy-http-foreign-cancel-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("bounded legacy foreign-cancel connection opens");
+        let active = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(101),
+            4_096,
+        ));
+        let follow_up = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(103),
+            4_096,
+        ));
+        signal_legacy_test_peer_stop(&stop_tx);
+        let served = server
+            .join()
+            .expect("legacy foreign-cancel server must join")
+            .expect("legacy foreign-cancel server exchange must remain bounded");
+
+        assert!(
+            served,
+            "bounded legacy foreign-cancel peer must serve the exchange"
+        );
+        assert_eq!(
+            active
+                .expect("foreign cancellation must not cancel active request")
+                .id,
+            Some(RequestId::Number(101))
+        );
+        let notification = connection
+            .take_legacy_notification()
+            .expect("foreign cancellation is retained as an ordinary notification");
+        assert_eq!(notification.method, "notifications/cancelled");
+        assert_eq!(
+            notification.params.expect("foreign cancellation params")["requestId"],
+            102
+        );
+        assert_eq!(
+            follow_up
+                .expect("foreign cancellation does not disturb follow-up alignment")
+                .id,
+            Some(RequestId::Number(103))
+        );
     }
 
     #[test]

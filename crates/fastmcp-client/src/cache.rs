@@ -8,9 +8,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use fastmcp_protocol::{
-    CacheScope, CacheTtl, CacheableResult, CoreResult, FinalCoreResult, ServerNotification,
-};
+use fastmcp_protocol::{CacheScope, CacheTtl, CoreResult, FinalCoreResult, ServerNotification};
 
 /// Default maximum number of retained final complete results per client.
 pub const DEFAULT_FINAL_CACHE_CAPACITY: usize = 128;
@@ -225,7 +223,11 @@ pub struct FinalCacheStats {
 
 #[derive(Clone, Debug)]
 struct FinalCacheEntry {
-    cacheable: CacheableResult<CoreResult>,
+    // Keep the exact decoded result. `CacheableResult<T>` wraps a
+    // `CompleteResult<T>`, so it cannot honestly wrap an already-composed
+    // `CoreResult` without changing the result shape.
+    result: CoreResult,
+    scope: CacheScope,
     generation: FinalCacheGeneration,
     receipt: Instant,
     expires_at: Instant,
@@ -351,8 +353,8 @@ impl FinalResultCache {
         };
         let entry_generation = entry.generation;
         let expires_at = entry.expires_at;
-        let result = entry.cacheable.result.clone();
-        let scope = entry.cacheable.scope;
+        let result = entry.result.clone();
+        let scope = entry.scope;
 
         let miss = if entry_generation != self.begin_fetch(key.result_set()) {
             Some(FinalCacheMiss::Invalidated)
@@ -429,7 +431,8 @@ impl FinalResultCache {
         self.entries.insert(
             key,
             FinalCacheEntry {
-                cacheable: CacheableResult { result, ttl, scope },
+                result,
+                scope,
                 generation: captured_generation,
                 receipt,
                 expires_at,

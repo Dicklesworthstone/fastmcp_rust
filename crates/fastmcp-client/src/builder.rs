@@ -1061,7 +1061,10 @@ mod tests {
     fn reverse_handlers_derive_exact_legacy_capabilities_before_connect() {
         let handlers = ReverseRequestHandlers::new()
             .with_sampling_create_message(|_cancellation, _params| {
-                Ok(fastmcp_protocol::CreateMessageResult::text("ok", "test-model"))
+                Ok(fastmcp_protocol::CreateMessageResult::text(
+                    "ok",
+                    "test-model",
+                ))
             })
             .with_roots_list(|_cancellation, _params| {
                 Ok(fastmcp_protocol::ListRootsResult::new(Vec::new()))
@@ -1070,7 +1073,11 @@ mod tests {
 
         assert!(builder.capabilities.sampling.is_some());
         assert_eq!(
-            builder.capabilities.roots.as_ref().map(|roots| roots.list_changed),
+            builder
+                .capabilities
+                .roots
+                .as_ref()
+                .map(|roots| roots.list_changed),
             Some(false)
         );
         builder
@@ -1083,11 +1090,12 @@ mod tests {
     #[test]
     fn reverse_handlers_reject_modern_or_list_changed_legacy_configuration() {
         let sampling_handler = || {
-            ReverseRequestHandlers::new().with_sampling_create_message(
-                |_cancellation, _params| {
-                    Ok(fastmcp_protocol::CreateMessageResult::text("ok", "test-model"))
-                },
-            )
+            ReverseRequestHandlers::new().with_sampling_create_message(|_cancellation, _params| {
+                Ok(fastmcp_protocol::CreateMessageResult::text(
+                    "ok",
+                    "test-model",
+                ))
+            })
         };
         let modern = ClientBuilder::new().reverse_request_handlers(sampling_handler());
         let modern_error = modern
@@ -1116,13 +1124,13 @@ mod tests {
     #[test]
     fn builder_advertises_callbacks_before_legacy_initialize_and_dispatches_them() {
         let script = "IFS= read -r initialize || exit 1; \
-            case \"$initialize\" in *'\"method\":\"initialize\"'*'\"sampling\":{}'*'\"roots":{}'*) capabilities_ok=true;; *) capabilities_ok=false;; esac; \
+            case \"$initialize\" in *'\"method\":\"initialize\"'*'\"sampling\":{}'*'\"roots\":{}'*) capabilities_ok=true;; *) capabilities_ok=false;; esac; \
             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"callback-builder\",\"version\":\"1.0.0\"}}}'; \
             IFS= read -r lifecycle || exit 1; \
             case \"$lifecycle\" in *notifications/initialized*) lifecycle_ok=true;; *) lifecycle_ok=false;; esac; \
+            IFS= read -r request || exit 1; \
             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}'; \
             IFS= read -r callback || exit 1; \
-            IFS= read -r request || exit 1; \
             case \"$callback\" in *'\"id\":41'*'\"model\":\"builder-model\"'*) callback_ok=true;; *) callback_ok=false;; esac; \
             case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"capabilities\":%s,\"lifecycle\":%s,\"callback\":%s,\"request\":%s}}\\n' \"$capabilities_ok\" \"$lifecycle_ok\" \"$callback_ok\" \"$request_ok\"; exec sleep 2";

@@ -1726,10 +1726,8 @@ where
             state.fail_all(error, ExecutionTerminalReason::ConnectionLost);
             return Ok(());
         };
-        let retain_late_response_diagnostic = state
-            .tombstones
-            .get(&correlation_key)
-            .map(|tombstone| {
+        let retain_late_response_diagnostic =
+            state.tombstones.get(&correlation_key).map(|tombstone| {
                 debug_assert!(tombstone.generation > 0);
                 tombstone.retain_late_response_diagnostic
             });
