@@ -10551,43 +10551,21 @@ mod tests {
             for (policy, version, era) in [
                 (CliProtocolPolicy::Auto, "2026-07-28", "modern-2026"),
                 (CliProtocolPolicy::Auto, "2024-11-05", "legacy-2024"),
-                (
-                    CliProtocolPolicy::ModernOnly,
-                    "2026-07-28",
-                    "modern-2026",
-                ),
-                (
-                    CliProtocolPolicy::LegacyOnly,
-                    "2024-11-05",
-                    "legacy-2024",
-                ),
+                (CliProtocolPolicy::ModernOnly, "2026-07-28", "modern-2026"),
+                (CliProtocolPolicy::LegacyOnly, "2024-11-05", "legacy-2024"),
             ] {
                 let status = InspectProtocolStatus::new(policy, version)
                     .expect("each policy must report its exact admitted protocol version");
-                let text = format_inspect_text(
-                    &server_info,
-                    &capabilities,
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    status,
-                );
+                let text =
+                    format_inspect_text(&server_info, &capabilities, &[], &[], &[], &[], status);
                 assert!(text.contains(&format!(
                     "Protocol: policy={} version={version} era={era}",
                     policy.server_launch_value()
                 )));
 
-                let json = format_inspect_json(
-                    &server_info,
-                    &capabilities,
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    status,
-                )
-                .expect("inspect status serializes");
+                let json =
+                    format_inspect_json(&server_info, &capabilities, &[], &[], &[], &[], status)
+                        .expect("inspect status serializes");
                 let value: serde_json::Value =
                     serde_json::from_str(&json).expect("inspect status is JSON");
                 assert_eq!(value["protocol"]["policy"], policy.server_launch_value());
@@ -10607,9 +10585,8 @@ mod tests {
                     .expect("the baseline policy/version pair is admitted");
                 let accepted_before = accepted;
 
-                let error = InspectProtocolStatus::new(policy, rejected_version).expect_err(
-                    "changing only the negotiated protocol version must be rejected",
-                );
+                let error = InspectProtocolStatus::new(policy, rejected_version)
+                    .expect_err("changing only the negotiated protocol version must be rejected");
 
                 assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
                 assert_eq!(accepted, accepted_before);

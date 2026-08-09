@@ -29,14 +29,7 @@ emit_wire() {
 }
 
 is_exact_modern_discovery() {
-    case "$1" in
-        *'"method":"server/discover"'*) ;;
-        *) return 1 ;;
-    esac
-    case "$1" in
-        *'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) ;;
-        *) return 1 ;;
-    esac
+    printf '%s\n' "$1" | grep -Eq '^\{"jsonrpc":"2\.0","method":"server/discover","params":\{"_meta":\{"io\.modelcontextprotocol/clientCapabilities":\{\},"io\.modelcontextprotocol/clientInfo":\{"name":"[^"]*","version":"[^"]*"\},"io\.modelcontextprotocol/protocolVersion":"2026-07-28"\}\},"id":1\}$' || return 1
 }
 
 while IFS= read -r request; do
@@ -60,14 +53,7 @@ require_no_final_metadata() {
 }
 
 is_exact_modern_discovery() {
-    case "$1" in
-        *'"method":"server/discover"'*) ;;
-        *) return 1 ;;
-    esac
-    case "$1" in
-        *'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) ;;
-        *) return 1 ;;
-    esac
+    printf '%s\n' "$1" | grep -Eq '^\{"jsonrpc":"2\.0","method":"server/discover","params":\{"_meta":\{"io\.modelcontextprotocol/clientCapabilities":\{\},"io\.modelcontextprotocol/clientInfo":\{"name":"[^"]*","version":"[^"]*"\},"io\.modelcontextprotocol/protocolVersion":"2026-07-28"\}\},"id":1\}$' || return 1
 }
 
 is_exact_legacy_initialize() {
@@ -76,13 +62,12 @@ is_exact_legacy_initialize() {
 }
 
 is_exact_legacy_initialized_notification() {
-    case "$1" in
-        *'"method":"notifications/initialized"'*) ;;
-        *) return 1 ;;
-    esac
-    case "$1" in
-        *'"id":'*|*'"params":'*) return 1 ;;
-    esac
+    [ "$1" = '{"jsonrpc":"2.0","method":"notifications/initialized"}' ] || return 1
+    require_no_final_metadata "$1"
+}
+
+is_exact_legacy_operating_request() {
+    printf '%s\n' "$1" | grep -Eq '^\{"jsonrpc":"2\.0","method":"(tools/list|resources/list|resources/templates/list|prompts/list)","params":\{\},"id":[0-9]+\}$' || return 1
     require_no_final_metadata "$1"
 }
 
@@ -127,8 +112,7 @@ while IFS= read -r request; do
             state=operating
             ;;
         operating)
-            require_request_id "$request" || exit 1
-            require_no_final_metadata "$request" || exit 1
+            is_exact_legacy_operating_request "$request" || exit 1
             case "$request" in
                 *'"method":"tools/list"'*)
                     respond '{"tools":[]}'
@@ -152,6 +136,8 @@ done
 
 const LEGACY_PLANTED_INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"}},"id":1}"#;
 const LEGACY_PLANTED_REPEATED_INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"}},"id":2}"#;
+const LEGACY_PLANTED_INITIALIZED_NOTIFICATION: &str =
+    r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
 const LEGACY_PLANTED_TOOLS_LIST_REQUEST: &str =
     r#"{"jsonrpc":"2.0","method":"tools/list","params":{},"id":2}"#;
 
@@ -161,14 +147,7 @@ emit_wire() {
 }
 
 is_exact_modern_discovery() {
-    case "$1" in
-        *'"method":"server/discover"'*) ;;
-        *) return 1 ;;
-    esac
-    case "$1" in
-        *'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) ;;
-        *) return 1 ;;
-    esac
+    printf '%s\n' "$1" | grep -Eq '^\{"jsonrpc":"2\.0","method":"server/discover","params":\{"_meta":\{"io\.modelcontextprotocol/clientCapabilities":\{\},"io\.modelcontextprotocol/clientInfo":\{"name":"[^"]*","version":"[^"]*"\},"io\.modelcontextprotocol/protocolVersion":"2026-07-28"\}\},"id":1\}$' || return 1
 }
 
 while IFS= read -r request; do
@@ -230,11 +209,33 @@ fn assert_no_final_metadata(request: &serde_json::Value) {
 }
 
 fn assert_exact_modern_discovery_request(request: &serde_json::Value) {
+    assert_eq!(
+        request
+            .as_object()
+            .expect("modern discovery must be a JSON object")
+            .len(),
+        4,
+        "modern discovery must contain only JSON-RPC envelope fields"
+    );
     assert_eq!(request["jsonrpc"], "2.0");
     assert_eq!(request_method(request), "server/discover");
-    let metadata = request["params"]["_meta"]
+    assert_eq!(request["id"], 1);
+    let params = request["params"]
+        .as_object()
+        .expect("modern discovery must carry object params");
+    assert_eq!(
+        params.len(),
+        1,
+        "modern discovery params must contain only _meta"
+    );
+    let metadata = params["_meta"]
         .as_object()
         .expect("modern discovery must carry request metadata");
+    assert_eq!(
+        metadata.len(),
+        3,
+        "modern discovery metadata must contain only final protocol fields"
+    );
     assert_eq!(
         metadata["io.modelcontextprotocol/protocolVersion"],
         "2026-07-28"
@@ -242,14 +243,32 @@ fn assert_exact_modern_discovery_request(request: &serde_json::Value) {
     assert!(
         metadata
             .get("io.modelcontextprotocol/clientCapabilities")
-            .is_some(),
-        "modern discovery must carry final client capabilities"
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|capabilities| capabilities.is_empty()),
+        "modern discovery must carry exactly the empty final client capabilities object"
+    );
+    let client_info = metadata
+        .get("io.modelcontextprotocol/clientInfo")
+        .and_then(serde_json::Value::as_object)
+        .expect("modern discovery must carry final client info object");
+    assert_eq!(
+        client_info.len(),
+        2,
+        "modern discovery client info must contain only name and version"
     );
     assert!(
-        metadata
-            .get("io.modelcontextprotocol/clientInfo")
+        client_info
+            .get("name")
+            .and_then(serde_json::Value::as_str)
             .is_some(),
-        "modern discovery must carry final client info"
+        "modern discovery client info name must be a string"
+    );
+    assert!(
+        client_info
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "modern discovery client info version must be a string"
     );
 }
 
@@ -321,6 +340,14 @@ fn assert_exact_legacy_initialize_request(request: &serde_json::Value) {
 }
 
 fn assert_exact_legacy_initialized_notification_request(request: &serde_json::Value) {
+    assert_eq!(
+        request
+            .as_object()
+            .expect("legacy initialized notification must be a JSON object")
+            .len(),
+        2,
+        "legacy initialized notification must contain only JSON-RPC envelope fields"
+    );
     assert_eq!(request["jsonrpc"], "2.0");
     assert_eq!(request_method(request), "notifications/initialized");
     assert!(
@@ -335,6 +362,14 @@ fn assert_exact_legacy_initialized_notification_request(request: &serde_json::Va
 }
 
 fn assert_exact_legacy_operating_request(request: &serde_json::Value) {
+    assert_eq!(
+        request
+            .as_object()
+            .expect("legacy operating request must be a JSON object")
+            .len(),
+        4,
+        "legacy operating request must contain only JSON-RPC envelope fields"
+    );
     assert_eq!(request["jsonrpc"], "2.0");
     assert!(
         matches!(
@@ -342,6 +377,17 @@ fn assert_exact_legacy_operating_request(request: &serde_json::Value) {
             "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
         ),
         "legacy inspect must issue only operating list requests after initialization"
+    );
+    assert!(
+        request.get("id").is_some_and(serde_json::Value::is_number),
+        "legacy operating request must carry a numeric JSON-RPC request ID"
+    );
+    assert!(
+        request
+            .get("params")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|params| params.is_empty()),
+        "legacy operating request must carry exactly an empty params object"
     );
     assert_no_final_metadata(request);
 }
@@ -946,6 +992,18 @@ fn run_legacy_fixture_with_requests(requests: &[&str]) -> Output {
         .expect("legacy lifecycle fixture must exit after its input closes")
 }
 
+fn run_modern_fixture_with_request(request: &str) -> Output {
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("printf '%s\n' \"$1\" | /bin/sh -c \"$2\"")
+        .arg("modern-discovery-fixture")
+        .arg(request)
+        .arg(MODERN_INSPECT_FIXTURE);
+    run_with_deadline(command, Duration::from_secs(10))
+        .expect("modern discovery fixture must exit after its input closes")
+}
+
 #[cfg(unix)]
 #[test]
 fn e2e_test_json_report_against_static_protocol_fixture() {
@@ -1048,14 +1106,11 @@ fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
             "{policy} inspect text should succeed, stderr: {}",
             stderr_str(&text_output)
         );
-        let expected_text = format!(
-            "Protocol: policy={policy} version={expected_version} era={expected_era}"
-        );
+        let expected_text =
+            format!("Protocol: policy={policy} version={expected_version} era={expected_era}");
         let text = stdout_str(&text_output);
         assert_eq!(
-            text
-                .lines()
-                .find(|line| line.starts_with("Protocol: ")),
+            text.lines().find(|line| line.starts_with("Protocol: ")),
             Some(expected_text.as_str()),
             "{case_name} text inspect must emit the selected protocol triad exactly"
         );
@@ -1067,8 +1122,8 @@ fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
             "{policy} inspect JSON should succeed, stderr: {}",
             stderr_str(&json_output)
         );
-        let json: serde_json::Value = serde_json::from_str(&stdout_str(&json_output))
-            .expect("inspect output should be JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout_str(&json_output)).expect("inspect output should be JSON");
         assert_eq!(json["protocol"]["policy"], policy);
         assert_eq!(json["protocol"]["version"], expected_version);
         assert_eq!(json["protocol"]["era"], expected_era);
@@ -1114,6 +1169,152 @@ fn e2e_legacy_lifecycle_fixture_planted_negative_rejects_repeated_initialize() {
     );
     assert_exact_legacy_initialize_request(&wire[0]);
     assert_exact_legacy_initialize_request(&wire[1]);
+}
+
+#[test]
+fn e2e_legacy_initialized_fixture_planted_negatives_reject_noncanonical_envelopes() {
+    for (case_name, malformed_notification) in [
+        (
+            "extra envelope field",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized","extra":true}"#,
+        ),
+        (
+            "unexpected params object",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
+        ),
+    ] {
+        let output = run_legacy_fixture_with_requests(&[
+            LEGACY_PLANTED_INITIALIZE_REQUEST,
+            malformed_notification,
+        ]);
+        assert!(
+            !output.status.success(),
+            "legacy fixture must reject initialized notification with {case_name}"
+        );
+        let wire = observed_protocol_wire(&output);
+        assert_eq!(
+            wire.len(),
+            2,
+            "rejected initialized notification must follow exactly one initialize"
+        );
+        assert_exact_legacy_initialize_request(&wire[0]);
+        let expected: serde_json::Value = serde_json::from_str(malformed_notification)
+            .expect("planted notification must be JSON");
+        assert_eq!(
+            wire[1], expected,
+            "fixture must reject the observed initialized notification with {case_name}"
+        );
+    }
+}
+
+#[test]
+fn e2e_legacy_operating_fixture_planted_negatives_reject_noncanonical_envelopes() {
+    for (case_name, malformed_operating_request) in [
+        (
+            "extra envelope field",
+            r#"{"jsonrpc":"2.0","method":"tools/list","params":{},"id":2,"extra":true}"#,
+        ),
+        (
+            "non-object params",
+            r#"{"jsonrpc":"2.0","method":"tools/list","params":null,"id":2}"#,
+        ),
+    ] {
+        let output = run_legacy_fixture_with_requests(&[
+            LEGACY_PLANTED_INITIALIZE_REQUEST,
+            LEGACY_PLANTED_INITIALIZED_NOTIFICATION,
+            malformed_operating_request,
+        ]);
+        assert!(
+            !output.status.success(),
+            "legacy fixture must reject operating request with {case_name}"
+        );
+        let wire = observed_protocol_wire(&output);
+        assert_eq!(
+            wire.len(),
+            3,
+            "rejected operating request must follow initialize and initialized notification"
+        );
+        assert_exact_legacy_initialize_request(&wire[0]);
+        assert_exact_legacy_initialized_notification_request(&wire[1]);
+        let expected: serde_json::Value = serde_json::from_str(malformed_operating_request)
+            .expect("planted operating request must be JSON");
+        assert_eq!(
+            wire[2], expected,
+            "fixture must reject the observed operating request with {case_name}"
+        );
+    }
+}
+
+#[test]
+fn e2e_modern_discovery_fixture_planted_negatives_reject_noncanonical_envelopes() {
+    for (case_name, malformed_discovery) in [
+        (
+            "extra envelope field",
+            r#"{"jsonrpc":"2.0","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"planted-modern-client","version":"1.0.0"},"io.modelcontextprotocol/protocolVersion":"2026-07-28"}},"id":1,"extra":true}"#,
+        ),
+        (
+            "wrong jsonrpc",
+            r#"{"jsonrpc":"1.0","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"planted-modern-client","version":"1.0.0"},"io.modelcontextprotocol/protocolVersion":"2026-07-28"}},"id":1}"#,
+        ),
+        (
+            "missing jsonrpc",
+            r#"{"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"planted-modern-client","version":"1.0.0"},"io.modelcontextprotocol/protocolVersion":"2026-07-28"}},"id":1}"#,
+        ),
+        (
+            "wrong method",
+            r#"{"jsonrpc":"2.0","method":"server/unknown","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"planted-modern-client","version":"1.0.0"},"io.modelcontextprotocol/protocolVersion":"2026-07-28"}},"id":1}"#,
+        ),
+        (
+            "wrong id",
+            r#"{"jsonrpc":"2.0","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"planted-modern-client","version":"1.0.0"},"io.modelcontextprotocol/protocolVersion":"2026-07-28"}},"id":2}"#,
+        ),
+        (
+            "missing id",
+            r#"{"jsonrpc":"2.0","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"planted-modern-client","version":"1.0.0"},"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        ),
+        (
+            "null params",
+            r#"{"jsonrpc":"2.0","method":"server/discover","params":null,"id":1}"#,
+        ),
+        (
+            "extra params field",
+            r#"{"jsonrpc":"2.0","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"planted-modern-client","version":"1.0.0"},"io.modelcontextprotocol/protocolVersion":"2026-07-28"},"extra":true},"id":1}"#,
+        ),
+        (
+            "null metadata",
+            r#"{"jsonrpc":"2.0","method":"server/discover","params":{"_meta":null},"id":1}"#,
+        ),
+        (
+            "non-object client capabilities",
+            r#"{"jsonrpc":"2.0","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":null,"io.modelcontextprotocol/clientInfo":{"name":"planted-modern-client","version":"1.0.0"},"io.modelcontextprotocol/protocolVersion":"2026-07-28"}},"id":1}"#,
+        ),
+        (
+            "extra client info field",
+            r#"{"jsonrpc":"2.0","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"planted-modern-client","version":"1.0.0","extra":true},"io.modelcontextprotocol/protocolVersion":"2026-07-28"}},"id":1}"#,
+        ),
+        (
+            "extra metadata field",
+            r#"{"jsonrpc":"2.0","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"planted-modern-client","version":"1.0.0"},"io.modelcontextprotocol/protocolVersion":"2026-07-28","extra":true}},"id":1}"#,
+        ),
+    ] {
+        let output = run_modern_fixture_with_request(malformed_discovery);
+        assert!(
+            !output.status.success(),
+            "modern fixture must reject discovery with {case_name}"
+        );
+        let wire = observed_protocol_wire(&output);
+        assert_eq!(
+            wire.len(),
+            1,
+            "rejected {case_name} must be the only observed discovery request"
+        );
+        let expected: serde_json::Value =
+            serde_json::from_str(malformed_discovery).expect("planted discovery must be JSON");
+        assert_eq!(
+            wire[0], expected,
+            "fixture must reject the actual discovery request with {case_name}"
+        );
+    }
 }
 
 #[test]
