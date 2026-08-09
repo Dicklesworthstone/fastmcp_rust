@@ -2397,8 +2397,7 @@ fn final_subscription_terminal_event(event: &SseEvent) -> bool {
 }
 
 fn final_subscription_terminal_notification(notification: &JsonRpcRequest) -> bool {
-    let Ok(ServerNotification::Cancelled(params)) = ServerNotification::decode(&notification)
-    else {
+    let Ok(ServerNotification::Cancelled(params)) = ServerNotification::decode(notification) else {
         return false;
     };
     params
@@ -3619,6 +3618,11 @@ impl ServerHttpSession {
             return self.handle_modern(cx, endpoint_response).map(Err);
         };
         let request = self.endpoint_session.recv_modern_request(cx)?;
+        if request.method == "notifications/cancelled" {
+            return Ok(Err(ServerHttpEndpointResponse::Immediate(
+                HttpResponse::bad_request(),
+            )));
+        }
         Ok(Ok((request, sse)))
     }
 
@@ -4967,10 +4971,7 @@ impl Server {
                     .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 serde_json::to_value(self.server_discovery()?).map_err(McpError::from)
             } else {
-                match self
-                    .router
-                    .dispatch_stateless(&request_ctx, &admission_request)
-                {
+                match self.router.dispatch_stateless(&request_ctx, &admission_request) {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
                         self.dispatch_extension_fallback(&request_ctx, &admission_request)
                     }
