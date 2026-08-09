@@ -587,14 +587,6 @@ enum LegacyEmbeddedContent {
     Blob(String),
 }
 
-fn legacy_list_tools_params(params: FinalListParams) -> ListToolsParams {
-    ListToolsParams {
-        cursor: params.cursor,
-        include_tags: params.include_tags,
-        exclude_tags: params.exclude_tags,
-    }
-}
-
 fn legacy_list_resources_params(params: FinalListParams) -> ListResourcesParams {
     ListResourcesParams {
         cursor: params.cursor,
@@ -888,8 +880,10 @@ pub struct Router {
     tools: HashMap<String, BoxedToolHandler>,
     /// Immutable final-dialect schemas admitted with each registered tool.
     ///
-    /// This stays separate from the legacy `Tool` definition so final catalog
-    /// and invocation paths never consume a raw, handler-provided schema.
+    /// This is a final-only index: every tool remains registered in `tools`
+    /// for the exact legacy surface, while only entries present here are
+    /// visible or invokable on modern routes. This keeps final schema
+    /// admission from changing legacy registration semantics.
     final_tool_schemas: HashMap<String, FinalToolSchemas>,
     tool_order: Vec<String>,
     completion_handler: Option<BoxedCompletionHandler>,
@@ -1021,20 +1015,24 @@ impl Router {
     pub fn add_tool<H: ToolHandler + 'static>(&mut self, handler: H) {
         let def = handler.definition();
         let schemas = match admit_final_tool_schemas(&def) {
-            Ok(schemas) => schemas,
+            Ok(schemas) => Some(schemas),
             Err(error) => {
                 log::warn!(
                     target: "fastmcp_rust::router",
-                    "refusing tool with an unadmitted final schema; tool_key={}; error_code={:?}",
+                    "registering tool for legacy only because final schema admission failed; tool_key={}; error_code={:?}",
                     safe_log_label(&def.name),
                     error.code
                 );
-                return;
+                None
             }
         };
         let is_new = !self.tools.contains_key(&def.name);
         self.tools.insert(def.name.clone(), Box::new(handler));
-        self.final_tool_schemas.insert(def.name.clone(), schemas);
+        if let Some(schemas) = schemas {
+            self.final_tool_schemas.insert(def.name.clone(), schemas);
+        } else {
+            self.final_tool_schemas.remove(&def.name);
+        }
         if is_new {
             self.tool_order.push(def.name);
         }
@@ -1080,9 +1078,24 @@ impl Router {
             }
         }
 
-        let schemas = admit_final_tool_schemas(&def)?;
+        let schemas = match admit_final_tool_schemas(&def) {
+            Ok(schemas) => Some(schemas),
+            Err(error) => {
+                log::warn!(
+                    target: "fastmcp_rust::router",
+                    "registering tool for legacy only because final schema admission failed; tool_key={}; error_code={:?}",
+                    safe_log_label(&def.name),
+                    error.code
+                );
+                None
+            }
+        };
         self.tools.insert(def.name.clone(), Box::new(handler));
-        self.final_tool_schemas.insert(def.name.clone(), schemas);
+        if let Some(schemas) = schemas {
+            self.final_tool_schemas.insert(def.name.clone(), schemas);
+        } else {
+            self.final_tool_schemas.remove(&def.name);
+        }
         if !existed {
             self.tool_order.push(def.name);
         }
@@ -1894,20 +1907,13 @@ impl Router {
                 let request =
                     CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", params.as_ref())
                         .map_err(|error| McpError::invalid_params(error.to_string()))?;
-                let CoreRequest::Final(FinalCoreRequest::ToolsList(params)) = &request else {
+                let CoreRequest::Final(FinalCoreRequest::ToolsList(params)) = request else {
                     return Err(McpError::internal_error(
                         "modern tools/list dispatch selected another core request",
                     ));
                 };
-                let result = self.handle_tools_list(
-                    request_ctx,
-                    legacy_list_tools_params(params.clone()),
-                    None,
-                );
                 encode_final_core_result(
-                    result.and_then(|result| {
-                        self.project_final_tools_list(request_ctx, result, self.final_cache_hints)
-                    }),
+                    self.handle_final_tools_list(request_ctx, params),
                     |result| FinalCoreResult::ToolsList {
                         result,
                         diagnostic: None,
@@ -2166,6 +2172,53 @@ impl Router {
             tools: tools.get(offset..end).unwrap_or_default().to_vec(),
             next_cursor,
         })
+    }
+
+    /// Handles a final tools/list request using only the final-admitted tool
+    /// index. A legacy-only tool is deliberately absent before its definition
+    /// hook is reached, so malformed final schemas cannot influence a modern
+    /// catalog page or its cursor.
+    fn handle_final_tools_list(
+        &self,
+        request_ctx: &McpContext,
+        params: FinalListParams,
+    ) -> McpResult<FinalListToolsResult> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
+        let tag_filters =
+            TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
+            Some(&tag_filters)
+        } else {
+            None
+        };
+        let tools = crate::catch_extension_unwind(|| {
+            self.tool_order
+                .iter()
+                .filter(|name| self.final_tool_schemas.contains_key(name.as_str()))
+                .filter_map(|name| self.tools.get(name))
+                .map(|handler| handler.definition())
+                .filter(|tool| tag_filters.is_none_or(|filters| filters.matches(&tool.tags)))
+                .collect::<Vec<_>>()
+        })
+        .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
+
+        let result = if let Some(page_size) = self.list_page_size {
+            let offset = decode_cursor_offset(params.cursor.as_deref())?;
+            let end = offset.saturating_add(page_size).min(tools.len());
+            ListToolsResult {
+                tools: tools.get(offset..end).unwrap_or_default().to_vec(),
+                next_cursor: (end < tools.len()).then(|| encode_cursor_offset(end)),
+            }
+        } else {
+            ListToolsResult {
+                tools,
+                next_cursor: None,
+            }
+        };
+        self.project_final_tools_list(request_ctx, result, self.final_cache_hints)
     }
 
     fn project_final_tools_list(
@@ -2651,6 +2704,12 @@ impl Router {
             .tools
             .get(&params.name)
             .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {}", params.name)))?;
+        let (input_schema, output_schema) = self
+            .final_tool_schemas
+            .get(&params.name)
+            .cloned()
+            .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {}", params.name)))
+            .map(|schemas| (schemas.input, schemas.output))?;
         if params.arguments.is_explicit_null() {
             return Err(McpError::invalid_params(
                 "tools/call arguments must not be null",
@@ -2660,22 +2719,17 @@ impl Router {
             .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
         if declares_final_tasks {
             require_final_tasks_capability(&params.meta)?;
-            self.final_task_runtime.as_ref().ok_or_else(|| {
+            let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
                 McpError::internal_error(
                     "task-capable tool requires an installed final Tasks runtime",
                 )
             })?;
+            runtime.ensure_task_service_ready()?;
         }
         let arguments = params
             .arguments
             .into_value()
             .unwrap_or_else(|| serde_json::json!({}));
-        let (input_schema, output_schema) = self
-            .final_tool_schemas
-            .get(&params.name)
-            .cloned()
-            .ok_or_else(|| McpError::internal_error("tool has no admitted final schemas"))
-            .map(|schemas| (schemas.input, schemas.output))?;
         if input_schema.validate(&arguments).is_err() {
             let mut result = crate::handler::promote_legacy_tool_content(vec![Content::text(
                 "Tool arguments do not match the declared input schema.",
@@ -3903,13 +3957,7 @@ impl Router {
             let Some(handler) = tools.remove(&name) else {
                 continue;
             };
-            let Some(schemas) = final_tool_schemas.remove(&name) else {
-                result.warnings.push(format!(
-                    "Tool '{}' has no admitted final schemas and was not mounted",
-                    name
-                ));
-                continue;
-            };
+            let schemas = final_tool_schemas.remove(&name);
             let mounted_name = Self::apply_prefix(&name, prefix);
             trace!(
                 target: targets::HANDLER,
@@ -3930,8 +3978,12 @@ impl Router {
             let mounted = MountedToolHandler::new(handler, mounted_name.clone());
             let needs_order_push = !existed && !self.tool_order.iter().any(|n| n == &mounted_name);
             self.tools.insert(mounted_name.clone(), Box::new(mounted));
-            self.final_tool_schemas
-                .insert(mounted_name.clone(), schemas);
+            if let Some(schemas) = schemas {
+                self.final_tool_schemas
+                    .insert(mounted_name.clone(), schemas);
+            } else {
+                self.final_tool_schemas.remove(&mounted_name);
+            }
             if needs_order_push {
                 self.tool_order.push(mounted_name);
             }
@@ -3944,13 +3996,7 @@ impl Router {
             let mut remaining: Vec<(String, BoxedToolHandler)> = tools.into_iter().collect();
             remaining.sort_by(|a, b| a.0.cmp(&b.0));
             for (name, handler) in remaining {
-                let Some(schemas) = final_tool_schemas.remove(&name) else {
-                    result.warnings.push(format!(
-                        "Tool '{}' has no admitted final schemas and was not mounted",
-                        name
-                    ));
-                    continue;
-                };
+                let schemas = final_tool_schemas.remove(&name);
                 let mounted_name = Self::apply_prefix(&name, prefix);
 
                 let existed = self.tools.contains_key(&mounted_name);
@@ -3962,8 +4008,12 @@ impl Router {
 
                 let mounted = MountedToolHandler::new(handler, mounted_name.clone());
                 self.tools.insert(mounted_name.clone(), Box::new(mounted));
-                self.final_tool_schemas
-                    .insert(mounted_name.clone(), schemas);
+                if let Some(schemas) = schemas {
+                    self.final_tool_schemas
+                        .insert(mounted_name.clone(), schemas);
+                } else {
+                    self.final_tool_schemas.remove(&mounted_name);
+                }
                 if !existed && !self.tool_order.iter().any(|n| n == &mounted_name) {
                     self.tool_order.push(mounted_name);
                 }
@@ -6031,6 +6081,89 @@ mod router_tests {
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
             Ok(vec![Content::text(format!("called {}", self.name))])
         }
+    }
+
+    /// A tool that remains valid for legacy registration and dispatch but is
+    /// intentionally excluded from the final-admitted index.
+    struct LegacyOnlyNamedTool {
+        name: String,
+        tags: Vec<String>,
+    }
+
+    impl LegacyOnlyNamedTool {
+        fn with_tags(name: &str, tags: Vec<String>) -> Self {
+            Self {
+                name: name.to_owned(),
+                tags,
+            }
+        }
+    }
+
+    impl ToolHandler for LegacyOnlyNamedTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: self.name.clone(),
+                description: Some(format!("Legacy-only tool {}", self.name)),
+                input_schema: serde_json::json!({"type": "object"}),
+                // A scalar final output schema is inadmissible, but legacy
+                // dispatch does not consume it.
+                output_schema: Some(serde_json::json!(false)),
+                icon: None,
+                version: None,
+                tags: self.tags.clone(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text(format!("called {}", self.name))])
+        }
+    }
+
+    fn final_tools_list_request(
+        cursor: Option<&str>,
+        include_tags: Option<Vec<&str>>,
+        exclude_tags: Option<Vec<&str>>,
+        id: i64,
+    ) -> JsonRpcRequest {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "_meta".to_owned(),
+            serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }),
+        );
+        if let Some(cursor) = cursor {
+            params.insert("cursor".to_owned(), serde_json::json!(cursor));
+        }
+        if let Some(include_tags) = include_tags {
+            params.insert("includeTags".to_owned(), serde_json::json!(include_tags));
+        }
+        if let Some(exclude_tags) = exclude_tags {
+            params.insert("excludeTags".to_owned(), serde_json::json!(exclude_tags));
+        }
+        JsonRpcRequest::new("tools/list", Some(serde_json::Value::Object(params)), id)
+    }
+
+    fn mixed_era_mounted_tool_router() -> Router {
+        let mut source = Router::new();
+        source.add_tool(NamedTool::with_tags("first", vec!["visible".to_owned()]));
+        source.add_tool(LegacyOnlyNamedTool::with_tags(
+            "legacy-middle",
+            vec!["visible".to_owned()],
+        ));
+        source.add_tool(NamedTool::with_tags("second", vec!["visible".to_owned()]));
+        source.add_tool(NamedTool::with_tags(
+            "excluded",
+            vec!["visible".to_owned(), "excluded".to_owned()],
+        ));
+        source.add_tool(NamedTool::with_tags("other", vec!["other".to_owned()]));
+
+        let mut router = Router::new();
+        let mounted = router.mount_tools(source, Some("peer"));
+        assert_eq!(mounted.tools, 5);
+        router
     }
 
     static MACRO_DUAL_ERA_TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -9587,6 +9720,110 @@ mod router_tests {
         assert!(result.next_cursor.is_none());
     }
 
+    #[test]
+    fn final_mixed_era_mount_excludes_legacy_only_tools_before_cursor_pagination() {
+        let mut router = mixed_era_mounted_tool_router();
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 164, Budget::INFINITE, &state);
+
+        let legacy = router
+            .handle_tools_list(
+                &request_ctx,
+                ListToolsParams {
+                    cursor: None,
+                    include_tags: Some(vec!["visible".to_owned()]),
+                    exclude_tags: Some(vec!["excluded".to_owned()]),
+                },
+                None,
+            )
+            .expect("legacy filtering retains every registered tool");
+        assert_eq!(
+            legacy
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["peer/first", "peer/legacy-middle", "peer/second"],
+            "the legacy catalog retains the mounted legacy-only entry in source order"
+        );
+
+        router.set_list_page_size(Some(1));
+        let first_page = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(
+                    None,
+                    Some(vec!["visible"]),
+                    Some(vec!["excluded"]),
+                    164_i64,
+                ),
+            )
+            .expect("the first final page contains the first admitted entry");
+        assert_eq!(first_page["tools"][0]["name"], "peer/first");
+        assert_eq!(first_page["tools"].as_array().map(Vec::len), Some(1));
+        let cursor = first_page["nextCursor"]
+            .as_str()
+            .expect("the first admitted page has a continuation cursor");
+        assert_eq!(
+            decode_cursor_offset(Some(cursor)).expect("cursor is router-generated"),
+            1,
+            "the cursor advances across admitted entries, not every legacy registration"
+        );
+
+        let second_page = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(
+                    Some(cursor),
+                    Some(vec!["visible"]),
+                    Some(vec!["excluded"]),
+                    165_i64,
+                ),
+            )
+            .expect("the continuation page skips the legacy-only entry");
+        assert_eq!(second_page["tools"][0]["name"], "peer/second");
+        assert_eq!(second_page["tools"].as_array().map(Vec::len), Some(1));
+        assert!(
+            second_page.get("nextCursor").is_none(),
+            "the second admitted entry terminates the filtered final sequence"
+        );
+    }
+
+    #[test]
+    fn final_mixed_era_mount_applies_tag_filters_only_to_admitted_order() {
+        let router = mixed_era_mounted_tool_router();
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 166, Budget::INFINITE, &state);
+
+        let visible = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, Some(vec!["visible"]), None, 166_i64),
+            )
+            .expect("the final include filter projects only admitted visible entries");
+        assert_eq!(
+            visible["tools"]
+                .as_array()
+                .expect("final tools are an array")
+                .iter()
+                .map(|tool| tool["name"].as_str().expect("tool name is a string"))
+                .collect::<Vec<_>>(),
+            vec!["peer/first", "peer/second", "peer/excluded"],
+            "the legacy-only visible entry is absent without disturbing admitted insertion order"
+        );
+
+        let other = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, Some(vec!["other"]), None, 167_i64),
+            )
+            .expect("the include filter is evaluated after final admission");
+        assert_eq!(other["tools"][0]["name"], "peer/other");
+        assert_eq!(other["tools"].as_array().map(Vec::len), Some(1));
+    }
+
     // ── handle_resources_list with session state filter ──────────────────
 
     #[test]
@@ -11367,115 +11604,88 @@ mod router_tests {
     }
 
     #[test]
-    fn final_tool_registration_rejects_unadmitted_schemas_without_catalog_mutation() {
-        for (
-            invalid_final_input_schema,
-            missing_final_input_object_type,
-            invalid_final_output_schema,
-            expected_message,
-        ) in [
-            (
-                true,
-                false,
-                false,
-                "tool declares a final input schema that is not an object",
-            ),
-            (
-                false,
-                true,
-                false,
-                "tool declares a final input schema without type object",
-            ),
-            (
-                false,
-                false,
-                true,
-                "tool declares a final output schema that is not an object",
-            ),
-        ] {
-            let final_calls = Arc::new(AtomicUsize::new(0));
-            let legacy_calls = Arc::new(AtomicUsize::new(0));
-            let mut router = Router::new();
-            router.add_tool(SchemaBoundaryTool {
-                final_calls: Arc::new(AtomicUsize::new(0)),
-                legacy_calls: Arc::new(AtomicUsize::new(0)),
-                output_matches_schema: true,
-                output_is_error: false,
-                output_has_unevaluated_property: false,
-                invalid_final_input_schema: false,
-                missing_final_input_object_type: false,
-                invalid_final_output_schema: false,
-            });
-            let cx = Cx::for_testing();
-            let state = SessionState::new();
-            let request_ctx = request_context(&cx, 158, Budget::INFINITE, &state);
-            let baseline_catalog = router
-                .dispatch_stateless(
-                    &request_ctx,
-                    &JsonRpcRequest::new(
-                        "tools/list",
-                        Some(serde_json::json!({
-                            "_meta": {
-                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                                "io.modelcontextprotocol/clientCapabilities": {},
-                            }
-                        })),
-                        158_i64,
-                    ),
-                )
-                .expect("the admitted baseline tool appears in the final catalog");
+    fn invalid_final_schema_preserves_legacy_and_isolates_modern_routes() {
+        let original_final_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_tool(SchemaBoundaryTool {
+            final_calls: Arc::clone(&original_final_calls),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            output_matches_schema: true,
+            output_is_error: false,
+            output_has_unevaluated_property: false,
+            invalid_final_input_schema: false,
+            missing_final_input_object_type: false,
+            invalid_final_output_schema: false,
+        });
+        router
+            .add_tool_with_behavior(
+                SchemaBoundaryTool {
+                    final_calls: Arc::clone(&final_calls),
+                    legacy_calls: Arc::clone(&legacy_calls),
+                    output_matches_schema: true,
+                    output_is_error: false,
+                    output_has_unevaluated_property: false,
+                    invalid_final_input_schema: false,
+                    missing_final_input_object_type: false,
+                    invalid_final_output_schema: true,
+                },
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("legacy registration remains valid when only final schema admission fails");
 
-            let error = router
-                .add_tool_with_behavior(
-                    SchemaBoundaryTool {
-                        final_calls: Arc::clone(&final_calls),
-                        legacy_calls: Arc::clone(&legacy_calls),
-                        output_matches_schema: true,
-                        output_is_error: false,
-                        output_has_unevaluated_property: false,
-                        invalid_final_input_schema,
-                        missing_final_input_object_type,
-                        invalid_final_output_schema,
-                    },
-                    crate::DuplicateBehavior::Replace,
-                )
-                .expect_err("invalid final schemas fail before replacing a registered tool");
-            assert_eq!(error.code, McpErrorCode::InternalError);
-            assert_eq!(error.message, expected_message);
-            assert_eq!(final_calls.load(Ordering::SeqCst), 0);
-            assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 158, Budget::INFINITE, &state);
+        let legacy = router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "schema-boundary-tool".to_owned(),
+                    arguments: Some(serde_json::json!({"value": "accepted"})),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("the legacy-valid replacement remains callable");
+        assert!(!legacy.is_error);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
 
-            let catalog_after = router
-                .dispatch_stateless(
-                    &request_ctx,
-                    &JsonRpcRequest::new(
-                        "tools/list",
-                        Some(serde_json::json!({
-                            "_meta": {
-                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                                "io.modelcontextprotocol/clientCapabilities": {},
-                            }
-                        })),
-                        159_i64,
-                    ),
-                )
-                .expect("a rejected registration cannot corrupt the admitted catalog");
-            assert_eq!(catalog_after, baseline_catalog);
+        let modern_catalog = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "tools/list",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        }
+                    })),
+                    159_i64,
+                ),
+            )
+            .expect("a final catalog omits legacy-only tool entries");
+        assert_eq!(modern_catalog["tools"], serde_json::json!([]));
 
-            let preserved = router
-                .dispatch_stateless(
-                    &request_ctx,
-                    &final_tools_call_request(
-                        "schema-boundary-tool",
-                        serde_json::json!({"value": "accepted"}),
-                        160_i64,
-                    ),
-                )
-                .expect("the pre-existing admitted handler remains callable");
-            assert_eq!(preserved["resultType"], "complete");
-            assert_eq!(final_calls.load(Ordering::SeqCst), 0);
-            assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
-        }
+        let modern_error = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "schema-boundary-tool",
+                    serde_json::json!({"value": "accepted"}),
+                    160_i64,
+                ),
+            )
+            .expect_err("a legacy-only tool is not invokable through the final route");
+        assert_eq!(modern_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(modern_error.message, "Unknown tool: schema-boundary-tool");
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(original_final_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -11662,6 +11872,40 @@ mod router_tests {
             store.task_count(),
             0,
             "pre-handler admission does not persist a task"
+        );
+    }
+
+    #[test]
+    fn final_task_capable_tool_with_unready_service_rejects_before_handler_without_store_mutation()
+    {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = task_runtime_for_router(Arc::clone(&store));
+        let _unready_service = runtime
+            .install_task_service(1, Arc::new(NoopFinalTaskSupervisor))
+            .expect("an installed but unpolled task service remains unready");
+        let mut router = Router::new();
+        router.set_final_task_runtime(Some(runtime));
+        router.add_tool(TaskCapableRouterTool {
+            final_calls: Arc::clone(&final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 162, Budget::INFINITE, &state);
+
+        let error = router
+            .dispatch_stateless(&request_ctx, &final_task_capable_tool_request(162_i64))
+            .expect_err("an installed but unready task service is refused before handler call");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            error.message,
+            "Final task creation requires an installed ready task service"
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.task_count(),
+            0,
+            "pre-handler readiness admission cannot persist a task"
         );
     }
 
