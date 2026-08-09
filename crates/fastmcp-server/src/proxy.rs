@@ -2536,7 +2536,7 @@ impl ProxyClient {
         }
     }
 
-    fn read_resource_final(
+    pub(crate) fn read_resource_final(
         &self,
         ctx: &McpContext,
         uri: &str,
@@ -2552,7 +2552,7 @@ impl ProxyClient {
         }
     }
 
-    fn get_prompt_final(
+    pub(crate) fn get_prompt_final(
         &self,
         ctx: &McpContext,
         name: &str,
