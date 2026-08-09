@@ -1054,6 +1054,19 @@ fn valid_metadata_name(name: &str) -> bool {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
 }
 
+fn reject_bare_unknown_members(value: &Value, known: &[&str]) -> Result<(), CommonTypeError> {
+    let object = value
+        .as_object()
+        .ok_or(CommonTypeError::Invalid("wire object"))?;
+    for key in object.keys() {
+        let qualified = matches!(split_metadata_key(key), Some((Some(_), _)));
+        if !known.contains(&key.as_str()) && !qualified {
+            return Err(CommonTypeError::Invalid("unrecognized bare wire member"));
+        }
+    }
+    Ok(())
+}
+
 fn reject_explicit_null_fields(value: &Value, fields: &[&str]) -> Result<(), CommonTypeError> {
     let object = value
         .as_object()
@@ -1614,6 +1627,11 @@ impl<'de> Deserialize<'de> for EmbeddedResourceContents {
                 "embedded resource requires exactly one of text or blob",
             ));
         }
+        // Schema-allowed additional properties are namespaced extension
+        // members; bare strangers (for example a snake_case mime_type
+        // shadowing the canonical mimeType) must reject.
+        reject_bare_unknown_members(&value, &["uri", "text", "blob", "mimeType", "_meta"])
+            .map_err(serde::de::Error::custom)?;
         reject_explicit_null_fields(&value, &["mimeType", "_meta"])
             .map_err(serde::de::Error::custom)?;
         let wire: EmbeddedResourceContentsWire =
@@ -1803,6 +1821,27 @@ impl<'de> Deserialize<'de> for ContentBlock {
         ) {
             return Err(serde::de::Error::custom("content discriminator"));
         }
+        // Schema-allowed additional properties are namespaced extension
+        // members; a bare unknown member is a shadow/squatting risk and must
+        // reject without consuming the block.
+        let known_members: &[&str] = match kind {
+            "text" => &["type", "text", "annotations", "_meta"],
+            "image" | "audio" => &["type", "data", "mimeType", "annotations", "_meta"],
+            "resource_link" => &[
+                "type",
+                "icons",
+                "name",
+                "title",
+                "uri",
+                "description",
+                "mimeType",
+                "annotations",
+                "size",
+                "_meta",
+            ],
+            _ => &["type", "resource", "annotations", "_meta"],
+        };
+        reject_bare_unknown_members(&value, known_members).map_err(serde::de::Error::custom)?;
         let optional_non_null_fields = match kind {
             "resource_link" => &[
                 "icons",
