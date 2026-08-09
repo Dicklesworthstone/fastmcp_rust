@@ -908,9 +908,8 @@ fn e2e_public_http_auto_falls_back_to_exact_legacy_on_live_eligible_refusal() {
 #[test]
 fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
     let gate = Arc::new(OverlapFinalMethodGate::default());
-    let mut server = HttpServerFixture::spawn_with_middleware(Some(
-        Arc::clone(&gate) as Arc<dyn Middleware>
-    ));
+    let mut server =
+        HttpServerFixture::spawn_with_middleware(Some(Arc::clone(&gate) as Arc<dyn Middleware>));
     let address = server.address();
 
     let (completed_tx, completed_rx) = mpsc::channel();

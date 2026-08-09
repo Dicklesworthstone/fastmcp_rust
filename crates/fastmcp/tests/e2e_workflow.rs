@@ -1044,7 +1044,7 @@ impl FinalTasksHttpFixture {
                 }
             });
         }));
-        let startup = FinalTasksHttpStartupGuard {
+        let mut startup = FinalTasksHttpStartupGuard {
             shutdown: Some(shutdown_tx),
             finished: Some(finished_rx),
             join,
@@ -1502,8 +1502,6 @@ impl ToolHandler for SessionGetHandler {
         Ok(vec![Content::Text { text: result }])
     }
 }
-
-use std::sync::Arc;
 
 #[test]
 fn workflow_concurrent_clients_isolation() {
