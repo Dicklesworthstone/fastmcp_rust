@@ -6150,7 +6150,7 @@ impl Server {
                     modern_http_owner,
                     request_cancellation.clone(),
                     terminal_delivery,
-                    notification_sender,
+                    Arc::clone(&notification_sender),
                 )
                 .await
             }
@@ -8153,6 +8153,7 @@ impl Server {
                         request_id_to_u64(request.id.as_ref()),
                         InboundRequestTransport::Stdio,
                     );
+                    let request_cancellation = McpRequestCancellation::new();
                     let notification_send = Arc::clone(&worker_send);
                     let notification_cx = worker_cx.clone();
                     let notification_cancellation = request_cancellation.clone();

@@ -130,6 +130,17 @@ impl ExtensionId {
         if value.matches('/').count() != 1 || !valid_prefix(prefix) || !valid_name(name) {
             return Err(ExtensionRegistryError::InvalidIdentifier(value));
         }
+        // The official second DNS labels are reserved: `com.mcp.*` or
+        // `org.modelcontextprotocol.*` would masquerade as official
+        // namespaces. Deeper labels (`com.example.mcp`) stay available, and
+        // the exact official prefix keeps resolving.
+        if let Some(second_label) = prefix.split('.').nth(1) {
+            let reserved = second_label.eq_ignore_ascii_case("mcp")
+                || second_label.eq_ignore_ascii_case("modelcontextprotocol");
+            if reserved && prefix != "io.modelcontextprotocol" {
+                return Err(ExtensionRegistryError::ReservedNamespace(value));
+            }
+        }
         Ok(Self(value))
     }
 
