@@ -7,6 +7,20 @@ use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::Duration;
 
+use crate::FinalTaskRuntime;
+use crate::Session;
+use crate::bidirectional::{
+    MrtrCompletedInputs, MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputRequest,
+    MrtrInputRequests, MrtrInputRequired, MrtrRetry,
+};
+use crate::handler::{
+    BidirectionalSenders, BoxFuture, FinalMethodOutcome, FinalToolOutcome,
+    ProgressNotificationSender, UriParams, empty_final_result_meta, encode_final_complete_result,
+};
+use crate::handler::{
+    BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
+    CompletionHandler, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
+};
 #[cfg(test)]
 use asupersync::time::wall_now;
 use asupersync::types::Time;
@@ -42,26 +56,6 @@ use fastmcp_protocol::{
     ReadResourceResult, Resource, ResourceContent, ResourceTemplate, ServerBehavior,
     ServerBehaviorRegistry, TemplateValue, Tool, admit_final_schema, exact_json_to_serde, validate,
     validate_strict,
-};
-#[cfg(test)]
-use fastmcp_protocol::{CancelTaskParams, CancelTaskResult, GetTaskParams, GetTaskResult};
-
-use crate::bidirectional::{
-    MrtrCompletedInputs, MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputRequest,
-    MrtrInputRequests, MrtrInputRequired, MrtrRetry,
-};
-use crate::handler::{
-    BidirectionalSenders, BoxFuture, FinalMethodOutcome, FinalToolOutcome,
-    ProgressNotificationSender, UriParams, empty_final_result_meta, encode_final_complete_result,
-};
-#[cfg(test)]
-use crate::tasks::SharedTaskManager;
-
-use crate::FinalTaskRuntime;
-use crate::Session;
-use crate::handler::{
-    BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
-    CompletionHandler, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
 };
 
 /// Type alias for a notification sender callback.
@@ -4422,82 +4416,6 @@ impl Router {
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "prompt")),
         }
-    }
-
-    // ========================================================================
-    // Task Dispatch Methods (Docket/SEP-1686)
-    // ========================================================================
-
-    /// Handles the tasks/get request.
-    ///
-    /// Gets information about a specific task, including its result if completed.
-    #[cfg(test)]
-    pub fn handle_tasks_get(
-        &self,
-        request_ctx: &McpContext,
-        params: GetTaskParams,
-        task_manager: Option<&SharedTaskManager>,
-    ) -> McpResult<GetTaskResult> {
-        if let Some(error) = budget_error(request_ctx) {
-            return Err(error);
-        }
-
-        let task_manager = task_manager.ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::MethodNotFound,
-                "Background tasks not enabled on this server",
-            )
-        })?;
-
-        debug!(
-            target: targets::HANDLER,
-            "getting task; task_key={}",
-            safe_log_label(params.id.as_str())
-        );
-
-        let task = task_manager
-            .get_info(&params.id)
-            .ok_or_else(|| McpError::invalid_params(format!("Task not found: {}", params.id)))?;
-
-        let result = task_manager.get_result(&params.id);
-
-        Ok(GetTaskResult { task, result })
-    }
-
-    /// Handles the tasks/cancel request.
-    ///
-    /// Requests cancellation of a running or pending task.
-    #[cfg(test)]
-    pub fn handle_tasks_cancel(
-        &self,
-        request_ctx: &McpContext,
-        params: CancelTaskParams,
-        task_manager: Option<&SharedTaskManager>,
-    ) -> McpResult<CancelTaskResult> {
-        if let Some(error) = budget_error(request_ctx) {
-            return Err(error);
-        }
-
-        let task_manager = task_manager.ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::MethodNotFound,
-                "Background tasks not enabled on this server",
-            )
-        })?;
-
-        debug!(
-            target: targets::HANDLER,
-            "cancelling task; task_key={}; reason_present={}",
-            safe_log_label(params.id.as_str()),
-            params.reason.is_some()
-        );
-
-        let task = task_manager.cancel(&params.id, params.reason)?;
-
-        Ok(CancelTaskResult {
-            cancelled: true,
-            task,
-        })
     }
 }
 
@@ -10197,35 +10115,6 @@ mod router_tests {
         assert!(result.instructions.is_none());
     }
 
-    // ── handle_tasks_get/cancel without manager ─────────────────────────
-
-    #[test]
-    fn handle_tasks_get_no_manager_errors() {
-        let r = Router::new();
-        let cx = Cx::for_testing();
-        let params = GetTaskParams {
-            id: fastmcp_protocol::TaskId("test-id".to_string()),
-        };
-        let request_ctx = McpContext::new(cx, 1);
-        let err = r.handle_tasks_get(&request_ctx, params, None).unwrap_err();
-        assert!(err.message.contains("not enabled"));
-    }
-
-    #[test]
-    fn handle_tasks_cancel_no_manager_errors() {
-        let r = Router::new();
-        let cx = Cx::for_testing();
-        let params = CancelTaskParams {
-            id: fastmcp_protocol::TaskId("test-id".to_string()),
-            reason: None,
-        };
-        let request_ctx = McpContext::new(cx, 1);
-        let err = r
-            .handle_tasks_cancel(&request_ctx, params, None)
-            .unwrap_err();
-        assert!(err.message.contains("not enabled"));
-    }
-
     // ── add_resource_with_behavior (Warn / Replace) ─────────────────────
 
     #[test]
@@ -12094,44 +11983,6 @@ mod router_tests {
             .handle_prompts_get(&request_ctx, params, state, None, None)
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
-    }
-
-    // ── handle_tasks_get/cancel with real task manager ───────────────────
-
-    #[test]
-    fn handle_tasks_get_with_manager_returns_task() {
-        use crate::tasks::TaskManager;
-        let r = Router::new();
-        let cx = Cx::for_testing();
-        let tm = TaskManager::new_for_testing();
-        tm.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
-        let id = tm.submit(&cx, "t", None).unwrap();
-        let shared = tm.into_shared();
-        let params = GetTaskParams { id: id.clone() };
-        let request_ctx = McpContext::new(cx, 1);
-        let result = r
-            .handle_tasks_get(&request_ctx, params, Some(&shared))
-            .unwrap();
-        assert_eq!(result.task.id, id);
-        assert!(result.result.is_none());
-    }
-
-    #[test]
-    fn handle_tasks_get_task_not_found() {
-        use crate::tasks::TaskManager;
-        use fastmcp_protocol::TaskId;
-        let r = Router::new();
-        let cx = Cx::for_testing();
-        let tm = TaskManager::new_for_testing();
-        let shared = tm.into_shared();
-        let params = GetTaskParams {
-            id: TaskId::from_string("nonexistent".to_string()),
-        };
-        let request_ctx = McpContext::new(cx, 1);
-        let err = r
-            .handle_tasks_get(&request_ctx, params, Some(&shared))
-            .unwrap_err();
-        assert!(err.message.contains("not found"));
     }
 
     #[test]

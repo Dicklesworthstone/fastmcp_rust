@@ -2431,6 +2431,82 @@ impl HttpServerConfig {
     }
 }
 
+fn http_request_accepts_sse(request: &HttpRequest) -> bool {
+    request.header("accept").is_some_and(|value| {
+        const MAX_ACCEPT_ENTRIES: usize = 64;
+        const MAX_ACCEPT_PARAMETERS: usize = 32;
+        const MAX_QVALUE_BYTES: usize = 32;
+
+        let mut entries = value.split(',');
+        for _ in 0..MAX_ACCEPT_ENTRIES {
+            let Some(entry) = entries.next() else {
+                return false;
+            };
+            let mut parameters = entry.split(';');
+            let media_type = parameters.next().unwrap_or("").trim_matches([' ', '\t']);
+            let Some((kind, subtype)) = media_type.split_once('/') else {
+                continue;
+            };
+            if !(kind.eq_ignore_ascii_case("text") || kind == "*")
+                || !(subtype.eq_ignore_ascii_case("event-stream") || subtype == "*")
+            {
+                continue;
+            }
+
+            let mut quality = None;
+            let mut parameter_count = 0;
+            let mut malformed = false;
+            for parameter in parameters {
+                parameter_count += 1;
+                if parameter_count > MAX_ACCEPT_PARAMETERS {
+                    malformed = true;
+                    break;
+                }
+                let Some((name, value)) = parameter.split_once('=') else {
+                    continue;
+                };
+                if !name.trim_matches([' ', '\t']).eq_ignore_ascii_case("q") {
+                    continue;
+                }
+                if quality.is_some() {
+                    malformed = true;
+                    break;
+                }
+                let value = value.trim_matches([' ', '\t']);
+                if value.len() > MAX_QVALUE_BYTES || value.is_empty() {
+                    malformed = true;
+                    break;
+                }
+                quality = Some(match value.split_once('.') {
+                    Some(("0", fraction))
+                        if fraction.len() <= 3
+                            && fraction.bytes().all(|byte| byte.is_ascii_digit()) =>
+                    {
+                        fraction.bytes().any(|byte| byte != b'0')
+                    }
+                    Some(("1", fraction))
+                        if fraction.len() <= 3
+                            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+                            && fraction.bytes().all(|byte| byte == b'0') =>
+                    {
+                        true
+                    }
+                    None if value == "0" => false,
+                    None if value == "1" => true,
+                    _ => {
+                        malformed = true;
+                        false
+                    }
+                });
+            }
+            if !malformed && quality.unwrap_or(true) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 /// A live server composition over the transport's bounded dual-era HTTP endpoint.
 ///
 /// Modern finite requests are dispatched immediately; a final
@@ -4060,6 +4136,7 @@ impl ServerHttpSession {
         request: HttpRequest,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         self.reap_modern_dispatches();
+        let mut request = request;
         if request.path == self.server.http_config.health_path && request.method == HttpMethod::Get
         {
             return Ok(ServerHttpEndpointResponse::Immediate(
@@ -4077,6 +4154,12 @@ impl ServerHttpSession {
                 HttpStatus::BAD_REQUEST,
             )));
         }
+        if is_modern {
+            request = match self.prepare_modern_http_request(request) {
+                Ok(request) => request,
+                Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
+            };
+        }
         if let Some(response) = self.legacy_reverse_response_from_http(&request) {
             return self.handle_legacy_reverse_response(response);
         }
@@ -4089,6 +4172,37 @@ impl ServerHttpSession {
             return self.handle_modern(cx, endpoint_response);
         }
         self.handle_legacy(cx, endpoint_response)
+    }
+
+    fn prepare_modern_http_request(
+        &self,
+        mut request: HttpRequest,
+    ) -> Result<HttpRequest, HttpResponse> {
+        let request_requires_sse = Codec::new()
+            .decode_complete_message(&request.body)
+            .ok()
+            .and_then(|message| match message {
+                JsonRpcMessage::Request(request) => Some(request),
+                JsonRpcMessage::Response(_) => None,
+            })
+            .is_some_and(|request| {
+                request.method == SUBSCRIPTIONS_LISTEN
+                    || self.server.modern_request_requires_owned_sse(&request)
+            });
+        if !request_requires_sse {
+            return Ok(request);
+        }
+        if !http_request_accepts_sse(&request) {
+            return Err(HttpResponse::new(HttpStatus::NOT_ACCEPTABLE));
+        }
+        // The transport defaults a dual-acceptable request to JSON.
+        // Request-scoped final notifications instead require the
+        // connection-owned SSE sender, so select that accepted form before
+        // the request enters the transport ingress queue.
+        request
+            .headers
+            .insert("accept".to_owned(), "text/event-stream".to_owned());
+        Ok(request)
     }
 
     /// Returns a transport-backed roots provider after exact-2024 roots
@@ -4257,6 +4371,11 @@ impl ServerHttpSession {
 
         match endpoint_response {
             DualEraHttpEndpointResponse::ModernJson(pending) => {
+                if self.server.modern_request_requires_owned_sse(&request) {
+                    return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
+                        HttpStatus::NOT_ACCEPTABLE,
+                    )));
+                }
                 let response = self.server.dispatch_with_protocol_policy(
                     self.server.protocol_policy,
                     &inbound,
@@ -4353,6 +4472,10 @@ impl ServerHttpSession {
                 HttpResponse::new(HttpStatus::BAD_REQUEST),
             )));
         }
+        let request = match self.prepare_modern_http_request(request) {
+            Ok(request) => request,
+            Err(response) => return Ok(Err(ServerHttpEndpointResponse::Immediate(response))),
+        };
         let endpoint_response = self
             .endpoint_session
             .lock()
@@ -5024,11 +5147,7 @@ async fn serve_http_connection(
         && request.path == endpoint.server.http_config.legacy_sse_path;
     let is_modern_sse = request.method == HttpMethod::Post
         && request.path == endpoint.server.http_config.handler_config.base_path
-        && request.header("accept").is_some_and(|accept| {
-            accept
-                .split(',')
-                .any(|value| value.trim() == "text/event-stream")
-        });
+        && http_request_accepts_sse(&request);
     if is_modern_sse {
         let mut session = match endpoint.open_session(cx) {
             Ok(session) => session,
@@ -5953,18 +6072,13 @@ impl Server {
         let mut request_ctx = inbound
             .request_context()
             .with_request_cancellation(request_cancellation.clone());
-        if let Some(marker) = request
-            .params
-            .as_ref()
-            .and_then(|params| params.get("_meta"))
-            .and_then(|meta| meta.get("progressToken"))
-            .cloned()
-            .and_then(|marker| serde_json::from_value::<ProgressMarker>(marker).ok())
-        {
+        if let Some(marker) = Self::request_progress_marker(&request) {
             let sender = notification_sender.clone();
             request_ctx = request_ctx.with_progress_reporter(
-                ProgressNotificationSender::new(marker, move |notification| sender(notification))
-                    .into_reporter(),
+                ProgressNotificationSender::new_final(marker, move |notification| {
+                    sender(notification)
+                })
+                .into_reporter(),
             );
         }
         let budget = self.create_request_budget(request_ctx.cx());
@@ -6348,13 +6462,23 @@ impl Server {
                 runtime.map_or_else(SessionState::new, |runtime| runtime.session_state.clone());
             let bidirectional_senders = runtime
                 .and_then(|runtime| runtime.bidirectional_senders(self, &request_cancellation));
-            let (request_ctx, _request_lease_guard) = self.request_context(
+            let (mut request_ctx, _request_lease_guard) = self.request_context(
                 cx,
                 request_id_to_u64(request.id.as_ref()),
                 session_state.clone(),
                 request_cancellation.clone(),
                 budget,
             )?;
+            if let (Some(marker), Some(runtime)) = (Self::request_progress_marker(request), runtime)
+            {
+                let sender = Arc::clone(&runtime.notification_sender);
+                request_ctx = request_ctx.with_progress_reporter(
+                    ProgressNotificationSender::new(marker, move |notification| {
+                        sender(notification)
+                    })
+                    .into_reporter(),
+                );
+            }
             Self::enforce_request_context(&request_ctx)?;
             if !request_ctx.commit_anonymous_auth() {
                 return Err(McpError::internal_error(
@@ -11461,6 +11585,16 @@ impl Server {
         }
     }
 
+    fn request_progress_marker(request: &JsonRpcRequest) -> Option<ProgressMarker> {
+        request
+            .params
+            .as_ref()?
+            .get("_meta")?
+            .get("progressToken")
+            .cloned()
+            .and_then(|marker| serde_json::from_value(marker).ok())
+    }
+
     fn final_log_level_rank(level: LoggingLevel) -> u8 {
         match level {
             LoggingLevel::Debug => 1,
@@ -11506,6 +11640,20 @@ impl Server {
                 .then_some(ceiling)
                 .unwrap_or(requested),
         )
+    }
+
+    fn modern_request_requires_owned_sse(&self, request: &JsonRpcRequest) -> bool {
+        if request.id.is_none() || request.method.starts_with("notifications/") {
+            return false;
+        }
+        if Self::request_progress_marker(request).is_some() {
+            return true;
+        }
+        self.final_request_log_level(request)
+            .is_some_and(|minimum| {
+                Self::final_log_level_rank(LoggingLevel::Error)
+                    >= Self::final_log_level_rank(minimum)
+            })
     }
 
     fn final_log_notification_metadata(&self) -> Option<OpenMetadata> {
@@ -17980,6 +18128,33 @@ mod lib_unit_tests {
         }
     }
 
+    struct HttpRequestScopedProgressTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for HttpRequestScopedProgressTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "http_request_scoped_progress".to_owned(),
+                description: Some(
+                    "Proves final HTTP notifications remain request-scoped".to_owned(),
+                ),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            ctx.report_progress(1.0, Some("HTTP progress"));
+            Ok(vec![Content::text("HTTP progress completed")])
+        }
+    }
+
     struct LiveLegacyCompletionHandler;
 
     impl CompletionHandler for LiveLegacyCompletionHandler {
@@ -19053,6 +19228,51 @@ mod lib_unit_tests {
             .clone()
     }
 
+    fn legacy_stdio_progress_transcript(include_progress_token: bool) -> Vec<JsonRpcMessage> {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+        let mut params = serde_json::json!({
+            "name": "live_legacy_runtime_connection_tool",
+            "arguments": {"sample": false},
+        });
+        if include_progress_token {
+            params
+                .as_object_mut()
+                .expect("legacy tool parameters must be an object")
+                .insert(
+                    "_meta".to_owned(),
+                    serde_json::json!({"progressToken": "legacy-stdio-progress"}),
+                );
+        }
+        Server::new("legacy-stdio-progress", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .tool(LiveLegacyRuntimeConnectionTool)
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyScriptTransport {
+                    inbound: std::collections::VecDeque::from([
+                        exact_legacy_initialize_request(711, serde_json::json!("1.0.0")),
+                        JsonRpcMessage::Request(JsonRpcRequest::notification(
+                            "notifications/initialized",
+                            None,
+                        )),
+                        JsonRpcMessage::Request(JsonRpcRequest::new(
+                            "tools/call",
+                            Some(params),
+                            712_i64,
+                        )),
+                    ]),
+                    sent: Arc::clone(&sent),
+                    receive_calls,
+                },
+            )
+            .expect("public stdio transport must complete the legacy progress script");
+        sent.lock()
+            .expect("legacy stdio sent-message mutex must not be poisoned")
+            .clone()
+    }
+
     fn run_live_websocket_split<R, W>(server: Server, reader: R, writer: W) -> Result<(), String>
     where
         R: Read + Send + 'static,
@@ -20050,6 +20270,53 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn public_stdio_legacy_progress_token_installs_f64_notification_sender() {
+        let sent = legacy_stdio_progress_transcript(true);
+        let progress = sent.iter().find_map(|message| match message {
+            JsonRpcMessage::Request(request) if request.method == "notifications/progress" => {
+                Some(request)
+            }
+            _ => None,
+        });
+        let params = progress
+            .and_then(|request| request.params.as_ref())
+            .expect("the public legacy stdio request must emit progress");
+        assert_eq!(
+            params.get("progressToken"),
+            Some(&serde_json::json!("legacy-stdio-progress"))
+        );
+        assert_eq!(
+            params.get("progress").and_then(serde_json::Value::as_f64),
+            Some(1.0)
+        );
+        assert_eq!(
+            params.get("message"),
+            Some(&serde_json::json!("legacy connection progress")),
+            "legacy progress must retain its f64 ProgressParams wire model"
+        );
+    }
+
+    #[test]
+    fn public_stdio_legacy_progress_sender_is_absent_when_only_token_is_removed() {
+        let sent = legacy_stdio_progress_transcript(false);
+        assert!(
+            sent.iter().any(|message| matches!(
+                message,
+                JsonRpcMessage::Response(response)
+                    if response.id == Some(712_i64.into()) && response.error.is_none()
+            )),
+            "removing only the progress token must retain normal legacy handler dispatch"
+        );
+        assert!(
+            !sent.iter().any(|message| matches!(
+                message,
+                JsonRpcMessage::Request(request) if request.method == "notifications/progress"
+            )),
+            "removing only the progress token must leave the legacy progress sender absent"
+        );
+    }
+
+    #[test]
     fn public_split_legacy_sampling_cancel_late_reply_preserves_connection() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let (outbound, inbound) = sync_channel(32);
@@ -20760,6 +21027,190 @@ mod lib_unit_tests {
                 return Err(format!(
                     "modern loopback discovery result was unexpected: {response:?}"
                 ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_dual_accept_sse_streams_progress_log_and_terminal_frames() {
+        run_live_http_test(|cx| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let bound = Server::new("live-modern-sse-frames", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .log_level(Level::Debug)
+                .tool(HttpRequestScopedProgressTool {
+                    calls: Arc::clone(&calls),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("live modern SSE bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("live modern SSE address failed: {error}"))?;
+            let request = JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "http_request_scoped_progress",
+                    "arguments": {},
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                        "progressToken": "live-http-progress",
+                        "io.modelcontextprotocol/logLevel": "info",
+                    },
+                })),
+                813_i64,
+            );
+            let body = serde_json::to_vec(&request)
+                .map_err(|error| format!("live SSE request did not serialize: {error}"))?;
+            let request = live_http_post(
+                "/mcp",
+                &body,
+                &[
+                    ("Accept", "application/json, text/event-stream; Q=1."),
+                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                    ("Mcp-Method", "tools/call"),
+                    ("Mcp-Name", "http_request_scoped_progress"),
+                ],
+            );
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let deadline = caller_cx
+                        .now()
+                        .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                    let mut stream =
+                        asupersync::time::timeout_at(deadline, AsyncTcpStream::connect(address))
+                            .await
+                            .map_err(|_| {
+                                live_http_test_timeout("live modern SSE client connection")
+                            })?
+                            .map_err(|error| format!("live modern SSE connect failed: {error}"))?;
+                    asupersync::time::timeout_at(deadline, stream.write_all(&request))
+                        .await
+                        .map_err(|_| live_http_test_timeout("live modern SSE request write"))?
+                        .map_err(|error| format!("live modern SSE write failed: {error}"))?;
+                    asupersync::time::timeout_at(deadline, stream.flush())
+                        .await
+                        .map_err(|_| live_http_test_timeout("live modern SSE request flush"))?
+                        .map_err(|error| format!("live modern SSE flush failed: {error}"))?;
+                    let mut received = Vec::new();
+                    read_live_http_until(&mut stream, &mut received, b"notifications/progress")
+                        .await?;
+                    read_live_http_until(&mut stream, &mut received, b"notifications/message")
+                        .await?;
+                    read_live_http_until(&mut stream, &mut received, b"\"id\":813").await?;
+                    read_live_http_to_end(
+                        &mut stream,
+                        &mut received,
+                        "live modern SSE terminal EOF",
+                    )
+                    .await?;
+                    caller_cx.cancel_with(CancelKind::User, Some("modern SSE stream complete"));
+                    Ok::<_, String>(received)
+                })
+                .map_err(|error| format!("live modern SSE client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let response = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("live modern SSE client failed: {error:?}"))??;
+            serve.map_err(|error| format!("live modern SSE server failed: {error}"))?;
+            let response = std::str::from_utf8(&response)
+                .map_err(|error| format!("live modern SSE response was not UTF-8: {error}"))?;
+            if !response.starts_with("HTTP/1.1 200")
+                || !response
+                    .to_ascii_lowercase()
+                    .contains("content-type: text/event-stream")
+            {
+                return Err(format!(
+                    "live modern SSE response head was unexpected: {response}"
+                ));
+            }
+            for required in [
+                "notifications/progress",
+                "notifications/message",
+                "\"id\":813",
+            ] {
+                if !response.contains(required) {
+                    return Err(format!("live modern SSE response omitted {required}"));
+                }
+            }
+            if response.match_indices("data: ").count() < 3 {
+                return Err("live modern SSE response collapsed request-scoped frames".to_owned());
+            }
+            if calls.load(Ordering::Acquire) != 1 {
+                return Err("live modern SSE handler did not execute exactly once".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_dual_accept_rejects_only_four_digit_qvalue_before_handler() {
+        run_live_http_test(|cx| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let bound = Server::new("live-modern-sse-qvalue", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .log_level(Level::Debug)
+                .tool(HttpRequestScopedProgressTool {
+                    calls: Arc::clone(&calls),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("live malformed SSE bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("live malformed SSE address failed: {error}"))?;
+            let request = JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "http_request_scoped_progress",
+                    "arguments": {},
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                        "progressToken": "live-http-progress",
+                        "io.modelcontextprotocol/logLevel": "info",
+                    },
+                })),
+                813_i64,
+            );
+            let body = serde_json::to_vec(&request)
+                .map_err(|error| format!("live malformed request did not serialize: {error}"))?;
+            let request = live_http_post(
+                "/mcp",
+                &body,
+                &[
+                    ("Accept", "application/json, text/event-stream; Q=1.0000"),
+                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                    ("Mcp-Method", "tools/call"),
+                    ("Mcp-Name", "http_request_scoped_progress"),
+                ],
+            );
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let response = live_http_exchange(address, request).await;
+                    caller_cx.cancel_with(CancelKind::User, Some("malformed SSE request complete"));
+                    response
+                })
+                .map_err(|error| format!("live malformed client admission failed: {error}"))?;
+            let serve = bound.serve(&cx).await;
+            let response = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("live malformed client failed: {error:?}"))??;
+            serve.map_err(|error| format!("live malformed server failed: {error}"))?;
+            if !response.starts_with(b"HTTP/1.1 406") || calls.load(Ordering::Acquire) != 0 {
+                return Err(
+                    "changing only the SSE qvalue precision must reject before handler entry"
+                        .to_owned(),
+                );
             }
             Ok(())
         });
@@ -25678,6 +26129,215 @@ mod lib_unit_tests {
             2,
             "acknowledgement and cancellation are the only terminal-stream frames",
         );
+    }
+
+    #[test]
+    fn http_sse_accept_qvalue_admits_rfc_forms_and_rejects_four_fraction_digits() {
+        let accepts = |value| {
+            http_request_accepts_sse(
+                &HttpRequest::new(HttpMethod::Post, "/mcp").with_header("accept", value),
+            )
+        };
+        assert!(accepts("  */* ; unrelated=value ; Q = 1. "));
+        assert!(!accepts("  */* ; unrelated=value ; Q = 0. "));
+        assert!(!accepts("text/event-stream; q=1.0000"));
+        assert!(!accepts("text/event-stream; q=0.0000"));
+    }
+
+    #[test]
+    fn public_http_request_scoped_progress_and_logging_use_owned_sse() {
+        let cx = Cx::for_testing();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let endpoint = Server::new("final-http-request-scoped", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .log_level(Level::Debug)
+            .tool(HttpRequestScopedProgressTool {
+                calls: Arc::clone(&calls),
+            })
+            .build_http_endpoint("http://final.test")
+            .expect("modern endpoint must build");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("modern endpoint session must open");
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "http_request_scoped_progress",
+                "arguments": {},
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    "progressToken": "final-http-progress",
+                    "io.modelcontextprotocol/logLevel": "info",
+                },
+            })),
+            811_i64,
+        );
+        let ServerHttpEndpointResponse::ModernSse(sse) = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_header("accept", "application/json, text/event-stream; Q=1.")
+                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                    .with_header("mcp-method", "tools/call")
+                    .with_header("mcp-name", "http_request_scoped_progress")
+                    .with_body(serde_json::to_vec(&request).expect("final request must encode")),
+            )
+            .expect("notification-capable modern request must dispatch over SSE")
+        else {
+            panic!("notification-capable modern request must select SSE");
+        };
+
+        let progress = sse
+            .recv_event(&cx)
+            .expect("progress must precede the terminal response");
+        let JsonRpcMessage::Request(progress) = Codec::new()
+            .decode_complete_message(progress.data.as_bytes())
+            .expect("progress event must remain JSON-RPC")
+        else {
+            panic!("first request-scoped frame must be a progress notification");
+        };
+        let ServerNotification::Progress(progress) = ServerNotification::decode(&progress)
+            .expect("progress must use the final server notification union")
+        else {
+            panic!("first request-scoped frame must be notifications/progress");
+        };
+        assert_eq!(
+            progress.progress_token,
+            ProgressMarker::from("final-http-progress")
+        );
+
+        let log = sse
+            .recv_event(&cx)
+            .expect("typed log must follow handler progress");
+        let JsonRpcMessage::Request(log) = Codec::new()
+            .decode_complete_message(log.data.as_bytes())
+            .expect("log event must remain JSON-RPC")
+        else {
+            panic!("second request-scoped frame must be a log notification");
+        };
+        assert!(matches!(
+            ServerNotification::decode(&log)
+                .expect("log must use the final server notification union"),
+            ServerNotification::Message(_)
+        ));
+        assert!(matches!(
+            Codec::new()
+                .decode_complete_message(
+                    sse.recv_event(&cx)
+                        .expect("terminal response must follow notifications")
+                        .data
+                        .as_bytes(),
+                )
+                .expect("terminal response must remain JSON-RPC"),
+            JsonRpcMessage::Response(response)
+                if response.id == Some(811_i64.into()) && response.error.is_none()
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn public_http_request_scoped_notifications_reject_only_zero_quality_sse() {
+        let cx = Cx::for_testing();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let endpoint = Server::new("final-http-request-scoped", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .log_level(Level::Debug)
+            .tool(HttpRequestScopedProgressTool {
+                calls: Arc::clone(&calls),
+            })
+            .build_http_endpoint("http://final.test")
+            .expect("modern endpoint must build");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("modern endpoint session must open");
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "http_request_scoped_progress",
+                "arguments": {},
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    "progressToken": "final-http-progress",
+                    "io.modelcontextprotocol/logLevel": "info",
+                },
+            })),
+            811_i64,
+        );
+        let response = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_header("accept", "application/json, text/event-stream; Q=0.")
+                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                    .with_header("mcp-method", "tools/call")
+                    .with_header("mcp-name", "http_request_scoped_progress")
+                    .with_body(serde_json::to_vec(&request).expect("final request must encode")),
+            )
+            .expect("zero-quality SSE request must be rejected before dispatch");
+        assert!(matches!(
+            response,
+            ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::NOT_ACCEPTABLE
+        ));
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            0,
+            "changing only the SSE quality from one to zero must prevent handler entry"
+        );
+    }
+
+    #[test]
+    fn public_http_ordinary_json_request_remains_one_response() {
+        let cx = Cx::for_testing();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let endpoint = Server::new("final-http-json-only", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .tool(HttpRequestScopedProgressTool {
+                calls: Arc::clone(&calls),
+            })
+            .build_http_endpoint("http://final.test")
+            .expect("modern endpoint must build");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("modern endpoint session must open");
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "http_request_scoped_progress",
+                "arguments": {},
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            812_i64,
+        );
+        let response = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_header("accept", "application/json")
+                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                    .with_header("mcp-method", "tools/call")
+                    .with_header("mcp-name", "http_request_scoped_progress")
+                    .with_body(serde_json::to_vec(&request).expect("final request must encode")),
+            )
+            .expect("ordinary JSON-only request must dispatch");
+        let ServerHttpEndpointResponse::Immediate(response) = response else {
+            panic!("ordinary JSON-only request must retain its one-response representation");
+        };
+        assert!(matches!(
+            Codec::new()
+                .decode_complete_message(&response.body)
+                .expect("JSON-only response must remain JSON-RPC"),
+            JsonRpcMessage::Response(response)
+                if response.id == Some(812_i64.into()) && response.error.is_none()
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
