@@ -2203,11 +2203,14 @@ mod tests {
 
     #[test]
     fn test_rich_resource_summary_uses_plain_terminal_safe_uri_cells() {
+        // Cells must FIT the default 80-column table: truncation would clip
+        // the very literals this test asserts on, so the hostile fixture
+        // stays short while still covering markup pass-through and redaction.
         let resource = Resource {
-            uri: "file://[bold]segment[/]/{id}?token=uri-canary".to_string(),
+            uri: "[bold]s[/]?token=uri-canary".to_string(),
             name: "[cyan]resource[/]".to_string(),
-            description: Some("[dim]description[/]".to_string()),
-            mime_type: Some("[green]application/json[/]".to_string()),
+            description: Some("[dim]d[/]".to_string()),
+            mime_type: Some("[green]a[/]".to_string()),
             icon: None,
             version: None,
             tags: vec![],
@@ -2217,11 +2220,11 @@ mod tests {
             .render(&[resource], console.console());
 
         console.assert_contains("[cyan]resource[/]");
-        console.assert_contains("file://[bold]segment[/]/{id}?token=[REDACTED]");
-        console.assert_contains("[dim]description[/]");
-        console.assert_contains("[green]application/json[/]");
+        console.assert_contains("[bold]s[/]?token=[REDACTED]");
+        console.assert_contains("[dim]d[/]");
+        console.assert_contains("[green]a[/]");
         console.assert_not_contains("[yellow]");
-        console.assert_not_contains(r"\[bold]segment\[/]");
+        console.assert_not_contains(r"\[bold]s\[/]");
         console.assert_not_contains("uri-canary");
     }
 

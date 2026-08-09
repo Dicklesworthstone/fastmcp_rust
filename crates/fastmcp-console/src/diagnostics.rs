@@ -300,7 +300,12 @@ impl RichErrorRenderer {
         // trusted framing tags once; all peer-controlled fragments were
         // parity-safe escaped before interpolation above.
         let text = markup::render_or_plain(&content);
-        let panel = Panel::from_rich_text(&text, console.width())
+        // Panels never wrap: overlong lines are truncated at the content
+        // width, which can clip redacted context. Fold to the inner width
+        // (borders plus the 1-cell padding on each side) before framing.
+        let content_width = console.width().saturating_sub(4).max(1);
+        let wrapped = Text::new("\n").join(&text.wrap(content_width));
+        let panel = Panel::from_rich_text(&wrapped, console.width())
             .style(theme.border_style.clone()) // Use border style for panel
             .padding(1);
 
@@ -493,7 +498,9 @@ mod tests {
     fn render_warning_includes_message() {
         let tc = TestConsole::new();
         render_warning("something happened", tc.console());
-        assert!(tc.contains("warning"));
+        // The rich path labels "Warning:" and the plain path "[WARN]";
+        // assert the semantic marker case-insensitively.
+        assert!(tc.output_string().to_lowercase().contains("warn"));
         assert!(tc.contains("something happened"));
     }
 
