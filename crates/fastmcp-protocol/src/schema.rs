@@ -2885,8 +2885,10 @@ fn subtract_decimal_integers(left: &mut String, right: &str) {
         }
         digits[left_index] = digit as u8 + b'0';
     }
+    // The caller charges validation work against the untrimmed result length
+    // and trims afterwards; trimming here would erase that charge for exact
+    // divisions and undercount the long-division budget.
     *left = digits.into_iter().map(char::from).collect();
-    trim_decimal_integer(left);
 }
 
 fn trim_decimal_integer(value: &mut String) {
