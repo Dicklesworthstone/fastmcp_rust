@@ -559,6 +559,8 @@ pub const MCP_APPS_UI_METADATA_KEY: &str = "ui";
 pub const MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY: &str = "ui/resourceUri";
 /// Maximum members in a closed nested MCP Apps tool `ui` metadata object.
 pub const MAX_MCP_APPS_UI_METADATA_MEMBERS: usize = 2;
+/// Maximum audience entries retained by one Apps tool visibility declaration.
+pub const MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES: usize = 128;
 /// Maximum origins retained by one Apps CSP directive.
 pub const MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE: usize = 128;
 /// Maximum UTF-8 bytes retained for one Apps CSP origin or host-selected domain.
@@ -610,6 +612,12 @@ impl McpAppsToolMetadata {
             .is_some_and(|resource_uri| !resource_uri.has_scheme("ui"))
         {
             return Err(McpAppsMetadataError::ResourceUriMustUseUiScheme);
+        }
+        if visibility
+            .as_ref()
+            .is_some_and(|visibility| visibility.len() > MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES)
+        {
+            return Err(McpAppsMetadataError::TooManyToolVisibilityEntries);
         }
         Ok(Self {
             resource_uri,
@@ -1189,6 +1197,8 @@ pub enum McpAppsMetadataError {
     InvalidResourceMetadata,
     /// A resource binding URI must use the `ui:` scheme.
     ResourceUriMustUseUiScheme,
+    /// A tool visibility declaration carried more than its bounded number of entries.
+    TooManyToolVisibilityEntries,
     /// One CSP directive carried more than its bounded number of origins.
     TooManyCspDomains,
     /// One CSP origin was empty or exceeded its bounded byte allowance.
@@ -1215,6 +1225,9 @@ impl fmt::Display for McpAppsMetadataError {
                 .write_str("MCP Apps resource _meta.ui does not satisfy its closed schema"),
             Self::ResourceUriMustUseUiScheme => {
                 formatter.write_str("MCP Apps resourceUri must use the ui: scheme")
+            }
+            Self::TooManyToolVisibilityEntries => {
+                formatter.write_str("MCP Apps tool visibility exceeds its entry limit")
             }
             Self::TooManyCspDomains => {
                 formatter.write_str("MCP Apps CSP directive exceeds its origin limit")
@@ -3899,6 +3912,49 @@ mod tests {
             serde_json::to_value(&tool).expect("tool re-encodes"),
             accepted,
             "Apps visibility re-encodes duplicates in their received order"
+        );
+    }
+
+    #[test]
+    fn apps_02_bounds_tool_visibility_entries_without_changing_duplicates_or_order() {
+        let accepted_visibility = (0..MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES)
+            .map(|index| {
+                if index % 2 == 0 {
+                    McpAppsToolVisibility::App
+                } else {
+                    McpAppsToolVisibility::Model
+                }
+            })
+            .collect::<Vec<_>>();
+        let baseline = McpAppsToolMetadata::try_new(None, Some(accepted_visibility.clone()))
+            .expect("the tool visibility entry bound is admitted");
+        let baseline_wire =
+            serde_json::to_value(&baseline).expect("bounded visibility metadata serializes");
+        assert_eq!(
+            baseline.effective_visibility(),
+            accepted_visibility,
+            "bounded visibility retains received duplicate entries in order"
+        );
+
+        let mut planted_visibility = accepted_visibility;
+        planted_visibility.push(McpAppsToolVisibility::App);
+        assert_eq!(
+            McpAppsToolMetadata::try_new(None, Some(planted_visibility.clone())),
+            Err(McpAppsMetadataError::TooManyToolVisibilityEntries),
+            "adding only one visibility entry beyond the bound is rejected with the typed error"
+        );
+        let planted = McpAppsToolMetadata {
+            resource_uri: None,
+            visibility: Some(planted_visibility),
+        };
+        assert!(
+            serde_json::to_value(&planted).is_err(),
+            "direct construction cannot bypass the visibility entry bound during serialization"
+        );
+        assert_eq!(
+            serde_json::to_value(&baseline).expect("bounded metadata re-serializes"),
+            baseline_wire,
+            "rejecting the one-entry plant cannot mutate the admitted metadata"
         );
     }
 

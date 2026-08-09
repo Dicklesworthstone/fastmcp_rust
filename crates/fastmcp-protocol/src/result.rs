@@ -1076,11 +1076,11 @@ fn decode_result_meta(members: &mut ExactJsonObject) -> Result<ResultMeta, Resul
     let server_info = match members.take("serverInfo") {
         None => None,
         Some(value) => {
-            let metadata_has_final_identity = meta
-                .as_ref()
-                .is_some_and(|metadata: &crate::common_types::OpenMetadata| {
-                    matches!(metadata.server_info(), Ok(Some(_)))
-                });
+            let metadata_has_final_identity =
+                meta.as_ref()
+                    .is_some_and(|metadata: &crate::common_types::OpenMetadata| {
+                        matches!(metadata.server_info(), Ok(Some(_)))
+                    });
             if metadata_has_final_identity {
                 return Err(ResultDecodeError::new(
                     ResultDecodeErrorKind::InvalidKnownMember,
@@ -1088,9 +1088,14 @@ fn decode_result_meta(members: &mut ExactJsonObject) -> Result<ResultMeta, Resul
                 ));
             }
             let value = exact_json_to_serde(&value)?;
-            Some(serde_json::from_value::<Implementation>(value).map_err(|_| {
-                ResultDecodeError::new(ResultDecodeErrorKind::InvalidKnownMember, "$.serverInfo")
-            })?)
+            Some(
+                serde_json::from_value::<Implementation>(value).map_err(|_| {
+                    ResultDecodeError::new(
+                        ResultDecodeErrorKind::InvalidKnownMember,
+                        "$.serverInfo",
+                    )
+                })?,
+            )
         }
     };
     Ok(ResultMeta {
