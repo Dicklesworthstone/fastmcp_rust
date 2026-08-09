@@ -132,10 +132,11 @@ use fastmcp_protocol::tasks_extension::{
     TaskRequestMeta, UpdateTaskParams as FinalUpdateTaskParams,
 };
 use fastmcp_protocol::{
-    CallToolParams, CancelTaskParams, CancelTaskResult, CancelledParams, ClientCapabilities,
-    ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey, FINAL_CLIENT_CAPABILITIES_META_KEY,
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreRequest, FinalLogMessageParams,
-    FinalProgressNotificationParams, FinalRequestMeta,
+    CallToolParams, CancelTaskParams, CancelTaskResult, CancellationSender,
+    CancellationWireMessage, CancelledParams, ClientCapabilities, ClientInfo, CoreDispatchError,
+    CoreRequest, CorrelationKey, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams, FinalCoreRequest,
+    FinalLogMessageParams, FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams, GetTaskParams,
     GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION, JsonRpcError,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyPromptMessage,
@@ -427,7 +428,7 @@ fn validate_subscription_acknowledgement(
                 )
             })
         })?;
-    if &subscription_id != expected_id {
+    if !subscription_id.correlates_with(expected_id) {
         return Err(subscription_listener_protocol_error(
             "Subscription acknowledgement ID does not match the listen request",
         ));
@@ -2013,6 +2014,7 @@ fn invoke_reverse_request_handler<P, R>(
 }
 
 fn live_server_request_response(
+    selected_era: Option<ProtocolEra>,
     handlers: &mut ReverseRequestHandlers,
     request: &JsonRpcRequest,
 ) -> Option<JsonRpcMessage> {
@@ -2025,6 +2027,18 @@ fn live_server_request_response(
             id,
             serde_json::json!({}),
         )));
+    }
+
+    // These reverse methods are exact MCP 2024-11-05 vocabulary. A final
+    // session must not silently keep servicing them merely because a caller
+    // configured legacy callbacks on the client object.
+    if selected_era != Some(ProtocolEra::Legacy2024)
+        && matches!(
+            request.method.as_str(),
+            "sampling/createMessage" | "roots/list" | "elicitation/create"
+        )
+    {
+        return method_not_found_response(request);
     }
 
     let response = match request.method.as_str() {
@@ -2154,23 +2168,6 @@ fn json_rpc_error_to_mcp(error: JsonRpcError) -> McpError {
         Some(data) => McpError::with_data(code, error.message, data),
         None => McpError::new(code, error.message),
     }
-}
-
-fn cancellation_control_message(
-    request_id: RequestId,
-    reason: Option<String>,
-    await_cleanup: Option<bool>,
-) -> McpResult<JsonRpcMessage> {
-    let params = serde_json::to_value(CancelledParams {
-        request_id,
-        reason,
-        await_cleanup,
-    })
-    .map_err(|_| McpError::invalid_params("Invalid cancellation control parameters"))?;
-    Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
-        "notifications/cancelled",
-        Some(params),
-    )))
 }
 
 fn decode_response_payload<R: serde::de::DeserializeOwned>(
@@ -3293,11 +3290,9 @@ enum ResponseRoute {
 struct ResponseRegistry {
     pending: std::collections::HashMap<CorrelationKey, oneshot::Sender<CorrelatedResponse>>,
     tombstones: std::collections::HashMap<CorrelationKey, Instant>,
-    /// IDs whose one permitted cancellation control has been claimed.
-    ///
-    /// This state is intentionally separate from response tombstones: callers
-    /// may cancel an arbitrary peer-known ID, including one the local allocator
-    /// has not reached, without preventing a later local waiter registration.
+    /// Live local owners whose one permitted cancellation control has been
+    /// claimed. This remains distinct from response tombstones so a timeout
+    /// can retain its late-response guard after its outbound control write.
     cancellation_controls: std::collections::HashMap<CorrelationKey, Instant>,
     terminal_error: Option<McpError>,
     uncorrelated_diagnostics: u8,
@@ -3342,10 +3337,7 @@ impl ResponseRegistry {
         }
 
         let (sender, receiver) = oneshot::channel();
-        // A public caller may have cancelled a peer-known ID before the local
-        // monotonic allocator reached it. Admission of a genuinely new waiter
-        // starts a new request generation with its own one-control allowance;
-        // unlike a response tombstone, the old control marker never blocks it.
+        // A new local owner begins a fresh cancellation-control generation.
         self.cancellation_controls.remove(&key);
         self.pending.insert(key, sender);
         Ok(ResponseWaiter { id, receiver })
@@ -3471,6 +3463,18 @@ impl ResponseRegistry {
             })?;
         self.cancellation_controls.insert(key, expires_at);
         Ok(true)
+    }
+
+    /// Returns whether this client currently owns a live request ID.
+    fn owns_live_request(&mut self, id: &RequestId) -> McpResult<bool> {
+        self.prune_expired_retained_state(Instant::now());
+        if let Some(terminal_error) = &self.terminal_error {
+            return Err(terminal_error.clone());
+        }
+        let key = id
+            .correlation_key()
+            .map_err(|_| McpError::internal_error("Invalid JSON-RPC request ID"))?;
+        Ok(self.pending.contains_key(&key))
     }
 
     fn prune_expired_retained_state(&mut self, now: Instant) {
@@ -4966,7 +4970,11 @@ impl Client {
     }
 
     fn server_request_response(&mut self, request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
-        live_server_request_response(&mut self.reverse_request_handlers, request)
+        live_server_request_response(
+            self.session.selected_era(),
+            &mut self.reverse_request_handlers,
+            request,
+        )
     }
 
     /// Verifies that the initialized server can answer an MCP ping request.
@@ -5073,6 +5081,45 @@ impl Client {
             );
         }
         Ok(params)
+    }
+
+    /// Builds the one selected-era JSON-RPC cancellation notification.
+    ///
+    /// Cancellation notifications contain only their cancellation parameters.
+    /// Optional final notification metadata is never required or synthesized.
+    fn cancellation_control_message(
+        &self,
+        request_id: RequestId,
+        reason: Option<String>,
+    ) -> McpResult<JsonRpcMessage> {
+        let cancellation = match self.session.selected_era() {
+            Some(ProtocolEra::Legacy2024) => CancellationWireMessage::Legacy2024 {
+                sender: CancellationSender::Client,
+                params: CancelledParams { request_id, reason },
+            },
+            Some(ProtocolEra::Modern2026) => CancellationWireMessage::Modern2026 {
+                sender: CancellationSender::Client,
+                params: FinalCancelledNotificationParams {
+                    request_id,
+                    reason,
+                    meta: None,
+                    additional: Default::default(),
+                },
+            },
+            None => {
+                return Err(McpError::internal_error(
+                    "Client has no negotiated protocol era for cancellation",
+                ));
+            }
+        };
+        cancellation
+            .encode()
+            .map(JsonRpcMessage::Request)
+            .map_err(|error| {
+                McpError::invalid_params(format!(
+                    "Invalid cancellation control parameters: {error}"
+                ))
+            })
     }
 
     fn prepare_request_parameters(
@@ -5220,6 +5267,24 @@ impl Client {
         };
         if !modern_session || !is_final_server_notification_method(request) {
             return Ok(None);
+        }
+
+        if request.method == "notifications/cancelled" {
+            let Ok(cancellation) = CancellationWireMessage::decode(
+                ProtocolEra::Modern2026,
+                CancellationSender::Server,
+                request,
+            ) else {
+                return Ok(Some(ModernServerNotification::Retained));
+            };
+            if !matches!(cancellation, CancellationWireMessage::Modern2026 { .. }) {
+                return Ok(Some(ModernServerNotification::Retained));
+            }
+            // Generic high-level receive paths have no active
+            // subscriptions/listen ownership context. A server cancellation is
+            // therefore retained inertly here; the dedicated stdio listener
+            // validates and applies cancellation only to its own live stream.
+            return Ok(Some(ModernServerNotification::Retained));
         }
 
         let notification = ServerNotification::decode(request).map_err(|error| {
@@ -5664,18 +5729,12 @@ impl Client {
         Ok(())
     }
 
-    /// Sends a cancellation notification for a request ID known to the peer.
+    /// Sends a cancellation notification for a locally owned live request.
     ///
-    /// Set `await_cleanup` to emit the provisional `awaitCleanup: true` wire
-    /// field. This call does not wait for, correlate, or validate a peer cleanup
-    /// acknowledgement; peer handling of the field remains server-dependent
-    /// and unverified.
-    /// The first call for an arbitrary request ID emits at most one bounded
-    /// control frame; repeated calls for that ID are retained no-ops through the
-    /// maximum ordinary-request lifetime. A successfully admitted later local
-    /// request with the same ID begins a new generation. If the ID currently
-    /// owns a local waiter, that waiter first receives local cancellation and
-    /// its late response is discarded through a tombstone.
+    /// Both supported wire forms contain `requestId` and an optional `reason`.
+    /// Modern notification metadata remains optional and is never synthesized.
+    /// The live waiter receives local cancellation first and its one late
+    /// response is discarded through a tombstone.
     ///
     /// On Unix child pipes the control write is one bounded, nonblocking atomic
     /// write. The standard library exposes no equivalent safe primitive for
@@ -5689,34 +5748,38 @@ impl Client {
         &mut self,
         request_id: impl Into<RequestId>,
         reason: Option<String>,
-        await_cleanup: bool,
     ) -> McpResult<()> {
         let request_id = request_id.into();
-        let control = cancellation_control_message(
-            request_id.clone(),
-            reason,
-            await_cleanup.then_some(true),
-        )?;
         self.ensure_initialized()?;
+        if !self.responses.owns_live_request(&request_id)? {
+            return Err(McpError::invalid_request(
+                "Client cancellation requires a locally owned live request ID",
+            ));
+        }
+        let control = self.cancellation_control_message(request_id.clone(), reason)?;
 
         let claimed = match self.responses.claim_cancellation_control(&request_id) {
             Ok(claimed) => claimed,
             Err(error) => return Err(self.terminate_connection(error)),
         };
         if !claimed {
-            return Ok(());
+            return Err(McpError::invalid_request(
+                "Client cancellation was already committed for this request ID",
+            ));
         }
 
-        if let Err(error) = self
+        match self
             .responses
             .tombstone(&request_id, McpError::request_cancelled())
         {
-            return Err(self.terminate_connection(error));
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(McpError::invalid_request(
+                    "Client cancellation requires a locally owned live request ID",
+                ));
+            }
+            Err(error) => return Err(self.terminate_connection(error)),
         }
-        // Arbitrary peer-known, already-completed, and not-locally-owned IDs
-        // still receive their one public cancellation control. The independent
-        // marker does not poison future waiter registration for a locally
-        // not-yet-issued ID.
         if let Err(control_error) = self.send_bounded_control_message(control) {
             let terminal = self.terminate_connection(control_error);
             return Err(terminal);
@@ -5771,7 +5834,7 @@ impl Client {
     }
 
     fn send_timeout_cancellation_control(&mut self, request_id: &RequestId) -> McpResult<()> {
-        let control = cancellation_control_message(request_id.clone(), None, None)?;
+        let control = self.cancellation_control_message(request_id.clone(), None)?;
         self.send_bounded_control_message(control)
     }
 
@@ -5946,7 +6009,12 @@ impl Client {
 
         loop {
             if let Some(response) = waiter.try_response()? {
-                debug_assert_eq!(response.id.as_ref(), Some(&expected_id));
+                debug_assert!(
+                    response
+                        .id
+                        .as_ref()
+                        .is_some_and(|response_id| response_id.correlates_with(&expected_id))
+                );
                 return Ok(response);
             }
 
@@ -6092,7 +6160,7 @@ impl Client {
                         )),
                     );
                 };
-                if subscription_id != expected_id {
+                if !subscription_id.correlates_with(&expected_id) {
                     return Err(
                         self.terminate_connection(subscription_listener_protocol_error(
                             "Subscription listener terminal ID does not match its request",
@@ -6225,7 +6293,9 @@ impl Client {
                             .and_then(|value| {
                                 serde_json::from_value::<RequestId>(value.clone()).ok()
                             });
-                        if subscription_id.as_ref() != Some(&expected_id) {
+                        if !subscription_id.as_ref().is_some_and(|subscription_id| {
+                            subscription_id.correlates_with(&expected_id)
+                        }) {
                             return Err(self.terminate_connection(
                                 subscription_listener_protocol_error(
                                     "Tasks event subscription ID does not match the listen request",
@@ -6249,6 +6319,40 @@ impl Client {
                         }
                         task_notifications.push(notification);
                         continue;
+                    }
+
+                    if request.method == "notifications/cancelled" {
+                        let cancellation = match CancellationWireMessage::decode(
+                            ProtocolEra::Modern2026,
+                            CancellationSender::Server,
+                            &request,
+                        ) {
+                            Ok(CancellationWireMessage::Modern2026 { params, .. }) => params,
+                            Ok(CancellationWireMessage::Legacy2024 { .. }) | Err(_) => continue,
+                        };
+                        if !cancellation.request_id.correlates_with(&expected_id) {
+                            continue;
+                        }
+                        if let Some(metadata_subscription_id) = cancellation
+                            .meta
+                            .as_ref()
+                            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                            .and_then(|value| {
+                                serde_json::from_value::<RequestId>(value.clone()).ok()
+                            })
+                            && !metadata_subscription_id.correlates_with(&expected_id)
+                        {
+                            continue;
+                        }
+                        let error = McpError::request_cancelled();
+                        match self.responses.tombstone(&expected_id, error.clone()) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(tombstone_error) => {
+                                return Err(self.terminate_connection(tombstone_error));
+                            }
+                        }
+                        return Err(error);
                     }
 
                     if is_final_server_notification_method(&request) {
@@ -6280,29 +6384,12 @@ impl Client {
                                 }
                                 accepted_filter = Some(acknowledgement.notifications);
                             }
-                            ServerNotification::Cancelled(cancellation) => {
-                                if cancellation.request_id != expected_id {
-                                    return Err(self.terminate_connection(
-                                        subscription_listener_protocol_error(
-                                            "Subscription cancellation ID does not match the listen request",
-                                        ),
-                                    ));
-                                }
-                                let error = McpError::request_cancelled();
-                                match self.responses.tombstone(&expected_id, error.clone()) {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        return Err(self.terminate_connection(
-                                            subscription_listener_protocol_error(
-                                                "Subscription cancellation could not retire its listen request",
-                                            ),
-                                        ));
-                                    }
-                                    Err(tombstone_error) => {
-                                        return Err(self.terminate_connection(tombstone_error));
-                                    }
-                                }
-                                return Err(error);
+                            ServerNotification::Cancelled(_) => {
+                                return Err(self.terminate_connection(
+                                    subscription_listener_protocol_error(
+                                        "Subscription cancellation bypassed the final cancellation codec",
+                                    ),
+                                ));
                             }
                             notification @ (ServerNotification::ResourcesListChanged(_)
                             | ServerNotification::ToolsListChanged(_)
@@ -8791,6 +8878,15 @@ mod tests {
 
     #[cfg(unix)]
     fn make_shell_scripted_initialized_client(script: &str, timeout: Duration) -> Client {
+        make_shell_scripted_initialized_client_for_version(script, timeout, PROTOCOL_VERSION)
+    }
+
+    #[cfg(unix)]
+    fn make_shell_scripted_initialized_client_for_version(
+        script: &str,
+        timeout: Duration,
+        protocol_version: &str,
+    ) -> Client {
         let mut command = Command::new("sh");
         command
             .args(["-c", script])
@@ -8812,9 +8908,9 @@ mod tests {
                 version: "1.0.0".to_string(),
             },
             ServerCapabilities::default(),
-            PROTOCOL_VERSION.to_string(),
+            protocol_version.to_string(),
         )
-        .expect("test client uses the exact supported protocol version");
+        .expect("test client uses a supported protocol version");
         Client::from_parts(
             child,
             transport,
@@ -9039,34 +9135,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn public_cancellation_emits_for_arbitrary_id_without_poisoning_future_registration() {
-        let script = "IFS= read -r cancellation; IFS= read -r request; \
-            case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*) method_ok=true;; *) method_ok=false;; esac; \
-            case \"$cancellation\" in *'\"requestId\":2'*) id_ok=true;; *) id_ok=false;; esac; \
-            case \"$cancellation\" in *'\"reason\":\"pre-cancel\"'*) reason_ok=true;; *) reason_ok=false;; esac; \
-            if [ \"$method_ok\" = true ] && [ \"$id_ok\" = true ] && [ \"$reason_ok\" = true ]; \
-              then cancellation_ok=true; else cancellation_ok=false; fi; \
-            case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
-            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"cancellation\":%s,\"request\":%s}}\\n' \
-              \"$cancellation_ok\" \"$request_ok\"; exec sleep 2";
+    fn public_cancellation_rejects_non_owned_id_without_peer_contact() {
+        let script = "IFS= read -r request; \
+            case \"$request\" in *'\"method\":\"test/new-generation\"'*'\"id\":2'*) \
+              printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"request\":true}}\\n' ;; *) exit 1 ;; esac; \
+            exec sleep 2";
         let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
 
-        client
-            .cancel_request(2_i64, Some("pre-cancel".to_string()), false)
-            .expect("an arbitrary peer-known ID receives one control frame");
-        assert_eq!(client.responses.cancellation_control_len(), 1);
-        client
-            .cancel_request(2_i64, Some("duplicate".to_string()), true)
-            .expect("the same arbitrary ID is an at-most-once no-op");
-        assert_eq!(client.responses.cancellation_control_len(), 1);
+        let error = client
+            .cancel_request(2_i64, Some("pre-cancel".to_string()))
+            .expect_err("a peer-known but non-owned ID cannot produce a cancellation frame");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(client.responses.cancellation_control_len(), 0);
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 0);
 
         let evidence: serde_json::Value = client
             .send_request("test/new-generation", serde_json::json!({}))
-            .expect("the later local request generation must not be poisoned");
-        assert_eq!(
-            evidence,
-            serde_json::json!({"cancellation": true, "request": true})
-        );
+            .expect("the first peer contact is the ordinary local request");
+        assert_eq!(evidence, serde_json::json!({"request": true}));
         assert_eq!(client.responses.cancellation_control_len(), 0);
         client.close().expect("client cleanup");
     }
@@ -9079,7 +9166,7 @@ mod tests {
             case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*) method_ok=true;; *) method_ok=false;; esac; \
             case \"$cancellation\" in *'\"requestId\":20'*) id_ok=true;; *) id_ok=false;; esac; \
             case \"$cancellation\" in *'\"reason\":\"stop\"'*) reason_ok=true;; *) reason_ok=false;; esac; \
-            case \"$cancellation\" in *'\"awaitCleanup\":true'*) cleanup_ok=true;; *) cleanup_ok=false;; esac; \
+            case \"$cancellation\" in *'\"awaitCleanup\"'*) cleanup_ok=false;; *) cleanup_ok=true;; esac; \
             if [ \"$method_ok\" = true ] && [ \"$id_ok\" = true ] && [ \"$reason_ok\" = true ] && [ \"$cleanup_ok\" = true ]; \
               then cancellation_ok=true; else cancellation_ok=false; fi; \
             case \"$second\" in *'\"id\":2'*) second_ok=true;; *) second_ok=false;; esac; \
@@ -9099,11 +9186,12 @@ mod tests {
             .expect("commit request before public cancellation");
 
         client
-            .cancel_request(request_id.clone(), Some("stop".to_string()), true)
+            .cancel_request(request_id.clone(), Some("stop".to_string()))
             .expect("first public cancellation must commit one control frame");
-        client
-            .cancel_request(request_id, Some("duplicate".to_string()), false)
-            .expect("duplicate cancellation is an idempotent bounded no-op");
+        let duplicate = client
+            .cancel_request(request_id, Some("duplicate".to_string()))
+            .expect_err("a retired request is no longer a live cancellation owner");
+        assert_eq!(duplicate.code, McpErrorCode::InvalidRequest);
 
         let waiter_error = waiter
             .try_response()
@@ -9131,6 +9219,109 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn modern_stdio_cancellation_uses_only_exact_cancellation_members() {
+        let discovery =
+            modern_discovery_response("modern-cancellation-server", &[MODERN_PROTOCOL_VERSION]);
+        let script = format!(
+            "IFS= read -r discovery || exit 1; \
+             case \"$discovery\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \
+             IFS= read -r first || exit 1; \
+             case \"$first\" in *'\"method\":\"test/cancel\"'*'\"id\":20'*) ;; *) exit 1 ;; esac; \
+             IFS= read -r cancellation || exit 1; \
+             case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":20'*'\"reason\":\"stop\"'*) ;; *) exit 1 ;; esac; \
+             case \"$cancellation\" in *'\"_meta\"'*|*'\"awaitCleanup\"'*) exit 1 ;; *) ;; esac; \
+             IFS= read -r ping || exit 1; \
+             case \"$ping\" in *'\"method\":\"ping\"'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the cancellation client");
+
+        let request_id = RequestId::Number(20);
+        let mut waiter = client
+            .responses
+            .register(request_id.clone())
+            .expect("register modern cancellation owner");
+        client
+            .transport
+            .send(
+                &client.cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "test/cancel",
+                    Some(serde_json::json!({})),
+                    20,
+                )),
+            )
+            .expect("commit request before modern cancellation");
+        client
+            .cancel_request(request_id, Some("stop".to_owned()))
+            .expect("modern cancellation writes one final stdio notification");
+        assert_eq!(
+            waiter
+                .try_response()
+                .expect_err("the live modern owner receives local cancellation")
+                .code,
+            McpErrorCode::RequestCancelled
+        );
+        client
+            .ping()
+            .expect("the scripted peer admits only the exact final cancellation wire");
+        assert_eq!(client.responses.cancellation_control_len(), 1);
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modern_stdio_peer_cancellation_ignores_non_subscription_request_ids() {
+        let discovery = modern_discovery_response(
+            "modern-peer-cancellation-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        let script = format!(
+            "IFS= read -r discovery || exit 1; \
+             case \"$discovery\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \
+             IFS= read -r first || exit 1; \
+             case \"$first\" in *'\"method\":\"ping\"'*'\"id\":2'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":2}}}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r second || exit 1; \
+             case \"$second\" in *'\"method\":\"ping\"'*'\"id\":3'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the peer-cancellation client");
+
+        client
+            .ping()
+            .expect("matching final peer cancellation must not release a ping waiter");
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 0);
+
+        client
+            .ping()
+            .expect("subsequent ordinary requests remain aligned");
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert!(client.is_initialized());
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn oversized_public_cancellation_is_local_first_then_connection_terminal() {
         let mut client =
             make_shell_scripted_initialized_client("exec sleep 2", Duration::from_secs(1));
@@ -9146,7 +9337,7 @@ mod tests {
             .expect("commit request before oversized cancellation");
 
         let error = client
-            .cancel_request(request_id, Some("x".repeat(512)), false)
+            .cancel_request(request_id, Some("x".repeat(512)))
             .expect_err("oversized atomic control must fail boundedly");
 
         assert_eq!(error.message, CONTROL_FRAME_CAPACITY_ERROR);
@@ -9458,7 +9649,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn clt_reverse_request_handlers_positive() {
+    fn clt_legacy_reverse_request_handlers_remain_unchanged() {
         let script = "IFS= read -r request; \
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
             IFS= read -r sampling; \
@@ -9472,6 +9663,10 @@ mod tests {
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sampling\":%s,\"roots\":%s,\"elicitation\":%s}}\\n' \
             \"$sampling_ok\" \"$roots_ok\" \"$elicitation_ok\"; exec sleep 2";
         let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(ProtocolEra::Legacy2024)
+        );
         let sampling_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let roots_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let elicitation_calls = std::sync::Arc::new(AtomicUsize::new(0));
@@ -9516,6 +9711,94 @@ mod tests {
         assert_eq!(elicitation_calls.load(Ordering::Relaxed), 1);
         assert!(client.is_initialized());
         assert!(!client.transport.is_closed());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_modern_reverse_request_handlers_are_rejected_without_callback_mutation() {
+        let script = "IFS= read -r request; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
+            IFS= read -r sampling; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"roots/list\",\"id\":42}\\n'; \
+            IFS= read -r roots; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"elicitation/create\",\"id\":43,\"params\":{\"mode\":\"form\",\"message\":\"approval\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}}\\n'; \
+            IFS= read -r elicitation; \
+            case \"$sampling\" in *'\"code\":-32601'*'\"id\":41'*) sampling_rejected=true;; *) sampling_rejected=false;; esac; \
+            case \"$roots\" in *'\"code\":-32601'*'\"id\":42'*) roots_rejected=true;; *) roots_rejected=false;; esac; \
+            case \"$elicitation\" in *'\"code\":-32601'*'\"id\":43'*) elicitation_rejected=true;; *) elicitation_rejected=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"samplingRejected\":%s,\"rootsRejected\":%s,\"elicitationRejected\":%s}}\\n' \
+            \"$sampling_rejected\" \"$roots_rejected\" \"$elicitation_rejected\"; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client_for_version(
+            script,
+            Duration::from_secs(2),
+            MODERN_PROTOCOL_VERSION,
+        );
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(ProtocolEra::Modern2026)
+        );
+        let sampling_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let roots_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let elicitation_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let handlers = ReverseRequestHandlers::new()
+            .with_sampling_create_message({
+                let sampling_calls = std::sync::Arc::clone(&sampling_calls);
+                move |_params| {
+                    sampling_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(CreateMessageResult::text("handled", "handler-model"))
+                }
+            })
+            .with_roots_list({
+                let roots_calls = std::sync::Arc::clone(&roots_calls);
+                move |_params| {
+                    roots_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(ListRootsResult::new(vec![fastmcp_protocol::Root::new(
+                        "file:///workspace",
+                    )]))
+                }
+            })
+            .with_elicitation_create({
+                let elicitation_calls = std::sync::Arc::clone(&elicitation_calls);
+                move |_params| {
+                    elicitation_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(ElicitResult::decline())
+                }
+            });
+        client.set_reverse_request_handlers(handlers);
+
+        let result: serde_json::Value = client
+            .send_request("test/reverse-handlers", serde_json::json!({}))
+            .expect("modern rejection of legacy reverse requests must keep the session aligned");
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "samplingRejected": true,
+                "rootsRejected": true,
+                "elicitationRejected": true
+            })
+        );
+        assert_eq!(
+            sampling_calls.load(Ordering::Relaxed),
+            0,
+            "modern rejection must not invoke the sampling callback"
+        );
+        assert_eq!(
+            roots_calls.load(Ordering::Relaxed),
+            0,
+            "modern rejection must not invoke the roots callback"
+        );
+        assert_eq!(
+            elicitation_calls.load(Ordering::Relaxed),
+            0,
+            "modern rejection must not invoke the elicitation callback"
+        );
+        assert!(client.is_initialized());
+        assert!(!client.transport.is_closed());
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert!(client.responses.terminal_error().is_none());
         client.close().expect("client cleanup");
     }
 
@@ -11316,7 +11599,7 @@ mod tests {
         );
         assert!(client.child.is_none(), "terminal failure reaps the child");
         let later = client
-            .cancel_request(50_i64, None, false)
+            .cancel_request(50_i64, None)
             .expect_err("initialized APIs must not retry a terminal connection");
         assert_eq!(later.code, error.code);
         assert_eq!(later.message, error.message);
@@ -11873,7 +12156,7 @@ mod tests {
         let mut client = make_closed_client(true);
         std::thread::sleep(Duration::from_millis(50));
 
-        let _ = client.cancel_request(7i64, Some("stop".to_string()), true);
+        let _ = client.cancel_request(7i64, Some("stop".to_string()));
         assert!(client.list_tools().is_err());
         assert!(
             client
@@ -12174,7 +12457,7 @@ mod tests {
         let mut client = make_closed_client(false);
         std::thread::sleep(Duration::from_millis(50));
         let error = client
-            .cancel_request(99_i64, None, false)
+            .cancel_request(99_i64, None)
             .expect_err("cancellation must initialize the session first");
         assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
         assert!(!client.is_initialized());
@@ -13624,7 +13907,9 @@ mod tests {
     fn clt_01_subscriptions_listen_matching_cancellation_is_request_owned() {
         let script = modern_subscriptions_listen_client_script(
             2,
-            &[r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#],
+            &[
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2e0,"_meta":{"io.modelcontextprotocol/subscriptionId":2.0}}}"#,
+            ],
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -13646,6 +13931,44 @@ mod tests {
         client
             .close()
             .expect("cancellation leaves the client closable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_subscriptions_listen_ignores_invalid_or_foreign_cancellation_controls() {
+        let script = modern_subscriptions_listen_client_script(
+            2,
+            &[
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":null}}"#,
+                r#"{"jsonrpc":"2.0","id":99,"method":"notifications/cancelled","params":{"requestId":2}}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"reason":null}}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","id":2e0,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2.0}}}"#,
+            ],
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the subscription client");
+
+        let collector = client
+            .listen_subscriptions_typed(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect("invalid and foreign controls are inert for the owned live listener");
+        assert!(matches!(
+            collector.notifications.as_slice(),
+            [ServerNotification::ToolsListChanged(None)]
+        ));
+        assert!(client.is_initialized());
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("modern client cleanup");
     }
 
     #[cfg(unix)]

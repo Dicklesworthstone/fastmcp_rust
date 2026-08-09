@@ -6,12 +6,14 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::pin::Pin;
+use std::task::Poll;
 use std::time::Instant;
 
 use asupersync::Cx;
 use asupersync::bytes::Buf;
+use asupersync::channel::oneshot;
 use asupersync::http::Body;
 use asupersync::http::h1::http_client::ClientIo;
 use asupersync::http::h1::{
@@ -376,7 +378,9 @@ impl ModernHttpResponseStream {
                             .and_then(|value| {
                                 serde_json::from_value::<RequestId>(value.clone()).ok()
                             });
-                        if subscription_id.as_ref() != Some(&request_id) {
+                        if !subscription_id.as_ref().is_some_and(|subscription_id| {
+                            subscription_id.correlates_with(&request_id)
+                        }) {
                             return Err(
                                 ModernHttpSubscriptionListenError::TaskEventSubscriptionIdMismatch,
                             );
@@ -408,18 +412,10 @@ impl ModernHttpResponseStream {
                             )?;
                             accepted_filter = Some(acknowledgement.notifications);
                         }
-                        ServerNotification::Cancelled(cancellation) => {
-                            if cancellation.request_id != request_id {
-                                return Err(
-                                    ModernHttpSubscriptionListenError::CancellationIdMismatch {
-                                        expected: request_id,
-                                        actual: cancellation.request_id,
-                                    },
-                                );
-                            }
-                            return Err(ModernHttpSubscriptionListenError::Cancelled {
-                                request_id,
-                            });
+                        ServerNotification::Cancelled(_) => {
+                            return Err(
+                                ModernHttpSubscriptionListenError::ServerCancellationOnHttp,
+                            );
                         }
                         notification @ (ServerNotification::ResourcesListChanged(_)
                         | ServerNotification::ToolsListChanged(_)
@@ -456,14 +452,25 @@ impl ModernHttpResponseStream {
     ) -> Result<Vec<u8>, ModernHttpExecutorError> {
         let mut response = self.response;
         let mut bytes = Vec::new();
+        let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
 
         loop {
             if cx.checkpoint().is_err() {
                 return Err(ModernHttpExecutorError::Cancelled);
             }
-            let Some(frame) =
-                poll_fn(|task_cx| Pin::new(&mut response.body).poll_frame(task_cx)).await
-            else {
+            let mut cancellation = std::pin::pin!(cancellation_signal.recv(cx));
+            let frame = poll_fn(|task_cx| {
+                if cancellation.as_mut().poll(task_cx).is_ready() {
+                    return Poll::Ready(Err(()));
+                }
+                match Pin::new(&mut response.body).poll_frame(task_cx) {
+                    Poll::Ready(frame) => Poll::Ready(Ok(frame)),
+                    Poll::Pending => Poll::Pending,
+                }
+            })
+            .await;
+            let frame = frame.map_err(|()| ModernHttpExecutorError::Cancelled)?;
+            let Some(frame) = frame else {
                 break;
             };
             if cx.checkpoint().is_err() {
@@ -504,29 +511,59 @@ pub struct ModernHttpSseResponseStream {
 }
 
 impl ModernHttpSseResponseStream {
+    fn close_response_for_cancellation(&mut self) {
+        self.response = None;
+        self.parser = None;
+        self.pending_events.clear();
+    }
+
     /// Returns the next completed SSE `data` payload, or `None` at EOF.
     ///
     /// The returned payload is not JSON-RPC-admitted. Its caller must decode
     /// it through the protocol's strict response/notification admission path.
     pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<String>, ModernHttpExecutorError> {
+        if cx.checkpoint().is_err() {
+            self.close_response_for_cancellation();
+            return Err(ModernHttpExecutorError::Cancelled);
+        }
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(Some(event));
         }
         if self.end_of_stream.is_some() {
             return Ok(None);
         }
+        let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
 
         loop {
             if cx.checkpoint().is_err() {
+                self.close_response_for_cancellation();
                 return Err(ModernHttpExecutorError::Cancelled);
             }
-            let response = self
-                .response
-                .as_mut()
-                .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
-            let Some(frame) =
-                poll_fn(|task_cx| Pin::new(&mut response.body).poll_frame(task_cx)).await
-            else {
+            let frame = {
+                let response = self
+                    .response
+                    .as_mut()
+                    .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
+                let mut cancellation = std::pin::pin!(cancellation_signal.recv(cx));
+                poll_fn(|task_cx| {
+                    if cancellation.as_mut().poll(task_cx).is_ready() {
+                        return Poll::Ready(Err(()));
+                    }
+                    match Pin::new(&mut response.body).poll_frame(task_cx) {
+                        Poll::Ready(frame) => Poll::Ready(Ok(frame)),
+                        Poll::Pending => Poll::Pending,
+                    }
+                })
+                .await
+            };
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(()) => {
+                    self.close_response_for_cancellation();
+                    return Err(ModernHttpExecutorError::Cancelled);
+                }
+            };
+            let Some(frame) = frame else {
                 let parser = self
                     .parser
                     .take()
@@ -537,6 +574,7 @@ impl ModernHttpSseResponseStream {
                 return Ok(None);
             };
             if cx.checkpoint().is_err() {
+                self.close_response_for_cancellation();
                 return Err(ModernHttpExecutorError::Cancelled);
             }
             let Some(mut data) = frame
@@ -670,17 +708,11 @@ pub enum ModernHttpSubscriptionListenError {
     TaskEventSubscriptionIdMismatch,
     /// A Tasks event named a task outside the acknowledged exact-ID set.
     TaskEventOutsideAcceptedFilter,
-    /// A final cancellation targeted another request instead of this listener.
-    CancellationIdMismatch {
-        /// The immutable ID assigned to the outgoing listen request.
-        expected: RequestId,
-        /// The request ID carried by the cancellation notification.
-        actual: RequestId,
-    },
     /// The caller cancelled this request-owned listener context.
     CallerCancelled { request_id: RequestId },
-    /// The server cancelled this request-owned listener.
-    Cancelled { request_id: RequestId },
+    /// Server cancellation notifications are invalid on a modern HTTP SSE
+    /// response stream; response-body closure is the only cancellation signal.
+    ServerCancellationOnHttp,
     /// The SSE stream reached EOF without a complete terminal result.
     EndOfStream {
         /// The parser's exact report of discarded framing at EOF.
@@ -763,17 +795,12 @@ impl fmt::Display for ModernHttpSubscriptionListenError {
             Self::TaskEventOutsideAcceptedFilter => formatter.write_str(
                 "subscriptions/listen Tasks event was outside its accepted taskIds filter",
             ),
-            Self::CancellationIdMismatch { expected, actual } => write!(
-                formatter,
-                "subscriptions/listen cancellation ID {actual:?} did not match request {expected:?}"
-            ),
             Self::CallerCancelled { request_id } => write!(
                 formatter,
                 "subscriptions/listen request {request_id:?} was cancelled by the caller"
             ),
-            Self::Cancelled { request_id } => write!(
-                formatter,
-                "subscriptions/listen request {request_id:?} was cancelled by the server"
+            Self::ServerCancellationOnHttp => formatter.write_str(
+                "subscriptions/listen received an invalid server cancellation notification over HTTP",
             ),
             Self::EndOfStream { .. } => formatter.write_str(
                 "subscriptions/listen SSE reached EOF before terminal complete result",
@@ -809,9 +836,8 @@ impl std::error::Error for ModernHttpSubscriptionListenError {
             | Self::EventOutsideAcceptedFilter
             | Self::TaskEventSubscriptionIdMismatch
             | Self::TaskEventOutsideAcceptedFilter
-            | Self::CancellationIdMismatch { .. }
             | Self::CallerCancelled { .. }
-            | Self::Cancelled { .. }
+            | Self::ServerCancellationOnHttp
             | Self::EndOfStream { .. } => None,
         }
     }
@@ -841,7 +867,11 @@ fn collect_final_subscriptions_terminal(
     notifications: Vec<ServerNotification>,
     task_notifications: Vec<FinalTaskStatusNotification>,
 ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
-    if response.id.as_ref() != Some(&expected_id) {
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|response_id| response_id.correlates_with(&expected_id))
+    {
         return Err(ModernHttpSubscriptionListenError::ResponseIdMismatch {
             expected: expected_id,
             actual: response.id,
@@ -870,7 +900,7 @@ fn collect_final_subscriptions_terminal(
     else {
         return Err(ModernHttpSubscriptionListenError::UnexpectedTerminalResult);
     };
-    if subscription_id != expected_id {
+    if !subscription_id.correlates_with(&expected_id) {
         return Err(ModernHttpSubscriptionListenError::TerminalIdMismatch {
             expected: expected_id,
             actual: subscription_id,
@@ -902,7 +932,7 @@ fn validate_http_subscription_acknowledgement(
             serde_json::from_value::<RequestId>(value.clone())
                 .map_err(|_| ModernHttpSubscriptionListenError::AcknowledgementInvalidId)
         })?;
-    if &subscription_id != expected_id {
+    if !subscription_id.correlates_with(expected_id) {
         return Err(
             ModernHttpSubscriptionListenError::AcknowledgementIdMismatch {
                 expected: expected_id.clone(),
@@ -1300,6 +1330,11 @@ pub enum ClientHttpConnectionError {
     /// A modern notification acknowledgement carried a body rather than the
     /// empty acknowledgement required by the stateless notification surface.
     ModernNotificationUnexpectedBody,
+    /// Modern HTTP cancellation is selected by closing the request-owned
+    /// response body, never by posting a second JSON-RPC notification.
+    ModernCancellationRequiresResponseClose,
+    /// MCP 2026-07-28 does not permit client notification POSTs over HTTP.
+    ModernClientNotificationPostUnsupported { method: String },
     /// Final `subscriptions/listen` requires the modern HTTP transport.
     SubscriptionsListenRequiresModern,
     /// A modern subscription response stream failed typed admission or collection.
@@ -1362,6 +1397,13 @@ impl fmt::Display for ClientHttpConnectionError {
             ),
             Self::ModernNotificationUnexpectedBody => formatter
                 .write_str("modern HTTP notification acknowledgement must have an empty body"),
+            Self::ModernCancellationRequiresResponseClose => formatter.write_str(
+                "modern HTTP cancellation requires closing the request-owned response body",
+            ),
+            Self::ModernClientNotificationPostUnsupported { method } => write!(
+                formatter,
+                "modern HTTP does not permit a client notification POST for {method}"
+            ),
             Self::SubscriptionsListenRequiresModern => {
                 formatter.write_str("subscriptions/listen requires the modern HTTP transport")
             }
@@ -1387,6 +1429,8 @@ impl std::error::Error for ClientHttpConnectionError {
             | Self::ResponseIdMismatch { .. }
             | Self::ModernNotificationUnexpectedStatus { .. }
             | Self::ModernNotificationUnexpectedBody
+            | Self::ModernCancellationRequiresResponseClose
+            | Self::ModernClientNotificationPostUnsupported { .. }
             | Self::SubscriptionsListenRequiresModern
             | Self::FinalToolCallRequiresModern => None,
             Self::ResponseAdmission(error) => Some(error),
@@ -1747,8 +1791,9 @@ impl ClientHttpConnection {
     /// Sends one client notification through the selected transport.
     ///
     /// Exact legacy notifications are posted to the pinned message endpoint
-    /// without an ID. Modern notifications retain their stateless final POST
-    /// contract and consume their finite HTTP acknowledgement before returning.
+    /// without an ID. MCP 2026-07-28 rejects every client notification over
+    /// HTTP before a POST can be opened; client cancellation closes the owned
+    /// response body instead.
     pub async fn notify(
         &mut self,
         cx: &Cx,
@@ -1758,32 +1803,17 @@ impl ClientHttpConnection {
         let method = method.as_ref();
         match self {
             Self::Modern(client) => {
-                let response = client
-                    .request(
-                        cx,
-                        method,
-                        parameters.unwrap_or_else(|| serde_json::json!({})),
-                        None,
-                    )
-                    .await
-                    .map_err(ClientHttpConnectionError::Modern)?;
-                if response.metadata().status() != 202 {
-                    return Err(
-                        ClientHttpConnectionError::ModernNotificationUnexpectedStatus {
-                            status: response.metadata().status(),
-                        },
-                    );
+                if method == "notifications/cancelled" {
+                    return Err(ClientHttpConnectionError::ModernCancellationRequiresResponseClose);
                 }
-                let body = response
-                    .read_to_end(cx, MAX_MODERN_HTTP_PROBE_BODY_BYTES)
-                    .await
-                    .map_err(|error| {
-                        ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error))
-                    })?;
-                if !body.is_empty() {
-                    return Err(ClientHttpConnectionError::ModernNotificationUnexpectedBody);
-                }
-                Ok(())
+                let _ = client;
+                let _ = cx;
+                let _ = parameters;
+                Err(
+                    ClientHttpConnectionError::ModernClientNotificationPostUnsupported {
+                        method: method.to_owned(),
+                    },
+                )
             }
             Self::LegacySse { client, .. } => {
                 if let Some(parameters) = parameters.as_ref() {
@@ -1840,6 +1870,8 @@ pub enum ModernHttpClientError {
     MissingRequestId { method: String },
     /// The caller supplied an ID for a final notification method.
     NotificationHasRequestId { method: String },
+    /// MCP 2026-07-28 does not permit client notification POSTs over HTTP.
+    ClientNotificationPostUnsupported { method: String },
     /// JSON-RPC or final metadata serialization failed before a native POST.
     RequestEncodingFailed,
     /// The native executor rejected or failed the HTTP exchange.
@@ -1908,6 +1940,10 @@ impl fmt::Display for ModernHttpClientError {
                     "modern MCP notification {method} must not have an ID"
                 )
             }
+            Self::ClientNotificationPostUnsupported { method } => write!(
+                formatter,
+                "modern HTTP does not permit a client notification POST for {method}"
+            ),
             Self::RequestEncodingFailed => {
                 formatter.write_str("modern MCP request encoding failed")
             }
@@ -1967,6 +2003,7 @@ impl std::error::Error for ModernHttpClientError {
             | Self::ServerInitiatedFinalMethod { .. }
             | Self::MissingRequestId { .. }
             | Self::NotificationHasRequestId { .. }
+            | Self::ClientNotificationPostUnsupported { .. }
             | Self::RequestEncodingFailed
             | Self::DiscoveryRejected
             | Self::InvalidDiscoveryResponse
@@ -2119,12 +2156,18 @@ impl ModernHttpClient {
         parameters: serde_json::Value,
         request_id: Option<RequestId>,
     ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
+        let method = method.as_ref();
+        if request_id.is_none() {
+            return Err(ModernHttpClientError::ClientNotificationPostUnsupported {
+                method: method.to_owned(),
+            });
+        }
         let client_extensions = merge_client_extensions(self.active_mcp_apps_settings(), None);
         let request = build_modern_request_with_extensions(
             &self.modern_post_target,
             &self.client_info,
             &self.client_capabilities,
-            method.as_ref(),
+            method,
             parameters,
             request_id,
             client_extensions.as_ref(),
@@ -3264,9 +3307,12 @@ fn contains_header_control(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::future::Future as _;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -3280,10 +3326,10 @@ mod tests {
 
     use super::{
         ClientHttpConnection, ClientHttpConnectionError, LegacySseHttpClientError,
-        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpClientError,
-        ModernHttpExecutorError, ModernHttpResponseKind, ModernHttpSubscriptionListenCollector,
-        ModernHttpSubscriptionListenError, decode_modern_discovery_response,
-        merge_client_extensions, validate_response_head,
+        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpClient,
+        ModernHttpClientError, ModernHttpExecutorError, ModernHttpResponseKind,
+        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
+        decode_modern_discovery_response, merge_client_extensions, validate_response_head,
     };
     use crate::sse::SseLimits;
     use crate::{
@@ -3295,6 +3341,19 @@ mod tests {
     struct CapturedHttpRequest {
         head: String,
         body: Vec<u8>,
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingWake(AtomicUsize);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     const LEGACY_TEST_PEER_BOUND: Duration = Duration::from_secs(2);
@@ -3453,7 +3512,7 @@ mod tests {
         });
 
         let cx = Cx::for_request();
-        let mut connection = runtime_block_on(
+        let connection = runtime_block_on(
             ClientBuilder::new()
                 .mcp_apps(
                     McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
@@ -3658,14 +3717,14 @@ mod tests {
         serde_json::to_vec(&response).expect("typed Tasks discovery response")
     }
 
-    fn subscriptions_listen_sse_events(acknowledgement_id: i64) -> [String; 4] {
+    fn subscriptions_listen_sse_events(acknowledgement_id: &str) -> [String; 4] {
         [
             format!(
                 "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":{acknowledgement_id}}},\"notifications\":{{\"toolsListChanged\":true,\"promptsListChanged\":true}}}}}}\n\n"
             ),
             "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n".to_owned(),
             "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}\n\n".to_owned(),
-            "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2}}}\n\n".to_owned(),
+            "data: {\"jsonrpc\":\"2.0\",\"id\":2e0,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2.0}}}\n\n".to_owned(),
         ]
     }
 
@@ -3901,11 +3960,11 @@ mod tests {
     }
 
     #[test]
-    fn public_http_connection_auto_selects_modern_and_accepts_a_content_type_free_empty_notification_acknowledgement()
-     {
+    fn public_http_connection_rejects_modern_progress_notification_without_peer_contact() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local modern listener");
         let address = listener.local_addr().expect("read local modern address");
         let modern_target = format!("http://{address}/mcp");
+        let (verify_sender, verify_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut probe, _) = listener.accept().expect("accept modern probe");
             let probe_request = read_request(&mut probe);
@@ -3921,42 +3980,17 @@ mod tests {
                 "server/discover"
             );
             write_response(&mut probe, 200, "application/json", modern_discovery_body());
-
-            let (mut stream, _) = listener.accept().expect("accept modern request");
-            let request = read_request(&mut stream);
-            assert!(request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
-            assert!(
-                request
-                    .head
-                    .contains("MCP-Protocol-Version: 2026-07-28\r\n")
-            );
-            let body = serde_json::from_slice::<serde_json::Value>(&request.body)
-                .expect("modern request must be JSON-RPC");
-            assert_eq!(body["method"], "tools/list");
-            assert_eq!(
-                body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
-                "2026-07-28"
-            );
-            write_response(
-                &mut stream,
-                200,
-                "application/json",
-                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
-            );
-
-            let (mut notification, _) = listener.accept().expect("accept modern notification");
-            let notification_request = read_request(&mut notification);
-            assert!(
-                notification_request
-                    .head
-                    .starts_with("POST /mcp HTTP/1.1\r\n")
-            );
-            let body = serde_json::from_slice::<serde_json::Value>(&notification_request.body)
-                .expect("modern notification must be JSON-RPC");
-            assert_eq!(body["method"], "notifications/cancelled");
-            assert!(body.get("id").is_none());
-            assert_eq!(body["params"]["requestId"], 2);
-            write_response_without_content_type(&mut notification, 202, b"");
+            verify_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("client reports the local progress refusal");
+            listener
+                .set_nonblocking(true)
+                .expect("configure listener for no-POST assertion");
+            match listener.accept() {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("modern progress must not open a notification POST"),
+                Err(error) => panic!("unexpected listener error: {error}"),
+            }
         });
 
         let cx = Cx::for_request();
@@ -3974,38 +4008,95 @@ mod tests {
         .expect("recognized modern discovery selects the public HTTP connection");
         assert_eq!(connection.selected_protocol_era(), ProtocolEra::Modern2026);
 
-        let response = runtime_block_on(connection.request_json(
+        let error = runtime_block_on(connection.notify(
             &cx,
-            "tools/list",
-            serde_json::json!({}),
-            RequestId::Number(2),
-            4_096,
+            "notifications/progress",
+            Some(serde_json::json!({"progressToken": 2, "progress": 0.5})),
         ))
-        .expect("the public HTTP request path retains the selected modern transport");
-        assert_eq!(
-            response
-                .result
-                .as_ref()
-                .expect("modern response has result")["resultType"],
-            "complete",
-        );
-        runtime_block_on(connection.notify(
-            &cx,
-            "notifications/cancelled",
-            Some(serde_json::json!({"requestId": 2})),
-        ))
-        .expect("a modern notification receives its exact empty 202 acknowledgement");
+        .expect_err("final HTTP refuses a client progress POST before peer contact");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::ModernClientNotificationPostUnsupported { ref method }
+                if method == "notifications/progress"
+        ));
+        verify_sender
+            .send(())
+            .expect("release the peer no-POST assertion");
         server.join().expect("local modern server must join");
     }
 
     #[test]
-    fn public_http_connection_notify_rejects_only_one_nonempty_byte_in_a_content_type_free_202_acknowledgement()
-     {
+    fn modern_http_client_rejects_progress_notification_without_peer_contact() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind notification listener");
         let address = listener
             .local_addr()
             .expect("read notification listener address");
         let modern_target = format!("http://{address}/mcp");
+        let (verify_sender, verify_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+            verify_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("client reports the direct local progress refusal");
+            listener
+                .set_nonblocking(true)
+                .expect("configure listener for no-POST assertion");
+            match listener.accept() {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("direct modern progress request must not open a notification POST"),
+                Err(error) => panic!("unexpected listener error: {error}"),
+            }
+        });
+
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "public-http-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery selects a direct modern client")
+        .into_modern()
+        .expect("modern-only discovery cannot yield legacy");
+        let error = runtime_block_on(client.request(
+            &cx,
+            "notifications/progress",
+            serde_json::json!({"progressToken": 2, "progress": 0.5}),
+            None,
+        ))
+        .expect_err("direct modern client refuses every notification POST before peer contact");
+        assert!(matches!(
+            error,
+            ModernHttpClientError::ClientNotificationPostUnsupported { ref method }
+                if method == "notifications/progress"
+        ));
+        verify_sender
+            .send(())
+            .expect("release the peer no-POST assertion");
+        server.join().expect("notification test server must join");
+    }
+
+    #[test]
+    fn modern_http_cancellation_rejects_notification_post_without_contacting_the_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind modern listener");
+        let address = listener.local_addr().expect("read modern listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let (verify_sender, verify_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut probe, _) = listener.accept().expect("accept modern probe");
             let probe_request = read_request(&mut probe);
@@ -4016,15 +4107,17 @@ mod tests {
             );
             write_response(&mut probe, 200, "application/json", modern_discovery_body());
 
-            let (mut notification, _) = listener.accept().expect("accept modern notification");
-            let notification_request = read_request(&mut notification);
-            let body = serde_json::from_slice::<serde_json::Value>(&notification_request.body)
-                .expect("modern notification must be JSON-RPC");
-            assert_eq!(body["method"], "notifications/cancelled");
-            assert!(body.get("id").is_none());
-            // The response differs from the accepted neighbour only by this
-            // single body byte.
-            write_response_without_content_type(&mut notification, 202, b"x");
+            verify_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("client reports the local cancellation refusal");
+            listener
+                .set_nonblocking(true)
+                .expect("configure local listener for a no-POST assertion");
+            match listener.accept() {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("modern cancellation must not open a notification POST"),
+                Err(error) => panic!("unexpected listener error: {error}"),
+            }
         });
 
         let cx = Cx::for_request();
@@ -4044,12 +4137,112 @@ mod tests {
             "notifications/cancelled",
             Some(serde_json::json!({"requestId": 2})),
         ))
-        .expect_err("one nonempty acknowledgement byte must remain rejected");
+        .expect_err("modern cancellation is response-body closure, not a notification POST");
         assert!(matches!(
             error,
-            ClientHttpConnectionError::ModernNotificationUnexpectedBody
+            ClientHttpConnectionError::ModernCancellationRequiresResponseClose
         ));
-        server.join().expect("notification test server must join");
+        verify_sender
+            .send(())
+            .expect("release the peer no-POST assertion");
+        server.join().expect("modern peer must join");
+    }
+
+    #[test]
+    fn modern_http_sse_cancellation_drops_the_owned_response_body_immediately() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind modern SSE listener");
+        let address = listener.local_addr().expect("read modern SSE address");
+        let modern_target = format!("http://{address}/mcp");
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener.accept().expect("accept modern SSE request");
+            let request = read_request(&mut stream);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("modern request must be JSON-RPC")["method"],
+                "tools/call"
+            );
+            begin_chunked_sse(&mut stream);
+            ready_sender
+                .send(())
+                .expect("tell client the response body is live");
+            release_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("wait until the caller cancels the owned stream");
+        });
+
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "public-http-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery selects a direct modern client")
+        .into_modern()
+        .expect("modern-only discovery cannot yield legacy");
+        let response = runtime_block_on(client.request(
+            &cx,
+            "tools/call",
+            serde_json::json!({"name": "echo", "arguments": {}}),
+            Some(RequestId::Number(2)),
+        ))
+        .expect("open the request-owned SSE response");
+        let mut stream = response
+            .into_sse_stream(SseLimits::new(1_024, 8_192, 4).expect("nonzero SSE bounds"))
+            .expect("the response is an SSE stream");
+        ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server exposed the live response body");
+
+        let wake_counter = Arc::new(CountingWake::default());
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut task_context = Context::from_waker(&waker);
+        let mut next_event = std::pin::pin!(stream.next_event(&cx));
+        assert!(matches!(
+            next_event.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+
+        cx.cancel_with(
+            CancelKind::User,
+            Some("cancel the owned modern SSE response"),
+        );
+        assert!(
+            wake_counter.0.load(Ordering::SeqCst) > 0,
+            "Cx cancellation must wake the already-pending quiet response body"
+        );
+        assert!(matches!(
+            next_event.as_mut().poll(&mut task_context),
+            Poll::Ready(Err(ModernHttpExecutorError::Cancelled))
+        ));
+        drop(next_event);
+        assert!(stream.response.is_none());
+        assert!(stream.parser.is_none());
+        assert!(stream.pending_events.is_empty());
+
+        release_sender
+            .send(())
+            .expect("release the response-owning peer");
+        server.join().expect("modern SSE server must join");
     }
 
     #[test]
@@ -4231,7 +4424,7 @@ mod tests {
             assert_eq!(body["params"]["notifications"]["promptsListChanged"], true);
 
             begin_chunked_sse(&mut stream);
-            for event in subscriptions_listen_sse_events(2) {
+            for event in subscriptions_listen_sse_events("2e0") {
                 write_chunked_sse_event(&mut stream, &event);
             }
             finish_chunked_sse(&mut stream);
@@ -4262,7 +4455,12 @@ mod tests {
         ))
         .expect("typed final HTTP listener admits acknowledgement, ordered events, and terminal");
 
-        assert_eq!(collector.subscription_id, RequestId::Number(2));
+        assert!(
+            collector
+                .subscription_id
+                .correlates_with(&RequestId::Number(2)),
+            "mathematically equal integer spellings retain one subscription owner"
+        );
         assert_eq!(collector.accepted_filter.tools_list_changed, Some(true));
         assert_eq!(collector.accepted_filter.prompts_list_changed, Some(true));
         assert!(matches!(
@@ -4279,6 +4477,72 @@ mod tests {
         server
             .join()
             .expect("final subscriptions/listen server must join");
+    }
+
+    #[test]
+    fn public_http_modern_subscriptions_listen_rejects_server_cancellation_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind final subscriptions/listen cancellation listener");
+        let address = listener
+            .local_addr()
+            .expect("read final subscriptions/listen cancellation address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept final subscriptions/listen request");
+            let request = read_request(&mut stream);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("subscriptions/listen request must be JSON-RPC")["method"],
+                "subscriptions/listen"
+            );
+            begin_chunked_sse(&mut stream);
+            write_chunked_sse_event(
+                &mut stream,
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}\n\n",
+            );
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("modern discovery selects final HTTP subscriptions/listen");
+        let error = runtime_block_on(connection.listen_subscriptions_typed(
+            &cx,
+            RequestId::Number(2),
+            SubscriptionFilter::default(),
+            SseLimits::new(1_024, 8_192, 16).expect("explicit SSE bounds are nonzero"),
+        ))
+        .expect_err("server cancellation notifications are invalid on final HTTP SSE");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::SubscriptionsListen(
+                ModernHttpSubscriptionListenError::ServerCancellationOnHttp
+            )
+        ));
+        server
+            .join()
+            .expect("final subscriptions/listen cancellation server must join");
     }
 
     #[test]
@@ -4361,7 +4625,7 @@ mod tests {
             );
             begin_chunked_sse(&mut stream);
             // This differs from the admitted stream only in the acknowledgement ID.
-            for event in subscriptions_listen_sse_events(3) {
+            for event in subscriptions_listen_sse_events("3") {
                 write_chunked_sse_event(&mut stream, &event);
             }
             finish_chunked_sse(&mut stream);

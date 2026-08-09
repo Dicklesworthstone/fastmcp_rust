@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, sha256_bounded};
-use fastmcp_protocol::methods::{SUBSCRIPTIONS_LISTEN, TOOLS_CALL};
+use fastmcp_protocol::methods::{INITIALIZE, SUBSCRIPTIONS_LISTEN, TOOLS_CALL};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::tasks_extension::{
     CancelTaskParams, CancelTaskResult, GetTaskParams, GetTaskResult, TASK_STATUS_NOTIFICATION,
@@ -22,8 +22,9 @@ use fastmcp_protocol::tasks_extension::{
     UpdateTaskResult, task_subscription_ids,
 };
 use fastmcp_protocol::{
-    CancelledParams, CoreRequest, CoreResult, CoreResultDiscriminatorPolicy, DecodedResult,
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult,
+    CancellationSender, CancellationWireMessage, CancelledParams, CoreRequest, CoreResult,
+    CoreResultDiscriminatorPolicy, DecodedResult, FINAL_SUBSCRIPTION_ID_META_KEY,
+    FinalCancelledNotificationParams, FinalCoreResult,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId, ResultPeerDiagnostic,
     ResultPeerEra, SubscriptionFilter, decode_peer_result,
@@ -758,13 +759,16 @@ impl<T> ExecutorState<T> {
         let request_id = request.id.clone().ok_or_else(|| {
             McpError::invalid_request("Client reverse request omitted a JSON-RPC request ID")
         })?;
-        if self.pending.contains_key(&request_id)
-            || !self.pending_reverse_request_ids.insert(request_id.clone())
+        if self
+            .pending_reverse_request_ids
+            .iter()
+            .any(|owned_request_id| owned_request_id.correlates_with(&request_id))
         {
             return Err(McpError::invalid_request(
                 "Client reverse request ID is already active",
             ));
         }
+        self.pending_reverse_request_ids.insert(request_id.clone());
         if self.reverse_requests.len() >= MAX_RETAINED_PEER_ACTIVITY {
             let removed = self.pending_reverse_request_ids.remove(&request_id);
             debug_assert!(removed);
@@ -1098,7 +1102,9 @@ where
         match message {
             JsonRpcMessage::Response(response) => self.route_response_locked(&mut state, response),
             JsonRpcMessage::Request(request) => {
-                if request.id.is_some() {
+                if request.method == "notifications/cancelled" {
+                    self.route_cancellation_notification_locked(cx, &mut state, &request)?;
+                } else if request.id.is_some() {
                     if state.result_peer_era == ResultPeerEra::Modern {
                         self.reject_modern_reverse_request_locked(cx, &mut state, request)?;
                     } else if let Err(error) = state.retain_reverse_request(request) {
@@ -1109,7 +1115,6 @@ where
                     .route_task_subscription_acknowledgement_locked(&mut state, &request)?
                 {
                 } else if self.route_task_subscription_notification_locked(&mut state, &request)? {
-                } else if self.route_cancellation_notification_locked(cx, &mut state, &request)? {
                 } else if self.route_stream_notification_locked(&mut state, &request)? {
                 } else if !state.retain_notification(request) {
                     let error = McpError::internal_error("Client peer-activity queue is full");
@@ -1347,23 +1352,34 @@ where
                 "Client request executor connection is no longer usable",
             ));
         }
-        if !state.pending_reverse_request_ids.contains(&request_id) {
+        let owned_request_id = state
+            .pending_reverse_request_ids
+            .iter()
+            .find(|owned_request_id| owned_request_id.correlates_with(&request_id))
+            .cloned();
+        let Some(owned_request_id) = owned_request_id else {
             return Err(McpError::invalid_request(
                 "Client reverse response does not own a live peer request ID",
             ));
-        }
+        };
         state
             .transport
             .send(
                 cx,
-                &JsonRpcMessage::Response(JsonRpcResponse::success(request_id.clone(), result)),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    owned_request_id.clone(),
+                    result,
+                )),
             )
             .map_err(|error| self.handle_send_error_locked(&mut state, error))?;
-        let removed = state.pending_reverse_request_ids.remove(&request_id);
+        let removed = state.pending_reverse_request_ids.remove(&owned_request_id);
         debug_assert!(removed);
-        state
-            .reverse_requests
-            .retain(|request| request.id.as_ref() != Some(&request_id));
+        state.reverse_requests.retain(|request| {
+            request
+                .id
+                .as_ref()
+                .is_none_or(|request_id| !request_id.correlates_with(&owned_request_id))
+        });
         Ok(())
     }
 
@@ -1410,6 +1426,16 @@ where
     ) -> McpResult<()> {
         execution.ensure_owner(&self.state)?;
         let mut state = self.state.borrow_mut();
+        let is_active_modern_subscription = state.result_peer_era == ResultPeerEra::Modern
+            && state
+                .pending
+                .get(&execution.request_id)
+                .is_some_and(|pending| pending.method == SUBSCRIPTIONS_LISTEN);
+        if !is_active_modern_subscription {
+            return Err(McpError::invalid_request(
+                "Peer cancellation is only valid for an active modern subscriptions/listen request",
+            ));
+        }
         self.cancel_pending_without_notification_locked(
             cx,
             &mut state,
@@ -1517,16 +1543,28 @@ where
     }
 
     fn route_response_locked(&self, state: &mut ExecutorState<T>, response: JsonRpcResponse) {
-        let Some(request_id) = response.id.clone() else {
+        let Some(response_id) = response.id.clone() else {
             let error = McpError::invalid_request("Peer response omitted a request ID");
             state.fail_all(error, ExecutionTerminalReason::ConnectionLost);
             return;
         };
-        if let Some(tombstone) = state.tombstones.remove(&request_id) {
+        let tombstone_id = state
+            .tombstones
+            .keys()
+            .find(|request_id| request_id.correlates_with(&response_id))
+            .cloned();
+        if let Some(tombstone_id) = tombstone_id
+            && let Some(tombstone) = state.tombstones.remove(&tombstone_id)
+        {
             debug_assert!(tombstone.generation > 0);
             return;
         }
-        let Some(pending) = state.pending.remove(&request_id) else {
+        let owned_request_id = state
+            .pending
+            .keys()
+            .find(|request_id| request_id.correlates_with(&response_id))
+            .cloned();
+        let Some(owned_request_id) = owned_request_id else {
             if !state.retain_uncorrelated_response(response) {
                 state.fail_all(
                     McpError::internal_error("Client uncorrelated-response queue is full"),
@@ -1535,6 +1573,10 @@ where
             }
             return;
         };
+        let pending = state
+            .pending
+            .remove(&owned_request_id)
+            .expect("correlated pending request remains live until removal");
         let generation = pending.record.execution_generation;
         let accepts_task_result =
             state.result_peer_era == ResultPeerEra::Modern && pending.method == TOOLS_CALL;
@@ -1545,9 +1587,9 @@ where
                 Err(error) => {
                     state
                         .stream_notifications
-                        .remove(&(request_id.clone(), generation));
+                        .remove(&(owned_request_id.clone(), generation));
                     state.terminal_records.insert(
-                        (request_id.clone(), generation),
+                        (owned_request_id.clone(), generation),
                         ExecutionTerminalRecord {
                             terminal_state: ExecutionTerminalState::Failed,
                             terminal_reason: ExecutionTerminalReason::PeerProtocol,
@@ -1559,14 +1601,15 @@ where
                             tombstone: false,
                         },
                     );
-                    state
-                        .completed
-                        .insert((request_id, generation), ExecutionOutcome::Failure(error));
+                    state.completed.insert(
+                        (owned_request_id, generation),
+                        ExecutionOutcome::Failure(error),
+                    );
                     return;
                 }
             };
         state.terminal_records.insert(
-            (request_id.clone(), generation),
+            (owned_request_id.clone(), generation),
             ExecutionTerminalRecord {
                 terminal_state: ExecutionTerminalState::Response,
                 terminal_reason: ExecutionTerminalReason::FinalResponse,
@@ -1579,7 +1622,7 @@ where
             },
         );
         state.completed.insert(
-            (request_id, generation),
+            (owned_request_id, generation),
             ExecutionOutcome::Response(decoded),
         );
     }
@@ -1631,6 +1674,19 @@ where
         reason: ExecutionTerminalReason,
         notify_peer: bool,
     ) -> McpResult<()> {
+        let Some(pending) = state.pending.get(request_id) else {
+            return Ok(());
+        };
+        // MCP forbids client cancellation of initialize. A local owner still
+        // transitions to cancellation, but no peer notification is emitted.
+        let notify_peer = notify_peer && pending.method != INITIALIZE;
+        // Assemble the selected-era notification before the terminal CAS so a
+        // local encoding failure leaves the still-live owner unchanged.
+        let cancellation = if notify_peer {
+            Some(self.cancellation_control_message(state, request_id)?)
+        } else {
+            None
+        };
         let Some(mut pending) = state.pending.remove(request_id) else {
             return Ok(());
         };
@@ -1685,16 +1741,9 @@ where
         if !notify_peer {
             return Ok(());
         }
-        let params = serde_json::to_value(CancelledParams {
-            request_id: request_id.clone(),
-            reason: None,
-            await_cleanup: None,
-        })
-        .map_err(|_| McpError::internal_error("Failed to encode cancellation request"))?;
-        let cancellation = JsonRpcMessage::Request(JsonRpcRequest::notification(
-            "notifications/cancelled",
-            Some(params),
-        ));
+        let Some(cancellation) = cancellation else {
+            return Ok(());
+        };
         if let Err(error) = state.transport.send(cx, &cancellation) {
             let error = transport_error_to_mcp(error);
             state.fail_all(error, ExecutionTerminalReason::ConnectionLost);
@@ -1711,26 +1760,92 @@ where
         if notification.method != "notifications/cancelled" {
             return Ok(false);
         }
-        let Some(params) = notification.params.clone() else {
+        let era = match state.result_peer_era {
+            ResultPeerEra::Legacy => ProtocolEra::Legacy2024,
+            ResultPeerEra::Modern => ProtocolEra::Modern2026,
+        };
+        let Ok(cancellation) =
+            CancellationWireMessage::decode(era, CancellationSender::Server, notification)
+        else {
             return Ok(true);
         };
-        let Ok(cancelled) = serde_json::from_value::<CancelledParams>(params) else {
-            return Ok(true);
-        };
-        let request_id = cancelled.request_id;
-        if state.pending.contains_key(&request_id) {
-            self.cancel_pending_without_notification_locked(
-                cx,
-                state,
-                &request_id,
-                ExecutionTerminalReason::PeerSubscriptionTeardown,
-            )?;
-        } else if state.pending_reverse_request_ids.remove(&request_id) {
-            state
-                .reverse_requests
-                .retain(|request| request.id.as_ref() != Some(&request_id));
+        match cancellation {
+            CancellationWireMessage::Legacy2024 { params, .. } => {
+                let owned_request_id = state
+                    .pending_reverse_request_ids
+                    .iter()
+                    .find(|request_id| request_id.correlates_with(&params.request_id))
+                    .cloned();
+                if let Some(owned_request_id) = owned_request_id {
+                    state.pending_reverse_request_ids.remove(&owned_request_id);
+                    state.reverse_requests.retain(|request| {
+                        request
+                            .id
+                            .as_ref()
+                            .is_none_or(|request_id| !request_id.correlates_with(&owned_request_id))
+                    });
+                }
+            }
+            CancellationWireMessage::Modern2026 { params, .. } => {
+                if let Some(metadata_subscription_id) = params
+                    .meta
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                    .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+                    && !metadata_subscription_id.correlates_with(&params.request_id)
+                {
+                    return Ok(true);
+                }
+                let active_subscription_id =
+                    state.pending.iter().find_map(|(request_id, pending)| {
+                        (pending.method == SUBSCRIPTIONS_LISTEN
+                            && request_id.correlates_with(&params.request_id))
+                        .then(|| request_id.clone())
+                    });
+                if let Some(active_subscription_id) = active_subscription_id {
+                    self.cancel_pending_without_notification_locked(
+                        cx,
+                        state,
+                        &active_subscription_id,
+                        ExecutionTerminalReason::PeerSubscriptionTeardown,
+                    )?;
+                }
+            }
         }
         Ok(true)
+    }
+
+    fn cancellation_control_message(
+        &self,
+        state: &ExecutorState<T>,
+        request_id: &RequestId,
+    ) -> McpResult<JsonRpcMessage> {
+        let cancellation = match state.result_peer_era {
+            ResultPeerEra::Legacy => CancellationWireMessage::Legacy2024 {
+                sender: CancellationSender::Client,
+                params: CancelledParams {
+                    request_id: request_id.clone(),
+                    reason: None,
+                },
+            },
+            ResultPeerEra::Modern => CancellationWireMessage::Modern2026 {
+                sender: CancellationSender::Client,
+                params: FinalCancelledNotificationParams {
+                    request_id: request_id.clone(),
+                    reason: None,
+                    meta: None,
+                    additional: Default::default(),
+                },
+            },
+        };
+        cancellation
+            .encode()
+            .map(JsonRpcMessage::Request)
+            .map_err(|error| {
+                McpError::invalid_params(format!(
+                    "Invalid cancellation control parameters: {error}"
+                ))
+            })
     }
 
     fn route_task_subscription_acknowledgement_locked(
@@ -1759,10 +1874,15 @@ where
         else {
             return Ok(false);
         };
-        let Some(pending) = state.pending.get(&subscription_id) else {
+        let Some((owned_subscription_id, generation)) = state
+            .pending
+            .iter()
+            .find(|(request_id, _)| request_id.correlates_with(&subscription_id))
+            .map(|(request_id, pending)| (request_id.clone(), pending.record.execution_generation))
+        else {
             return Ok(false);
         };
-        let key = (subscription_id.clone(), pending.record.execution_generation);
+        let key = (owned_subscription_id, generation);
         let Some(subscription) = state.task_subscriptions.get(&key) else {
             return Ok(false);
         };
@@ -1811,10 +1931,15 @@ where
         else {
             return Ok(false);
         };
-        let Some(pending) = state.pending.get(&subscription_id) else {
+        let Some((owned_subscription_id, generation)) = state
+            .pending
+            .iter()
+            .find(|(request_id, _)| request_id.correlates_with(&subscription_id))
+            .map(|(request_id, pending)| (request_id.clone(), pending.record.execution_generation))
+        else {
             return Ok(false);
         };
-        let key = (subscription_id.clone(), pending.record.execution_generation);
+        let key = (owned_subscription_id, generation);
         let Some(subscription) = state.task_subscriptions.get(&key) else {
             return Ok(false);
         };
@@ -2676,9 +2801,15 @@ mod tests {
             ExecutionTerminalReason::AbsoluteTimeout,
         );
 
-        let subscription = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let subscription = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
         let mut subscribed = subscription
-            .execute(&cx, request(46))
+            .execute(
+                &cx,
+                JsonRpcRequest::new(SUBSCRIPTIONS_LISTEN, Some(serde_json::json!({})), 46),
+            )
             .expect("subscription-owned request commits");
         subscription
             .accept_subscription_teardown(&cx, &mut subscribed)
@@ -2747,6 +2878,64 @@ mod tests {
         assert_eq!(executor.take_notifications().len(), 1);
         assert!(executor.terminal_records().is_empty());
         assert!(executor.take_cancellation_events().is_empty());
+    }
+
+    #[test]
+    fn modern_executor_cancellation_omits_optional_final_metadata() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute(&cx, request(47))
+            .expect("modern request commits before cancellation");
+
+        executor
+            .cancel(&cx, &mut execution)
+            .expect("final cancellation needs no synthesized metadata");
+
+        let state = executor.state.borrow();
+        assert_eq!(state.transport.sent.len(), 2);
+        let JsonRpcMessage::Request(cancellation) = &state.transport.sent[1] else {
+            panic!("cancellation is a JSON-RPC notification");
+        };
+        assert!(cancellation.is_notification());
+        assert_eq!(cancellation.method, "notifications/cancelled");
+        let params = cancellation
+            .params
+            .as_ref()
+            .expect("final cancellation carries parameters");
+        assert_eq!(params.get("requestId"), Some(&serde_json::json!(47)));
+        assert!(params.get("_meta").is_none());
+        assert!(params.get("awaitCleanup").is_none());
+    }
+
+    #[test]
+    fn malformed_modern_peer_cancellation_leaves_owner_state_unchanged() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/cancelled",
+                Some(serde_json::json!({"reason": "missing request ID"})),
+            )))]),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute(&cx, request(48))
+            .expect("baseline modern request commits");
+        let pending_before = executor.pending_records();
+
+        executor
+            .drive(&cx)
+            .expect("invalid peer cancellation is ignored without terminating the client");
+        assert_eq!(executor.pending_records(), pending_before);
+        assert!(executor.terminal_records().is_empty());
+        assert!(executor.take_cancellation_events().is_empty());
+        assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+        executor
+            .cancel(&cx, &mut execution)
+            .expect("the still-live owner remains locally cancellable");
     }
 
     #[test]
@@ -2824,37 +3013,29 @@ mod tests {
         );
         assert_eq!(executor.state.borrow().transport.sent.len(), 2);
 
-        let cancelled = RequestExecutor::new(ScriptedTransport::new([Ok(
-            JsonRpcMessage::Request(JsonRpcRequest::notification(
-                "notifications/cancelled",
-                Some(serde_json::json!({"requestId": 43, "reason": "peer text"})),
-            )),
-        )]));
+        let cancelled = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([
+                Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/cancelled",
+                    Some(serde_json::json!({"requestId": 43, "reason": "peer text"})),
+                ))),
+                Ok(response(43, serde_json::json!({}))),
+            ]),
+            ResultPeerEra::Modern,
+        );
         let mut cancelled_execution = cancelled
             .execute(&cx, request(43))
             .expect("request commits before peer cancellation");
+        let pending_before = cancelled.pending_records();
         cancelled
             .drive(&cx)
-            .expect("valid peer cancellation remains a local transition");
-        assert_eq!(
-            cancelled
-                .wait(&cx, &mut cancelled_execution)
-                .expect_err("peer cancellation releases only the matching owner")
-                .code,
-            McpErrorCode::RequestCancelled,
-        );
+            .expect("server cancellation for a non-subscription is ignored");
+        assert_eq!(cancelled.pending_records(), pending_before);
+        cancelled
+            .wait(&cx, &mut cancelled_execution)
+            .expect("the ordinary request remains owned by its terminal response");
         assert_eq!(cancelled.state.borrow().transport.sent.len(), 1);
-        assert_eq!(
-            cancelled.take_cancellation_events(),
-            vec![CancellationRequested {
-                request_id: RequestId::Number(43),
-                reason: ExecutionTerminalReason::PeerSubscriptionTeardown,
-            }],
-        );
-        assert_eq!(
-            cancelled.terminal_records()[0].cancellation_transport_attempts,
-            0
-        );
+        assert!(cancelled.take_cancellation_events().is_empty());
         assert!(cancelled.take_notifications().is_empty());
     }
 
