@@ -188,6 +188,77 @@ pub struct FinalListParams {
     pub exclude_tags: Option<Vec<String>>,
 }
 
+/// Wire presence of an optional final request `arguments` member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalArguments<T> {
+    /// The `arguments` member was not present on the wire.
+    Absent,
+    /// The member was present with the explicit JSON value `null`.
+    ExplicitNull,
+    /// The member was present with its admitted typed value.
+    Value(T),
+}
+
+impl<T> FinalArguments<T> {
+    /// Returns whether the arguments member was absent.
+    #[must_use]
+    pub const fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    /// Returns whether the arguments member was explicitly `null`.
+    #[must_use]
+    pub const fn is_explicit_null(&self) -> bool {
+        matches!(self, Self::ExplicitNull)
+    }
+
+    /// Borrows the admitted argument value, if one was present.
+    #[must_use]
+    pub const fn as_value(&self) -> Option<&T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Absent | Self::ExplicitNull => None,
+        }
+    }
+
+    /// Consumes the presence marker and returns its admitted value.
+    #[must_use]
+    pub fn into_value(self) -> Option<T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Absent | Self::ExplicitNull => None,
+        }
+    }
+}
+
+impl<T> Default for FinalArguments<T> {
+    fn default() -> Self {
+        Self::Absent
+    }
+}
+
+impl<T: Serialize> Serialize for FinalArguments<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Absent | Self::ExplicitNull => serializer.serialize_none(),
+            Self::Value(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for FinalArguments<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer)
+            .map(|value| value.map_or(Self::ExplicitNull, Self::Value))
+    }
+}
+
 /// Final `tools/call` request parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -200,10 +271,10 @@ pub struct FinalCallToolParams {
     /// Optional method-owned tool arguments.
     #[serde(
         default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_json_object"
+        skip_serializing_if = "FinalArguments::is_absent",
+        deserialize_with = "deserialize_final_json_object_arguments"
     )]
-    pub arguments: Option<Value>,
+    pub arguments: FinalArguments<Value>,
     /// Optional replies to embedded final input requests.
     #[serde(
         rename = "inputResponses",
@@ -255,8 +326,8 @@ pub struct FinalGetPromptParams {
     /// Name of the selected prompt.
     pub name: String,
     /// Optional prompt arguments.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "FinalArguments::is_absent")]
+    pub arguments: FinalArguments<BTreeMap<String, String>>,
     /// Optional replies to embedded final input requests.
     #[serde(
         rename = "inputResponses",
@@ -273,15 +344,17 @@ pub struct FinalGetPromptParams {
     pub request_state: Option<String>,
 }
 
-fn deserialize_optional_json_object<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+fn deserialize_final_json_object_arguments<'de, D>(
+    deserializer: D,
+) -> Result<FinalArguments<Value>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<Value>::deserialize(deserializer)?;
-    if value.as_ref().is_some_and(|value| !value.is_object()) {
+    let arguments = FinalArguments::<Value>::deserialize(deserializer)?;
+    if arguments.as_value().is_some_and(|value| !value.is_object()) {
         return Err(serde::de::Error::custom("arguments must be an object"));
     }
-    Ok(value)
+    Ok(arguments)
 }
 
 /// Exact legacy reference accepted by `completion/complete`.
@@ -2097,6 +2170,50 @@ impl CoreRequest {
             Self::Legacy(request) => request.decode_result(&input).map(CoreResult::Legacy),
             Self::Final(request) => request
                 .decode_result(&input, Some(response_id))
+                .map(CoreResult::Final),
+        }
+    }
+
+    /// Decodes a successful JSON-RPC response from its admitted result source.
+    ///
+    /// Unlike [`Self::decode_response`], this path does not serialize the
+    /// response's [`Value`] again. The caller supplies the exact source JSON
+    /// retained while the response frame was admitted, preserving object
+    /// member order and number lexemes for the lossless result algebra. The
+    /// parsed value must still equal the response's typed result so source from
+    /// a different response cannot be attached accidentally.
+    pub fn decode_response_result(
+        &self,
+        response: &JsonRpcResponse,
+        result_source: &str,
+    ) -> Result<CoreResult, CoreDispatchError> {
+        let Some(response_id) = response.id.as_ref() else {
+            return Err(CoreDispatchError::InvalidResult {
+                era: self.era(),
+                method: self.method(),
+            });
+        };
+        let Some(result) = response.result.as_ref() else {
+            return Err(CoreDispatchError::InvalidResult {
+                era: self.era(),
+                method: self.method(),
+            });
+        };
+        let admitted_value: Value =
+            serde_json::from_str(result_source).map_err(|_| CoreDispatchError::InvalidResult {
+                era: self.era(),
+                method: self.method(),
+            })?;
+        if &admitted_value != result {
+            return Err(CoreDispatchError::InvalidResult {
+                era: self.era(),
+                method: self.method(),
+            });
+        }
+        match self {
+            Self::Legacy(request) => request.decode_result(result_source).map(CoreResult::Legacy),
+            Self::Final(request) => request
+                .decode_result(result_source, Some(response_id))
                 .map(CoreResult::Final),
         }
     }
@@ -4792,6 +4909,72 @@ mod tests {
                 "{method} retains retry input responses and request state"
             );
         }
+    }
+
+    #[test]
+    fn final_arguments_preserve_absence_explicit_null_and_object_presence() {
+        let meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+
+        let tool_absent = serde_json::json!({"_meta": meta.clone(), "name": "weather"});
+        let CoreRequest::Final(FinalCoreRequest::ToolsCall(tool)) =
+            CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&tool_absent))
+                .expect("an absent final tool arguments member is admitted")
+        else {
+            panic!("tools/call selects its final request type");
+        };
+        assert!(tool.arguments.is_absent());
+        assert_eq!(
+            CoreRequest::Final(FinalCoreRequest::ToolsCall(tool))
+                .encode_params()
+                .expect("absent tool arguments encode")
+                .expect("tools/call has params"),
+            tool_absent,
+        );
+
+        let tool_null =
+            serde_json::json!({"_meta": meta.clone(), "name": "weather", "arguments": null});
+        let CoreRequest::Final(FinalCoreRequest::ToolsCall(tool)) =
+            CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&tool_null))
+                .expect("an explicit null reaches the final handler admission boundary")
+        else {
+            panic!("tools/call selects its final request type");
+        };
+        assert!(tool.arguments.is_explicit_null());
+        assert_eq!(
+            CoreRequest::Final(FinalCoreRequest::ToolsCall(tool))
+                .encode_params()
+                .expect("null tool arguments encode")
+                .expect("tools/call has params"),
+            tool_null,
+        );
+
+        let prompt_absent = serde_json::json!({"_meta": meta.clone(), "name": "summary"});
+        let CoreRequest::Final(FinalCoreRequest::PromptsGet(prompt)) =
+            CoreRequest::decode(ProtocolEra::Modern2026, PROMPTS_GET, Some(&prompt_absent))
+                .expect("an absent final prompt arguments member is admitted")
+        else {
+            panic!("prompts/get selects its final request type");
+        };
+        assert!(prompt.arguments.is_absent());
+
+        let prompt_null = serde_json::json!({"_meta": meta, "name": "summary", "arguments": null});
+        let CoreRequest::Final(FinalCoreRequest::PromptsGet(prompt)) =
+            CoreRequest::decode(ProtocolEra::Modern2026, PROMPTS_GET, Some(&prompt_null))
+                .expect("an explicit null prompt arguments member retains its presence")
+        else {
+            panic!("prompts/get selects its final request type");
+        };
+        assert!(prompt.arguments.is_explicit_null());
+        assert_eq!(
+            CoreRequest::Final(FinalCoreRequest::PromptsGet(prompt))
+                .encode_params()
+                .expect("null prompt arguments encode")
+                .expect("prompts/get has params"),
+            prompt_null,
+        );
     }
 
     #[test]

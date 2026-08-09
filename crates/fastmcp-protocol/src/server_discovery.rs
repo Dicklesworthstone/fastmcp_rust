@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use crate::common_types::OpenMetadata;
 use crate::{
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, ServerInfo,
-    protocol_version::FINAL_PROTOCOL_VERSION,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, ResultPeerDiagnostic,
+    ServerInfo, protocol_version::FINAL_PROTOCOL_VERSION,
 };
 
 /// The exact JSON-RPC method for final server discovery.
@@ -554,8 +554,8 @@ impl<'de> Deserialize<'de> for OptionalServerInstructions {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerDiscoverResult {
-    #[serde(rename = "resultType")]
-    result_type: String,
+    #[serde(rename = "resultType", skip_serializing_if = "Option::is_none")]
+    result_type: Option<String>,
     #[serde(rename = "supportedVersions")]
     supported_versions: Vec<String>,
     capabilities: ServerDiscoverCapabilities,
@@ -583,7 +583,7 @@ impl ServerDiscoverResult {
         cache_hints: DiscoveryCacheHints,
     ) -> Self {
         Self {
-            result_type: COMPLETE_DISCOVERY_RESULT_TYPE.to_owned(),
+            result_type: Some(COMPLETE_DISCOVERY_RESULT_TYPE.to_owned()),
             supported_versions: SERVER_DISCOVER_SUPPORTED_VERSIONS
                 .iter()
                 .map(|version| (*version).to_owned())
@@ -603,9 +603,30 @@ impl ServerDiscoverResult {
     }
 
     /// Returns the schema-open result discriminator received from the peer.
+    ///
+    /// An absent peer discriminator is exposed as the compatibility default
+    /// `complete`; [`Self::peer_diagnostic`] distinguishes that wire omission
+    /// from an explicitly emitted discriminator.
     #[must_use]
     pub fn result_type(&self) -> &str {
-        &self.result_type
+        self.result_type
+            .as_deref()
+            .unwrap_or(COMPLETE_DISCOVERY_RESULT_TYPE)
+    }
+
+    /// Returns bounded evidence for a final peer whose otherwise-valid
+    /// discovery result omitted its required `resultType` discriminator.
+    ///
+    /// The admitted object retains the omission when re-encoded. This avoids
+    /// rewriting captured peer evidence while local construction continues to
+    /// emit `resultType: "complete"` unconditionally.
+    #[must_use]
+    pub const fn peer_diagnostic(&self) -> Option<ResultPeerDiagnostic> {
+        if self.result_type.is_none() {
+            Some(ResultPeerDiagnostic::ModernMissingResultType)
+        } else {
+            None
+        }
     }
 
     /// Returns the derived capability shape.
@@ -636,8 +657,8 @@ impl ServerDiscoverResult {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerDiscoverResultWire {
-    #[serde(rename = "resultType")]
-    result_type: String,
+    #[serde(rename = "resultType", default)]
+    result_type: OptionalDiscoveryResultType,
     #[serde(rename = "supportedVersions")]
     supported_versions: Vec<String>,
     capabilities: ServerDiscoverCapabilities,
@@ -653,6 +674,24 @@ struct ServerDiscoverResultWire {
     extras: BTreeMap<String, Value>,
 }
 
+/// Presence-aware peer discriminator.
+///
+/// `Option<String>` alone would conflate explicit `null` with absence. This
+/// wrapper is constructed only when the member is present, so `null` and every
+/// non-string JSON value fail `String` deserialization while true absence uses
+/// `Default` and selects the compatibility rule.
+#[derive(Default)]
+struct OptionalDiscoveryResultType(Option<String>);
+
+impl<'de> Deserialize<'de> for OptionalDiscoveryResultType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(|result_type| Self(Some(result_type)))
+    }
+}
+
 impl<'de> Deserialize<'de> for ServerDiscoverResult {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -660,7 +699,7 @@ impl<'de> Deserialize<'de> for ServerDiscoverResult {
     {
         let wire = ServerDiscoverResultWire::deserialize(deserializer)?;
         Ok(Self {
-            result_type: wire.result_type,
+            result_type: wire.result_type.0,
             supported_versions: wire.supported_versions,
             capabilities: wire.capabilities,
             metadata: wire.metadata,
@@ -748,9 +787,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        DiscoveryCacheHints, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
-        ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
-        ServerDiscoverResult, ServerInfo, ServerInstructions,
+        DiscoveryCacheHints, ResultPeerDiagnostic, SERVER_DISCOVER_METHOD,
+        SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior, ServerBehaviorRegistry,
+        ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult, ServerInfo,
+        ServerInstructions,
     };
 
     fn fully_installed_capabilities() -> ServerDiscoverCapabilities {
@@ -918,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn srv_02_b_planted_negative() {
+    fn server_discover_missing_result_type_defaults_complete_with_diagnostic() {
         let admitted = ServerDiscoverResult::new(
             fully_installed_capabilities(),
             ServerInfo {
@@ -937,14 +977,52 @@ mod tests {
             .expect("the discovery result is an object")
             .remove("resultType");
 
-        assert!(
-            serde_json::from_value::<ServerDiscoverResult>(missing_result_type).is_err(),
-            "removing only required resultType rejects the final discovery result"
+        let decoded = serde_json::from_value::<ServerDiscoverResult>(missing_result_type.clone())
+            .expect("an otherwise-valid omitted discriminator uses the client compatibility rule");
+        assert_eq!(decoded.result_type(), "complete");
+        assert_eq!(
+            decoded.peer_diagnostic(),
+            Some(ResultPeerDiagnostic::ModernMissingResultType)
+        );
+        assert_eq!(
+            serde_json::to_value(decoded).expect("compatibility discovery re-encodes"),
+            missing_result_type,
+            "captured peer evidence must not gain a synthesized discriminator"
         );
         assert_eq!(
             serde_json::to_vec(&admitted).expect("the admitted result still encodes"),
             unchanged_before,
             "rejecting the one-field variant cannot mutate locally admitted state"
+        );
+    }
+
+    #[test]
+    fn srv_02_b_planted_negative() {
+        let admitted = ServerDiscoverResult::new(
+            fully_installed_capabilities(),
+            ServerInfo {
+                name: "contract-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let unchanged_before =
+            serde_json::to_vec(&admitted).expect("the admitted result has a stable wire image");
+        let admitted_wire = serde_json::to_value(&admitted).expect("the admitted result encodes");
+
+        for planted_result_type in [Value::Null, json!(false), json!({"complete": true})] {
+            let mut planted = admitted_wire.clone();
+            planted["resultType"] = planted_result_type;
+            assert!(
+                serde_json::from_value::<ServerDiscoverResult>(planted).is_err(),
+                "explicit null and wrong JSON kinds never use the absence compatibility rule"
+            );
+        }
+        assert_eq!(
+            serde_json::to_vec(&admitted).expect("the admitted result still encodes"),
+            unchanged_before,
+            "rejecting one-field variants cannot mutate locally admitted state"
         );
     }
 

@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use fastmcp_protocol::{
-    DiscoveryCacheHints, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
-    ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
-    ServerDiscoverResult, ServerInfo, ServerInstructions,
+    DiscoveryCacheHints, ResultPeerDiagnostic, SERVER_DISCOVER_METHOD,
+    SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior, ServerBehaviorRegistry,
+    ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult, ServerInfo,
+    ServerInstructions,
 };
 use serde_json::{Value, json};
 
@@ -114,15 +115,37 @@ fn srv_02_a_planted_negative() {
         .expect("baseline result is an object")
         .remove("resultType");
 
-    let rejection = serde_json::from_value::<ServerDiscoverResult>(planted);
-
-    assert!(
-        rejection.is_err(),
-        "removing only the required resultType field rejects the discovery result"
+    let compatibility = serde_json::from_value::<ServerDiscoverResult>(planted.clone())
+        .expect("an otherwise-valid absent resultType defaults to complete at client ingestion");
+    assert_eq!(compatibility.result_type(), "complete");
+    assert_eq!(
+        compatibility.peer_diagnostic(),
+        Some(ResultPeerDiagnostic::ModernMissingResultType)
+    );
+    assert_eq!(
+        serde_json::to_value(compatibility).expect("compatibility result re-encodes"),
+        planted,
+        "captured peer evidence must retain the discriminator omission"
     );
     assert_eq!(
         serde_json::to_vec(&admitted).expect("admitted state still encodes"),
         unchanged_before,
-        "rejected wire input cannot mutate an already-admitted result"
+        "compatibility admission cannot mutate an already-authored result"
+    );
+
+    let mut explicit_null: Value =
+        serde_json::to_value(&admitted).expect("baseline result re-encodes");
+    explicit_null["resultType"] = Value::Null;
+    assert!(
+        serde_json::from_value::<ServerDiscoverResult>(explicit_null).is_err(),
+        "explicit null is not the absent-discriminator compatibility case"
+    );
+
+    let mut wrong_type: Value =
+        serde_json::to_value(&admitted).expect("baseline result re-encodes");
+    wrong_type["resultType"] = json!({ "complete": true });
+    assert!(
+        serde_json::from_value::<ServerDiscoverResult>(wrong_type).is_err(),
+        "a non-string discriminator is invalid rather than absent"
     );
 }

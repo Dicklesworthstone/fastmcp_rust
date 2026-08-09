@@ -7,6 +7,7 @@ use serde::de::Error as _;
 use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 /// The JSON-RPC version string. Used as a static reference to avoid allocations.
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -125,6 +126,76 @@ pub fn decode_strict_jsonrpc_message(
 ) -> Result<JsonRpcMessage, JsonRpcAdmissionError> {
     admit_raw_jsonrpc_document(bytes, document_byte_limit).map_err(JsonRpcAdmissionError::Raw)?;
     serde_json::from_slice(bytes).map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)
+}
+
+/// One strictly admitted JSON-RPC response paired with the exact source JSON
+/// of its result member.
+///
+/// `raw_result` is absent for an error response and present even when a success
+/// result is the explicit JSON value `null`. It is retained only for local
+/// method-specific result decoding; the public [`JsonRpcResponse`] remains
+/// unchanged and existing typed transport APIs keep their established shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonRpcResponseAdmission {
+    response: JsonRpcResponse,
+    raw_result: Option<String>,
+}
+
+impl JsonRpcResponseAdmission {
+    /// Returns the ordinary typed response.
+    #[must_use]
+    pub const fn response(&self) -> &JsonRpcResponse {
+        &self.response
+    }
+
+    /// Returns the exact result-member source JSON, including member order and
+    /// number lexemes, when the response is successful.
+    #[must_use]
+    pub fn raw_result(&self) -> Option<&str> {
+        self.raw_result.as_deref()
+    }
+
+    /// Splits this admission into its typed response and exact result source.
+    #[must_use]
+    pub fn into_parts(self) -> (JsonRpcResponse, Option<String>) {
+        (self.response, self.raw_result)
+    }
+}
+
+/// Strictly decodes one JSON-RPC response while retaining its exact result
+/// member source for the final result algebra.
+///
+/// This applies the same bounded raw-document admission as
+/// [`decode_strict_jsonrpc_message`]. Callers that already decoded a frame may
+/// compare the returned typed response with that first decode before attaching
+/// `raw_result` to its correlation owner.
+pub fn decode_strict_jsonrpc_response(
+    bytes: &[u8],
+    document_byte_limit: usize,
+) -> Result<JsonRpcResponseAdmission, JsonRpcAdmissionError> {
+    admit_raw_jsonrpc_document(bytes, document_byte_limit).map_err(JsonRpcAdmissionError::Raw)?;
+    let wire =
+        JsonRpcResponseRawWire::deserialize(&mut serde_json::Deserializer::from_slice(bytes))
+            .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+    let raw_result = wire.result.map(|result| result.get().to_owned());
+    let result = raw_result
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+    let response = JsonRpcResponse {
+        jsonrpc: wire.jsonrpc,
+        result,
+        error: wire.error,
+        id: wire.id,
+    };
+    response
+        .validate()
+        .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+    Ok(JsonRpcResponseAdmission {
+        response,
+        raw_result,
+    })
 }
 
 struct RawJsonScanner<'a> {
@@ -994,6 +1065,28 @@ where
     JsonRpcError::deserialize(deserializer).map(Some)
 }
 
+fn deserialize_raw_response_result<'de, D>(
+    deserializer: D,
+) -> Result<Option<Box<RawValue>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Box::<RawValue>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonRpcResponseRawWire {
+    #[serde(deserialize_with = "deserialize_jsonrpc_version")]
+    jsonrpc: Cow<'static, str>,
+    #[serde(default, deserialize_with = "deserialize_raw_response_result")]
+    result: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "deserialize_response_error")]
+    error: Option<JsonRpcError>,
+    #[serde(default, deserialize_with = "deserialize_request_id")]
+    id: Option<RequestId>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JsonRpcResponseWire {
@@ -1226,6 +1319,31 @@ mod tests {
             ),
             RawJsonRpcDisposition::ClientSharedChannelFailure
         ));
+    }
+
+    #[test]
+    fn strict_response_admission_retains_exact_result_source() {
+        let frame = br#"{"jsonrpc":"2.0","result":{"zeta":1.20e+4,"alpha":{"second":2,"first":1},"middle":null},"id":73}"#;
+        let admission = decode_strict_jsonrpc_response(frame, 4 * 1024)
+            .expect("strict response admission accepts the bounded frame");
+        assert_eq!(admission.response().id, Some(RequestId::Number(73)));
+        assert_eq!(
+            admission.raw_result(),
+            Some(r#"{"zeta":1.20e+4,"alpha":{"second":2,"first":1},"middle":null}"#),
+            "the exact result substring retains top-level and nested member order plus number lexemes"
+        );
+
+        let explicit_null =
+            decode_strict_jsonrpc_response(br#"{"jsonrpc":"2.0","result":null,"id":74}"#, 4 * 1024)
+                .expect("an explicit null success remains present");
+        assert_eq!(explicit_null.raw_result(), Some("null"));
+
+        let error = decode_strict_jsonrpc_response(
+            br#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"missing"},"id":75}"#,
+            4 * 1024,
+        )
+        .expect("an error response has no result source");
+        assert!(error.raw_result().is_none());
     }
 
     #[test]

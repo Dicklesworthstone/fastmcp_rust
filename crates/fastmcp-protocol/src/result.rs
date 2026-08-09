@@ -1654,9 +1654,7 @@ mod tests {
             ResultPeerEra::Modern,
             &CoreResultDiscriminatorPolicy,
         )
-        .expect(
-            "a modern peer omission follows the pinned complete-result compatibility rule",
-        );
+        .expect("a modern peer omission follows the pinned complete-result compatibility rule");
         assert_eq!(
             diagnostic,
             Some(ResultPeerDiagnostic::ModernMissingResultType)

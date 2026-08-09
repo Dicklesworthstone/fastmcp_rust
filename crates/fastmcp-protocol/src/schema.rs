@@ -37,8 +37,9 @@ pub const MAX_SCHEMA_INSTANCE_DEPTH: usize = 64;
 /// Maximum UTF-8 bytes in one instance string or object member name.
 pub const MAX_SCHEMA_INSTANCE_STRING_BYTES: usize = 64 * 1024;
 
-/// Maximum schema applications performed by one validation call, including
-/// local-reference, composition, and conditional branch evaluation.
+/// Maximum work units performed by one validation call, including schema
+/// applications, branch probes, regular-expression compilation and matching,
+/// and object-property annotation bookkeeping.
 pub const MAX_SCHEMA_VALIDATION_WORK: usize = 4_096;
 
 /// Maximum local `$ref` hops on a single validation path.
@@ -812,6 +813,32 @@ impl<'a> ValidationContext<'a> {
     }
 }
 
+fn consume_validation_work(
+    context: &mut ValidationContext<'_>,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) -> bool {
+    if !context.enforce_unevaluated_properties {
+        return true;
+    }
+    if context.consume_work() {
+        true
+    } else {
+        push_error(errors, path, "schema validation work limit exceeded");
+        false
+    }
+}
+
+fn charged_regex_is_match(
+    pattern: &Regex,
+    candidate: &str,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'_>,
+) -> Option<bool> {
+    consume_validation_work(context, path, errors).then(|| pattern.is_match(candidate))
+}
+
 fn validate_instance_bounds(
     value: &Value,
     path: &str,
@@ -963,7 +990,7 @@ fn validate_internal(
             validate_array(schema_obj, arr, path, errors, context);
         }
         Value::String(s) => {
-            validate_string(schema_obj, s, path, errors);
+            validate_string(schema_obj, s, path, errors, context);
         }
         Value::Number(n) => {
             validate_number(schema_obj, n, path, errors);
@@ -1169,6 +1196,9 @@ fn branch_is_valid(
     path: &str,
     context: &mut ValidationContext<'_>,
 ) -> bool {
+    if context.enforce_unevaluated_properties && !context.consume_work() {
+        return false;
+    }
     let mut branch_errors = Vec::new();
     validate_internal(schema, value, path, &mut branch_errors, context);
     branch_errors.is_empty()
@@ -1239,7 +1269,10 @@ fn validate_object(
     }
 
     let properties = schema.get("properties").and_then(Value::as_object);
-    let patterns = compile_pattern_properties(schema, path, errors);
+    let patterns = compile_pattern_properties(schema, path, errors, context);
+    if context.work_exhausted {
+        return;
+    }
 
     for (key, value) in obj {
         let property_path = format!("{path}.{key}");
@@ -1247,7 +1280,12 @@ fn validate_object(
             validate_internal(property_schema, value, &property_path, errors, context);
         }
         for (pattern, pattern_schema) in &patterns {
-            if pattern.is_match(key) {
+            let Some(matches) =
+                charged_regex_is_match(pattern, key, &property_path, errors, context)
+            else {
+                return;
+            };
+            if matches {
                 validate_internal(pattern_schema, value, &property_path, errors, context);
             }
         }
@@ -1271,9 +1309,20 @@ fn validate_object(
     // Check additionalProperties after applying both named and pattern properties.
     if let Some(additional) = schema.get("additionalProperties") {
         for (key, value) in obj {
+            let mut matches_pattern = false;
+            for (pattern, _) in &patterns {
+                let Some(matches) = charged_regex_is_match(pattern, key, path, errors, context)
+                else {
+                    return;
+                };
+                if matches {
+                    matches_pattern = true;
+                    break;
+                }
+            }
             let is_defined_property = properties
                 .is_some_and(|properties| properties.contains_key(key))
-                || patterns.iter().any(|(pattern, _)| pattern.is_match(key));
+                || matches_pattern;
             if !is_defined_property {
                 match additional {
                     Value::Bool(false) => {
@@ -1351,6 +1400,9 @@ fn validate_unevaluated_properties(
     );
 
     for (key, member) in obj {
+        if !consume_validation_work(context, path, errors) {
+            return;
+        }
         if !evaluated.contains(key) {
             validate_internal(
                 unevaluated_schema,
@@ -1384,17 +1436,37 @@ fn mark_evaluated_object_properties(
     }
 
     let properties = schema.get("properties").and_then(Value::as_object);
-    let patterns = compile_pattern_properties(schema, path, errors);
+    let patterns = compile_pattern_properties(schema, path, errors, context);
+    if context.work_exhausted {
+        return;
+    }
     for key in obj.keys() {
+        if !consume_validation_work(context, path, errors) {
+            return;
+        }
         let matched_property = properties.is_some_and(|properties| properties.contains_key(key));
-        let matched_pattern = patterns.iter().any(|(pattern, _)| pattern.is_match(key));
+        let mut matched_pattern = false;
+        for (pattern, _) in &patterns {
+            let Some(matches) = charged_regex_is_match(pattern, key, path, errors, context) else {
+                return;
+            };
+            if matches {
+                matched_pattern = true;
+                break;
+            }
+        }
         if matched_property || matched_pattern || schema.contains_key("additionalProperties") {
             evaluated.insert(key.clone());
         }
     }
 
     if include_unevaluated_properties && schema.contains_key("unevaluatedProperties") {
-        evaluated.extend(obj.keys().cloned());
+        for key in obj.keys() {
+            if !consume_validation_work(context, path, errors) {
+                return;
+            }
+            evaluated.insert(key.clone());
+        }
     }
 
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
@@ -1406,14 +1478,7 @@ fn mark_evaluated_object_properties(
                 Ok(target) if branch_is_valid(target, value, path, context) => {
                     if let Some(target) = target.as_object() {
                         mark_evaluated_object_properties(
-                            target,
-                            value,
-                            obj,
-                            path,
-                            true,
-                            evaluated,
-                            errors,
-                            context,
+                            target, value, obj, path, true, evaluated, errors, context,
                         );
                     }
                 }
@@ -1456,39 +1521,30 @@ fn mark_evaluated_object_properties(
             .iter()
             .filter(|subschema| branch_is_valid(subschema, value, path, context))
             .collect();
-        if matching.len() == 1 && let Some(subschema) = matching[0].as_object() {
+        if matching.len() == 1
+            && let Some(subschema) = matching[0].as_object()
+        {
             mark_evaluated_object_properties(
-                subschema,
-                value,
-                obj,
-                path,
-                true,
-                evaluated,
-                errors,
-                context,
+                subschema, value, obj, path, true, evaluated, errors, context,
             );
         }
     }
 
     if let Some(condition) = schema.get("if") {
-        let branch = if branch_is_valid(condition, value, path, context) {
-            "then"
-        } else {
-            "else"
-        };
+        let condition_matched = branch_is_valid(condition, value, path, context);
+        if condition_matched && let Some(condition) = condition.as_object() {
+            mark_evaluated_object_properties(
+                condition, value, obj, path, true, evaluated, errors, context,
+            );
+        }
+
+        let branch = if condition_matched { "then" } else { "else" };
         if let Some(subschema) = schema.get(branch)
             && branch_is_valid(subschema, value, path, context)
             && let Some(subschema) = subschema.as_object()
         {
             mark_evaluated_object_properties(
-                subschema,
-                value,
-                obj,
-                path,
-                true,
-                evaluated,
-                errors,
-                context,
+                subschema, value, obj, path, true, evaluated, errors, context,
             );
         }
     }
@@ -1513,14 +1569,7 @@ fn mark_composition_evaluated_properties(
             && let Some(subschema) = subschema.as_object()
         {
             mark_evaluated_object_properties(
-                subschema,
-                value,
-                obj,
-                path,
-                true,
-                evaluated,
-                errors,
-                context,
+                subschema, value, obj, path, true, evaluated, errors, context,
             );
         }
     }
@@ -1530,6 +1579,7 @@ fn compile_pattern_properties<'a>(
     schema: &'a serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'_>,
 ) -> Vec<(Regex, &'a Value)> {
     let Some(pattern_properties) = schema.get("patternProperties").and_then(Value::as_object)
     else {
@@ -1542,6 +1592,9 @@ fn compile_pattern_properties<'a>(
 
     let mut patterns = Vec::with_capacity(pattern_properties.len());
     for (source, pattern_schema) in pattern_properties {
+        if !consume_validation_work(context, path, errors) {
+            break;
+        }
         if source.len() > MAX_PATTERN_PROPERTY_BYTES {
             push_error(errors, path, "patternProperties pattern exceeds byte limit");
             continue;
@@ -1706,6 +1759,7 @@ fn validate_string(
     s: &str,
     path: &str,
     errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'_>,
 ) {
     // Check minLength/maxLength
     let len = s.chars().count();
@@ -1730,9 +1784,15 @@ fn validate_string(
 
     // Check pattern (JSON Schema semantics: pattern matches if any substring matches).
     if let Some(pattern) = schema.get("pattern").and_then(serde_json::Value::as_str) {
+        if !consume_validation_work(context, path, errors) {
+            return;
+        }
         match Regex::new(pattern) {
             Ok(re) => {
-                if !re.is_match(s) {
+                let Some(matches) = charged_regex_is_match(&re, s, path, errors, context) else {
+                    return;
+                };
+                if !matches {
                     push_error(
                         errors,
                         path,
@@ -2272,9 +2332,9 @@ mod tests {
         let mut planted = accepted.clone();
         planted["unexpected"] = json!(true);
 
-        let errors = schema.validate(&planted).expect_err(
-            "adding only an unevaluated property must be rejected by the false schema",
-        );
+        let errors = schema
+            .validate(&planted)
+            .expect_err("adding only an unevaluated property must be rejected by the false schema");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, "root.unexpected");
         assert_eq!(errors[0].message, "schema rejects all values");
@@ -2291,6 +2351,357 @@ mod tests {
 
         assert!(validate(&legacy_schema, &legacy_instance).is_ok());
         assert_eq!(legacy_instance, json!({"legacy": true}));
+    }
+
+    fn assert_admitted_annotations_accept_only_evaluated_members(schema: Value, accepted: Value) {
+        let schema = admit_final_schema(schema).expect("the bounded annotation schema admits");
+        schema
+            .validate(&accepted)
+            .expect("members annotated by successful applicators remain accepted");
+
+        let mut planted = accepted.clone();
+        planted
+            .as_object_mut()
+            .expect("the annotation fixture is an object")
+            .insert("unexpected".to_owned(), Value::Bool(true));
+        let errors = schema
+            .validate(&planted)
+            .expect_err("adding only an unevaluated member must reject");
+        assert!(errors.iter().any(|error| {
+            error.path == "root.unexpected" && error.message == "schema rejects all values"
+        }));
+        assert!(accepted.get("unexpected").is_none());
+    }
+
+    #[test]
+    fn admitted_ref_annotations_reach_unevaluated_properties() {
+        assert_admitted_annotations_accept_only_evaluated_members(
+            json!({
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "$defs": {
+                    "referenced": {
+                        "properties": {"viaRef": {"type": "integer"}},
+                        "required": ["viaRef"]
+                    }
+                },
+                "$ref": "#/$defs/referenced",
+                "unevaluatedProperties": false
+            }),
+            json!({"viaRef": 1}),
+        );
+    }
+
+    #[test]
+    fn admitted_all_of_annotations_reach_unevaluated_properties() {
+        assert_admitted_annotations_accept_only_evaluated_members(
+            json!({
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "allOf": [{
+                    "properties": {"viaAllOf": {"type": "integer"}},
+                    "required": ["viaAllOf"]
+                }],
+                "unevaluatedProperties": false
+            }),
+            json!({"viaAllOf": 1}),
+        );
+    }
+
+    #[test]
+    fn admitted_any_of_unions_all_successful_branch_annotations() {
+        assert_admitted_annotations_accept_only_evaluated_members(
+            json!({
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "anyOf": [
+                    {
+                        "properties": {"alpha": {"type": "integer"}},
+                        "required": ["alpha"]
+                    },
+                    {
+                        "properties": {"beta": {"type": "integer"}},
+                        "required": ["beta"]
+                    }
+                ],
+                "unevaluatedProperties": false
+            }),
+            json!({"alpha": 1, "beta": 2}),
+        );
+    }
+
+    #[test]
+    fn admitted_one_of_uses_only_the_unique_successful_branch_annotations() {
+        assert_admitted_annotations_accept_only_evaluated_members(
+            json!({
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "oneOf": [
+                    {
+                        "properties": {"alpha": {"type": "integer"}},
+                        "required": ["alpha"]
+                    },
+                    {
+                        "properties": {"beta": {"type": "integer"}},
+                        "required": ["beta"]
+                    }
+                ],
+                "unevaluatedProperties": false
+            }),
+            json!({"alpha": 1}),
+        );
+    }
+
+    #[test]
+    fn admitted_dependent_schema_annotations_reach_unevaluated_properties() {
+        assert_admitted_annotations_accept_only_evaluated_members(
+            json!({
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "properties": {"trigger": {"const": true}},
+                "required": ["trigger"],
+                "dependentSchemas": {
+                    "trigger": {
+                        "properties": {"payload": {"type": "string"}},
+                        "required": ["payload"]
+                    }
+                },
+                "unevaluatedProperties": false
+            }),
+            json!({"trigger": true, "payload": "ready"}),
+        );
+    }
+
+    #[test]
+    fn admitted_if_without_then_or_else_propagates_successful_annotations() {
+        assert_admitted_annotations_accept_only_evaluated_members(
+            json!({
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "if": {
+                    "properties": {"kind": {"const": "ready"}},
+                    "required": ["kind"]
+                },
+                "unevaluatedProperties": false
+            }),
+            json!({"kind": "ready"}),
+        );
+    }
+
+    #[test]
+    fn admitted_if_and_then_union_successful_annotations() {
+        assert_admitted_annotations_accept_only_evaluated_members(
+            json!({
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "if": {
+                    "properties": {"kind": {"const": "ready"}},
+                    "required": ["kind"]
+                },
+                "then": {
+                    "properties": {"payload": {"type": "string"}},
+                    "required": ["payload"]
+                },
+                "unevaluatedProperties": false
+            }),
+            json!({"kind": "ready", "payload": "complete"}),
+        );
+    }
+
+    #[test]
+    fn admitted_else_propagates_only_the_selected_branch_annotations() {
+        assert_admitted_annotations_accept_only_evaluated_members(
+            json!({
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "if": {
+                    "properties": {"kind": {"const": "primary"}},
+                    "required": ["kind"]
+                },
+                "else": {
+                    "properties": {
+                        "kind": {"const": "fallback"},
+                        "payload": {"type": "string"}
+                    },
+                    "required": ["kind", "payload"]
+                },
+                "unevaluatedProperties": false
+            }),
+            json!({"kind": "fallback", "payload": "complete"}),
+        );
+    }
+
+    #[test]
+    fn admitted_nested_unevaluated_properties_annotations_reach_outer_schema() {
+        assert_admitted_annotations_accept_only_evaluated_members(
+            json!({
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "allOf": [{
+                    "properties": {"nested": {"type": "string"}},
+                    "required": ["nested"],
+                    "unevaluatedProperties": false
+                }],
+                "unevaluatedProperties": false
+            }),
+            json!({"nested": "ready"}),
+        );
+    }
+
+    fn pattern_property_work_schema() -> AdmittedSchema {
+        let mut patterns = serde_json::Map::new();
+        for index in 0..MAX_PATTERN_PROPERTIES {
+            patterns.insert(format!("^never-{index}$"), Value::Bool(true));
+        }
+        admit_final_schema(json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "patternProperties": patterns
+        }))
+        .expect("the maximum bounded pattern family admits")
+    }
+
+    fn object_with_null_members(count: usize) -> Value {
+        let members: serde_json::Map<String, Value> = (0..count)
+            .map(|index| (format!("field-{index}"), Value::Null))
+            .collect();
+        Value::Object(members)
+    }
+
+    #[test]
+    fn admitted_pattern_compilation_and_key_matching_share_work_limit() {
+        let schema = pattern_property_work_schema();
+        let accepted = object_with_null_members(62);
+        schema
+            .validate(&accepted)
+            .expect("pattern compilation and 62 bounded key scans fit the work budget");
+
+        let planted = object_with_null_members(63);
+        let errors = schema
+            .validate(&planted)
+            .expect_err("adding one key must exceed the shared regex work budget");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message == "schema validation work limit exceeded")
+        );
+        assert_eq!(accepted.as_object().unwrap().len(), 62);
+    }
+
+    #[test]
+    fn raw_pattern_work_remains_legacy_while_admitted_final_is_bounded() {
+        let mut patterns = serde_json::Map::new();
+        for index in 0..MAX_PATTERN_PROPERTIES {
+            patterns.insert(format!("^never-{index}$"), Value::Bool(true));
+        }
+        let schema = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "patternProperties": patterns,
+            "additionalProperties": true
+        });
+        let instance = object_with_null_members(63);
+
+        validate(&schema, &instance)
+            .expect("raw validation preserves its legacy pattern-work behavior");
+        validate_strict(&schema, &instance)
+            .expect("raw strict validation preserves its legacy pattern-work behavior");
+
+        let admitted = admit_final_schema(schema).expect("the bounded final schema admits");
+        let errors = admitted
+            .validate(&instance)
+            .expect_err("admitted-final validation enforces the shared regex work budget");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message == "schema validation work limit exceeded")
+        );
+    }
+
+    fn named_property_annotation_work_schema(count: usize) -> AdmittedSchema {
+        let properties: serde_json::Map<String, Value> = (0..count)
+            .map(|index| (format!("field-{index}"), Value::Bool(true)))
+            .collect();
+        admit_final_schema(json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": properties,
+            "unevaluatedProperties": false
+        }))
+        .expect("the bounded named-property schema admits")
+    }
+
+    #[test]
+    fn admitted_key_annotation_bookkeeping_shares_work_limit() {
+        let accepted_schema = named_property_annotation_work_schema(1_364);
+        let accepted = object_with_null_members(1_364);
+        accepted_schema
+            .validate(&accepted)
+            .expect("1,364 property validations and annotations fit the work budget");
+
+        let planted_schema = named_property_annotation_work_schema(1_365);
+        let planted = object_with_null_members(1_365);
+        let errors = planted_schema
+            .validate(&planted)
+            .expect_err("adding one property must exceed the shared annotation work budget");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message == "schema validation work limit exceeded")
+        );
+        assert_eq!(accepted.as_object().unwrap().len(), 1_364);
+    }
+
+    fn repeated_pattern_work_schema(units: usize) -> AdmittedSchema {
+        let unit = json!({
+            "allOf": vec![
+                json!({"$ref": "#/$defs/matching-pattern"});
+                MAX_COMPOSITION_BRANCHES
+            ]
+        });
+        admit_final_schema(json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$defs": {
+                "matching-pattern": {"type": "string", "pattern": "^ready$"}
+            },
+            "allOf": vec![unit; units]
+        }))
+        .expect("the bounded repeated-pattern schema admits")
+    }
+
+    #[test]
+    fn admitted_string_pattern_compilation_and_matching_share_work_limit() {
+        repeated_pattern_work_schema(15)
+            .validate(&json!("ready"))
+            .expect("15 bounded repeated pattern units fit the work budget");
+
+        let errors = repeated_pattern_work_schema(16)
+            .validate(&json!("ready"))
+            .expect_err("adding one repeated pattern unit must exceed the shared work budget");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message == "schema validation work limit exceeded")
+        );
+    }
+
+    fn repeated_branch_probe_work_schema(units: usize) -> AdmittedSchema {
+        let mut branches = vec![Value::Bool(false); MAX_COMPOSITION_BRANCHES];
+        branches[0] = Value::Bool(true);
+        let unit = json!({"oneOf": branches});
+        admit_final_schema(json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "allOf": vec![unit; units],
+            "unevaluatedProperties": true
+        }))
+        .expect("the bounded repeated-branch schema admits")
+    }
+
+    #[test]
+    fn admitted_repeated_branch_probes_share_work_limit() {
+        repeated_branch_probe_work_schema(10)
+            .validate(&json!({}))
+            .expect("ten repeated branch-probe units fit the work budget");
+
+        let errors = repeated_branch_probe_work_schema(11)
+            .validate(&json!({}))
+            .expect_err("adding one repeated branch unit must exceed the shared work budget");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message == "schema validation work limit exceeded")
+        );
     }
 
     fn final_schema_format_schema() -> AdmittedSchema {
