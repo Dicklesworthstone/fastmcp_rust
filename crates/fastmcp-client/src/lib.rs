@@ -109,10 +109,10 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::Once;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once, mpsc};
 use std::time::{Duration, Instant};
 
 use asupersync::{Cx, channel::oneshot};
@@ -120,6 +120,8 @@ use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sh
 use fastmcp_protocol::common_types::{
     ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
+#[cfg(test)]
+use fastmcp_protocol::common_types::JsonInteger;
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, OFFICIAL_TASKS_RESULT_DISCRIMINATOR, official_tasks_empty_settings,
     register_official_tasks_extension,
@@ -144,8 +146,9 @@ use fastmcp_protocol::{
     ListTasksParams, ListTasksResult, ListToolsParams, LogLevel, LogMessageParams,
     PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, ReadResourceParams, RequestId,
     RequestMeta, Resource, ResourceTemplate, ServerCapabilities, ServerInfo, ServerNotification,
-    SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo, TaskResult,
-    TaskStatus, Tool, ToolAnnotations, decode_strict_jsonrpc_response, task_subscription_ids,
+    RootsCapability, SamplingCapability, SetLogLevelParams, SubmitTaskParams, SubmitTaskResult,
+    TaskId, TaskInfo, TaskResult, TaskStatus, Tool, ToolAnnotations,
+    decode_strict_jsonrpc_response, task_subscription_ids,
 };
 use fastmcp_protocol::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionDirection, ExtensionSettings,
@@ -160,23 +163,87 @@ use crate::session::resolve_mcp_apps_activation;
 /// The callback receives the progress value, optional total, and optional message.
 pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<&str>);
 
+/// Cancellation handle owned by one server-initiated reverse request.
+///
+/// The client marks this handle cancelled when an exact MCP 2024-11-05
+/// `notifications/cancelled` message names the callback's request ID. Reverse
+/// callbacks must check it at their own cancellation points and return without
+/// producing further effects when it is set.
+const REVERSE_CALLBACK_OPEN: u8 = 0;
+const REVERSE_CALLBACK_CANCELLED: u8 = 1;
+const REVERSE_CALLBACK_RESPONSE_SENT: u8 = 2;
+
+#[derive(Clone, Debug)]
+pub struct ReverseRequestCancellation(Arc<std::sync::atomic::AtomicU8>);
+
+impl ReverseRequestCancellation {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU8::new(
+            REVERSE_CALLBACK_OPEN,
+        )))
+    }
+
+    fn cancel(&self) {
+        let _ = self.0.compare_exchange(
+            REVERSE_CALLBACK_OPEN,
+            REVERSE_CALLBACK_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn is_open(&self) -> bool {
+        self.0.load(Ordering::Acquire) == REVERSE_CALLBACK_OPEN
+    }
+
+    fn record_response_sent(&self) {
+        let previous = self
+            .0
+            .compare_exchange(
+                REVERSE_CALLBACK_OPEN,
+                REVERSE_CALLBACK_RESPONSE_SENT,
+                Ordering::AcqRel,
+                Ordering::Acquire);
+        debug_assert!(
+            previous.is_ok(),
+            "only an elected open callback can record a response write"
+        );
+    }
+
+    /// Returns whether the server cancelled this reverse request.
+    #[must_use]
+    pub fn is_cancel_requested(&self) -> bool {
+        self.0.load(Ordering::Acquire) == REVERSE_CALLBACK_CANCELLED
+    }
+
+    /// Returns `RequestCancelled` when the server cancelled this request.
+    ///
+    /// This is the usual cooperative cancellation point for synchronous
+    /// callbacks that perform work in a loop.
+    pub fn checkpoint(&self) -> McpResult<()> {
+        if self.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+        Ok(())
+    }
+}
+
 /// Handler for a server-initiated `sampling/createMessage` request.
-pub type SamplingRequestHandler =
-    Box<dyn FnMut(CreateMessageParams) -> McpResult<CreateMessageResult> + Send>;
+pub type SamplingRequestHandler = Box<
+    dyn FnMut(ReverseRequestCancellation, CreateMessageParams) -> McpResult<CreateMessageResult>
+        + Send,
+>;
 
 /// Handler for a server-initiated `roots/list` request.
-pub type RootsRequestHandler = Box<dyn FnMut(ListRootsParams) -> McpResult<ListRootsResult> + Send>;
-
-/// Handler for a server-initiated `elicitation/create` request.
-pub type ElicitationRequestHandler =
-    Box<dyn FnMut(ElicitRequestParams) -> McpResult<ElicitResult> + Send>;
+pub type RootsRequestHandler = Box<
+    dyn FnMut(ReverseRequestCancellation, ListRootsParams) -> McpResult<ListRootsResult> + Send,
+>;
 
 /// Configurable handlers for reverse requests received from a live MCP server.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ReverseRequestHandlers {
-    sampling_create_message: Option<SamplingRequestHandler>,
-    roots_list: Option<RootsRequestHandler>,
-    elicitation_create: Option<ElicitationRequestHandler>,
+    sampling_create_message: Option<Arc<Mutex<SamplingRequestHandler>>>,
+    roots_list: Option<Arc<Mutex<RootsRequestHandler>>>,
 }
 
 impl ReverseRequestHandlers {
@@ -186,7 +253,6 @@ impl ReverseRequestHandlers {
         Self {
             sampling_create_message: None,
             roots_list: None,
-            elicitation_create: None,
         }
     }
 
@@ -194,9 +260,11 @@ impl ReverseRequestHandlers {
     #[must_use]
     pub fn with_sampling_create_message<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(CreateMessageParams) -> McpResult<CreateMessageResult> + Send + 'static,
+        F: FnMut(ReverseRequestCancellation, CreateMessageParams) -> McpResult<CreateMessageResult>
+            + Send
+            + 'static,
     {
-        self.sampling_create_message = Some(Box::new(handler));
+        self.sampling_create_message = Some(Arc::new(Mutex::new(Box::new(handler))));
         self
     }
 
@@ -204,23 +272,69 @@ impl ReverseRequestHandlers {
     #[must_use]
     pub fn with_roots_list<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(ListRootsParams) -> McpResult<ListRootsResult> + Send + 'static,
+        F: FnMut(ReverseRequestCancellation, ListRootsParams) -> McpResult<ListRootsResult>
+            + Send
+            + 'static,
     {
-        self.roots_list = Some(Box::new(handler));
+        self.roots_list = Some(Arc::new(Mutex::new(Box::new(handler))));
         self
     }
 
-    /// Configures handling for `elicitation/create`.
-    #[must_use]
-    pub fn with_elicitation_create<F>(mut self, handler: F) -> Self
-    where
-        F: FnMut(ElicitRequestParams) -> McpResult<ElicitResult> + Send + 'static,
-    {
-        self.elicitation_create = Some(Box::new(handler));
-        self
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sampling_create_message.is_none() && self.roots_list.is_none()
+    }
+
+    /// Adds the exact 2024-11-05 client capabilities implied by these
+    /// callbacks. Roots-list-change remains disabled because registering a
+    /// roots handler does not authorize the client to originate change events.
+    pub(crate) fn derive_legacy_capabilities(&self, capabilities: &mut ClientCapabilities) {
+        if self.sampling_create_message.is_some() {
+            capabilities.sampling.get_or_insert(SamplingCapability {});
+        }
+        if self.roots_list.is_some() {
+            capabilities.roots.get_or_insert(RootsCapability {
+                list_changed: false,
+            });
+        }
+    }
+
+    /// Ensures that an exact-2024 callback configuration and its advertised
+    /// capabilities describe precisely the same server-callable surface.
+    pub(crate) fn validate_legacy_capabilities(
+        &self,
+        capabilities: &ClientCapabilities,
+    ) -> McpResult<()> {
+        if self.sampling_create_message.is_some() != capabilities.sampling.is_some() {
+            return Err(McpError::invalid_params(
+                "MCP 2024-11-05 sampling callback configuration must match the advertised sampling capability",
+            ));
+        }
+        match (&self.roots_list, &capabilities.roots) {
+            (Some(_), Some(roots)) if !roots.list_changed => {}
+            (Some(_), Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "MCP 2024-11-05 reverse roots callbacks cannot advertise roots.listChanged",
+                ));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "MCP 2024-11-05 roots callback configuration must match the advertised roots capability",
+                ));
+            }
+            (None, None) => {}
+        }
+        if capabilities.elicitation.is_some() {
+            return Err(McpError::invalid_params(
+                "MCP 2024-11-05 does not define an elicitation client capability",
+            ));
+        }
+        Ok(())
     }
 }
-use fastmcp_transport::{StdioTransport, Transport, TransportError};
+use fastmcp_transport::{
+    StdioRecvHalf, StdioSendHalf, StdioTransport, Transport, TransportError, TransportRecvHalf,
+    TransportSendHalf,
+};
 
 use crate::cache::{FinalCachePageLookup, final_cache_hints};
 use crate::execution::{
@@ -2006,75 +2120,444 @@ where
 }
 
 fn invoke_reverse_request_handler<P, R>(
-    handler: &mut dyn FnMut(P) -> McpResult<R>,
+    handler: &mut dyn FnMut(ReverseRequestCancellation, P) -> McpResult<R>,
+    cancellation: ReverseRequestCancellation,
     params: P,
 ) -> McpResult<R> {
-    catch_client_callback_unwind(|| handler(params))
+    catch_client_callback_unwind(|| handler(cancellation, params))
         .map_err(|_| McpError::internal_error("Client reverse request handler failed"))?
 }
 
-fn live_server_request_response(
+fn invoke_locked_reverse_request_handler<P, R>(
+    handler: &Arc<Mutex<Box<dyn FnMut(ReverseRequestCancellation, P) -> McpResult<R> + Send>>>,
+    cancellation: ReverseRequestCancellation,
+    params: P,
+) -> McpResult<R> {
+    let mut handler = handler
+        .lock()
+        .map_err(|_| McpError::internal_error("Client reverse request handler failed"))?;
+    // The worker can wait behind another callback invocation. Cancellation
+    // received during that wait must win before this handler gets any effect.
+    cancellation.checkpoint()?;
+    invoke_reverse_request_handler(handler.as_mut(), cancellation, params)
+}
+
+const MAX_REVERSE_CALLBACK_WORKERS: usize = 4;
+const MAX_QUEUED_REVERSE_CALLBACKS: usize = 16;
+const REVERSE_CALLBACK_POLL_SLICE: Duration = Duration::from_millis(10);
+const REVERSE_CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const REVERSE_CALLBACK_SHUTDOWN_TIMEOUT_ERROR: &str =
+    "Client reverse callback workers did not stop within the shutdown bound";
+
+struct ActiveReverseCallback {
+    request_id: RequestId,
+    cancellation: ReverseRequestCancellation,
+}
+
+#[derive(Default)]
+struct ReverseCallbackState {
+    closing: AtomicBool,
+    active: Mutex<Vec<ActiveReverseCallback>>,
+    terminal_error: Mutex<Option<McpError>>,
+}
+
+impl ReverseCallbackState {
+    fn admit(&self, request_id: &RequestId) -> McpResult<ReverseRequestCancellation> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| McpError::internal_error("Client reverse callback registry failed"))?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(McpError::internal_error("Client reverse callback dispatcher is closed"));
+        }
+        if active.len() >= MAX_QUEUED_REVERSE_CALLBACKS {
+            return Err(McpError::internal_error(
+                "Client reverse callback capacity exceeded",
+            ));
+        }
+        if active
+            .iter()
+            .any(|callback| callback.request_id.correlates_with(request_id))
+        {
+            return Err(McpError::invalid_request(
+                "Duplicate live reverse callback request ID",
+            ));
+        }
+        let cancellation = ReverseRequestCancellation::new();
+        active.push(ActiveReverseCallback {
+            request_id: request_id.clone(),
+            cancellation: cancellation.clone(),
+        });
+        Ok(cancellation)
+    }
+
+    fn cancel(&self, request_id: &RequestId) -> bool {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cancelled = false;
+        for callback in active.iter() {
+            if callback.request_id.correlates_with(request_id) {
+                callback.cancellation.cancel();
+                cancelled = true;
+            }
+        }
+        cancelled
+    }
+
+    fn complete(&self, request_id: &RequestId) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.retain(|callback| !callback.request_id.correlates_with(request_id));
+    }
+
+    /// Claims the one response write while ordering it against a cancellation
+    /// already admitted by the sole receive loop.
+    ///
+    /// The claim is deliberately made before a protocol-sized transport write
+    /// and releases this registry lock before that write can block. This keeps
+    /// cancellation reception independent of a full child-stdin pipe while
+    /// preserving the response-vs-cancellation linearization point.
+    fn claim_response_if_open(
+        &self,
+        request_id: &RequestId,
+        cancellation: &ReverseRequestCancellation,
+    ) -> bool {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closing.load(Ordering::Acquire)
+            || !active.iter().any(|callback| {
+                callback.request_id.correlates_with(request_id)
+                    && Arc::ptr_eq(&callback.cancellation.0, &cancellation.0)
+            })
+            || !cancellation.is_open()
+        {
+            return false;
+        }
+
+        cancellation.record_response_sent();
+        active.retain(|callback| !callback.request_id.correlates_with(request_id));
+        true
+    }
+
+    fn cancel_all(&self) {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.closing.store(true, Ordering::Release);
+        for callback in active.iter() {
+            callback.cancellation.cancel();
+        }
+    }
+
+    fn fail_connection(&self, error: McpError) {
+        {
+            let mut terminal_error = self
+                .terminal_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if terminal_error.is_none() {
+                *terminal_error = Some(error);
+            }
+        }
+        self.cancel_all();
+    }
+
+    fn terminal_error(&self) -> Option<McpError> {
+        self.terminal_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+struct ReverseCallbackJob {
+    request_id: RequestId,
+    cancellation: ReverseRequestCancellation,
+    invoke: Box<dyn FnOnce() -> JsonRpcMessage + Send>,
+}
+
+struct ReverseCallbackPool {
+    state: Arc<ReverseCallbackState>,
+    sender: Option<mpsc::SyncSender<ReverseCallbackJob>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Performs the elected reverse response write.
+///
+/// Callback frames use the ordinary framed transport path, rather than the
+/// 512-byte atomic control path reserved for cancellation controls. The
+/// codec's normal bounded frame limit therefore applies to full MCP sampling
+/// and roots results. A failed write is terminal because framing disposition
+/// is no longer recoverable.
+#[cfg(unix)]
+fn commit_reverse_callback_response(
+    state: &ReverseCallbackState,
+    request_id: &RequestId,
+    response_sender: &Arc<Mutex<StdioSendHalf<ChildStdin>>>,
+    cx: &Cx,
+    cancellation: &ReverseRequestCancellation,
+    response: &JsonRpcMessage,
+) -> Result<bool, TransportError> {
+    let mut sender = response_sender.lock().map_err(|_| TransportError::Closed)?;
+    if !state.claim_response_if_open(request_id, cancellation) {
+        return Ok(false);
+    }
+    sender.send(cx, response)?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn commit_reverse_callback_response(
+    _state: &ReverseCallbackState,
+    _request_id: &RequestId,
+    _response_sender: &Arc<Mutex<StdioSendHalf<ChildStdin>>>,
+    _cx: &Cx,
+    _cancellation: &ReverseRequestCancellation,
+    _response: &JsonRpcMessage,
+) -> Result<bool, TransportError> {
+    Err(TransportError::Closed)
+}
+
+impl ReverseCallbackPool {
+    fn new(response_sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>, cx: Cx) -> Self {
+        let state = Arc::new(ReverseCallbackState::default());
+        let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_REVERSE_CALLBACKS);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut workers = Vec::with_capacity(MAX_REVERSE_CALLBACK_WORKERS);
+        for _ in 0..MAX_REVERSE_CALLBACK_WORKERS {
+            let worker_state = Arc::clone(&state);
+            let worker_receiver = Arc::clone(&receiver);
+            let worker_sender = Arc::clone(&response_sender);
+            let worker_cx = cx.clone();
+            workers.push(std::thread::spawn(move || loop {
+                let job = match worker_receiver
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv()
+                {
+                    Ok(job) => job,
+                    Err(_) => return,
+                };
+                if worker_state.closing.load(Ordering::Acquire)
+                    || job.cancellation.is_cancel_requested()
+                {
+                    worker_state.complete(&job.request_id);
+                    continue;
+                }
+                let response = (job.invoke)();
+                if worker_state.closing.load(Ordering::Acquire) {
+                    worker_state.complete(&job.request_id);
+                    continue;
+                }
+                match commit_reverse_callback_response(
+                    &worker_state,
+                    &job.request_id,
+                    &worker_sender,
+                    &worker_cx,
+                    &job.cancellation,
+                    &response,
+                ) {
+                    Ok(false) => {
+                        worker_state.complete(&job.request_id);
+                        continue;
+                    }
+                    Ok(true) => {}
+                    Err(error) => {
+                        worker_state.fail_connection(transport_error_to_mcp(error));
+                        worker_state.complete(&job.request_id);
+                        return;
+                    }
+                }
+            }));
+        }
+        Self {
+            state,
+            sender: Some(sender),
+            workers,
+        }
+    }
+
+    fn dispatch<P, R>(
+        &self,
+        request_id: RequestId,
+        params: P,
+        handler: Arc<Mutex<Box<dyn FnMut(ReverseRequestCancellation, P) -> McpResult<R> + Send>>>,
+    ) -> McpResult<()>
+    where
+        P: Send + 'static,
+        R: serde::Serialize + Send + 'static,
+    {
+        let cancellation = self.state.admit(&request_id)?;
+        let invoke_cancellation = cancellation.clone();
+        let response_id = request_id.clone();
+        let job = ReverseCallbackJob {
+            request_id: request_id.clone(),
+            cancellation,
+            invoke: Box::new(move || {
+                let result =
+                    invoke_locked_reverse_request_handler(&handler, invoke_cancellation, params);
+                reverse_request_response(response_id, result)
+            }),
+        };
+        let Some(sender) = self.sender.as_ref() else {
+            self.state.complete(&request_id);
+            return Err(McpError::internal_error("Client reverse callback dispatcher is closed"));
+        };
+        match sender.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.state.complete(&request_id);
+                Err(McpError::internal_error(
+                    "Client reverse callback capacity exceeded",
+                ))
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.state.complete(&request_id);
+                Err(McpError::internal_error("Client reverse callback dispatcher is closed"))
+            }
+        }
+    }
+
+    fn cancel(&self, request_id: &RequestId) -> bool {
+        self.state.cancel(request_id)
+    }
+
+    fn cancel_all(&self) {
+        self.state.cancel_all();
+    }
+
+    /// Joins finished callback workers without permitting an uncooperative
+    /// synchronous callback to make explicit connection shutdown unbounded.
+    ///
+    /// A timed-out worker remains owned by this pool for a later `close` retry
+    /// (and for `Drop`'s definitive join); it is never detached.
+    fn join_bounded(&mut self) -> McpResult<()> {
+        self.sender.take();
+        let deadline = Instant::now()
+            .checked_add(REVERSE_CALLBACK_SHUTDOWN_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        loop {
+            let mut unfinished = Vec::new();
+            for worker in std::mem::take(&mut self.workers) {
+                if worker.is_finished() {
+                    let _ = worker.join();
+                } else {
+                    unfinished.push(worker);
+                }
+            }
+            self.workers = unfinished;
+            if self.workers.is_empty() {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(McpError::internal_error(
+                    REVERSE_CALLBACK_SHUTDOWN_TIMEOUT_ERROR,
+                ));
+            }
+            std::thread::sleep((deadline - now).min(REVERSE_CALLBACK_POLL_SLICE));
+        }
+    }
+
+    fn join_unbounded(&mut self) {
+        self.sender.take();
+        for worker in std::mem::take(&mut self.workers) {
+            let _ = worker.join();
+        }
+    }
+
+    fn close_unbounded(&mut self) {
+        self.cancel_all();
+        self.join_unbounded();
+    }
+}
+
+impl Drop for ReverseCallbackPool {
+    fn drop(&mut self) {
+        self.close_unbounded();
+    }
+}
+
+enum LiveServerRequestDispatch {
+    Immediate(JsonRpcMessage),
+    CallbackAdmitted,
+}
+
+fn live_server_request_dispatch(
     selected_era: Option<ProtocolEra>,
-    handlers: &mut ReverseRequestHandlers,
+    handlers: &ReverseRequestHandlers,
+    callbacks: &ReverseCallbackPool,
     request: &JsonRpcRequest,
-) -> Option<JsonRpcMessage> {
+) -> Option<LiveServerRequestDispatch> {
     let id = request.id.clone()?;
     if request.method.starts_with("notifications/") {
-        return invalid_notification_request_response(request);
+        return invalid_notification_request_response(request)
+            .map(LiveServerRequestDispatch::Immediate);
     }
     if request.method == "ping" {
-        return Some(JsonRpcMessage::Response(JsonRpcResponse::success(
-            id,
-            serde_json::json!({}),
-        )));
+        return Some(LiveServerRequestDispatch::Immediate(
+            JsonRpcMessage::Response(JsonRpcResponse::success(id, serde_json::json!({}))),
+        ));
     }
 
-    // These reverse methods are exact MCP 2024-11-05 vocabulary. A final
-    // session must not silently keep servicing them merely because a caller
-    // configured legacy callbacks on the client object.
+    // Sampling and roots are the only server-to-client reverse requests in
+    // exact MCP 2024-11-05. A final session must not silently keep servicing
+    // either method merely because a caller configured legacy callbacks on the
+    // client object.
     if selected_era != Some(ProtocolEra::Legacy2024)
-        && matches!(
-            request.method.as_str(),
-            "sampling/createMessage" | "roots/list" | "elicitation/create"
-        )
+        && matches!(request.method.as_str(), "sampling/createMessage" | "roots/list")
     {
-        return method_not_found_response(request);
+        return method_not_found_response(request).map(LiveServerRequestDispatch::Immediate);
     }
 
-    let response = match request.method.as_str() {
-        "sampling/createMessage" => reverse_request_response(
-            id,
-            handlers.sampling_create_message.as_mut().map_or_else(
-                || Err(McpError::method_not_found("sampling/createMessage")),
-                |handler| {
-                    decode_reverse_request_params(request)
-                        .and_then(|params| invoke_reverse_request_handler(handler.as_mut(), params))
-                },
-            ),
-        ),
-        "roots/list" => reverse_request_response(
-            id,
-            handlers.roots_list.as_mut().map_or_else(
-                || Err(McpError::method_not_found("roots/list")),
-                |handler| {
-                    decode_reverse_request_params(request)
-                        .and_then(|params| invoke_reverse_request_handler(handler.as_mut(), params))
-                },
-            ),
-        ),
-        "elicitation/create" => reverse_request_response(
-            id,
-            handlers.elicitation_create.as_mut().map_or_else(
-                || Err(McpError::method_not_found("elicitation/create")),
-                |handler| {
-                    decode_reverse_request_params(request)
-                        .and_then(|params| invoke_reverse_request_handler(handler.as_mut(), params))
-                },
-            ),
-        ),
-        _ => return method_not_found_response(request),
+    let dispatch = match request.method.as_str() {
+        "sampling/createMessage" => match handlers.sampling_create_message.as_ref() {
+            Some(handler) => match decode_reverse_request_params(request) {
+                Ok(params) => callbacks
+                    .dispatch(id.clone(), params, Arc::clone(handler))
+                    .map_or_else(
+                        |error| LiveServerRequestDispatch::Immediate(reverse_request_response(id, Err(error))),
+                        |_| LiveServerRequestDispatch::CallbackAdmitted,
+                    ),
+                Err(error) => {
+                    LiveServerRequestDispatch::Immediate(reverse_request_response(id, Err(error)))
+                }
+            },
+            None => LiveServerRequestDispatch::Immediate(reverse_request_response(
+                id,
+                Err(McpError::method_not_found("sampling/createMessage")),
+            )),
+        },
+        "roots/list" => match handlers.roots_list.as_ref() {
+            Some(handler) => match decode_reverse_request_params(request) {
+                Ok(params) => callbacks
+                    .dispatch(id.clone(), params, Arc::clone(handler))
+                    .map_or_else(
+                        |error| LiveServerRequestDispatch::Immediate(reverse_request_response(id, Err(error))),
+                        |_| LiveServerRequestDispatch::CallbackAdmitted,
+                    ),
+                Err(error) => {
+                    LiveServerRequestDispatch::Immediate(reverse_request_response(id, Err(error)))
+                }
+            },
+            None => LiveServerRequestDispatch::Immediate(reverse_request_response(
+                id,
+                Err(McpError::method_not_found("roots/list")),
+            )),
+        },
+        _ => return method_not_found_response(request).map(LiveServerRequestDispatch::Immediate),
     };
-    Some(response)
+    Some(dispatch)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2647,6 +3130,17 @@ fn validate_timeout_duration(
 
 #[cfg(unix)]
 fn recv_child_transport(
+    transport: &mut StdioRecvHalf<ChildStdout>,
+    cx: &Cx,
+    deadline: Option<Instant>,
+) -> Result<(JsonRpcMessage, Instant), TransportError> {
+    transport
+        .recv_until_or_closed(cx, deadline)
+        .map(|message| (message, Instant::now()))
+}
+
+#[cfg(unix)]
+fn recv_initializing_child_transport(
     transport: &mut StdioTransport<ChildStdout, ChildStdin>,
     cx: &Cx,
     deadline: Option<Instant>,
@@ -2655,8 +3149,20 @@ fn recv_child_transport(
 }
 
 #[cfg(not(unix))]
-fn recv_child_transport(
+fn recv_initializing_child_transport(
     transport: &mut StdioTransport<ChildStdout, ChildStdin>,
+    cx: &Cx,
+    deadline: Option<Instant>,
+) -> Result<(JsonRpcMessage, Instant), TransportError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(TransportError::ReceiveDeadlineExceeded);
+    }
+    transport.recv_with_completion(cx)
+}
+
+#[cfg(not(unix))]
+fn recv_child_transport(
+    transport: &mut StdioRecvHalf<ChildStdout>,
     cx: &Cx,
     deadline: Option<Instant>,
 ) -> Result<(JsonRpcMessage, Instant), TransportError> {
@@ -2666,30 +3172,36 @@ fn recv_child_transport(
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(TransportError::ReceiveDeadlineExceeded);
     }
-    transport.recv_with_completion(cx)
+    transport.recv(cx).map(|message| (message, Instant::now()))
 }
 
 #[cfg(unix)]
 fn send_child_server_response_during_receive(
-    transport: &mut StdioTransport<ChildStdout, ChildStdin>,
+    transport: &Arc<Mutex<StdioSendHalf<ChildStdin>>>,
     _cx: &Cx,
     message: &JsonRpcMessage,
 ) -> McpResult<()> {
     transport
+        .lock()
+        .map_err(|_| McpError::internal_error("Client stdio response writer failed"))?
         .try_send_control_message(message)
         .map_err(transport_error_to_mcp)
 }
 
 #[cfg(not(unix))]
 fn send_child_server_response_during_receive(
-    transport: &mut StdioTransport<ChildStdout, ChildStdin>,
+    transport: &Arc<Mutex<StdioSendHalf<ChildStdin>>>,
     cx: &Cx,
     message: &JsonRpcMessage,
 ) -> McpResult<()> {
     // Standard child pipes expose no portable nonblocking write on this path.
     // Preserve frame-boundary behavior explicitly; the caller abandons the
     // connection if this send itself fails.
-    transport.send(cx, message).map_err(transport_error_to_mcp)
+    transport
+        .lock()
+        .map_err(|_| McpError::internal_error("Client stdio response writer failed"))?
+        .send(cx, message)
+        .map_err(transport_error_to_mcp)
 }
 
 fn initialize_child_transport(
@@ -2720,7 +3232,8 @@ fn initialize_child_transport(
     let deadlines = RequestDeadlines::start_at(timeout_policy, committed_at)?;
 
     let response = loop {
-        let (message, received_at) = recv_child_transport(transport, cx, Some(deadlines.next()))
+        let (message, received_at) =
+            recv_initializing_child_transport(transport, cx, Some(deadlines.next()))
             .map_err(|error| match error {
                 TransportError::ReceiveDeadlineExceeded => {
                     request_timeout_error(deadlines.next_kind())
@@ -4137,8 +4650,12 @@ pub struct Client {
     /// Latest retryable process-cleanup failure. This is cleared when a later
     /// close proves that the retained ownership scope is quiescent.
     pending_process_cleanup_error: Option<McpError>,
-    /// Transport for communication.
-    transport: StdioTransport<ChildStdout, ChildStdin>,
+    /// Independently owned stdio reader. Callback workers never borrow this
+    /// half, so the sole reader can continue admitting cancellation frames.
+    transport: StdioRecvHalf<ChildStdout>,
+    /// Serializes every outbound frame, including callback completions the
+    /// sole reader commits between bounded receive polls.
+    response_sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
     /// Capability context for cancellation.
     cx: Cx,
     /// Session state after initialization.
@@ -4160,6 +4677,8 @@ pub struct Client {
     last_final_cache_page: Option<FinalCachePageState>,
     /// Application handlers for server-initiated requests on this connection.
     reverse_request_handlers: ReverseRequestHandlers,
+    /// Fixed, owned callback workers for exact-2024 reverse requests.
+    reverse_callback_pool: ReverseCallbackPool,
     /// Idle/absolute policy for ordinary stdio responses.
     ///
     /// Unix child pipes use bounded readiness polling, including while a peer
@@ -4464,6 +4983,10 @@ impl Client {
         };
         let client_capabilities = ClientCapabilities::default();
 
+        let (transport, response_sender) = transport.into_split();
+        let response_sender = Arc::new(Mutex::new(response_sender));
+        let reverse_callback_pool = ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
+
         // Create a temporary client for initialization
         let mut client = Self {
             child: Some(child_guard.disarm()),
@@ -4473,6 +4996,7 @@ impl Client {
             cleanup_error: None,
             pending_process_cleanup_error: None,
             transport,
+            response_sender,
             cx,
             session: ClientSession::new_placeholder(
                 client_info.clone(),
@@ -4494,6 +5018,7 @@ impl Client {
             last_core_result_receipt: None,
             last_final_cache_page: None,
             reverse_request_handlers: ReverseRequestHandlers::new(),
+            reverse_callback_pool,
             timeout_policy: RequestTimeoutPolicy::default(),
             auto_initialize: false,
             initialized: AtomicBool::new(false),
@@ -4594,6 +5119,9 @@ impl Client {
         session: ClientSession,
         timeout_policy: RequestTimeoutPolicy,
     ) -> Self {
+        let (transport, response_sender) = transport.into_split();
+        let response_sender = Arc::new(Mutex::new(response_sender));
+        let reverse_callback_pool = ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
         Self {
             child: Some(child),
             group_anchor,
@@ -4602,6 +5130,7 @@ impl Client {
             cleanup_error: None,
             pending_process_cleanup_error: None,
             transport,
+            response_sender,
             cx,
             session,
             next_id: AtomicU64::new(2), // Start at 2 since initialize used 1
@@ -4612,6 +5141,7 @@ impl Client {
             last_core_result_receipt: None,
             last_final_cache_page: None,
             reverse_request_handlers: ReverseRequestHandlers::new(),
+            reverse_callback_pool,
             timeout_policy,
             auto_initialize: false,
             initialized: AtomicBool::new(true), // Already initialized by builder
@@ -4650,6 +5180,9 @@ impl Client {
         session: ClientSession,
         timeout_policy: RequestTimeoutPolicy,
     ) -> Self {
+        let (transport, response_sender) = transport.into_split();
+        let response_sender = Arc::new(Mutex::new(response_sender));
+        let reverse_callback_pool = ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
         Self {
             child: Some(child),
             group_anchor,
@@ -4658,6 +5191,7 @@ impl Client {
             cleanup_error: None,
             pending_process_cleanup_error: None,
             transport,
+            response_sender,
             cx,
             session,
             next_id: AtomicU64::new(1), // Start at 1 since initialize hasn't happened
@@ -4668,6 +5202,7 @@ impl Client {
             last_core_result_receipt: None,
             last_final_cache_page: None,
             reverse_request_handlers: ReverseRequestHandlers::new(),
+            reverse_callback_pool,
             timeout_policy,
             auto_initialize: true,
             initialized: AtomicBool::new(false),
@@ -4688,6 +5223,9 @@ impl Client {
     ///
     /// Returns an error if initialization fails.
     pub fn ensure_initialized(&mut self) -> McpResult<()> {
+        if let Err(error) = self.drain_completed_reverse_callbacks() {
+            return Err(self.terminate_connection(error));
+        }
         if let Some(error) = self.responses.terminal_error() {
             return Err(error);
         }
@@ -4774,7 +5312,15 @@ impl Client {
     fn terminate_connection(&mut self, error: McpError) -> McpError {
         self.initialized.store(false, Ordering::SeqCst);
         self.responses.fail_all(error.clone());
-        if let Err(cleanup_error) = self.transport.close().map_err(transport_error_to_mcp) {
+        self.cancel_reverse_callback_pool();
+        if let Err(cleanup_error) = self.join_reverse_callback_pool() {
+            // Do not attempt to lock or close stdin while a retained callback
+            // worker may still own its writer lock. The worker remains owned
+            // by this client and a later explicit close can retry the join.
+            self.retain_cleanup_error(cleanup_error);
+            return error;
+        }
+        if let Err(cleanup_error) = self.close_transport().map_err(transport_error_to_mcp) {
             self.retain_cleanup_error(cleanup_error);
         }
         if let Err(cleanup_error) = self.stop_retained_child() {
@@ -4964,17 +5510,104 @@ impl Client {
         Ok(())
     }
 
-    /// Replaces the reverse request handlers used by this live client session.
-    pub fn set_reverse_request_handlers(&mut self, handlers: ReverseRequestHandlers) {
+    /// Clears reverse request handlers on a live client.
+    ///
+    /// Non-empty exact-2024 callback handlers must be configured through
+    /// [`ClientBuilder::reverse_request_handlers`] before initialization so
+    /// the advertised capabilities and callable methods cannot diverge.
+    pub fn set_reverse_request_handlers(&mut self, handlers: ReverseRequestHandlers) -> McpResult<()> {
+        if !handlers.is_empty() {
+            return Err(McpError::invalid_params(
+                "Configure reverse request handlers with ClientBuilder before initialization",
+            ));
+        }
+        self.reverse_request_handlers = handlers;
+        Ok(())
+    }
+
+    pub(crate) fn install_reverse_request_handlers_before_initialization(
+        &mut self,
+        handlers: ReverseRequestHandlers,
+    ) {
+        debug_assert!(!self.initialized.load(Ordering::SeqCst));
         self.reverse_request_handlers = handlers;
     }
 
     fn server_request_response(&mut self, request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
-        live_server_request_response(
+        match live_server_request_dispatch(
             self.session.selected_era(),
-            &mut self.reverse_request_handlers,
+            &self.reverse_request_handlers,
+            &self.reverse_callback_pool,
             request,
+        )? {
+            LiveServerRequestDispatch::Immediate(response) => Some(response),
+            LiveServerRequestDispatch::CallbackAdmitted => None,
+        }
+    }
+
+    fn cancel_legacy_reverse_callback(&mut self, request: &JsonRpcRequest) -> bool {
+        if self.session.selected_era() != Some(ProtocolEra::Legacy2024) {
+            return false;
+        }
+        let Ok(CancellationWireMessage::Legacy2024 { params, .. }) =
+            CancellationWireMessage::decode(
+                ProtocolEra::Legacy2024,
+                CancellationSender::Server,
+                request,
+            )
+        else {
+            return false;
+        };
+
+        self.reverse_callback_pool.cancel(&params.request_id)
+    }
+
+    fn drain_completed_reverse_callbacks(&mut self) -> McpResult<()> {
+        self.reverse_callback_pool
+            .state
+            .terminal_error()
+            .map_or(Ok(()), Err)
+    }
+
+    fn reverse_callback_poll_deadline(&self, deadline: Instant) -> Instant {
+        deadline.min(
+            Instant::now()
+                .checked_add(REVERSE_CALLBACK_POLL_SLICE)
+                .unwrap_or(deadline),
         )
+    }
+
+    fn cancel_reverse_callback_pool(&self) {
+        self.reverse_callback_pool.cancel_all();
+    }
+
+    fn join_reverse_callback_pool(&mut self) -> McpResult<()> {
+        self.reverse_callback_pool.join_bounded()
+    }
+
+    fn join_reverse_callback_pool_unbounded(&mut self) {
+        self.reverse_callback_pool.join_unbounded();
+    }
+
+    fn transport_is_closed(&self) -> bool {
+        self.transport.is_closed()
+    }
+
+    fn close_transport(&mut self) -> Result<(), TransportError> {
+        let receiver = self.transport.close();
+        let sender = self
+            .response_sender
+            .lock()
+            .map_err(|_| TransportError::Closed)?
+            .close();
+        receiver.and(sender)
+    }
+
+    fn send_to_server(&self, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.response_sender
+            .lock()
+            .map_err(|_| TransportError::Closed)?
+            .send(&self.cx, message)
     }
 
     /// Verifies that the initialized server can answer an MCP ping request.
@@ -5371,10 +6004,7 @@ impl Client {
         // an exact owner in the shared-channel correlation registry.
         let waiter = self.responses.register(request_id.clone())?;
 
-        if let Err(error) = self
-            .transport
-            .send(&self.cx, &JsonRpcMessage::Request(request))
-        {
+        if let Err(error) = self.send_to_server(&JsonRpcMessage::Request(request)) {
             let error = self.record_send_failure(Some(&request_id), error);
             return Err(error);
         }
@@ -5600,21 +6230,28 @@ impl Client {
         {
             let deadline = Instant::now() + FINAL_CACHE_NOTIFICATION_DRAIN_WINDOW;
             loop {
-                let (message, _) =
-                    match recv_child_transport(&mut self.transport, &self.cx, Some(deadline)) {
-                        Ok(received) => received,
-                        Err(TransportError::ReceiveDeadlineExceeded)
-                            if !self.transport.is_closed() =>
-                        {
-                            return Ok(());
+                let receive_deadline = self.reverse_callback_poll_deadline(deadline);
+                let (message, _) = match recv_child_transport(
+                    &mut self.transport,
+                    &self.cx,
+                    Some(receive_deadline),
+                ) {
+                    Ok(received) => received,
+                    Err(TransportError::ReceiveDeadlineExceeded) if !self.transport_is_closed() => {
+                        if receive_deadline < deadline {
+                            self.drain_completed_reverse_callbacks()
+                                .map_err(|error| self.terminate_connection(error))?;
+                            continue;
                         }
-                        Err(TransportError::Cancelled) if !self.transport.is_closed() => {
-                            return Err(self.terminate_connection(McpError::request_cancelled()));
-                        }
-                        Err(error) => {
-                            return Err(self.terminate_connection(transport_error_to_mcp(error)));
-                        }
-                    };
+                        return Ok(());
+                    }
+                    Err(TransportError::Cancelled) if !self.transport_is_closed() => {
+                        return Err(self.terminate_connection(McpError::request_cancelled()));
+                    }
+                    Err(error) => {
+                        return Err(self.terminate_connection(transport_error_to_mcp(error)));
+                    }
+                };
                 self.process_idle_cache_invalidation_message(message)?;
             }
         }
@@ -5651,6 +6288,9 @@ impl Client {
                 }
             }
             JsonRpcMessage::Request(request) => {
+                if self.cancel_legacy_reverse_callback(&request) {
+                    return Ok(());
+                }
                 if self.retain_modern_server_notification(&request)?.is_some() {
                     return Ok(());
                 }
@@ -5708,10 +6348,7 @@ impl Client {
             id: None,
         };
 
-        if let Err(error) = self
-            .transport
-            .send(&self.cx, &JsonRpcMessage::Request(request))
-        {
+        if let Err(error) = self.send_to_server(&JsonRpcMessage::Request(request)) {
             return Err(self.record_send_failure(None, error));
         }
 
@@ -5720,10 +6357,7 @@ impl Client {
 
     fn send_initialized_notification(&mut self) -> McpResult<()> {
         let notification = JsonRpcRequest::initialized_notification();
-        if let Err(error) = self
-            .transport
-            .send(&self.cx, &JsonRpcMessage::Request(notification))
-        {
+        if let Err(error) = self.send_to_server(&JsonRpcMessage::Request(notification)) {
             return Err(self.record_send_failure(None, error));
         }
         Ok(())
@@ -5813,7 +6447,9 @@ impl Client {
     fn send_bounded_control_message(&mut self, message: JsonRpcMessage) -> McpResult<()> {
         #[cfg(unix)]
         {
-            self.transport
+            self.response_sender
+                .lock()
+                .map_err(|_| McpError::internal_error("Client stdio response writer failed"))?
                 .try_send_control_message(&message)
                 .map_err(transport_error_to_mcp)
         }
@@ -5830,7 +6466,7 @@ impl Client {
         // A peer-controlled server request must not turn the surrounding
         // response deadline into an unbounded child-stdin write on platforms
         // where child pipes expose the required nonblocking primitive.
-        send_child_server_response_during_receive(&mut self.transport, &self.cx, &message)
+        send_child_server_response_during_receive(&self.response_sender, &self.cx, &message)
     }
 
     fn send_timeout_cancellation_control(&mut self, request_id: &RequestId) -> McpResult<()> {
@@ -5920,10 +6556,10 @@ impl Client {
         &mut self,
         response: JsonRpcResponse,
     ) -> McpResult<ResponseRoute> {
-        let frame = self.transport.last_received_frame().ok_or_else(|| {
-            McpError::internal_error("Successful stdio response lost its admitted source frame")
+        let frame = serde_json::to_vec(&response).map_err(|_| {
+            McpError::internal_error("Successful stdio response could not retain its result source")
         })?;
-        let admission = decode_strict_jsonrpc_response(frame, frame.len()).map_err(|_| {
+        let admission = decode_strict_jsonrpc_response(&frame, frame.len()).map_err(|_| {
             McpError::internal_error("Admitted stdio response could not retain its raw result")
         })?;
         if admission.response() != &response {
@@ -5975,6 +6611,9 @@ impl Client {
                 }
             }
             JsonRpcMessage::Request(request) => {
+                if self.cancel_legacy_reverse_callback(&request) {
+                    return timeout;
+                }
                 match self.retain_modern_server_notification(&request) {
                     Ok(Some(_)) => return timeout,
                     Ok(None) => {}
@@ -6022,25 +6661,31 @@ impl Client {
                 return Err(self.timeout_committed_request(&expected_id, kind));
             }
 
+            let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
             let (message, received_at) =
-                match recv_child_transport(&mut self.transport, &self.cx, Some(deadlines.next())) {
+                match recv_child_transport(&mut self.transport, &self.cx, Some(receive_deadline)) {
                     Ok(received) => received,
                     Err(TransportError::ReceiveDeadlineExceeded) => {
+                        if receive_deadline < deadlines.next() && !self.transport_is_closed() {
+                            self.drain_completed_reverse_callbacks()
+                                .map_err(|error| self.terminate_connection(error))?;
+                            continue;
+                        }
                         let kind = deadlines
                             .expired_at(Instant::now())
                             .unwrap_or_else(|| deadlines.next_kind());
-                        if self.transport.is_closed() {
+                        if self.transport_is_closed() {
                             return Err(self.finish_partial_frame_timeout(&expected_id, kind));
                         }
                         return Err(self.timeout_committed_request(&expected_id, kind));
                     }
-                    Err(TransportError::Timeout) if !self.transport.is_closed() => {
+                    Err(TransportError::Timeout) if !self.transport_is_closed() => {
                         return Err(self.finish_open_context_interruption(
                             &expected_id,
                             McpError::internal_error("Request timed out"),
                         ));
                     }
-                    Err(TransportError::Cancelled) if !self.transport.is_closed() => {
+                    Err(TransportError::Cancelled) if !self.transport_is_closed() => {
                         return Err(self.finish_open_context_interruption(
                             &expected_id,
                             McpError::request_cancelled(),
@@ -6083,6 +6728,9 @@ impl Client {
                     }
                 }
                 JsonRpcMessage::Request(request) => {
+                    if self.cancel_legacy_reverse_callback(&request) {
+                        continue;
+                    }
                     match self.retain_modern_server_notification(&request) {
                         Ok(Some(_)) => continue,
                         Ok(None) => {}
@@ -6187,25 +6835,31 @@ impl Client {
                 return Err(self.timeout_committed_request(&expected_id, kind));
             }
 
+            let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
             let (message, received_at) =
-                match recv_child_transport(&mut self.transport, &self.cx, Some(deadlines.next())) {
+                match recv_child_transport(&mut self.transport, &self.cx, Some(receive_deadline)) {
                     Ok(received) => received,
                     Err(TransportError::ReceiveDeadlineExceeded) => {
+                        if receive_deadline < deadlines.next() && !self.transport_is_closed() {
+                            self.drain_completed_reverse_callbacks()
+                                .map_err(|error| self.terminate_connection(error))?;
+                            continue;
+                        }
                         let kind = deadlines
                             .expired_at(Instant::now())
                             .unwrap_or_else(|| deadlines.next_kind());
-                        if self.transport.is_closed() {
+                        if self.transport_is_closed() {
                             return Err(self.finish_partial_frame_timeout(&expected_id, kind));
                         }
                         return Err(self.timeout_committed_request(&expected_id, kind));
                     }
-                    Err(TransportError::Timeout) if !self.transport.is_closed() => {
+                    Err(TransportError::Timeout) if !self.transport_is_closed() => {
                         return Err(self.finish_open_context_interruption(
                             &expected_id,
                             McpError::internal_error("Request timed out"),
                         ));
                     }
-                    Err(TransportError::Cancelled) if !self.transport.is_closed() => {
+                    Err(TransportError::Cancelled) if !self.transport_is_closed() => {
                         return Err(self.finish_open_context_interruption(
                             &expected_id,
                             McpError::request_cancelled(),
@@ -6251,6 +6905,9 @@ impl Client {
                     }
                 }
                 JsonRpcMessage::Request(request) => {
+                    if self.cancel_legacy_reverse_callback(&request) {
+                        continue;
+                    }
                     if request.id.is_none() && request.method == TASK_STATUS_NOTIFICATION {
                         let Some(accepted_filter) = accepted_filter.as_ref() else {
                             return Err(self.terminate_connection(
@@ -6958,10 +7615,7 @@ impl Client {
 
         let waiter = self.responses.register(request_id.clone())?;
 
-        if let Err(error) = self
-            .transport
-            .send(&self.cx, &JsonRpcMessage::Request(request))
-        {
+        if let Err(error) = self.send_to_server(&JsonRpcMessage::Request(request)) {
             let error = self.record_send_failure(Some(&request_id), error);
             return Err(error);
         }
@@ -7026,25 +7680,31 @@ impl Client {
                 return Err(self.timeout_committed_request(&expected_id, kind));
             }
 
+            let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
             let (message, received_at) =
-                match recv_child_transport(&mut self.transport, &self.cx, Some(deadlines.next())) {
+                match recv_child_transport(&mut self.transport, &self.cx, Some(receive_deadline)) {
                     Ok(received) => received,
                     Err(TransportError::ReceiveDeadlineExceeded) => {
+                        if receive_deadline < deadlines.next() && !self.transport_is_closed() {
+                            self.drain_completed_reverse_callbacks()
+                                .map_err(|error| self.terminate_connection(error))?;
+                            continue;
+                        }
                         let kind = deadlines
                             .expired_at(Instant::now())
                             .unwrap_or_else(|| deadlines.next_kind());
-                        if self.transport.is_closed() {
+                        if self.transport_is_closed() {
                             return Err(self.finish_partial_frame_timeout(&expected_id, kind));
                         }
                         return Err(self.timeout_committed_request(&expected_id, kind));
                     }
-                    Err(TransportError::Timeout) if !self.transport.is_closed() => {
+                    Err(TransportError::Timeout) if !self.transport_is_closed() => {
                         return Err(self.finish_open_context_interruption(
                             &expected_id,
                             McpError::internal_error("Request timed out"),
                         ));
                     }
-                    Err(TransportError::Cancelled) if !self.transport.is_closed() => {
+                    Err(TransportError::Cancelled) if !self.transport_is_closed() => {
                         return Err(self.finish_open_context_interruption(
                             &expected_id,
                             McpError::request_cancelled(),
@@ -7084,6 +7744,9 @@ impl Client {
                     }
                 }
                 JsonRpcMessage::Request(request) => {
+                    if self.cancel_legacy_reverse_callback(&request) {
+                        continue;
+                    }
                     match self.retain_modern_server_notification(&request) {
                         Ok(Some(ModernServerNotification::Progress(progress))) => {
                             if progress.progress.is_finite()
@@ -7729,10 +8392,7 @@ impl Client {
         let request_id = RequestId::Number(id_i64);
         let request = JsonRpcRequest::new("subscriptions/listen", Some(params_value), id_i64);
         let waiter = self.responses.register(request_id.clone())?;
-        if let Err(error) = self
-            .transport
-            .send(&self.cx, &JsonRpcMessage::Request(request))
-        {
+        if let Err(error) = self.send_to_server(&JsonRpcMessage::Request(request)) {
             return Err(self.record_send_failure(Some(&request_id), error));
         }
         let committed_at = Instant::now();
@@ -8119,15 +8779,16 @@ impl Client {
         self.initialized.store(false, Ordering::SeqCst);
         self.responses
             .fail_all(McpError::internal_error("Client connection closed"));
+        self.cancel_reverse_callback_pool();
+        self.join_reverse_callback_pool()?;
 
         // Transport teardown is one-shot. Preserve any failure because a
         // consumed writer cannot make a later close prove that the earlier
         // flush/close succeeded.
-        let transport_result = self.transport.close().map_err(transport_error_to_mcp);
+        let transport_result = self.close_transport().map_err(transport_error_to_mcp);
         if let Err(error) = transport_result {
             self.retain_cleanup_error(error);
         }
-
         // Process teardown is phaseful and retryable. Only an error from a
         // terminal phase becomes sticky; a later successful quiescence proof
         // clears the prior attempt's transient failure.
@@ -8162,7 +8823,9 @@ impl Drop for Client {
         // callers requiring proof must call close() and handle its result.
         self.responses
             .fail_all(McpError::internal_error("Client connection closed"));
-        let _ = self.transport.close();
+        self.cancel_reverse_callback_pool();
+        self.join_reverse_callback_pool_unbounded();
+        let _ = self.close_transport();
         if let Err(error) = self.stop_retained_child() {
             log::error!("Client drop could not verify subprocess cleanup: {error}");
         }
@@ -8200,6 +8863,117 @@ mod tests {
 
     #[cfg(unix)]
     use asupersync::runtime::RuntimeBuilder;
+
+    #[test]
+    fn reverse_callback_forced_cancellation_before_writer_election_wins() {
+        let state = Arc::new(ReverseCallbackState::default());
+        let request_id = RequestId::Number(41);
+        let cancellation = state
+            .admit(&request_id)
+            .expect("test callback is admitted before its worker starts");
+        let writer_turn = Arc::new(Mutex::new(()));
+        let writer_hold = writer_turn
+            .lock()
+            .expect("test owns the writer before the callback can commit");
+        let (waiting_sender, waiting_receiver) = std::sync::mpsc::sync_channel(1);
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let worker_state = Arc::clone(&state);
+        let worker_cancellation = cancellation.clone();
+        let worker_turn = Arc::clone(&writer_turn);
+        let worker_request_id = request_id.clone();
+        let worker_writes = Arc::clone(&writes);
+
+        let worker = std::thread::spawn(move || {
+            waiting_sender
+                .send(())
+                .expect("callback worker reaches the writer election");
+            let _writer = worker_turn
+                .lock()
+                .expect("writer election lock remains valid");
+            result_sender
+                .send(
+                    worker_state
+                        .send_if_open(&worker_request_id, &worker_cancellation, || {
+                            worker_writes.fetch_add(1, Ordering::AcqRel);
+                            Ok(())
+                        })
+                        .expect("test response send is successful"),
+                )
+                .expect("callback worker reports its terminal election");
+        });
+
+        waiting_receiver
+            .recv()
+            .expect("reader processes the queued cancellation before writer ownership releases");
+        assert!(state.cancel(&request_id));
+        drop(writer_hold);
+
+        assert!(
+            !result_receiver
+                .recv()
+                .expect("callback worker reports the forced election"),
+            "a cancellation observed while the response waits for writer ownership must win"
+        );
+        assert!(cancellation.is_cancel_requested());
+        assert_eq!(
+            writes.load(Ordering::Acquire),
+            0,
+            "a cancelled callback cannot enter its response write"
+        );
+        worker.join().expect("callback worker does not panic");
+    }
+
+    #[test]
+    fn reverse_callback_forced_writer_election_excludes_late_cancellation() {
+        let state = Arc::new(ReverseCallbackState::default());
+        let request_id = RequestId::Number(41);
+        let cancellation = state
+            .admit(&request_id)
+            .expect("test callback is admitted before its worker starts");
+        let (write_started_sender, write_started_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_write_sender, release_write_receiver) = std::sync::mpsc::sync_channel(1);
+        let worker_state = Arc::clone(&state);
+        let worker_request_id = request_id.clone();
+        let worker_cancellation = cancellation.clone();
+
+        let worker = std::thread::spawn(move || {
+            worker_state
+                .send_if_open(&worker_request_id, &worker_cancellation, || {
+                    // This marks the modelled atomic write as committed before
+                    // permitting the reader to attempt its cancellation.
+                    write_started_sender
+                        .send(())
+                        .expect("test observes the committed write");
+                    release_write_receiver
+                        .recv()
+                        .expect("test releases the atomic write model");
+                    Ok(())
+                })
+                .expect("test response send is successful")
+        });
+        write_started_receiver
+            .recv()
+            .expect("test observes the response write election");
+        let cancel_state = Arc::clone(&state);
+        let cancel_request_id = request_id.clone();
+        let cancellation_attempt = std::thread::spawn(move || cancel_state.cancel(&cancel_request_id));
+        release_write_sender
+            .send(())
+            .expect("test completes the atomic write model");
+
+        assert!(
+            worker.join().expect("callback worker does not panic"),
+            "the response that reaches the actual write first owns the terminal outcome"
+        );
+        assert!(
+            !cancellation_attempt
+                .join()
+                .expect("cancellation observer does not panic"),
+            "a later cancellation finds no live callback after the write"
+        );
+        assert!(!cancellation.is_cancel_requested());
+    }
 
     fn task_info(id: &str, status: TaskStatus) -> TaskInfo {
         TaskInfo {
@@ -8876,9 +9650,70 @@ mod tests {
         make_closed_client_with_cx(initialized, Cx::for_request())
     }
 
+    #[test]
+    fn internal_client_constructors_own_the_shared_response_sender() {
+        let mut initialized = make_closed_client(true);
+        assert!(initialized.is_initialized());
+        assert!(initialized.response_sender.lock().is_ok());
+        initialized.close().expect("initialized constructor cleanup");
+
+        let mut uninitialized = make_closed_client(false);
+        assert!(!uninitialized.is_initialized());
+        assert!(uninitialized.response_sender.lock().is_ok());
+        uninitialized
+            .close()
+            .expect("uninitialized constructor cleanup");
+    }
+
     #[cfg(unix)]
     fn make_shell_scripted_initialized_client(script: &str, timeout: Duration) -> Client {
         make_shell_scripted_initialized_client_for_version(script, timeout, PROTOCOL_VERSION)
+    }
+
+    #[cfg(unix)]
+    fn make_shell_scripted_initialized_client_with_reverse_handlers(
+        script: &str,
+        timeout: Duration,
+        handlers: ReverseRequestHandlers,
+    ) -> Client {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().expect("spawn scripted peer");
+        let stdin = child.stdin.take().expect("scripted peer stdin");
+        let stdout = child.stdout.take().expect("scripted peer stdout");
+        let transport = StdioTransport::new(stdout, stdin);
+        let mut capabilities = ClientCapabilities::default();
+        handlers.derive_legacy_capabilities(&mut capabilities);
+        handlers
+            .validate_legacy_capabilities(&capabilities)
+            .expect("scripted legacy callbacks retain their advertised capability contract");
+        let session = ClientSession::try_new(
+            ClientInfo {
+                name: "test-client".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            capabilities,
+            ServerInfo {
+                name: "scripted-server".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ServerCapabilities::default(),
+            PROTOCOL_VERSION.to_string(),
+        )
+        .expect("test client uses the exact legacy protocol version");
+        let mut client = Client::from_parts(
+            child,
+            transport,
+            Cx::for_request(),
+            session,
+            RequestTimeoutPolicy::new(timeout, timeout).unwrap(),
+        );
+        client.reverse_request_handlers = handlers;
+        client
     }
 
     #[cfg(unix)]
@@ -9659,21 +10494,15 @@ mod tests {
             IFS= read -r elicitation; \
             case \"$sampling\" in *'\"model\":\"handler-model\"'*'\"id\":41'*) sampling_ok=true;; *) sampling_ok=false;; esac; \
             case \"$roots\" in *'file:///workspace'*'\"id\":42'*) roots_ok=true;; *) roots_ok=false;; esac; \
-            case \"$elicitation\" in *'\"action\":\"decline\"'*'\"id\":43'*) elicitation_ok=true;; *) elicitation_ok=false;; esac; \
-            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sampling\":%s,\"roots\":%s,\"elicitation\":%s}}\\n' \
-            \"$sampling_ok\" \"$roots_ok\" \"$elicitation_ok\"; exec sleep 2";
-        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
-        assert_eq!(
-            client.selected_protocol_era(),
-            Some(ProtocolEra::Legacy2024)
-        );
+            case \"$elicitation\" in *'\"code\":-32601'*'\"id\":43'*) elicitation_rejected=true;; *) elicitation_rejected=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sampling\":%s,\"roots\":%s,\"elicitationRejected\":%s}}\\n' \
+            \"$sampling_ok\" \"$roots_ok\" \"$elicitation_rejected\"; exec sleep 2";
         let sampling_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let roots_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let elicitation_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let handlers = ReverseRequestHandlers::new()
             .with_sampling_create_message({
                 let sampling_calls = std::sync::Arc::clone(&sampling_calls);
-                move |params| {
+                move |_cancellation, params| {
                     sampling_calls.fetch_add(1, Ordering::Relaxed);
                     assert_eq!(params.max_tokens, 9);
                     Ok(CreateMessageResult::text("handled", "handler-model"))
@@ -9681,22 +10510,19 @@ mod tests {
             })
             .with_roots_list({
                 let roots_calls = std::sync::Arc::clone(&roots_calls);
-                move |_params| {
+                move |_cancellation, _params| {
                     roots_calls.fetch_add(1, Ordering::Relaxed);
                     Ok(ListRootsResult::new(vec![fastmcp_protocol::Root::new(
                         "file:///workspace",
                     )]))
                 }
-            })
-            .with_elicitation_create({
-                let elicitation_calls = std::sync::Arc::clone(&elicitation_calls);
-                move |params| {
-                    elicitation_calls.fetch_add(1, Ordering::Relaxed);
-                    assert_eq!(params.message(), "approval");
-                    Ok(ElicitResult::decline())
-                }
             });
-        client.set_reverse_request_handlers(handlers);
+        let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
+            script,
+            Duration::from_secs(2),
+            handlers,
+        );
+        assert_eq!(client.selected_protocol_era(), Some(ProtocolEra::Legacy2024));
 
         let result: serde_json::Value = client
             .send_request("test/reverse-handlers", serde_json::json!({}))
@@ -9704,13 +10530,260 @@ mod tests {
 
         assert_eq!(
             result,
-            serde_json::json!({"sampling": true, "roots": true, "elicitation": true})
+            serde_json::json!({"sampling": true, "roots": true, "elicitationRejected": true})
         );
         assert_eq!(sampling_calls.load(Ordering::Relaxed), 1);
         assert_eq!(roots_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(elicitation_calls.load(Ordering::Relaxed), 1);
         assert!(client.is_initialized());
         assert!(!client.transport.is_closed());
+        client.close().expect("client cleanup");
+    }
+
+    #[test]
+    fn reverse_callback_cancellation_after_handler_lock_prevents_invocation() {
+        let invoked = Arc::new(AtomicBool::new(false));
+        let handler: Arc<
+            Mutex<
+                Box<
+                    dyn FnMut(ReverseRequestCancellation, ()) -> McpResult<()> + Send,
+                >,
+            >,
+        > = Arc::new(Mutex::new(Box::new({
+            let invoked = Arc::clone(&invoked);
+            move |_cancellation, ()| {
+                invoked.store(true, Ordering::Release);
+                Ok(())
+            }
+        })));
+        let handler_lock = handler.lock().expect("hold the handler before worker acquisition");
+        let cancellation = ReverseRequestCancellation::new();
+        let worker_handler = Arc::clone(&handler);
+        let worker_cancellation = cancellation.clone();
+        let worker = std::thread::spawn(move || {
+            invoke_locked_reverse_request_handler(&worker_handler, worker_cancellation, ())
+        });
+
+        cancellation.cancel();
+        drop(handler_lock);
+
+        let error = worker
+            .join()
+            .expect("callback worker must not panic")
+            .expect_err("cancellation admitted while waiting for the lock must win");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert!(
+            !invoked.load(Ordering::Acquire),
+            "the handler must not run after cancellation wins the lock race"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_sized_reverse_callback_response_preserves_follow_up_alignment() {
+        let script = "IFS= read -r request; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
+            IFS= read -r sampling; \
+            case \"$sampling\" in *'\"id\":41'*'\"model\":\"large-model\"'*) shape_ok=true;; *) shape_ok=false;; esac; \
+            case ${#sampling} in [0-9]|[0-9][0-9]|[0-9][0-9][0-9]|[0-9][0-9][0-9][0-9][0-9]) frame_ok=false;; *) frame_ok=true;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"request\":true,\"frame\":%s,\"shape\":%s}}\\n' \"$frame_ok\" \"$shape_ok\"; \
+            IFS= read -r ping; \
+            case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":3'*) ping_ok=true;; *) ping_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"aligned\":%s}}\\n' \"$ping_ok\"; exec sleep 2";
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message(
+            |_cancellation, _params| {
+                Ok(CreateMessageResult::text("x".repeat(2_048), "large-model"))
+            },
+        );
+        let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
+            script,
+            Duration::from_secs(2),
+            handlers,
+        );
+
+        let first: serde_json::Value = client
+            .send_request("test/protocol-sized-callback", serde_json::json!({}))
+            .expect("a protocol-sized callback response must be framed normally");
+        assert_eq!(
+            first,
+            serde_json::json!({"request": true, "frame": true, "shape": true})
+        );
+        let ping: serde_json::Value = client
+            .send_request("ping", serde_json::json!({}))
+            .expect("the following request remains frame-aligned");
+        assert_eq!(ping, serde_json::json!({"aligned": true}));
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverse_callback_shutdown_is_bounded_and_retains_noncooperative_worker() {
+        let script = "IFS= read -r request; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"request\":true}}\\n'; exec sleep 2";
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            move |_cancellation, _params| {
+                started.store(true, Ordering::Release);
+                while !release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                Ok(CreateMessageResult::text("released", "shutdown-test"))
+            }
+        });
+        let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
+            script,
+            Duration::from_secs(2),
+            handlers,
+        );
+
+        let response: serde_json::Value = client
+            .send_request("test/noncooperative-callback", serde_json::json!({}))
+            .expect("the peer response remains independently readable");
+        assert_eq!(response, serde_json::json!({"request": true}));
+        let start_deadline = Instant::now() + Duration::from_millis(250);
+        while !started.load(Ordering::Acquire) && Instant::now() < start_deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(started.load(Ordering::Acquire), "callback must be running before shutdown");
+
+        let close_started = Instant::now();
+        let error = client
+            .close()
+            .expect_err("a noncooperative callback must bound explicit shutdown");
+        assert_eq!(error.message, REVERSE_CALLBACK_SHUTDOWN_TIMEOUT_ERROR);
+        assert!(
+            close_started.elapsed() < Duration::from_secs(1),
+            "explicit close must return within its callback-shutdown bound"
+        );
+        assert!(
+            !client.reverse_callback_pool.workers.is_empty(),
+            "the timed-out worker remains owned for a later join"
+        );
+        assert!(
+            !client.transport_is_closed(),
+            "a retained worker must not race transport teardown"
+        );
+
+        release.store(true, Ordering::Release);
+        client
+            .close()
+            .expect("released callback is joined before final transport teardown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_legacy_reverse_callback_cancellation_is_observable_without_blocking_reader() {
+        let script = "IFS= read -r request; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":41}}\\n'; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"readerRemainedLive\":true}}\\n'; \
+            IFS= read -r ping; \
+            case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
+            case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":3'*) ping_ok=true;; *) ping_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"ping\":%s}}\\n' \
+            \"$request_ok\" \"$ping_ok\"; exec sleep 2";
+        let observed_cancellation = std::sync::Arc::new(AtomicBool::new(false));
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+            let observed_cancellation = std::sync::Arc::clone(&observed_cancellation);
+            move |cancellation, _params| {
+                while !cancellation.is_cancel_requested() {
+                    std::thread::yield_now();
+                }
+                observed_cancellation.store(true, Ordering::Release);
+                cancellation.checkpoint()?;
+                Ok(CreateMessageResult::text("cancelled", "cancelled"))
+            }
+        });
+        let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
+            script,
+            Duration::from_secs(2),
+            handlers,
+        );
+
+        let result: serde_json::Value = client
+            .send_request("test/reverse-callback-cancellation", serde_json::json!({}))
+            .expect("the sole reader must receive the caller response while the callback waits");
+        assert_eq!(result, serde_json::json!({"readerRemainedLive": true}));
+
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while !observed_cancellation.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            observed_cancellation.load(Ordering::Acquire),
+            "the live callback must observe its matching server cancellation"
+        );
+
+        let ping: serde_json::Value = client
+            .send_request("ping", serde_json::json!({}))
+            .expect("the reader remains usable after callback cancellation");
+        assert_eq!(ping, serde_json::json!({"request": true, "ping": true}));
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_legacy_reverse_callback_foreign_cancellation_does_not_cancel_callback() {
+        // This differs from the admitted cancellation path only by the server
+        // cancellation request ID: 42 is not the live callback's ID 41.
+        let script = "IFS= read -r request; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":42}}\\n'; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"readerRemainedLive\":true}}\\n'; \
+            IFS= read -r ping; \
+            IFS= read -r callback; \
+            case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
+            case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":3'*) ping_ok=true;; *) ping_ok=false;; esac; \
+            case \"$callback\" in *'\"id\":41'*'\"model\":\"uncancelled\"'*) callback_ok=true;; *) callback_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"ping\":%s,\"callback\":%s}}\\n' \
+            \"$request_ok\" \"$ping_ok\" \"$callback_ok\"; exec sleep 2";
+        let release_callback = std::sync::Arc::new(AtomicBool::new(false));
+        let observed_foreign_cancellation = std::sync::Arc::new(AtomicBool::new(false));
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+            let release_callback = std::sync::Arc::clone(&release_callback);
+            let observed_foreign_cancellation =
+                std::sync::Arc::clone(&observed_foreign_cancellation);
+            move |cancellation, _params| {
+                while !release_callback.load(Ordering::Acquire) {
+                    if cancellation.is_cancel_requested() {
+                        observed_foreign_cancellation.store(true, Ordering::Release);
+                        return Err(McpError::request_cancelled());
+                    }
+                    std::thread::yield_now();
+                }
+                assert!(
+                    !cancellation.is_cancel_requested(),
+                    "a foreign cancellation ID must not affect this callback"
+                );
+                Ok(CreateMessageResult::text("handled", "uncancelled"))
+            }
+        });
+        let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
+            script,
+            Duration::from_secs(2),
+            handlers,
+        );
+
+        let result: serde_json::Value = client
+            .send_request("test/reverse-callback-cancellation", serde_json::json!({}))
+            .expect("a foreign cancellation must not block the caller response");
+        assert_eq!(result, serde_json::json!({"readerRemainedLive": true}));
+        release_callback.store(true, Ordering::Release);
+
+        let ping: serde_json::Value = client
+            .send_request("ping", serde_json::json!({}))
+            .expect("the uncancelled callback response and later ping remain aligned");
+        assert_eq!(
+            ping,
+            serde_json::json!({"request": true, "ping": true, "callback": true})
+        );
+        assert!(
+            !observed_foreign_cancellation.load(Ordering::Acquire),
+            "only the cancellation request ID differs from the admitted path"
+        );
         client.close().expect("client cleanup");
     }
 
@@ -9738,35 +10811,6 @@ mod tests {
             client.selected_protocol_era(),
             Some(ProtocolEra::Modern2026)
         );
-        let sampling_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let roots_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let elicitation_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let handlers = ReverseRequestHandlers::new()
-            .with_sampling_create_message({
-                let sampling_calls = std::sync::Arc::clone(&sampling_calls);
-                move |_params| {
-                    sampling_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(CreateMessageResult::text("handled", "handler-model"))
-                }
-            })
-            .with_roots_list({
-                let roots_calls = std::sync::Arc::clone(&roots_calls);
-                move |_params| {
-                    roots_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(ListRootsResult::new(vec![fastmcp_protocol::Root::new(
-                        "file:///workspace",
-                    )]))
-                }
-            })
-            .with_elicitation_create({
-                let elicitation_calls = std::sync::Arc::clone(&elicitation_calls);
-                move |_params| {
-                    elicitation_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(ElicitResult::decline())
-                }
-            });
-        client.set_reverse_request_handlers(handlers);
-
         let result: serde_json::Value = client
             .send_request("test/reverse-handlers", serde_json::json!({}))
             .expect("modern rejection of legacy reverse requests must keep the session aligned");
@@ -9778,21 +10822,6 @@ mod tests {
                 "rootsRejected": true,
                 "elicitationRejected": true
             })
-        );
-        assert_eq!(
-            sampling_calls.load(Ordering::Relaxed),
-            0,
-            "modern rejection must not invoke the sampling callback"
-        );
-        assert_eq!(
-            roots_calls.load(Ordering::Relaxed),
-            0,
-            "modern rejection must not invoke the roots callback"
-        );
-        assert_eq!(
-            elicitation_calls.load(Ordering::Relaxed),
-            0,
-            "modern rejection must not invoke the elicitation callback"
         );
         assert!(client.is_initialized());
         assert!(!client.transport.is_closed());
@@ -9810,33 +10839,25 @@ mod tests {
             IFS= read -r sampling; \
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"roots/list\",\"id\":42}\\n'; \
             IFS= read -r roots; \
-            printf '{\"jsonrpc\":\"2.0\",\"method\":\"elicitation/create\",\"id\":43,\"params\":{\"mode\":\"form\",\"message\":\"approval\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}}\\n'; \
-            IFS= read -r elicitation; \
             case \"$sampling\" in *'\"model\":\"handler-model\"'*'\"id\":41'*) sampling_ok=true;; *) sampling_ok=false;; esac; \
             case \"$roots\" in *'\"code\":-32601'*'\"id\":42'*) roots_missing=true;; *) roots_missing=false;; esac; \
-            case \"$elicitation\" in *'\"action\":\"decline\"'*'\"id\":43'*) elicitation_ok=true;; *) elicitation_ok=false;; esac; \
-            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sampling\":%s,\"rootsMissing\":%s,\"elicitation\":%s}}\\n' \
-            \"$sampling_ok\" \"$roots_missing\" \"$elicitation_ok\"; exec sleep 2";
-        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sampling\":%s,\"rootsMissing\":%s}}\\n' \
+            \"$sampling_ok\" \"$roots_missing\"; exec sleep 2";
         let sampling_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let roots_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let elicitation_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let handlers = ReverseRequestHandlers::new()
             .with_sampling_create_message({
                 let sampling_calls = std::sync::Arc::clone(&sampling_calls);
-                move |_params| {
+                move |_cancellation, _params| {
                     sampling_calls.fetch_add(1, Ordering::Relaxed);
                     Ok(CreateMessageResult::text("handled", "handler-model"))
                 }
-            })
-            .with_elicitation_create({
-                let elicitation_calls = std::sync::Arc::clone(&elicitation_calls);
-                move |_params| {
-                    elicitation_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(ElicitResult::decline())
-                }
             });
-        client.set_reverse_request_handlers(handlers);
+        let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
+            script,
+            Duration::from_secs(2),
+            handlers,
+        );
 
         let result: serde_json::Value = client
             .send_request("test/reverse-handlers", serde_json::json!({}))
@@ -9844,7 +10865,7 @@ mod tests {
 
         assert_eq!(
             result,
-            serde_json::json!({"sampling": true, "rootsMissing": true, "elicitation": true})
+            serde_json::json!({"sampling": true, "rootsMissing": true})
         );
         assert_eq!(sampling_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
@@ -9852,7 +10873,6 @@ mod tests {
             0,
             "missing handler must leave state unchanged"
         );
-        assert_eq!(elicitation_calls.load(Ordering::Relaxed), 1);
         assert!(client.is_initialized());
         assert!(!client.transport.is_closed());
         assert_eq!(client.responses.pending_len(), 0);
@@ -14694,7 +15714,7 @@ mod tests {
     #[test]
     fn clt_01_completion_client_result_positive() {
         let script = modern_completion_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","completion":{"values":["staging"],"total":1,"hasMore":false}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","completion":{"values":["staging"],"total":922337203685477580812345678901234567890,"hasMore":false}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -14712,7 +15732,11 @@ mod tests {
         };
         assert!(diagnostic.is_none());
         assert_eq!(result.payload.completion.values, vec!["staging".to_owned()]);
-        assert_eq!(result.payload.completion.total, Some(1));
+        let expected_total = serde_json::from_str::<JsonInteger>(
+            "922337203685477580812345678901234567890",
+        )
+        .expect("arbitrary-precision completion total is an exact JSON integer");
+        assert_eq!(result.payload.completion.total, Some(expected_total));
         assert_eq!(result.payload.completion.has_more, Some(false));
         client.close().expect("modern client cleanup");
     }
@@ -15467,7 +16491,11 @@ mod tests {
             panic!("legacy completion must not require a final result discriminator");
         };
         assert_eq!(result.completion.values, vec!["staging".to_owned()]);
-        assert_eq!(result.completion.total, Some(1));
+        assert_eq!(
+            result.completion.total,
+            Some(JsonInteger::from(1_i64)),
+            "legacy completion total remains an explicit JSON integer"
+        );
         assert_eq!(result.completion.has_more, Some(false));
         client.close().expect("legacy client cleanup");
     }

@@ -14,13 +14,14 @@ use std::time::Instant;
 use asupersync::Cx;
 use asupersync::bytes::Buf;
 use asupersync::channel::oneshot;
-use asupersync::http::Body;
+use asupersync::http::{Body, Frame};
 use asupersync::http::h1::http_client::ClientIo;
 use asupersync::http::h1::{
     ClientError, ClientStreamingResponse, HttpClient, Method, RedirectPolicy, RetryPolicy,
 };
 use fastmcp_protocol::extensions::{
-    McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID, OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+    ExtensionDirection, McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID,
+    OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
 };
 use fastmcp_protocol::methods::{
     Final2026Direction, Final2026EnvelopeKind, PROMPTS_GET, RESOURCES_READ, SUBSCRIPTIONS_LISTEN,
@@ -30,24 +31,30 @@ use fastmcp_protocol::protocol_policy::{
     HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
 };
 use fastmcp_protocol::tasks_extension::{
-    TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY,
+    CancelTaskParams as FinalCancelTaskParams, CancelTaskResult as FinalCancelTaskResult,
+    GetTaskParams as FinalGetTaskParams, GetTaskResult as FinalGetTaskResult,
+    Task as FinalTask, TaskId as FinalTaskId, TaskInputLedger,
+    TaskInputResponses as FinalTaskInputResponses, TaskMethodRequest, TaskRequestMeta,
+    UpdateTaskParams as FinalUpdateTaskParams, UpdateTaskResult as FinalUpdateTaskResult,
+    TASK_CANCEL, TASK_GET, TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY, TASK_UPDATE,
     TaskStatusNotification as FinalTaskStatusNotification,
 };
 use fastmcp_protocol::{
-    ClientCapabilities, ClientInfo, CompleteResult, CoreDispatchError, CoreRequest, CoreResult,
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalNotificationError, FinalRequestMeta,
-    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
-    JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
-    SERVER_DISCOVER, ServerDiscoverResult, ServerNotification, SubscriptionFilter,
-    decode_strict_jsonrpc_message, decode_strict_jsonrpc_response, task_subscription_ids,
+    CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo, CompleteResult,
+    CoreDispatchError, CoreRequest, CoreResult, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult,
+    FinalNotificationError, FinalRequestMeta, FinalSubscriptionsAcknowledgedNotificationParams,
+    FinalSubscriptionsListenResult, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification,
+    SubscriptionFilter, decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
+    task_subscription_ids,
 };
 
 use crate::session::resolve_mcp_apps_activation;
 use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError};
 use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
-    ClientProtocolPlan, FinalToolCallOutcome, admit_final_tasks_discovery_surface,
-    admit_final_tasks_result_discriminator,
+    ClientProtocolPlan, FinalToolCallOutcome, ReverseRequestCancellation, ReverseRequestHandlers,
+    admit_final_tasks_discovery_surface, admit_final_tasks_result_discriminator,
 };
 
 /// Exact request headers required for a modern MCP JSON-RPC POST.
@@ -73,6 +80,14 @@ const MAX_LEGACY_SSE_MESSAGE_BYTES: usize = 64 * 1024;
 /// Maximum server notifications retained while one legacy request waits for
 /// its correlated terminal response.
 const MAX_QUEUED_LEGACY_NOTIFICATIONS: usize = 64;
+
+/// Maximum terminal response IDs retained after server-authorized cancellation.
+///
+/// A legacy SSE peer can deliver the cancelled request's terminal response only
+/// after the caller has already received `notifications/cancelled`. Retaining a
+/// bounded tombstone lets the next request discard that late terminal frame
+/// without misaligning the shared SSE stream.
+const MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS: usize = 64;
 
 /// Final-only metadata keys that exact 2024-11-05 public requests must reject
 /// before opening their legacy message POST.
@@ -432,8 +447,21 @@ impl ModernHttpResponseStream {
                             )?;
                             notifications.push(notification);
                         }
-                        notification @ (ServerNotification::Progress(_)
-                        | ServerNotification::Message(_)) => notifications.push(notification),
+                        ServerNotification::Progress(_) | ServerNotification::Message(_) => {
+                            // `subscriptions/listen` admits only the categories
+                            // explicitly established by its first acknowledgement.
+                            // Progress and log notifications belong to the
+                            // request-scoped response stream of the request that
+                            // opted into them; they are never subscription events.
+                            if accepted_filter.is_none() {
+                                return Err(
+                                    ModernHttpSubscriptionListenError::EventBeforeAcknowledgement,
+                                );
+                            }
+                            return Err(
+                                ModernHttpSubscriptionListenError::EventOutsideAcceptedFilter,
+                            );
+                        }
                     }
                 }
             }
@@ -470,12 +498,10 @@ impl ModernHttpResponseStream {
             })
             .await;
             let frame = frame.map_err(|()| ModernHttpExecutorError::Cancelled)?;
+            let frame = reject_body_frame_after_cancellation(cx, frame)?;
             let Some(frame) = frame else {
                 break;
             };
-            if cx.checkpoint().is_err() {
-                return Err(ModernHttpExecutorError::Cancelled);
-            }
             let Some(mut data) = frame
                 .map_err(|_| ModernHttpExecutorError::ResponseBodyReadFailed)?
                 .into_data()
@@ -563,6 +589,14 @@ impl ModernHttpSseResponseStream {
                     return Err(ModernHttpExecutorError::Cancelled);
                 }
             };
+            let frame = match reject_body_frame_after_cancellation(cx, frame) {
+                Ok(frame) => frame,
+                Err(ModernHttpExecutorError::Cancelled) => {
+                    self.close_response_for_cancellation();
+                    return Err(ModernHttpExecutorError::Cancelled);
+                }
+                Err(error) => return Err(error),
+            };
             let Some(frame) = frame else {
                 let parser = self
                     .parser
@@ -573,10 +607,6 @@ impl ModernHttpSseResponseStream {
                 self.end_of_stream = Some(end_of_stream);
                 return Ok(None);
             };
-            if cx.checkpoint().is_err() {
-                self.close_response_for_cancellation();
-                return Err(ModernHttpExecutorError::Cancelled);
-            }
             let Some(mut data) = frame
                 .map_err(|_| ModernHttpExecutorError::ResponseBodyReadFailed)?
                 .into_data()
@@ -1279,6 +1309,9 @@ pub enum ClientHttpConnection {
     LegacySse {
         client: LegacySseHttpClient,
         negotiated_protocol_version: Option<String>,
+        client_capabilities: ClientCapabilities,
+        reverse_request_handlers: ReverseRequestHandlers,
+        cancelled_response_ids: VecDeque<RequestId>,
     },
 }
 
@@ -1306,6 +1339,15 @@ pub enum ClientHttpConnectionError {
         expected: RequestId,
         actual: Option<RequestId>,
     },
+    /// The exact legacy server cancelled the request currently awaiting its
+    /// correlated response.
+    LegacyRequestCancelled { request_id: RequestId },
+    /// Too many late terminal response IDs remain after cancelled legacy
+    /// requests, so accepting another cancellation would lose stream alignment.
+    LegacyCancelledResponseQueueFull,
+    /// The caller attempted to reuse an ID whose cancelled legacy terminal
+    /// response has not yet been drained from the shared SSE stream.
+    LegacyCancelledRequestStillDraining { request_id: RequestId },
     /// A public legacy request attempted to carry final-only metadata.
     LegacyFinalMetadata { member: &'static str },
     /// Too many interleaved legacy notifications accumulated before a response.
@@ -1341,6 +1383,8 @@ pub enum ClientHttpConnectionError {
     SubscriptionsListen(ModernHttpSubscriptionListenError),
     /// Final Tasks-backed `tools/call` requires the modern HTTP transport.
     FinalToolCallRequiresModern,
+    /// Official final Tasks lifecycle methods require the modern HTTP transport.
+    FinalTasksRequiresModern { method: &'static str },
 }
 
 impl fmt::Display for ClientHttpConnectionError {
@@ -1366,6 +1410,19 @@ impl fmt::Display for ClientHttpConnectionError {
                     "legacy SSE response ID {actual:?} did not match request {expected:?}"
                 )
             }
+            Self::LegacyRequestCancelled { request_id } => {
+                write!(
+                    formatter,
+                    "legacy SSE server cancellation matched active request {request_id:?}"
+                )
+            }
+            Self::LegacyCancelledResponseQueueFull => formatter.write_str(
+                "legacy SSE retained too many cancelled response IDs before their terminal frames arrived",
+            ),
+            Self::LegacyCancelledRequestStillDraining { request_id } => write!(
+                formatter,
+                "legacy request ID {request_id:?} cannot be reused before its cancelled terminal response is drained",
+            ),
             Self::LegacyFinalMetadata { member } => write!(
                 formatter,
                 "exact legacy request cannot carry final-only metadata member {member}"
@@ -1410,6 +1467,9 @@ impl fmt::Display for ClientHttpConnectionError {
             Self::SubscriptionsListen(error) => error.fmt(formatter),
             Self::FinalToolCallRequiresModern => formatter
                 .write_str("final Tasks-backed tools/call requires the modern HTTP transport"),
+            Self::FinalTasksRequiresModern { method } => {
+                write!(formatter, "final {method} requires the modern HTTP transport")
+            }
         }
     }
 }
@@ -1422,6 +1482,9 @@ impl std::error::Error for ClientHttpConnectionError {
             Self::LegacyResponseStreamEnded { .. }
             | Self::LegacyUnexpectedMessage { .. }
             | Self::LegacyResponseIdMismatch { .. }
+            | Self::LegacyRequestCancelled { .. }
+            | Self::LegacyCancelledResponseQueueFull
+            | Self::LegacyCancelledRequestStillDraining { .. }
             | Self::LegacyFinalMetadata { .. }
             | Self::LegacyNotificationQueueFull
             | Self::ExpectedJsonResponse { .. }
@@ -1432,7 +1495,8 @@ impl std::error::Error for ClientHttpConnectionError {
             | Self::ModernCancellationRequiresResponseClose
             | Self::ModernClientNotificationPostUnsupported { .. }
             | Self::SubscriptionsListenRequiresModern
-            | Self::FinalToolCallRequiresModern => None,
+            | Self::FinalToolCallRequiresModern
+            | Self::FinalTasksRequiresModern { .. } => None,
             Self::ResponseAdmission(error) => Some(error),
             Self::SubscriptionsListen(error) => Some(error),
         }
@@ -1607,7 +1671,9 @@ impl ClientHttpConnection {
                             });
                         }
                         JsonRpcMessage::Response(response) => {
-                            if response.id.as_ref() != Some(&request_id) {
+                            if !response.id.as_ref().is_some_and(|response_id| {
+                                response_id.correlates_with(&request_id)
+                            }) {
                                 return Err(ClientHttpConnectionError::LegacyResponseIdMismatch {
                                     expected: request_id,
                                     actual: response.id,
@@ -1729,7 +1795,9 @@ impl ClientHttpConnection {
                         JsonRpcAdmissionError::InvalidEnvelope,
                     ));
                 }
-                if response.id.as_ref() != Some(&request_id) {
+                if !response.id.as_ref().is_some_and(|response_id| {
+                    response_id.correlates_with(&request_id)
+                }) {
                     return Err(ClientHttpConnectionError::ResponseIdMismatch {
                         expected: request_id,
                         actual: response.id,
@@ -1762,6 +1830,82 @@ impl ClientHttpConnection {
             Self::LegacySse { .. } => {
                 Err(ClientHttpConnectionError::SubscriptionsListenRequiresModern)
             }
+        }
+    }
+
+    /// Reads one task through the official final Tasks extension.
+    ///
+    /// An exact MCP 2024-11-05 connection rejects this before opening its
+    /// legacy message endpoint. A modern connection performs version and
+    /// bilateral extension admission before its native POST.
+    pub async fn get_task_final(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        task_id: FinalTaskId,
+        maximum_response_bytes: usize,
+    ) -> Result<FinalGetTaskResult, ClientHttpConnectionError> {
+        match self {
+            Self::Modern(client) => client
+                .get_task_final(cx, request_id, task_id, maximum_response_bytes)
+                .await
+                .map_err(ClientHttpConnectionError::Modern),
+            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalTasksRequiresModern {
+                method: TASK_GET,
+            }),
+        }
+    }
+
+    /// Supplies responses for one final input-required task through the
+    /// official Tasks extension.
+    ///
+    /// An exact MCP 2024-11-05 connection rejects this before opening its
+    /// legacy message endpoint. A modern connection validates the retained
+    /// task input ledger before its native POST.
+    pub async fn update_task_final(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        task: &FinalTask,
+        input_responses: FinalTaskInputResponses,
+        maximum_response_bytes: usize,
+    ) -> Result<FinalUpdateTaskResult, ClientHttpConnectionError> {
+        match self {
+            Self::Modern(client) => client
+                .update_task_final(
+                    cx,
+                    request_id,
+                    task,
+                    input_responses,
+                    maximum_response_bytes,
+                )
+                .await
+                .map_err(ClientHttpConnectionError::Modern),
+            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalTasksRequiresModern {
+                method: TASK_UPDATE,
+            }),
+        }
+    }
+
+    /// Requests cancellation through the official final Tasks extension.
+    ///
+    /// An exact MCP 2024-11-05 connection rejects this before opening its
+    /// legacy message endpoint.
+    pub async fn cancel_task_final(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        task_id: FinalTaskId,
+        maximum_response_bytes: usize,
+    ) -> Result<FinalCancelTaskResult, ClientHttpConnectionError> {
+        match self {
+            Self::Modern(client) => client
+                .cancel_task_final(cx, request_id, task_id, maximum_response_bytes)
+                .await
+                .map_err(ClientHttpConnectionError::Modern),
+            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalTasksRequiresModern {
+                method: TASK_CANCEL,
+            }),
         }
     }
 
@@ -1893,6 +2037,58 @@ pub enum ModernHttpClientError {
     /// The retained discovery response did not admit the official Tasks
     /// result discriminator with exact bilateral empty settings.
     TasksNegotiation,
+    /// The retained final discovery response did not bilaterally admit this
+    /// official Tasks lifecycle method with exact empty settings.
+    TasksMethodNegotiation { method: &'static str },
+    /// The caller supplied an invalid JSON-RPC correlation key for an official
+    /// final Tasks lifecycle request.
+    InvalidTasksRequestId { method: &'static str },
+    /// Constructing or validating the exact official Tasks request failed
+    /// before any native HTTP exchange began.
+    TasksRequestEncoding { method: &'static str },
+    /// `tasks/update` requires an `input_required` task returned by this peer.
+    TasksUpdateRequiresInputRequired,
+    /// `tasks/update` responses did not match the retained task input ledger.
+    TasksUpdateInputMismatch,
+    /// A final Tasks response body was not one strictly admitted JSON-RPC
+    /// response envelope.
+    InvalidTasksJsonRpcResponse {
+        /// Exact official Tasks method that received the malformed response.
+        method: &'static str,
+        /// The strict admission failure.
+        error: JsonRpcAdmissionError,
+    },
+    /// A final Tasks response did not retain the outgoing request ID.
+    TasksResponseIdMismatch {
+        /// Exact official Tasks method that received the contradictory response.
+        method: &'static str,
+        /// The immutable outgoing request ID.
+        expected: RequestId,
+        /// The response ID observed on the wire.
+        actual: Option<RequestId>,
+    },
+    /// The server returned a JSON-RPC error to an official Tasks lifecycle request.
+    TasksRemoteError {
+        /// Exact official Tasks method that received the error.
+        method: &'static str,
+        /// Server-provided JSON-RPC code.
+        code: i32,
+        /// Server-provided JSON-RPC message.
+        message: String,
+    },
+    /// A successful official Tasks lifecycle response did not contain a
+    /// lossless result payload.
+    TasksResultMissing { method: &'static str },
+    /// A successful official Tasks lifecycle response did not match its exact
+    /// typed result envelope.
+    TasksResultDecode { method: &'static str },
+    /// `tasks/get` returned a task ID other than the one requested.
+    TasksGetIdMismatch {
+        /// Task ID retained from the outgoing request.
+        expected: FinalTaskId,
+        /// Task ID decoded from the peer result.
+        actual: FinalTaskId,
+    },
     /// The finite response body was not one strictly admitted JSON-RPC message.
     InvalidJsonRpcResponse(JsonRpcAdmissionError),
     /// The server returned a response for a different request.
@@ -1962,6 +2158,52 @@ impl fmt::Display for ModernHttpClientError {
             }
             Self::TasksNegotiation => formatter
                 .write_str("final HTTP tools/call Tasks result was not bilaterally negotiated"),
+            Self::TasksMethodNegotiation { method } => write!(
+                formatter,
+                "final HTTP {method} was not bilaterally admitted by the official Tasks extension"
+            ),
+            Self::InvalidTasksRequestId { method } => {
+                write!(formatter, "final HTTP {method} requires a valid JSON-RPC request ID")
+            }
+            Self::TasksRequestEncoding { method } => {
+                write!(formatter, "final HTTP {method} request encoding failed")
+            }
+            Self::TasksUpdateRequiresInputRequired => {
+                formatter.write_str("tasks/update requires an input_required final task")
+            }
+            Self::TasksUpdateInputMismatch => formatter.write_str(
+                "tasks/update inputResponses do not match the retained task input requests",
+            ),
+            Self::InvalidTasksJsonRpcResponse { method, error } => write!(
+                formatter,
+                "final HTTP {method} response failed JSON-RPC admission: {error}"
+            ),
+            Self::TasksResponseIdMismatch {
+                method,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "final HTTP {method} response ID {actual:?} did not match request {expected:?}"
+            ),
+            Self::TasksRemoteError {
+                method,
+                code,
+                message,
+            } => write!(
+                formatter,
+                "final HTTP {method} failed with JSON-RPC {code}: {message}"
+            ),
+            Self::TasksResultMissing { method } => {
+                write!(formatter, "final HTTP {method} response omitted its result")
+            }
+            Self::TasksResultDecode { method } => {
+                write!(formatter, "final HTTP {method} result is invalid")
+            }
+            Self::TasksGetIdMismatch { expected, actual } => write!(
+                formatter,
+                "final HTTP tasks/get returned task ID {actual:?}, expected {expected:?}"
+            ),
             Self::InvalidJsonRpcResponse(error) => {
                 write!(
                     formatter,
@@ -1994,6 +2236,7 @@ impl std::error::Error for ModernHttpClientError {
             Self::Executor(error) => Some(error),
             Self::Negotiation(error) => Some(error),
             Self::LegacySse(error) => Some(error),
+            Self::InvalidTasksJsonRpcResponse { error, .. } => Some(error),
             Self::InvalidJsonRpcResponse(error) => Some(error),
             Self::TypedResult(error) => Some(error),
             Self::MissingModernPostTarget
@@ -2010,6 +2253,16 @@ impl std::error::Error for ModernHttpClientError {
             | Self::DiscoveryDoesNotAdvertiseModernProtocol
             | Self::InvalidRequestId
             | Self::TasksNegotiation
+            | Self::TasksMethodNegotiation { .. }
+            | Self::InvalidTasksRequestId { .. }
+            | Self::TasksRequestEncoding { .. }
+            | Self::TasksUpdateRequiresInputRequired
+            | Self::TasksUpdateInputMismatch
+            | Self::TasksResponseIdMismatch { .. }
+            | Self::TasksRemoteError { .. }
+            | Self::TasksResultMissing { .. }
+            | Self::TasksResultDecode { .. }
+            | Self::TasksGetIdMismatch { .. }
             | Self::ResponseIdMismatch { .. }
             | Self::RemoteError { .. }
             | Self::UnexpectedToolCallResult => None,
@@ -2157,6 +2410,7 @@ impl ModernHttpClient {
         request_id: Option<RequestId>,
     ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
         let method = method.as_ref();
+        validate_final_method(method, request_id.is_some())?;
         if request_id.is_none() {
             return Err(ModernHttpClientError::ClientNotificationPostUnsupported {
                 method: method.to_owned(),
@@ -2296,7 +2550,9 @@ impl ModernHttpClient {
             ));
         }
         let (_, result_source) = admission.into_parts();
-        if response.id.as_ref() != Some(&request_id) {
+        if !response.id.as_ref().is_some_and(|response_id| {
+            response_id.correlates_with(&request_id)
+        }) {
             return Err(ModernHttpClientError::ResponseIdMismatch {
                 expected: request_id,
                 actual: response.id,
@@ -2326,6 +2582,292 @@ impl ModernHttpClient {
             }
             _ => Err(ModernHttpClientError::UnexpectedToolCallResult),
         }
+    }
+
+    /// Reads one task through the negotiated official Tasks extension.
+    ///
+    /// This rejects before a native POST when the retained discovery response
+    /// did not select MCP 2026-07-28 or did not bilaterally admit
+    /// `tasks/get` with exact empty extension settings.
+    pub async fn get_task_final(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        task_id: FinalTaskId,
+        maximum_response_bytes: usize,
+    ) -> Result<FinalGetTaskResult, ModernHttpClientError> {
+        let (request_meta, client_extensions) = self.prepare_final_tasks_method(TASK_GET)?;
+        let wire = TaskMethodRequest::new(
+            request_id.clone(),
+            TASK_GET,
+            FinalGetTaskParams {
+                request: request_meta,
+                task_id: task_id.clone(),
+            },
+        );
+        let wire = TaskMethodRequest::decode(
+            serde_json::to_value(wire)
+                .map_err(|_| ModernHttpClientError::TasksRequestEncoding { method: TASK_GET })?,
+        )
+        .map_err(|_| ModernHttpClientError::TasksRequestEncoding { method: TASK_GET })?;
+        let parameters = serde_json::to_value(wire.params)
+            .map_err(|_| ModernHttpClientError::TasksRequestEncoding { method: TASK_GET })?;
+        let result: FinalGetTaskResult = self
+            .send_final_tasks_request(
+                cx,
+                TASK_GET,
+                request_id,
+                parameters,
+                &client_extensions,
+                maximum_response_bytes,
+            )
+            .await?;
+        let actual = result.task.base().task_id.clone();
+        if actual != task_id {
+            return Err(ModernHttpClientError::TasksGetIdMismatch {
+                expected: task_id,
+                actual,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Supplies responses for the exact input requests retained by one final
+    /// `input_required` task through the official Tasks extension.
+    ///
+    /// The request is rejected before a native POST unless the task is an
+    /// admitted input-required task and `inputResponses` exactly matches its
+    /// retained input ledger.
+    pub async fn update_task_final(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        task: &FinalTask,
+        input_responses: FinalTaskInputResponses,
+        maximum_response_bytes: usize,
+    ) -> Result<FinalUpdateTaskResult, ModernHttpClientError> {
+        let (request_meta, client_extensions) = self.prepare_final_tasks_method(TASK_UPDATE)?;
+        let FinalTask::InputRequired {
+            base,
+            input_requests,
+        } = task
+        else {
+            return Err(ModernHttpClientError::TasksUpdateRequiresInputRequired);
+        };
+        let ledger = TaskInputLedger::from_requests(input_requests)
+            .map_err(|_| ModernHttpClientError::TasksUpdateInputMismatch)?;
+        ledger
+            .validate_responses(&input_responses)
+            .map_err(|_| ModernHttpClientError::TasksUpdateInputMismatch)?;
+
+        let wire = TaskMethodRequest::new(
+            request_id.clone(),
+            TASK_UPDATE,
+            FinalUpdateTaskParams {
+                request: request_meta,
+                task_id: base.task_id.clone(),
+                input_responses,
+            },
+        );
+        let wire = TaskMethodRequest::decode_update(
+            serde_json::to_value(wire).map_err(|_| {
+                ModernHttpClientError::TasksRequestEncoding {
+                    method: TASK_UPDATE,
+                }
+            })?,
+            &ledger,
+        )
+        .map_err(|_| ModernHttpClientError::TasksRequestEncoding {
+            method: TASK_UPDATE,
+        })?;
+        let parameters = serde_json::to_value(wire.params).map_err(|_| {
+            ModernHttpClientError::TasksRequestEncoding {
+                method: TASK_UPDATE,
+            }
+        })?;
+        self.send_final_tasks_request(
+            cx,
+            TASK_UPDATE,
+            request_id,
+            parameters,
+            &client_extensions,
+            maximum_response_bytes,
+        )
+        .await
+    }
+
+    /// Requests cancellation through the negotiated official Tasks extension.
+    ///
+    /// The response preserves the exact empty final `complete` acknowledgement
+    /// rather than projecting a task snapshot.
+    pub async fn cancel_task_final(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        task_id: FinalTaskId,
+        maximum_response_bytes: usize,
+    ) -> Result<FinalCancelTaskResult, ModernHttpClientError> {
+        let (request_meta, client_extensions) = self.prepare_final_tasks_method(TASK_CANCEL)?;
+        let wire = TaskMethodRequest::new(
+            request_id.clone(),
+            TASK_CANCEL,
+            FinalCancelTaskParams {
+                request: request_meta,
+                task_id,
+            },
+        );
+        let wire = TaskMethodRequest::decode_cancel(
+            serde_json::to_value(wire).map_err(|_| {
+                ModernHttpClientError::TasksRequestEncoding {
+                    method: TASK_CANCEL,
+                }
+            })?,
+        )
+        .map_err(|_| ModernHttpClientError::TasksRequestEncoding {
+            method: TASK_CANCEL,
+        })?;
+        let parameters = serde_json::to_value(wire.params).map_err(|_| {
+            ModernHttpClientError::TasksRequestEncoding {
+                method: TASK_CANCEL,
+            }
+        })?;
+        self.send_final_tasks_request(
+            cx,
+            TASK_CANCEL,
+            request_id,
+            parameters,
+            &client_extensions,
+            maximum_response_bytes,
+        )
+        .await
+    }
+
+    /// Proves the selected final version and exact bilateral Tasks admission
+    /// before constructing an extension request. The returned metadata and
+    /// extension map are then shared by the typed wire validator and native
+    /// HTTP request constructor.
+    fn prepare_final_tasks_method(
+        &self,
+        method: &'static str,
+    ) -> Result<(TaskRequestMeta, BTreeMap<String, serde_json::Value>), ModernHttpClientError>
+    {
+        if !self
+            .server_discovery
+            .supported_versions()
+            .iter()
+            .any(|version| version == MODERN_PROTOCOL_VERSION)
+        {
+            return Err(ModernHttpClientError::DiscoveryDoesNotAdvertiseModernProtocol);
+        }
+        admit_final_tasks_discovery_surface(
+            &self.server_discovery,
+            method,
+            ExtensionDirection::ClientToServer,
+        )
+        .map_err(|_| ModernHttpClientError::TasksMethodNegotiation { method })?;
+
+        let tasks_extension = BTreeMap::from([(
+            fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+            serde_json::json!({}),
+        )]);
+        let client_extensions = merge_client_extensions(
+            self.active_mcp_apps_settings(),
+            Some(&tasks_extension),
+        )
+        .ok_or(ModernHttpClientError::TasksRequestEncoding { method })?;
+        let mut final_metadata = FinalRequestMeta::new(self.client_capabilities.clone());
+        final_metadata.client_info = Some(self.client_info.clone());
+        let mut metadata = serde_json::to_value(final_metadata)
+            .map_err(|_| ModernHttpClientError::TasksRequestEncoding { method })?;
+        let capabilities = metadata
+            .as_object_mut()
+            .and_then(|metadata| {
+                metadata.get_mut(fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY)
+            })
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or(ModernHttpClientError::TasksRequestEncoding { method })?;
+        capabilities.insert(
+            "extensions".to_owned(),
+            serde_json::Value::Object(client_extensions.clone().into_iter().collect()),
+        );
+        let meta = serde_json::from_value(metadata)
+            .map_err(|_| ModernHttpClientError::TasksRequestEncoding { method })?;
+        Ok((TaskRequestMeta { meta }, client_extensions))
+    }
+
+    async fn send_final_tasks_request<R>(
+        &self,
+        cx: &Cx,
+        method: &'static str,
+        request_id: RequestId,
+        parameters: serde_json::Value,
+        client_extensions: &BTreeMap<String, serde_json::Value>,
+        maximum_response_bytes: usize,
+    ) -> Result<R, ModernHttpClientError>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        if request_id.validate().is_err() {
+            return Err(ModernHttpClientError::InvalidTasksRequestId { method });
+        }
+        let request = build_modern_tasks_request(
+            &self.modern_post_target,
+            &self.client_info,
+            &self.client_capabilities,
+            method,
+            parameters,
+            request_id.clone(),
+            client_extensions,
+        )?;
+        let response = self
+            .executor
+            .execute(cx, &request)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        let body = response
+            .read_to_end(cx, maximum_response_bytes)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        let message = decode_strict_jsonrpc_message(&body, maximum_response_bytes).map_err(|error| {
+            ModernHttpClientError::InvalidTasksJsonRpcResponse { method, error }
+        })?;
+        let JsonRpcMessage::Response(response) = message else {
+            return Err(ModernHttpClientError::InvalidTasksJsonRpcResponse {
+                method,
+                error: JsonRpcAdmissionError::InvalidEnvelope,
+            });
+        };
+        let admission = decode_strict_jsonrpc_response(&body, maximum_response_bytes).map_err(
+            |error| ModernHttpClientError::InvalidTasksJsonRpcResponse { method, error },
+        )?;
+        if admission.response() != &response {
+            return Err(ModernHttpClientError::InvalidTasksJsonRpcResponse {
+                method,
+                error: JsonRpcAdmissionError::InvalidEnvelope,
+            });
+        }
+        if !response.id.as_ref().is_some_and(|response_id| {
+            response_id.correlates_with(&request_id)
+        }) {
+            return Err(ModernHttpClientError::TasksResponseIdMismatch {
+                method,
+                expected: request_id,
+                actual: response.id,
+            });
+        }
+        if let Some(error) = response.error.as_ref() {
+            return Err(ModernHttpClientError::TasksRemoteError {
+                method,
+                code: error.code,
+                message: error.message.clone(),
+            });
+        }
+        let (_, result_source) = admission.into_parts();
+        let result_source = result_source
+            .as_deref()
+            .ok_or(ModernHttpClientError::TasksResultMissing { method })?;
+        serde_json::from_str(result_source)
+            .map_err(|_| ModernHttpClientError::TasksResultDecode { method })
     }
 }
 
@@ -2772,12 +3314,19 @@ impl LegacySseResponseStream {
         }
     }
 
+    fn close_for_cancellation(&mut self) {
+        self.response = None;
+        self.parser.finish();
+        self.pending_events.clear();
+    }
+
     async fn next_event(
         &mut self,
         cx: &Cx,
     ) -> Result<Option<LegacySseEvent>, LegacySseHttpClientError> {
         loop {
             if cx.checkpoint().is_err() {
+                self.close_for_cancellation();
                 return Err(LegacySseHttpClientError::Cancelled);
             }
             if let Some(event) = self.pending_events.pop_front() {
@@ -2786,9 +3335,34 @@ impl LegacySseResponseStream {
             let Some(response) = self.response.as_mut() else {
                 return Ok(None);
             };
-            let Some(frame) =
-                poll_fn(|task_cx| Pin::new(&mut response.body).poll_frame(task_cx)).await
-            else {
+            let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
+            let mut cancellation = std::pin::pin!(cancellation_signal.recv(cx));
+            let frame = poll_fn(|task_cx| {
+                if cancellation.as_mut().poll(task_cx).is_ready() {
+                    return Poll::Ready(Err(()));
+                }
+                match Pin::new(&mut response.body).poll_frame(task_cx) {
+                    Poll::Ready(frame) => Poll::Ready(Ok(frame)),
+                    Poll::Pending => Poll::Pending,
+                }
+            })
+            .await;
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(()) => {
+                    self.close_for_cancellation();
+                    return Err(LegacySseHttpClientError::Cancelled);
+                }
+            };
+            let frame = match reject_body_frame_after_cancellation(cx, frame) {
+                Ok(frame) => frame,
+                Err(ModernHttpExecutorError::Cancelled) => {
+                    self.close_for_cancellation();
+                    return Err(LegacySseHttpClientError::Cancelled);
+                }
+                Err(error) => return Err(LegacySseHttpClientError::Executor(error)),
+            };
+            let Some(frame) = frame else {
                 self.response = None;
                 self.parser.finish();
                 return Ok(None);
@@ -2960,18 +3534,44 @@ fn validate_legacy_sse_response_head(
     }
 }
 
+/// Applies the cancellation boundary after the body poll has selected a ready
+/// frame or EOF. The body and cancellation signal can become ready in the same
+/// poll, so the pre-poll cancellation select alone cannot safely admit either
+/// outcome to a caller.
+fn reject_body_frame_after_cancellation<T, E>(
+    cx: &Cx,
+    frame: Option<Result<Frame<T>, E>>,
+) -> Result<Option<Result<Frame<T>, E>>, ModernHttpExecutorError> {
+    cx.checkpoint()
+        .map_err(|_| ModernHttpExecutorError::Cancelled)?;
+    Ok(frame)
+}
+
 async fn drain_native_response(
     cx: &Cx,
     response: &mut ClientStreamingResponse<ClientIo>,
     maximum_bytes: usize,
 ) -> Result<(), ModernHttpExecutorError> {
     let mut consumed = 0_usize;
+    let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
     loop {
         if cx.checkpoint().is_err() {
             return Err(ModernHttpExecutorError::Cancelled);
         }
-        let Some(frame) = poll_fn(|task_cx| Pin::new(&mut response.body).poll_frame(task_cx)).await
-        else {
+        let mut cancellation = std::pin::pin!(cancellation_signal.recv(cx));
+        let frame = poll_fn(|task_cx| {
+            if cancellation.as_mut().poll(task_cx).is_ready() {
+                return Poll::Ready(Err(()));
+            }
+            match Pin::new(&mut response.body).poll_frame(task_cx) {
+                Poll::Ready(frame) => Poll::Ready(Ok(frame)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await
+        .map_err(|()| ModernHttpExecutorError::Cancelled)?;
+        let frame = reject_body_frame_after_cancellation(cx, frame)?;
+        let Some(frame) = frame else {
             return Ok(());
         };
         let Some(mut data) = frame
@@ -3046,6 +3646,60 @@ fn build_modern_request_with_extensions(
     client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
 ) -> Result<ModernHttpRequest, ModernHttpClientError> {
     validate_final_method(method, request_id.is_some())?;
+    build_modern_request_after_method_validation(
+        target,
+        client_info,
+        client_capabilities,
+        method,
+        parameters,
+        request_id,
+        client_extensions,
+    )
+}
+
+/// Builds an official Tasks extension request after its typed wire envelope
+/// and bilateral discovery admission have already been proven by the caller.
+///
+/// This deliberately remains separate from the generic final-method builder:
+/// extension methods are not part of the core method registry and must never
+/// become reachable through the ungated raw request surface.
+fn build_modern_tasks_request(
+    target: &str,
+    client_info: &ClientInfo,
+    client_capabilities: &ClientCapabilities,
+    method: &'static str,
+    parameters: serde_json::Value,
+    request_id: RequestId,
+    client_extensions: &BTreeMap<String, serde_json::Value>,
+) -> Result<ModernHttpRequest, ModernHttpClientError> {
+    if !matches!(method, TASK_GET | TASK_UPDATE | TASK_CANCEL) {
+        return Err(ModernHttpClientError::TasksRequestEncoding { method });
+    }
+    if request_id.validate().is_err() {
+        return Err(ModernHttpClientError::InvalidTasksRequestId { method });
+    }
+    build_modern_request_after_method_validation(
+        target,
+        client_info,
+        client_capabilities,
+        method,
+        parameters,
+        Some(request_id),
+        Some(client_extensions),
+    )
+}
+
+/// Adds final HTTP metadata after the caller has validated that the method is
+/// reachable through its own core or extension-specific admission path.
+fn build_modern_request_after_method_validation(
+    target: &str,
+    client_info: &ClientInfo,
+    client_capabilities: &ClientCapabilities,
+    method: &str,
+    parameters: serde_json::Value,
+    request_id: Option<RequestId>,
+    client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+) -> Result<ModernHttpRequest, ModernHttpClientError> {
     let mut parameters = parameters
         .as_object()
         .cloned()
@@ -3168,7 +3822,9 @@ fn decode_modern_discovery_response(
     if admission.response() != &response {
         return Err(ModernHttpClientError::InvalidDiscoveryResponse);
     }
-    if response.id != Some(RequestId::Number(1)) {
+    if !response.id.as_ref().is_some_and(|response_id| {
+        response_id.correlates_with(&RequestId::Number(1))
+    }) {
         return Err(ModernHttpClientError::InvalidDiscoveryResponse);
     }
     if response.error.is_some() {
@@ -3318,6 +3974,8 @@ mod tests {
 
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::{CancelKind, Cx};
+    use asupersync::bytes::Bytes;
+    use asupersync::http::Frame;
     use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
     use fastmcp_protocol::protocol_policy::{LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION};
     use fastmcp_protocol::{
@@ -3329,7 +3987,8 @@ mod tests {
         MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpClient,
         ModernHttpClientError, ModernHttpExecutorError, ModernHttpResponseKind,
         ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
-        decode_modern_discovery_response, merge_client_extensions, validate_response_head,
+        decode_modern_discovery_response, merge_client_extensions,
+        reject_body_frame_after_cancellation, validate_response_head,
     };
     use crate::sse::SseLimits;
     use crate::{
@@ -3884,6 +4543,148 @@ mod tests {
         result
     }
 
+    fn assert_public_http_tasks_lifecycle_request(
+        request: CapturedHttpRequest,
+        method: &str,
+        request_id: i64,
+    ) -> serde_json::Value {
+        assert!(request.head.contains(&format!("Mcp-Method: {method}\r\n")));
+        assert!(request
+            .head
+            .contains("MCP-Protocol-Version: 2026-07-28\r\n"));
+        let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .expect("Tasks lifecycle request must be JSON-RPC");
+        assert_eq!(body["id"], request_id);
+        assert_eq!(body["method"], method);
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                ["extensions"],
+            serde_json::json!({"io.modelcontextprotocol/tasks": {}})
+        );
+        body
+    }
+
+    fn run_public_http_tasks_lifecycle(
+    ) -> Result<
+        (
+            fastmcp_protocol::FinalGetTaskResult,
+            fastmcp_protocol::FinalUpdateTaskResult,
+            fastmcp_protocol::FinalCancelTaskResult,
+        ),
+        ClientHttpConnectionError,
+    > {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind local Tasks lifecycle HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read local Tasks lifecycle HTTP address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept Tasks lifecycle probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("Tasks lifecycle probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                &modern_tasks_discovery_body(),
+            );
+
+            let (mut get, _) = listener.accept().expect("accept tasks/get request");
+            let get = assert_public_http_tasks_lifecycle_request(
+                read_request(&mut get),
+                "tasks/get",
+                2,
+            );
+            assert_eq!(get["params"]["taskId"], "task-73");
+            write_response(
+                &mut get,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-73","status":"input_required","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"inputRequests":{}}}"#,
+            );
+
+            let (mut update, _) = listener.accept().expect("accept tasks/update request");
+            let update = assert_public_http_tasks_lifecycle_request(
+                read_request(&mut update),
+                "tasks/update",
+                3,
+            );
+            assert_eq!(update["params"]["taskId"], "task-73");
+            assert_eq!(update["params"]["inputResponses"], serde_json::json!({}));
+            write_response(
+                &mut update,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete"}}"#,
+            );
+
+            let (mut cancel, _) = listener.accept().expect("accept tasks/cancel request");
+            let cancel = assert_public_http_tasks_lifecycle_request(
+                read_request(&mut cancel),
+                "tasks/cancel",
+                4,
+            );
+            assert_eq!(cancel["params"]["taskId"], "task-73");
+            write_response(
+                &mut cancel,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("Tasks discovery selects final HTTP lifecycle methods");
+        let task_id = fastmcp_protocol::FinalTaskId::parse("task-73")
+            .expect("bounded Tasks lifecycle ID");
+        let result = (|| {
+            let get = runtime_block_on(connection.get_task_final(
+                &cx,
+                RequestId::Number(2),
+                task_id.clone(),
+                4_096,
+            ))?;
+            let update = runtime_block_on(connection.update_task_final(
+                &cx,
+                RequestId::Number(3),
+                &get.task,
+                BTreeMap::new(),
+                4_096,
+            ))?;
+            let cancel = runtime_block_on(connection.cancel_task_final(
+                &cx,
+                RequestId::Number(4),
+                task_id,
+                4_096,
+            ))?;
+            Ok((get, update, cancel))
+        })();
+        assert_eq!(connection.selected_protocol_era(), ProtocolEra::Modern2026);
+        assert_eq!(connection.protocol_version(), Some(MODERN_PROTOCOL_VERSION));
+        server.join().expect("Tasks lifecycle HTTP server must join");
+        result
+    }
+
     #[test]
     fn bounded_empty_content_encoding_elements_preserve_the_identity_stream_lane() {
         let encoding = format!(
@@ -3960,6 +4761,20 @@ mod tests {
     }
 
     #[test]
+    fn modern_discovery_response_correlates_numeric_aliases_and_rejects_foreign_ids() {
+        let numeric_alias = br#"{"jsonrpc":"2.0","id":1e0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#;
+        assert!(decode_modern_discovery_response(numeric_alias).is_ok());
+
+        // This body differs only in its response ID, which must not be admitted
+        // as the `server/discover` probe response for ID 1.
+        let foreign_id = br#"{"jsonrpc":"2.0","id":2e0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#;
+        assert!(matches!(
+            decode_modern_discovery_response(foreign_id),
+            Err(ModernHttpClientError::InvalidDiscoveryResponse)
+        ));
+    }
+
+    #[test]
     fn public_http_connection_rejects_modern_progress_notification_without_peer_contact() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local modern listener");
         let address = listener.local_addr().expect("read local modern address");
@@ -4026,7 +4841,7 @@ mod tests {
     }
 
     #[test]
-    fn modern_http_client_rejects_progress_notification_without_peer_contact() {
+    fn modern_http_client_rejects_server_notification_before_transport_contact() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind notification listener");
         let address = listener
             .local_addr()
@@ -4042,6 +4857,20 @@ mod tests {
                 "server/discover"
             );
             write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut request, _) = listener.accept().expect("accept positive modern request");
+            let request = read_request(&mut request);
+            let request = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("positive modern request must be JSON-RPC");
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "tools/list");
+            write_response(
+                &mut request,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#,
+            );
+
             verify_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .expect("client reports the direct local progress refusal");
@@ -4073,16 +4902,25 @@ mod tests {
         .expect("modern discovery selects a direct modern client")
         .into_modern()
         .expect("modern-only discovery cannot yield legacy");
+        let positive = runtime_block_on(client.request(
+            &cx,
+            "tools/list",
+            serde_json::json!({}),
+            Some(RequestId::Number(2)),
+        ))
+        .expect("an active final client request opens exactly one modern POST");
+        assert_eq!(positive.metadata().kind(), ModernHttpResponseKind::Json);
+        drop(positive);
         let error = runtime_block_on(client.request(
             &cx,
             "notifications/progress",
-            serde_json::json!({"progressToken": 2, "progress": 0.5}),
-            None,
+            serde_json::json!({}),
+            Some(RequestId::Number(2)),
         ))
-        .expect_err("direct modern client refuses every notification POST before peer contact");
+        .expect_err("server-only final notifications fail before a modern POST can open");
         assert!(matches!(
             error,
-            ModernHttpClientError::ClientNotificationPostUnsupported { ref method }
+            ModernHttpClientError::ServerInitiatedFinalMethod { ref method }
                 if method == "notifications/progress"
         ));
         verify_sender
@@ -4243,6 +5081,116 @@ mod tests {
             .send(())
             .expect("release the response-owning peer");
         server.join().expect("modern SSE server must join");
+    }
+
+    #[test]
+    fn legacy_quiet_sse_cancellation_drops_the_owned_response_body_immediately() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy SSE listener");
+        let address = listener.local_addr().expect("read legacy SSE address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let request = read_request(&mut stream);
+            assert!(request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            assert!(
+                !request.head.contains("MCP-Protocol-Version:"),
+                "exact legacy SSE GET must not carry final headers"
+            );
+            begin_chunked_sse(&mut stream);
+            write_chunked_sse_event(
+                &mut stream,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+            ready_sender
+                .send(())
+                .expect("tell client the exact legacy body is quiet and live");
+            release_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("wait until the caller cancels the quiet legacy stream");
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    "http://127.0.0.1:9/mcp",
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::LegacyOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("exact legacy connection opens its configured SSE lane");
+        ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server exposed the live exact legacy response body");
+
+        let ClientHttpConnection::LegacySse { client, .. } = &mut connection else {
+            panic!("LegacyOnly must retain the exact legacy SSE lane");
+        };
+        let wake_counter = Arc::new(CountingWake::default());
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut task_context = Context::from_waker(&waker);
+        let mut next_message = std::pin::pin!(client.next_message(&cx));
+        assert!(matches!(
+            next_message.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+
+        cx.cancel_with(
+            CancelKind::User,
+            Some("cancel the owned exact legacy SSE response"),
+        );
+        assert!(
+            wake_counter.0.load(Ordering::SeqCst) > 0,
+            "Cx cancellation must wake the already-pending quiet legacy response body"
+        );
+        assert!(matches!(
+            next_message.as_mut().poll(&mut task_context),
+            Poll::Ready(Err(LegacySseHttpClientError::Cancelled))
+        ));
+        drop(next_message);
+        assert!(client.stream.response.is_none());
+        assert!(client.stream.pending_events.is_empty());
+
+        release_sender
+            .send(())
+            .expect("release the response-owning exact legacy peer");
+        server.join().expect("legacy SSE server must join");
+    }
+
+    #[test]
+    fn ready_body_frame_is_rejected_when_cancellation_wins_after_poll() {
+        let cx = Cx::for_request();
+        let ready_frame = Some(Ok::<_, ()>(Frame::data(Bytes::copy_from_slice(b"ready"))));
+        cx.cancel_with(
+            CancelKind::User,
+            Some("cancel immediately after a ready native body frame"),
+        );
+
+        assert!(matches!(
+            reject_body_frame_after_cancellation(&cx, ready_frame),
+            Err(ModernHttpExecutorError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn ready_body_eof_is_rejected_when_cancellation_wins_after_poll() {
+        let cx = Cx::for_request();
+        let ready_eof = None::<Result<Frame<Bytes>, ()>>;
+        cx.cancel_with(
+            CancelKind::User,
+            Some("cancel immediately after a ready native body EOF"),
+        );
+
+        assert!(matches!(
+            reject_body_frame_after_cancellation(&cx, ready_eof),
+            Err(ModernHttpExecutorError::Cancelled)
+        ));
     }
 
     #[test]
@@ -4480,6 +5428,75 @@ mod tests {
     }
 
     #[test]
+    fn public_http_modern_subscriptions_listen_requires_acknowledgement_as_first_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind final subscriptions/listen first-frame listener");
+        let address = listener
+            .local_addr()
+            .expect("read final subscriptions/listen first-frame address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("modern probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept final subscriptions/listen request");
+            let request = read_request(&mut stream);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("subscriptions/listen request must be JSON-RPC")["method"],
+                "subscriptions/listen"
+            );
+            begin_chunked_sse(&mut stream);
+            // This differs from a valid subscription stream only in its first
+            // dispatched JSON-RPC notification: the required acknowledgement
+            // has been replaced with an otherwise valid progress frame.
+            write_chunked_sse_event(
+                &mut stream,
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5}}\n\n",
+            );
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("modern discovery selects final HTTP subscriptions/listen");
+        let error = runtime_block_on(connection.listen_subscriptions_typed(
+            &cx,
+            RequestId::Number(2),
+            SubscriptionFilter::default(),
+            SseLimits::new(1_024, 8_192, 16).expect("explicit SSE bounds are nonzero"),
+        ))
+        .expect_err("a subscription stream must begin with its acknowledgement");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::SubscriptionsListen(
+                ModernHttpSubscriptionListenError::EventBeforeAcknowledgement
+            )
+        ));
+        server
+            .join()
+            .expect("first-frame subscription server must join");
+    }
+
+    #[test]
     fn public_http_modern_subscriptions_listen_rejects_server_cancellation_frames() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .expect("bind final subscriptions/listen cancellation listener");
@@ -4597,6 +5614,150 @@ mod tests {
     }
 
     #[test]
+    fn public_http_tasks_lifecycle_emits_typed_exact_extension_wires() {
+        let (get, update, cancel) = run_public_http_tasks_lifecycle()
+            .expect("typed HTTP Tasks lifecycle must retain all three final responses");
+        assert_eq!(get.task.base().task_id.as_str(), "task-73");
+        assert!(matches!(get.task, fastmcp_protocol::FinalTask::InputRequired { .. }));
+        assert!(update.meta.is_none());
+        assert!(update.additional.is_empty());
+        assert!(cancel.meta.is_none());
+        assert!(cancel.additional.is_empty());
+    }
+
+    #[test]
+    fn public_http_tasks_get_rejects_absent_capability_without_post() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind local absent-Tasks HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read local absent-Tasks HTTP address");
+        let modern_target = format!("http://{address}/mcp");
+        let (stop_tx, stop_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept absent-Tasks probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("absent-Tasks probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+            listener
+                .set_nonblocking(true)
+                .expect("make absent-Tasks listener nonblocking");
+            assert!(
+                accept_legacy_test_peer(
+                    &listener,
+                    &stop_rx,
+                    Instant::now() + LEGACY_TEST_PEER_BOUND,
+                )
+                .expect("observe absent-Tasks request path")
+                .is_none(),
+                "unadvertised Tasks method must not open a native POST"
+            );
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("modern discovery without Tasks still selects final HTTP");
+        let error = runtime_block_on(connection.get_task_final(
+            &cx,
+            RequestId::Number(2),
+            fastmcp_protocol::FinalTaskId::parse("task-73").expect("bounded task ID"),
+            4_096,
+        ))
+        .expect_err("unadvertised Tasks method must be rejected locally");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::Modern(ModernHttpClientError::TasksMethodNegotiation {
+                method: fastmcp_protocol::TASK_GET
+            })
+        ));
+        signal_legacy_test_peer_stop(&stop_tx);
+        server
+            .join()
+            .expect("absent-Tasks HTTP listener must observe no POST");
+    }
+
+    #[test]
+    fn public_http_tasks_lifecycle_rejects_legacy_before_message_post() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind local legacy Tasks-negative listener");
+        let address = listener
+            .local_addr()
+            .expect("read local legacy Tasks-negative address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+            listener
+                .set_nonblocking(true)
+                .expect("make legacy Tasks-negative listener nonblocking");
+            assert!(
+                accept_legacy_test_peer(
+                    &listener,
+                    &stop_rx,
+                    Instant::now() + LEGACY_TEST_PEER_BOUND,
+                )
+                .expect("observe legacy Tasks-negative request path")
+                .is_none(),
+                "final Tasks lifecycle must not open the legacy message endpoint"
+            );
+            finish_chunked_sse(&mut sse);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    "http://127.0.0.1:9/mcp",
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::LegacyOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("legacy-only opens the exact configured SSE route");
+        let error = runtime_block_on(connection.cancel_task_final(
+            &cx,
+            RequestId::Number(2),
+            fastmcp_protocol::FinalTaskId::parse("task-73").expect("bounded task ID"),
+            4_096,
+        ))
+        .expect_err("final Tasks lifecycle must be rejected before legacy POST");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::FinalTasksRequiresModern {
+                method: fastmcp_protocol::TASK_CANCEL
+            }
+        ));
+        signal_legacy_test_peer_stop(&stop_tx);
+        server
+            .join()
+            .expect("legacy Tasks-negative listener must observe no POST");
+    }
+
+    #[test]
     fn public_http_modern_subscriptions_listen_rejects_one_field_acknowledgement_id_mismatch() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .expect("bind local malformed final subscriptions/listen listener");
@@ -4681,7 +5842,7 @@ mod tests {
             let sse_request = read_request(&mut sse);
             assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
             let sse_body = format!(
-                "event: endpoint\ndata: {advertised_message_target}\n\nevent: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}\n\n"
+                "event: endpoint\ndata: {advertised_message_target}\n\nevent: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":2e0,\"result\":{{}}}}\n\n"
             );
             write_response(&mut sse, 200, "text/event-stream", sse_body.as_bytes());
 
@@ -4742,7 +5903,10 @@ mod tests {
             4_096,
         ))
         .expect("legacy request posts then waits for its exact SSE response");
-        assert_eq!(response.id, Some(RequestId::Number(2)));
+        assert!(response
+            .id
+            .as_ref()
+            .is_some_and(|response_id| response_id.correlates_with(&RequestId::Number(2))));
         runtime_block_on(connection.notify(
             &cx,
             "notifications/cancelled",

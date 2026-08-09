@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use fastmcp_protocol::{CacheScope, CoreResult, FinalCoreResult, ServerNotification};
+use fastmcp_protocol::{
+    CacheScope, CacheTtl, CacheableResult, CoreResult, FinalCoreResult, ServerNotification,
+};
 
 /// Default maximum number of retained final complete results per client.
 pub const DEFAULT_FINAL_CACHE_CAPACITY: usize = 128;
@@ -223,11 +225,10 @@ pub struct FinalCacheStats {
 
 #[derive(Clone, Debug)]
 struct FinalCacheEntry {
-    result: CoreResult,
+    cacheable: CacheableResult<CoreResult>,
     generation: FinalCacheGeneration,
     receipt: Instant,
     expires_at: Instant,
-    scope: CacheScope,
     encoded_bytes: usize,
 }
 
@@ -350,8 +351,8 @@ impl FinalResultCache {
         };
         let entry_generation = entry.generation;
         let expires_at = entry.expires_at;
-        let result = entry.result.clone();
-        let scope = entry.scope;
+        let result = entry.cacheable.result.clone();
+        let scope = entry.cacheable.scope;
 
         let miss = if entry_generation != self.begin_fetch(key.result_set()) {
             Some(FinalCacheMiss::Invalidated)
@@ -397,13 +398,13 @@ impl FinalResultCache {
             return FinalCacheInsert::InvalidatedDuringFetch;
         }
 
-        let Some((ttl_ms, scope)) = final_cache_hints(&result) else {
+        let Some((ttl, scope)) = final_cache_hints(&result) else {
             return FinalCacheInsert::NotCacheable;
         };
-        if ttl_ms == 0 {
+        if ttl.as_millis() == 0 {
             return FinalCacheInsert::ImmediatelyStale;
         }
-        let Some(expires_at) = receipt.checked_add(Duration::from_millis(ttl_ms)) else {
+        let Some(expires_at) = receipt.checked_add(Duration::from_millis(ttl.as_millis())) else {
             return FinalCacheInsert::ExpiryOutOfRange;
         };
 
@@ -428,11 +429,10 @@ impl FinalResultCache {
         self.entries.insert(
             key,
             FinalCacheEntry {
-                result,
+                cacheable: CacheableResult { result, ttl, scope },
                 generation: captured_generation,
                 receipt,
                 expires_at,
-                scope,
                 encoded_bytes,
             },
         );
@@ -535,7 +535,7 @@ impl Default for FinalResultCache {
     }
 }
 
-pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(u64, CacheScope)> {
+pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(CacheTtl, CacheScope)> {
     let CoreResult::Final(result) = result else {
         return None;
     };
@@ -543,7 +543,7 @@ pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(u64, CacheScope)
         FinalCoreResult::Discover(result) => {
             let hints = result.cache_hints();
             Some((
-                hints.ttl_ms(),
+                CacheTtl::milliseconds(hints.ttl_ms()),
                 if hints.is_public() {
                     CacheScope::Public
                 } else {
@@ -551,21 +551,26 @@ pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(u64, CacheScope)
                 },
             ))
         }
-        FinalCoreResult::ToolsList { result, .. } => {
-            Some((result.payload.ttl_ms, result.payload.cache_scope))
-        }
-        FinalCoreResult::ResourcesList { result, .. } => {
-            Some((result.payload.ttl_ms, result.payload.cache_scope))
-        }
-        FinalCoreResult::ResourceTemplatesList { result, .. } => {
-            Some((result.payload.ttl_ms, result.payload.cache_scope))
-        }
-        FinalCoreResult::ResourcesRead { result, .. } => {
-            Some((result.payload.ttl_ms, result.payload.cache_scope))
-        }
-        FinalCoreResult::PromptsList { result, .. } => {
-            Some((result.payload.ttl_ms, result.payload.cache_scope))
-        }
+        FinalCoreResult::ToolsList { result, .. } => Some((
+            CacheTtl::milliseconds(result.payload.ttl_ms),
+            result.payload.cache_scope,
+        )),
+        FinalCoreResult::ResourcesList { result, .. } => Some((
+            CacheTtl::milliseconds(result.payload.ttl_ms),
+            result.payload.cache_scope,
+        )),
+        FinalCoreResult::ResourceTemplatesList { result, .. } => Some((
+            CacheTtl::milliseconds(result.payload.ttl_ms),
+            result.payload.cache_scope,
+        )),
+        FinalCoreResult::ResourcesRead { result, .. } => Some((
+            CacheTtl::milliseconds(result.payload.ttl_ms),
+            result.payload.cache_scope,
+        )),
+        FinalCoreResult::PromptsList { result, .. } => Some((
+            CacheTtl::milliseconds(result.payload.ttl_ms),
+            result.payload.cache_scope,
+        )),
         FinalCoreResult::Completion { .. }
         | FinalCoreResult::ToolsCall { .. }
         | FinalCoreResult::ToolsCallTask { .. }
@@ -628,6 +633,45 @@ mod tests {
                 r#"{{"resultType":"complete","tools":[],"ttlMs":{ttl_ms},"cacheScope":"{scope}"{suffix}}}"#
             ))
             .expect("the cache fixture is an admitted final complete result")
+    }
+
+    #[test]
+    fn final_catalog_hints_enter_the_cache_as_typed_cacheable_results() {
+        let catalog = tools_result(73, "public", None);
+        assert_eq!(
+            final_cache_hints(&catalog),
+            Some((CacheTtl::milliseconds(73), CacheScope::Public)),
+            "a final catalog ttlMs/cacheScope pair becomes one typed cache hint"
+        );
+        let mut cache = FinalResultCache::default();
+        let key = key("credential-a", None);
+        let generation = cache.begin_fetch(key.result_set());
+        assert_eq!(
+            cache.insert_if_current(key.clone(), generation, catalog),
+            FinalCacheInsert::Stored,
+            "the typed cache hint owns the retained final result"
+        );
+        assert!(matches!(cache.lookup(&key), FinalCacheLookup::Fresh(_)));
+
+        let request = CoreRequest::Final(FinalCoreRequest::ResourcesRead(
+            fastmcp_protocol::FinalReadResourceParams {
+                meta: OpenMetadata::default(),
+                uri: serde_json::from_str("\"file:///input-required.txt\"")
+                    .expect("absolute URI fixture"),
+                input_responses: None,
+                request_state: None,
+            },
+        ));
+        let input_required = request
+            .decode_result(
+                r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"ttlMs":73,"cacheScope":"public"}"#,
+            )
+            .expect("input-required fixture decodes with inert cache lookalikes");
+        assert_eq!(
+            final_cache_hints(&input_required),
+            None,
+            "changing only complete to input_required keeps cache lookalikes inert"
+        );
     }
 
     fn notification(method: &str, params: Option<serde_json::Value>) -> ServerNotification {

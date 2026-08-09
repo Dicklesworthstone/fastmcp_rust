@@ -139,7 +139,11 @@ fn clt_01_a_positive() {
     let records = executor.pending_records();
     assert_eq!(records.len(), 2);
     assert!(records.iter().all(|record| {
-        record.correlation_key == record.request_id
+        record.correlation_key
+            == record
+                .request_id
+                .correlation_key()
+                .expect("committed request IDs remain canonicalizable")
             && record.request_state == ExecutionTerminalState::Pending
             && record.send_committed
             && record.idle_deadline <= record.absolute_deadline
@@ -314,6 +318,92 @@ fn clt_01_a_planted_negative() {
     assert!(executor.take_notifications().is_empty());
     assert!(executor.take_uncorrelated_responses().is_empty());
     assert!(executor.take_cancellation_events().is_empty());
+}
+
+#[test]
+fn canonical_terminal_id_tombstone_prevents_reuse_and_late_duplicate_aba() {
+    let cx = Cx::for_testing();
+    let (transport, probe) = ScriptedTransport::new(std::iter::empty());
+    let executor = RequestExecutor::new(transport);
+    let mut completed = executor
+        .execute(&cx, request(301))
+        .expect("baseline request commits");
+    executor
+        .route_response_with_raw_result(
+            &cx,
+            JsonRpcResponse::success(
+                RequestId::Integer("301e0".to_owned()),
+                serde_json::json!({"kind": "complete"}),
+            ),
+            Some(r#"{"kind":"complete"}"#.to_owned()),
+        )
+        .expect("a numeric response alias completes the baseline owner");
+
+    let same_canonical_request = || {
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"id": "same-canonical-id"})),
+            RequestId::Integer("301e0".to_owned()),
+        )
+    };
+    assert_eq!(
+        executor
+            .execute(&cx, same_canonical_request())
+            .expect_err("unconsumed terminal outcome retains its canonical ID")
+            .code,
+        McpErrorCode::InvalidRequest,
+    );
+    assert_eq!(
+        executor
+            .wait(&cx, &mut completed)
+            .expect("baseline owner consumes its final response")
+            .id,
+        Some(RequestId::Integer("301e0".to_owned())),
+    );
+    assert_eq!(
+        executor
+            .execute(&cx, same_canonical_request())
+            .expect_err("consumption cannot reopen the canonical ID before expiry")
+            .code,
+        McpErrorCode::InvalidRequest,
+    );
+
+    let mut adjacent = executor
+        .execute(&cx, request(302))
+        .expect("an unrelated request remains admissible");
+    let pending_before_late_duplicate = executor.pending_records();
+    executor
+        .route_response_with_raw_result(
+            &cx,
+            JsonRpcResponse::success(
+                RequestId::Number(301),
+                serde_json::json!({"kind": "complete"}),
+            ),
+            Some(r#"{"kind":"complete"}"#.to_owned()),
+        )
+        .expect("changing only the late final ID targets the retired owner");
+    assert_eq!(executor.pending_records(), pending_before_late_duplicate);
+    executor
+        .route_response_with_raw_result(
+            &cx,
+            JsonRpcResponse::success(
+                RequestId::Number(302),
+                serde_json::json!({"kind": "complete"}),
+            ),
+            Some(r#"{"kind":"complete"}"#.to_owned()),
+        )
+        .expect("only the adjacent owner's final may complete it");
+    assert_eq!(
+        executor
+            .wait(&cx, &mut adjacent)
+            .expect("late duplicate cannot complete the adjacent owner")
+            .id,
+        Some(RequestId::Number(302)),
+    );
+    assert_eq!(probe.sent_len(), 2);
+    let late_duplicates = executor.take_uncorrelated_responses();
+    assert_eq!(late_duplicates.len(), 1);
+    assert_eq!(late_duplicates[0].id, Some(RequestId::Number(301)));
 }
 
 #[test]

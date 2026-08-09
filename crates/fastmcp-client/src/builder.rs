@@ -41,7 +41,7 @@ use fastmcp_transport::StdioTransport;
 use crate::{
     ChildGuard, ChildOwnership, Client, ClientHttpConnection, ClientHttpConnectionError,
     ClientHttpNegotiation, ClientHttpNegotiationError, ClientProtocolPlan, ClientSession,
-    HttpClient, HttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy,
+    HttpClient, HttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
     combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
 };
 
@@ -143,6 +143,8 @@ pub struct ClientBuilder {
     inherit_env: bool,
     /// Client capabilities to advertise.
     capabilities: ClientCapabilities,
+    /// Exact-2024 server-to-client callbacks installed before initialization.
+    reverse_request_handlers: ReverseRequestHandlers,
     /// Optional official MCP Apps client settings for final discovery.
     mcp_apps_settings: Option<McpAppsClientSettings>,
     /// Whether to defer initialization until first use.
@@ -169,6 +171,10 @@ impl std::fmt::Debug for ClientBuilder {
                 &self.capabilities.elicitation.is_some(),
             )
             .field("roots_capability", &self.capabilities.roots.is_some())
+            .field(
+                "reverse_request_handlers_configured",
+                &!self.reverse_request_handlers.is_empty(),
+            )
             .field("mcp_apps_configured", &self.mcp_apps_settings.is_some())
             .field("auto_initialize", &self.auto_initialize)
             .field("owned_process_group", &self.owned_process_group)
@@ -204,6 +210,7 @@ impl ClientBuilder {
             env_vars: HashMap::new(),
             inherit_env: true,
             capabilities: ClientCapabilities::default(),
+            reverse_request_handlers: ReverseRequestHandlers::new(),
             mcp_apps_settings: None,
             auto_initialize: false,
             owned_process_group: false,
@@ -339,6 +346,22 @@ impl ClientBuilder {
     #[must_use]
     pub fn capabilities(mut self, capabilities: ClientCapabilities) -> Self {
         self.capabilities = capabilities;
+        self.reverse_request_handlers
+            .derive_legacy_capabilities(&mut self.capabilities);
+        self
+    }
+
+    /// Configures exact MCP 2024-11-05 server-to-client request handlers.
+    ///
+    /// The builder derives the matching legacy `sampling` and `roots`
+    /// capabilities before the initialize handshake. A client that configures
+    /// either callback is pinned to exact legacy negotiation: MCP 2026-07-28
+    /// deliberately rejects these legacy reverse request methods.
+    #[must_use]
+    pub fn reverse_request_handlers(mut self, handlers: ReverseRequestHandlers) -> Self {
+        self.reverse_request_handlers = handlers;
+        self.reverse_request_handlers
+            .derive_legacy_capabilities(&mut self.capabilities);
         self
     }
 
@@ -656,6 +679,25 @@ impl ClientBuilder {
         cx: &Cx,
         retry_deadline: Instant,
     ) -> McpResult<Client> {
+        // A configured reverse callback is an exact-2024 capability. Do not
+        // advertise it to a final peer and then reject that peer's request at
+        // runtime; select the only compatible handshake before spawning.
+        if !self.reverse_request_handlers.is_empty() {
+            self.reverse_request_handlers
+                .validate_legacy_capabilities(&self.capabilities)?;
+            let legacy_plan = ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly);
+            let mut client = self.try_connect_with_protocol_plan(
+                command,
+                args,
+                cx,
+                legacy_plan,
+                false,
+                retry_deadline,
+            )?;
+            client.set_protocol_plan_after_selection(self.protocol_plan.clone());
+            return Ok(client);
+        }
+
         let modern_plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
         match self.try_connect_with_protocol_plan(
             command,
@@ -705,6 +747,7 @@ impl ClientBuilder {
         defer_initialization: bool,
         retry_deadline: Instant,
     ) -> McpResult<Client> {
+        self.validate_reverse_callback_configuration(&protocol_plan)?;
         // Build the command
         let executable = resolve_stdio_command(command, self.working_dir.as_deref())?;
         let (mut cmd, child_ownership, mut group_anchor) =
@@ -811,6 +854,23 @@ impl ClientBuilder {
         }
     }
 
+    fn validate_reverse_callback_configuration(
+        &self,
+        protocol_plan: &ClientProtocolPlan,
+    ) -> McpResult<()> {
+        match protocol_plan.policy() {
+            ProtocolPolicy::LegacyOnly => self
+                .reverse_request_handlers
+                .validate_legacy_capabilities(&self.capabilities),
+            ProtocolPolicy::ModernOnly if !self.reverse_request_handlers.is_empty() => {
+                Err(McpError::invalid_params(
+                    "MCP 2026-07-28 does not support exact-2024 reverse request handlers",
+                ))
+            }
+            ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto => Ok(()),
+        }
+    }
+
     fn initialize_timeout_policy_for_retry_deadline(
         &self,
         retry_deadline: Instant,
@@ -881,7 +941,7 @@ impl ClientBuilder {
         .with_mcp_apps_settings(self.mcp_apps_settings.clone())
         .with_protocol_plan(protocol_plan);
 
-        Client::from_parts_uninitialized_with_ownership(
+        let mut client = Client::from_parts_uninitialized_with_ownership(
             child,
             child_ownership,
             group_anchor,
@@ -889,7 +949,11 @@ impl ClientBuilder {
             cx.clone(),
             session,
             timeout_policy,
-        )
+        );
+        client.install_reverse_request_handlers_before_initialization(
+            self.reverse_request_handlers.clone(),
+        );
+        client
     }
 
     /// Performs the initialization handshake and creates the client.
@@ -991,6 +1055,106 @@ mod tests {
         assert!(builder.env_vars.is_empty());
         assert!(!builder.auto_initialize);
         assert!(!builder.owned_process_group);
+    }
+
+    #[test]
+    fn reverse_handlers_derive_exact_legacy_capabilities_before_connect() {
+        let handlers = ReverseRequestHandlers::new()
+            .with_sampling_create_message(|_cancellation, _params| {
+                Ok(fastmcp_protocol::CreateMessageResult::text("ok", "test-model"))
+            })
+            .with_roots_list(|_cancellation, _params| {
+                Ok(fastmcp_protocol::ListRootsResult::new(Vec::new()))
+            });
+        let builder = ClientBuilder::new().reverse_request_handlers(handlers);
+
+        assert!(builder.capabilities.sampling.is_some());
+        assert_eq!(
+            builder.capabilities.roots.as_ref().map(|roots| roots.list_changed),
+            Some(false)
+        );
+        builder
+            .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(
+                ProtocolPolicy::LegacyOnly,
+            ))
+            .expect("derived callbacks and advertised legacy capabilities agree");
+    }
+
+    #[test]
+    fn reverse_handlers_reject_modern_or_list_changed_legacy_configuration() {
+        let sampling_handler = || {
+            ReverseRequestHandlers::new().with_sampling_create_message(
+                |_cancellation, _params| {
+                    Ok(fastmcp_protocol::CreateMessageResult::text("ok", "test-model"))
+                },
+            )
+        };
+        let modern = ClientBuilder::new().reverse_request_handlers(sampling_handler());
+        let modern_error = modern
+            .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(
+                ProtocolPolicy::ModernOnly,
+            ))
+            .expect_err("final negotiation cannot expose exact-2024 callbacks");
+        assert_eq!(modern_error.code, fastmcp_core::McpErrorCode::InvalidParams);
+
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.roots = Some(fastmcp_protocol::RootsCapability { list_changed: true });
+        let legacy = ClientBuilder::new()
+            .capabilities(capabilities)
+            .reverse_request_handlers(ReverseRequestHandlers::new().with_roots_list(
+                |_cancellation, _params| Ok(fastmcp_protocol::ListRootsResult::new(Vec::new())),
+            ));
+        let legacy_error = legacy
+            .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(
+                ProtocolPolicy::LegacyOnly,
+            ))
+            .expect_err("a callback cannot imply roots/list_changed authority");
+        assert_eq!(legacy_error.code, fastmcp_core::McpErrorCode::InvalidParams);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builder_advertises_callbacks_before_legacy_initialize_and_dispatches_them() {
+        let script = "IFS= read -r initialize || exit 1; \
+            case \"$initialize\" in *'\"method\":\"initialize\"'*'\"sampling\":{}'*'\"roots":{}'*) capabilities_ok=true;; *) capabilities_ok=false;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"callback-builder\",\"version\":\"1.0.0\"}}}'; \
+            IFS= read -r lifecycle || exit 1; \
+            case \"$lifecycle\" in *notifications/initialized*) lifecycle_ok=true;; *) lifecycle_ok=false;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}'; \
+            IFS= read -r callback || exit 1; \
+            IFS= read -r request || exit 1; \
+            case \"$callback\" in *'\"id\":41'*'\"model\":\"builder-model\"'*) callback_ok=true;; *) callback_ok=false;; esac; \
+            case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"capabilities\":%s,\"lifecycle\":%s,\"callback\":%s,\"request\":%s}}\\n' \"$capabilities_ok\" \"$lifecycle_ok\" \"$callback_ok\" \"$request_ok\"; exec sleep 2";
+        let handlers = ReverseRequestHandlers::new()
+            .with_sampling_create_message(|_cancellation, _params| {
+                Ok(fastmcp_protocol::CreateMessageResult::text(
+                    "configured before initialize",
+                    "builder-model",
+                ))
+            })
+            .with_roots_list(|_cancellation, _params| {
+                Ok(fastmcp_protocol::ListRootsResult::new(Vec::new()))
+            });
+        let mut client = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+            .reverse_request_handlers(handlers)
+            .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request())
+            .expect("legacy callback configuration completes initialize before exposure");
+
+        let result: serde_json::Value = client
+            .send_request("test/builder-callback", serde_json::json!({}))
+            .expect("configured callback responds on the initialized client");
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "capabilities": true,
+                "lifecycle": true,
+                "callback": true,
+                "request": true
+            })
+        );
+        client.close().expect("builder callback client cleanup");
     }
 
     #[test]
