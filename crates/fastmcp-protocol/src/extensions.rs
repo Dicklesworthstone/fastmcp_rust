@@ -1014,6 +1014,18 @@ pub struct NegotiatedExtensionSet {
     unknown_server: BTreeMap<ExtensionId, ExtensionSettings>,
 }
 
+/// Opaque current-exchange receipt authorizing one MCP Apps Host/View bridge.
+///
+/// This can only be derived from a frozen registry and a negotiated extension
+/// set in which the exact official Apps descriptor is active. It deliberately
+/// exposes no literal-based constructor: callers must retain the current
+/// negotiation result rather than recreating Apps activation from schema IDs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpAppsActivationReceipt {
+    registry_digest: [u8; 32],
+    effective_settings_fingerprint: [u8; 32],
+}
+
 impl NegotiatedExtensionSet {
     /// Returns the registry receipt that this set is bound to.
     #[must_use]
@@ -1043,6 +1055,38 @@ impl NegotiatedExtensionSet {
     #[must_use]
     pub fn active_extensions(&self) -> impl ExactSizeIterator<Item = &NegotiatedExtension> {
         self.active.values()
+    }
+
+    /// Derives the sole receipt accepted by the Apps Host/View bridge for this
+    /// current negotiated exchange.
+    ///
+    /// The receipt is unavailable for a legacy exchange, a different frozen
+    /// registry, inactive Apps settings, or any descriptor that differs from
+    /// the frozen official method-free Apps descriptor.
+    #[must_use]
+    pub fn mcp_apps_activation_receipt(
+        &self,
+        registry: &ExtensionDescriptorRegistry,
+    ) -> Option<McpAppsActivationReceipt> {
+        if self.protocol_era != ProtocolEra::Modern2026 || self.ensure_registry(registry).is_err() {
+            return None;
+        }
+        let id = official_mcp_apps_extension_id();
+        let descriptor = registry.descriptor(&id)?;
+        if validate_official_mcp_apps_descriptor(descriptor).is_err() {
+            return None;
+        }
+        let active = self.active(&id)?;
+        let settings =
+            McpAppsClientSettings::from_extension_settings(active.effective_settings().settings())
+                .ok()?;
+        if !settings.supports_mcp_apps_html() {
+            return None;
+        }
+        Some(McpAppsActivationReceipt {
+            registry_digest: *self.registry_receipt.digest(),
+            effective_settings_fingerprint: *active.effective_settings().fingerprint(),
+        })
     }
 
     /// Returns unknown current-message client settings preserved only for diagnostics.
@@ -2265,10 +2309,7 @@ mod tests {
             // each helper-built extension derives a distinct header from its
             // method; a shared literal would collide on the second register.
             routing_headers: vec![ExtensionRoutingHeaderDescriptor {
-                name: format!(
-                    "Mcp-{}",
-                    method.rsplit('/').next().unwrap_or("weather")
-                ),
+                name: format!("Mcp-{}", method.rsplit('/').next().unwrap_or("weather")),
             }],
             stdio_correlation: None,
         }

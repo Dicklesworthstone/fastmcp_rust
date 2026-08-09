@@ -26,10 +26,10 @@ use crate::methods::{
 use crate::protocol_policy::ProtocolEra;
 use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
 use crate::result::{
-    CompleteResult, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonMember,
-    ExactJsonValue, InputRequiredResult, ResultDecodeError, ResultPeerDiagnostic,
-    UnknownResultMembers, decode_peer_result_for_era, encode_complete_result, encode_result,
-    exact_json_from_serde, exact_json_to_serde, has_final_only_metadata,
+    CompleteResult, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue,
+    InputRequiredResult, ResultDecodeError, ResultPeerDiagnostic, UnknownResultMembers,
+    decode_peer_result_for_era, encode_complete_result, encode_result, exact_json_to_serde,
+    has_final_only_metadata,
 };
 use crate::types::{
     ClientCapabilities, ClientInfo, LegacyContent, LegacyMetadata, LegacyPromptMessage,
@@ -3879,8 +3879,13 @@ fn encode_final_complete<T: Serialize>(
             });
         }
     }
-    encode_complete_result(&result.meta, payload.members().to_vec(), known_names, &result.extras)
-        .map_err(CoreDispatchError::from)
+    encode_complete_result(
+        &result.meta,
+        payload.members().to_vec(),
+        known_names,
+        &result.extras,
+    )
+    .map_err(CoreDispatchError::from)
 }
 
 fn encode_final_input_required(
@@ -4644,43 +4649,7 @@ pub struct LogMessageParams {
 // Background Tasks (Docket/SEP-1686)
 // ============================================================================
 
-use crate::types::{TaskId, TaskInfo, TaskResult, TaskStatus};
-
-/// tasks/get request params.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetTaskParams {
-    /// Task ID to retrieve.
-    pub id: TaskId,
-}
-
-/// tasks/get response result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetTaskResult {
-    /// Task information.
-    pub task: TaskInfo,
-    /// Task result (if completed).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<TaskResult>,
-}
-
-/// tasks/cancel request params.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelTaskParams {
-    /// Task ID to cancel.
-    pub id: TaskId,
-    /// Reason for cancellation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-/// tasks/cancel response result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelTaskResult {
-    /// Whether the cancellation was successful.
-    pub cancelled: bool,
-    /// Updated task information.
-    pub task: TaskInfo,
-}
+use crate::types::{TaskId, TaskResult, TaskStatus};
 
 /// Task status change notification params.
 ///
@@ -8669,101 +8638,6 @@ mod tests {
         // No total
         let params = ProgressParams::new("t", 0.5);
         assert_eq!(params.fraction(), None);
-    }
-
-    // ========================================================================
-    // GetTaskParams Tests
-    // ========================================================================
-
-    #[test]
-    fn get_task_params_serialization() {
-        let params = GetTaskParams {
-            id: TaskId::from_string("task-abc"),
-        };
-        let value = serde_json::to_value(&params).expect("serialize");
-        assert_eq!(value["id"], "task-abc");
-    }
-
-    // ========================================================================
-    // GetTaskResult Tests
-    // ========================================================================
-
-    #[test]
-    fn get_task_result_serialization() {
-        let result = GetTaskResult {
-            task: crate::types::TaskInfo {
-                id: TaskId::from_string("task-1"),
-                task_type: "compute".to_string(),
-                status: TaskStatus::Completed,
-                progress: Some(1.0),
-                message: Some("Done".to_string()),
-                created_at: "2026-01-28T00:00:00Z".to_string(),
-                started_at: Some("2026-01-28T00:01:00Z".to_string()),
-                completed_at: Some("2026-01-28T00:02:00Z".to_string()),
-                error: None,
-            },
-            result: Some(crate::types::TaskResult {
-                id: TaskId::from_string("task-1"),
-                success: true,
-                data: Some(serde_json::json!({"value": 42})),
-                error: None,
-            }),
-        };
-        let value = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(value["task"]["status"], "completed");
-        assert_eq!(value["result"]["success"], true);
-        assert_eq!(value["result"]["data"]["value"], 42);
-    }
-
-    // ========================================================================
-    // CancelTaskParams Tests
-    // ========================================================================
-
-    #[test]
-    fn cancel_task_params_serialization() {
-        let params = CancelTaskParams {
-            id: TaskId::from_string("task-1"),
-            reason: Some("No longer needed".to_string()),
-        };
-        let value = serde_json::to_value(&params).expect("serialize");
-        assert_eq!(value["id"], "task-1");
-        assert_eq!(value["reason"], "No longer needed");
-    }
-
-    #[test]
-    fn cancel_task_params_without_reason() {
-        let params = CancelTaskParams {
-            id: TaskId::from_string("task-2"),
-            reason: None,
-        };
-        let value = serde_json::to_value(&params).expect("serialize");
-        assert_eq!(value["id"], "task-2");
-        assert!(value.get("reason").is_none());
-    }
-
-    // ========================================================================
-    // CancelTaskResult Tests
-    // ========================================================================
-
-    #[test]
-    fn cancel_task_result_serialization() {
-        let result = CancelTaskResult {
-            cancelled: true,
-            task: crate::types::TaskInfo {
-                id: TaskId::from_string("task-1"),
-                task_type: "compute".to_string(),
-                status: TaskStatus::Cancelled,
-                progress: None,
-                message: None,
-                created_at: "2026-01-28T00:00:00Z".to_string(),
-                started_at: None,
-                completed_at: None,
-                error: None,
-            },
-        };
-        let value = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(value["cancelled"], true);
-        assert_eq!(value["task"]["status"], "cancelled");
     }
 
     // ========================================================================
