@@ -10409,6 +10409,51 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    fn make_test_server_info() -> fastmcp_protocol::ServerInfo {
+        fastmcp_protocol::ServerInfo {
+            name: "test-server".to_string(),
+            version: "1.0.0".to_string(),
+        }
+    }
+
+    fn make_test_capabilities(
+        tools: bool,
+        resources: bool,
+        prompts: bool,
+    ) -> fastmcp_protocol::ServerCapabilities {
+        fastmcp_protocol::ServerCapabilities {
+            tools: if tools {
+                Some(fastmcp_protocol::ToolsCapability {
+                    list_changed: false,
+                })
+            } else {
+                None
+            },
+            resources: if resources {
+                Some(fastmcp_protocol::ResourcesCapability {
+                    subscribe: false,
+                    list_changed: false,
+                })
+            } else {
+                None
+            },
+            prompts: if prompts {
+                Some(fastmcp_protocol::PromptsCapability {
+                    list_changed: false,
+                })
+            } else {
+                None
+            },
+            logging: None,
+            tasks: None,
+        }
+    }
+
+    fn make_test_protocol_status() -> InspectProtocolStatus {
+        InspectProtocolStatus::new(CliProtocolPolicy::Auto, "2026-07-28")
+            .expect("the modern exact version is admitted under Auto")
+    }
+
     // ============================================================================
     // CLI Argument Parsing Tests
     // ============================================================================
@@ -12894,51 +12939,6 @@ mod tests {
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
-        }
-
-        fn make_test_server_info() -> fastmcp_protocol::ServerInfo {
-            fastmcp_protocol::ServerInfo {
-                name: "test-server".to_string(),
-                version: "1.0.0".to_string(),
-            }
-        }
-
-        fn make_test_capabilities(
-            tools: bool,
-            resources: bool,
-            prompts: bool,
-        ) -> fastmcp_protocol::ServerCapabilities {
-            fastmcp_protocol::ServerCapabilities {
-                tools: if tools {
-                    Some(fastmcp_protocol::ToolsCapability {
-                        list_changed: false,
-                    })
-                } else {
-                    None
-                },
-                resources: if resources {
-                    Some(fastmcp_protocol::ResourcesCapability {
-                        subscribe: false,
-                        list_changed: false,
-                    })
-                } else {
-                    None
-                },
-                prompts: if prompts {
-                    Some(fastmcp_protocol::PromptsCapability {
-                        list_changed: false,
-                    })
-                } else {
-                    None
-                },
-                logging: None,
-                tasks: None,
-            }
-        }
-
-        fn make_test_protocol_status() -> InspectProtocolStatus {
-            InspectProtocolStatus::new(CliProtocolPolicy::Auto, "2026-07-28")
-                .expect("the modern exact version is admitted under Auto")
         }
 
         fn make_test_tool(name: &str, description: Option<&str>) -> fastmcp_protocol::Tool {

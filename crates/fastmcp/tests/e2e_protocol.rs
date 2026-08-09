@@ -25,9 +25,7 @@ use fastmcp_rust::{
     TokenAuthProvider,
 };
 #[cfg(unix)]
-use fastmcp_rust::{
-    auto, Client, Cx, ProtocolEra, ProtocolPolicy,
-};
+use fastmcp_rust::{Client, Cx, ProtocolEra, ProtocolPolicy, auto};
 use serde_json::json;
 
 // ============================================================================
@@ -1195,7 +1193,10 @@ fn connect_auto_stdio_to_shipped_echo_server(server_policy: &str) -> Client {
         .to_str()
         .expect("the shipped example path is valid UTF-8");
     let builder = auto::client_builder().env("FASTMCP_PROTOCOL_POLICY", server_policy);
-    assert_eq!(builder.selected_protocol_plan().policy(), ProtocolPolicy::Auto);
+    assert_eq!(
+        builder.selected_protocol_plan().policy(),
+        ProtocolPolicy::Auto
+    );
 
     let cx = Cx::for_request();
     builder
@@ -1214,7 +1215,10 @@ fn e2e_public_stdio_auto_selects_modern_on_the_shipped_facade_server() {
         Some(ProtocolEra::Modern2026),
         "the real Auto server must retain the successful modern discovery selection"
     );
-    assert_eq!(client.protocol_version(), fastmcp_rust::modern::PROTOCOL_VERSION);
+    assert_eq!(
+        client.protocol_version(),
+        fastmcp_rust::modern::PROTOCOL_VERSION
+    );
     assert_eq!(client.server_info().name, "echo-server");
     assert!(
         client.server_discovery().is_some(),
