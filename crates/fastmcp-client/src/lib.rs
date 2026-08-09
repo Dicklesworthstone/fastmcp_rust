@@ -8243,22 +8243,25 @@ mod tests {
         let refreshed = http_tools_list_response(4, "refreshed", 1_000);
         let server = std::thread::spawn(move || {
             let (mut probe, _) = listener.accept().expect("accept HTTP discovery");
-            let probe = read_http_cache_test_request(&mut probe);
-            assert_eq!(probe["id"], 1);
-            assert_eq!(probe["method"], "server/discover");
+            let probe_request = read_http_cache_test_request(&mut probe);
+            assert_eq!(probe_request["id"], 1);
+            assert_eq!(probe_request["method"], "server/discover");
             write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
 
             let (mut first_list, _) = listener.accept().expect("accept initial tools/list");
-            let first_list = read_http_cache_test_request(&mut first_list);
-            assert_eq!(first_list["id"], 2);
-            assert_eq!(first_list["method"], "tools/list");
+            let first_list_request = read_http_cache_test_request(&mut first_list);
+            assert_eq!(first_list_request["id"], 2);
+            assert_eq!(first_list_request["method"], "tools/list");
             write_http_cache_test_response(&mut first_list, "application/json", &initial);
 
             let (mut listen, _) = listener.accept().expect("accept subscriptions/listen");
-            let listen = read_http_cache_test_request(&mut listen);
-            assert_eq!(listen["id"], 3);
-            assert_eq!(listen["method"], "subscriptions/listen");
-            assert_eq!(listen["params"]["notifications"]["toolsListChanged"], true);
+            let listen_request = read_http_cache_test_request(&mut listen);
+            assert_eq!(listen_request["id"], 3);
+            assert_eq!(listen_request["method"], "subscriptions/listen");
+            assert_eq!(
+                listen_request["params"]["notifications"]["toolsListChanged"],
+                true
+            );
             let acknowledgement_filter = if acknowledges_tools_list_changes {
                 r#"{"toolsListChanged":true}"#
             } else {
@@ -8278,9 +8281,9 @@ mod tests {
                 let (mut second_list, _) = listener
                     .accept()
                     .expect("accepted change forces a second tools/list");
-                let second_list = read_http_cache_test_request(&mut second_list);
-                assert_eq!(second_list["id"], 4);
-                assert_eq!(second_list["method"], "tools/list");
+                let second_list_request = read_http_cache_test_request(&mut second_list);
+                assert_eq!(second_list_request["id"], 4);
+                assert_eq!(second_list_request["method"], "tools/list");
                 write_http_cache_test_response(&mut second_list, "application/json", &refreshed);
             }
         });
@@ -8392,15 +8395,15 @@ mod tests {
         let list_response = http_tools_list_response(2, "receipt", 1);
         let server = std::thread::spawn(move || {
             let (mut probe, _) = listener.accept().expect("accept HTTP receipt discovery");
-            let probe = read_http_cache_test_request(&mut probe);
-            assert_eq!(probe["id"], 1);
-            assert_eq!(probe["method"], "server/discover");
+            let probe_request = read_http_cache_test_request(&mut probe);
+            assert_eq!(probe_request["id"], 1);
+            assert_eq!(probe_request["method"], "server/discover");
             write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
 
             let (mut list, _) = listener.accept().expect("accept HTTP receipt tools/list");
-            let list = read_http_cache_test_request(&mut list);
-            assert_eq!(list["id"], 2);
-            assert_eq!(list["method"], "tools/list");
+            let list_request = read_http_cache_test_request(&mut list);
+            assert_eq!(list_request["id"], 2);
+            assert_eq!(list_request["method"], "tools/list");
             write_http_cache_test_response(&mut list, "application/json", &list_response);
         });
 
