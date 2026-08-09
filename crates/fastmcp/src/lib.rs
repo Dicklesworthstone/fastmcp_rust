@@ -642,7 +642,8 @@ pub mod modern {
     pub use fastmcp_client::http_executor::{
         MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
         MODERN_MCP_CONTENT_TYPE, ModernHttpClientError, ModernHttpSubscriptionListenCollector,
-        ModernHttpSubscriptionListenError,
+        ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
+        ModernHttpSubscriptionListener,
     };
     pub use fastmcp_client::{
         BoundedListPage, CachePartitionKey, CompletionContext, CompletionParams,
@@ -862,6 +863,14 @@ pub mod modern {
         pub fn mcp_apps(self, settings: McpAppsClientSettings) -> Self {
             Self {
                 inner: self.inner.mcp_apps(settings),
+            }
+        }
+
+        /// Adds one environment variable to the final-only stdio subprocess.
+        #[must_use]
+        pub fn env(self, key: impl Into<String>, value: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.env(key, value),
             }
         }
 
