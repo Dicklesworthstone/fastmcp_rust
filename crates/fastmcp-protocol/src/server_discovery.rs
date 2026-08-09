@@ -554,8 +554,10 @@ impl<'de> Deserialize<'de> for OptionalServerInstructions {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerDiscoverResult {
-    #[serde(rename = "resultType", skip_serializing_if = "Option::is_none")]
-    result_type: Option<String>,
+    #[serde(rename = "resultType")]
+    result_type: String,
+    #[serde(skip)]
+    peer_missing_result_type: bool,
     #[serde(rename = "supportedVersions")]
     supported_versions: Vec<String>,
     capabilities: ServerDiscoverCapabilities,
@@ -583,7 +585,8 @@ impl ServerDiscoverResult {
         cache_hints: DiscoveryCacheHints,
     ) -> Self {
         Self {
-            result_type: Some(COMPLETE_DISCOVERY_RESULT_TYPE.to_owned()),
+            result_type: COMPLETE_DISCOVERY_RESULT_TYPE.to_owned(),
+            peer_missing_result_type: false,
             supported_versions: SERVER_DISCOVER_SUPPORTED_VERSIONS
                 .iter()
                 .map(|version| (*version).to_owned())
@@ -604,25 +607,23 @@ impl ServerDiscoverResult {
 
     /// Returns the schema-open result discriminator received from the peer.
     ///
-    /// An absent peer discriminator is exposed as the compatibility default
+    /// An absent peer discriminator is normalized to the compatibility default
     /// `complete`; [`Self::peer_diagnostic`] distinguishes that wire omission
     /// from an explicitly emitted discriminator.
     #[must_use]
     pub fn result_type(&self) -> &str {
-        self.result_type
-            .as_deref()
-            .unwrap_or(COMPLETE_DISCOVERY_RESULT_TYPE)
+        &self.result_type
     }
 
     /// Returns bounded evidence for a final peer whose otherwise-valid
     /// discovery result omitted its required `resultType` discriminator.
     ///
-    /// The admitted object retains the omission when re-encoded. This avoids
-    /// rewriting captured peer evidence while local construction continues to
-    /// emit `resultType: "complete"` unconditionally.
+    /// Re-encoding canonicalizes the peer omission to the required
+    /// `resultType: "complete"`, so compatibility evidence cannot cause a
+    /// locally emitted final discovery result to omit its discriminator.
     #[must_use]
     pub const fn peer_diagnostic(&self) -> Option<ResultPeerDiagnostic> {
-        if self.result_type.is_none() {
+        if self.peer_missing_result_type {
             Some(ResultPeerDiagnostic::ModernMissingResultType)
         } else {
             None
@@ -698,8 +699,13 @@ impl<'de> Deserialize<'de> for ServerDiscoverResult {
         D: Deserializer<'de>,
     {
         let wire = ServerDiscoverResultWire::deserialize(deserializer)?;
+        let peer_missing_result_type = wire.result_type.0.is_none();
         Ok(Self {
-            result_type: wire.result_type.0,
+            result_type: wire
+                .result_type
+                .0
+                .unwrap_or_else(|| COMPLETE_DISCOVERY_RESULT_TYPE.to_owned()),
+            peer_missing_result_type,
             supported_versions: wire.supported_versions,
             capabilities: wire.capabilities,
             metadata: wire.metadata,
@@ -986,8 +992,8 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(decoded).expect("compatibility discovery re-encodes"),
-            missing_result_type,
-            "captured peer evidence must not gain a synthesized discriminator"
+            serde_json::to_value(&admitted).expect("local discovery result re-encodes"),
+            "peer compatibility input is canonicalized before local emission"
         );
         assert_eq!(
             serde_json::to_vec(&admitted).expect("the admitted result still encodes"),

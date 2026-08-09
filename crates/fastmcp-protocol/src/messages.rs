@@ -10,7 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::common_types::{
-    AbsoluteUri, ContentBlock, EmbeddedResourceContents, JsonInteger, LoggingLevel, OpenMetadata,
+    AbsoluteUri, ContentBlock, EmbeddedResourceContents, ExactNonNegativeJsonNumber, JsonInteger,
+    LoggingLevel, OpenMetadata,
 };
 use crate::jsonrpc::{JsonRpcRequest, JsonRpcResponse, RequestId};
 use crate::methods::{
@@ -668,9 +669,7 @@ fn validate_raw_completion_context_arguments(
     let mut entries = 0_usize;
     loop {
         let key = cursor.parse_string()?;
-        if raw_json_string_content_bytes(cursor.source, key)
-            > MAX_COMPLETION_CONTEXT_ARGUMENT_KEY_BYTES
-        {
+        if raw_json_string_content_bytes(key) > MAX_COMPLETION_CONTEXT_ARGUMENT_KEY_BYTES {
             return Err("completion context argument key exceeds the maximum raw JSON byte limit");
         }
         entries = entries
@@ -687,9 +686,7 @@ fn validate_raw_completion_context_arguments(
         cursor.skip_whitespace();
         if cursor.peek() == Some(b'"') {
             let value = cursor.parse_string()?;
-            if raw_json_string_content_bytes(cursor.source, value)
-                > MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES
-            {
+            if raw_json_string_content_bytes(value) > MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES {
                 return Err(
                     "completion context argument value exceeds the maximum raw JSON byte limit",
                 );
@@ -722,7 +719,7 @@ fn raw_completion_context_object_within_limit(
     }
 }
 
-fn raw_json_string_content_bytes(source: &str, token: std::ops::Range<usize>) -> usize {
+fn raw_json_string_content_bytes(token: std::ops::Range<usize>) -> usize {
     token.end.saturating_sub(token.start.saturating_add(2))
 }
 
@@ -1344,16 +1341,16 @@ impl<'de> Deserialize<'de> for FinalCancelledNotificationParams {
 }
 
 /// Exact final `notifications/progress` parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FinalProgressNotificationParams {
     /// Token from the client request being progressed.
     #[serde(rename = "progressToken")]
     pub progress_token: ProgressMarker,
     /// Progress completed so far.
-    pub progress: f64,
+    pub progress: ExactNonNegativeJsonNumber,
     /// Total work, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total: Option<f64>,
+    pub total: Option<ExactNonNegativeJsonNumber>,
     /// Optional progress message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -1363,6 +1360,47 @@ pub struct FinalProgressNotificationParams {
     /// Schema-open extension members retained without activating behavior.
     #[serde(flatten, default)]
     pub additional: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct FinalProgressNotificationParamsWire {
+    #[serde(rename = "progressToken")]
+    progress_token: ProgressMarker,
+    progress: ExactNonNegativeJsonNumber,
+    #[serde(default)]
+    total: Option<ExactNonNegativeJsonNumber>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(rename = "_meta", default)]
+    meta: Option<OpenMetadata>,
+    #[serde(flatten, default)]
+    additional: BTreeMap<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for FinalProgressNotificationParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = FinalProgressNotificationParamsWire::deserialize(deserializer)?;
+        if wire
+            .total
+            .as_ref()
+            .is_some_and(|total| wire.progress > *total)
+        {
+            return Err(serde::de::Error::custom(
+                "final progress must not exceed its total",
+            ));
+        }
+        Ok(Self {
+            progress_token: wire.progress_token,
+            progress: wire.progress,
+            total: wire.total,
+            message: wire.message,
+            meta: wire.meta,
+            additional: wire.additional,
+        })
+    }
 }
 
 /// Exact final `notifications/resources/updated` parameters.
@@ -2258,6 +2296,38 @@ impl ServerNotification {
         }
     }
 
+    /// Decodes a final server notification with the exact received `params` JSON.
+    ///
+    /// Only the modern progress branch needs this companion to preserve native-size
+    /// decimal and exponent spellings that a materialized [`Value`] normalizes.
+    /// The caller must pass the raw `params` member from the same admitted frame.
+    /// Other final notification branches use [`Self::decode`] unchanged.
+    pub fn decode_with_raw_params(
+        request: &JsonRpcRequest,
+        raw_params: &str,
+    ) -> Result<Self, FinalNotificationError> {
+        admit_final_notification(request, Final2026Peer::Server)?;
+        if request.method != NOTIFICATIONS_PROGRESS {
+            return Self::decode(request);
+        }
+
+        let parsed_params = serde_json::from_str(raw_params).map_err(|_| {
+            FinalNotificationError::InvalidParams {
+                method: NOTIFICATIONS_PROGRESS,
+            }
+        })?;
+        if request.params.as_ref() != Some(&parsed_params) {
+            return Err(FinalNotificationError::InvalidParams {
+                method: NOTIFICATIONS_PROGRESS,
+            });
+        }
+        serde_json::from_str(raw_params)
+            .map(Self::Progress)
+            .map_err(|_| FinalNotificationError::InvalidParams {
+                method: NOTIFICATIONS_PROGRESS,
+            })
+    }
+
     /// Returns this notification's exact method literal.
     #[must_use]
     pub const fn method(&self) -> &'static str {
@@ -2704,8 +2774,8 @@ pub enum LegacyCoreResult {
 ///
 /// Every complete branch carries the bounded final complete-result algebra.
 /// `tools/call`, `resources/read`, and `prompts/get` additionally carry the
-/// final MRTR `input_required` branch. Both preserve an absent-result-type
-/// compatibility diagnostic for callers that record peer conformance.
+/// final MRTR `input_required` branch. An absent `resultType` is accepted
+/// only by the separately selected legacy result decoder.
 #[derive(Debug, Clone)]
 pub enum FinalCoreResult {
     /// `server/discover`.
@@ -4567,30 +4637,6 @@ pub struct LogMessageParams {
 
 use crate::types::{TaskId, TaskInfo, TaskResult, TaskStatus};
 
-/// tasks/list request params.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ListTasksParams {
-    /// Cursor for pagination.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
-    /// Maximum number of tasks to return.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
-    /// Filter by task status.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<TaskStatus>,
-}
-
-/// tasks/list response result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListTasksResult {
-    /// List of tasks.
-    pub tasks: Vec<TaskInfo>,
-    /// Next cursor for pagination.
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
-}
-
 /// tasks/get request params.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetTaskParams {
@@ -4624,26 +4670,6 @@ pub struct CancelTaskResult {
     /// Whether the cancellation was successful.
     pub cancelled: bool,
     /// Updated task information.
-    pub task: TaskInfo,
-}
-
-/// tasks/submit request params.
-///
-/// Used to submit a new background task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubmitTaskParams {
-    /// Task type identifier.
-    #[serde(rename = "taskType")]
-    pub task_type: String,
-    /// Task parameters.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<serde_json::Value>,
-}
-
-/// tasks/submit response result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubmitTaskResult {
-    /// Created task information.
     pub task: TaskInfo,
 }
 
@@ -5569,6 +5595,131 @@ mod tests {
                 "{expected_method} preserves its exact notification parameter shape"
             );
         }
+    }
+
+    #[test]
+    fn final_progress_raw_params_preserve_large_decimal_and_exponent_lexemes() {
+        let large_wire = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"job-large","progress":123456789012345678901234567890}}"#;
+        let large_request: JsonRpcRequest =
+            serde_json::from_str(large_wire).expect("large exact progress notification parses");
+        let large_params =
+            r#"{"progressToken":"job-large","progress":123456789012345678901234567890}"#;
+        let large_notification =
+            ServerNotification::decode_with_raw_params(&large_request, large_params)
+                .expect("large exact progress notification is admitted with its raw parameters");
+        let ServerNotification::Progress(large_params) = &large_notification else {
+            panic!("progress method decodes to the progress notification variant");
+        };
+        assert_eq!(
+            large_params.progress.as_str(),
+            "123456789012345678901234567890",
+            "the large integer progress lexeme is retained without an IEEE-754 conversion"
+        );
+        assert_eq!(
+            serde_json::to_string(
+                &large_notification
+                    .encode()
+                    .expect("large progress re-encodes")
+            )
+            .expect("large progress JSON serializes"),
+            large_wire,
+            "the large integer progress lexeme round-trips exactly"
+        );
+
+        let equivalent_wire = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"job-decimal","progress":1.20e+4,"total":12000.0}}"#;
+        let equivalent_request: JsonRpcRequest = serde_json::from_str(equivalent_wire)
+            .expect("decimal/exponent exact progress notification parses");
+        let equivalent_params =
+            r#"{"progressToken":"job-decimal","progress":1.20e+4,"total":12000.0}"#;
+        let equivalent_notification =
+            ServerNotification::decode_with_raw_params(&equivalent_request, equivalent_params)
+                .expect("numerically equal decimal and exponent progress fields are admitted");
+        let ServerNotification::Progress(equivalent_params) = &equivalent_notification else {
+            panic!("progress method decodes to the progress notification variant");
+        };
+        assert_eq!(equivalent_params.progress.as_str(), "1.20e+4");
+        assert_eq!(
+            equivalent_params
+                .total
+                .as_ref()
+                .map(ExactNonNegativeJsonNumber::as_str),
+            Some("12000.0")
+        );
+        assert_eq!(
+            equivalent_params.total.as_ref(),
+            Some(&equivalent_params.progress)
+        );
+        assert_eq!(
+            serde_json::to_string(
+                &equivalent_notification
+                    .encode()
+                    .expect("equivalent progress re-encodes")
+            )
+            .expect("equivalent progress JSON serializes"),
+            equivalent_wire,
+            "equivalent decimal/exponent values retain their individual wire lexemes"
+        );
+    }
+
+    #[test]
+    fn final_progress_rejects_one_variable_invalid_and_non_monotonic_values() {
+        let baseline_params =
+            r#"{"progressToken":"job-ordered","progress":1.20e+4,"total":12000.0}"#;
+        let baseline_wire = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{baseline_params}}}"#
+        );
+        let baseline: JsonRpcRequest =
+            serde_json::from_str(&baseline_wire).expect("baseline progress notification parses");
+        let admitted = ServerNotification::decode_with_raw_params(&baseline, baseline_params)
+            .expect("equal exact progress and total values form the baseline");
+        let baseline_wire = serde_json::to_value(&baseline).expect("baseline progress serializes");
+
+        let negative_params = r#"{"progressToken":"job-ordered","progress":-1,"total":12000.0}"#;
+        let negative: JsonRpcRequest = serde_json::from_str(&format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{negative_params}}}"#
+        ))
+        .expect("one-variable negative progress notification parses");
+        assert!(
+            matches!(
+                ServerNotification::decode_with_raw_params(&negative, negative_params),
+                Err(FinalNotificationError::InvalidParams {
+                    method: NOTIFICATIONS_PROGRESS
+                })
+            ),
+            "changing only progress to a negative number rejects final progress admission"
+        );
+
+        let non_monotonic_params =
+            r#"{"progressToken":"job-ordered","progress":1.20e+4,"total":11999.0}"#;
+        let non_monotonic: JsonRpcRequest = serde_json::from_str(&format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{non_monotonic_params}}}"#
+        ))
+        .expect("one-variable non-monotonic progress notification parses");
+        assert!(
+            matches!(
+                ServerNotification::decode_with_raw_params(&non_monotonic, non_monotonic_params),
+                Err(FinalNotificationError::InvalidParams {
+                    method: NOTIFICATIONS_PROGRESS
+                })
+            ),
+            "changing only total below progress rejects non-monotonic final progress"
+        );
+        assert_eq!(
+            serde_json::to_value(admitted.encode().expect("baseline progress re-encodes"))
+                .expect("baseline progress JSON serializes"),
+            baseline_wire,
+            "rejections cannot mutate the admitted exact progress baseline"
+        );
+    }
+
+    #[test]
+    fn legacy_progress_params_remain_the_separate_2024_f64_surface() {
+        let legacy: ProgressParams =
+            serde_json::from_str(r#"{"progressToken":"legacy-job","progress":-1.5,"total":2.0}"#)
+                .expect("legacy progress remains governed by its existing f64 decoder");
+
+        assert_eq!(legacy.progress, -1.5);
+        assert_eq!(legacy.total, Some(2.0));
     }
 
     #[test]
@@ -6983,25 +7134,16 @@ mod tests {
         );
 
         for (first, second, case) in [
-            (
-                oversized.as_str(),
-                small,
-                "oversized-first/small-second",
-            ),
-            (
-                small,
-                oversized.as_str(),
-                "small-first/oversized-second",
-            ),
+            (oversized.as_str(), small, "oversized-first/small-second"),
+            (small, oversized.as_str(), "small-first/oversized-second"),
         ] {
-            let error = serde_json::from_str::<JsonRpcRequest>(&final_completion_request(
-                first, second,
-            ))
-            .expect_err("every final context occurrence must be raw-bounded before serde");
+            let error =
+                serde_json::from_str::<JsonRpcRequest>(&final_completion_request(first, second))
+                    .expect_err("every final context occurrence must be raw-bounded before serde");
             assert!(
-                error
-                    .to_string()
-                    .contains("completion context argument value exceeds the maximum raw JSON byte limit"),
+                error.to_string().contains(
+                    "completion context argument value exceeds the maximum raw JSON byte limit"
+                ),
                 "{case} must fail at the raw bound rather than after serde reaches a duplicate context"
             );
         }
@@ -8722,48 +8864,6 @@ mod tests {
         assert_eq!(value["level"], "info");
         assert_eq!(value["logger"], "fastmcp_rust::server");
         assert_eq!(value["data"], "hello");
-    }
-
-    #[test]
-    fn list_tasks_params_serialization() {
-        let params = ListTasksParams {
-            cursor: None,
-            limit: None,
-            status: None,
-        };
-        let value = serde_json::to_value(&params).expect("serialize list tasks params");
-        assert_eq!(value, serde_json::json!({}));
-
-        let params = ListTasksParams {
-            cursor: Some("next".to_string()),
-            limit: Some(10),
-            status: Some(TaskStatus::Running),
-        };
-        let value = serde_json::to_value(&params).expect("serialize list tasks params");
-        assert_eq!(
-            value,
-            serde_json::json!({"cursor": "next", "limit": 10, "status": "running"})
-        );
-    }
-
-    #[test]
-    fn submit_task_params_serialization() {
-        let params = SubmitTaskParams {
-            task_type: "demo".to_string(),
-            params: None,
-        };
-        let value = serde_json::to_value(&params).expect("serialize submit task params");
-        assert_eq!(value, serde_json::json!({"taskType": "demo"}));
-
-        let params = SubmitTaskParams {
-            task_type: "demo".to_string(),
-            params: Some(serde_json::json!({"payload": 1})),
-        };
-        let value = serde_json::to_value(&params).expect("serialize submit task params");
-        assert_eq!(
-            value,
-            serde_json::json!({"taskType": "demo", "params": {"payload": 1}})
-        );
     }
 
     #[test]

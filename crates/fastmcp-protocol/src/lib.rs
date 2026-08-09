@@ -41,6 +41,7 @@
 pub mod common_types;
 pub mod extensions;
 mod jsonrpc;
+pub mod mcp_apps_bridge;
 mod messages;
 pub mod methods;
 pub mod protocol_policy;
@@ -92,6 +93,7 @@ pub use jsonrpc::{
     RawJsonRpcDisposition, RequestId, UncorrelatedJsonRpcErrorResponse, admit_raw_jsonrpc_document,
     decode_strict_jsonrpc_message, decode_strict_jsonrpc_response, dispose_raw_jsonrpc_failure,
 };
+pub use mcp_apps_bridge::*;
 pub use messages::*;
 pub use methods::SERVER_DISCOVER;
 pub use protocol_version::{

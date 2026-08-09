@@ -2320,11 +2320,20 @@ mod tests {
         );
         assert_eq!(descriptor.resolver.id, MCP_APPS_NEGOTIATION_RESOLVER_ID);
         assert_eq!(
+            descriptor.resolver.version,
+            MCP_APPS_NEGOTIATION_RESOLVER_VERSION
+        );
+        assert_eq!(
             descriptor.resolver.fallback,
             ExtensionFallbackPolicy::InactiveOnEitherPeer
         );
         assert!(descriptor.method.is_none());
         assert!(descriptor.notification.is_none());
+        assert_eq!(
+            validate_official_mcp_apps_descriptor(descriptor),
+            Ok(()),
+            "the public descriptor is the exact method-free Apps capability shape"
+        );
         registry.freeze().expect("MCP Apps registry freezes");
 
         let client = ClientExtensionDiscovery {
@@ -2360,6 +2369,36 @@ mod tests {
                 .into_value(),
             client_wire,
             "negotiation retains the same validated client settings object"
+        );
+    }
+
+    #[test]
+    fn apps_01_descriptor_rejects_one_method_plant_without_registration_mutation() {
+        let accepted = official_mcp_apps_descriptor();
+        let mut planted = accepted.clone();
+        planted.method = Some(ExtensionMethodDescriptor {
+            name: MCP_APPS_INITIALIZE_METHOD.to_owned(),
+            direction: ExtensionDirection::ClientToServer,
+            http_era_disposition: Some(ExtensionHttpEraDisposition::ModernExclusive),
+            legacy_fallback: false,
+        });
+
+        assert_eq!(
+            validate_official_mcp_apps_descriptor(&planted),
+            Err(ExtensionRegistryError::OfficialMcpAppsDescriptorMismatch),
+            "only adding a client/server method rejects the Host/View-only Apps descriptor"
+        );
+        let mut registry = ExtensionDescriptorRegistry::new();
+        assert_eq!(
+            registry.register(planted),
+            Err(ExtensionRegistryError::OfficialMcpAppsDescriptorMismatch),
+            "the registry must reject the same descriptor mutation before ownership changes"
+        );
+        assert_eq!(registry.descriptors().len(), 0);
+        assert_eq!(
+            validate_official_mcp_apps_descriptor(&accepted),
+            Ok(()),
+            "the rejected one-variable descriptor cannot mutate the admitted baseline"
         );
     }
 

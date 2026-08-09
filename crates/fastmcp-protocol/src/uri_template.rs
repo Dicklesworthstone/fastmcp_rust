@@ -397,16 +397,13 @@ impl ReversibleResourceTemplate {
                             )?;
                             Some(ReversibleBoundary::Literal(encoded))
                         }
-                        Some(UriTemplatePart::Expression(next)) => Some(
-                            reversible_adjacent_expression_boundary(expression, next)?,
-                        ),
+                        Some(UriTemplatePart::Expression(next)) => {
+                            Some(reversible_adjacent_expression_boundary(expression, next)?)
+                        }
                         None => None,
                     };
 
-                    validate_reversible_expression(
-                        expression,
-                        next_boundary.as_ref(),
-                    )?;
+                    validate_reversible_expression(expression, next_boundary.as_ref())?;
                     parts.push(ReversibleTemplatePart::Expression(
                         ReversibleTemplateExpression {
                             operator: expression.operator(),
@@ -557,7 +554,7 @@ enum ReversibleBoundary {
 }
 
 impl ReversibleBoundary {
-    const fn as_str(&self) -> &str {
+    fn as_str(&self) -> &str {
         match self {
             Self::Literal(value) | Self::ExpressionPrefix(value) => value,
         }
@@ -1808,9 +1805,12 @@ fn reversible_adjacent_expression_boundary(
     expression: &UriTemplateExpression,
     next: &UriTemplateExpression,
 ) -> Result<ReversibleBoundary, UriTemplateError> {
-    let variable = next.variables().first().ok_or(UriTemplateError::NonReversibleTemplate {
-        reason: UriTemplateMatchRejection::MultipleVariables,
-    })?;
+    let variable = next
+        .variables()
+        .first()
+        .ok_or(UriTemplateError::NonReversibleTemplate {
+            reason: UriTemplateMatchRejection::MultipleVariables,
+        })?;
     if next.variables().len() != 1 {
         return Err(UriTemplateError::NonReversibleTemplate {
             reason: UriTemplateMatchRejection::MultipleVariables,
@@ -1837,9 +1837,7 @@ fn reversible_adjacent_expression_boundary(
             }
             "/".to_owned()
         }
-        UriTemplateOperator::PathParameter => {
-            reversible_named_expression_prefix(";", variable)?
-        }
+        UriTemplateOperator::PathParameter => reversible_named_expression_prefix(";", variable)?,
         UriTemplateOperator::Query => reversible_named_expression_prefix("?", variable)?,
         UriTemplateOperator::QueryContinuation => {
             reversible_named_expression_prefix("&", variable)?
@@ -2426,8 +2424,8 @@ mod tests {
     }
 
     #[test]
-    fn reversible_resource_template_reserved_and_fragment_preescaped_scalars_reject_without_mutation(
-    ) {
+    fn reversible_resource_template_reserved_and_fragment_preescaped_scalars_reject_without_mutation()
+     {
         for template in ["mcp://resource/{+value}", "mcp://resource{#value}"] {
             let matcher = UriTemplate::parse(template)
                 .expect("the reserved or fragment template parses")
@@ -2534,7 +2532,7 @@ mod tests {
     #[test]
     fn reversible_resource_template_adjacent_path_query_round_trips_exactly() {
         let accepted = "mcp://resource{/collection}{?revision}";
-        let planted_ambiguous = "mcp://resource{/collection}{.revision}";
+        let planted_ambiguous = "mcp://resource{/collection}{/revision}";
         let matcher = UriTemplate::parse(accepted)
             .expect("the positive control parses")
             .compile_reversible()
@@ -2580,9 +2578,11 @@ mod tests {
         );
 
         let error = UriTemplate::parse(planted_ambiguous)
-            .expect("changing only the following query marker to a label remains valid RFC 6570")
+            .expect(
+                "changing only the following query marker to a path marker remains valid RFC 6570",
+            )
             .compile_reversible()
-            .expect_err("a raw dot can belong to the preceding path scalar");
+            .expect_err("identical path markers cannot distinguish an omitted adjacent scalar");
         assert_eq!(
             error,
             UriTemplateError::NonReversibleTemplate {

@@ -11,6 +11,7 @@ use base64::Engine as _;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 /// A structural rejection at the protocol wire boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +63,10 @@ pub const MAX_ICON_SIZE_BYTES: usize = 128;
 pub const MAX_CONTENT_ENCODED_BYTES: usize = 1024 * 1024;
 /// Maximum UTF-8 bytes in each W3C trace field.
 pub const MAX_TRACE_FIELD_BYTES: usize = 4 * 1024;
+/// Maximum bytes retained for one exact final progress number lexeme.
+pub const MAX_EXACT_PROGRESS_NUMBER_BYTES: usize = 256;
+/// Largest absolute decimal exponent accepted for one final progress number.
+pub const MAX_EXACT_PROGRESS_EXPONENT_ABS: i32 = 9_999;
 
 /// A schema-valid RFC 3986 URI with a required ASCII scheme.
 ///
@@ -491,6 +496,185 @@ impl<'de> Deserialize<'de> for JsonInteger {
         let value = serde_json::Number::deserialize(deserializer)?;
         Self::try_from_number(value).map_err(serde::de::Error::custom)
     }
+}
+
+/// A bounded, exact, finite nonnegative JSON number used by final progress
+/// notifications.
+///
+/// The original JSON-number lexeme is retained for wire re-encoding. Ordering
+/// is computed from bounded decimal components, never through IEEE-754.
+#[derive(Clone, Debug)]
+pub struct ExactNonNegativeJsonNumber {
+    raw: Box<RawValue>,
+    significant_digits: String,
+    decimal_point: i32,
+}
+
+impl ExactNonNegativeJsonNumber {
+    /// Admits one bounded nonnegative JSON number while retaining its spelling.
+    pub fn try_from_number(number: serde_json::Number) -> Result<Self, CommonTypeError> {
+        Self::parse(number.as_str())
+    }
+
+    /// Parses one exact progress number from its JSON-number lexeme.
+    pub fn parse(lexeme: &str) -> Result<Self, CommonTypeError> {
+        let raw = RawValue::from_string(lexeme.to_owned())
+            .map_err(|_| CommonTypeError::Invalid("JSON progress number"))?;
+        Self::from_raw(raw)
+    }
+
+    fn from_raw(raw: Box<RawValue>) -> Result<Self, CommonTypeError> {
+        let lexeme = raw.get();
+        if lexeme.len() > MAX_EXACT_PROGRESS_NUMBER_BYTES {
+            return Err(CommonTypeError::TooLong("exact progress number"));
+        }
+        if lexeme.starts_with('-') {
+            return Err(CommonTypeError::Invalid("nonnegative progress number"));
+        }
+
+        let (mantissa, exponent) = match lexeme.find(|character| matches!(character, 'e' | 'E')) {
+            Some(index) => (
+                &lexeme[..index],
+                parse_bounded_progress_exponent(&lexeme[index + 1..])?,
+            ),
+            None => (lexeme, 0),
+        };
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if whole.is_empty()
+            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(CommonTypeError::Invalid("JSON progress number"));
+        }
+        let digits = [whole, fraction].concat();
+        let first_significant = digits
+            .bytes()
+            .position(|byte| byte != b'0')
+            .unwrap_or(digits.len());
+        let significant_digits = if first_significant == digits.len() {
+            "0".to_owned()
+        } else {
+            digits[first_significant..].to_owned()
+        };
+        let decimal_point = i32::try_from(whole.len())
+            .map_err(|_| CommonTypeError::TooLong("exact progress number"))?
+            .checked_sub(
+                i32::try_from(first_significant)
+                    .map_err(|_| CommonTypeError::TooLong("exact progress number"))?,
+            )
+            .and_then(|point| point.checked_add(exponent))
+            .ok_or(CommonTypeError::TooLong("exact progress number"))?;
+
+        Ok(Self {
+            raw,
+            significant_digits,
+            decimal_point,
+        })
+    }
+
+    /// Returns the exact JSON-number spelling retained from the wire.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.raw.get()
+    }
+
+    fn is_zero(&self) -> bool {
+        self.significant_digits == "0"
+    }
+}
+
+impl PartialEq for ExactNonNegativeJsonNumber {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for ExactNonNegativeJsonNumber {}
+
+impl PartialOrd for ExactNonNegativeJsonNumber {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ExactNonNegativeJsonNumber {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.is_zero(), other.is_zero()) {
+            (true, true) => return std::cmp::Ordering::Equal,
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            (false, false) => {}
+        }
+        match self.decimal_point.cmp(&other.decimal_point) {
+            std::cmp::Ordering::Equal => {}
+            order => return order,
+        }
+        for index in 0..self
+            .significant_digits
+            .len()
+            .max(other.significant_digits.len())
+        {
+            match self
+                .significant_digits
+                .as_bytes()
+                .get(index)
+                .copied()
+                .unwrap_or(b'0')
+                .cmp(
+                    &other
+                        .significant_digits
+                        .as_bytes()
+                        .get(index)
+                        .copied()
+                        .unwrap_or(b'0'),
+                ) {
+                std::cmp::Ordering::Equal => {}
+                order => return order,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+impl Serialize for ExactNonNegativeJsonNumber {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExactNonNegativeJsonNumber {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let number = serde_json::Number::deserialize(deserializer)?;
+        Self::try_from_number(number).map_err(serde::de::Error::custom)
+    }
+}
+
+fn parse_bounded_progress_exponent(value: &str) -> Result<i32, CommonTypeError> {
+    let (negative, digits) = match value.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, value.strip_prefix('+').unwrap_or(value)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(CommonTypeError::Invalid("JSON progress number"));
+    }
+    let magnitude = digits.bytes().try_fold(0_i32, |value, byte| {
+        value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(i32::from(byte - b'0')))
+    });
+    let Some(magnitude) = magnitude else {
+        return Err(CommonTypeError::TooLong("progress number exponent"));
+    };
+    if magnitude > MAX_EXACT_PROGRESS_EXPONENT_ABS {
+        return Err(CommonTypeError::TooLong("progress number exponent"));
+    }
+    Ok(if negative { -magnitude } else { magnitude })
 }
 
 fn valid_json_integer(value: &str) -> bool {
@@ -2216,6 +2400,38 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn exact_nonnegative_json_numbers_preserve_lexemes_and_compare_mathematically() {
+        let large = ExactNonNegativeJsonNumber::parse("123456789012345678901234567890")
+            .expect("large integer exact progress number");
+        let decimal = ExactNonNegativeJsonNumber::parse("1.20e+4")
+            .expect("decimal exponent exact progress number");
+        let equivalent = ExactNonNegativeJsonNumber::parse("12000.0")
+            .expect("equivalent decimal exact progress number");
+        let greater =
+            ExactNonNegativeJsonNumber::parse("12000.0001").expect("greater exact progress number");
+
+        assert_eq!(large.as_str(), "123456789012345678901234567890");
+        assert_eq!(decimal.as_str(), "1.20e+4");
+        assert_eq!(decimal, equivalent);
+        assert!(greater > decimal);
+        assert_eq!(
+            serde_json::to_string(&decimal).expect("exact progress number serializes"),
+            "1.20e+4",
+            "the decimal/exponent lexeme re-encodes without an IEEE-754 conversion"
+        );
+        assert_eq!(
+            ExactNonNegativeJsonNumber::parse("-1"),
+            Err(CommonTypeError::Invalid("nonnegative progress number")),
+            "changing only the sign rejects an otherwise valid progress number"
+        );
+        assert_eq!(
+            ExactNonNegativeJsonNumber::parse("1e10000"),
+            Err(CommonTypeError::TooLong("progress number exponent")),
+            "the exact comparison representation bounds decimal exponents"
+        );
+    }
 
     #[test]
     fn prt_02_a_positive() {

@@ -3,8 +3,14 @@
 //! Core types used in MCP communication.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
-use crate::common_types::{AbsoluteUri, Annotations, OpenMetadata, RawIcon, SamplingContentBlock};
+use crate::common_types::{
+    AbsoluteUri, Annotations, ContentBlock, OpenMetadata, RawIcon, SamplingContentBlock,
+};
+use crate::extensions::MCP_APPS_HTML_MIME_TYPE;
+use crate::messages::{FinalCallToolResult, FinalCoreResult};
+use crate::result::{MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_ENCODED_BYTES};
 use base64::Engine as _;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
@@ -543,6 +549,890 @@ pub struct FinalToolAnnotations {
     pub open_world_hint: Option<bool>,
 }
 
+// ============================================================================
+// MCP Apps metadata, lifecycle, and result projection
+// ============================================================================
+
+/// Nested `_meta` member reserved by the MCP Apps protocol.
+pub const MCP_APPS_UI_METADATA_KEY: &str = "ui";
+/// Deprecated flat metadata member that this final-only surface rejects.
+pub const MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY: &str = "ui/resourceUri";
+/// Maximum members in a closed nested MCP Apps tool `ui` metadata object.
+pub const MAX_MCP_APPS_UI_METADATA_MEMBERS: usize = 2;
+/// Maximum origins retained by one Apps CSP directive.
+pub const MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE: usize = 128;
+/// Maximum UTF-8 bytes retained for one Apps CSP origin or host-selected domain.
+pub const MAX_MCP_APPS_CSP_DOMAIN_BYTES: usize = 2_048;
+
+/// A tool audience declared in nested MCP Apps metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpAppsToolVisibility {
+    /// The model can discover and invoke the tool.
+    Model,
+    /// The rendered App can invoke the tool through its later bridge runtime.
+    App,
+}
+
+/// A Host-selected way to present an App View.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpAppsDisplayMode {
+    /// The View appears in normal document flow.
+    Inline,
+    /// The View occupies the host's full display surface.
+    Fullscreen,
+    /// The View is presented picture-in-picture.
+    Pip,
+}
+
+/// Closed Apps metadata attached to a final `Tool` under `_meta.ui`.
+///
+/// The resource URI is intentionally typed as an absolute `ui:` URI. Security
+/// configuration belongs to resource metadata and is intentionally not part
+/// of this non-security protocol slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpAppsToolMetadata {
+    /// UI resource rendered when this tool is invoked, when declared.
+    pub resource_uri: Option<AbsoluteUri>,
+    /// Optional explicit audiences; absence retains the Apps default of both.
+    pub visibility: Option<Vec<McpAppsToolVisibility>>,
+}
+
+impl McpAppsToolMetadata {
+    /// Creates validated closed Apps tool metadata.
+    pub fn try_new(
+        resource_uri: Option<AbsoluteUri>,
+        visibility: Option<Vec<McpAppsToolVisibility>>,
+    ) -> Result<Self, McpAppsMetadataError> {
+        if resource_uri
+            .as_ref()
+            .is_some_and(|resource_uri| !resource_uri.has_scheme("ui"))
+        {
+            return Err(McpAppsMetadataError::ResourceUriMustUseUiScheme);
+        }
+        Ok(Self {
+            resource_uri,
+            visibility,
+        })
+    }
+
+    /// Returns the effective visibility without changing absent versus present
+    /// wire state.
+    #[must_use]
+    pub fn effective_visibility(&self) -> &[McpAppsToolVisibility] {
+        const DEFAULT_VISIBILITY: [McpAppsToolVisibility; 2] =
+            [McpAppsToolVisibility::Model, McpAppsToolVisibility::App];
+        self.visibility.as_deref().unwrap_or(&DEFAULT_VISIBILITY)
+    }
+
+    /// Produces a standalone final `_meta` object containing this exact nested
+    /// Apps member.
+    pub fn to_open_metadata(&self) -> Result<OpenMetadata, McpAppsMetadataError> {
+        let value =
+            serde_json::to_value(self).map_err(|_| McpAppsMetadataError::InvalidToolMetadata)?;
+        OpenMetadata::try_from_entries([(MCP_APPS_UI_METADATA_KEY.to_owned(), value)])
+            .map_err(|_| McpAppsMetadataError::InvalidToolMetadata)
+    }
+
+    /// Merges this typed `ui` member into existing final open metadata.
+    pub fn merge_into(
+        &self,
+        metadata: &OpenMetadata,
+    ) -> Result<OpenMetadata, McpAppsMetadataError> {
+        reject_deprecated_mcp_apps_metadata(metadata)?;
+        if metadata.entries().contains_key(MCP_APPS_UI_METADATA_KEY) {
+            return Err(McpAppsMetadataError::UiMetadataAlreadyPresent);
+        }
+        let mut entries = metadata.entries().clone();
+        entries.insert(
+            MCP_APPS_UI_METADATA_KEY.to_owned(),
+            serde_json::to_value(self).map_err(|_| McpAppsMetadataError::InvalidToolMetadata)?,
+        );
+        OpenMetadata::try_from_entries(entries)
+            .map_err(|_| McpAppsMetadataError::InvalidToolMetadata)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpAppsToolMetadataWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource_uri: Option<AbsoluteUri>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    visibility: Option<Vec<McpAppsToolVisibility>>,
+}
+
+impl Serialize for McpAppsToolMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Self::try_new(self.resource_uri.clone(), self.visibility.clone())
+            .map_err(serde::ser::Error::custom)?;
+        McpAppsToolMetadataWire {
+            resource_uri: self.resource_uri.clone(),
+            visibility: self.visibility.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpAppsToolMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = McpAppsToolMetadataWire::deserialize(deserializer)?;
+        Self::try_new(wire.resource_uri, wire.visibility).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Bounded CSP origins declared by an Apps resource.
+///
+/// These declarations remain requests to the host. They do not authorize a
+/// network connection, nested frame, or base URI without host-side policy.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpAppsResourceCsp {
+    /// Origins for network requests (`connect-src`).
+    pub connect_domains: Option<Vec<String>>,
+    /// Origins for static resources (`img-src`, `script-src`, and related directives).
+    pub resource_domains: Option<Vec<String>>,
+    /// Origins allowed for nested frames (`frame-src`).
+    pub frame_domains: Option<Vec<String>>,
+    /// Origins allowed as document base URIs (`base-uri`).
+    pub base_uri_domains: Option<Vec<String>>,
+}
+
+impl McpAppsResourceCsp {
+    /// Creates a bounded CSP declaration without granting any host authority.
+    pub fn try_new(
+        connect_domains: Option<Vec<String>>,
+        resource_domains: Option<Vec<String>>,
+        frame_domains: Option<Vec<String>>,
+        base_uri_domains: Option<Vec<String>>,
+    ) -> Result<Self, McpAppsMetadataError> {
+        for domains in [
+            connect_domains.as_deref(),
+            resource_domains.as_deref(),
+            frame_domains.as_deref(),
+            base_uri_domains.as_deref(),
+        ] {
+            validate_mcp_apps_domains(domains)?;
+        }
+        Ok(Self {
+            connect_domains,
+            resource_domains,
+            frame_domains,
+            base_uri_domains,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpAppsResourceCspWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connect_domains: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource_domains: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frame_domains: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_uri_domains: Option<Vec<String>>,
+}
+
+impl Serialize for McpAppsResourceCsp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Self::try_new(
+            self.connect_domains.clone(),
+            self.resource_domains.clone(),
+            self.frame_domains.clone(),
+            self.base_uri_domains.clone(),
+        )
+        .map_err(serde::ser::Error::custom)?;
+        McpAppsResourceCspWire {
+            connect_domains: self.connect_domains.clone(),
+            resource_domains: self.resource_domains.clone(),
+            frame_domains: self.frame_domains.clone(),
+            base_uri_domains: self.base_uri_domains.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpAppsResourceCsp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = McpAppsResourceCspWire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.connect_domains,
+            wire.resource_domains,
+            wire.frame_domains,
+            wire.base_uri_domains,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// An empty-object Apps sandbox permission marker.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpAppsResourcePermission {}
+
+/// Optional sandbox permissions requested by an Apps resource.
+///
+/// Presence requests a host permission; absence does not. A host may further
+/// restrict or reject every requested permission.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpAppsResourcePermissions {
+    /// Camera permission marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<McpAppsResourcePermission>,
+    /// Microphone permission marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub microphone: Option<McpAppsResourcePermission>,
+    /// Geolocation permission marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geolocation: Option<McpAppsResourcePermission>,
+    /// Clipboard-write permission marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard_write: Option<McpAppsResourcePermission>,
+}
+
+/// Closed Apps rendering metadata attached to a `Resource` under `_meta.ui`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpAppsResourceMetadata {
+    /// Optional CSP declarations for the rendered view.
+    pub csp: Option<McpAppsResourceCsp>,
+    /// Optional sandbox permission requests.
+    pub permissions: Option<McpAppsResourcePermissions>,
+    /// Optional host-defined dedicated view domain.
+    pub domain: Option<String>,
+    /// Whether the View prefers a visible host-provided border and background.
+    pub prefers_border: Option<bool>,
+}
+
+impl McpAppsResourceMetadata {
+    /// Creates closed non-security resource presentation metadata.
+    #[must_use]
+    pub const fn new(prefers_border: Option<bool>) -> Self {
+        Self {
+            csp: None,
+            permissions: None,
+            domain: None,
+            prefers_border,
+        }
+    }
+
+    /// Creates bounded resource rendering metadata with all currently stable
+    /// Apps fields. The domain is retained as host-defined opaque data.
+    pub fn try_new(
+        csp: Option<McpAppsResourceCsp>,
+        permissions: Option<McpAppsResourcePermissions>,
+        domain: Option<String>,
+        prefers_border: Option<bool>,
+    ) -> Result<Self, McpAppsMetadataError> {
+        if domain
+            .as_deref()
+            .is_some_and(|domain| domain.is_empty() || domain.len() > MAX_MCP_APPS_CSP_DOMAIN_BYTES)
+        {
+            return Err(McpAppsMetadataError::InvalidDomain);
+        }
+        Ok(Self {
+            csp,
+            permissions,
+            domain,
+            prefers_border,
+        })
+    }
+
+    /// Produces a standalone final `_meta` object containing this exact nested
+    /// Apps member.
+    pub fn to_open_metadata(&self) -> Result<OpenMetadata, McpAppsMetadataError> {
+        let value = serde_json::to_value(self)
+            .map_err(|_| McpAppsMetadataError::InvalidResourceMetadata)?;
+        OpenMetadata::try_from_entries([(MCP_APPS_UI_METADATA_KEY.to_owned(), value)])
+            .map_err(|_| McpAppsMetadataError::InvalidResourceMetadata)
+    }
+
+    /// Merges this typed `ui` member into existing final open metadata.
+    pub fn merge_into(
+        &self,
+        metadata: &OpenMetadata,
+    ) -> Result<OpenMetadata, McpAppsMetadataError> {
+        reject_deprecated_mcp_apps_metadata(metadata)?;
+        if metadata.entries().contains_key(MCP_APPS_UI_METADATA_KEY) {
+            return Err(McpAppsMetadataError::UiMetadataAlreadyPresent);
+        }
+        let mut entries = metadata.entries().clone();
+        entries.insert(
+            MCP_APPS_UI_METADATA_KEY.to_owned(),
+            serde_json::to_value(self)
+                .map_err(|_| McpAppsMetadataError::InvalidResourceMetadata)?,
+        );
+        OpenMetadata::try_from_entries(entries)
+            .map_err(|_| McpAppsMetadataError::InvalidResourceMetadata)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpAppsResourceMetadataWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    csp: Option<McpAppsResourceCsp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permissions: Option<McpAppsResourcePermissions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prefers_border: Option<bool>,
+}
+
+impl Serialize for McpAppsResourceMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        McpAppsResourceMetadataWire {
+            csp: self.csp.clone(),
+            permissions: self.permissions.clone(),
+            domain: self.domain.clone(),
+            prefers_border: self.prefers_border,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpAppsResourceMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = McpAppsResourceMetadataWire::deserialize(deserializer)?;
+        Self::try_new(wire.csp, wire.permissions, wire.domain, wire.prefers_border)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A validated association between a tool's nested Apps metadata and an HTML
+/// UI resource in the final catalog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpAppsResourceBinding {
+    /// Exact `ui:` resource URI selected by the tool.
+    pub resource_uri: AbsoluteUri,
+    /// The tool's effective Apps visibility.
+    pub visibility: Vec<McpAppsToolVisibility>,
+}
+
+impl McpAppsResourceBinding {
+    /// Derives a binding only when the tool declares a nested Apps resource URI.
+    pub fn from_tool(tool: &FinalTool) -> Result<Option<Self>, McpAppsMetadataError> {
+        let Some(metadata) = tool.mcp_apps_metadata()? else {
+            return Ok(None);
+        };
+        let visibility = metadata.effective_visibility().to_vec();
+        let Some(resource_uri) = metadata.resource_uri else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            resource_uri,
+            visibility,
+        }))
+    }
+
+    /// Verifies that a catalog resource is the exact HTML resource selected by
+    /// this binding. Resource presentation metadata remains optional.
+    pub fn validate_resource(
+        &self,
+        resource: &FinalResource,
+    ) -> Result<(), McpAppsResourceBindingError> {
+        let _ = resource
+            .mcp_apps_metadata()
+            .map_err(McpAppsResourceBindingError::Metadata)?;
+        if resource.uri != self.resource_uri {
+            return Err(McpAppsResourceBindingError::UriMismatch);
+        }
+        if resource.mime_type.as_deref() != Some(MCP_APPS_HTML_MIME_TYPE) {
+            return Err(McpAppsResourceBindingError::HtmlMimeTypeRequired);
+        }
+        Ok(())
+    }
+}
+
+/// A View lifecycle phase. This pure protocol state machine does not send or
+/// receive any `ui/*` RPC message; a future bridge runtime owns that work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsViewLifecycle {
+    /// No initialization attempt has been admitted.
+    New,
+    /// One initialization request is reserved and awaiting its response.
+    InitializeInFlight,
+    /// Initialization succeeded and the initialized notification is due.
+    AwaitingInitialized,
+    /// The View may receive ordinary application traffic.
+    Active,
+    /// Terminal teardown has begun.
+    Closing,
+    /// Terminal teardown is complete.
+    Closed,
+}
+
+impl Default for McpAppsViewLifecycle {
+    fn default() -> Self {
+        Self::New
+    }
+}
+
+impl McpAppsViewLifecycle {
+    /// Reserves the single legal initialization attempt.
+    pub fn begin_initialize(&mut self) -> Result<(), McpAppsLifecycleError> {
+        self.transition(Self::New, Self::InitializeInFlight, "initialize")
+    }
+
+    /// Commits a successful initialization response.
+    pub fn initialization_succeeded(&mut self) -> Result<(), McpAppsLifecycleError> {
+        self.transition(
+            Self::InitializeInFlight,
+            Self::AwaitingInitialized,
+            "initialize response",
+        )
+    }
+
+    /// Atomically rolls a failed initialization back before exposure.
+    pub fn initialization_failed(&mut self) -> Result<(), McpAppsLifecycleError> {
+        self.transition(Self::InitializeInFlight, Self::New, "initialize rollback")
+    }
+
+    /// Admits the sole initialized notification and enables application traffic.
+    pub fn admit_initialized(&mut self) -> Result<(), McpAppsLifecycleError> {
+        self.transition(
+            Self::AwaitingInitialized,
+            Self::Active,
+            "initialized notification",
+        )
+    }
+
+    /// Begins one terminal teardown from every non-terminal phase.
+    pub fn begin_closing(&mut self) -> Result<(), McpAppsLifecycleError> {
+        match *self {
+            Self::New | Self::InitializeInFlight | Self::AwaitingInitialized | Self::Active => {
+                *self = Self::Closing;
+                Ok(())
+            }
+            Self::Closing | Self::Closed => Err(McpAppsLifecycleError::InvalidTransition {
+                from: *self,
+                operation: "begin closing",
+            }),
+        }
+    }
+
+    /// Completes one terminal teardown.
+    pub fn finish_closing(&mut self) -> Result<(), McpAppsLifecycleError> {
+        self.transition(Self::Closing, Self::Closed, "finish closing")
+    }
+
+    /// Returns whether ordinary Host/View application traffic is legal.
+    #[must_use]
+    pub const fn permits_application_traffic(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    fn transition(
+        &mut self,
+        expected: Self,
+        next: Self,
+        operation: &'static str,
+    ) -> Result<(), McpAppsLifecycleError> {
+        if *self != expected {
+            return Err(McpAppsLifecycleError::InvalidTransition {
+                from: *self,
+                operation,
+            });
+        }
+        *self = next;
+        Ok(())
+    }
+}
+
+/// One validated Apps-side projection of a complete final `tools/call` result.
+///
+/// This projection intentionally accepts only the complete final result
+/// branch. Tasks and MRTR input-required branches remain outside the Apps
+/// bridge until an explicit composition contract is implemented.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpAppsToolResult {
+    /// Complete final content projected without normalization.
+    pub content: Vec<ContentBlock>,
+    /// Tool-level error indicator retained exactly.
+    pub is_error: bool,
+    /// Optional structured output, including an explicitly present JSON null.
+    pub structured_content: Option<serde_json::Value>,
+}
+
+impl McpAppsToolResult {
+    /// Constructs a bounded Apps result projection.
+    pub fn try_new(
+        content: Vec<ContentBlock>,
+        is_error: bool,
+        structured_content: Option<serde_json::Value>,
+    ) -> Result<Self, McpAppsResultProjectionError> {
+        if content.len() > MAX_RESULT_CONTAINER_MEMBERS {
+            return Err(McpAppsResultProjectionError::ResultTooLarge);
+        }
+        let result = Self {
+            content,
+            is_error,
+            structured_content,
+        };
+        let encoded = serde_json::to_vec(&McpAppsToolResultWire::from(&result))
+            .map_err(|_| McpAppsResultProjectionError::ResultTooLarge)?;
+        if encoded.len() > MAX_RESULT_ENCODED_BYTES {
+            return Err(McpAppsResultProjectionError::ResultTooLarge);
+        }
+        Ok(result)
+    }
+
+    /// Projects one fully validated final `tools/call` payload exactly once.
+    pub fn from_final_call_tool_result(
+        result: &FinalCallToolResult,
+    ) -> Result<Self, McpAppsResultProjectionError> {
+        Self::try_new(
+            result.content.clone(),
+            result.is_error,
+            result.structured_content.clone(),
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpAppsToolResultWire {
+    content: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    structured_content: Option<serde_json::Value>,
+}
+
+impl From<&McpAppsToolResult> for McpAppsToolResultWire {
+    fn from(result: &McpAppsToolResult) -> Self {
+        Self {
+            content: result.content.clone(),
+            is_error: result.is_error,
+            structured_content: result.structured_content.clone(),
+        }
+    }
+}
+
+impl Serialize for McpAppsToolResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Self::try_new(
+            self.content.clone(),
+            self.is_error,
+            self.structured_content.clone(),
+        )
+        .map_err(serde::ser::Error::custom)?;
+        McpAppsToolResultWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpAppsToolResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = McpAppsToolResultWire::deserialize(deserializer)?;
+        Self::try_new(wire.content, wire.is_error, wire.structured_content)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Projects the complete `tools/call` branch while rejecting deferred Tasks and
+/// MRTR branches before any Apps result is produced.
+pub fn project_final_core_tools_call_result(
+    result: &FinalCoreResult,
+) -> Result<McpAppsToolResult, McpAppsResultProjectionError> {
+    match result {
+        FinalCoreResult::ToolsCall { result, .. } => {
+            McpAppsToolResult::from_final_call_tool_result(&result.payload)
+        }
+        FinalCoreResult::ToolsCallTask { .. } => {
+            Err(McpAppsResultProjectionError::TasksUnsupported)
+        }
+        FinalCoreResult::ToolsCallInputRequired { .. } => {
+            Err(McpAppsResultProjectionError::MrtrUnsupported)
+        }
+        _ => Err(McpAppsResultProjectionError::NotToolsCall),
+    }
+}
+
+/// Metadata validation failures specific to the closed Apps `ui` member.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsMetadataError {
+    /// The old flat `ui/resourceUri` key is forbidden on the final surface.
+    DeprecatedFlatResourceUri,
+    /// The nested `ui` member was not an object.
+    UiMetadataMustBeObject,
+    /// A tool `ui` object did not satisfy its closed schema.
+    InvalidToolMetadata,
+    /// A resource `ui` object did not satisfy its closed schema.
+    InvalidResourceMetadata,
+    /// A resource binding URI must use the `ui:` scheme.
+    ResourceUriMustUseUiScheme,
+    /// One CSP directive carried more than its bounded number of origins.
+    TooManyCspDomains,
+    /// One CSP origin was empty or exceeded its bounded byte allowance.
+    InvalidCspDomain,
+    /// The host-defined Apps domain was empty or exceeded its bounded allowance.
+    InvalidDomain,
+    /// A merge would overwrite a pre-existing nested `ui` member.
+    UiMetadataAlreadyPresent,
+}
+
+impl fmt::Display for McpAppsMetadataError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeprecatedFlatResourceUri => formatter.write_str(
+                "deprecated flat MCP Apps metadata key ui/resourceUri is forbidden; use _meta.ui.resourceUri",
+            ),
+            Self::UiMetadataMustBeObject => {
+                formatter.write_str("MCP Apps _meta.ui must be an object")
+            }
+            Self::InvalidToolMetadata => {
+                formatter.write_str("MCP Apps tool _meta.ui does not satisfy its closed schema")
+            }
+            Self::InvalidResourceMetadata => formatter
+                .write_str("MCP Apps resource _meta.ui does not satisfy its closed schema"),
+            Self::ResourceUriMustUseUiScheme => {
+                formatter.write_str("MCP Apps resourceUri must use the ui: scheme")
+            }
+            Self::TooManyCspDomains => {
+                formatter.write_str("MCP Apps CSP directive exceeds its origin limit")
+            }
+            Self::InvalidCspDomain => {
+                formatter.write_str("MCP Apps CSP origin is empty or exceeds its byte limit")
+            }
+            Self::InvalidDomain => {
+                formatter.write_str("MCP Apps domain is empty or exceeds its byte limit")
+            }
+            Self::UiMetadataAlreadyPresent => {
+                formatter.write_str("MCP Apps _meta already contains a ui member")
+            }
+        }
+    }
+}
+
+impl std::error::Error for McpAppsMetadataError {}
+
+/// A catalog resource did not satisfy one validated Apps binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsResourceBindingError {
+    /// The candidate resource URI differs from the tool's exact binding URI.
+    UriMismatch,
+    /// The candidate resource is not an Apps HTML resource.
+    HtmlMimeTypeRequired,
+    /// Resource metadata was not a valid closed Apps metadata object.
+    Metadata(McpAppsMetadataError),
+}
+
+impl fmt::Display for McpAppsResourceBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UriMismatch => {
+                formatter.write_str("MCP Apps resource URI differs from tool binding")
+            }
+            Self::HtmlMimeTypeRequired => {
+                formatter.write_str("MCP Apps bound resource must use text/html;profile=mcp-app")
+            }
+            Self::Metadata(error) => write!(formatter, "MCP Apps resource metadata: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for McpAppsResourceBindingError {}
+
+/// Illegal transition in the pure Apps View lifecycle state machine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsLifecycleError {
+    /// The requested operation is not legal from the retained lifecycle phase.
+    InvalidTransition {
+        /// Current lifecycle phase.
+        from: McpAppsViewLifecycle,
+        /// Name of the rejected operation.
+        operation: &'static str,
+    },
+}
+
+impl fmt::Display for McpAppsLifecycleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTransition { from, operation } => {
+                write!(
+                    formatter,
+                    "MCP Apps lifecycle cannot {operation} from {from:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for McpAppsLifecycleError {}
+
+/// Apps result projection failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsResultProjectionError {
+    /// The projected result exceeds the final result bounds.
+    ResultTooLarge,
+    /// A Tasks-backed `tools/call` result has no Apps result composition.
+    TasksUnsupported,
+    /// An MRTR `input_required` tools/call result has no Apps result composition.
+    MrtrUnsupported,
+    /// Only the final `tools/call` result family can be projected.
+    NotToolsCall,
+}
+
+impl fmt::Display for McpAppsResultProjectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResultTooLarge => {
+                formatter.write_str("MCP Apps result exceeds final result bounds")
+            }
+            Self::TasksUnsupported => {
+                formatter.write_str("MCP Apps does not project Tasks-backed tool results")
+            }
+            Self::MrtrUnsupported => {
+                formatter.write_str("MCP Apps does not project MRTR input-required tool results")
+            }
+            Self::NotToolsCall => {
+                formatter.write_str("MCP Apps projects only final tools/call results")
+            }
+        }
+    }
+}
+
+impl std::error::Error for McpAppsResultProjectionError {}
+
+fn validate_mcp_apps_domains(domains: Option<&[String]>) -> Result<(), McpAppsMetadataError> {
+    let Some(domains) = domains else {
+        return Ok(());
+    };
+    if domains.len() > MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE {
+        return Err(McpAppsMetadataError::TooManyCspDomains);
+    }
+    if domains
+        .iter()
+        .any(|domain| domain.is_empty() || domain.len() > MAX_MCP_APPS_CSP_DOMAIN_BYTES)
+    {
+        return Err(McpAppsMetadataError::InvalidCspDomain);
+    }
+    Ok(())
+}
+
+fn reject_deprecated_mcp_apps_metadata(
+    metadata: &OpenMetadata,
+) -> Result<(), McpAppsMetadataError> {
+    if metadata
+        .entries()
+        .contains_key(MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY)
+    {
+        Err(McpAppsMetadataError::DeprecatedFlatResourceUri)
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_mcp_apps_tool_metadata(
+    metadata: &OpenMetadata,
+) -> Result<Option<McpAppsToolMetadata>, McpAppsMetadataError> {
+    reject_deprecated_mcp_apps_metadata(metadata)?;
+    let Some(value) = metadata.entries().get(MCP_APPS_UI_METADATA_KEY) else {
+        return Ok(None);
+    };
+    if !value.is_object() {
+        return Err(McpAppsMetadataError::UiMetadataMustBeObject);
+    }
+    let metadata = serde_json::from_value(value.clone())
+        .map_err(|_| McpAppsMetadataError::InvalidToolMetadata)?;
+    Ok(Some(metadata))
+}
+
+fn parse_mcp_apps_resource_metadata(
+    metadata: &OpenMetadata,
+) -> Result<Option<McpAppsResourceMetadata>, McpAppsMetadataError> {
+    reject_deprecated_mcp_apps_metadata(metadata)?;
+    let Some(value) = metadata.entries().get(MCP_APPS_UI_METADATA_KEY) else {
+        return Ok(None);
+    };
+    if !value.is_object() {
+        return Err(McpAppsMetadataError::UiMetadataMustBeObject);
+    }
+    let metadata = serde_json::from_value(value.clone())
+        .map_err(|_| McpAppsMetadataError::InvalidResourceMetadata)?;
+    Ok(Some(metadata))
+}
+
+fn serialize_final_tool_metadata<S>(
+    metadata: &Option<OpenMetadata>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if let Some(metadata) = metadata {
+        parse_mcp_apps_tool_metadata(metadata).map_err(serde::ser::Error::custom)?;
+    }
+    metadata.serialize(serializer)
+}
+
+fn deserialize_final_tool_metadata<'de, D>(
+    deserializer: D,
+) -> Result<Option<OpenMetadata>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let metadata = Option::<OpenMetadata>::deserialize(deserializer)?;
+    if let Some(metadata) = &metadata {
+        parse_mcp_apps_tool_metadata(metadata).map_err(serde::de::Error::custom)?;
+    }
+    Ok(metadata)
+}
+
+fn serialize_final_resource_metadata<S>(
+    metadata: &Option<OpenMetadata>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if let Some(metadata) = metadata {
+        parse_mcp_apps_resource_metadata(metadata).map_err(serde::ser::Error::custom)?;
+    }
+    metadata.serialize(serializer)
+}
+
+fn deserialize_final_resource_metadata<'de, D>(
+    deserializer: D,
+) -> Result<Option<OpenMetadata>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let metadata = Option::<OpenMetadata>::deserialize(deserializer)?;
+    if let Some(metadata) = &metadata {
+        parse_mcp_apps_resource_metadata(metadata).map_err(serde::de::Error::custom)?;
+    }
+    Ok(metadata)
+}
+
 /// Exact final `Tool` model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -576,8 +1466,30 @@ pub struct FinalTool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<FinalToolAnnotations>,
     /// Optional final metadata.
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_final_tool_metadata",
+        deserialize_with = "deserialize_final_tool_metadata"
+    )]
     pub meta: Option<OpenMetadata>,
+}
+
+impl FinalTool {
+    /// Reads and validates the tool's optional closed `_meta.ui` Apps member.
+    pub fn mcp_apps_metadata(&self) -> Result<Option<McpAppsToolMetadata>, McpAppsMetadataError> {
+        self.meta
+            .as_ref()
+            .map_or(Ok(None), parse_mcp_apps_tool_metadata)
+    }
+
+    /// Derives the optional exact Apps resource binding declared by this tool.
+    pub fn mcp_apps_resource_binding(
+        &self,
+    ) -> Result<Option<McpAppsResourceBinding>, McpAppsMetadataError> {
+        McpAppsResourceBinding::from_tool(self)
+    }
 }
 
 /// Exact final `Resource` model.
@@ -607,8 +1519,26 @@ pub struct FinalResource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Annotations>,
     /// Optional final metadata.
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_final_resource_metadata",
+        deserialize_with = "deserialize_final_resource_metadata"
+    )]
     pub meta: Option<OpenMetadata>,
+}
+
+impl FinalResource {
+    /// Reads and validates the resource's optional closed `_meta.ui` Apps
+    /// presentation member.
+    pub fn mcp_apps_metadata(
+        &self,
+    ) -> Result<Option<McpAppsResourceMetadata>, McpAppsMetadataError> {
+        self.meta
+            .as_ref()
+            .map_or(Ok(None), parse_mcp_apps_resource_metadata)
+    }
 }
 
 /// Exact final `ResourceTemplate` model.
@@ -2735,6 +3665,346 @@ mod tests {
             serde_json::to_value(accepted).expect("accepted outputSchema re-encodes"),
             accepted_wire,
             "rejecting the one-field null plant cannot mutate the accepted model"
+        );
+    }
+
+    #[test]
+    fn apps_02_nested_tool_resource_metadata_and_result_projection_round_trip() {
+        let tool_wire = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"},
+            "_meta": {
+                "ui": {
+                    "resourceUri": "ui://weather/dashboard",
+                    "visibility": ["model", "app"]
+                },
+                "com.example/catalog": "weather"
+            }
+        });
+        let tool: FinalTool = serde_json::from_value(tool_wire.clone())
+            .expect("a nested Apps tool resource binding is valid final metadata");
+        let metadata = tool
+            .mcp_apps_metadata()
+            .expect("nested Apps tool metadata remains typed")
+            .expect("the tool declares Apps metadata");
+        assert_eq!(
+            metadata.resource_uri.as_ref().map(AbsoluteUri::as_str),
+            Some("ui://weather/dashboard")
+        );
+        assert_eq!(
+            metadata.effective_visibility(),
+            [McpAppsToolVisibility::Model, McpAppsToolVisibility::App]
+        );
+        assert_eq!(
+            serde_json::to_value(&tool).expect("tool re-encodes exact nested metadata"),
+            tool_wire
+        );
+
+        let resource_wire = json!({
+            "uri": "ui://weather/dashboard",
+            "name": "weather-dashboard",
+            "mimeType": MCP_APPS_HTML_MIME_TYPE,
+            "_meta": {"ui": {
+                "csp": {
+                    "connectDomains": ["https://api.weather.example"],
+                    "resourceDomains": ["https://cdn.weather.example"],
+                    "frameDomains": ["https://maps.weather.example"],
+                    "baseUriDomains": ["https://cdn.weather.example"]
+                },
+                "permissions": {"geolocation": {}},
+                "domain": "weather-view.host.example",
+                "prefersBorder": true
+            }}
+        });
+        let resource: FinalResource = serde_json::from_value(resource_wire.clone())
+            .expect("an Apps HTML resource accepts nested presentation metadata");
+        let resource_metadata = resource
+            .mcp_apps_metadata()
+            .expect("resource metadata remains typed")
+            .expect("resource declares Apps presentation");
+        assert_eq!(resource_metadata.prefers_border, Some(true));
+        assert_eq!(
+            resource_metadata
+                .csp
+                .as_ref()
+                .and_then(|csp| csp.connect_domains.as_ref())
+                .map(|domains| domains.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["https://api.weather.example"])
+        );
+        assert!(
+            resource_metadata
+                .permissions
+                .as_ref()
+                .and_then(|permissions| permissions.geolocation.as_ref())
+                .is_some()
+        );
+        assert_eq!(
+            resource_metadata.domain.as_deref(),
+            Some("weather-view.host.example")
+        );
+        tool.mcp_apps_resource_binding()
+            .expect("tool metadata is valid")
+            .expect("tool has an Apps binding")
+            .validate_resource(&resource)
+            .expect("the exact Apps HTML catalog resource satisfies the binding");
+        assert_eq!(
+            serde_json::to_value(&resource).expect("resource re-encodes exact nested metadata"),
+            resource_wire
+        );
+
+        let final_result = FinalCallToolResult {
+            content: vec![ContentBlock::text("sunny")],
+            is_error: false,
+            structured_content: Some(serde_json::Value::Null),
+        };
+        let projected = McpAppsToolResult::from_final_call_tool_result(&final_result)
+            .expect("a complete final tools/call result projects into Apps content");
+        let result_wire = json!({
+            "content": [{"type": "text", "text": "sunny"}],
+            "structuredContent": null
+        });
+        assert_eq!(
+            serde_json::to_value(&projected).expect("Apps result serializes"),
+            result_wire
+        );
+        assert_eq!(
+            serde_json::from_value::<McpAppsToolResult>(result_wire)
+                .expect("Apps result round-trips exactly"),
+            projected
+        );
+    }
+
+    #[test]
+    fn apps_02_rejects_only_deprecated_flat_resource_uri_metadata() {
+        let accepted = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"},
+            "_meta": {"ui": {"resourceUri": "ui://weather/dashboard"}}
+        });
+        let baseline: FinalTool = serde_json::from_value(accepted.clone())
+            .expect("nested Apps resource metadata is the baseline");
+        let mut planted = accepted.clone();
+        let metadata = planted["_meta"]
+            .as_object_mut()
+            .expect("baseline metadata is an object");
+        let nested = metadata
+            .remove(MCP_APPS_UI_METADATA_KEY)
+            .expect("baseline has nested Apps metadata");
+        let resource_uri = nested["resourceUri"].clone();
+        metadata.insert(
+            MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY.to_owned(),
+            resource_uri,
+        );
+
+        assert!(
+            serde_json::from_value::<FinalTool>(planted).is_err(),
+            "only replacing nested ui.resourceUri with the deprecated flat key rejects the tool"
+        );
+        assert_eq!(
+            serde_json::to_value(&baseline).expect("baseline remains serializable"),
+            accepted,
+            "the flat-key rejection cannot mutate the accepted nested binding"
+        );
+    }
+
+    #[test]
+    fn apps_02_rejects_one_csp_origin_beyond_the_bounded_directive_limit() {
+        let accepted = json!({
+            "uri": "ui://weather/dashboard",
+            "name": "weather-dashboard",
+            "mimeType": MCP_APPS_HTML_MIME_TYPE,
+            "_meta": {"ui": {"csp": {
+                "connectDomains": (0..MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE)
+                    .map(|index| format!("https://{index}.weather.example"))
+                    .collect::<Vec<_>>()
+            }}}
+        });
+        let baseline: FinalResource = serde_json::from_value(accepted.clone())
+            .expect("a bounded Apps CSP declaration is valid");
+        let mut planted = accepted.clone();
+        planted["_meta"]["ui"]["csp"]["connectDomains"]
+            .as_array_mut()
+            .expect("bounded baseline has a CSP origin array")
+            .push(json!(format!(
+                "https://{MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE}.weather.example"
+            )));
+
+        assert!(
+            serde_json::from_value::<FinalResource>(planted).is_err(),
+            "adding only one origin beyond the CSP directive bound rejects the resource metadata"
+        );
+        assert_eq!(
+            serde_json::to_value(baseline).expect("bounded baseline re-encodes"),
+            accepted,
+            "the one-origin rejection cannot mutate the admitted Apps metadata"
+        );
+    }
+
+    #[test]
+    fn apps_02_direct_csp_construction_cannot_bypass_serialization_bounds() {
+        let accepted = McpAppsResourceCsp {
+            connect_domains: Some(
+                (0..MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE)
+                    .map(|index| format!("https://{index}.weather.example"))
+                    .collect(),
+            ),
+            ..McpAppsResourceCsp::default()
+        };
+        let accepted_wire = serde_json::to_value(&accepted)
+            .expect("the direct CSP value at the directive bound serializes");
+
+        let mut planted = accepted.clone();
+        planted
+            .connect_domains
+            .as_mut()
+            .expect("the direct CSP fixture has connect domains")
+            .push(format!(
+                "https://{MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE}.weather.example"
+            ));
+
+        assert!(
+            serde_json::to_value(&planted).is_err(),
+            "adding only one domain beyond the bound rejects direct CSP serialization"
+        );
+        assert_eq!(
+            serde_json::to_value(&accepted).expect("accepted direct CSP re-serializes"),
+            accepted_wire,
+            "a rejected direct CSP serialization cannot mutate the bounded baseline"
+        );
+    }
+
+    #[test]
+    fn apps_02_preserves_duplicate_and_ordered_visibility() {
+        let accepted = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"},
+            "_meta": {"ui": {"visibility": ["app", "model", "app"]}}
+        });
+        let tool: FinalTool = serde_json::from_value(accepted.clone())
+            .expect("the stable Apps visibility array permits duplicates in wire order");
+        let metadata = tool
+            .mcp_apps_metadata()
+            .expect("Apps metadata remains typed")
+            .expect("the tool declares Apps metadata");
+        assert_eq!(
+            metadata.effective_visibility(),
+            [
+                McpAppsToolVisibility::App,
+                McpAppsToolVisibility::Model,
+                McpAppsToolVisibility::App,
+            ],
+            "Apps visibility preserves the received duplicate sequence"
+        );
+        assert_eq!(
+            serde_json::to_value(&tool).expect("tool re-encodes"),
+            accepted,
+            "Apps visibility re-encodes duplicates in their received order"
+        );
+    }
+
+    #[test]
+    fn apps_02_rejects_one_non_html_bound_resource_without_mutating_binding() {
+        let tool: FinalTool = serde_json::from_value(json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"},
+            "_meta": {"ui": {"resourceUri": "ui://weather/dashboard"}}
+        }))
+        .expect("nested Apps binding is valid");
+        let binding = tool
+            .mcp_apps_resource_binding()
+            .expect("tool metadata is valid")
+            .expect("tool declares an Apps resource");
+        let accepted = json!({
+            "uri": "ui://weather/dashboard",
+            "name": "weather-dashboard",
+            "mimeType": MCP_APPS_HTML_MIME_TYPE
+        });
+        let baseline: FinalResource =
+            serde_json::from_value(accepted.clone()).expect("Apps resource baseline decodes");
+        let mut planted = accepted.clone();
+        planted["mimeType"] = json!("text/plain");
+
+        assert_eq!(binding.validate_resource(&baseline), Ok(()));
+        let incompatible: FinalResource = serde_json::from_value(planted)
+            .expect("only MIME type changes; resource remains a final resource");
+        assert_eq!(
+            binding.validate_resource(&incompatible),
+            Err(McpAppsResourceBindingError::HtmlMimeTypeRequired),
+            "only replacing the Apps HTML MIME type rejects the bound resource"
+        );
+        assert_eq!(
+            serde_json::to_value(&baseline).expect("baseline resource re-encodes"),
+            accepted,
+            "the invalid resource cannot mutate the admitted binding target"
+        );
+    }
+
+    #[test]
+    fn apps_02_view_lifecycle_requires_initialization_before_activation() {
+        assert_eq!(
+            serde_json::to_value(McpAppsDisplayMode::Pip).expect("display mode serializes exactly"),
+            json!("pip")
+        );
+        assert_eq!(
+            serde_json::from_value::<McpAppsDisplayMode>(json!("fullscreen"))
+                .expect("known display mode decodes"),
+            McpAppsDisplayMode::Fullscreen
+        );
+        assert!(
+            serde_json::from_value::<McpAppsDisplayMode>(json!("overlay")).is_err(),
+            "only replacing a known display mode with an undeclared value rejects it"
+        );
+
+        let mut lifecycle = McpAppsViewLifecycle::default();
+        assert!(!lifecycle.permits_application_traffic());
+        assert_eq!(
+            lifecycle.admit_initialized(),
+            Err(McpAppsLifecycleError::InvalidTransition {
+                from: McpAppsViewLifecycle::New,
+                operation: "initialized notification",
+            }),
+            "only omitting the prior initialization transition rejects early activation"
+        );
+        assert_eq!(lifecycle, McpAppsViewLifecycle::New);
+
+        lifecycle
+            .begin_initialize()
+            .expect("one initialization reservation is legal from New");
+        lifecycle
+            .initialization_succeeded()
+            .expect("a successful initialization awaits exactly one notification");
+        lifecycle
+            .admit_initialized()
+            .expect("the first initialized notification activates the View");
+        assert!(lifecycle.permits_application_traffic());
+        lifecycle
+            .begin_closing()
+            .expect("an active View can begin terminal teardown");
+        lifecycle
+            .finish_closing()
+            .expect("a closing View reaches Closed exactly once");
+        assert_eq!(lifecycle, McpAppsViewLifecycle::Closed);
+    }
+
+    #[test]
+    fn apps_02_result_projection_rejects_one_unknown_wire_member() {
+        let accepted = json!({
+            "content": [{"type": "text", "text": "sunny"}],
+            "isError": true
+        });
+        let baseline: McpAppsToolResult = serde_json::from_value(accepted.clone())
+            .expect("bounded complete Apps tool result is valid");
+        let mut planted = accepted.clone();
+        planted["task"] = json!({"taskId": "deferred"});
+
+        assert!(
+            serde_json::from_value::<McpAppsToolResult>(planted).is_err(),
+            "only adding a Tasks-shaped member rejects the complete Apps result projection"
+        );
+        assert_eq!(
+            serde_json::to_value(&baseline).expect("baseline result re-encodes"),
+            accepted,
+            "the rejected Tasks-shaped member cannot mutate the complete Apps result"
         );
     }
 }
