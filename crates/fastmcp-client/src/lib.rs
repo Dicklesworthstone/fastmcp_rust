@@ -86,6 +86,7 @@ pub use fastmcp_protocol::{
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, LegacySseHttpClient,
     LegacySseHttpClientError, ModernHttpClient, ModernHttpClientError, ModernHttpResponseStream,
+    ModernHttpSubscriptionListenCollector,
 };
 pub use mcp_config::claude_desktop_config_path;
 pub use negotiation::{
@@ -3703,6 +3704,9 @@ impl HttpClient {
                         },
                     );
                 }
+                connection.record_legacy_negotiated_protocol_version(
+                    initialization.protocol_version.clone(),
+                );
                 connection
                     .notify(cx, "notifications/initialized", None)
                     .await
@@ -3881,7 +3885,7 @@ impl HttpClient {
         let request_id = self.next_request_id()?;
         let response = self
             .connection
-            .request_json_with_result_source(
+            .request_json_with_result_source_at(
                 cx,
                 method,
                 parameters,
@@ -3890,8 +3894,7 @@ impl HttpClient {
             )
             .await
             .map_err(HttpClientError::Connection)?;
-        let (mut response, result_source) = response;
-        let receipt = Instant::now();
+        let (mut response, result_source, receipt) = response;
         if let Some(error) = response.error.take() {
             return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
         }
@@ -3919,6 +3922,51 @@ impl HttpClient {
             );
         }
         Ok(result)
+    }
+
+    /// Collects one typed final HTTP subscription stream and invalidates this
+    /// client's bounded complete-result cache for each accepted catalog or
+    /// resource-change event before returning the collector.
+    ///
+    /// The returned collector still retains the exact ordered notifications.
+    /// Only admitted `tools/list_changed`, `resources/list_changed`,
+    /// `prompts/list_changed`, and `resource_updated` events alter local
+    /// cache generations; progress and log events remain cache-neutral.
+    pub async fn listen_subscriptions_typed(
+        &mut self,
+        cx: &Cx,
+        notifications: SubscriptionFilter,
+        limits: sse::SseLimits,
+    ) -> Result<ModernHttpSubscriptionListenCollector, HttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        let request_id = self.next_request_id()?;
+        let collector = self
+            .connection
+            .listen_subscriptions_typed(cx, request_id, notifications, limits)
+            .await
+            .map_err(HttpClientError::Connection)?;
+        self.apply_final_cache_subscription_invalidations(&collector.notifications);
+        Ok(collector)
+    }
+
+    fn apply_final_cache_subscription_invalidations(
+        &mut self,
+        notifications: &[ServerNotification],
+    ) {
+        for notification in notifications {
+            if matches!(
+                notification,
+                ServerNotification::ResourcesListChanged(_)
+                    | ServerNotification::ToolsListChanged(_)
+                    | ServerNotification::PromptsListChanged(_)
+                    | ServerNotification::ResourceUpdated(_)
+            ) {
+                self.final_result_cache
+                    .invalidate_notification(notification);
+            }
+        }
     }
 
     fn core_request_parameters(
@@ -5451,15 +5499,15 @@ impl Client {
                     .take()
                     .unwrap_or_else(Instant::now);
                 let page_result_set = key.result_set().clone();
-                let insert = self.final_result_cache.insert_if_current_at(
+                let _ = self.final_result_cache.insert_if_current_at(
                     key,
                     generation,
                     result.clone(),
                     receipt,
                 );
-                let miss = if matches!(insert, FinalCacheInsert::InvalidatedDuringFetch)
-                    && miss != FinalCacheMiss::Disabled
-                {
+                let invalidated_during_fetch =
+                    generation != self.final_result_cache.begin_fetch(&page_result_set);
+                let miss = if invalidated_during_fetch {
                     Some(FinalCacheMiss::Invalidated)
                 } else {
                     Some(miss)
@@ -8057,7 +8105,14 @@ pub(crate) fn transport_error_to_mcp(e: TransportError) -> McpError {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    #[cfg(unix)]
+    use std::io::{Read as _, Write as _};
+    #[cfg(unix)]
+    use std::net::{TcpListener, TcpStream};
     use std::process::{Command, Stdio};
+
+    #[cfg(unix)]
+    use asupersync::runtime::RuntimeBuilder;
 
     fn task_info(id: &str, status: TaskStatus) -> TaskInfo {
         TaskInfo {
@@ -8073,6 +8128,352 @@ mod tests {
                 .then(|| "2026-08-01T00:00:01Z".to_string()),
             error: None,
         }
+    }
+
+    #[cfg(unix)]
+    fn http_test_runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("HTTP cache test runtime must build")
+            .block_on(future)
+    }
+
+    #[cfg(unix)]
+    fn read_http_cache_test_request(stream: &mut TcpStream) -> serde_json::Value {
+        let mut wire = Vec::new();
+        let mut buffer = [0_u8; 4_096];
+        let head_end = loop {
+            let read = stream
+                .read(&mut buffer)
+                .expect("read HTTP cache test request");
+            assert!(read > 0, "client closed before a complete HTTP request");
+            wire.extend_from_slice(&buffer[..read]);
+            if let Some(position) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let head = std::str::from_utf8(&wire[..head_end]).expect("HTTP request head is UTF-8");
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| {
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("content length is numeric")
+                })
+            })
+            .expect("HTTP cache request has a content length");
+        while wire.len() < head_end + content_length {
+            let read = stream
+                .read(&mut buffer)
+                .expect("read HTTP cache request body");
+            assert!(read > 0, "client closed before the complete HTTP body");
+            wire.extend_from_slice(&buffer[..read]);
+        }
+        serde_json::from_slice(&wire[head_end..head_end + content_length])
+            .expect("HTTP cache request is JSON-RPC")
+    }
+
+    #[cfg(unix)]
+    fn write_http_cache_test_response(stream: &mut TcpStream, content_type: &str, body: &[u8]) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write HTTP cache response head");
+        stream
+            .write_all(body)
+            .expect("write HTTP cache response body");
+        stream.flush().expect("flush HTTP cache response");
+    }
+
+    #[cfg(unix)]
+    fn http_cache_test_plan(modern_target: &str) -> ClientProtocolPlan {
+        ClientProtocolPlan::http(
+            ProtocolPolicy::ModernOnly,
+            Some(
+                CanonicalHttpUrl::parse(modern_target)
+                    .expect("local HTTP cache target is canonical"),
+            ),
+            None,
+            None,
+            "http-cache-test-credential".to_owned(),
+            "http-cache-test-security".to_owned(),
+            "http-cache-test-transport".to_owned(),
+            1,
+            1,
+            0,
+        )
+        .expect("modern-only HTTP cache plan is complete")
+    }
+
+    #[cfg(unix)]
+    fn http_tools_list_response(id: i64, tool_name: &str, ttl_ms: u64) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "resultType": "complete",
+                "tools": [{
+                    "name": tool_name,
+                    "inputSchema": {"type": "object"}
+                }],
+                "ttlMs": ttl_ms,
+                "cacheScope": "private"
+            }
+        }))
+        .expect("HTTP cache tools/list response serializes")
+    }
+
+    #[cfg(unix)]
+    fn assert_http_subscription_cache_invalidation(acknowledges_tools_list_changes: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP cache listener");
+        let address = listener
+            .local_addr()
+            .expect("read HTTP cache listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let discovery = modern_discovery_response(
+            "http-subscription-cache-modern-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        let initial = http_tools_list_response(2, "cached", 1_000);
+        let refreshed = http_tools_list_response(4, "refreshed", 1_000);
+        let server = std::thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept HTTP discovery");
+            let probe = read_http_cache_test_request(&mut probe);
+            assert_eq!(probe["id"], 1);
+            assert_eq!(probe["method"], "server/discover");
+            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+
+            let (mut first_list, _) = listener.accept().expect("accept initial tools/list");
+            let first_list = read_http_cache_test_request(&mut first_list);
+            assert_eq!(first_list["id"], 2);
+            assert_eq!(first_list["method"], "tools/list");
+            write_http_cache_test_response(&mut first_list, "application/json", &initial);
+
+            let (mut listen, _) = listener.accept().expect("accept subscriptions/listen");
+            let listen = read_http_cache_test_request(&mut listen);
+            assert_eq!(listen["id"], 3);
+            assert_eq!(listen["method"], "subscriptions/listen");
+            assert_eq!(listen["params"]["notifications"]["toolsListChanged"], true);
+            let acknowledgement_filter = if acknowledges_tools_list_changes {
+                r#"{"toolsListChanged":true}"#
+            } else {
+                // This differs only by the accepted tools-list change field.
+                r#"{}"#
+            };
+            let terminal = r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#;
+            let sse = format!(
+                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}},\"notifications\":{acknowledgement_filter}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\n{}",
+                acknowledges_tools_list_changes
+                    .then_some(format!("data: {terminal}\n\n"))
+                    .unwrap_or_default(),
+            );
+            write_http_cache_test_response(&mut listen, "text/event-stream", sse.as_bytes());
+
+            if acknowledges_tools_list_changes {
+                let (mut second_list, _) = listener
+                    .accept()
+                    .expect("accepted change forces a second tools/list");
+                let second_list = read_http_cache_test_request(&mut second_list);
+                assert_eq!(second_list["id"], 4);
+                assert_eq!(second_list["method"], "tools/list");
+                write_http_cache_test_response(&mut second_list, "application/json", &refreshed);
+            }
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(HttpClient::connect(
+            &cx,
+            http_cache_test_plan(&modern_target),
+            ClientInfo {
+                name: "http-cache-test-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("public HTTP client completes discovery");
+        let initial_result = http_test_runtime_block_on(client.request_final_core(
+            &cx,
+            "tools/list",
+            serde_json::json!({}),
+        ))
+        .expect("initial public HTTP tools/list fills the cache");
+        assert!(
+            initial_result
+                .encode()
+                .expect("initial typed result re-encodes")
+                .contains("cached")
+        );
+
+        let collected = http_test_runtime_block_on(client.listen_subscriptions_typed(
+            &cx,
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+            sse::SseLimits::new(1_024, 8_192, 16).expect("explicit SSE bounds are nonzero"),
+        ));
+        if acknowledges_tools_list_changes {
+            let collector = collected.expect("accepted HTTP change event is returned");
+            assert!(matches!(
+                collector.notifications.as_slice(),
+                [ServerNotification::ToolsListChanged(None)]
+            ));
+            let refreshed_result = http_test_runtime_block_on(client.request_final_core(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+            ))
+            .expect("accepted change invalidates the public HTTP cache before the next hit");
+            assert!(
+                refreshed_result
+                    .encode()
+                    .expect("refreshed typed result re-encodes")
+                    .contains("refreshed")
+            );
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            assert_eq!(client.final_result_cache_stats().fills, 2);
+            assert_eq!(client.final_result_cache_stats().invalidations, 1);
+        } else {
+            let error = collected.expect_err("one omitted accepted-filter field rejects the event");
+            assert!(matches!(
+                error,
+                HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(
+                    http_executor::ModernHttpSubscriptionListenError::EventOutsideAcceptedFilter
+                ))
+            ));
+            let cached_result = http_test_runtime_block_on(client.request_final_core(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+            ))
+            .expect("rejected change leaves the public HTTP cache unchanged");
+            assert!(
+                cached_result
+                    .encode()
+                    .expect("cached typed result re-encodes")
+                    .contains("cached")
+            );
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert_eq!(client.final_result_cache_stats().invalidations, 0);
+        }
+        server
+            .join()
+            .expect("HTTP subscription cache server must join");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_public_http_subscription_change_invalidates_the_connection_cache() {
+        assert_http_subscription_cache_invalidation(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_public_http_subscription_rejects_one_unacknowledged_change_field() {
+        assert_http_subscription_cache_invalidation(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_http_ttl_receipt_survives_later_result_routing() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP receipt listener");
+        let address = listener
+            .local_addr()
+            .expect("read HTTP receipt listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let discovery =
+            modern_discovery_response("http-ttl-receipt-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        let list_response = http_tools_list_response(2, "receipt", 1);
+        let server = std::thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept HTTP receipt discovery");
+            let probe = read_http_cache_test_request(&mut probe);
+            assert_eq!(probe["id"], 1);
+            assert_eq!(probe["method"], "server/discover");
+            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+
+            let (mut list, _) = listener.accept().expect("accept HTTP receipt tools/list");
+            let list = read_http_cache_test_request(&mut list);
+            assert_eq!(list["id"], 2);
+            assert_eq!(list["method"], "tools/list");
+            write_http_cache_test_response(&mut list, "application/json", &list_response);
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = http_test_runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            http_cache_test_plan(&modern_target),
+            ClientInfo {
+                name: "http-ttl-receipt-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("public HTTP connection completes discovery");
+        let (response, result_source, receipt) =
+            http_test_runtime_block_on(connection.request_json_with_result_source_at(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+                RequestId::Number(2),
+                4_096,
+            ))
+            .expect("HTTP response retains its transport decode receipt");
+        server.join().expect("HTTP receipt server must join");
+
+        // This is deliberately after receipt capture: it represents result
+        // routing work that must not extend a one-millisecond peer TTL.
+        std::thread::sleep(Duration::from_millis(2));
+        let core_parameters = serde_json::json!({
+            "_meta": FinalRequestMeta::new(ClientCapabilities::default())
+        });
+        let core_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "tools/list",
+            Some(&core_parameters),
+        )
+        .expect("modern tools/list request admits its final metadata");
+        let (result, diagnostic) = decode_core_result_with_cache_ttl_from_source(
+            &core_request,
+            response
+                .result
+                .as_ref()
+                .expect("HTTP response has a result"),
+            result_source.as_deref(),
+        )
+        .expect("later typed-result routing succeeds");
+        assert!(diagnostic.is_none());
+
+        let key = FinalCacheKey::new(
+            "http-ttl-receipt-test",
+            MODERN_PROTOCOL_VERSION,
+            "{}",
+            "{}",
+            "tools/list",
+            "{}",
+            None,
+            1,
+            1,
+            1,
+            1,
+            CachePartitionKey::new("http-ttl-receipt-test"),
+            FinalCacheResultSet::Tools,
+        );
+        let mut cache = FinalResultCache::default();
+        let generation = cache.begin_fetch(key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(key.clone(), generation, result, receipt),
+            FinalCacheInsert::Stored
+        );
+        assert!(matches!(
+            cache.lookup_at(&key, Instant::now()),
+            FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -13575,15 +13976,62 @@ mod tests {
         )
         .expect("modern discovery initializes the list-restart client");
 
-        assert!(client
-            .list_tools()
-            .expect("a generation drift restarts from a cursorless page")
-            .is_empty());
+        assert!(
+            client
+                .list_tools()
+                .expect("a generation drift restarts from a cursorless page")
+                .is_empty()
+        );
         assert!(matches!(
             client.take_final_server_notifications().as_slice(),
             [ServerNotification::ToolsListChanged(None)]
         ));
         client.close().expect("modern list-restart cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_disabled_cache_restarts_a_cursorless_list_after_generation_drift() {
+        let discovery = modern_discovery_response(
+            "cache-disabled-list-restart-modern-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        let script = format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \
+             IFS= read -r first_page || exit 1; \
+             case \"$first_page\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"stale\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"nextCursor\":\"page-2\",\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r second_page || exit 1; \
+             case \"$second_page\" in *tools/list*'\"cursor\":\"page-2\"'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"mixed\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r restarted || exit 1; \
+             case \"$restarted\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"fresh\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the disabled-cache list client");
+        client.set_final_result_cache_enabled(false);
+
+        let tools = client
+            .list_tools()
+            .expect("disabled caching still restarts the cursorless list after invalidation");
+        assert!(matches!(tools.as_slice(), [Tool { name, .. }] if name == "fresh"));
+        assert!(matches!(
+            client.take_final_server_notifications().as_slice(),
+            [ServerNotification::ToolsListChanged(None)]
+        ));
+        client
+            .close()
+            .expect("modern disabled-cache list-restart cleanup");
     }
 
     #[cfg(unix)]

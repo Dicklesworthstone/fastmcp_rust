@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::poll_fn;
 use std::pin::Pin;
+use std::time::Instant;
 
 use asupersync::Cx;
 use asupersync::bytes::Buf;
@@ -1246,7 +1247,10 @@ pub enum ClientHttpConnection {
     /// Stateless MCP 2026-07-28 POST transport.
     Modern(ModernHttpClient),
     /// Exact MCP 2024-11-05 SSE plus message POST transport.
-    LegacySse(LegacySseHttpClient),
+    LegacySse {
+        client: LegacySseHttpClient,
+        negotiated_protocol_version: Option<String>,
+    },
 }
 
 /// One response returned through `ClientHttpConnection::request`.
@@ -1422,7 +1426,10 @@ impl ClientHttpConnection {
         .map_err(ClientHttpConnectionError::Modern)?
         {
             ModernHttpConnectOutcome::Modern(client) => Ok(Self::Modern(client)),
-            ModernHttpConnectOutcome::LegacySse(client) => Ok(Self::LegacySse(client)),
+            ModernHttpConnectOutcome::LegacySse(client) => Ok(Self::LegacySse {
+                client,
+                negotiated_protocol_version: None,
+            }),
         }
     }
 
@@ -1431,17 +1438,41 @@ impl ClientHttpConnection {
     pub const fn selected_protocol_era(&self) -> ProtocolEra {
         match self {
             Self::Modern(_) => ProtocolEra::Modern2026,
-            Self::LegacySse(_) => ProtocolEra::Legacy2024,
+            Self::LegacySse { .. } => ProtocolEra::Legacy2024,
         }
     }
 
-    /// Returns the exact immutable protocol version selected by this connection.
+    /// Returns the exact protocol version validated for this connection.
+    ///
+    /// Modern selection validates its version during discovery. Exact legacy
+    /// selection returns `None` until the high-level client has validated the
+    /// `initialize` response and retained its wire value.
     #[must_use]
-    pub const fn protocol_version(&self) -> &'static str {
+    pub fn protocol_version(&self) -> Option<&str> {
         match self {
-            Self::Modern(_) => MODERN_PROTOCOL_VERSION,
-            Self::LegacySse(_) => LEGACY_PROTOCOL_VERSION,
+            Self::Modern(_) => Some(MODERN_PROTOCOL_VERSION),
+            Self::LegacySse {
+                negotiated_protocol_version,
+                ..
+            } => negotiated_protocol_version.as_deref(),
         }
+    }
+
+    /// Records the exact legacy version after its `initialize` response has
+    /// been validated by the high-level lifecycle.
+    pub(crate) fn record_legacy_negotiated_protocol_version(&mut self, version: String) {
+        let Self::LegacySse {
+            negotiated_protocol_version,
+            ..
+        } = self
+        else {
+            unreachable!("only a legacy initialization can record a legacy protocol version");
+        };
+        debug_assert!(
+            negotiated_protocol_version.is_none(),
+            "legacy protocol version is immutable after initialization"
+        );
+        *negotiated_protocol_version = Some(version);
     }
 
     /// Returns the immutable policy and endpoint bundle used for this connection.
@@ -1449,7 +1480,7 @@ impl ClientHttpConnection {
     pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
         match self {
             Self::Modern(client) => client.protocol_plan(),
-            Self::LegacySse(client) => client.protocol_plan(),
+            Self::LegacySse { client, .. } => client.protocol_plan(),
         }
     }
 
@@ -1461,7 +1492,7 @@ impl ClientHttpConnection {
     pub fn server_discovery(&self) -> Option<&ServerDiscoverResult> {
         match self {
             Self::Modern(client) => Some(client.server_discovery()),
-            Self::LegacySse(_) => None,
+            Self::LegacySse { .. } => None,
         }
     }
 
@@ -1470,7 +1501,7 @@ impl ClientHttpConnection {
     pub fn mcp_apps_active(&self) -> bool {
         match self {
             Self::Modern(client) => client.mcp_apps_active(),
-            Self::LegacySse(_) => false,
+            Self::LegacySse { .. } => false,
         }
     }
 
@@ -1481,7 +1512,7 @@ impl ClientHttpConnection {
     pub fn take_legacy_notification(&mut self) -> Option<JsonRpcRequest> {
         match self {
             Self::Modern(_) => None,
-            Self::LegacySse(client) => client.take_notification(),
+            Self::LegacySse { client, .. } => client.take_notification(),
         }
     }
 
@@ -1504,7 +1535,7 @@ impl ClientHttpConnection {
                 .await
                 .map(ClientHttpResponse::Modern)
                 .map_err(ClientHttpConnectionError::Modern),
-            Self::LegacySse(client) => {
+            Self::LegacySse { client, .. } => {
                 reject_final_only_legacy_request_metadata(&parameters)?;
                 let request = JsonRpcRequest::new(method, Some(parameters), request_id.clone());
                 client
@@ -1575,10 +1606,17 @@ impl ClientHttpConnection {
         .map(|(response, _)| response)
     }
 
-    /// Sends one request and retains the exact admitted result source for a
-    /// modern JSON response. Legacy SSE keeps its established typed behavior
-    /// and therefore returns no source sidecar.
-    pub(crate) async fn request_json_with_result_source(
+    /// Sends one request and returns its strictly admitted response together
+    /// with the lossless JSON source of its `result` member.
+    ///
+    /// A modern JSON response returns `Some(source)` when it has a result. The
+    /// source is retained without re-serialization, preserving its member
+    /// order and JSON-number lexemes. The response and source originate from
+    /// the same admitted body, and the response ID is correlated to
+    /// `request_id` before either is returned. Exact legacy SSE responses
+    /// retain their established typed behavior and therefore return `None`.
+    /// Use [`Self::request_json`] when the source sidecar is not needed.
+    pub async fn request_json_with_result_source(
         &mut self,
         cx: &Cx,
         method: impl AsRef<str>,
@@ -1586,11 +1624,39 @@ impl ClientHttpConnection {
         request_id: RequestId,
         maximum_response_bytes: usize,
     ) -> Result<(JsonRpcResponse, Option<String>), ClientHttpConnectionError> {
+        self.request_json_with_result_source_at(
+            cx,
+            method,
+            parameters,
+            request_id,
+            maximum_response_bytes,
+        )
+        .await
+        .map(|(response, result_source, _)| (response, result_source))
+    }
+
+    /// Sends one request and retains the monotonic receipt instant captured
+    /// immediately after strict transport response decoding completes.
+    ///
+    /// The receipt is intentionally captured before response-envelope routing
+    /// and ID correlation. It is crate-visible only so bounded final-cache TTL
+    /// accounting can start at ingress without changing the public raw-source
+    /// API.
+    pub(crate) async fn request_json_with_result_source_at(
+        &mut self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        maximum_response_bytes: usize,
+    ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
         let response = self
             .request(cx, method, parameters, request_id.clone())
             .await?;
         match response {
-            ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => Ok((response, None)),
+            ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => {
+                Ok((response, None, Instant::now()))
+            }
             ClientHttpResponse::Legacy(JsonRpcMessage::Request(_)) => {
                 Err(ClientHttpConnectionError::UnexpectedResponseMessage { request_id })
             }
@@ -1614,6 +1680,7 @@ impl ClientHttpConnection {
                 };
                 let admission = decode_strict_jsonrpc_response(&body, maximum_response_bytes)
                     .map_err(ClientHttpConnectionError::ResponseAdmission)?;
+                let receipt = Instant::now();
                 if admission.response() != &response {
                     return Err(ClientHttpConnectionError::ResponseAdmission(
                         JsonRpcAdmissionError::InvalidEnvelope,
@@ -1626,7 +1693,7 @@ impl ClientHttpConnection {
                     });
                 }
                 let (_, result_source) = admission.into_parts();
-                Ok((response, result_source))
+                Ok((response, result_source, receipt))
             }
         }
     }
@@ -1649,7 +1716,9 @@ impl ClientHttpConnection {
                 .listen_subscriptions_typed(cx, request_id, notifications, limits)
                 .await
                 .map_err(ClientHttpConnectionError::SubscriptionsListen),
-            Self::LegacySse(_) => Err(ClientHttpConnectionError::SubscriptionsListenRequiresModern),
+            Self::LegacySse { .. } => {
+                Err(ClientHttpConnectionError::SubscriptionsListenRequiresModern)
+            }
         }
     }
 
@@ -1672,7 +1741,7 @@ impl ClientHttpConnection {
                 .call_tool_final_outcome(cx, request_id, name, arguments, maximum_response_bytes)
                 .await
                 .map_err(ClientHttpConnectionError::Modern),
-            Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalToolCallRequiresModern),
+            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalToolCallRequiresModern),
         }
     }
 
@@ -1717,7 +1786,7 @@ impl ClientHttpConnection {
                 }
                 Ok(())
             }
-            Self::LegacySse(client) => {
+            Self::LegacySse { client, .. } => {
                 if let Some(parameters) = parameters.as_ref() {
                     reject_final_only_legacy_request_metadata(parameters)?;
                 }
@@ -3364,11 +3433,18 @@ mod tests {
             ))
             .expect("public client sends the negotiated Apps request");
         assert_eq!(response.id, Some(RequestId::Number(2)));
+        assert_eq!(
+            result_source.as_deref(),
+            Some(
+                r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","zeta":{"second":2,"first":1},"alpha":1.20e+4}"#
+            ),
+            "the public source-bearing HTTP API retains result member order and number lexemes",
+        );
         server.join().expect("Apps negotiation server must join");
     }
 
     #[test]
-    fn public_http_connection_advertises_configured_apps_after_active_discovery() {
+    fn public_http_connection_request_json_with_result_source_is_lossless() {
         assert_public_http_apps_advertisement_after_discovery(true);
     }
 
@@ -3698,7 +3774,7 @@ mod tests {
             4_096,
         ));
         assert_eq!(connection.selected_protocol_era(), ProtocolEra::Modern2026);
-        assert_eq!(connection.protocol_version(), MODERN_PROTOCOL_VERSION);
+        assert_eq!(connection.protocol_version(), Some(MODERN_PROTOCOL_VERSION));
         server.join().expect("Tasks HTTP tool server must join");
         result
     }
@@ -3861,13 +3937,6 @@ mod tests {
         ))
         .expect("the public HTTP request path retains the selected modern transport");
         assert_eq!(
-            result_source.as_deref(),
-            Some(
-                r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","zeta":{"second":2,"first":1},"alpha":1.20e+4}"#
-            ),
-            "the shipped HTTP boundary retains result member order and number lexemes",
-        );
-        assert_eq!(
             response
                 .result
                 .as_ref()
@@ -3938,7 +4007,7 @@ mod tests {
     }
 
     #[test]
-    fn public_http_connection_request_json_rejects_only_a_modern_response_id_mismatch() {
+    fn public_http_connection_request_json_with_result_source_rejects_a_stale_response_id() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind modern mismatch listener");
         let address = listener.local_addr().expect("read modern mismatch address");
         let modern_target = format!("http://{address}/mcp");
@@ -3958,12 +4027,14 @@ mod tests {
                 .expect("modern request must be JSON-RPC");
             assert_eq!(body["id"], 2);
             assert_eq!(body["method"], "tools/list");
-            // Only the response ID differs from the admitted positive request.
+            // This carries the discovery request's stale ID instead of the
+            // just-sent tools/list ID; the result source must not escape that
+            // failed correlation check.
             write_response(
                 &mut stream,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
             );
         });
 
@@ -3979,19 +4050,19 @@ mod tests {
                 .connect_http_with_cx(&cx),
         )
         .expect("modern discovery selects the exact stateless connection");
-        let error = runtime_block_on(connection.request_json(
+        let error = runtime_block_on(connection.request_json_with_result_source(
             &cx,
             "tools/list",
             serde_json::json!({}),
             RequestId::Number(2),
             4_096,
         ))
-        .expect_err("only the response ID differs from the admitted modern request");
+        .expect_err("a stale response ID cannot return a result source for this request");
         assert!(matches!(
             error,
             ClientHttpConnectionError::ResponseIdMismatch {
                 expected: RequestId::Number(2),
-                actual: Some(RequestId::Number(3)),
+                actual: Some(RequestId::Number(1)),
             }
         ));
         server.join().expect("modern mismatch server must join");
@@ -4347,7 +4418,11 @@ mod tests {
         )
         .expect("legacy-only opens the exact configured SSE route");
         assert_eq!(connection.selected_protocol_era(), ProtocolEra::Legacy2024);
-        assert_eq!(connection.protocol_version(), LEGACY_PROTOCOL_VERSION);
+        assert_eq!(
+            connection.protocol_version(),
+            None,
+            "a raw legacy connection has not yet validated an initialize wire version"
+        );
 
         let response = runtime_block_on(connection.request_json(
             &cx,
@@ -4515,6 +4590,11 @@ mod tests {
         )
         .expect("the public client completes the exact fresh legacy lifecycle");
         assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
+        assert_eq!(
+            client.connection().protocol_version(),
+            Some(LEGACY_PROTOCOL_VERSION),
+            "the public client retains the exact validated legacy initialize wire version"
+        );
         assert_eq!(client.server_info().name, "legacy-server");
         assert!(client.legacy_server_capabilities().is_some());
         assert!(client.server_discovery().is_none());
@@ -4618,6 +4698,11 @@ mod tests {
         )
         .expect("legacy-only public client completes the exact lifecycle");
         assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
+        assert_eq!(
+            client.connection().protocol_version(),
+            Some(LEGACY_PROTOCOL_VERSION),
+            "the public client retains the exact validated legacy initialize wire version"
+        );
         assert_eq!(client.server_info().name, "legacy-only-server");
         assert!(client.legacy_server_capabilities().is_some());
         assert!(client.server_discovery().is_none());
@@ -4635,7 +4720,7 @@ mod tests {
     }
 
     #[test]
-    fn public_http_client_rejects_only_a_legacy_initialize_version_mismatch() {
+    fn public_http_client_rejects_a_wrong_legacy_initialize_wire_version() {
         let listener =
             TcpListener::bind("127.0.0.1:0").expect("bind local legacy-version listener");
         let address = listener
