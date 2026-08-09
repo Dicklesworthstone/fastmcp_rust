@@ -8228,6 +8228,16 @@ impl Server {
                     Ok(response) => response.map(|response| {
                         legacy_handled_response(response, active_request, &worker_cx)
                     }),
+                    // Peer-fault rejections of id-less frames are dropped
+                    // rather than terminating the dispatch worker.
+                    Err(error) if matches!(error.code(), -32600 | -32601 | -32602) => {
+                        debug!(
+                            target: targets::SESSION,
+                            "Dropped invalid exact-2024 notification; code={}",
+                            error.code()
+                        );
+                        None
+                    }
                     Err(_) => {
                         if let Some(id) = request_id.as_ref() {
                             worker_queue_state.discard(id);
@@ -9397,6 +9407,16 @@ impl Server {
                             Ok(response) => response.map(|response| {
                                 legacy_handled_response(response, active_request, cx)
                             }),
+                            // Peer-fault rejections of id-less frames are
+                            // dropped rather than terminating the connection.
+                            Err(error) if matches!(error.code(), -32600 | -32601 | -32602) => {
+                                debug!(
+                                    target: targets::SESSION,
+                                    "Dropped invalid exact-2024 notification; code={}",
+                                    error.code()
+                                );
+                                None
+                            }
                             Err(_) => self.graceful_shutdown(1),
                         }
                     }
@@ -9781,6 +9801,18 @@ impl Server {
                             Ok(response) => response.map(|response| {
                                 legacy_handled_response(response, active_request, cx)
                             }),
+                            // A peer-fault rejection of an id-less frame has no
+                            // response channel; JSON-RPC drops it without
+                            // advancing lifecycle, and one malformed peer
+                            // notification must not terminate the connection.
+                            Err(error) if matches!(error.code(), -32600 | -32601 | -32602) => {
+                                debug!(
+                                    target: targets::SESSION,
+                                    "Dropped invalid exact-2024 notification; code={}",
+                                    error.code()
+                                );
+                                None
+                            }
                             Err(_) => {
                                 self.graceful_shutdown_returning();
                                 return Err(server_run_error(

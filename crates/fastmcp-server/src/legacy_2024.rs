@@ -18,9 +18,10 @@ use fastmcp_protocol::methods::{
     PROMPTS_LIST, RESOURCES_LIST, RESOURCES_READ, RESOURCES_SUBSCRIBE, RESOURCES_TEMPLATES_LIST,
     RESOURCES_UNSUBSCRIBE, ROOTS_LIST, SAMPLING_CREATE_MESSAGE, TOOLS_CALL, TOOLS_LIST,
     decode_legacy_2024_11_05_client_capabilities, decode_legacy_2024_11_05_envelope,
-    translate_legacy_2024_result, validate_legacy_2024_11_05_initialize_result,
-    validate_legacy_2024_11_05_method_params,
+    decode_legacy_2024_11_05_envelope_classified, translate_legacy_2024_result,
+    validate_legacy_2024_11_05_initialize_result, validate_legacy_2024_11_05_method_params,
 };
+use fastmcp_protocol::methods::Legacy2024EnvelopeError;
 use serde_json::{Value, json};
 
 /// Maximum combined subscriptions and pending reverse requests retained by
@@ -663,12 +664,24 @@ where
     ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
         self.require_binding(binding)?;
         let request_id = response_id_from_wire(&wire);
-        let envelope = match decode_legacy_2024_11_05_envelope(wire) {
+        let envelope = match decode_legacy_2024_11_05_envelope_classified(wire) {
             Ok(envelope) => envelope,
-            Err(_) => {
-                let error = Legacy2024AdapterError::invalid_request(
-                    "invalid exact MCP 2024-11-05 envelope",
-                );
+            Err(error) => {
+                // A valid envelope whose method-owned params content is
+                // malformed is an Invalid Params rejection, not an invalid
+                // request; envelope-structure failures keep -32600.
+                let error = match error {
+                    Legacy2024EnvelopeError::MethodParams(_) => {
+                        Legacy2024AdapterError::invalid_params(
+                            "invalid exact MCP 2024-11-05 parameters",
+                        )
+                    }
+                    Legacy2024EnvelopeError::Envelope(_) => {
+                        Legacy2024AdapterError::invalid_request(
+                            "invalid exact MCP 2024-11-05 envelope",
+                        )
+                    }
+                };
                 return match request_id {
                     Some(id) => Ok(Legacy2024Outbound::Response(error_response(id, error))),
                     None => Err(error),
