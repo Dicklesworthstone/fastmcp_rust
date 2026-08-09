@@ -5,7 +5,16 @@
 # Build products stay worker-local. Copying worker-scoped target caches back
 # adds disk pressure and can stall old RCH clients after the command succeeded.
 target/
+target-*/
 .rch-target-*/
+
+# Local coordination and verification databases are not compiler inputs.
+# They can be large, contain host-specific locks, and must never be copied to
+# a remote build worker as part of a source verification snapshot.
+.beads/
+.beads_polish_tmp/
+.wm-verify/
+.grok/
 
 # Tests may emit diagnostic traces on remote workers. They are generated
 # artifacts (already ignored by Git) and must not participate in source sync.
