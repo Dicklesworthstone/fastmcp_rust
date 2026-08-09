@@ -40,6 +40,7 @@
 #![allow(dead_code)]
 
 mod builder;
+mod cache;
 mod execution;
 pub mod http_auth;
 pub mod http_executor;
@@ -49,6 +50,11 @@ mod session;
 pub mod sse;
 
 pub use builder::ClientBuilder;
+pub use cache::{
+    CachePartitionKey, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup,
+    FinalCacheMiss, FinalCacheResultSet, FinalCacheStats, FinalResultCache,
+    DEFAULT_FINAL_CACHE_CAPACITY,
+};
 pub use execution::{
     CancellationRequested, ExecutionTerminalReason, ExecutionTerminalRecord,
     ExecutionTerminalState, OpaquePagination, PaginationBounds, PendingRequestRecord, Request,
@@ -3814,6 +3820,8 @@ pub struct Client {
     responses: ResponseRegistry,
     /// Exact non-progress notifications received from a modern server.
     final_server_notifications: VecDeque<ServerNotification>,
+    /// Bounded final complete-result cache scoped to this client connection.
+    final_result_cache: FinalResultCache,
     /// Application handlers for server-initiated requests on this connection.
     reverse_request_handlers: ReverseRequestHandlers,
     /// Idle/absolute policy for ordinary stdio responses.
@@ -4145,6 +4153,7 @@ impl Client {
             next_id: AtomicU64::new(1),
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            final_result_cache: FinalResultCache::default(),
             reverse_request_handlers: ReverseRequestHandlers::new(),
             timeout_policy: RequestTimeoutPolicy::default(),
             auto_initialize: false,
@@ -4259,6 +4268,7 @@ impl Client {
             next_id: AtomicU64::new(2), // Start at 2 since initialize used 1
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            final_result_cache: FinalResultCache::default(),
             reverse_request_handlers: ReverseRequestHandlers::new(),
             timeout_policy,
             auto_initialize: false,
@@ -4311,6 +4321,7 @@ impl Client {
             next_id: AtomicU64::new(1), // Start at 1 since initialize hasn't happened
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            final_result_cache: FinalResultCache::default(),
             reverse_request_handlers: ReverseRequestHandlers::new(),
             timeout_policy,
             auto_initialize: true,
@@ -4541,6 +4552,33 @@ impl Client {
     #[must_use]
     pub fn take_final_server_notifications(&mut self) -> Vec<ServerNotification> {
         self.final_server_notifications.drain(..).collect()
+    }
+
+    /// Returns whether final complete-result caching is enabled for this client.
+    ///
+    /// Exact MCP 2024-11-05 requests bypass this cache unconditionally.
+    #[must_use]
+    pub const fn final_result_cache_enabled(&self) -> bool {
+        self.final_result_cache.is_enabled()
+    }
+
+    /// Enables or disables final complete-result caching for this client.
+    ///
+    /// Disabling the cache is an opt-out: retained entries remain local and
+    /// unavailable until caching is enabled again.
+    pub fn set_final_result_cache_enabled(&mut self, enabled: bool) {
+        self.final_result_cache.set_enabled(enabled);
+    }
+
+    /// Returns redacted aggregate final-cache counters.
+    #[must_use]
+    pub const fn final_result_cache_stats(&self) -> FinalCacheStats {
+        self.final_result_cache.stats()
+    }
+
+    /// Removes all final complete-result cache entries for this client.
+    pub fn clear_final_result_cache(&mut self) {
+        self.final_result_cache.clear();
     }
 
     /// Returns the immutable transport policy and endpoint configuration.
@@ -4828,6 +4866,11 @@ impl Client {
             McpError::invalid_request(format!("Invalid final server notification: {error}"))
         })?;
 
+        // Advance the matching generation before exposing the notification or
+        // accepting a late fetch completion. A fetch captures its generation
+        // before send and can only fill while it remains current.
+        self.final_result_cache.invalidate_notification(&notification);
+
         let ServerNotification::Progress(progress) = notification else {
             if self.final_server_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
                 return Err(McpError::invalid_request(
@@ -4972,6 +5015,78 @@ impl Client {
             })?;
         let result = self.send_prepared_request(method, params_value)?;
         decode_core_result(&core_request, &result).map_err(|error| self.terminate_connection(error))
+    }
+
+    fn final_cache_key(
+        &self,
+        method: &str,
+        semantic_parameters: serde_json::Value,
+        cursor: Option<&str>,
+        result_set: FinalCacheResultSet,
+    ) -> McpResult<FinalCacheKey> {
+        let normalized_capabilities = serde_json::to_string(self.session.client_capabilities())
+            .map_err(|_| McpError::internal_error("Client capabilities could not form a cache key"))?;
+        let extension_settings = self
+            .session
+            .mcp_apps_settings()
+            .map(|settings| serde_json::to_string(&settings.to_extension_settings().into_value()))
+            .transpose()
+            .map_err(|_| McpError::internal_error("Client extension settings could not form a cache key"))?
+            .unwrap_or_else(|| "{}".to_owned());
+        let semantic_projection = serde_json::to_string(&semantic_parameters).map_err(|_| {
+            McpError::internal_error("Client semantic parameters could not form a cache key")
+        })?;
+        let endpoint_configuration = self
+            .session
+            .protocol_plan()
+            .modern_post_target()
+            .unwrap_or("stdio")
+            .to_owned();
+
+        // This cache is owned by one client instance, so this fixed local
+        // partition cannot cross a connection or credential boundary. HTTP
+        // cache sharing requires its separately qualified partition adapter.
+        Ok(FinalCacheKey::new(
+            endpoint_configuration,
+            MODERN_PROTOCOL_VERSION,
+            normalized_capabilities,
+            extension_settings,
+            method,
+            semantic_projection,
+            cursor.map(ToOwned::to_owned),
+            0,
+            0,
+            CachePartitionKey::new("stdio-client-connection"),
+            result_set,
+        ))
+    }
+
+    fn cached_final_core_request<F>(
+        &mut self,
+        method: &str,
+        semantic_parameters: serde_json::Value,
+        cursor: Option<&str>,
+        result_set: FinalCacheResultSet,
+        fetch: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnOnce(&mut Self) -> McpResult<CoreResult>,
+    {
+        if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
+            return fetch(self);
+        }
+
+        let key = self.final_cache_key(method, semantic_parameters, cursor, result_set)?;
+        if let FinalCacheLookup::Fresh(result) = self.final_result_cache.lookup(&key) {
+            return Ok(result);
+        }
+
+        let generation = self.final_result_cache.begin_fetch(key.result_set());
+        let result = fetch(self)?;
+        let _ = self
+            .final_result_cache
+            .insert_if_current(key, generation, result.clone());
+        Ok(result)
     }
 
     /// Sends a notification (no response expected).
@@ -5786,11 +5901,18 @@ impl Client {
     /// connection.
     pub fn list_tools_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
+        let cursor = cursor.map(ToOwned::to_owned);
         let params = ListToolsParams {
-            cursor: cursor.map(ToOwned::to_owned),
+            cursor: cursor.clone(),
             ..ListToolsParams::default()
         };
-        self.send_typed_core_request("tools/list", params)
+        self.cached_final_core_request(
+            "tools/list",
+            serde_json::json!({}),
+            cursor.as_deref(),
+            FinalCacheResultSet::Tools,
+            move |client| client.send_typed_core_request("tools/list", params),
+        )
     }
 
     /// Lists available tools.
@@ -6373,11 +6495,18 @@ impl Client {
     /// connection.
     pub fn list_resources_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
+        let cursor = cursor.map(ToOwned::to_owned);
         let params = ListResourcesParams {
-            cursor: cursor.map(ToOwned::to_owned),
+            cursor: cursor.clone(),
             ..ListResourcesParams::default()
         };
-        self.send_typed_core_request("resources/list", params)
+        self.cached_final_core_request(
+            "resources/list",
+            serde_json::json!({}),
+            cursor.as_deref(),
+            FinalCacheResultSet::Resources,
+            move |client| client.send_typed_core_request("resources/list", params),
+        )
     }
 
     /// Lists available resources.
@@ -6439,11 +6568,18 @@ impl Client {
     /// connection.
     pub fn list_resource_templates_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
+        let cursor = cursor.map(ToOwned::to_owned);
         let params = ListResourceTemplatesParams {
-            cursor: cursor.map(ToOwned::to_owned),
+            cursor: cursor.clone(),
             ..ListResourceTemplatesParams::default()
         };
-        self.send_typed_core_request("resources/templates/list", params)
+        self.cached_final_core_request(
+            "resources/templates/list",
+            serde_json::json!({}),
+            cursor.as_deref(),
+            FinalCacheResultSet::ResourceTemplates,
+            move |client| client.send_typed_core_request("resources/templates/list", params),
+        )
     }
 
     /// Lists available resource templates.
@@ -6544,12 +6680,17 @@ impl Client {
     /// connection.
     pub fn read_resource_typed(&mut self, uri: &str) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
-        self.send_typed_core_request(
+        let uri = uri.to_owned();
+        let params = ReadResourceParams {
+            uri: uri.clone(),
+            meta: None,
+        };
+        self.cached_final_core_request(
             "resources/read",
-            ReadResourceParams {
-                uri: uri.to_owned(),
-                meta: None,
-            },
+            serde_json::json!({"uri": uri}),
+            None,
+            FinalCacheResultSet::Resource(params.uri.clone()),
+            move |client| client.send_typed_core_request("resources/read", params),
         )
     }
 
@@ -6612,11 +6753,18 @@ impl Client {
     /// connection.
     pub fn list_prompts_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
+        let cursor = cursor.map(ToOwned::to_owned);
         let params = ListPromptsParams {
-            cursor: cursor.map(ToOwned::to_owned),
+            cursor: cursor.clone(),
             ..ListPromptsParams::default()
         };
-        self.send_typed_core_request("prompts/list", params)
+        self.cached_final_core_request(
+            "prompts/list",
+            serde_json::json!({}),
+            cursor.as_deref(),
+            FinalCacheResultSet::Prompts,
+            move |client| client.send_typed_core_request("prompts/list", params),
+        )
     }
 
     /// Lists available prompts.
@@ -12534,6 +12682,87 @@ mod tests {
             CoreResult::Final(FinalCoreResult::ToolsList { .. })
         ));
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_final_tools_list_replays_the_complete_result_without_a_second_request() {
+        let script = modern_typed_list_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":1000,"cacheScope":"private","x-retained":9007199254740993123456789}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the cache client");
+        client
+            .set_request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_millis(10), Duration::from_millis(10))
+                    .expect("short test policy is valid"),
+            )
+            .expect("cache test policy is accepted");
+
+        let first = client
+            .list_tools_typed(None)
+            .expect("first tools/list response fills the final cache");
+        let second = client
+            .list_tools_typed(None)
+            .expect("fresh final cache hit avoids a second peer request");
+
+        assert_eq!(
+            first.encode().expect("first complete result re-encodes"),
+            second.encode().expect("cached complete result re-encodes"),
+            "the cached result retains unknown members and their exact number spelling"
+        );
+        assert_eq!(client.final_result_cache_stats().hits, 1);
+        assert_eq!(client.final_result_cache_stats().fills, 1);
+        client.close().expect("modern cache client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_list_change_during_fetch_discards_the_late_cache_fill() {
+        let discovery = modern_discovery_response(
+            "cache-invalidation-modern-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        let script = format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \
+             IFS= read -r second || exit 1; \
+             case \"$second\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r third || exit 1; \
+             case \"$third\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the invalidation client");
+
+        client
+            .list_tools_typed(None)
+            .expect("the first tools/list completes after the change notification");
+        client
+            .list_tools_typed(None)
+            .expect("the invalidated first fill requires a fresh second request");
+
+        assert_eq!(client.final_result_cache_stats().fills, 1);
+        assert_eq!(client.final_result_cache_stats().hits, 0);
+        assert!(matches!(
+            client.take_final_server_notifications().as_slice(),
+            [ServerNotification::ToolsListChanged(None)]
+        ));
+        client.close().expect("modern invalidation client cleanup");
     }
 
     #[cfg(unix)]
