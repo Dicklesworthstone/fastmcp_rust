@@ -254,8 +254,20 @@ fn assert_exact_modern_discovery_request(request: &serde_json::Value) {
 }
 
 fn assert_exact_legacy_initialize_request(request: &serde_json::Value) {
+    assert_eq!(
+        request
+            .as_object()
+            .expect("legacy initialize must be a JSON object")
+            .len(),
+        4,
+        "legacy initialize must contain only JSON-RPC envelope fields"
+    );
     assert_eq!(request["jsonrpc"], "2.0");
     assert_eq!(request_method(request), "initialize");
+    assert!(
+        request.get("id").is_some_and(serde_json::Value::is_number),
+        "legacy initialize must carry a numeric JSON-RPC request ID"
+    );
     let params = request["params"]
         .as_object()
         .expect("legacy initialize must carry params");

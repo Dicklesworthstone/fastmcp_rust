@@ -3871,14 +3871,13 @@ impl Drop for FinalTaskServiceReadinessLease {
         // A stale future must never revoke a replacement runner's readiness.
         // The matching lease is the sole proof that this exact entered runner
         // still owns the generation observed by `ensure_task_service_ready`.
-        if signal.as_ref().is_some_and(|service| {
-            service.service_id == self.service_id
-                && service.ready_generation == Some(self.ready_generation)
-        }) {
-            signal
-                .as_mut()
-                .expect("checked current task-service signal")
-                .ready_generation = None;
+        let Some(service) = signal.as_mut() else {
+            return;
+        };
+        if service.service_id == self.service_id
+            && service.ready_generation == Some(self.ready_generation)
+        {
+            service.ready_generation = None;
         }
     }
 }
@@ -5657,7 +5656,7 @@ mod tests {
         assert!(
             runtime
                 .create_task_with_work(work_descriptor.clone(), None)
-            .is_err(),
+                .is_err(),
             "installing a runner without entering run does not authorize task advertisement"
         );
         assert!(
@@ -5701,6 +5700,10 @@ mod tests {
             .block_on(runner.run(&cx))
             .expect("initial durable work is recovered by the caller-owned supervisor");
 
+        assert!(
+            runtime.ensure_task_service_ready().is_err(),
+            "a runner that exits from run revokes the readiness probe"
+        );
         assert!(
             runtime
                 .create_task_with_work(final_test_work_descriptor(), None)
