@@ -56,9 +56,12 @@ pub mod uri;
 /// Immutable protocol-limit snapshots and cumulative logical-exchange admission.
 pub mod limits {
     use std::fmt;
+    use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::Duration;
 
     use asupersync::Time;
+
+    use crate::McpContext;
 
     /// Default maximum number of rounds in one logical exchange.
     pub const DEFAULT_LOGICAL_EXCHANGE_MAX_ROUNDS: u16 = 8;
@@ -186,6 +189,39 @@ pub mod limits {
         #[must_use]
         pub const fn logical_exchange_max_wall_clock(&self) -> Duration {
             self.logical_exchange_max_wall_clock
+        }
+
+        /// Returns the componentwise stricter snapshot of `self` and `other`.
+        ///
+        /// A logical exchange can retain its original snapshot while meeting it
+        /// with a tighter current policy or hard ceiling. No field in the
+        /// returned snapshot can be looser than its counterpart in either
+        /// input.
+        #[must_use]
+        pub fn meet(&self, other: &Self) -> Self {
+            Self {
+                logical_exchange_max_rounds: self
+                    .logical_exchange_max_rounds
+                    .min(other.logical_exchange_max_rounds),
+                logical_exchange_max_inputs_per_round: self
+                    .logical_exchange_max_inputs_per_round
+                    .min(other.logical_exchange_max_inputs_per_round),
+                logical_exchange_max_inputs: self
+                    .logical_exchange_max_inputs
+                    .min(other.logical_exchange_max_inputs),
+                logical_exchange_max_state_bytes: self
+                    .logical_exchange_max_state_bytes
+                    .min(other.logical_exchange_max_state_bytes),
+                logical_exchange_max_wall_clock: self
+                    .logical_exchange_max_wall_clock
+                    .min(other.logical_exchange_max_wall_clock),
+            }
+        }
+
+        /// Tightens this snapshot against `ceiling` componentwise.
+        #[must_use]
+        pub fn tighten(&self, ceiling: &Self) -> Self {
+            self.meet(ceiling)
         }
     }
 
@@ -367,6 +403,8 @@ pub mod limits {
     /// A rejected logical-exchange admission or accounting operation.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum LogicalExchangeBudgetError {
+        /// The caller context was cancelled, expired, or otherwise no longer live.
+        Cancelled,
         /// The exchange's immutable absolute deadline has expired.
         DeadlineExceeded,
         /// An input was admitted before a round began.
@@ -388,6 +426,7 @@ pub mod limits {
     impl fmt::Display for LogicalExchangeBudgetError {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
+                Self::Cancelled => formatter.write_str("logical-exchange caller context cancelled"),
                 Self::DeadlineExceeded => formatter.write_str("logical-exchange deadline exceeded"),
                 Self::InputOutsideRound => {
                     formatter.write_str("logical-exchange input requires a round")
@@ -426,41 +465,113 @@ pub mod limits {
 
     impl std::error::Error for LogicalExchangeBudgetError {}
 
-    /// Cumulative, checked admission accounting for one logical exchange.
-    ///
-    /// The budget owns one immutable [`ProtocolLimits`] snapshot and an
-    /// absolute deadline. Every failed operation leaves its counters unchanged;
-    /// callers can therefore reserve an input and its prospective state bytes
-    /// atomically before performing the associated work.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct LogicalExchangeBudget {
-        limits: ProtocolLimits,
-        deadline: Time,
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct LogicalExchangeCounters {
         rounds_started: u16,
         inputs_in_current_round: u16,
         inputs_admitted: u16,
         state_bytes_admitted: usize,
     }
 
+    /// Cumulative, checked admission accounting for one logical exchange.
+    ///
+    /// The budget owns one immutable [`ProtocolLimits`] snapshot and an
+    /// absolute deadline. Every failed operation leaves its counters unchanged;
+    /// callers can therefore reserve an input and its prospective state bytes
+    /// atomically before performing the associated work.
+    #[derive(Debug, Clone)]
+    pub struct LogicalExchangeBudget {
+        limits: ProtocolLimits,
+        deadline: Time,
+        context: McpContext,
+        counters: Arc<Mutex<LogicalExchangeCounters>>,
+        #[cfg(test)]
+        before_counter_lock: Option<Arc<std::sync::Barrier>>,
+    }
+
+    impl PartialEq for LogicalExchangeBudget {
+        fn eq(&self, other: &Self) -> bool {
+            if self.limits != other.limits || self.deadline != other.deadline {
+                return false;
+            }
+
+            // Clones intentionally share counters. Do not attempt to lock the
+            // same non-reentrant mutex twice when comparing a budget with
+            // itself or one of its clones.
+            if Arc::ptr_eq(&self.counters, &other.counters) {
+                return true;
+            }
+
+            // Take snapshots in allocation-address order. Each lock guard is
+            // dropped before acquiring the next one, so two threads comparing
+            // the same distinct budgets in opposite orders cannot deadlock.
+            let self_counters_address = Arc::as_ptr(&self.counters).addr();
+            let other_counters_address = Arc::as_ptr(&other.counters).addr();
+            let (self_counters, other_counters) = if self_counters_address < other_counters_address
+            {
+                let self_counters = *self.counters();
+                let other_counters = *other.counters();
+                (self_counters, other_counters)
+            } else {
+                let other_counters = *other.counters();
+                let self_counters = *self.counters();
+                (self_counters, other_counters)
+            };
+
+            self_counters == other_counters
+        }
+    }
+
+    impl Eq for LogicalExchangeBudget {}
+
     impl LogicalExchangeBudget {
-        /// Captures `limits` and calculates its absolute deadline from `started_at`.
+        /// Captures `limits` and the caller context's time, deadline, and cancellation domain.
         pub fn new(
             limits: ProtocolLimits,
-            started_at: Time,
+            context: &McpContext,
         ) -> Result<Self, LogicalExchangeBudgetError> {
-            Self::with_external_deadline(limits, started_at, None)
+            Self::with_external_deadline(limits, context, None)
         }
 
-        /// Captures `limits` and meets its deadline with an existing outer deadline.
+        /// Captures `limits` and meets its deadline with the caller context and `external_deadline`.
         ///
         /// The earlier of the configured logical-exchange deadline and
-        /// `external_deadline` is retained. The deadline can never be extended
-        /// after construction.
+        /// the caller context's budget deadline and `external_deadline` is
+        /// retained. The deadline can never be extended after construction.
         pub fn with_external_deadline(
             limits: ProtocolLimits,
-            started_at: Time,
+            context: &McpContext,
             external_deadline: Option<Time>,
         ) -> Result<Self, LogicalExchangeBudgetError> {
+            context
+                .ensure_live()
+                .map_err(|_| LogicalExchangeBudgetError::Cancelled)?;
+            let started_at = context.cx().now();
+            let outer_deadline = match (context.budget().deadline, external_deadline) {
+                (Some(context_deadline), Some(external_deadline)) => {
+                    Some(context_deadline.min(external_deadline))
+                }
+                (Some(context_deadline), None) => Some(context_deadline),
+                (None, Some(external_deadline)) => Some(external_deadline),
+                (None, None) => None,
+            };
+            let deadline = Self::calculate_deadline(&limits, started_at, outer_deadline)?;
+
+            Ok(Self {
+                limits,
+                deadline,
+                context: context.clone(),
+                counters: Arc::new(Mutex::new(LogicalExchangeCounters::default())),
+                #[cfg(test)]
+                before_counter_lock: None,
+            })
+        }
+
+        fn calculate_deadline(
+            limits: &ProtocolLimits,
+            started_at: Time,
+            external_deadline: Option<Time>,
+        ) -> Result<Time, LogicalExchangeBudgetError> {
             let duration_nanos = u64::try_from(limits.logical_exchange_max_wall_clock.as_nanos())
                 .map_err(|_| LogicalExchangeBudgetError::ArithmeticOverflow {
                 resource: LogicalExchangeBudgetResource::WallClockNanos,
@@ -474,14 +585,45 @@ pub mod limits {
             let deadline = external_deadline
                 .map_or(configured_deadline, |outer| outer.min(configured_deadline));
 
-            Ok(Self {
-                limits,
-                deadline,
-                rounds_started: 0,
-                inputs_in_current_round: 0,
-                inputs_admitted: 0,
-                state_bytes_admitted: 0,
-            })
+            Ok(deadline)
+        }
+
+        fn counters(&self) -> MutexGuard<'_, LogicalExchangeCounters> {
+            #[cfg(test)]
+            if let Some(barrier) = &self.before_counter_lock {
+                barrier.wait();
+            }
+
+            self.counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        #[cfg(test)]
+        fn with_before_counter_lock_barrier(mut self, barrier: Arc<std::sync::Barrier>) -> Self {
+            self.before_counter_lock = Some(barrier);
+            self
+        }
+
+        fn check_admission(&self) -> Result<(), LogicalExchangeBudgetError> {
+            if self.context.cx().now() >= self.deadline {
+                return Err(LogicalExchangeBudgetError::DeadlineExceeded);
+            }
+            self.context
+                .ensure_live()
+                .map_err(|_| LogicalExchangeBudgetError::Cancelled)
+        }
+
+        /// Checks caller liveness while the clone-shared counters are locked.
+        ///
+        /// Mutators use this at their commit boundary so an admission that
+        /// waited behind another clone cannot commit after cancellation or a
+        /// deadline transition.
+        fn check_admission_while_holding_counters(
+            &self,
+            _counters: &MutexGuard<'_, LogicalExchangeCounters>,
+        ) -> Result<(), LogicalExchangeBudgetError> {
+            self.check_admission()
         }
 
         /// Returns the immutable limit snapshot used by this exchange.
@@ -498,41 +640,38 @@ pub mod limits {
 
         /// Returns the number of successfully started rounds.
         #[must_use]
-        pub const fn rounds_started(&self) -> u16 {
-            self.rounds_started
+        pub fn rounds_started(&self) -> u16 {
+            self.counters().rounds_started
         }
 
         /// Returns the number of inputs admitted in the active round.
         #[must_use]
-        pub const fn inputs_in_current_round(&self) -> u16 {
-            self.inputs_in_current_round
+        pub fn inputs_in_current_round(&self) -> u16 {
+            self.counters().inputs_in_current_round
         }
 
         /// Returns the total inputs admitted by the exchange.
         #[must_use]
-        pub const fn inputs_admitted(&self) -> u16 {
-            self.inputs_admitted
+        pub fn inputs_admitted(&self) -> u16 {
+            self.counters().inputs_admitted
         }
 
         /// Returns the total encoded state bytes admitted by the exchange.
         #[must_use]
-        pub const fn state_bytes_admitted(&self) -> usize {
-            self.state_bytes_admitted
+        pub fn state_bytes_admitted(&self) -> usize {
+            self.counters().state_bytes_admitted
         }
 
-        /// Fails once the immutable absolute deadline has been reached.
-        pub fn check_deadline(&self, now: Time) -> Result<(), LogicalExchangeBudgetError> {
-            if now >= self.deadline {
-                Err(LogicalExchangeBudgetError::DeadlineExceeded)
-            } else {
-                Ok(())
-            }
+        /// Fails when the caller context is cancelled or the immutable deadline has elapsed.
+        pub fn check_deadline(&self) -> Result<(), LogicalExchangeBudgetError> {
+            self.check_admission()
         }
 
         /// Starts one round after checking the exchange deadline and round limit.
-        pub fn try_start_round(&mut self, now: Time) -> Result<(), LogicalExchangeBudgetError> {
-            self.check_deadline(now)?;
-            let next_rounds = self.rounds_started.checked_add(1).ok_or(
+        pub fn try_start_round(&self) -> Result<(), LogicalExchangeBudgetError> {
+            let mut counters = self.counters();
+            self.check_admission_while_holding_counters(&counters)?;
+            let next_rounds = counters.rounds_started.checked_add(1).ok_or(
                 LogicalExchangeBudgetError::ArithmeticOverflow {
                     resource: LogicalExchangeBudgetResource::Rounds,
                 },
@@ -543,23 +682,29 @@ pub mod limits {
                 });
             }
 
-            self.rounds_started = next_rounds;
-            self.inputs_in_current_round = 0;
+            let next_counters = LogicalExchangeCounters {
+                rounds_started: next_rounds,
+                inputs_in_current_round: 0,
+                inputs_admitted: counters.inputs_admitted,
+                state_bytes_admitted: counters.state_bytes_admitted,
+            };
+            self.check_admission_while_holding_counters(&counters)?;
+            *counters = next_counters;
             Ok(())
         }
 
         /// Atomically reserves one input and its prospective encoded state bytes.
         pub fn try_reserve_input(
-            &mut self,
-            now: Time,
+            &self,
             state_bytes: usize,
         ) -> Result<(), LogicalExchangeBudgetError> {
-            self.check_deadline(now)?;
-            if self.rounds_started == 0 {
+            let mut counters = self.counters();
+            self.check_admission_while_holding_counters(&counters)?;
+            if counters.rounds_started == 0 {
                 return Err(LogicalExchangeBudgetError::InputOutsideRound);
             }
 
-            let next_round_inputs = self.inputs_in_current_round.checked_add(1).ok_or(
+            let next_round_inputs = counters.inputs_in_current_round.checked_add(1).ok_or(
                 LogicalExchangeBudgetError::ArithmeticOverflow {
                     resource: LogicalExchangeBudgetResource::InputsInRound,
                 },
@@ -569,7 +714,7 @@ pub mod limits {
                     limit: self.limits.logical_exchange_max_inputs_per_round,
                 });
             }
-            let next_total_inputs = self.inputs_admitted.checked_add(1).ok_or(
+            let next_total_inputs = counters.inputs_admitted.checked_add(1).ok_or(
                 LogicalExchangeBudgetError::ArithmeticOverflow {
                     resource: LogicalExchangeBudgetResource::TotalInputs,
                 },
@@ -579,7 +724,7 @@ pub mod limits {
                     limit: self.limits.logical_exchange_max_inputs,
                 });
             }
-            let next_state_bytes = self.state_bytes_admitted.checked_add(state_bytes).ok_or(
+            let next_state_bytes = counters.state_bytes_admitted.checked_add(state_bytes).ok_or(
                 LogicalExchangeBudgetError::ArithmeticOverflow {
                     resource: LogicalExchangeBudgetResource::StateBytes,
                 },
@@ -590,20 +735,25 @@ pub mod limits {
                 });
             }
 
-            self.inputs_in_current_round = next_round_inputs;
-            self.inputs_admitted = next_total_inputs;
-            self.state_bytes_admitted = next_state_bytes;
+            let next_counters = LogicalExchangeCounters {
+                rounds_started: counters.rounds_started,
+                inputs_in_current_round: next_round_inputs,
+                inputs_admitted: next_total_inputs,
+                state_bytes_admitted: next_state_bytes,
+            };
+            self.check_admission_while_holding_counters(&counters)?;
+            *counters = next_counters;
             Ok(())
         }
 
         /// Atomically reserves encoded state bytes not associated with a new input.
         pub fn try_reserve_state_bytes(
-            &mut self,
-            now: Time,
+            &self,
             state_bytes: usize,
         ) -> Result<(), LogicalExchangeBudgetError> {
-            self.check_deadline(now)?;
-            let next_state_bytes = self.state_bytes_admitted.checked_add(state_bytes).ok_or(
+            let mut counters = self.counters();
+            self.check_admission_while_holding_counters(&counters)?;
+            let next_state_bytes = counters.state_bytes_admitted.checked_add(state_bytes).ok_or(
                 LogicalExchangeBudgetError::ArithmeticOverflow {
                     resource: LogicalExchangeBudgetResource::StateBytes,
                 },
@@ -614,14 +764,24 @@ pub mod limits {
                 });
             }
 
-            self.state_bytes_admitted = next_state_bytes;
+            let next_counters = LogicalExchangeCounters {
+                rounds_started: counters.rounds_started,
+                inputs_in_current_round: counters.inputs_in_current_round,
+                inputs_admitted: counters.inputs_admitted,
+                state_bytes_admitted: next_state_bytes,
+            };
+            self.check_admission_while_holding_counters(&counters)?;
+            *counters = next_counters;
             Ok(())
         }
     }
 
     #[cfg(test)]
     mod tests {
+        use std::sync::{Arc, Barrier};
+
         use super::*;
+        use crate::{Budget, Cx, McpRequestCancellation};
 
         fn small_limits() -> ProtocolLimits {
             ProtocolLimits::builder()
@@ -691,83 +851,284 @@ pub mod limits {
         }
 
         #[test]
-        fn logical_exchange_budget_cumulatively_charges_valid_rounds_inputs_and_bytes() {
-            let start = Time::from_secs(100);
-            let mut budget = LogicalExchangeBudget::new(small_limits(), start).unwrap();
+        fn protocol_limits_meet_tightens_every_field_without_mutating_inputs() {
+            let original = ProtocolLimits::builder()
+                .logical_exchange_max_rounds(8)
+                .logical_exchange_max_inputs_per_round(7)
+                .logical_exchange_max_inputs(9)
+                .logical_exchange_max_state_bytes(80)
+                .logical_exchange_max_wall_clock(Duration::from_secs(12))
+                .build()
+                .unwrap();
+            let ceiling = ProtocolLimits::builder()
+                .logical_exchange_max_rounds(6)
+                .logical_exchange_max_inputs_per_round(5)
+                .logical_exchange_max_inputs(6)
+                .logical_exchange_max_state_bytes(64)
+                .logical_exchange_max_wall_clock(Duration::from_secs(9))
+                .build()
+                .unwrap();
 
-            budget.try_start_round(start).unwrap();
-            budget.try_reserve_input(start, 3).unwrap();
-            budget.try_reserve_input(start, 4).unwrap();
-            budget.try_start_round(Time::from_secs(101)).unwrap();
-            budget.try_reserve_input(Time::from_secs(101), 2).unwrap();
+            let tightened = original.meet(&ceiling);
+            assert_eq!(tightened.logical_exchange_max_rounds(), 6);
+            assert_eq!(tightened.logical_exchange_max_inputs_per_round(), 5);
+            assert_eq!(tightened.logical_exchange_max_inputs(), 6);
+            assert_eq!(tightened.logical_exchange_max_state_bytes(), 64);
+            assert_eq!(
+                tightened.logical_exchange_max_wall_clock(),
+                Duration::from_secs(9)
+            );
+            assert_eq!(original.tighten(&ceiling), tightened);
+            assert_eq!(original.logical_exchange_max_rounds(), 8);
+            assert_eq!(original.logical_exchange_max_inputs_per_round(), 7);
+            assert_eq!(original.logical_exchange_max_inputs(), 9);
+            assert_eq!(original.logical_exchange_max_state_bytes(), 80);
+            assert_eq!(
+                original.logical_exchange_max_wall_clock(),
+                Duration::from_secs(12)
+            );
+        }
+
+        #[test]
+        fn logical_exchange_budget_cumulatively_charges_valid_rounds_inputs_and_bytes() {
+            let context = McpContext::new(Cx::for_testing(), 1);
+            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+
+            budget.try_start_round().unwrap();
+            budget.try_reserve_input(3).unwrap();
+            budget.try_reserve_input(4).unwrap();
+            budget.try_start_round().unwrap();
+            budget.try_reserve_input(2).unwrap();
 
             assert_eq!(budget.rounds_started(), 2);
             assert_eq!(budget.inputs_in_current_round(), 1);
             assert_eq!(budget.inputs_admitted(), 3);
             assert_eq!(budget.state_bytes_admitted(), 9);
-            assert_eq!(budget.deadline(), Time::from_secs(105));
-            assert_eq!(
-                budget.check_deadline(Time::from_secs(105)),
-                Err(LogicalExchangeBudgetError::DeadlineExceeded)
-            );
+            assert_eq!(budget.check_deadline(), Ok(()));
         }
 
         #[test]
         fn logical_exchange_budget_rejects_overages_without_mutating_accounting() {
-            let start = Time::from_secs(100);
-            let mut budget = LogicalExchangeBudget::new(small_limits(), start).unwrap();
+            let context = McpContext::new(Cx::for_testing(), 1);
+            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
 
             assert_eq!(
-                budget.try_reserve_input(start, 1),
+                budget.try_reserve_input(1),
                 Err(LogicalExchangeBudgetError::InputOutsideRound)
             );
-            budget.try_start_round(start).unwrap();
-            budget.try_reserve_input(start, 3).unwrap();
-            budget.try_reserve_input(start, 4).unwrap();
-            let after_first_round = budget.clone();
+            budget.try_start_round().unwrap();
+            budget.try_reserve_input(3).unwrap();
+            budget.try_reserve_input(4).unwrap();
             assert_eq!(
-                budget.try_reserve_input(start, 1),
+                budget.try_reserve_input(1),
                 Err(LogicalExchangeBudgetError::InputsPerRoundLimitExceeded { limit: 2 })
             );
-            assert_eq!(budget, after_first_round);
+            assert_eq!(budget.inputs_in_current_round(), 2);
+            assert_eq!(budget.inputs_admitted(), 2);
+            assert_eq!(budget.state_bytes_admitted(), 7);
 
-            budget.try_start_round(Time::from_secs(101)).unwrap();
-            budget.try_reserve_input(Time::from_secs(101), 2).unwrap();
-            let after_total_inputs = budget.clone();
+            budget.try_start_round().unwrap();
+            budget.try_reserve_input(2).unwrap();
             assert_eq!(
-                budget.try_reserve_input(Time::from_secs(101), 0),
+                budget.try_reserve_input(0),
                 Err(LogicalExchangeBudgetError::InputsLimitExceeded { limit: 3 })
             );
-            assert_eq!(budget, after_total_inputs);
             assert_eq!(
-                budget.try_reserve_state_bytes(Time::from_secs(101), 1),
+                budget.try_reserve_state_bytes(1),
                 Err(LogicalExchangeBudgetError::StateByteLimitExceeded { limit: 9 })
             );
-            assert_eq!(budget, after_total_inputs);
             assert_eq!(
-                budget.try_start_round(Time::from_secs(101)),
+                budget.try_reserve_state_bytes(usize::MAX),
+                Err(LogicalExchangeBudgetError::ArithmeticOverflow {
+                    resource: LogicalExchangeBudgetResource::StateBytes,
+                })
+            );
+            assert_eq!(
+                budget.try_start_round(),
                 Err(LogicalExchangeBudgetError::RoundLimitExceeded { limit: 2 })
             );
-            assert_eq!(budget, after_total_inputs);
-            assert_eq!(
-                budget.try_reserve_state_bytes(Time::from_secs(105), 0),
-                Err(LogicalExchangeBudgetError::DeadlineExceeded)
-            );
-            assert_eq!(budget, after_total_inputs);
+            assert_eq!(budget.rounds_started(), 2);
+            assert_eq!(budget.inputs_in_current_round(), 1);
+            assert_eq!(budget.inputs_admitted(), 3);
+            assert_eq!(budget.state_bytes_admitted(), 9);
         }
 
         #[test]
-        fn logical_exchange_budget_meets_an_outer_deadline_and_rejects_deadline_overflow() {
-            let limits = small_limits();
+        fn logical_exchange_budget_clones_share_counters_across_threads() {
+            let context = McpContext::new(Cx::for_testing(), 1);
+            let limits = ProtocolLimits::builder()
+                .logical_exchange_max_rounds(2)
+                .logical_exchange_max_inputs_per_round(2)
+                .logical_exchange_max_inputs(3)
+                .logical_exchange_max_state_bytes(9)
+                .logical_exchange_max_wall_clock(HARD_LOGICAL_EXCHANGE_MAX_WALL_CLOCK)
+                .build()
+                .unwrap();
+            let budget = LogicalExchangeBudget::new(limits, &context).unwrap();
+            budget.try_start_round().unwrap();
+
+            let barrier = Arc::new(Barrier::new(3));
+            let first_budget = budget.clone();
+            let first_barrier = barrier.clone();
+            let first = std::thread::spawn(move || {
+                first_barrier.wait();
+                first_budget.try_reserve_input(5)
+            });
+            let second_budget = budget.clone();
+            let second_barrier = barrier.clone();
+            let second = std::thread::spawn(move || {
+                second_barrier.wait();
+                second_budget.try_reserve_input(5)
+            });
+
+            barrier.wait();
+            let first = first.join().expect("first admission worker panicked");
+            let second = second.join().expect("second admission worker panicked");
+
+            assert!(matches!(first, Ok(())) ^ matches!(second, Ok(())));
+            assert!(matches!(
+                first.as_ref().err().or(second.as_ref().err()),
+                Some(LogicalExchangeBudgetError::StateByteLimitExceeded { limit: 9 })
+            ));
+            assert_eq!(budget.inputs_admitted(), 1);
+            assert_eq!(budget.state_bytes_admitted(), 5);
+        }
+
+        #[test]
+        fn logical_exchange_budget_equality_handles_self_and_shared_clones() {
+            let context = McpContext::new(Cx::for_testing(), 1);
+            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+            let clone = budget.clone();
+
+            assert!(Arc::ptr_eq(&budget.counters, &clone.counters));
+            assert_eq!(budget, budget);
+            assert_eq!(budget, clone);
+
+            budget.try_start_round().unwrap();
+            budget.try_reserve_input(3).unwrap();
+            assert_eq!(budget, clone);
+        }
+
+        #[test]
+        fn logical_exchange_budget_equality_is_safe_across_threads_for_distinct_states() {
+            let context = McpContext::new(Cx::for_testing(), 1);
+            let first_budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+            let second_budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+            assert!(!Arc::ptr_eq(
+                &first_budget.counters,
+                &second_budget.counters
+            ));
+
+            let barrier = Arc::new(Barrier::new(3));
+            let first_other = second_budget.clone();
+            let second_other = first_budget.clone();
+            let first_barrier = barrier.clone();
+            let first = std::thread::spawn(move || {
+                first_barrier.wait();
+                first_budget == first_other
+            });
+            let second_barrier = barrier.clone();
+            let second = std::thread::spawn(move || {
+                second_barrier.wait();
+                second_budget == second_other
+            });
+
+            barrier.wait();
+            assert!(first.join().expect("first equality worker panicked"));
+            assert!(second.join().expect("second equality worker panicked"));
+        }
+
+        #[test]
+        fn logical_exchange_budget_rejects_caller_context_cancellation() {
+            let request_cancellation = McpRequestCancellation::new();
+            let context = McpContext::new(Cx::for_testing(), 1)
+                .with_request_cancellation(request_cancellation.clone());
+            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+
+            assert!(request_cancellation.cancel());
+            assert_eq!(
+                budget.try_start_round(),
+                Err(LogicalExchangeBudgetError::Cancelled)
+            );
+            assert_eq!(budget.rounds_started(), 0);
+
+            let cx = Cx::for_testing();
+            let context = McpContext::new(cx.clone(), 2);
+            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+            cx.set_cancel_requested(true);
+            assert_eq!(
+                budget.try_start_round(),
+                Err(LogicalExchangeBudgetError::Cancelled)
+            );
+            assert_eq!(budget.rounds_started(), 0);
+        }
+
+        #[test]
+        fn logical_exchange_budget_rechecks_cancellation_after_counter_lock_contention() {
+            let request_cancellation = McpRequestCancellation::new();
+            let context = McpContext::new(Cx::for_testing(), 1)
+                .with_request_cancellation(request_cancellation.clone());
+            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+
+            let held_counters = budget.counters();
+            let before_counter_lock = Arc::new(Barrier::new(2));
+            let delayed_clone = budget
+                .clone()
+                .with_before_counter_lock_barrier(before_counter_lock.clone());
+            let worker = std::thread::spawn(move || delayed_clone.try_start_round());
+
+            // The worker is poised immediately before acquiring the shared
+            // counter lock. A pre-lock liveness check has therefore either
+            // already happened (the former TOCTOU ordering) or is still ahead
+            // of the lock (the fixed ordering).
+            before_counter_lock.wait();
+            assert!(request_cancellation.cancel());
+            drop(held_counters);
+
+            assert_eq!(
+                worker.join().expect("delayed admission worker panicked"),
+                Err(LogicalExchangeBudgetError::Cancelled)
+            );
+            assert_eq!(budget.rounds_started(), 0);
+        }
+
+        #[test]
+        fn logical_exchange_budget_uses_context_time_without_a_caller_supplied_instant() {
+            let context = McpContext::new(Cx::for_testing(), 1);
             let budget = LogicalExchangeBudget::with_external_deadline(
-                limits,
-                Time::from_secs(100),
-                Some(Time::from_secs(102)),
+                small_limits(),
+                &context,
+                Some(Time::ZERO),
             )
             .unwrap();
-            assert_eq!(budget.deadline(), Time::from_secs(102));
+            assert_eq!(budget.deadline(), Time::ZERO);
             assert_eq!(
-                LogicalExchangeBudget::new(small_limits(), Time::MAX),
+                budget.try_start_round(),
+                Err(LogicalExchangeBudgetError::DeadlineExceeded)
+            );
+            assert_eq!(budget.rounds_started(), 0);
+        }
+
+        #[test]
+        fn logical_exchange_budget_meets_the_caller_context_deadline() {
+            let cx = Cx::for_testing();
+            let context_deadline = cx.now().saturating_add_nanos(1_000_000_000_000);
+            let context = McpContext::new(cx, 1)
+                .with_budget_ceiling(Budget::new().with_deadline(context_deadline));
+            let limits = ProtocolLimits::builder()
+                .logical_exchange_max_wall_clock(HARD_LOGICAL_EXCHANGE_MAX_WALL_CLOCK)
+                .build()
+                .unwrap();
+
+            let budget = LogicalExchangeBudget::new(limits, &context).unwrap();
+
+            assert_eq!(budget.deadline(), context_deadline);
+        }
+
+        #[test]
+        fn logical_exchange_budget_preserves_checked_deadline_arithmetic() {
+            assert_eq!(
+                LogicalExchangeBudget::calculate_deadline(&small_limits(), Time::MAX, None),
                 Err(LogicalExchangeBudgetError::ArithmeticOverflow {
                     resource: LogicalExchangeBudgetResource::DeadlineNanos,
                 })
