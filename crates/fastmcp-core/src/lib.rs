@@ -1014,8 +1014,17 @@ pub mod limits {
         #[test]
         fn logical_exchange_budget_equality_is_safe_across_threads_for_distinct_states() {
             let context = McpContext::new(Cx::for_testing(), 1);
-            let first_budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
-            let second_budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+            // Equality includes the deadline, and the testing clock advances
+            // between constructions; pin one external deadline below the
+            // configured window so both budgets agree and the comparison
+            // reaches the ordered counter locking under test.
+            let shared_deadline = Some(Time::from_nanos(1_000_000));
+            let first_budget =
+                LogicalExchangeBudget::with_external_deadline(small_limits(), &context, shared_deadline)
+                    .unwrap();
+            let second_budget =
+                LogicalExchangeBudget::with_external_deadline(small_limits(), &context, shared_deadline)
+                    .unwrap();
             assert!(!Arc::ptr_eq(
                 &first_budget.counters,
                 &second_budget.counters
