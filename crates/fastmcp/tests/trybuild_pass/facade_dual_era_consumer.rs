@@ -110,6 +110,17 @@ mod prelude_client_completion_input_reachability {
     }
 }
 
+async fn bind_modern_http(
+    server: modern::Server,
+    cx: &modern::Cx,
+) -> modern::McpResult<modern::HttpServer> {
+    server.bind_http(cx, "127.0.0.1:0").await
+}
+
+async fn serve_modern_http(server: modern::Server, cx: &modern::Cx) -> modern::McpResult<()> {
+    server.serve_http(cx, "127.0.0.1:0").await
+}
+
 fn assert_client_http_and_subscription_exports() {
     let _ = modern::HttpClient::connect;
     let _ = modern::HttpClient::call_tool_outcome;
@@ -117,8 +128,8 @@ fn assert_client_http_and_subscription_exports() {
     let _ = modern::HttpClient::get_task;
     let _ = modern::HttpClient::update_task;
     let _ = modern::HttpClient::cancel_task;
-    let _ = modern::Server::bind_http;
-    let _ = modern::Server::serve_http;
+    let _ = bind_modern_http;
+    let _ = serve_modern_http;
     let _ = modern::HttpServer::serve;
     let _: modern::SubscriptionFilter = SubscriptionFilter {
         tools_list_changed: Some(true),

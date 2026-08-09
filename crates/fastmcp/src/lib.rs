@@ -722,30 +722,30 @@ pub mod modern {
         FinalCallToolResult, FinalCancelTaskParams, FinalCancelTaskResult,
         FinalCancelledNotificationParams, FinalCompletionArgument, FinalCompletionContext,
         FinalCompletionParams, FinalCompletionReference, FinalCompletionResult,
-        FinalCompletionValues, FinalCoreResultType, FinalCreateMessageInputRequiredResult,
-        FinalCreateMessageParams, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams,
-        FinalEmbeddedElicitationParams, FinalEmbeddedElicitationResult,
-        FinalEmbeddedFormElicitationParams, FinalEmbeddedInputKind, FinalEmbeddedInputRequest,
-        FinalEmbeddedInputResponse, FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult,
-        FinalEmbeddedUrlElicitationParams, FinalEmptyNotificationParams, FinalEmptyParams,
-        FinalEmptyResult, FinalGetPromptParams, FinalGetPromptResult, FinalGetTaskParams,
-        FinalGetTaskResult, FinalHttpRequestMetadata, FinalInputRequiredResultType,
-        FinalListParams, FinalListPromptsResult, FinalListResourceTemplatesResult,
-        FinalListResourcesResult, FinalListToolsResult, FinalLogMessageParams,
-        FinalNotificationError, FinalProgressNotificationParams, FinalPrompt, FinalPromptArgument,
-        FinalPromptMessage, FinalProtocolVersion, FinalReadResourceParams, FinalReadResourceResult,
-        FinalRequestAdmission, FinalRequestMeta, FinalResource, FinalResourceTemplate,
-        FinalResourceUpdatedNotificationParams, FinalSamplingMessage, FinalSamplingMessageContent,
-        FinalSamplingMessageContentBlock, FinalSubscriptionsAcknowledgedNotificationParams,
-        FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, FinalTaskCallToolResult,
-        FinalTaskError, FinalTaskId, FinalTaskStatus, FinalTaskStatusNotificationParams, FinalTool,
-        FinalToolAnnotations, FinalToolChoice, FinalToolChoiceMode, HEADER_MISMATCH_ERROR_CODE,
-        HeaderMismatchError, HeaderMismatchReason, IncludeContext, InputRequiredResult,
-        MAX_MCP_APPS_CSP_DOMAIN_BYTES, MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE,
-        MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES, MAX_MCP_APPS_UI_METADATA_MEMBERS,
-        MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
-        MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES, MAX_TASK_ID_BYTES,
-        MAX_TASK_INPUT_MAP_ENTRIES, MAX_TASK_SUBSCRIPTION_IDS,
+        FinalCompletionValues, FinalCoreRequest, FinalCoreResult, FinalCoreResultType,
+        FinalCreateMessageInputRequiredResult, FinalCreateMessageParams, FinalCreateMessageResult,
+        FinalEmbeddedCreateMessageParams, FinalEmbeddedElicitationParams,
+        FinalEmbeddedElicitationResult, FinalEmbeddedFormElicitationParams, FinalEmbeddedInputKind,
+        FinalEmbeddedInputRequest, FinalEmbeddedInputResponse, FinalEmbeddedRootsListParams,
+        FinalEmbeddedRootsListResult, FinalEmbeddedUrlElicitationParams,
+        FinalEmptyNotificationParams, FinalEmptyParams, FinalEmptyResult, FinalGetPromptParams,
+        FinalGetPromptResult, FinalGetTaskParams, FinalGetTaskResult, FinalHttpRequestMetadata,
+        FinalInputRequiredResultType, FinalListParams, FinalListPromptsResult,
+        FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult,
+        FinalLogMessageParams, FinalNotificationError, FinalProgressNotificationParams,
+        FinalPrompt, FinalPromptArgument, FinalPromptMessage, FinalProtocolVersion,
+        FinalReadResourceParams, FinalReadResourceResult, FinalRequestAdmission, FinalRequestMeta,
+        FinalResource, FinalResourceTemplate, FinalResourceUpdatedNotificationParams,
+        FinalSamplingMessage, FinalSamplingMessageContent, FinalSamplingMessageContentBlock,
+        FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
+        FinalSubscriptionsListenResult, FinalTaskCallToolResult, FinalTaskError, FinalTaskId,
+        FinalTaskStatus, FinalTaskStatusNotificationParams, FinalTool, FinalToolAnnotations,
+        FinalToolChoice, FinalToolChoiceMode, HEADER_MISMATCH_ERROR_CODE, HeaderMismatchError,
+        HeaderMismatchReason, IncludeContext, InputRequiredResult, MAX_MCP_APPS_CSP_DOMAIN_BYTES,
+        MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE, MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES,
+        MAX_MCP_APPS_UI_METADATA_MEMBERS, MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH,
+        MAX_RESULT_ENCODED_BYTES, MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES,
+        MAX_TASK_ID_BYTES, MAX_TASK_INPUT_MAP_ENTRIES, MAX_TASK_SUBSCRIPTION_IDS,
         MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY, MCP_METHOD_HEADER,
         MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
         MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, McpAppsDisplayMode, McpAppsLifecycleError,
@@ -2190,9 +2190,23 @@ mod tests {
         ) -> modern::McpResult<modern::FinalCancelTaskResult> = modern::Client::cancel_task;
         let _: fn(modern::ServerBuilder, modern::FinalResourceTemplate) -> modern::ServerBuilder =
             modern::ServerBuilder::resource_template;
+        async fn bind_modern_http(
+            server: modern::Server,
+            cx: &modern::Cx,
+        ) -> modern::McpResult<modern::HttpServer> {
+            server.bind_http(cx, "127.0.0.1:0").await
+        }
+
+        async fn serve_modern_http(
+            server: modern::Server,
+            cx: &modern::Cx,
+        ) -> modern::McpResult<()> {
+            server.serve_http(cx, "127.0.0.1:0").await
+        }
+
         let _ = modern::HttpClient::connect;
-        let _ = modern::Server::bind_http;
-        let _ = modern::Server::serve_http;
+        let _ = bind_modern_http;
+        let _ = serve_modern_http;
 
         let auto_builder = auto::client_builder();
         assert_eq!(
@@ -2425,7 +2439,7 @@ mod tests {
 
         use super::{
             AsyncStdioTransport, StdioTransport, Transport, TransportRecvHalf, TransportSendHalf,
-            TwoPhaseTransport, modern, transport,
+            TwoPhaseTransport, transport,
         };
 
         fn requires_two_phase_transport<T: TwoPhaseTransport>() {}
@@ -2434,7 +2448,7 @@ mod tests {
         requires_two_phase_transport::<StdioTransport<Cursor<Vec<u8>>, Vec<u8>>>();
         let _: Option<AsyncStdioTransport> = None;
         let _: Option<transport::websocket::WsFrame> = None;
-        let _: Option<modern::transport::sse::SseEvent> = None;
+        let _: Option<transport::sse::SseEvent> = None;
         let _: Option<&dyn Transport> = None;
         let _ = requires_split_halves::<
             transport::websocket::WsServerRecvHalf<Cursor<Vec<u8>>, Vec<u8>>,
