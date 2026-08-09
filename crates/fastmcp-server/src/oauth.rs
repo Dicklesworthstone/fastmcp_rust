@@ -5865,7 +5865,10 @@ mod tests {
     #[test]
     fn server_token_auth_code_verifier_too_short() {
         let mut config = OAuthServerConfig::default();
-        config.min_code_verifier_length = 0;
+        // Fail-closed validation now rejects configs below the RFC 7636
+        // 43-byte floor outright, so the most permissive LEGAL configuration
+        // is the floor itself; the short verifier below must still bounce.
+        config.min_code_verifier_length = PKCE_CODE_VERIFIER_MIN_BYTES;
         let server = OAuthServer::new(config);
         let client = OAuthClient::builder("c")
             .redirect_uri("http://127.0.0.1/cb")
@@ -5899,7 +5902,10 @@ mod tests {
             scopes: None,
         };
         let result = server.token(&token_req);
-        assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
+        // PKCE verifier failures on the token endpoint uniformly surface as
+        // invalid_grant (RFC 7636 section 4.6), keeping length and mismatch
+        // rejections indistinguishable to a probing client.
+        assert!(matches!(result, Err(OAuthError::InvalidGrant(_))));
         assert!(
             server
                 .state

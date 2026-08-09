@@ -916,6 +916,17 @@ mod tests {
         }
     }
 
+    /// Live partitions are scoped by client AND method (aced504); tests that
+    /// address stored partitions directly must compose the same key. These
+    /// suites extract the client id from the request method, so both digest
+    /// stages consume the same string.
+    fn method_scoped_test_key(id: &str) -> Sha256Digest {
+        let client = sha256_bounded(id.as_bytes(), MAX_CLIENT_ID_BYTES)
+            .expect("test identifier is within the bound");
+        rate_limit_method_partition(client, id)
+            .expect("test method partition input is within the bound")
+    }
+
     fn modern_test_request(method: &str, id: &str) -> JsonRpcRequest {
         JsonRpcRequest::new(
             method,
@@ -1837,10 +1848,8 @@ mod tests {
             "touching an exhausted legitimate partition must preserve its limit"
         );
 
-        let stale_key = sha256_bounded(b"stale-token-attacker-0", MAX_CLIENT_ID_BYTES)
-            .expect("test identifier is within the bound");
-        let legitimate_key = sha256_bounded(legitimate_id.as_bytes(), MAX_CLIENT_ID_BYTES)
-            .expect("test identifier is within the bound");
+        let stale_key = method_scoped_test_key("stale-token-attacker-0");
+        let legitimate_key = method_scoped_test_key(legitimate_id);
         let stale_last_seen = Instant::now()
             .checked_sub(idle_ttl + idle_ttl)
             .expect("the test idle interval must fit in Instant");
@@ -1860,9 +1869,7 @@ mod tests {
                 .is_ok(),
             "stale but non-reset state must use the shared overflow limiter"
         );
-        let active_state_probe_key =
-            sha256_bounded(active_state_probe.as_bytes(), MAX_CLIENT_ID_BYTES)
-                .expect("test identifier is within the bound");
+        let active_state_probe_key = method_scoped_test_key(active_state_probe);
         {
             let partitions = middleware
                 .limiters
@@ -1894,8 +1901,7 @@ mod tests {
                 .is_ok(),
             "a safely reset stale attacker partition should be reclaimed"
         );
-        let newcomer_key = sha256_bounded(newcomer_id.as_bytes(), MAX_CLIENT_ID_BYTES)
-            .expect("test identifier is within the bound");
+        let newcomer_key = method_scoped_test_key(newcomer_id);
         let partitions = middleware
             .limiters
             .lock()
@@ -1946,10 +1952,8 @@ mod tests {
             "touching a limited legitimate partition must preserve its window"
         );
 
-        let stale_key = sha256_bounded(b"stale-window-attacker-0", MAX_CLIENT_ID_BYTES)
-            .expect("test identifier is within the bound");
-        let legitimate_key = sha256_bounded(legitimate_id.as_bytes(), MAX_CLIENT_ID_BYTES)
-            .expect("test identifier is within the bound");
+        let stale_key = method_scoped_test_key("stale-window-attacker-0");
+        let legitimate_key = method_scoped_test_key(legitimate_id);
         let stale_last_seen = Instant::now()
             .checked_sub(idle_ttl + idle_ttl)
             .expect("the test idle interval must fit in Instant");
@@ -1969,9 +1973,7 @@ mod tests {
                 .is_ok(),
             "stale but active window state must use the shared overflow limiter"
         );
-        let active_state_probe_key =
-            sha256_bounded(active_state_probe.as_bytes(), MAX_CLIENT_ID_BYTES)
-                .expect("test identifier is within the bound");
+        let active_state_probe_key = method_scoped_test_key(active_state_probe);
         {
             let partitions = middleware
                 .limiters
@@ -2002,8 +2004,7 @@ mod tests {
                 .is_ok(),
             "an empty stale attacker partition should be reclaimed"
         );
-        let newcomer_key = sha256_bounded(newcomer_id.as_bytes(), MAX_CLIENT_ID_BYTES)
-            .expect("test identifier is within the bound");
+        let newcomer_key = method_scoped_test_key(newcomer_id);
         let partitions = middleware
             .limiters
             .lock()
