@@ -2387,6 +2387,38 @@ impl ServerNotification {
         };
         Ok(JsonRpcRequest::notification(self.method(), params))
     }
+
+    /// Serializes this notification as its exact JSON-RPC wire frame.
+    ///
+    /// [`encode`](Self::encode) carries its params as `serde_json::Value`,
+    /// whose map representation cannot preserve member order, so byte-exact
+    /// emission and round-trip fidelity proofs must use this string encoder:
+    /// the typed params serialize directly, preserving declaration order and
+    /// raw number lexemes.
+    pub fn encode_wire(&self) -> Result<String, FinalNotificationError> {
+        let method = self.method();
+        let params = match self {
+            Self::Cancelled(params) => Some(serde_json::to_string(params)),
+            Self::Progress(params) => Some(serde_json::to_string(params)),
+            Self::Message(params) => Some(serde_json::to_string(params)),
+            Self::ResourceUpdated(params) => Some(serde_json::to_string(params)),
+            Self::ResourcesListChanged(params)
+            | Self::ToolsListChanged(params)
+            | Self::PromptsListChanged(params) => {
+                params.as_ref().map(|params| serde_json::to_string(params))
+            }
+            Self::SubscriptionsAcknowledged(params) => Some(serde_json::to_string(params)),
+        };
+        let params = params
+            .transpose()
+            .map_err(|_| FinalNotificationError::EncodeFailure { method })?;
+        Ok(match params {
+            Some(params) => {
+                format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params}}}"#)
+            }
+            None => format!(r#"{{"jsonrpc":"2.0","method":"{method}"}}"#),
+        })
+    }
 }
 
 fn admit_final_notification(
@@ -5594,12 +5626,9 @@ mod tests {
             "the large integer progress lexeme is retained without an IEEE-754 conversion"
         );
         assert_eq!(
-            serde_json::to_string(
-                &large_notification
-                    .encode()
-                    .expect("large progress re-encodes")
-            )
-            .expect("large progress JSON serializes"),
+            large_notification
+                .encode_wire()
+                .expect("large progress re-encodes"),
             large_wire,
             "the large integer progress lexeme round-trips exactly"
         );
@@ -5628,12 +5657,9 @@ mod tests {
             Some(&equivalent_params.progress)
         );
         assert_eq!(
-            serde_json::to_string(
-                &equivalent_notification
-                    .encode()
-                    .expect("equivalent progress re-encodes")
-            )
-            .expect("equivalent progress JSON serializes"),
+            equivalent_notification
+                .encode_wire()
+                .expect("equivalent progress re-encodes"),
             equivalent_wire,
             "equivalent decimal/exponent values retain their individual wire lexemes"
         );

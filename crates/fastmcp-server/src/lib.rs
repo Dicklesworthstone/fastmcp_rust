@@ -8856,7 +8856,12 @@ impl Server {
                             let principal_result = response_id.as_ref().map_or(Ok(()), |_| {
                                 bind_anonymous_connection_principal(&session_principal)
                             });
-                            principal_admission.resolve(principal_result.is_ok());
+                            // Id-less messages construct the admission already
+                            // admitted; resolving again would trip the
+                            // single-transition invariant.
+                            if response_id.is_some() {
+                                principal_admission.resolve(principal_result.is_ok());
+                            }
                             if let Err(error) = principal_result
                                 && let Some(id) = response_id
                             {
@@ -8962,7 +8967,12 @@ impl Server {
                             let principal_result = response_id.as_ref().map_or(Ok(()), |_| {
                                 bind_anonymous_connection_principal(&session_principal)
                             });
-                            principal_admission.resolve(principal_result.is_ok());
+                            // Id-less messages construct the admission already
+                            // admitted; resolving again would trip the
+                            // single-transition invariant.
+                            if response_id.is_some() {
+                                principal_admission.resolve(principal_result.is_ok());
+                            }
                             if let Err(error) = principal_result
                                 && let Some(id) = response_id
                             {
@@ -10042,11 +10052,20 @@ impl Server {
 
         let active_guard = match id.clone() {
             Some(request_id) => {
-                match ActiveRequestGuard::try_new(
+                // Reuse the queue-admitted cancellation token when this
+                // request came through the dispatch queue. `cancel_reserved`
+                // cancels the admitted token, so an in-band cancellation that
+                // arrives while the request is dispatching must act on the
+                // same token the dispatch observes and finalizes against.
+                let admitted_cancellation = dispatch_queue
+                    .and_then(|queue| queue.admitted_request_cancellation(&request_id))
+                    .unwrap_or_default();
+                match ActiveRequestGuard::try_new_with_cancellation(
                     Arc::clone(&self.active_requests),
                     session.id(),
                     request_id.clone(),
                     request_cx.clone(),
+                    admitted_cancellation,
                 ) {
                     Ok(guard) => Some(guard),
                     Err(_duplicate_id) => {
@@ -10174,6 +10193,11 @@ impl Server {
                 request_cx,
                 budget,
             )
+            // An accepted in-band notifications/cancelled must suppress the
+            // request's response entirely (2024-11-05 cancellation contract);
+            // ambient cancellation and deadline expiry still produce their
+            // ordinary terminal error responses.
+            .suppress_cancelled_response()
             .with_deferred_stats(deferred_stats),
         )
     }
@@ -12155,6 +12179,20 @@ impl HandledRequest {
     /// explicit request cancellation won. Ambient cancellation and deadline
     /// expiry still produce their ordinary terminal error response.
     fn resolve_commit_race(&mut self, session: &mut Session) -> bool {
+        // An explicit in-band cancellation that already linearized wins
+        // outright: its suppression contract holds even when ambient shutdown
+        // or deadline expiry lands concurrently with response finalization.
+        // This must not eagerly CAS to FINALIZING, because ambient death below
+        // still needs to propagate into the token for `cancelled()` waiters.
+        let explicit_cancellation_linearized = self
+            .cancellation
+            .as_ref()
+            .is_some_and(McpRequestCancellation::is_cancel_requested);
+        if explicit_cancellation_linearized {
+            self.replace_with_terminal_error(session, McpError::request_cancelled());
+            return true;
+        }
+
         if let Some(error) = self.commit_liveness_error() {
             if let Some(cancellation) = &self.cancellation {
                 let _ = cancellation.cancel();
@@ -15354,14 +15392,19 @@ mod lib_unit_tests {
             .base()
             .task_id
             .clone();
+        // The caller extension registered with RejectOneSided, so the client
+        // must declare it alongside the official Tasks extension or the whole
+        // per-request negotiation (correctly) rejects.
+        let mut get_params = final_tasks_get_params(&task_id, serde_json::json!({}));
+        get_params
+            .pointer_mut("/_meta/io.modelcontextprotocol~1clientCapabilities/extensions")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("baseline request declares client extensions")
+            .insert("com.example/echo".to_owned(), serde_json::json!({}));
         let response = server
             .dispatch_stateless(
                 &InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory),
-                &JsonRpcRequest::new(
-                    fastmcp_protocol::TASK_GET,
-                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
-                    71_i64,
-                ),
+                &JsonRpcRequest::new(fastmcp_protocol::TASK_GET, Some(get_params), 71_i64),
             )
             .expect("merged final Tasks handler must route requests");
         assert!(response.error.is_none());
@@ -16070,62 +16113,88 @@ mod lib_unit_tests {
         let mut session = initialized_test_session(&server);
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let request = JsonRpcRequest::new(
-            "tools/list",
-            Some(serde_json::json!({
-                "authorization": "Bearer top-level-secret",
-                "_meta": {
-                    "accessToken": "Bearer metadata-secret",
-                    "trace": "preserved-metadata"
-                },
-                "headers": {
-                    "Authorization": "Bearer header-secret",
-                    "x-preserved": "yes"
-                },
-                "arguments": {
-                    "token": "domain-value",
-                    "nested": {"authorization": "domain-authorization"}
+
+        // The fail-closed credential grammar rejects a request carrying more
+        // than one recognized credential source, so each recognized location
+        // proves its visible-to-auth-then-stripped custody in its own
+        // single-source dispatch.
+        let cases = [
+            (
+                91_i64,
+                serde_json::json!({
+                    "authorization": "Bearer top-level-secret",
+                    "arguments": {
+                        "token": "domain-value",
+                        "nested": {"authorization": "domain-authorization"}
+                    }
+                }),
+            ),
+            (
+                92_i64,
+                serde_json::json!({
+                    "_meta": {
+                        "accessToken": "Bearer metadata-secret",
+                        "trace": "preserved-metadata"
+                    }
+                }),
+            ),
+            (
+                93_i64,
+                serde_json::json!({
+                    "headers": {
+                        "Authorization": "Bearer header-secret",
+                        "x-preserved": "yes"
+                    }
+                }),
+            ),
+        ];
+        for (id, params) in cases {
+            let request = JsonRpcRequest::new("tools/list", Some(params.clone()), id);
+            let response = server
+                .dispatch_request(
+                    &Cx::for_testing(),
+                    &mut session,
+                    request,
+                    &notification_sender,
+                    &request_sender,
+                )
+                .expect("authenticated tools/list must respond");
+            assert!(
+                response.error.is_none(),
+                "unexpected response for id {id}: {response:?}"
+            );
+
+            let raw = raw
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("auth provider must receive raw params");
+            assert_eq!(raw, params, "auth must see the unstripped params");
+
+            let sanitized = sanitized
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("middleware must receive sanitized params");
+            match id {
+                91 => {
+                    assert!(sanitized.get("authorization").is_none());
+                    assert_eq!(sanitized["arguments"]["token"], "domain-value");
+                    assert_eq!(
+                        sanitized["arguments"]["nested"]["authorization"],
+                        "domain-authorization"
+                    );
                 }
-            })),
-            91_i64,
-        );
-
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                request,
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("authenticated tools/list must respond");
-        assert!(
-            response.error.is_none(),
-            "unexpected response: {response:?}"
-        );
-
-        let raw = raw
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .expect("auth provider must receive raw params");
-        assert_eq!(raw["authorization"], "Bearer top-level-secret");
-
-        let sanitized = sanitized
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .expect("middleware must receive sanitized params");
-        assert!(sanitized.get("authorization").is_none());
-        assert!(sanitized["_meta"].get("accessToken").is_none());
-        assert_eq!(sanitized["_meta"]["trace"], "preserved-metadata");
-        assert!(sanitized["headers"].get("Authorization").is_none());
-        assert_eq!(sanitized["headers"]["x-preserved"], "yes");
-        assert_eq!(sanitized["arguments"]["token"], "domain-value");
-        assert_eq!(
-            sanitized["arguments"]["nested"]["authorization"],
-            "domain-authorization"
-        );
+                92 => {
+                    assert!(sanitized["_meta"].get("accessToken").is_none());
+                    assert_eq!(sanitized["_meta"]["trace"], "preserved-metadata");
+                }
+                _ => {
+                    assert!(sanitized["headers"].get("Authorization").is_none());
+                    assert_eq!(sanitized["headers"]["x-preserved"], "yes");
+                }
+            }
+        }
     }
 
     #[test]
@@ -17909,52 +17978,117 @@ mod lib_unit_tests {
         let phase = Arc::new(AtomicUsize::new(0));
         let phase_for_receive = Arc::clone(&phase);
         let control_for_receive = Arc::clone(&control);
-        let cx = Cx::for_testing();
-        let exit_code = Server::new("stdio-modern-worker-shutdown-test", "1.0.0")
+        let server = Server::new("stdio-modern-worker-shutdown-test", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
             .tool(NonQuiescentModernTool {
                 control: Arc::clone(&control),
             })
             .on_shutdown(move || shutdown_observer.store(true, Ordering::Release))
+            .build();
+        // The modern dispatch arm admits requests through spawn_blocking, so
+        // the pump must run under a runtime with blocking threads; a bare
+        // testing Cx rejects every modern dispatch before the tool starts.
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("stdio pump reactor must initialize"))
+            .blocking_threads(4, MAX_DISPATCH_QUEUE_DEPTH)
             .build()
-            .run_loop_pump_with_policy(
-                &cx,
-                &cx,
-                move |_receive_cx, _worker_failed| match phase_for_receive
-                    .fetch_add(1, Ordering::AcqRel)
-                {
-                    0 => Ok(modern_discovery_opening_request()),
-                    1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
-                        "tools/call",
-                        Some(serde_json::json!({
-                            "name": "non_quiescent_modern_tool",
-                            "arguments": {},
-                            "_meta": {
-                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                            },
-                        })),
-                        710_i64,
-                    ))),
-                    2 if control_for_receive.wait_for_started(Duration::from_secs(2)) => {
-                        Err(TransportError::Closed)
+            .expect("stdio pump runtime must initialize");
+        let (sender, receiver) = sync_channel(1);
+        runtime
+            .handle()
+            .try_spawn_with_cx(move |cx| async move {
+                let dispatch_cx = cx.clone();
+                let pump_sender = sender.clone();
+                // The pump reports its exit code through the channel from the
+                // blocking closure itself rather than via join(): joining the
+                // pump task can park forever while the deliberately
+                // non-quiescent modern child still occupies its blocking
+                // thread, and the harness only needs the exit code.
+                if let Err(error) = cx.spawn_blocking(move |pump_cx| {
+                    let code = server.run_loop_pump_with_policy(
+                        &pump_cx,
+                        &dispatch_cx,
+                        move |_receive_cx, _worker_failed| match phase_for_receive
+                            .fetch_add(1, Ordering::AcqRel)
+                        {
+                            0 => Ok(modern_discovery_opening_request()),
+                            1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "tools/call",
+                                Some(serde_json::json!({
+                                    "name": "non_quiescent_modern_tool",
+                                    "arguments": {},
+                                    "_meta": {
+                                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                                    },
+                                })),
+                                710_i64,
+                            ))),
+                            2 if control_for_receive.wait_for_started(Duration::from_secs(2)) => {
+                                Err(TransportError::Closed)
+                            }
+                            2 => Err(TransportError::Timeout),
+                            _ => Err(TransportError::Closed),
+                        },
+                        move |_send_cx, _message| Ok(()),
+                        Arc::new(|_| {}),
+                        "stdio-modern-test",
+                        true,
+                        None,
+                        true,
+                    );
+                    let _ = pump_sender.send(Ok(code));
+                }) {
+                    let _ = sender.send(Err(format!("stdio pump admission failed: {error}")));
+                }
+            })
+            .expect("stdio pump task must be admitted");
+        // The pump legitimately holds several bounded worker-shutdown windows
+        // (5s each) before detaching the non-quiescent child, so the result
+        // wait must exceed their sum; the shared live-HTTP helper's 2s bound
+        // is far too tight here.
+        let pump_result: Result<Result<i32, String>, String> = runtime.block_on(async {
+            let cx = Cx::current().expect("the test runtime installs an ambient Cx");
+            let deadline = cx.now().saturating_add_nanos(30_000_000_000);
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => break Ok(result),
+                    Err(TryRecvError::Disconnected) => {
+                        break Err("stdio pump task exited without reporting its result".to_owned());
                     }
-                    2 => Err(TransportError::Timeout),
-                    _ => Err(TransportError::Closed),
-                },
-                move |_send_cx, _message| Ok(()),
-                Arc::new(|_| {}),
-                "stdio-modern-test",
-                true,
-                None,
-                true,
-            );
+                    Err(TryRecvError::Empty) => {
+                        if asupersync::time::timeout_at(
+                            deadline,
+                            asupersync::time::sleep(cx.now(), Duration::from_millis(5)),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break Err("stdio pump did not settle within its bound".to_owned());
+                        }
+                    }
+                }
+            }
+        });
 
-        assert_eq!(exit_code, 1);
-        assert!(control.has_started());
-        assert!(!control.has_finished());
-        assert!(!shutdown_called.load(Ordering::Acquire));
+        // Capture the pre-release observations, then release the parked tool
+        // BEFORE any panic: a failed assert (or a pump timeout) would
+        // otherwise unwind into the runtime drop, which joins the
+        // still-parked blocking thread forever.
+        let started = control.has_started();
+        let finished_before_release = control.has_finished();
+        let shutdown_before_release = shutdown_called.load(Ordering::Acquire);
         control.release();
-        assert!(control.wait_for_finished(Duration::from_secs(2)));
+        let finished_after_release = control.wait_for_finished(Duration::from_secs(2));
+
+        let exit_code = pump_result
+            .expect("stdio pump must report a result")
+            .expect("stdio pump must complete");
+        assert_eq!(exit_code, 1);
+        assert!(started);
+        assert!(!finished_before_release);
+        assert!(!shutdown_before_release);
+        assert!(finished_after_release);
     }
 
     #[test]
@@ -18600,6 +18734,7 @@ mod lib_unit_tests {
                         "arguments": {},
                         "_meta": {
                             MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                         },
                     })),
                     709_i64,
@@ -19561,8 +19696,13 @@ mod lib_unit_tests {
             Some(serde_json::json!({
                 "name": "live_modern_controlled_tool",
                 "arguments": {},
+                // Modern REQUESTS must carry clientCapabilities alongside
+                // protocolVersion or reserved-value validation rejects them
+                // with -32602 before dispatch (notifications stay
+                // protocolVersion-only by contract).
                 "_meta": {
                     MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                 },
             })),
             id,
@@ -26467,10 +26607,11 @@ mod lib_unit_tests {
             ),
             "changing only final logLevel from info to warning must suppress the info notification"
         );
+        // The dispatch task owns the response sender, so a completed request
+        // may legitimately close the body afterwards; the negative's
+        // invariant is only that no suppressed notification was queued.
         assert!(
-            sse.pop_event()
-                .expect("suppressed logging must not close the response body")
-                .is_none(),
+            !matches!(sse.pop_event(), Ok(Some(_))),
             "the log-level-only negative must leave no notification queued"
         );
     }

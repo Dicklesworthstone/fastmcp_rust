@@ -4747,9 +4747,20 @@ fn validate_final_task_request_meta(
     request: &FinalTaskRequestMeta,
     method: &'static str,
 ) -> McpResult<()> {
-    let protocol_version = request.meta.protocol_version().ok().flatten();
+    // Typed modern admission consumes the protocol-version marker upstream
+    // and deliberately strips it before handler parameter decoding, so its
+    // absence here is the normal dispatched shape; when a direct caller does
+    // supply it, it must still be the exact final version. Client
+    // capabilities survive stripping and remain required.
+    let Ok(protocol_version) = request.meta.protocol_version() else {
+        return Err(McpError::invalid_params(format!(
+            "Invalid final {method} parameters"
+        )));
+    };
     let client_capabilities = request.meta.client_capabilities().ok().flatten();
-    if protocol_version != Some(FINAL_PROTOCOL_VERSION) || client_capabilities.is_none() {
+    if protocol_version.is_some_and(|version| version != FINAL_PROTOCOL_VERSION)
+        || client_capabilities.is_none()
+    {
         return Err(McpError::invalid_params(format!(
             "Invalid final {method} parameters"
         )));
@@ -5238,6 +5249,212 @@ mod tests {
 
         fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
             self.inner.is_cancellation_requested(task_id)
+        }
+
+        // The probe wrapper must stay transparent for the initial-work
+        // recovery family; the trait defaults reject at the runner's entry
+        // checkpoint, which would fail readiness before the lease probe runs.
+        fn next_initial_work_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.next_initial_work_snapshot()
+        }
+
+        fn next_initial_work_snapshot_after(
+            &self,
+            after_task_id: Option<&FinalTaskId>,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.next_initial_work_snapshot_after(after_task_id)
+        }
+
+        fn take_initial_work_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+        ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+            self.inner.take_initial_work_if_current(expected)
+        }
+
+        fn take_initial_work_for_owner_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            owner_id: &str,
+        ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+            self.inner
+                .take_initial_work_for_owner_if_current(expected, owner_id)
+        }
+
+        fn restore_initial_work_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+            work_descriptor: FinalTaskWorkDescriptor,
+        ) -> McpResult<bool> {
+            self.inner
+                .restore_initial_work_if_current(task_id, generation, work_descriptor)
+        }
+
+        fn restore_initial_work_for_owner_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+            owner_id: &str,
+            dispatch_fence: Option<u64>,
+            work_descriptor: FinalTaskWorkDescriptor,
+        ) -> McpResult<bool> {
+            self.inner.restore_initial_work_for_owner_if_current(
+                task_id,
+                generation,
+                owner_id,
+                dispatch_fence,
+                work_descriptor,
+            )
+        }
+
+        fn replace_task_and_append_input_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+            input_responses: FinalTaskInputResponses,
+        ) -> McpResult<bool> {
+            self.inner.replace_task_and_append_input_if_current(
+                expected,
+                task,
+                notification,
+                input_responses,
+            )
+        }
+
+        fn replace_task_and_clear_input_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<bool> {
+            self.inner
+                .replace_task_and_clear_input_if_current(expected, task, notification)
+        }
+
+        fn take_input_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+        ) -> McpResult<Option<FinalTaskInputResponses>> {
+            self.inner.take_input_if_current(expected)
+        }
+
+        fn take_input_for_owner_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            owner_id: &str,
+        ) -> McpResult<Option<FinalTaskInputResponses>> {
+            self.inner.take_input_for_owner_if_current(expected, owner_id)
+        }
+
+        fn work_descriptor_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+        ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+            self.inner.work_descriptor_if_current(expected)
+        }
+
+        fn next_accepted_input_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.next_accepted_input_snapshot()
+        }
+
+        fn next_accepted_input_snapshot_after(
+            &self,
+            after_task_id: Option<&FinalTaskId>,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.next_accepted_input_snapshot_after(after_task_id)
+        }
+
+        fn restore_input_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+            input_responses: FinalTaskInputResponses,
+        ) -> McpResult<bool> {
+            self.inner
+                .restore_input_if_current(task_id, generation, input_responses)
+        }
+
+        fn restore_input_for_owner_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+            owner_id: &str,
+            dispatch_fence: Option<u64>,
+            input_responses: FinalTaskInputResponses,
+        ) -> McpResult<bool> {
+            self.inner.restore_input_for_owner_if_current(
+                task_id,
+                generation,
+                owner_id,
+                dispatch_fence,
+                input_responses,
+            )
+        }
+
+        fn begin_handoff_dispatch_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+        ) -> McpResult<bool> {
+            self.inner.begin_handoff_dispatch_if_current(task_id, generation)
+        }
+
+        fn begin_handoff_dispatch_for_owner_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+            owner_id: &str,
+        ) -> McpResult<Option<u64>> {
+            self.inner
+                .begin_handoff_dispatch_for_owner_if_current(task_id, generation, owner_id)
+        }
+
+        fn renew_handoff_dispatch_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+            owner_id: &str,
+            dispatch_fence: u64,
+        ) -> McpResult<bool> {
+            self.inner
+                .renew_handoff_dispatch_if_current(task_id, generation, owner_id, dispatch_fence)
+        }
+
+        fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
+            self.inner.handoff_dispatch_lease_heartbeat_interval()
+        }
+
+        fn finish_handoff_dispatch_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+        ) -> McpResult<bool> {
+            self.inner.finish_handoff_dispatch_if_current(task_id, generation)
+        }
+
+        fn finish_handoff_dispatch_for_owner_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+            owner_id: &str,
+            dispatch_fence: u64,
+        ) -> McpResult<bool> {
+            self.inner.finish_handoff_dispatch_for_owner_if_current(
+                task_id,
+                generation,
+                owner_id,
+                dispatch_fence,
+            )
+        }
+
+        fn request_cancellation_and_clear_input_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+        ) -> McpResult<bool> {
+            self.inner
+                .request_cancellation_and_clear_input_if_current(expected)
         }
     }
 
@@ -6376,7 +6593,11 @@ mod tests {
 
         let response = dispatch_final_tasks_get(&runtime, final_task_method_parameters(&task_id))
             .expect("official final tasks/get parameters are admitted");
-        assert_eq!(response["task"]["taskId"], serde_json::json!(task_id));
+        // The frozen final wire is the FLAT complete envelope (resultType +
+        // task fields as top-level members), not a nested `task` object —
+        // see the protocol GetTaskResult round-trip fixtures.
+        assert_eq!(response["resultType"], serde_json::json!("complete"));
+        assert_eq!(response["taskId"], serde_json::json!(task_id));
         assert!(
             dispatch_final_tasks_get(
                 &runtime,
@@ -8328,6 +8549,8 @@ mod tests {
             .update_task(&task_id, &ignored_responses)
             .expect("unknown and already-satisfied input keys are acknowledged as a no-op");
 
+        // Task carries no PartialEq; wire-value equality is the semantic
+        // identity for these serialized snapshots.
         assert_eq!(
             serde_json::to_value(
                 &runtime

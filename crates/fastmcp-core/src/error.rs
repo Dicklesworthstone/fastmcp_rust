@@ -160,7 +160,7 @@ impl McpError {
     /// Creates a request cancelled error.
     #[must_use]
     pub fn request_cancelled() -> Self {
-        Self::new(McpErrorCode::RequestCancelled, "Request was cancelled")
+        Self::new(McpErrorCode::RequestCancelled, "Request cancelled")
     }
 
     /// Returns a masked version of this error for client responses.

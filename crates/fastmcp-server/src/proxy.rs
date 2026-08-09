@@ -2927,8 +2927,9 @@ mod tests {
         );
         let notification = ServerNotification::Progress(params.clone());
         assert_eq!(
-            serde_json::to_string(&notification.encode().expect("notification re-encodes"))
-                .expect("notification serializes"),
+            notification
+                .encode_wire()
+                .expect("notification re-encodes byte-exactly"),
             wire,
             "modern proxy notification handling preserves exact progress lexemes"
         );
@@ -2967,12 +2968,9 @@ mod tests {
             "a rejected modern progress frame must not reach the exact callback"
         );
         assert_eq!(
-            serde_json::to_string(
-                &baseline_notification
-                    .encode()
-                    .expect("baseline notification re-encodes"),
-            )
-            .expect("baseline notification serializes"),
+            baseline_notification
+                .encode_wire()
+                .expect("baseline notification re-encodes byte-exactly"),
             baseline,
             "the rejected frame cannot alter the admitted raw-parameter baseline"
         );
@@ -4761,6 +4759,8 @@ exec sleep 2
         let server = thread::spawn(move || {
             let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
             let sse_request = read_http_request(&mut sse);
+            // Only the endpoint line interpolates; the literal JSON events
+            // stay outside format! so their braces need no escaping.
             let body = format!("event: endpoint\ndata: {expected_message_target}\n\n")
                 + concat!(
                     "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
@@ -4864,6 +4864,8 @@ exec sleep 2
         let server = thread::spawn(move || {
             let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
             let sse_request = read_http_request(&mut sse);
+            // Only the endpoint line interpolates; the literal JSON events
+            // stay outside format! so their braces need no escaping.
             let body = format!("event: endpoint\ndata: {expected_message_target}\n\n")
                 + concat!(
                     "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
@@ -4960,17 +4962,15 @@ exec sleep 2
             let server = thread::spawn(move || {
                 let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
                 let sse_request = read_http_request(&mut sse);
-                let mut body = format!("event: endpoint\ndata: {expected_message_target}\n\n");
-                body.push_str(concat!(
-                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
-                ));
-                body.push_str(&format!(
-                    "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{cancellation_request_id}}}}}\n\n"
-                ));
-                body.push_str(concat!(
-                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"active\",\"inputSchema\":{}}]}}\n\n",
-                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[{\"name\":\"follow-up\",\"inputSchema\":{}}]}}\n\n",
-                ));
+                // Interpolating lines are formatted individually (with literal
+                // braces escaped); pure-literal events stay outside format!.
+                let body = format!("event: endpoint\ndata: {expected_message_target}\n\n")
+                    + "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n"
+                    + &format!(
+                        "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{cancellation_request_id}}}}}\n\n"
+                    )
+                    + "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"active\",\"inputSchema\":{}}]}}\n\n"
+                    + "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[{\"name\":\"follow-up\",\"inputSchema\":{}}]}}\n\n";
                 write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
 
                 let mut posts = Vec::new();

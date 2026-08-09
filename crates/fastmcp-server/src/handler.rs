@@ -608,7 +608,7 @@ pub(crate) fn promote_legacy_tool_content(
     ))
 }
 
-const DEFAULT_FINAL_RESOURCE_TTL_MS: u64 = 60 * 60 * 1_000;
+pub(crate) const DEFAULT_FINAL_RESOURCE_TTL_MS: u64 = 60 * 60 * 1_000;
 
 /// Promotes legacy resource contents for a final handler default.
 ///
@@ -2793,8 +2793,12 @@ mod tests {
         )
         .expect("final progress parameters serialize");
         assert!(wire.contains("\"progressToken\":\"final-progress\""));
-        assert!(wire.contains("\"progress\":1e400"));
-        assert!(wire.contains("\"total\":1e400"));
+        // The pinned serde_json normalizes the exponent spelling AT PARSE
+        // ("1e400" -> "1e+400"), before the reporter ever sees the number;
+        // what this test proves is that the beyond-f64 VALUE survives without
+        // an IEEE-754 conversion (which would be "inf"/an error, not 1e+400).
+        assert!(wire.contains("\"progress\":1e+400"));
+        assert!(wire.contains("\"total\":1e+400"));
     }
 
     #[test]

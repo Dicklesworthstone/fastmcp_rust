@@ -133,8 +133,11 @@ fn compute_json_tool(_ctx: &McpContext) -> String {
 
 #[tool(name = "failing", description = "Always fails")]
 fn failing_tool_test(_ctx: &McpContext) -> McpResult<String> {
+    // An application-level error: framework-terminal codes (InternalError,
+    // RequestCancelled) now propagate as JSON-RPC failures instead of
+    // converting to is_error tool content.
     Err(McpError::new(
-        McpErrorCode::InternalError,
+        McpErrorCode::InvalidParams,
         "Something went wrong",
     ))
 }
@@ -228,8 +231,12 @@ fn block_until_cancelled(ctx: &McpContext) -> McpResult<String> {
         started.store(true, Ordering::Release);
     }
     state.barrier.wait();
+    // Sleep between liveness checks: a hot yield_now spin charges the
+    // request's poll quota fast enough to exhaust it before an in-band
+    // cancellation notification can arrive, which turns this fixture into a
+    // budget-death probe instead of a cancellation probe.
     while !ctx.is_cancelled() {
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(1));
     }
     if let Some(completed) = state.completed {
         completed.store(true, Ordering::Release);
@@ -395,7 +402,10 @@ fn request_id_to_u64_none_is_zero() {
 
 #[tool(name = "error_tool", description = "Always returns an error")]
 fn error_tool(_ctx: &McpContext) -> McpResult<String> {
-    Err(McpError::internal_error("Intentional error for testing"))
+    // An application-level error: framework-terminal codes (InternalError,
+    // RequestCancelled) now propagate as JSON-RPC failures instead of
+    // converting to is_error tool content.
+    Err(McpError::invalid_params("Intentional error for testing"))
 }
 
 // ============================================================================
@@ -919,7 +929,9 @@ mod router_tests {
         assert_eq!(access.scheme, "Bearer");
         assert_eq!(access.token, "alpha");
 
-        let params = serde_json::json!({"auth": {"token": "beta"}});
+        // Object credentials must carry an explicit scheme under the strict
+        // fail-closed grammar; a token-only object is malformed, not Bearer.
+        let params = serde_json::json!({"auth": {"scheme": "Bearer", "token": "beta"}});
         let request = AuthRequest {
             method: "tools/list",
             params: Some(&params),
@@ -929,6 +941,18 @@ mod router_tests {
         let access = request.access_token().expect("missing access credential");
         assert_eq!(access.scheme, "Bearer");
         assert_eq!(access.token, "beta");
+
+        let params = serde_json::json!({"auth": {"token": "gamma"}});
+        let request = AuthRequest {
+            method: "tools/list",
+            params: Some(&params),
+            transport_authorization: None,
+            request_id: 12,
+        };
+        assert!(
+            request.access_token().is_none(),
+            "a scheme-less object credential must be refused, not defaulted"
+        );
     }
 
     #[test]
@@ -2382,7 +2406,14 @@ mod router_tests {
         let log = logs.pop().expect("log message");
         assert_eq!(log.level, LogLevel::Info);
         let text = log.data.as_str().expect("log data string");
-        assert!(text.contains("Handled tools/call"));
+        // The handled-notification deliberately reports the sanitized method
+        // key (after its timestamp prefix), never the raw peer-visible
+        // method literal.
+        assert!(text.ends_with(&format!(
+            "Handled method={}",
+            crate::safe_peer_log_key("tools/call")
+        )));
+        assert!(!text.contains("tools/call"));
         info!(
             target: targets::SESSION,
             "e2e log notification {}",
@@ -2543,7 +2574,10 @@ mod router_tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.message.contains("nonexistent"));
+        // The refusal deliberately does not echo the peer-controlled tool
+        // name; only the sanitized method-not-found classification surfaces.
+        assert_eq!(err.code, McpErrorCode::MethodNotFound);
+        assert!(!err.message.contains("nonexistent"));
     }
 
     #[test]
@@ -2685,7 +2719,61 @@ mod router_tests {
 
     #[test]
     fn test_handle_resources_read_template_match_with_slash() {
-        let router = create_test_router();
+        // A simple `{id}` expression cannot span "/" under RFC 6570 matching;
+        // slash-bearing values are reachable through reserved expansion.
+        struct SlashTemplateResource;
+
+        impl ResourceHandler for SlashTemplateResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "resource://{+id}".to_string(),
+                    name: "Slash Template Resource".to_string(),
+                    description: None,
+                    mime_type: Some("text/plain".to_string()),
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(ResourceTemplate {
+                    uri_template: "resource://{+id}".to_string(),
+                    name: "Slash Template Resource".to_string(),
+                    description: None,
+                    mime_type: Some("text/plain".to_string()),
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                })
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Err(McpError::invalid_params(
+                    "uri parameters required for template resource",
+                ))
+            }
+
+            fn read_with_uri(
+                &self,
+                _ctx: &McpContext,
+                uri: &str,
+                params: &UriParams,
+            ) -> McpResult<Vec<ResourceContent>> {
+                let id = params
+                    .get("id")
+                    .ok_or_else(|| McpError::invalid_params("missing uri parameter: id"))?;
+                Ok(vec![ResourceContent {
+                    uri: uri.to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: Some(format!("Template {id}")),
+                    blob: None,
+                }])
+            }
+        }
+
+        let mut router = Router::new();
+        router.add_resource(SlashTemplateResource);
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
 
@@ -5332,7 +5420,7 @@ mod handler_direct_tests {
         let result = tool.call(&ctx, serde_json::json!({}));
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, McpErrorCode::InternalError);
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
     }
 
     #[test]
@@ -7004,7 +7092,15 @@ mod helper_function_tests {
                                 1_i64,
                             ),
                         )),
+                        // Operating requests are refused with -32600 until the
+                        // initialized notification completes the handshake.
                         1 => Ok(JsonRpcMessage::Request(
+                            fastmcp_protocol::JsonRpcRequest::notification(
+                                "notifications/initialized",
+                                None,
+                            ),
+                        )),
+                        2 => Ok(JsonRpcMessage::Request(
                             fastmcp_protocol::JsonRpcRequest::new(
                                 "tools/call",
                                 Some(
@@ -7018,7 +7114,7 @@ mod helper_function_tests {
                                 2_i64,
                             ),
                         )),
-                        2 => {
+                        3 => {
                             let deadline = Instant::now() + Duration::from_secs(2);
                             while !started_for_receive.load(Ordering::Acquire)
                                 && Instant::now() < deadline
@@ -7124,7 +7220,15 @@ mod helper_function_tests {
                                 1_i64,
                             ),
                         )),
+                        // Operating requests are refused with -32600 until the
+                        // initialized notification completes the handshake.
                         1 => Ok(JsonRpcMessage::Request(
+                            fastmcp_protocol::JsonRpcRequest::notification(
+                                "notifications/initialized",
+                                None,
+                            ),
+                        )),
+                        2 => Ok(JsonRpcMessage::Request(
                             fastmcp_protocol::JsonRpcRequest::new(
                                 "tools/call",
                                 Some(
@@ -7138,7 +7242,7 @@ mod helper_function_tests {
                                 2_i64,
                             ),
                         )),
-                        2 => loop {
+                        3 => loop {
                             match outbound_rx.recv_timeout(Duration::from_secs(2)) {
                                 Ok(JsonRpcMessage::Request(request))
                                     if request.method == "sampling/createMessage" =>
@@ -7321,11 +7425,17 @@ mod helper_function_tests {
             .build();
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory);
+        // `dispatch_stateless` is the modern-only public surface; requests
+        // must carry the final protocol marker and client capabilities.
         let request = JsonRpcRequest::new(
             "tools/call",
             Some(serde_json::json!({
                 "name": "greet",
                 "arguments": { "name": "stateless client" },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
             })),
             71_i64,
         );
@@ -7356,7 +7466,16 @@ mod helper_function_tests {
             .build();
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 72, InboundRequestTransport::Memory);
-        let baseline = JsonRpcRequest::new("tools/list", None, 72_i64);
+        let baseline = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            72_i64,
+        );
         let mut planted = baseline.clone();
         planted.method = "logging/setLevel".to_string();
 
@@ -7407,6 +7526,10 @@ mod helper_function_tests {
             Some(serde_json::json!({
                 "name": "declined",
                 "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
             })),
             73_i64,
         );
@@ -7447,6 +7570,10 @@ mod helper_function_tests {
             Some(serde_json::json!({
                 "name": "declined",
                 "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
             })),
             74_i64,
         );
@@ -7509,9 +7636,11 @@ mod helper_function_tests {
         let planted_response = server
             .dispatch_stateless(&inbound, &planted)
             .expect("planted handler request with an id must receive a response");
+        // An unknown tool name is an invalid `name` parameter (-32602) per the
+        // MCP unknown-tool mapping; the method itself exists.
         assert_eq!(
             planted_response.error.as_ref().map(|error| error.code),
-            Some(McpErrorCode::MethodNotFound.into())
+            Some(McpErrorCode::InvalidParams.into())
         );
         assert_eq!(
             serde_json::to_vec(&planted).expect("planted request remains serializable"),

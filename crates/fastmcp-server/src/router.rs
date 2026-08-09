@@ -335,14 +335,17 @@ fn final_mrtr_binding(
     method: &'static str,
     target: String,
     arguments: &impl serde::Serialize,
-) -> McpResult<MrtrExchangeBinding> {
+) -> McpResult<Option<MrtrExchangeBinding>> {
     if target.len() > MAX_MRTR_BINDING_BYTES {
         return Err(McpError::invalid_params("MRTR target exceeds its limit"));
     }
-    let session_partition = request_ctx
-        .session_cache_partition()
-        .map(|(partition, _revision)| partition)
-        .ok_or_else(|| McpError::invalid_params("MRTR retries require session state"))?;
+    // A binding is only consumable where retry state can live. Fresh
+    // dispatches on a session-less context stay valid; the binding is
+    // demanded again at the points that actually need it (retry resolution
+    // and input_required issuance).
+    let Some((session_partition, _revision)) = request_ctx.session_cache_partition() else {
+        return Ok(None);
+    };
     let principal_digest = request_ctx
         .auth()
         .map(|auth| {
@@ -351,13 +354,13 @@ fn final_mrtr_binding(
                 .unwrap_or_else(|| mrtr_digest(&auth))
         })
         .transpose()?;
-    Ok(MrtrExchangeBinding::new(
+    Ok(Some(MrtrExchangeBinding::new(
         method,
         target,
         mrtr_digest(arguments)?,
         session_partition,
         principal_digest,
-    ))
+    )))
 }
 
 fn handler_mrtr_input_requests(result: &InputRequiredResult) -> McpResult<MrtrInputRequests> {
@@ -1218,8 +1221,20 @@ fn run_handler<'a, T>(
             "Request timeout exceeded",
         )),
         Ok(Ok(outcome)) => {
-            if let Some(error) = budget_error(ctx) {
-                Err(error)
+            if budget_error(ctx).is_some() {
+                // A synchronous handler cannot be preempted by timeout_at, so
+                // a late completion surfaces here; deadline expiry keeps its
+                // distinguishable timeout message.
+                if budget
+                    .is_past_deadline(ctx.cx().now())
+                {
+                    Err(McpError::new(
+                        McpErrorCode::RequestCancelled,
+                        "Request timeout exceeded",
+                    ))
+                } else {
+                    Err(McpError::request_cancelled())
+                }
             } else {
                 Ok(outcome)
             }
@@ -2615,15 +2630,30 @@ impl Router {
 
         let join_cx = request_ctx.cx().clone();
         let dispatch_ctx = request_ctx.clone();
-        let mut task = request_ctx
-            .cx()
-            .spawn(move |child_cx| async move {
-                self.dispatch_stateless_in_request(&dispatch_ctx, &child_cx, &request)
-                    .await
-            })
-            .map_err(|_error| {
-                McpError::internal_error("request-owned modern dispatch could not be scheduled")
-            })?;
+        let spawn_self = Arc::clone(&self);
+        let spawn_request = request.clone();
+        let mut task = match request_ctx.cx().spawn(move |child_cx| async move {
+            spawn_self
+                .dispatch_stateless_in_request(&dispatch_ctx, &child_cx, &spawn_request)
+                .await
+        }) {
+            Ok(task) => task,
+            // A context without a spawn gateway (lab/test contexts, plain
+            // synchronous callers) cannot host the request-owned child; the
+            // in-request dispatch on the caller's own Cx preserves the same
+            // cancellation observations without child isolation. Every other
+            // spawn failure (region closed, quota) stays a scheduling error.
+            Err(asupersync::runtime::state::SpawnError::RuntimeUnavailable) => {
+                return self
+                    .dispatch_stateless_in_request(&request_ctx, request_ctx.cx(), &request)
+                    .await;
+            }
+            Err(_error) => {
+                return Err(McpError::internal_error(
+                    "request-owned modern dispatch could not be scheduled",
+                ));
+            }
+        };
 
         match task.join(&join_cx).await {
             Ok(result) => result,
@@ -2703,7 +2733,7 @@ impl Router {
                 let resume_inputs = match self.resolve_final_mrtr_retry(
                     params.request_state.as_deref(),
                     params.input_responses.as_ref(),
-                    &binding,
+                    binding.as_ref(),
                 )? {
                     FinalMrtrDispatch::InputRequired(result) => result,
                     FinalMrtrDispatch::Fresh => {
@@ -2786,7 +2816,7 @@ impl Router {
                 match self.resolve_final_mrtr_retry(
                     params.request_state.as_deref(),
                     params.input_responses.as_ref(),
-                    &binding,
+                    binding.as_ref(),
                 )? {
                     FinalMrtrDispatch::InputRequired(result) => result,
                     FinalMrtrDispatch::Fresh => {
@@ -2845,7 +2875,7 @@ impl Router {
                 match self.resolve_final_mrtr_retry(
                     params.request_state.as_deref(),
                     params.input_responses.as_ref(),
-                    &binding,
+                    binding.as_ref(),
                 )? {
                     FinalMrtrDispatch::InputRequired(result) => result,
                     FinalMrtrDispatch::Fresh => {
@@ -2963,11 +2993,14 @@ impl Router {
         &self,
         request_state: Option<&str>,
         input_responses: Option<&BTreeMap<String, serde_json::Value>>,
-        binding: &MrtrExchangeBinding,
+        binding: Option<&MrtrExchangeBinding>,
     ) -> McpResult<FinalMrtrDispatch> {
         match (request_state, input_responses) {
             (None, None) => Ok(FinalMrtrDispatch::Fresh),
             (Some(request_state), Some(input_responses)) => {
+                let binding = binding.ok_or_else(|| {
+                    McpError::invalid_params("MRTR retries require session state")
+                })?;
                 match self.mrtr_exchanges.accept_wire_bound(
                     request_state,
                     binding,
@@ -2989,7 +3022,7 @@ impl Router {
         request_ctx: &McpContext,
         request_cx: &Cx,
         params: FinalCallToolParams,
-        binding: MrtrExchangeBinding,
+        binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
     ) -> McpResult<serde_json::Value> {
         let request_metadata = params.meta.clone();
@@ -3007,6 +3040,11 @@ impl Router {
         match outcome {
             FinalToolOutcome::Complete(result) => encode_final_tools_call_result(Ok(result)),
             FinalToolOutcome::InputRequired(result) => {
+                let binding = binding.ok_or_else(|| {
+                    McpError::internal_error(
+                        "MRTR input_required requires session state to bind retries",
+                    )
+                })?;
                 self.issue_final_mrtr_input_required(binding, result)
             }
             FinalToolOutcome::CreateTask {
@@ -3031,7 +3069,7 @@ impl Router {
         request_ctx: &McpContext,
         request_cx: &Cx,
         params: FinalReadResourceParams,
-        binding: MrtrExchangeBinding,
+        binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
     ) -> McpResult<serde_json::Value> {
         match self
@@ -3048,6 +3086,11 @@ impl Router {
         {
             FinalMethodOutcome::Complete(result) => encode_final_resources_read_result(Ok(result)),
             FinalMethodOutcome::InputRequired(result) => {
+                let binding = binding.ok_or_else(|| {
+                    McpError::internal_error(
+                        "MRTR input_required requires session state to bind retries",
+                    )
+                })?;
                 self.issue_final_mrtr_input_required(binding, result)
             }
         }
@@ -3058,7 +3101,7 @@ impl Router {
         request_ctx: &McpContext,
         request_cx: &Cx,
         params: FinalGetPromptParams,
-        binding: MrtrExchangeBinding,
+        binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
     ) -> McpResult<serde_json::Value> {
         match self
@@ -3075,6 +3118,11 @@ impl Router {
         {
             FinalMethodOutcome::Complete(result) => encode_final_prompts_get_result(Ok(result)),
             FinalMethodOutcome::InputRequired(result) => {
+                let binding = binding.ok_or_else(|| {
+                    McpError::internal_error(
+                        "MRTR input_required requires session state to bind retries",
+                    )
+                })?;
                 self.issue_final_mrtr_input_required(binding, result)
             }
         }
@@ -3428,9 +3476,22 @@ impl Router {
                     additional: BTreeMap::new(),
                 })
             }
-            Outcome::Cancelled(_) => {
-                // Cancelled requests are reported as JSON-RPC errors
-                Err(McpError::request_cancelled())
+            Outcome::Cancelled(reason) => {
+                // Cancelled requests are reported as JSON-RPC errors; a
+                // deadline-driven cancellation keeps its distinguishable
+                // timeout message rather than collapsing into the generic
+                // cancel report.
+                if matches!(
+                    reason.kind,
+                    asupersync::CancelKind::Timeout | asupersync::CancelKind::Deadline
+                ) {
+                    Err(McpError::new(
+                        McpErrorCode::RequestCancelled,
+                        "Request timeout exceeded",
+                    ))
+                } else {
+                    Err(McpError::request_cancelled())
+                }
             }
             Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "tool")),
         }
@@ -4059,7 +4120,19 @@ impl Router {
             .await?;
 
         match outcome {
-            Outcome::Ok(result) => Ok(result),
+            Outcome::Ok(mut result) => {
+                // The legacy read bridge stamps fixed default cache hints; the
+                // router's configured policy replaces exactly those defaults,
+                // while direct final handlers keep their own explicit hints.
+                if let FinalMethodOutcome::Complete(complete) = &mut result
+                    && complete.payload.ttl_ms == crate::handler::DEFAULT_FINAL_RESOURCE_TTL_MS
+                    && matches!(complete.payload.cache_scope, CacheScope::Private)
+                {
+                    complete.payload.ttl_ms = self.final_cache_hints.resource_read_ttl_ms;
+                    complete.payload.cache_scope = self.final_cache_hints.scope;
+                }
+                Ok(result)
+            }
             Outcome::Err(error) => Err(sanitize_handler_error(request_ctx.cx(), "resource", error)),
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => {
@@ -6085,7 +6158,13 @@ mod router_tests {
                         .send_blocking(request_cx.clone())
                         .expect("the cancellation controller remains available");
                 }
-                let request_ctx = McpContext::new(request_cx, request_context_id);
+                // Modern tools/call computes an MRTR exchange binding, which
+                // requires a session cache partition on the request context.
+                let request_ctx = McpContext::with_state(
+                    request_cx,
+                    request_context_id,
+                    SessionState::new(),
+                );
                 let request = JsonRpcRequest::new(
                     "tools/call",
                     Some(serde_json::json!({
@@ -6317,6 +6396,9 @@ mod router_tests {
     }
 
     static MACRO_DUAL_ERA_TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// Serializes the tests that reset and assert the shared call counter;
+    /// concurrent resets interleave and turn the absolute counts flaky.
+    static MACRO_DUAL_ERA_TOOL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn final_tool_complete_result(
         payload: FinalCallToolResult,
@@ -7613,12 +7695,15 @@ mod router_tests {
             ))
         }
 
-        fn call_async_in_request<'a>(
+        // The modern stateless in-request path consults the disjoint final
+        // outcome hook, not `call_async_in_request`; override the hook the
+        // router actually dispatches through.
+        fn call_final_outcome_async_in_request<'a>(
             &'a self,
             ctx: &'a McpContext,
             request_cx: &'a Cx,
             arguments: serde_json::Value,
-        ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
             Box::pin(async move {
                 let label = arguments
                     .get("request")
@@ -7656,7 +7741,10 @@ mod router_tests {
                     .lock()
                     .expect("completion probe lock is not poisoned")
                     .push(label.clone());
-                Outcome::Ok(vec![Content::text(label)])
+                match crate::handler::promote_legacy_tool_content(vec![Content::text(label)]) {
+                    Ok(result) => Outcome::Ok(FinalToolOutcome::Complete(result)),
+                    Err(error) => Outcome::Err(error),
+                }
             })
         }
     }
@@ -8028,6 +8116,7 @@ mod router_tests {
         }
 
         fn call(&self, ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            eprintln!("WM-BUDGET call entered deadline={:?}", ctx.budget().deadline);
             *self
                 .observed_deadline
                 .lock()
@@ -8919,17 +9008,23 @@ mod router_tests {
             .add_tool_with_behavior(NamedTool::new(canary), crate::DuplicateBehavior::Error)
             .unwrap_err();
 
+        // Resource identities must be scheme-valid to survive final-catalog
+        // projection; the canary stays the peer-controlled URI component.
+        let canary_uri = format!("resource://{canary}");
         let mut resources = Router::new();
-        resources.add_resource(NamedResource::new(canary));
+        resources.add_resource(NamedResource::new(&canary_uri));
         let resource_error = resources
-            .add_resource_with_behavior(NamedResource::new(canary), crate::DuplicateBehavior::Error)
+            .add_resource_with_behavior(
+                NamedResource::new(&canary_uri),
+                crate::DuplicateBehavior::Error,
+            )
             .unwrap_err();
 
         let mut templates = Router::new();
-        templates.add_resource_template(marked_template(canary, "original"));
+        templates.add_resource_template(marked_template(&canary_uri, "original"));
         let template_error = templates
             .add_resource_template_with_behavior(
-                marked_template(canary, "incoming"),
+                marked_template(&canary_uri, "incoming"),
                 crate::DuplicateBehavior::Error,
             )
             .unwrap_err();
@@ -10934,7 +11029,10 @@ mod router_tests {
         let err = r
             .handle_tools_call(&request_ctx, params, state, None, None)
             .unwrap_err();
-        assert!(err.message.contains("missing"));
+        // The refusal deliberately does not echo the peer-controlled tool
+        // name; only the sanitized method-not-found classification surfaces.
+        assert_eq!(err.code, McpErrorCode::MethodNotFound);
+        assert!(!err.message.contains("missing"));
     }
 
     // ── handle_tools_call: zero poll balance without poll admission ──────
@@ -11256,7 +11354,10 @@ mod router_tests {
             .expect_err("alternating recursion must stop at the shared depth limit");
 
         assert_eq!(error.code, McpErrorCode::InternalError);
-        assert!(error.message.contains("Maximum resource read depth"));
+        // Internal errors crossing the handler boundary are sanitized, so the
+        // depth diagnosis never reaches the peer; the call count proves the
+        // shared limit stopped the alternating recursion.
+        assert_eq!(error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
         assert_eq!(calls.load(Ordering::Relaxed), 11);
     }
 
@@ -11343,10 +11444,13 @@ mod router_tests {
         let observed_deadline = Arc::new(Mutex::new(None));
         let timeout_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut router = Router::new();
+        // The timeout must outlive dispatch admission (a too-tight deadline
+        // rejects before the handler starts, proving nothing about read
+        // exposure) while still expiring before the handler's delay finishes.
         router
             .add_tool(BudgetProbeTool {
-                timeout: Some(Duration::from_millis(1)),
-                delay: Duration::from_millis(15),
+                timeout: Some(Duration::from_millis(10)),
+                delay: Duration::from_millis(100),
                 observed_deadline: Arc::clone(&observed_deadline),
                 timeout_read: Arc::clone(&timeout_read),
             })
@@ -12350,6 +12454,9 @@ mod router_tests {
 
     #[test]
     fn macro_tool_dispatches_exact_legacy_and_final_complete_results() {
+        let _counter_guard = MACRO_DUAL_ERA_TOOL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut router = Router::new();
         MACRO_DUAL_ERA_TOOL_CALLS.store(0, Ordering::SeqCst);
         router
@@ -13549,6 +13656,9 @@ mod router_tests {
 
     #[test]
     fn macro_tool_final_metadata_negative_is_non_mutating() {
+        let _counter_guard = MACRO_DUAL_ERA_TOOL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut router = Router::new();
         MACRO_DUAL_ERA_TOOL_CALLS.store(0, Ordering::SeqCst);
         router
@@ -15362,7 +15472,14 @@ mod router_tests {
                 .recv(&observer_cx)
                 .await
                 .expect("the request owner exposes its cancellation context");
+            // Bounded so a dispatch rejection fails the test loudly instead of
+            // spinning this observer loop forever.
+            let admission_deadline = std::time::Instant::now() + Duration::from_secs(10);
             while started.load(Ordering::SeqCst) < 2 {
+                assert!(
+                    std::time::Instant::now() < admission_deadline,
+                    "both owned modern requests must start before the admission deadline"
+                );
                 yield_once().await;
             }
             cancelled_cx.cancel_with(CancelKind::User, Some("test single-request cancellation"));
