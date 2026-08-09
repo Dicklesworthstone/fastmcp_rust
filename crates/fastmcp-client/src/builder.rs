@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult, block_on};
@@ -45,6 +45,80 @@ use crate::{
     combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
 };
 
+/// The maximum number of connection attempts admitted by the client retry policy.
+const MAX_CONNECTION_ATTEMPTS: u32 = 8;
+/// The maximum delay before one connection retry.
+const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// The maximum elapsed time for the entire connection retry operation.
+const MAX_CONNECTION_RETRY_ELAPSED: Duration = Duration::from_secs(120);
+/// The elapsed cap used by the legacy retry-count and millisecond-delay setters.
+const DEFAULT_CONNECTION_RETRY_ELAPSED: Duration = Duration::from_secs(120);
+/// Bounded timer slice used to observe a caller-owned context while waiting.
+const CONNECTION_RETRY_CANCEL_SLICE: Duration = Duration::from_millis(25);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConnectionRetryPolicy {
+    max_attempts: u32,
+    retry_delay: Duration,
+    total_elapsed: Duration,
+}
+
+impl ConnectionRetryPolicy {
+    fn new(max_attempts: u32, retry_delay: Duration, total_elapsed: Duration) -> McpResult<Self> {
+        if max_attempts == 0 {
+            return Err(McpError::invalid_params(
+                "Connection retry policy requires at least one attempt",
+            ));
+        }
+        if max_attempts > MAX_CONNECTION_ATTEMPTS {
+            return Err(McpError::invalid_params(format!(
+                "Connection retry attempts must not exceed {MAX_CONNECTION_ATTEMPTS}",
+            )));
+        }
+        if retry_delay > MAX_CONNECTION_RETRY_DELAY {
+            return Err(McpError::invalid_params(format!(
+                "Connection retry delay must not exceed {} seconds",
+                MAX_CONNECTION_RETRY_DELAY.as_secs(),
+            )));
+        }
+        if total_elapsed.is_zero() || total_elapsed > MAX_CONNECTION_RETRY_ELAPSED {
+            return Err(McpError::invalid_params(format!(
+                "Connection retry elapsed limit must be between 1ns and {} seconds",
+                MAX_CONNECTION_RETRY_ELAPSED.as_secs(),
+            )));
+        }
+
+        let retry_count = max_attempts.checked_sub(1).ok_or_else(|| {
+            McpError::invalid_params("Connection retry attempt count underflowed")
+        })?;
+        let scheduled_delay = retry_delay.checked_mul(retry_count).ok_or_else(|| {
+            McpError::invalid_params("Connection retry delays overflow the duration range")
+        })?;
+        if scheduled_delay > total_elapsed {
+            return Err(McpError::invalid_params(
+                "Connection retry delays exceed the total elapsed limit",
+            ));
+        }
+
+        Ok(Self {
+            max_attempts,
+            retry_delay,
+            total_elapsed,
+        })
+    }
+
+    fn from_legacy(max_retries: u32, retry_delay_ms: u64) -> McpResult<Self> {
+        let max_attempts = max_retries.checked_add(1).ok_or_else(|| {
+            McpError::invalid_params("Connection retry count exceeds the attempt range")
+        })?;
+        Self::new(
+            max_attempts,
+            Duration::from_millis(retry_delay_ms),
+            DEFAULT_CONNECTION_RETRY_ELAPSED,
+        )
+    }
+}
+
 /// Builder for configuring an MCP client.
 ///
 /// Use this to configure timeout, retry, and spawn options before
@@ -59,6 +133,8 @@ pub struct ClientBuilder {
     max_retries: u32,
     /// Delay between retries in milliseconds.
     retry_delay_ms: u64,
+    /// Explicit validated retry policy, if one supersedes legacy retry settings.
+    retry_policy: Option<ConnectionRetryPolicy>,
     /// Working directory for subprocess.
     working_dir: Option<PathBuf>,
     /// Environment variables to set for subprocess.
@@ -83,6 +159,7 @@ impl std::fmt::Debug for ClientBuilder {
             .field("timeout_policy", &self.timeout_policy)
             .field("max_retries", &self.max_retries)
             .field("retry_delay_ms", &self.retry_delay_ms)
+            .field("retry_policy", &self.retry_policy)
             .field("working_dir_set", &self.working_dir.is_some())
             .field("env_var_count", &self.env_vars.len())
             .field("inherit_env", &self.inherit_env)
@@ -122,6 +199,7 @@ impl ClientBuilder {
             timeout_policy: RequestTimeoutPolicy::default(),
             max_retries: 0,
             retry_delay_ms: 1_000,
+            retry_policy: None,
             working_dir: None,
             env_vars: HashMap::new(),
             inherit_env: true,
@@ -171,6 +249,7 @@ impl ClientBuilder {
     #[must_use]
     pub fn max_retries(mut self, retries: u32) -> Self {
         self.max_retries = retries;
+        self.retry_policy = None;
         self
     }
 
@@ -180,7 +259,34 @@ impl ClientBuilder {
     #[must_use]
     pub fn retry_delay_ms(mut self, delay: u64) -> Self {
         self.retry_delay_ms = delay;
+        self.retry_policy = None;
         self
+    }
+
+    /// Sets a validated bounded policy for connection retries.
+    ///
+    /// `max_attempts` includes the initial attempt, so one attempt preserves
+    /// the default zero-retry behavior. The policy rejects values above the
+    /// connection safety caps and delay schedules that exceed `total_elapsed`.
+    pub fn connection_retry_policy(
+        mut self,
+        max_attempts: u32,
+        retry_delay: Duration,
+        total_elapsed: Duration,
+    ) -> McpResult<Self> {
+        self.retry_policy = Some(ConnectionRetryPolicy::new(
+            max_attempts,
+            retry_delay,
+            total_elapsed,
+        )?);
+        Ok(self)
+    }
+
+    fn effective_connection_retry_policy(&self) -> McpResult<ConnectionRetryPolicy> {
+        match self.retry_policy {
+            Some(policy) => Ok(policy),
+            None => ConnectionRetryPolicy::from_legacy(self.max_retries, self.retry_delay_ms),
+        }
     }
 
     /// Sets the working directory for the subprocess.
@@ -417,36 +523,46 @@ impl ClientBuilder {
         // auto-initialize must never return a live client that cannot issue its
         // first protocol request.
         self.timeout_policy.validate()?;
+        let retry_policy = self.effective_connection_retry_policy()?;
+        let retry_deadline = Instant::now()
+            .checked_add(retry_policy.total_elapsed)
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Connection retry elapsed limit exceeds the monotonic clock range",
+                )
+            })?;
         let mut last_error = None;
-        // Compute attempts in u64 to avoid overflow when max_retries == u32::MAX.
-        let attempts = u64::from(self.max_retries) + 1;
 
-        for attempt in 0..attempts {
+        for attempt in 0..retry_policy.max_attempts {
             // Honor cancellation/budget before each attempt.
             if cx.checkpoint().is_err() {
                 return Err(McpError::request_cancelled());
             }
-
-            if attempt > 0 {
-                // Delay before retry while still observing cancellation.
-                // Slice sleeps so cancellation is detected promptly even for long delays.
-                let mut remaining_ms = self.retry_delay_ms;
-                while remaining_ms > 0 {
-                    if cx.checkpoint().is_err() {
-                        return Err(McpError::request_cancelled());
-                    }
-
-                    let sleep_ms = remaining_ms.min(25);
-                    std::thread::sleep(Duration::from_millis(sleep_ms));
-                    remaining_ms = remaining_ms.saturating_sub(sleep_ms);
-                }
+            if Instant::now() >= retry_deadline {
+                return Err(Self::connection_retry_elapsed_error());
             }
 
-            match self.try_connect(command, args, cx) {
-                Ok(client) => return Ok(client),
+            if attempt > 0 {
+                Self::wait_for_connection_retry(cx, retry_policy.retry_delay, retry_deadline)?;
+            }
+
+            match self.try_connect(command, args, cx, retry_deadline) {
+                Ok(mut client) => {
+                    if Instant::now() >= retry_deadline {
+                        let cleanup = client.close();
+                        return combine_operation_with_cleanup(
+                            Err(Self::connection_retry_elapsed_error()),
+                            || cleanup,
+                        );
+                    }
+                    return Ok(client);
+                }
                 Err(error) if is_cleanup_unverified(&error) => return Err(error),
                 Err(e) => {
                     last_error = Some(e);
+                    if Instant::now() >= retry_deadline {
+                        return Err(Self::connection_retry_elapsed_error());
+                    }
                 }
             }
         }
@@ -455,8 +571,65 @@ impl ClientBuilder {
         Err(last_error.unwrap_or_else(|| McpError::internal_error("Connection failed")))
     }
 
+    fn connection_retry_elapsed_error() -> McpError {
+        McpError::internal_error("Connection retry elapsed limit exceeded")
+    }
+
+    fn wait_for_connection_retry(
+        cx: &Cx,
+        retry_delay: Duration,
+        retry_deadline: Instant,
+    ) -> McpResult<()> {
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+
+        let delay_deadline = Instant::now().checked_add(retry_delay).ok_or_else(|| {
+            McpError::invalid_params("Connection retry delay exceeds the monotonic clock range")
+        })?;
+        loop {
+            if cx.checkpoint().is_err() {
+                return Err(McpError::request_cancelled());
+            }
+
+            let now = Instant::now();
+            if now >= retry_deadline {
+                return Err(Self::connection_retry_elapsed_error());
+            }
+            if now >= delay_deadline {
+                return Ok(());
+            }
+
+            let mut sleep_for = delay_deadline
+                .saturating_duration_since(now)
+                .min(retry_deadline.saturating_duration_since(now))
+                .min(CONNECTION_RETRY_CANCEL_SLICE);
+            if let Some(remaining_budget) = cx.budget().remaining_time(cx.now()) {
+                sleep_for = sleep_for.min(remaining_budget);
+            }
+            if sleep_for.is_zero() {
+                if cx.checkpoint().is_err() {
+                    return Err(McpError::request_cancelled());
+                }
+                return Err(Self::connection_retry_elapsed_error());
+            }
+
+            // This caller-owned timer is deliberately sliced so cancellation
+            // and deadline checkpoints remain observable during a retry wait.
+            block_on(async {
+                asupersync::time::sleep(cx.now(), sleep_for).await;
+            });
+        }
+    }
+
     /// Attempts a single connection.
-    fn try_connect(&self, command: &str, args: &[&str], cx: &Cx) -> McpResult<Client> {
+    fn try_connect(
+        &self,
+        command: &str,
+        args: &[&str],
+        cx: &Cx,
+        retry_deadline: Instant,
+    ) -> McpResult<Client> {
         match self.protocol_plan.policy() {
             ProtocolPolicy::ModernOnly | ProtocolPolicy::LegacyOnly => self
                 .try_connect_with_protocol_plan(
@@ -465,8 +638,9 @@ impl ClientBuilder {
                     cx,
                     self.protocol_plan.clone(),
                     self.auto_initialize,
+                    retry_deadline,
                 ),
-            ProtocolPolicy::Auto => self.try_connect_auto(command, args, cx),
+            ProtocolPolicy::Auto => self.try_connect_auto(command, args, cx, retry_deadline),
         }
     }
 
@@ -475,9 +649,22 @@ impl ClientBuilder {
     /// A stdio peer has one opening-frame classification, so the modern probe
     /// can never be reused for exact legacy initialization. Only the
     /// recognized JSON-RPC discovery refusal authorizes a second spawn.
-    fn try_connect_auto(&self, command: &str, args: &[&str], cx: &Cx) -> McpResult<Client> {
+    fn try_connect_auto(
+        &self,
+        command: &str,
+        args: &[&str],
+        cx: &Cx,
+        retry_deadline: Instant,
+    ) -> McpResult<Client> {
         let modern_plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
-        match self.try_connect_with_protocol_plan(command, args, cx, modern_plan, false) {
+        match self.try_connect_with_protocol_plan(
+            command,
+            args,
+            cx,
+            modern_plan,
+            false,
+            retry_deadline,
+        ) {
             Ok(mut client) => {
                 client.set_protocol_plan_after_selection(self.protocol_plan.clone());
                 Ok(client)
@@ -489,9 +676,18 @@ impl ClientBuilder {
                 if cx.checkpoint().is_err() {
                     return Err(McpError::request_cancelled());
                 }
+                if Instant::now() >= retry_deadline {
+                    return Err(Self::connection_retry_elapsed_error());
+                }
                 let legacy_plan = ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly);
-                let mut client =
-                    self.try_connect_with_protocol_plan(command, args, cx, legacy_plan, false)?;
+                let mut client = self.try_connect_with_protocol_plan(
+                    command,
+                    args,
+                    cx,
+                    legacy_plan,
+                    false,
+                    retry_deadline,
+                )?;
                 client.set_protocol_plan_after_selection(self.protocol_plan.clone());
                 Ok(client)
             }
@@ -507,6 +703,7 @@ impl ClientBuilder {
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
         defer_initialization: bool,
+        retry_deadline: Instant,
     ) -> McpResult<Client> {
         // Build the command
         let executable = resolve_stdio_command(command, self.working_dir.as_deref())?;
@@ -527,6 +724,11 @@ impl ClientBuilder {
         }
         for (key, value) in &self.env_vars {
             cmd.env(key, value);
+        }
+        // Command setup may consume the retry budget; never create a child
+        // once the post-delay retry deadline has expired.
+        if Instant::now() >= retry_deadline {
+            return Err(Self::connection_retry_elapsed_error());
         }
         // Spawn the subprocess
         let child = match cmd.spawn() {
@@ -549,6 +751,16 @@ impl ClientBuilder {
         if let Err(error) = child_guard.verify_group_anchor() {
             return combine_operation_with_cleanup(Err(error), || child_guard.cleanup());
         }
+        let initialization_policy = if defer_initialization {
+            None
+        } else {
+            match self.initialize_timeout_policy_for_retry_deadline(retry_deadline) {
+                Ok(policy) => Some(policy),
+                Err(error) => {
+                    return combine_operation_with_cleanup(Err(error), || child_guard.cleanup());
+                }
+            }
+        };
 
         // Get stdin/stdout handles
         let stdin = match child_guard.child_mut().stdin.take() {
@@ -583,6 +795,7 @@ impl ClientBuilder {
                 transport,
                 cx,
                 protocol_plan,
+                self.timeout_policy,
             ))
         } else {
             self.initialize_client(
@@ -592,8 +805,29 @@ impl ClientBuilder {
                 transport,
                 cx,
                 protocol_plan,
+                initialization_policy.expect("initialized connection has a retry timeout policy"),
+                retry_deadline,
             )
         }
+    }
+
+    fn initialize_timeout_policy_for_retry_deadline(
+        &self,
+        retry_deadline: Instant,
+    ) -> McpResult<RequestTimeoutPolicy> {
+        let remaining = retry_deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| *remaining >= Duration::from_millis(1))
+            .ok_or_else(Self::connection_retry_elapsed_error)?;
+        RequestTimeoutPolicy::new(
+            self.timeout_policy.idle_timeout().min(remaining),
+            self.timeout_policy.absolute_timeout().min(remaining),
+        )
+        .map(|policy| {
+            policy.reset_idle_on_matching_progress(
+                self.timeout_policy.resets_idle_on_matching_progress(),
+            )
+        })
     }
 
     fn prepare_stdio_command(
@@ -632,6 +866,7 @@ impl ClientBuilder {
         transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
+        timeout_policy: RequestTimeoutPolicy,
     ) -> Client {
         // Create a placeholder session - will be updated on first use
         let session = ClientSession::new_placeholder(
@@ -653,7 +888,7 @@ impl ClientBuilder {
             transport,
             cx.clone(),
             session,
-            self.timeout_policy,
+            timeout_policy,
         )
     }
 
@@ -666,6 +901,8 @@ impl ClientBuilder {
         transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
+        timeout_policy: RequestTimeoutPolicy,
+        retry_deadline: Instant,
     ) -> McpResult<Client> {
         let mut client = self.create_uninitialized_client(
             child,
@@ -674,10 +911,18 @@ impl ClientBuilder {
             transport,
             cx,
             protocol_plan,
+            timeout_policy,
         );
         if let Err(error) = client.ensure_initialized() {
             let cleanup = client.close();
             return combine_operation_with_cleanup(Err(error), || cleanup);
+        }
+        if Instant::now() >= retry_deadline {
+            let cleanup = client.close();
+            return combine_operation_with_cleanup(
+                Err(Self::connection_retry_elapsed_error()),
+                || cleanup,
+            );
         }
         Ok(client)
     }
@@ -740,6 +985,7 @@ mod tests {
         assert_eq!(builder.timeout_policy, RequestTimeoutPolicy::default());
         assert_eq!(builder.max_retries, 0);
         assert_eq!(builder.retry_delay_ms, 1_000);
+        assert!(builder.retry_policy.is_none());
         assert!(builder.inherit_env);
         assert!(builder.working_dir.is_none());
         assert!(builder.env_vars.is_empty());
@@ -895,7 +1141,61 @@ mod tests {
     }
 
     #[test]
-    fn test_connect_stdio_with_cx_max_retries_does_not_overflow() {
+    fn connection_retry_policy_accepts_hard_boundaries_and_preserves_zero_retries() {
+        let policy = ConnectionRetryPolicy::new(
+            MAX_CONNECTION_ATTEMPTS,
+            Duration::ZERO,
+            MAX_CONNECTION_RETRY_ELAPSED,
+        )
+        .expect("hard retry policy boundaries are valid");
+        assert_eq!(policy.max_attempts, MAX_CONNECTION_ATTEMPTS);
+        assert_eq!(policy.retry_delay, Duration::ZERO);
+        assert_eq!(policy.total_elapsed, MAX_CONNECTION_RETRY_ELAPSED);
+
+        let maximum_delay_policy =
+            ConnectionRetryPolicy::new(2, MAX_CONNECTION_RETRY_DELAY, MAX_CONNECTION_RETRY_ELAPSED)
+                .expect("maximum per-retry delay fits the maximum elapsed limit");
+        assert_eq!(maximum_delay_policy.retry_delay, MAX_CONNECTION_RETRY_DELAY);
+        assert_eq!(
+            maximum_delay_policy.total_elapsed,
+            MAX_CONNECTION_RETRY_ELAPSED
+        );
+
+        let default_policy = ClientBuilder::new()
+            .effective_connection_retry_policy()
+            .expect("default retry policy is valid");
+        assert_eq!(default_policy.max_attempts, 1);
+        assert_eq!(default_policy.retry_delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn connection_retry_policy_rejects_one_field_attempt_count_above_hard_cap() {
+        let error = ClientBuilder::new()
+            .connection_retry_policy(
+                MAX_CONNECTION_ATTEMPTS + 1,
+                Duration::ZERO,
+                MAX_CONNECTION_RETRY_ELAPSED,
+            )
+            .expect_err("only the attempt count differs from the hard-boundary policy");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn connection_retry_wait_rejects_pre_cancelled_context() {
+        let cx = Cx::for_request();
+        cx.set_cancel_requested(true);
+        let retry_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("short retry deadline fits the monotonic clock");
+
+        let error =
+            ClientBuilder::wait_for_connection_retry(&cx, Duration::from_millis(1), retry_deadline)
+                .expect_err("a cancelled context must not begin a retry wait");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[test]
+    fn connect_stdio_with_cx_rejects_legacy_retry_count_above_hard_limit() {
         let cx = Cx::for_request();
         cx.set_cancel_requested(true);
 
@@ -906,10 +1206,10 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "cancelled context should return an error, not panic from retry overflow"
+            "invalid retry configuration should return an error without attempting a connection"
         );
         let err = result.err().expect("error result");
-        assert_eq!(err.code, McpErrorCode::RequestCancelled);
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
     }
 
     #[test]
@@ -990,6 +1290,29 @@ mod tests {
             Some(serde_json::json!({"timeoutSource": "idle"}))
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connection_retry_elapsed_cap_terminates_slow_initialization() {
+        let started = Instant::now();
+        let builder = ClientBuilder::new()
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(30), Duration::from_secs(30))
+                    .expect("ordinary initialization policy is valid"),
+            )
+            .connection_retry_policy(1, Duration::ZERO, Duration::from_millis(25))
+            .expect("bounded retry policy is valid");
+
+        let error = match builder.connect_stdio("sh", &["-c", "exec sleep 5"]) {
+            Ok(mut client) => {
+                let _ = client.close();
+                panic!("slow initialization must not outlive the retry elapsed cap");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.message, "Connection retry elapsed limit exceeded");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(unix)]
