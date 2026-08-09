@@ -22,7 +22,7 @@ use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::reactor::create_reactor;
 use fastmcp_rust::{
     CanonicalHttpUrl, ClientHttpResponse, ClientProtocolPlan, Cx, JsonRpcMessage, JsonRpcRequest,
-    McpContext, McpResult, Middleware, MiddlewareDecision, ModernHttpResponseKind,
+    McpContext, McpError, McpResult, Middleware, MiddlewareDecision, ModernHttpResponseKind,
     ModernHttpResponseStream, ProtocolEra, ProtocolPolicy, Server, SseLimits, auto,
 };
 use serde_json::json;
@@ -250,7 +250,7 @@ impl HttpServerFixture {
             });
         }));
 
-        let startup = HttpServerStartupGuard {
+        let mut startup = HttpServerStartupGuard {
             shutdown: Some(shutdown_tx),
             finished: Some(finished_rx),
             join,
@@ -908,7 +908,9 @@ fn e2e_public_http_auto_falls_back_to_exact_legacy_on_live_eligible_refusal() {
 #[test]
 fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
     let gate = Arc::new(OverlapFinalMethodGate::default());
-    let mut server = HttpServerFixture::spawn_with_middleware(Some(Arc::clone(&gate)));
+    let mut server = HttpServerFixture::spawn_with_middleware(Some(
+        Arc::clone(&gate) as Arc<dyn Middleware>
+    ));
     let address = server.address();
 
     let (completed_tx, completed_rx) = mpsc::channel();
