@@ -19,8 +19,14 @@ use fastmcp_protocol::{
 };
 use log::{Level, LevelFilter};
 
-use crate::handler::CompletionHandler;
-use crate::proxy::{ProxyPromptHandler, ProxyResourceHandler, ProxyToolHandler};
+use crate::handler::{
+    CompletionHandler, FinalProxyPromptHandler, FinalProxyResourceHandler,
+    FinalProxyResourceTemplateHandler,
+};
+use crate::proxy::{
+    ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog, ProxyResourceHandler,
+    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler, ProxyTypedCatalog,
+};
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
 use crate::{
@@ -580,6 +586,24 @@ impl ServerBuilder {
         self
     }
 
+    /// Registers an intentionally exact MCP 2024-11-05-only resource.
+    #[must_use]
+    pub fn legacy_resource<H: ResourceHandler + 'static>(mut self, handler: H) -> Self {
+        if let Err(error) = self
+            .router
+            .add_legacy_resource_with_behavior(handler, self.on_duplicate)
+        {
+            log::error!(
+                target: "fastmcp_rust::builder",
+                "Failed to register exact-2024-only resource; code={:?}",
+                error.code
+            );
+        } else {
+            self.capabilities.resources = Some(ResourcesCapability::default());
+        }
+        self
+    }
+
     /// Registers a resource template.
     ///
     /// Duplicate handling is controlled by [`on_duplicate`](Self::on_duplicate).
@@ -594,6 +618,24 @@ impl ServerBuilder {
             log::error!(
                 target: "fastmcp_rust::builder",
                 "Failed to register resource template; code={:?}",
+                error.code
+            );
+        } else {
+            self.capabilities.resources = Some(ResourcesCapability::default());
+        }
+        self
+    }
+
+    /// Registers an intentionally exact MCP 2024-11-05-only resource template.
+    #[must_use]
+    pub fn legacy_resource_template(mut self, template: ResourceTemplate) -> Self {
+        if let Err(error) = self
+            .router
+            .add_legacy_resource_template_with_behavior(template, self.on_duplicate)
+        {
+            log::error!(
+                target: "fastmcp_rust::builder",
+                "Failed to register exact-2024-only resource template; code={:?}",
                 error.code
             );
         } else {
@@ -624,6 +666,24 @@ impl ServerBuilder {
         self
     }
 
+    /// Registers an intentionally exact MCP 2024-11-05-only prompt.
+    #[must_use]
+    pub fn legacy_prompt<H: PromptHandler + 'static>(mut self, handler: H) -> Self {
+        if let Err(error) = self
+            .router
+            .add_legacy_prompt_with_behavior(handler, self.on_duplicate)
+        {
+            log::error!(
+                target: "fastmcp_rust::builder",
+                "Failed to register exact-2024-only prompt; code={:?}",
+                error.code
+            );
+        } else {
+            self.capabilities.prompts = Some(PromptsCapability::default());
+        }
+        self
+    }
+
     /// Registers the server-wide `completion/complete` handler.
     ///
     /// The handler receives disjoint exact-legacy and final request parameter
@@ -633,6 +693,16 @@ impl ServerBuilder {
     #[must_use]
     pub fn completion_handler<H: CompletionHandler + 'static>(mut self, handler: H) -> Self {
         self.router.add_completion_handler(handler);
+        self
+    }
+
+    /// Registers a completion handler for exact MCP 2024-11-05 dispatch only.
+    ///
+    /// The handler remains available to legacy `completion/complete`, but is
+    /// neither advertised nor reachable through a final connection.
+    #[must_use]
+    pub fn legacy_completion_handler<H: CompletionHandler + 'static>(mut self, handler: H) -> Self {
+        self.router.add_legacy_completion_handler(handler);
         self
     }
 
@@ -653,7 +723,7 @@ impl ServerBuilder {
 
         // Preserve the existing legacy capability behavior. Exact-final tools
         // contribute only after immutable final registration succeeds.
-        let mut has_tools = !catalog.tools.is_empty();
+        let has_tools = !catalog.tools.is_empty();
         let has_resources = !catalog.resources.is_empty() || !catalog.resource_templates.is_empty();
         let has_prompts = !catalog.prompts.is_empty();
         let final_handlers = match catalog.final_tool_handlers(client.clone()) {
@@ -684,9 +754,9 @@ impl ServerBuilder {
         for handler in final_handlers {
             match self
                 .router
-                .add_tool_with_behavior(handler, self.on_duplicate)
+                .add_final_tool_with_behavior(handler, self.on_duplicate)
             {
-                Ok(()) => has_tools = true,
+                Ok(()) => {}
                 Err(error) => log::error!(
                     target: "fastmcp_rust::builder",
                     "Failed to register exact-final proxied tool; code={:?}",
@@ -729,6 +799,45 @@ impl ServerBuilder {
                 log::error!(
                     target: "fastmcp_rust::builder",
                     "Failed to register proxied prompt; code={:?}",
+                    error.code
+                );
+            }
+        }
+
+        for resource in catalog.final_resources {
+            if let Err(error) = self.router.add_final_resource_with_behavior(
+                FinalProxyResourceHandler::new(resource, client.clone()),
+                self.on_duplicate,
+            ) {
+                log::error!(
+                    target: "fastmcp_rust::builder",
+                    "Failed to register exact-final proxied resource; code={:?}",
+                    error.code
+                );
+            }
+        }
+
+        for template in catalog.final_resource_templates {
+            if let Err(error) = self.router.add_final_resource_with_behavior(
+                FinalProxyResourceTemplateHandler::new(template, client.clone()),
+                self.on_duplicate,
+            ) {
+                log::error!(
+                    target: "fastmcp_rust::builder",
+                    "Failed to register exact-final proxied resource template; code={:?}",
+                    error.code
+                );
+            }
+        }
+
+        for prompt in catalog.final_prompts {
+            if let Err(error) = self.router.add_final_prompt_with_behavior(
+                FinalProxyPromptHandler::new(prompt, client.clone()),
+                self.on_duplicate,
+            ) {
+                log::error!(
+                    target: "fastmcp_rust::builder",
+                    "Failed to register exact-final proxied prompt; code={:?}",
                     error.code
                 );
             }
@@ -781,85 +890,87 @@ impl ServerBuilder {
         prefix: &str,
         client: fastmcp_client::Client,
     ) -> Result<Self, fastmcp_core::McpError> {
-        // Create proxy client and fetch catalog
         let proxy_client = ProxyClient::from_client(client);
-        let catalog = proxy_client.catalog()?;
-
-        // Capture counts before consuming
-        let tool_count = catalog.tools.len() + catalog.final_tools.len();
-        let resource_count = catalog.resources.len();
-        let template_count = catalog.resource_templates.len();
-        let prompt_count = catalog.prompts.len();
+        let catalog = proxy_client.catalog_typed()?;
+        let (tool_count, resource_count, template_count, prompt_count) = match catalog {
+            ProxyTypedCatalog {
+                tools: ProxyToolCatalog::Legacy(tools),
+                resources: ProxyResourceCatalog::Legacy(resources),
+                resource_templates: ProxyResourceTemplateCatalog::Legacy(resource_templates),
+                prompts: ProxyPromptCatalog::Legacy(prompts),
+            } => {
+                let counts = (
+                    tools.len(),
+                    resources.len(),
+                    resource_templates.len(),
+                    prompts.len(),
+                );
+                for tool in tools {
+                    self.router.add_tool_with_behavior(
+                        ProxyToolHandler::with_prefix(tool, prefix, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+                for resource in resources {
+                    self.router.add_resource_with_behavior(
+                        ProxyResourceHandler::with_prefix(resource, prefix, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+                for template in resource_templates {
+                    self.router.add_resource_with_behavior(
+                        ProxyResourceHandler::from_template_with_prefix(
+                            template,
+                            prefix,
+                            proxy_client.clone(),
+                        ),
+                        self.on_duplicate,
+                    )?;
+                }
+                for prompt in prompts {
+                    self.router.add_prompt_with_behavior(
+                        ProxyPromptHandler::with_prefix(prompt, prefix, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+                counts
+            }
+            ProxyTypedCatalog {
+                tools: ProxyToolCatalog::Final(tools),
+                resources: ProxyResourceCatalog::Final(resources),
+                resource_templates: ProxyResourceTemplateCatalog::Final(resource_templates),
+                prompts: ProxyPromptCatalog::Final(prompts),
+            } => {
+                if !resources.is_empty() || !resource_templates.is_empty() {
+                    return Err(fastmcp_core::McpError::invalid_request(
+                        "a prefixed proxy cannot preserve exact-final resource URIs; use as_proxy_raw",
+                    ));
+                }
+                let counts = (tools.len(), 0, 0, prompts.len());
+                for tool in tools {
+                    self.router.add_final_tool_with_behavior(
+                        ProxyToolHandler::with_prefix_final(tool, prefix, proxy_client.clone())?,
+                        self.on_duplicate,
+                    )?;
+                }
+                for prompt in prompts {
+                    self.router.add_final_prompt_with_behavior(
+                        FinalProxyPromptHandler::with_prefix(prompt, prefix, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+                counts
+            }
+            _ => {
+                return Err(fastmcp_core::McpError::invalid_request(
+                    "proxy typed catalog mixes legacy and final component vectors",
+                ));
+            }
+        };
 
         let has_tools = tool_count > 0;
         let has_resources = resource_count > 0 || template_count > 0;
         let has_prompts = prompt_count > 0;
-
-        // Register tools with prefix
-        for tool in catalog.tools {
-            log::debug!(
-                target: "fastmcp_rust::proxy",
-                "Registering proxied tool with configured prefix"
-            );
-            self.router.add_tool_with_behavior(
-                ProxyToolHandler::with_prefix(tool, prefix, proxy_client.clone()),
-                self.on_duplicate,
-            )?;
-        }
-
-        // Register final tools with the exact catalog definition. Prefixing
-        // changes only the exposed name; the handler retains the original
-        // upstream name for forwarding.
-        for tool in catalog.final_tools {
-            log::debug!(
-                target: "fastmcp_rust::proxy",
-                "Registering exact-final proxied tool with configured prefix"
-            );
-            self.router.add_tool_with_behavior(
-                ProxyToolHandler::with_prefix_final(tool, prefix, proxy_client.clone())?,
-                self.on_duplicate,
-            )?;
-        }
-
-        // Register resources with prefix
-        for resource in catalog.resources {
-            log::debug!(
-                target: "fastmcp_rust::proxy",
-                "Registering proxied resource with configured prefix"
-            );
-            self.router.add_resource_with_behavior(
-                ProxyResourceHandler::with_prefix(resource, prefix, proxy_client.clone()),
-                self.on_duplicate,
-            )?;
-        }
-
-        // Register resource templates with prefix
-        for template in catalog.resource_templates {
-            log::debug!(
-                target: "fastmcp_rust::proxy",
-                "Registering proxied resource template with configured prefix"
-            );
-            self.router.add_resource_with_behavior(
-                ProxyResourceHandler::from_template_with_prefix(
-                    template,
-                    prefix,
-                    proxy_client.clone(),
-                ),
-                self.on_duplicate,
-            )?;
-        }
-
-        // Register prompts with prefix
-        for prompt in catalog.prompts {
-            log::debug!(
-                target: "fastmcp_rust::proxy",
-                "Registering proxied prompt with configured prefix"
-            );
-            self.router.add_prompt_with_behavior(
-                ProxyPromptHandler::with_prefix(prompt, prefix, proxy_client.clone()),
-                self.on_duplicate,
-            )?;
-        }
 
         // Update capabilities
         if has_tools {
@@ -909,68 +1020,123 @@ impl ServerBuilder {
         self.as_proxy_raw_with_proxy_client(ProxyClient::from_client(client))
     }
 
+    /// Registers one already-negotiated, typed upstream catalog without any
+    /// legacy projection. Final components are visible only to final routes;
+    /// legacy components remain visible only to exact MCP 2024-11-05 routes.
+    pub fn proxy_typed(
+        self,
+        proxy_client: ProxyClient,
+        catalog: ProxyTypedCatalog,
+    ) -> Result<Self, fastmcp_core::McpError> {
+        self.register_raw_typed_proxy_catalog(proxy_client, catalog)
+    }
+
     fn as_proxy_raw_with_proxy_client(
         self,
         proxy_client: ProxyClient,
     ) -> Result<Self, fastmcp_core::McpError> {
-        let catalog = proxy_client.catalog()?;
-        self.register_raw_proxy_catalog(proxy_client, catalog)
+        let catalog = proxy_client.catalog_typed()?;
+        self.register_raw_typed_proxy_catalog(proxy_client, catalog)
     }
 
-    fn register_raw_proxy_catalog(
+    /// Registers one already-negotiated typed upstream catalog without
+    /// projecting final resource/template/prompt definitions through their
+    /// narrower legacy models.
+    fn register_raw_typed_proxy_catalog(
         mut self,
         proxy_client: ProxyClient,
-        catalog: ProxyCatalog,
+        catalog: ProxyTypedCatalog,
     ) -> Result<Self, fastmcp_core::McpError> {
-        proxy_client.admit_catalog(&catalog)?;
-        let has_tools = !catalog.tools.is_empty() || !catalog.final_tools.is_empty();
-        let has_resources = !catalog.resources.is_empty() || !catalog.resource_templates.is_empty();
-        let has_prompts = !catalog.prompts.is_empty();
-        let final_handlers = catalog.final_tool_handlers(proxy_client.clone())?;
-
-        for tool in catalog.tools {
-            self.router.add_tool_with_behavior(
-                ProxyToolHandler::new(tool, proxy_client.clone()),
-                self.on_duplicate,
-            )?;
+        // `catalog_typed` calls this too, but keep the shape gate at this
+        // ownership boundary so an internal caller cannot accidentally compose
+        // mixed vectors into a downstream router.
+        catalog.era()?;
+        match (
+            catalog.tools,
+            catalog.resources,
+            catalog.resource_templates,
+            catalog.prompts,
+        ) {
+            (
+                ProxyToolCatalog::Legacy(tools),
+                ProxyResourceCatalog::Legacy(resources),
+                ProxyResourceTemplateCatalog::Legacy(resource_templates),
+                ProxyPromptCatalog::Legacy(prompts),
+            ) => {
+                let has_tools = !tools.is_empty();
+                let has_resources = !resources.is_empty() || !resource_templates.is_empty();
+                let has_prompts = !prompts.is_empty();
+                for tool in tools {
+                    self.router.add_tool_with_behavior(
+                        ProxyToolHandler::new(tool, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+                for resource in resources {
+                    self.router.add_resource_with_behavior(
+                        ProxyResourceHandler::new(resource, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+                for template in resource_templates {
+                    self.router.add_resource_with_behavior(
+                        ProxyResourceHandler::from_template(template, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+                for prompt in prompts {
+                    self.router.add_prompt_with_behavior(
+                        ProxyPromptHandler::new(prompt, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+                if has_tools {
+                    self.capabilities.tools = Some(ToolsCapability::default());
+                }
+                if has_resources {
+                    self.capabilities.resources = Some(ResourcesCapability::default());
+                }
+                if has_prompts {
+                    self.capabilities.prompts = Some(PromptsCapability::default());
+                }
+            }
+            (
+                ProxyToolCatalog::Final(tools),
+                ProxyResourceCatalog::Final(resources),
+                ProxyResourceTemplateCatalog::Final(resource_templates),
+                ProxyPromptCatalog::Final(prompts),
+            ) => {
+                for tool in tools {
+                    self.router.add_final_tool_with_behavior(
+                        ProxyToolHandler::from_final(tool, proxy_client.clone())?,
+                        self.on_duplicate,
+                    )?;
+                }
+                for resource in resources {
+                    self.router.add_final_resource_with_behavior(
+                        FinalProxyResourceHandler::new(resource, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+                for template in resource_templates {
+                    self.router.add_final_resource_with_behavior(
+                        FinalProxyResourceTemplateHandler::new(template, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+                for prompt in prompts {
+                    self.router.add_final_prompt_with_behavior(
+                        FinalProxyPromptHandler::new(prompt, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+            }
+            _ => {
+                return Err(fastmcp_core::McpError::invalid_request(
+                    "proxy typed catalog mixes legacy and final component vectors",
+                ));
+            }
         }
-
-        for handler in final_handlers {
-            self.router
-                .add_tool_with_behavior(handler, self.on_duplicate)?;
-        }
-
-        for resource in catalog.resources {
-            self.router.add_resource_with_behavior(
-                ProxyResourceHandler::new(resource, proxy_client.clone()),
-                self.on_duplicate,
-            )?;
-        }
-
-        for template in catalog.resource_templates {
-            self.router.add_resource_with_behavior(
-                ProxyResourceHandler::from_template(template, proxy_client.clone()),
-                self.on_duplicate,
-            )?;
-        }
-
-        for prompt in catalog.prompts {
-            self.router.add_prompt_with_behavior(
-                ProxyPromptHandler::new(prompt, proxy_client.clone()),
-                self.on_duplicate,
-            )?;
-        }
-
-        if has_tools {
-            self.capabilities.tools = Some(ToolsCapability::default());
-        }
-        if has_resources {
-            self.capabilities.resources = Some(ResourcesCapability::default());
-        }
-        if has_prompts {
-            self.capabilities.prompts = Some(PromptsCapability::default());
-        }
-
         Ok(self)
     }
 
@@ -2945,7 +3111,10 @@ mod tests {
 
         let server = ServerBuilder::new("srv", "1.0")
             .tool(TestTool)
-            .proxy(ProxyClient::from_backend(DuplicatePolicyProxyBackend), catalog)
+            .proxy(
+                ProxyClient::from_backend(DuplicatePolicyProxyBackend),
+                catalog,
+            )
             .build();
 
         assert_eq!(
@@ -2972,8 +3141,7 @@ mod tests {
         assert!(server.has_tools());
         let tools = server.tools();
         assert_eq!(
-            tools[0].name,
-            "legacy-weather",
+            tools[0].name, "legacy-weather",
             "the public builder path registers a catalog whose marker and entries select legacy"
         );
     }
@@ -3019,8 +3187,8 @@ mod tests {
             .proxy(final_catalog_proxy_client(ProtocolEra::Modern2026), catalog)
             .build();
 
-        assert!(server.has_tools());
-        assert_eq!(server.tools().len(), 1);
+        assert!(!server.has_tools());
+        assert!(server.tools().is_empty());
         let inbound = crate::InboundRequestContext::new(
             Cx::for_testing(),
             701,
@@ -3034,6 +3202,233 @@ mod tests {
             .result
             .expect("the modern tools/list response has a result payload");
         assert_eq!(catalog["tools"][0], expected);
+    }
+
+    #[test]
+    fn builder_proxy_rejects_final_tools_with_one_legacy_resource_vector() {
+        let mut catalog = final_proxy_catalog();
+        catalog.resources.push(Resource {
+            uri: "file:///must-not-project".to_owned(),
+            name: "must-not-project".to_owned(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        });
+
+        assert_rejected_proxy_catalog_preserves_local_registration(catalog);
+    }
+
+    #[test]
+    fn public_legacy_ping_is_retained_while_the_one_metadata_change_rejects_final_ping() {
+        let server = ServerBuilder::new("srv", "1.0").build();
+        let mut legacy_session =
+            crate::Session::new(server.info().clone(), server.capabilities().clone());
+        legacy_session.initialize(
+            fastmcp_protocol::ClientInfo {
+                name: "exact-2024-ping-client".to_owned(),
+                version: "1.0".to_owned(),
+            },
+            fastmcp_protocol::ClientCapabilities::default(),
+            "2024-11-05".to_owned(),
+        );
+        let state_before = legacy_session.state().len();
+        let legacy_ping = JsonRpcRequest::new("ping", Some(serde_json::json!({})), 714_i64);
+        let mut final_ping = legacy_ping.clone();
+        final_ping
+            .params
+            .as_mut()
+            .expect("the cloned ping request retains its object parameters")
+            .as_object_mut()
+            .expect("the cloned ping parameters remain an object")
+            .insert(
+                "_meta".to_owned(),
+                serde_json::json!({
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                }),
+            );
+        let mut final_without_metadata = final_ping
+            .params
+            .clone()
+            .expect("the final ping parameters are retained for the negative-control check");
+        final_without_metadata
+            .as_object_mut()
+            .expect("the final ping parameters remain an object")
+            .remove("_meta");
+        assert_eq!(final_ping.method, legacy_ping.method);
+        assert_eq!(final_ping.id, legacy_ping.id);
+        assert_eq!(Some(final_without_metadata), legacy_ping.params);
+
+        let notification_sender: crate::NotificationSender = Arc::new(|_| {});
+        let request_sender = crate::RequestSender::new(
+            Arc::new(crate::PendingRequests::new()),
+            Arc::new(|message| Err(format!("unexpected outbound message in test: {message:?}"))),
+        );
+        let legacy = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut legacy_session,
+                legacy_ping,
+                &notification_sender,
+                &request_sender,
+            )
+            .expect("the exact-2024 public dispatch path responds to ping");
+        assert_eq!(legacy.result, Some(serde_json::json!({})));
+        assert!(legacy.error.is_none());
+
+        let inbound = crate::InboundRequestContext::new(
+            Cx::for_testing(),
+            714,
+            crate::InboundRequestTransport::Memory,
+        );
+        let rejected = server
+            .dispatch_stateless(&inbound, &final_ping)
+            .expect("the final public dispatch path returns a JSON-RPC error");
+        assert_eq!(rejected.error.map(|error| error.code), Some(-32601));
+        assert!(rejected.result.is_none());
+        assert_eq!(
+            legacy_session.state().len(),
+            state_before,
+            "changing only the protocol-era metadata cannot mutate the legacy session state"
+        );
+    }
+
+    #[test]
+    fn typed_proxy_registration_retains_final_resource_template_and_prompt_metadata() {
+        let resource = serde_json::json!({
+            "uri": "mcp://upstream/resource",
+            "name": "upstream-resource",
+            "size": 4096,
+            "_meta": {"com.example/resource": {"retained": true}}
+        });
+        let template = serde_json::json!({
+            "uriTemplate": "mcp://upstream/{name}",
+            "name": "upstream-template",
+            "_meta": {"com.example/template": {"retained": true}}
+        });
+        let prompt = serde_json::json!({
+            "name": "upstream-prompt",
+            "arguments": [{"name": "region", "title": "Region"}],
+            "_meta": {"com.example/prompt": {"retained": true}}
+        });
+        let typed = ProxyTypedCatalog {
+            tools: ProxyToolCatalog::Final(Vec::new()),
+            resources: ProxyResourceCatalog::Final(vec![
+                serde_json::from_value(resource.clone())
+                    .expect("the final resource fixture is valid"),
+            ]),
+            resource_templates: ProxyResourceTemplateCatalog::Final(vec![
+                serde_json::from_value(template.clone())
+                    .expect("the final resource-template fixture is valid"),
+            ]),
+            prompts: ProxyPromptCatalog::Final(vec![
+                serde_json::from_value(prompt.clone()).expect("the final prompt fixture is valid"),
+            ]),
+        };
+        let server = ServerBuilder::new("srv", "1.0")
+            .proxy_typed(
+                ProxyClient::from_backend(DuplicatePolicyProxyBackend),
+                typed,
+            )
+            .expect("coherent typed catalog registers")
+            .build();
+        for (method, member, expected, id) in [
+            ("resources/list", "resources", resource, 711_i64),
+            (
+                "resources/templates/list",
+                "resourceTemplates",
+                template,
+                712_i64,
+            ),
+            ("prompts/list", "prompts", prompt, 713_i64),
+        ] {
+            let inbound = crate::InboundRequestContext::new(
+                Cx::for_testing(),
+                u64::try_from(id).expect("test request IDs are non-negative"),
+                crate::InboundRequestTransport::Memory,
+            );
+            let response = server
+                .dispatch_stateless(
+                    &inbound,
+                    &JsonRpcRequest::new(
+                        method,
+                        Some(serde_json::json!({
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientCapabilities": {},
+                            },
+                        })),
+                        id,
+                    ),
+                )
+                .expect("final discovery dispatch succeeds");
+            assert_eq!(
+                response.result.expect("final discovery has a result")[member][0],
+                expected,
+                "final proxy registration must retain exact {member} metadata"
+            );
+        }
+
+        assert!(server.resources().is_empty());
+        assert!(server.resource_templates().is_empty());
+        assert!(server.prompts().is_empty());
+        let router = server.into_router();
+        let state = fastmcp_core::SessionState::new();
+        let request_ctx =
+            fastmcp_core::McpContext::with_state(Cx::for_testing(), 714, state.clone());
+        let legacy_resource = router
+            .handle_resources_read(
+                &request_ctx,
+                &fastmcp_protocol::ReadResourceParams {
+                    uri: "mcp://upstream/resource".to_owned(),
+                    meta: None,
+                },
+                state.clone(),
+                None,
+                None,
+            )
+            .expect_err("typed-final resource registration is not legacy-visible");
+        assert_eq!(
+            legacy_resource.code,
+            fastmcp_core::McpErrorCode::ResourceNotFound
+        );
+        let legacy_prompt = router
+            .handle_prompts_get(
+                &request_ctx,
+                fastmcp_protocol::GetPromptParams {
+                    name: "upstream-prompt".to_owned(),
+                    arguments: None,
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect_err("typed-final prompt registration is not legacy-visible");
+        assert_eq!(
+            legacy_prompt.code,
+            fastmcp_core::McpErrorCode::PromptNotFound
+        );
+    }
+
+    #[test]
+    fn typed_proxy_registration_rejects_one_mixed_era_component_vector() {
+        let typed = ProxyTypedCatalog {
+            tools: ProxyToolCatalog::Legacy(Vec::new()),
+            resources: ProxyResourceCatalog::Final(Vec::new()),
+            resource_templates: ProxyResourceTemplateCatalog::Legacy(Vec::new()),
+            prompts: ProxyPromptCatalog::Legacy(Vec::new()),
+        };
+        let error = match ServerBuilder::new("srv", "1.0").register_raw_typed_proxy_catalog(
+            ProxyClient::from_backend(DuplicatePolicyProxyBackend),
+            typed,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("changing only resources to final rejects a mixed-era proxy catalog"),
+        };
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
     }
 
     #[test]

@@ -206,12 +206,11 @@ fn configure_blocking_tool_with_completion(
         .expect("blocking tool lock poisoned");
     *blocking_tool_state()
         .lock()
-        .expect("blocking tool state lock poisoned") =
-        Some(BlockingToolState {
-            barrier,
-            started,
-            completed,
-        });
+        .expect("blocking tool state lock poisoned") = Some(BlockingToolState {
+        barrier,
+        started,
+        completed,
+    });
     BlockingToolConfigGuard { _lock: lock }
 }
 

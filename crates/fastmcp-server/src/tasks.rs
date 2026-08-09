@@ -1638,6 +1638,20 @@ pub trait FinalTaskStore: Send + Sync {
         ))
     }
 
+    /// Legacy raw accepted-input claim.
+    ///
+    /// New task-service code must use
+    /// [`Self::take_input_for_owner_if_current`], which binds the claim to a
+    /// service owner before it can reach application code.
+    fn take_input_if_current(
+        &self,
+        _expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskInputResponses>> {
+        Err(McpError::internal_error(
+            "Final task store does not implement atomic task-input consumption",
+        ))
+    }
+
     /// Atomically leases the private accepted-input handoff to one service
     /// owner only when the store still contains the exact supplied generation
     /// in `working` state.
@@ -1648,7 +1662,7 @@ pub trait FinalTaskStore: Send + Sync {
     /// claim to exclusive owned fencing until finish or restoration. A stale
     /// generation, a non-working state, or an already-leased handoff returns
     /// `None` without delivering application work.
-    fn take_input_if_current(
+    fn take_input_for_owner_if_current(
         &self,
         _expected: &FinalTaskSnapshot,
         _owner_id: &str,
@@ -1677,6 +1691,14 @@ pub trait FinalTaskStore: Send + Sync {
     ///
     /// The cursor is part of the durable recovery contract: it prevents a
     /// permanently retryable low-sort-key task from starving later work.
+    fn next_initial_work_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+        Err(McpError::internal_error(
+            "Final task store does not implement initial-work recovery",
+        ))
+    }
+
+    /// Cursor-based initial-work recovery. Implementations must continue
+    /// after `after_task_id` and wrap to the beginning when necessary.
     fn next_initial_work_snapshot_after(
         &self,
         _after_task_id: Option<&FinalTaskId>,
@@ -1698,6 +1720,17 @@ pub trait FinalTaskStore: Send + Sync {
     fn take_initial_work_if_current(
         &self,
         _expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+        Err(McpError::internal_error(
+            "Final task store does not implement initial-work claiming",
+        ))
+    }
+
+    /// Owner-bound initial-work claim used exclusively by the authorized
+    /// runner.
+    fn take_initial_work_for_owner_if_current(
+        &self,
+        _expected: &FinalTaskSnapshot,
         _owner_id: &str,
     ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
         Err(McpError::internal_error(
@@ -1711,6 +1744,19 @@ pub trait FinalTaskStore: Send + Sync {
     /// exact original uncancelled `working` generation may become recoverable
     /// again.
     fn restore_initial_work_if_current(
+        &self,
+        _task_id: &FinalTaskId,
+        _generation: u64,
+        _work_descriptor: FinalTaskWorkDescriptor,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Final task store does not implement initial-work restoration",
+        ))
+    }
+
+    /// Owner- and fence-bound initial-work restoration used by the execution
+    /// guard.
+    fn restore_initial_work_for_owner_if_current(
         &self,
         _task_id: &FinalTaskId,
         _generation: u64,
@@ -1728,13 +1774,22 @@ pub trait FinalTaskStore: Send + Sync {
     /// `after_task_id` and wrapping to the beginning when necessary.
     ///
     /// The returned snapshot is only a compare-and-swap candidate. A service
-    /// must still call [`Self::take_input_if_current`] before delivering any
-    /// input to application code, so a concurrent terminal transition or
-    /// another service generation wins without replaying the handoff.
+    /// must still call [`Self::take_input_for_owner_if_current`] before
+    /// delivering any input to application code, so a concurrent terminal
+    /// transition or another service generation wins without replaying the
+    /// handoff.
     ///
     /// Stores that cannot enumerate their durable accepted-input handoffs fail
     /// closed. A service runner must never claim restart recovery merely
     /// because ordinary `get_task` is available.
+    fn next_accepted_input_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+        Err(McpError::internal_error(
+            "Final task store does not implement accepted-input recovery",
+        ))
+    }
+
+    /// Cursor-based accepted-input recovery. Implementations must continue
+    /// after `after_task_id` and wrap to the beginning when necessary.
     fn next_accepted_input_snapshot_after(
         &self,
         _after_task_id: Option<&FinalTaskId>,
@@ -1757,6 +1812,19 @@ pub trait FinalTaskStore: Send + Sync {
         &self,
         _task_id: &FinalTaskId,
         _generation: u64,
+        _input_responses: FinalTaskInputResponses,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Final task store does not implement accepted-input restoration",
+        ))
+    }
+
+    /// Owner- and fence-bound accepted-input restoration used by the
+    /// execution guard.
+    fn restore_input_for_owner_if_current(
+        &self,
+        _task_id: &FinalTaskId,
+        _generation: u64,
         _owner_id: &str,
         _dispatch_fence: Option<u64>,
         _input_responses: FinalTaskInputResponses,
@@ -1773,12 +1841,23 @@ pub trait FinalTaskStore: Send + Sync {
     /// `false`; an elected handoff is logically running before this method
     /// returns, so a later cancellation cannot interpose between a separate
     /// preflight check and the application call. The matching
-    /// [`Self::finish_handoff_dispatch_if_current`] or restoration operation
-    /// releases the owner-held dispatch fence. The returned monotonically
-    /// increasing fence identifies this exact election. Before and after
-    /// election the durable lease must expire unless renewed; expiry fences
-    /// the former owner before a restarted service can take over.
+    /// [`Self::finish_handoff_dispatch_for_owner_if_current`] or restoration
+    /// operation releases the owner-held dispatch fence. The returned
+    /// monotonically increasing fence identifies this exact election. Before
+    /// and after election the durable lease must expire unless renewed; expiry
+    /// fences the former owner before a restarted service can take over.
     fn begin_handoff_dispatch_if_current(
+        &self,
+        _task_id: &FinalTaskId,
+        _generation: u64,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Final task store does not implement atomic handoff dispatch election",
+        ))
+    }
+
+    /// Owner-bound dispatch election returning the store-issued fencing token.
+    fn begin_handoff_dispatch_for_owner_if_current(
         &self,
         _task_id: &FinalTaskId,
         _generation: u64,
@@ -1804,9 +1883,30 @@ pub trait FinalTaskStore: Send + Sync {
         ))
     }
 
+    /// Returns a positive interval strictly shorter than the store's elected
+    /// dispatch lease. The runner renews at this cadence while application
+    /// work is pending, so a durable store can safely reclaim only a crashed
+    /// or partitioned owner after its own lease expires.
+    fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
+        Err(McpError::internal_error(
+            "Final task store does not disclose a durable handoff lease heartbeat interval",
+        ))
+    }
+
     /// Releases a successfully completed durable dispatch lease. A `false`
     /// result means a newer state transition has already released it.
     fn finish_handoff_dispatch_if_current(
+        &self,
+        _task_id: &FinalTaskId,
+        _generation: u64,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Final task store does not implement atomic handoff dispatch completion",
+        ))
+    }
+
+    /// Owner- and fence-bound dispatch completion.
+    fn finish_handoff_dispatch_for_owner_if_current(
         &self,
         _task_id: &FinalTaskId,
         _generation: u64,
@@ -1952,6 +2052,7 @@ enum InMemoryFinalTaskHandoffKind {
 }
 
 const IN_MEMORY_FINAL_TASK_HANDOFF_LEASE: StdDuration = StdDuration::from_secs(30);
+const IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT: StdDuration = StdDuration::from_secs(10);
 
 impl InMemoryFinalTaskStore {
     /// Creates a store with the system monotonic clock and bounded retention.
@@ -2247,6 +2348,15 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
 
     fn take_input_if_current(
         &self,
+        _expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskInputResponses>> {
+        Err(McpError::internal_error(
+            "Raw final task input claims require an authorized service owner",
+        ))
+    }
+
+    fn take_input_for_owner_if_current(
+        &self,
         expected: &FinalTaskSnapshot,
         owner_id: &str,
     ) -> McpResult<Option<FinalTaskInputResponses>> {
@@ -2336,8 +2446,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                     && !state.cancellation_requests.contains(task_id)
                     && !state.handoff_leases.contains_key(task_id)
             },
-        )
-        else {
+        ) else {
             return Ok(None);
         };
         let task = state.tasks.get(&task_id).cloned().ok_or_else(|| {
@@ -2353,7 +2462,20 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         Ok(Some(FinalTaskSnapshot::new(task, generation)))
     }
 
+    fn next_initial_work_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.next_initial_work_snapshot_after(None)
+    }
+
     fn take_initial_work_if_current(
+        &self,
+        _expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+        Err(McpError::internal_error(
+            "Raw final task initial-work claims require an authorized service owner",
+        ))
+    }
+
+    fn take_initial_work_for_owner_if_current(
         &self,
         expected: &FinalTaskSnapshot,
         owner_id: &str,
@@ -2395,6 +2517,17 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn restore_initial_work_if_current(
+        &self,
+        _task_id: &FinalTaskId,
+        _generation: u64,
+        _work_descriptor: FinalTaskWorkDescriptor,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Raw final task initial-work restoration requires an authorized service owner",
+        ))
+    }
+
+    fn restore_initial_work_for_owner_if_current(
         &self,
         task_id: &FinalTaskId,
         generation: u64,
@@ -2446,8 +2579,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                     && !state.cancellation_requests.contains(task_id)
                     && !state.handoff_leases.contains_key(task_id)
             },
-        )
-        else {
+        ) else {
             return Ok(None);
         };
         let task = state.tasks.get(&task_id).cloned().ok_or_else(|| {
@@ -2461,7 +2593,22 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         Ok(Some(FinalTaskSnapshot::new(task, generation)))
     }
 
+    fn next_accepted_input_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.next_accepted_input_snapshot_after(None)
+    }
+
     fn restore_input_if_current(
+        &self,
+        _task_id: &FinalTaskId,
+        _generation: u64,
+        _input_responses: FinalTaskInputResponses,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Raw final task input restoration requires an authorized service owner",
+        ))
+    }
+
+    fn restore_input_for_owner_if_current(
         &self,
         task_id: &FinalTaskId,
         generation: u64,
@@ -2500,6 +2647,16 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn begin_handoff_dispatch_if_current(
+        &self,
+        _task_id: &FinalTaskId,
+        _generation: u64,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Raw final task dispatch election requires an authorized service owner",
+        ))
+    }
+
+    fn begin_handoff_dispatch_for_owner_if_current(
         &self,
         task_id: &FinalTaskId,
         generation: u64,
@@ -2561,7 +2718,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let renewed_expires_at = in_memory_final_task_handoff_lease_expiry(now)?;
-        let Some(lease) = state.handoff_leases.get_mut(task_id) else {
+        let Some(lease) = state.handoff_leases.get(task_id) else {
             return Ok(false);
         };
         if lease.generation != generation
@@ -2576,11 +2733,28 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         {
             return Ok(false);
         }
+        let Some(lease) = state.handoff_leases.get_mut(task_id) else {
+            return Ok(false);
+        };
         lease.recovery_expires_at = Some(renewed_expires_at);
         Ok(true)
     }
 
+    fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
+        Ok(IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT)
+    }
+
     fn finish_handoff_dispatch_if_current(
+        &self,
+        _task_id: &FinalTaskId,
+        _generation: u64,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Raw final task dispatch completion requires an authorized service owner",
+        ))
+    }
+
+    fn finish_handoff_dispatch_for_owner_if_current(
         &self,
         task_id: &FinalTaskId,
         generation: u64,
@@ -2729,9 +2903,7 @@ fn next_in_memory_final_task_generation(state: &mut InMemoryFinalTaskState) -> M
     Ok(generation)
 }
 
-fn next_in_memory_final_task_dispatch_fence(
-    state: &mut InMemoryFinalTaskState,
-) -> McpResult<u64> {
+fn next_in_memory_final_task_dispatch_fence(state: &mut InMemoryFinalTaskState) -> McpResult<u64> {
     let fence = state.next_dispatch_fence.checked_add(1).ok_or_else(|| {
         McpError::internal_error("In-memory final task dispatch fence space is exhausted")
     })?;
@@ -2750,9 +2922,9 @@ fn next_in_memory_final_task_recovery_id<'a>(
             task_ids
                 .iter()
                 .copied()
-                .find(|task_id| *task_id > after_task_id && eligible(task_id))
+                .find(|task_id| *task_id > after_task_id && eligible(*task_id))
         })
-        .or_else(|| task_ids.into_iter().find(|task_id| eligible(task_id)))
+        .or_else(|| task_ids.into_iter().find(|task_id| eligible(*task_id)))
         .cloned()
 }
 
@@ -3174,7 +3346,6 @@ pub trait ApplicationTaskSupervisor: Send + Sync {
 
 const MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN: usize = 64;
 const MAX_FINAL_TASK_RECOVERY_CAS_RETRIES: usize = 64;
-const FINAL_TASK_DISPATCH_LEASE_HEARTBEAT: StdDuration = StdDuration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FinalTaskRecoveryKind {
@@ -3391,7 +3562,7 @@ impl FinalTaskRuntime {
         };
         let input_responses = self
             .store
-            .take_input_if_current(&current, FINAL_TASK_TEST_DIRECT_OWNER)?;
+            .take_input_for_owner_if_current(&current, FINAL_TASK_TEST_DIRECT_OWNER)?;
         Ok(
             input_responses.map(|input_responses| FinalTaskAcceptedInput {
                 task_id: task_id.clone(),
@@ -3427,7 +3598,7 @@ impl FinalTaskRuntime {
             };
             let Some(input_responses) = self
                 .store
-                .take_input_if_current(&candidate, FINAL_TASK_TEST_DIRECT_OWNER)?
+                .take_input_for_owner_if_current(&candidate, FINAL_TASK_TEST_DIRECT_OWNER)?
             else {
                 continue;
             };
@@ -3470,7 +3641,10 @@ impl FinalTaskRuntime {
             };
             cx.checkpoint()
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
-            let Some(input_responses) = self.store.take_input_if_current(&candidate, owner_id)? else {
+            let Some(input_responses) = self
+                .store
+                .take_input_for_owner_if_current(&candidate, owner_id)?
+            else {
                 continue;
             };
             return Ok(Some(FinalTaskAcceptedInput {
@@ -3501,7 +3675,7 @@ impl FinalTaskRuntime {
             let task_id = candidate.task().base().task_id.clone();
             let Some(work_descriptor) = self
                 .store
-                .take_initial_work_if_current(&candidate, FINAL_TASK_TEST_DIRECT_OWNER)?
+                .take_initial_work_for_owner_if_current(&candidate, FINAL_TASK_TEST_DIRECT_OWNER)?
             else {
                 continue;
             };
@@ -3527,9 +3701,7 @@ impl FinalTaskRuntime {
         for _ in 0..MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
             cx.checkpoint()
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
-            let Some(candidate) = self
-                .store
-                .next_initial_work_snapshot_after(after_task_id)?
+            let Some(candidate) = self.store.next_initial_work_snapshot_after(after_task_id)?
             else {
                 return Ok(None);
             };
@@ -3542,7 +3714,7 @@ impl FinalTaskRuntime {
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
             let Some(work_descriptor) = self
                 .store
-                .take_initial_work_if_current(&candidate, owner_id)?
+                .take_initial_work_for_owner_if_current(&candidate, owner_id)?
             else {
                 continue;
             };
@@ -3568,7 +3740,7 @@ impl FinalTaskRuntime {
             .map_err(|error| McpError::internal_error(error.to_string()))?;
         let work_descriptor = self
             .store
-            .take_initial_work_if_current(&current, owner_id)?;
+            .take_initial_work_for_owner_if_current(&current, owner_id)?;
         Ok(work_descriptor.map(|work_descriptor| FinalTaskInitialWork {
             task_id: task_id.clone(),
             generation: current.generation(),
@@ -3588,7 +3760,9 @@ impl FinalTaskRuntime {
         };
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
-        let input_responses = self.store.take_input_if_current(&current, owner_id)?;
+        let input_responses = self
+            .store
+            .take_input_for_owner_if_current(&current, owner_id)?;
         Ok(
             input_responses.map(|input_responses| FinalTaskAcceptedInput {
                 task_id: task_id.clone(),
@@ -3614,7 +3788,6 @@ impl FinalTaskRuntime {
         work_descriptor: FinalTaskWorkDescriptor,
         status_message: Option<String>,
     ) -> McpResult<CreateTaskResult> {
-        self.ensure_task_service_ready()?;
         let task_id = generate_final_task_id()?;
         let now = final_task_timestamp()?;
         let task = FinalTask::Working(FinalTaskBase {
@@ -3630,7 +3803,7 @@ impl FinalTaskRuntime {
                 .map(final_task_duration)
                 .transpose()?,
         });
-        self.persist_new_with_work(task.clone(), work_descriptor)?;
+        self.persist_new_with_work_while_service_ready(task.clone(), work_descriptor)?;
         Ok(CreateTaskResult {
             task,
             meta: None,
@@ -3870,6 +4043,42 @@ impl FinalTaskRuntime {
         Ok(())
     }
 
+    /// Persists a publicly created task while its exact ready service
+    /// generation is still live.
+    ///
+    /// A readiness probe followed by an independent durable write would be a
+    /// TOCTOU boundary: a runner could exit after the probe but before a
+    /// caller receives an accepted task handle. Holding the signal lock only
+    /// through the synchronous store commit makes runner teardown wait until
+    /// the task is recoverable by the generation that authorized it. Delivery
+    /// and best-effort wakeup remain outside that lock.
+    fn persist_new_with_work_while_service_ready(
+        &self,
+        task: FinalTask,
+        work_descriptor: FinalTaskWorkDescriptor,
+    ) -> McpResult<()> {
+        let task_id = task.base().task_id.clone();
+        let notification = final_task_notification(&task);
+        {
+            let signal = self
+                .service_signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !Self::task_service_is_ready(signal.as_ref()) {
+                return Err(McpError::invalid_params(
+                    "Final task creation requires an installed ready task service",
+                ));
+            }
+            self.store
+                .create_task_with_work(task, notification.clone(), work_descriptor)?;
+        }
+        // The durable commit above is the acceptance point. Observer failures
+        // cannot revoke the returned task handle.
+        let _ = self.emit(notification);
+        self.signal_task_service(task_id);
+        Ok(())
+    }
+
     fn persist_transition_appending_input(
         &self,
         expected: &FinalTaskSnapshot,
@@ -3948,7 +4157,7 @@ impl FinalTaskRuntime {
         dispatch_fence: Option<u64>,
         input_responses: FinalTaskInputResponses,
     ) -> McpResult<bool> {
-        self.store.restore_input_if_current(
+        self.store.restore_input_for_owner_if_current(
             task_id,
             generation,
             owner_id,
@@ -3965,7 +4174,7 @@ impl FinalTaskRuntime {
         dispatch_fence: Option<u64>,
         work_descriptor: FinalTaskWorkDescriptor,
     ) -> McpResult<bool> {
-        self.store.restore_initial_work_if_current(
+        self.store.restore_initial_work_for_owner_if_current(
             task_id,
             generation,
             owner_id,
@@ -3981,7 +4190,7 @@ impl FinalTaskRuntime {
         owner_id: &str,
     ) -> McpResult<Option<u64>> {
         self.store
-            .begin_handoff_dispatch_if_current(task_id, generation, owner_id)
+            .begin_handoff_dispatch_for_owner_if_current(task_id, generation, owner_id)
     }
 
     fn renew_handoff_dispatch(
@@ -3991,12 +4200,18 @@ impl FinalTaskRuntime {
         owner_id: &str,
         dispatch_fence: u64,
     ) -> McpResult<bool> {
-        self.store.renew_handoff_dispatch_if_current(
-            task_id,
-            generation,
-            owner_id,
-            dispatch_fence,
-        )
+        self.store
+            .renew_handoff_dispatch_if_current(task_id, generation, owner_id, dispatch_fence)
+    }
+
+    fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
+        let interval = self.store.handoff_dispatch_lease_heartbeat_interval()?;
+        if interval.is_zero() {
+            return Err(McpError::internal_error(
+                "Final task store returned a zero dispatch lease heartbeat interval",
+            ));
+        }
+        Ok(interval)
     }
 
     fn finish_handoff_dispatch(
@@ -4006,8 +4221,12 @@ impl FinalTaskRuntime {
         owner_id: &str,
         dispatch_fence: u64,
     ) -> McpResult<bool> {
-        self.store
-            .finish_handoff_dispatch_if_current(task_id, generation, owner_id, dispatch_fence)
+        self.store.finish_handoff_dispatch_for_owner_if_current(
+            task_id,
+            generation,
+            owner_id,
+            dispatch_fence,
+        )
     }
 
     /// Verifies, without mutation, that a live entered task-service runner
@@ -4021,14 +4240,18 @@ impl FinalTaskRuntime {
             .service_signal
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if signal.as_ref().is_none_or(|service| {
-            service.ready_generation != Some(service.service_id) || service.sender.is_closed()
-        }) {
+        if !Self::task_service_is_ready(signal.as_ref()) {
             return Err(McpError::invalid_params(
                 "Final task creation requires an installed ready task service",
             ));
         }
         Ok(())
+    }
+
+    fn task_service_is_ready(service: Option<&FinalTaskServiceSignal>) -> bool {
+        service.is_some_and(|service| {
+            service.ready_generation == Some(service.service_id) && !service.sender.is_closed()
+        })
     }
 
     /// Elects readiness only for a runner that has already passed its entry
@@ -4150,7 +4373,10 @@ impl AuthorizedTaskServiceRunner {
                         &self.dispatch_owner,
                         self.initial_recovery_cursor.as_ref(),
                     )? {
-                        Some((FinalTaskRecoveryKind::Initial, handoff))
+                        Some((
+                            FinalTaskRecoveryKind::Initial,
+                            FinalTaskSupervisorHandoff::Initial(handoff),
+                        ))
                     } else {
                         self.runtime
                             .recover_accepted_input_with_checkpoints(
@@ -4158,7 +4384,12 @@ impl AuthorizedTaskServiceRunner {
                                 &self.dispatch_owner,
                                 self.accepted_recovery_cursor.as_ref(),
                             )?
-                            .map(|handoff| (FinalTaskRecoveryKind::Resumed, handoff))
+                            .map(|handoff| {
+                                (
+                                    FinalTaskRecoveryKind::Resumed,
+                                    FinalTaskSupervisorHandoff::Resumed(handoff),
+                                )
+                            })
                     }
                 }
                 FinalTaskRecoveryKind::Resumed => {
@@ -4167,7 +4398,10 @@ impl AuthorizedTaskServiceRunner {
                         &self.dispatch_owner,
                         self.accepted_recovery_cursor.as_ref(),
                     )? {
-                        Some((FinalTaskRecoveryKind::Resumed, handoff))
+                        Some((
+                            FinalTaskRecoveryKind::Resumed,
+                            FinalTaskSupervisorHandoff::Resumed(handoff),
+                        ))
                     } else {
                         self.runtime
                             .recover_initial_work_with_checkpoints(
@@ -4175,7 +4409,12 @@ impl AuthorizedTaskServiceRunner {
                                 &self.dispatch_owner,
                                 self.initial_recovery_cursor.as_ref(),
                             )?
-                            .map(|handoff| (FinalTaskRecoveryKind::Initial, handoff))
+                            .map(|handoff| {
+                                (
+                                    FinalTaskRecoveryKind::Initial,
+                                    FinalTaskSupervisorHandoff::Initial(handoff),
+                                )
+                            })
                     }
                 }
             };
@@ -4207,9 +4446,9 @@ impl AuthorizedTaskServiceRunner {
     async fn resume_task(&self, cx: &Cx, task_id: &FinalTaskId) -> McpResult<()> {
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
-        if let Some(initial) = self
-            .runtime
-            .take_initial_work_with_checkpoint(cx, task_id, &self.dispatch_owner)?
+        if let Some(initial) =
+            self.runtime
+                .take_initial_work_with_checkpoint(cx, task_id, &self.dispatch_owner)?
         {
             self.resume_handoff(cx, FinalTaskSupervisorHandoff::Initial(initial))
                 .await?;
@@ -4217,9 +4456,9 @@ impl AuthorizedTaskServiceRunner {
         }
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
-        if let Some(accepted) = self
-            .runtime
-            .take_accepted_input_with_checkpoint(cx, task_id, &self.dispatch_owner)?
+        if let Some(accepted) =
+            self.runtime
+                .take_accepted_input_with_checkpoint(cx, task_id, &self.dispatch_owner)?
         {
             self.resume_handoff(cx, FinalTaskSupervisorHandoff::Resumed(accepted))
                 .await?;
@@ -4238,7 +4477,10 @@ impl AuthorizedTaskServiceRunner {
             guard.disarm();
             return Ok(());
         }
-        match self.run_supervisor_with_lease_heartbeat(cx, handoff, &mut guard).await {
+        match self
+            .run_supervisor_with_lease_heartbeat(cx, handoff, &mut guard)
+            .await
+        {
             Ok(()) => {
                 let _ = guard.finish()?;
                 guard.disarm();
@@ -4260,12 +4502,10 @@ impl AuthorizedTaskServiceRunner {
         handoff: FinalTaskSupervisorHandoff,
         guard: &mut FinalTaskExecutionGuard,
     ) -> McpResult<()> {
-        let mut supervisor = Box::pin(self.supervisor.resume(cx, handoff));
+        let mut supervisor = self.supervisor.resume(cx, handoff);
+        let heartbeat_interval = guard.heartbeat_interval()?;
         loop {
-            let mut heartbeat = Box::pin(asupersync::time::sleep(
-                cx.now(),
-                FINAL_TASK_DISPATCH_LEASE_HEARTBEAT,
-            ));
+            let mut heartbeat = Box::pin(asupersync::time::sleep(cx.now(), heartbeat_interval));
             let completed = std::future::poll_fn(|task_context| {
                 if let std::task::Poll::Ready(result) = supervisor.as_mut().poll(task_context) {
                     return std::task::Poll::Ready(Some(result));
@@ -4293,13 +4533,6 @@ fn final_task_handoff_task_id(handoff: &FinalTaskSupervisorHandoff) -> &FinalTas
     match handoff {
         FinalTaskSupervisorHandoff::Initial(initial) => initial.task_id(),
         FinalTaskSupervisorHandoff::Resumed(accepted) => accepted.task_id(),
-    }
-}
-
-fn final_task_handoff_generation(handoff: &FinalTaskSupervisorHandoff) -> u64 {
-    match handoff {
-        FinalTaskSupervisorHandoff::Initial(initial) => initial.generation(),
-        FinalTaskSupervisorHandoff::Resumed(accepted) => accepted.generation(),
     }
 }
 
@@ -4349,11 +4582,10 @@ impl FinalTaskExecutionGuard {
     }
 
     fn elect(&mut self) -> McpResult<bool> {
-        let Some(dispatch_fence) = self.runtime.begin_handoff_dispatch(
-            &self.task_id,
-            self.generation,
-            &self.owner_id,
-        )? else {
+        let Some(dispatch_fence) =
+            self.runtime
+                .begin_handoff_dispatch(&self.task_id, self.generation, &self.owner_id)?
+        else {
             return Ok(false);
         };
         self.dispatch_fence = Some(dispatch_fence);
@@ -4370,6 +4602,10 @@ impl FinalTaskExecutionGuard {
             &self.owner_id,
             dispatch_fence,
         )
+    }
+
+    fn heartbeat_interval(&self) -> McpResult<StdDuration> {
+        self.runtime.handoff_dispatch_lease_heartbeat_interval()
     }
 
     fn finish(&self) -> McpResult<bool> {
@@ -4393,24 +4629,24 @@ impl FinalTaskExecutionGuard {
             return Ok(false);
         };
         let restored = match restoration {
-            FinalTaskHandoffRestoration::Initial(work_descriptor) => self
-                .runtime
-                .restore_initial_work(
+            FinalTaskHandoffRestoration::Initial(work_descriptor) => {
+                self.runtime.restore_initial_work(
                     &self.task_id,
                     self.generation,
                     &self.owner_id,
                     self.dispatch_fence,
                     work_descriptor.clone(),
-                ),
-            FinalTaskHandoffRestoration::Resumed(input_responses) => self
-                .runtime
-                .restore_accepted_input(
+                )
+            }
+            FinalTaskHandoffRestoration::Resumed(input_responses) => {
+                self.runtime.restore_accepted_input(
                     &self.task_id,
                     self.generation,
                     &self.owner_id,
                     self.dispatch_fence,
                     input_responses.clone(),
-                ),
+                )
+            }
         };
         if restored.is_ok() {
             self.restoration = None;
@@ -4628,70 +4864,55 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    /// Legacy-shaped test calls deliberately bind the stable test service
-    /// owner. Production code has no equivalent raw handoff path: it must go
-    /// through `AuthorizedTaskServiceRunner` and its execution guard.
-    trait FinalTaskStoreTestHandoffExt: FinalTaskStore {
-        fn take_input_if_current(
-            &self,
-            expected: &FinalTaskSnapshot,
-        ) -> McpResult<Option<FinalTaskInputResponses>> {
-            FinalTaskStore::take_input_if_current(self, expected, FINAL_TASK_TEST_DIRECT_OWNER)
-        }
-
-        fn take_initial_work_if_current(
-            &self,
-            expected: &FinalTaskSnapshot,
-        ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
-            FinalTaskStore::take_initial_work_if_current(
-                self,
-                expected,
-                FINAL_TASK_TEST_DIRECT_OWNER,
-            )
-        }
-
-        fn restore_input_if_current(
-            &self,
-            task_id: &FinalTaskId,
-            generation: u64,
-            input_responses: FinalTaskInputResponses,
-        ) -> McpResult<bool> {
-            FinalTaskStore::restore_input_if_current(
-                self,
-                task_id,
-                generation,
-                FINAL_TASK_TEST_DIRECT_OWNER,
-                None,
-                input_responses,
-            )
-        }
-
-        fn restore_initial_work_if_current(
-            &self,
-            task_id: &FinalTaskId,
-            generation: u64,
-            work_descriptor: FinalTaskWorkDescriptor,
-        ) -> McpResult<bool> {
-            FinalTaskStore::restore_initial_work_if_current(
-                self,
-                task_id,
-                generation,
-                FINAL_TASK_TEST_DIRECT_OWNER,
-                None,
-                work_descriptor,
-            )
-        }
-
-        fn next_initial_work_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
-            FinalTaskStore::next_initial_work_snapshot_after(self, None)
-        }
-
-        fn next_accepted_input_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
-            FinalTaskStore::next_accepted_input_snapshot_after(self, None)
-        }
+    fn test_take_input(
+        store: &InMemoryFinalTaskStore,
+        expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskInputResponses>> {
+        FinalTaskStore::take_input_for_owner_if_current(
+            store,
+            expected,
+            FINAL_TASK_TEST_DIRECT_OWNER,
+        )
     }
 
-    impl<T: FinalTaskStore + ?Sized> FinalTaskStoreTestHandoffExt for T {}
+    fn test_take_initial_work(
+        store: &InMemoryFinalTaskStore,
+        expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+        FinalTaskStore::take_initial_work_for_owner_if_current(
+            store,
+            expected,
+            FINAL_TASK_TEST_DIRECT_OWNER,
+        )
+    }
+
+    fn test_next_initial_work(
+        store: &InMemoryFinalTaskStore,
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
+        FinalTaskStore::next_initial_work_snapshot_after(store, None)
+    }
+
+    fn test_next_accepted_input(
+        store: &InMemoryFinalTaskStore,
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
+        FinalTaskStore::next_accepted_input_snapshot_after(store, None)
+    }
+
+    fn test_restore_initial_work(
+        store: &InMemoryFinalTaskStore,
+        task_id: &FinalTaskId,
+        generation: u64,
+        work_descriptor: FinalTaskWorkDescriptor,
+    ) -> McpResult<bool> {
+        FinalTaskStore::restore_initial_work_for_owner_if_current(
+            store,
+            task_id,
+            generation,
+            FINAL_TASK_TEST_DIRECT_OWNER,
+            None,
+            work_descriptor,
+        )
+    }
 
     fn final_task_runtime(
         store: Arc<InMemoryFinalTaskStore>,
@@ -4921,6 +5142,105 @@ mod tests {
         }
     }
 
+    /// Test store that observes whether public task creation retains its
+    /// durable record while the service-readiness generation is still held.
+    struct ReadinessLeaseProbeFinalTaskStore {
+        inner: Arc<InMemoryFinalTaskStore>,
+        service_signal: Mutex<Option<Arc<Mutex<Option<FinalTaskServiceSignal>>>>>,
+        observed_ready_lease: AtomicBool,
+    }
+
+    impl ReadinessLeaseProbeFinalTaskStore {
+        fn new(inner: Arc<InMemoryFinalTaskStore>) -> Self {
+            Self {
+                inner,
+                service_signal: Mutex::new(None),
+                observed_ready_lease: AtomicBool::new(false),
+            }
+        }
+
+        fn observe_service_signal(
+            &self,
+            service_signal: Arc<Mutex<Option<FinalTaskServiceSignal>>>,
+        ) {
+            *self
+                .service_signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(service_signal);
+        }
+    }
+
+    impl FinalTaskStore for ReadinessLeaseProbeFinalTaskStore {
+        fn create_task(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            self.inner.create_task(task, notification)
+        }
+
+        fn create_task_with_work(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+            work_descriptor: FinalTaskWorkDescriptor,
+        ) -> McpResult<()> {
+            let service_signal = self
+                .service_signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .expect("test store receives the runtime service signal before public creation");
+            self.observed_ready_lease.store(
+                matches!(
+                    service_signal.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                AtomicOrdering::SeqCst,
+            );
+            self.inner
+                .create_task_with_work(task, notification, work_descriptor)
+        }
+
+        fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
+            self.inner.get_task(task_id)
+        }
+
+        fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.get_task_snapshot(task_id)
+        }
+
+        fn replace_task(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            self.inner.replace_task(task, notification)
+        }
+
+        fn replace_task_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<bool> {
+            self.inner
+                .replace_task_if_current(expected, task, notification)
+        }
+
+        fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
+            self.inner.request_cancellation(task_id)
+        }
+
+        fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
+            self.inner.request_cancellation_if_current(expected)
+        }
+
+        fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+            self.inner.is_cancellation_requested(task_id)
+        }
+    }
+
     struct LoseFirstAcceptedRecoveryCandidateStore {
         inner: Arc<InMemoryFinalTaskStore>,
         lose_first_take: Mutex<bool>,
@@ -4970,7 +5290,7 @@ mod tests {
                 .replace_task_if_current(expected, task, notification)
         }
 
-        fn take_input_if_current(
+        fn take_input_for_owner_if_current(
             &self,
             expected: &FinalTaskSnapshot,
             owner_id: &str,
@@ -4981,14 +5301,18 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if *lose_first_take {
                 *lose_first_take = false;
-                if self.inner.take_input_if_current(expected, owner_id)?.is_some()
-                    && let Some(dispatch_fence) = self.inner.begin_handoff_dispatch_if_current(
-                        &expected.task().base().task_id,
-                        expected.generation(),
-                        owner_id,
-                    )?
+                if self
+                    .inner
+                    .take_input_for_owner_if_current(expected, owner_id)?
+                    .is_some()
+                    && let Some(dispatch_fence) =
+                        self.inner.begin_handoff_dispatch_for_owner_if_current(
+                            &expected.task().base().task_id,
+                            expected.generation(),
+                            owner_id,
+                        )?
                 {
-                    let _ = self.inner.finish_handoff_dispatch_if_current(
+                    let _ = self.inner.finish_handoff_dispatch_for_owner_if_current(
                         &expected.task().base().task_id,
                         expected.generation(),
                         owner_id,
@@ -4997,7 +5321,8 @@ mod tests {
                 }
                 return Ok(None);
             }
-            self.inner.take_input_if_current(expected, owner_id)
+            self.inner
+                .take_input_for_owner_if_current(expected, owner_id)
         }
 
         fn work_descriptor_if_current(
@@ -5012,6 +5337,10 @@ mod tests {
             after_task_id: Option<&FinalTaskId>,
         ) -> McpResult<Option<FinalTaskSnapshot>> {
             self.inner.next_accepted_input_snapshot_after(after_task_id)
+        }
+
+        fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
+            self.inner.handoff_dispatch_lease_heartbeat_interval()
         }
 
         fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
@@ -5069,7 +5398,7 @@ mod tests {
                 .replace_task_if_current(expected, task, notification)
         }
 
-        fn restore_input_if_current(
+        fn restore_input_for_owner_if_current(
             &self,
             task_id: &FinalTaskId,
             generation: u64,
@@ -5077,7 +5406,7 @@ mod tests {
             dispatch_fence: Option<u64>,
             input_responses: FinalTaskInputResponses,
         ) -> McpResult<bool> {
-            self.inner.restore_input_if_current(
+            self.inner.restore_input_for_owner_if_current(
                 task_id,
                 generation,
                 owner_id,
@@ -5086,7 +5415,7 @@ mod tests {
             )
         }
 
-        fn begin_handoff_dispatch_if_current(
+        fn begin_handoff_dispatch_for_owner_if_current(
             &self,
             task_id: &FinalTaskId,
             generation: u64,
@@ -5103,7 +5432,7 @@ mod tests {
                 return Ok(None);
             }
             self.inner
-                .begin_handoff_dispatch_if_current(task_id, generation, owner_id)
+                .begin_handoff_dispatch_for_owner_if_current(task_id, generation, owner_id)
         }
 
         fn renew_handoff_dispatch_if_current(
@@ -5121,14 +5450,18 @@ mod tests {
             )
         }
 
-        fn finish_handoff_dispatch_if_current(
+        fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
+            self.inner.handoff_dispatch_lease_heartbeat_interval()
+        }
+
+        fn finish_handoff_dispatch_for_owner_if_current(
             &self,
             task_id: &FinalTaskId,
             generation: u64,
             owner_id: &str,
             dispatch_fence: u64,
         ) -> McpResult<bool> {
-            self.inner.finish_handoff_dispatch_if_current(
+            self.inner.finish_handoff_dispatch_for_owner_if_current(
                 task_id,
                 generation,
                 owner_id,
@@ -6005,15 +6338,19 @@ mod tests {
         runtime.add_notification_emitter(Arc::new(move |_| {
             continued_by_second_emitter.store(true, AtomicOrdering::SeqCst);
         }));
-        let task = final_working_task_without_ttl("task-emitter-panics");
-        let task_id = task.base().task_id.clone();
+        let runner = runtime
+            .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+            .expect("install a ready service before public task creation");
+        let service_cx = Cx::for_testing();
+        let _running_service = enter_task_service_runner(runner, &service_cx);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.persist_new_with_work(task, final_test_work_descriptor())
+            runtime.create_task_with_work(final_test_work_descriptor(), None)
         }));
-        result
+        let created = result
             .expect("an emitter panic is contained after the durable write")
             .expect("a post-commit emitter panic cannot turn accepted creation into an error");
+        let task_id = created.task.base().task_id.clone();
         assert!(
             continued.load(AtomicOrdering::SeqCst),
             "a later emitter still receives the same durable notification after one panic"
@@ -6301,8 +6638,7 @@ mod tests {
         assert_ne!(terminal.generation(), stale_working.generation());
         assert!(matches!(terminal.task(), FinalTask::Completed { .. }));
         assert!(
-            store
-                .take_input_if_current(&stale_working)
+            test_take_input(&store, &stale_working)
                 .expect("stale generation take fails closed")
                 .is_none(),
             "a stale working generation cannot consume after a terminal winner"
@@ -6508,6 +6844,59 @@ mod tests {
     }
 
     #[test]
+    fn task_03_final_public_creation_holds_readiness_through_durable_commit() {
+        let inner = Arc::new(InMemoryFinalTaskStore::default());
+        let store = Arc::new(ReadinessLeaseProbeFinalTaskStore::new(inner));
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+        store.observe_service_signal(Arc::clone(&runtime.service_signal));
+        let runner = runtime
+            .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+            .expect("install caller-owned task service runner");
+        let service_cx = Cx::for_testing();
+        let running_service = enter_task_service_runner(runner, &service_cx);
+
+        runtime
+            .create_task_with_work(final_test_work_descriptor(), None)
+            .expect("an entered runner accepts a durably recoverable task");
+
+        assert!(
+            store.observed_ready_lease.load(AtomicOrdering::SeqCst),
+            "the durable create commit holds the exact ready service generation"
+        );
+        drop(running_service);
+    }
+
+    #[test]
+    fn task_03_final_public_creation_without_entered_runner_never_reaches_durable_commit() {
+        let inner = Arc::new(InMemoryFinalTaskStore::default());
+        let store = Arc::new(ReadinessLeaseProbeFinalTaskStore::new(inner));
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+        store.observe_service_signal(Arc::clone(&runtime.service_signal));
+        let _runner = runtime
+            .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+            .expect("installing alone does not enter a task service runner");
+
+        assert!(
+            runtime
+                .create_task_with_work(final_test_work_descriptor(), None)
+                .is_err(),
+            "changing only entered runner state rejects public task creation"
+        );
+        assert!(
+            !store.observed_ready_lease.load(AtomicOrdering::SeqCst),
+            "a rejected creation cannot call the durable store"
+        );
+    }
+
+    #[test]
     fn task_03_final_cancelled_before_entry_never_publishes_readiness_or_creates() {
         let store = Arc::new(InMemoryFinalTaskStore::default());
         let advertised = Arc::new(AtomicBool::new(false));
@@ -6602,14 +6991,11 @@ mod tests {
             .expect("initial task snapshot is readable")
             .expect("initial task snapshot is retained");
         assert_eq!(
-            store
-                .take_initial_work_if_current(&snapshot)
-                .expect("initial handoff lease is claimable"),
+            test_take_initial_work(&store, &snapshot).expect("initial handoff lease is claimable"),
             Some(work_descriptor.clone())
         );
         assert!(
-            store
-                .next_initial_work_snapshot()
+            test_next_initial_work(&store)
                 .expect("leased initial work scan is readable")
                 .is_none(),
             "a live recovery lease prevents concurrent delivery"
@@ -6623,14 +7009,12 @@ mod tests {
             .expect("fixed handoff lease fits the monotonic test clock");
         drop(clock);
 
-        let recovered = store
-            .next_initial_work_snapshot()
+        let recovered = test_next_initial_work(&store)
             .expect("expired initial-work lease scan is readable")
             .expect("an expired claim makes the durable initial work recoverable");
         assert_eq!(recovered.task().base().task_id, task_id);
         assert_eq!(
-            store
-                .take_initial_work_if_current(&recovered)
+            test_take_initial_work(&store, &recovered)
                 .expect("expired lease permits a new initial claim"),
             Some(work_descriptor),
             "lease expiry changes only recovery eligibility, not the durable descriptor"
@@ -6654,8 +7038,7 @@ mod tests {
             .expect("initial task snapshot is readable")
             .expect("initial task snapshot is retained");
         assert!(
-            store
-                .take_initial_work_if_current(&snapshot)
+            test_take_initial_work(&store, &snapshot)
                 .expect("initial handoff lease is claimable")
                 .is_some()
         );
@@ -6673,8 +7056,7 @@ mod tests {
         drop(clock);
 
         assert!(
-            store
-                .next_initial_work_snapshot()
+            test_next_initial_work(&store)
                 .expect("pre-expiry initial-work scan is readable")
                 .is_none(),
             "changing only the final millisecond keeps the live recovery lease exclusive"
@@ -6695,9 +7077,7 @@ mod tests {
             .expect("accepted-input task snapshot is readable")
             .expect("accepted-input task snapshot is retained");
         assert_eq!(
-            store
-                .take_input_if_current(&claimed)
-                .expect("accepted input claim is valid"),
+            test_take_input(&store, &claimed).expect("accepted input claim is valid"),
             Some(input_responses.clone())
         );
 
@@ -6709,15 +7089,12 @@ mod tests {
             .expect("fixed handoff lease fits the monotonic test clock");
         drop(clock);
 
-        let recovered = store
-            .next_accepted_input_snapshot()
+        let recovered = test_next_accepted_input(&store)
             .expect("expired accepted-input lease scan is readable")
             .expect("an expired accepted-input claim becomes recoverable");
         assert_ne!(recovered.generation(), claimed.generation());
         assert_eq!(
-            store
-                .take_input_if_current(&recovered)
-                .expect("expired input lease permits a new claim"),
+            test_take_input(&store, &recovered).expect("expired input lease permits a new claim"),
             Some(input_responses),
             "lease expiry changes only recovery eligibility, not the retained input"
         );
@@ -6736,8 +7113,7 @@ mod tests {
             .expect("accepted-input task snapshot is readable")
             .expect("accepted-input task snapshot is retained");
         assert!(
-            store
-                .take_input_if_current(&claimed)
+            test_take_input(&store, &claimed)
                 .expect("accepted input claim is valid")
                 .is_some()
         );
@@ -6755,11 +7131,35 @@ mod tests {
         drop(clock);
 
         assert!(
-            store
-                .next_accepted_input_snapshot()
+            test_next_accepted_input(&store)
                 .expect("pre-expiry accepted-input scan is readable")
                 .is_none(),
             "changing only the final millisecond keeps the accepted-input claim exclusive"
+        );
+    }
+
+    #[test]
+    fn task_03_final_raw_input_claim_is_guarded_while_owned_claim_delivers_once() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let input_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed retained roots response");
+        let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+        let snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("accepted-input snapshot is readable")
+            .expect("accepted-input task remains retained");
+
+        assert!(
+            FinalTaskStore::take_input_if_current(&*store, &snapshot).is_err(),
+            "the legacy raw store claim is fail-closed without an execution owner"
+        );
+        assert_eq!(
+            FinalTaskStore::take_input_for_owner_if_current(&*store, &snapshot, "guarded-owner",)
+                .expect("owned handoff claim is valid"),
+            Some(input_responses),
+            "changing only the owner guard makes the durable input available exactly once"
         );
     }
 
@@ -6782,11 +7182,11 @@ mod tests {
             .expect("initial task snapshot is readable")
             .expect("initial task snapshot is retained");
         assert_eq!(
-            FinalTaskStore::take_initial_work_if_current(&*store, &snapshot, owner_id)
+            FinalTaskStore::take_initial_work_for_owner_if_current(&*store, &snapshot, owner_id)
                 .expect("initial handoff claim is valid"),
             Some(work_descriptor)
         );
-        let dispatch_fence = FinalTaskStore::begin_handoff_dispatch_if_current(
+        let dispatch_fence = FinalTaskStore::begin_handoff_dispatch_for_owner_if_current(
             &*store,
             &task_id,
             snapshot.generation(),
@@ -6853,11 +7253,15 @@ mod tests {
             .expect("initial task snapshot is readable")
             .expect("initial task snapshot is retained");
         assert!(
-            FinalTaskStore::take_initial_work_if_current(&*store, &abandoned, crashed_owner)
-                .expect("initial handoff lease is claimable")
-                .is_some()
+            FinalTaskStore::take_initial_work_for_owner_if_current(
+                &*store,
+                &abandoned,
+                crashed_owner,
+            )
+            .expect("initial handoff lease is claimable")
+            .is_some()
         );
-        let crashed_fence = FinalTaskStore::begin_handoff_dispatch_if_current(
+        let crashed_fence = FinalTaskStore::begin_handoff_dispatch_for_owner_if_current(
             &*store,
             &task_id,
             abandoned.generation(),
@@ -6874,18 +7278,21 @@ mod tests {
             .expect("fixed handoff lease fits the monotonic test clock");
         drop(clock);
 
-        let replacement = store
-            .next_initial_work_snapshot()
+        let replacement = test_next_initial_work(&store)
             .expect("expired lease recovery scan is readable")
             .expect("expired lease yields a newly fenced recovery candidate");
         assert_ne!(replacement.generation(), abandoned.generation());
         assert!(
-            FinalTaskStore::take_initial_work_if_current(&*store, &replacement, recovery_owner)
-                .expect("replacement recovery lease is claimable")
-                .is_some()
+            FinalTaskStore::take_initial_work_for_owner_if_current(
+                &*store,
+                &replacement,
+                recovery_owner,
+            )
+            .expect("replacement recovery lease is claimable")
+            .is_some()
         );
         assert!(
-            !FinalTaskStore::finish_handoff_dispatch_if_current(
+            !FinalTaskStore::finish_handoff_dispatch_for_owner_if_current(
                 &*store,
                 &task_id,
                 abandoned.generation(),
@@ -6896,8 +7303,7 @@ mod tests {
             "an expired elected owner cannot complete or release a replacement recovery lease"
         );
         assert!(
-            store
-                .next_initial_work_snapshot()
+            test_next_initial_work(&store)
                 .expect("newer lease scan is readable")
                 .is_none(),
             "the late stale restoration leaves the replacement lease exclusive"
@@ -6922,8 +7328,7 @@ mod tests {
             .expect("initial task snapshot is readable")
             .expect("initial task snapshot is retained");
         assert!(
-            store
-                .take_initial_work_if_current(&snapshot)
+            test_take_initial_work(&store, &snapshot)
                 .expect("initial handoff lease is claimable")
                 .is_some()
         );
@@ -6939,15 +7344,13 @@ mod tests {
                 .expect("cancellation intent remains durable")
         );
         assert!(
-            store
-                .next_initial_work_snapshot()
+            test_next_initial_work(&store)
                 .expect("cancelled initial-work scan is readable")
                 .is_none(),
             "cancellation clears a claimed-but-not-dispatched initial handoff"
         );
         assert!(
-            !store
-                .restore_initial_work_if_current(&task_id, snapshot.generation(), work_descriptor)
+            !test_restore_initial_work(&store, &task_id, snapshot.generation(), work_descriptor)
                 .expect("stale claimed-work restoration is fenced by cancellation"),
             "only cancellation differs from the retryable supervisor-error path"
         );
@@ -6971,9 +7374,7 @@ mod tests {
             .expect("initial task snapshot is readable")
             .expect("initial task snapshot is retained");
         assert_eq!(
-            store
-                .take_initial_work_if_current(&snapshot)
-                .expect("initial handoff claim is valid"),
+            test_take_initial_work(&store, &snapshot).expect("initial handoff claim is valid"),
             Some(work_descriptor.clone())
         );
         {
@@ -7680,7 +8081,8 @@ mod tests {
     fn task_03_final_recovery_initial_only_backlog_never_fabricates_resumption() {
         let store = Arc::new(InMemoryFinalTaskStore::default());
         for index in 0..=MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN {
-            let task = final_working_task_without_ttl(&format!("task-fair-initial-only-{index:03}"));
+            let task =
+                final_working_task_without_ttl(&format!("task-fair-initial-only-{index:03}"));
             store
                 .create_task_with_work(
                     task.clone(),
@@ -7866,6 +8268,156 @@ mod tests {
                 .expect("read unchanged supervisor handoff state")
                 .is_none(),
             "rejected input cannot create a supervisor handoff"
+        );
+    }
+
+    #[test]
+    fn task_03_final_update_ignores_unknown_and_already_satisfied_keys_without_mutation() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let mut requests = final_roots_request();
+        requests.insert(
+            "other-roots".to_owned(),
+            serde_json::from_value(serde_json::json!({"method": "roots/list"}))
+                .expect("typed second roots request"),
+        );
+        runtime
+            .require_input(&task_id, requests, None)
+            .expect("task awaits two typed roots responses");
+        let first_response: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed first roots response");
+        runtime
+            .update_task(&task_id, &first_response)
+            .expect("first outstanding input response is accepted");
+        let before = runtime
+            .get_task(&task_id)
+            .expect("read task before ignored replay")
+            .task;
+        let generation_before = store
+            .get_task_snapshot(&task_id)
+            .expect("read task generation before ignored replay")
+            .expect("task is retained before ignored replay")
+            .generation();
+        let notification_before = store
+            .latest_notification(&task_id)
+            .expect("task retains notification before ignored replay");
+        let ignored_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({
+                "roots": {
+                    "role": "assistant",
+                    "model": "final-model",
+                    "content": {"type": "text", "text": "already satisfied"}
+                },
+                "stale-key": {
+                    "role": "assistant",
+                    "model": "final-model",
+                    "content": {"type": "text", "text": "unknown"}
+                }
+            }))
+            .expect("well-formed ignored response map");
+
+        runtime
+            .update_task(&task_id, &ignored_responses)
+            .expect("unknown and already-satisfied input keys are acknowledged as a no-op");
+
+        assert_eq!(
+            runtime
+                .get_task(&task_id)
+                .expect("read task after ignored replay")
+                .task,
+            before,
+            "ignored keys cannot change outstanding input state"
+        );
+        assert_eq!(
+            store
+                .get_task_snapshot(&task_id)
+                .expect("read generation after ignored replay")
+                .expect("task remains retained after ignored replay")
+                .generation(),
+            generation_before,
+            "ignored keys cannot advance the durable task generation"
+        );
+        assert_eq!(
+            store.latest_notification(&task_id),
+            Some(notification_before),
+            "ignored keys cannot emit a replacement task notification"
+        );
+    }
+
+    #[test]
+    fn task_03_final_update_rejects_wrong_kind_for_outstanding_key_with_ignored_keys_present() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let mut requests = final_roots_request();
+        requests.insert(
+            "other-roots".to_owned(),
+            serde_json::from_value(serde_json::json!({"method": "roots/list"}))
+                .expect("typed second roots request"),
+        );
+        runtime
+            .require_input(&task_id, requests, None)
+            .expect("task awaits two typed roots responses");
+        let first_response: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed first roots response");
+        runtime
+            .update_task(&task_id, &first_response)
+            .expect("first outstanding input response is accepted");
+        let before = runtime
+            .get_task(&task_id)
+            .expect("read task before planted wrong-kind response")
+            .task;
+        let generation_before = store
+            .get_task_snapshot(&task_id)
+            .expect("read generation before planted wrong-kind response")
+            .expect("task is retained before planted wrong-kind response")
+            .generation();
+        let rejected_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({
+                "roots": {
+                    "role": "assistant",
+                    "model": "final-model",
+                    "content": {"type": "text", "text": "already satisfied"}
+                },
+                "other-roots": {
+                    "role": "assistant",
+                    "model": "final-model",
+                    "content": {"type": "text", "text": "wrong outstanding kind"}
+                }
+            }))
+            .expect("well-formed mixed response map");
+
+        assert!(
+            runtime.update_task(&task_id, &rejected_responses).is_err(),
+            "changing only the stale key to an outstanding roots key preserves wrong-kind rejection"
+        );
+        assert_eq!(
+            runtime
+                .get_task(&task_id)
+                .expect("read task after rejected response")
+                .task,
+            before,
+            "wrong-kind outstanding input cannot mutate task state"
+        );
+        assert_eq!(
+            store
+                .get_task_snapshot(&task_id)
+                .expect("read generation after rejected response")
+                .expect("task remains retained after rejected response")
+                .generation(),
+            generation_before,
+            "wrong-kind outstanding input cannot advance the task generation"
         );
     }
 

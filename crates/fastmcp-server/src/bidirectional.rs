@@ -2389,11 +2389,8 @@ mod tests {
             .expect("MRTR input result must issue");
         let request_state = mrtr_state_from_wire(&required);
 
-        let unknown_only = MrtrInputResponses::new([(
-            "inert".to_owned(),
-            mrtr_roots_response(),
-        )])
-        .expect("typed response map permits an inert key");
+        let unknown_only = MrtrInputResponses::new([("inert".to_owned(), mrtr_roots_response())])
+            .expect("typed response map permits an inert key");
         let error = registry
             .accept(&request_state, unknown_only)
             .expect_err("unknown-only typed input must not rotate a continuation");

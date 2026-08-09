@@ -20,20 +20,22 @@ use fastmcp_core::{
     McpContext, McpError, McpOutcome, McpResult, NotificationSender, Outcome, ProgressReporter,
     SessionState,
 };
+use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
 use fastmcp_protocol::{
     CacheScope, CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy,
     DecodedResult, FinalCallToolResult, FinalCompletionParams, FinalCompletionValues,
-    FinalGetPromptResult,
-    FinalPromptMessage, FinalReadResourceResult, FinalTool, Icon, InputRequiredResult,
-    JsonRpcRequest, LegacyCompletionParams, ProgressMarker, ProgressParams, Prompt, PromptMessage,
-    Resource, ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations,
-    decode_peer_result, encode_result,
+    FinalGetPromptResult, FinalProgressNotificationParams, FinalPrompt, FinalPromptMessage,
+    FinalReadResourceResult, FinalResource, FinalResourceTemplate, FinalTool, Icon,
+    InputRequiredResult, JsonRpcRequest, LegacyCompletionParams, ProgressMarker, ProgressParams,
+    Prompt, PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra,
+    Tool, ToolAnnotations, decode_peer_result, encode_result,
 };
 
 use crate::bidirectional::MrtrCompletedInputs;
+use crate::proxy::ProxyClient;
 use crate::tasks::FinalTaskWorkDescriptor;
 
 // ============================================================================
@@ -55,6 +57,9 @@ where
 {
     /// The progress marker from the original request.
     marker: ProgressMarker,
+    /// Whether this sender emits the exact final progress model rather than
+    /// the exact-2024 `f64` model.
+    final_protocol: bool,
     /// Callback to send notifications.
     send_fn: F,
 }
@@ -65,7 +70,25 @@ where
 {
     /// Creates a new progress notification sender.
     pub fn new(marker: ProgressMarker, send_fn: F) -> Self {
-        Self { marker, send_fn }
+        Self {
+            marker,
+            final_protocol: false,
+            send_fn,
+        }
+    }
+
+    /// Creates a progress sender for MCP 2026-07-28 handler dispatch.
+    ///
+    /// Calls made through the ordinary [`ProgressReporter`] bridge are
+    /// admitted as exact nonnegative JSON numbers and emitted with
+    /// [`FinalProgressNotificationParams`]. The exact-2024 constructor
+    /// [`Self::new`] deliberately retains its `f64` wire model.
+    pub fn new_final(marker: ProgressMarker, send_fn: F) -> Self {
+        Self {
+            marker,
+            final_protocol: true,
+            send_fn,
+        }
     }
 
     /// Creates a progress reporter from this sender.
@@ -119,17 +142,137 @@ where
             );
         }
     }
+
+    /// Emits an exact-final progress notification after final-era admission.
+    ///
+    /// Callers use the public [`NotificationSender::send_progress_exact`]
+    /// capability; this raw-model helper is intentionally private so a legacy
+    /// sender cannot bypass its protocol-era gate.
+    fn send_final_progress_exact(
+        &self,
+        progress: ExactNonNegativeJsonNumber,
+        total: Option<ExactNonNegativeJsonNumber>,
+        message: Option<&str>,
+    ) {
+        if !self.final_protocol {
+            log::warn!(
+                target: "fastmcp_rust::handler",
+                "final progress notification rejected; reason=legacy_sender"
+            );
+            return;
+        }
+        if total.as_ref().is_some_and(|total| progress > *total) {
+            log::warn!(
+                target: "fastmcp_rust::handler",
+                "final progress notification rejected; reason=progress_exceeds_total"
+            );
+            return;
+        }
+        let params = FinalProgressNotificationParams {
+            progress_token: self.marker.clone(),
+            progress,
+            total,
+            message: message.map(str::to_owned),
+            meta: None,
+            additional: BTreeMap::new(),
+        };
+        let Ok(serialized_params) = serde_json::to_value(params) else {
+            log::warn!(
+                target: "fastmcp_rust::handler",
+                "final progress notification rejected; reason=serialization_failure"
+            );
+            return;
+        };
+        let notification =
+            JsonRpcRequest::notification("notifications/progress", Some(serialized_params));
+        if crate::catch_extension_unwind(|| (self.send_fn)(notification)).is_err() {
+            log::error!(
+                target: "fastmcp_rust::handler",
+                "progress notification callback terminated unexpectedly; detail=panic_payload_redacted"
+            );
+        }
+    }
 }
 
 impl<F> NotificationSender for ProgressNotificationSender<F>
 where
     F: Fn(JsonRpcRequest) + Send + Sync,
 {
+    fn send_progress_exact(
+        &self,
+        progress: serde_json::Number,
+        total: Option<serde_json::Number>,
+        message: Option<&str>,
+    ) {
+        if !self.final_protocol {
+            log::warn!(
+                target: "fastmcp_rust::handler",
+                "final progress notification rejected; reason=legacy_sender"
+            );
+            return;
+        }
+        let progress = match ExactNonNegativeJsonNumber::try_from_number(progress) {
+            Ok(progress) => progress,
+            Err(_) => {
+                log::warn!(
+                    target: "fastmcp_rust::handler",
+                    "final progress notification rejected; reason=invalid_nonnegative_numeric_value"
+                );
+                return;
+            }
+        };
+        let total = match total {
+            Some(total) => match ExactNonNegativeJsonNumber::try_from_number(total) {
+                Ok(total) => Some(total),
+                Err(_) => {
+                    log::warn!(
+                        target: "fastmcp_rust::handler",
+                        "final progress notification rejected; reason=invalid_nonnegative_numeric_value"
+                    );
+                    return;
+                }
+            },
+            None => None,
+        };
+        self.send_final_progress_exact(progress, total, message);
+    }
+
     fn send_progress(&self, progress: f64, total: Option<f64>, message: Option<&str>) {
+        if self.final_protocol {
+            let Some(progress) = exact_nonnegative_progress_from_f64(progress) else {
+                log::warn!(
+                    target: "fastmcp_rust::handler",
+                    "final progress notification rejected; reason=invalid_nonnegative_numeric_value"
+                );
+                return;
+            };
+            let total = match total {
+                Some(total) => match exact_nonnegative_progress_from_f64(total) {
+                    Some(total) => Some(total),
+                    None => {
+                        log::warn!(
+                            target: "fastmcp_rust::handler",
+                            "final progress notification rejected; reason=invalid_nonnegative_numeric_value"
+                        );
+                        return;
+                    }
+                },
+                None => None,
+            };
+            self.send_final_progress_exact(progress, total, message);
+            return;
+        }
         self.send_progress_with_serializer(progress, total, message, |params| {
             serde_json::to_value(params)
         });
     }
+}
+
+fn exact_nonnegative_progress_from_f64(value: f64) -> Option<ExactNonNegativeJsonNumber> {
+    value
+        .is_finite()
+        .then(|| ExactNonNegativeJsonNumber::parse(&value.to_string()).ok())
+        .flatten()
 }
 
 impl<F> std::fmt::Debug for ProgressNotificationSender<F>
@@ -862,6 +1005,20 @@ pub trait ResourceHandler: Send + Sync {
         None
     }
 
+    /// Returns an exact final resource catalog definition, when this handler
+    /// owns one. This bypasses lossy projection through [`Resource`], retaining
+    /// final-only fields such as `size`, full icons, annotations, and `_meta`.
+    fn final_definition(&self) -> Option<FinalResource> {
+        None
+    }
+
+    /// Returns an exact final resource-template catalog definition, when this
+    /// handler owns a template. This keeps final metadata immutable at router
+    /// registration rather than reconstructing it from the legacy template.
+    fn final_template_definition(&self) -> Option<FinalResourceTemplate> {
+        None
+    }
+
     /// Returns the final display title for this concrete resource.
     fn final_title(&self) -> Option<&str> {
         None
@@ -1189,6 +1346,13 @@ pub trait PromptHandler: Send + Sync {
     /// Returns the prompt definition.
     fn definition(&self) -> Prompt;
 
+    /// Returns an exact final prompt catalog definition, when this handler
+    /// owns one. In particular, argument titles and absent-vs-present
+    /// `required` values must not be projected through legacy prompt args.
+    fn final_definition(&self) -> Option<FinalPrompt> {
+        None
+    }
+
     /// Returns the final display title for this prompt.
     fn final_title(&self) -> Option<&str> {
         None
@@ -1462,6 +1626,218 @@ pub type BoxedPromptHandler = Box<dyn PromptHandler>;
 
 /// A boxed completion handler.
 pub type BoxedCompletionHandler = Box<dyn CompletionHandler>;
+
+/// Proxy adapter for an upstream exact-final resource catalog entry.
+///
+/// The legacy definition is deliberately only a dispatch fallback. The router
+/// reads [`Self::final_definition`] during admission, so final discovery keeps
+/// the upstream `size`, annotations, icon collection, and metadata verbatim.
+pub(crate) struct FinalProxyResourceHandler {
+    legacy: Resource,
+    final_definition: FinalResource,
+    external_uri: String,
+    client: ProxyClient,
+}
+
+impl FinalProxyResourceHandler {
+    pub(crate) fn new(final_definition: FinalResource, client: ProxyClient) -> Self {
+        let external_uri = final_definition.uri.as_str().to_owned();
+        let legacy = Resource {
+            uri: external_uri.clone(),
+            name: final_definition.name.clone(),
+            description: final_definition.description.clone(),
+            mime_type: final_definition.mime_type.clone(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        };
+        Self {
+            legacy,
+            final_definition,
+            external_uri,
+            client,
+        }
+    }
+}
+
+impl ResourceHandler for FinalProxyResourceHandler {
+    fn definition(&self) -> Resource {
+        self.legacy.clone()
+    }
+
+    fn final_definition(&self) -> Option<FinalResource> {
+        Some(self.final_definition.clone())
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        self.client.read_resource(ctx, &self.external_uri)
+    }
+
+    fn read_final(&self, ctx: &McpContext) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        self.client.read_resource_final(ctx, &self.external_uri)
+    }
+}
+
+/// Proxy adapter for an upstream exact-final resource-template catalog entry.
+pub(crate) struct FinalProxyResourceTemplateHandler {
+    legacy_template: ResourceTemplate,
+    final_definition: FinalResourceTemplate,
+    external_uri_template: String,
+    client: ProxyClient,
+}
+
+impl FinalProxyResourceTemplateHandler {
+    pub(crate) fn new(final_definition: FinalResourceTemplate, client: ProxyClient) -> Self {
+        let external_uri_template = final_definition.uri_template.clone();
+        let legacy_template = ResourceTemplate {
+            uri_template: external_uri_template.clone(),
+            name: final_definition.name.clone(),
+            description: final_definition.description.clone(),
+            mime_type: final_definition.mime_type.clone(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        };
+        Self {
+            legacy_template,
+            final_definition,
+            external_uri_template,
+            client,
+        }
+    }
+}
+
+impl ResourceHandler for FinalProxyResourceTemplateHandler {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: self.legacy_template.uri_template.clone(),
+            name: self.legacy_template.name.clone(),
+            description: self.legacy_template.description.clone(),
+            mime_type: self.legacy_template.mime_type.clone(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(self.legacy_template.clone())
+    }
+
+    fn final_template_definition(&self) -> Option<FinalResourceTemplate> {
+        Some(self.final_definition.clone())
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        self.client.read_resource(ctx, &self.external_uri_template)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        _params: &UriParams,
+    ) -> McpResult<Vec<ResourceContent>> {
+        self.client.read_resource(ctx, uri)
+    }
+
+    fn read_final(&self, ctx: &McpContext) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        self.client
+            .read_resource_final(ctx, &self.external_uri_template)
+    }
+
+    fn read_final_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        _params: &UriParams,
+    ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        self.client.read_resource_final(ctx, uri)
+    }
+}
+
+/// Proxy adapter for an upstream exact-final prompt catalog entry.
+pub(crate) struct FinalProxyPromptHandler {
+    legacy: Prompt,
+    final_definition: FinalPrompt,
+    external_name: String,
+    client: ProxyClient,
+}
+
+impl FinalProxyPromptHandler {
+    pub(crate) fn new(final_definition: FinalPrompt, client: ProxyClient) -> Self {
+        let external_name = final_definition.name.clone();
+        let legacy = Prompt {
+            name: external_name.clone(),
+            description: final_definition.description.clone(),
+            arguments: final_definition
+                .arguments
+                .as_ref()
+                .map(|arguments| {
+                    arguments
+                        .iter()
+                        .map(|argument| fastmcp_protocol::PromptArgument {
+                            name: argument.name.clone(),
+                            description: argument.description.clone(),
+                            required: argument.required.unwrap_or(false),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        };
+        Self {
+            legacy,
+            final_definition,
+            external_name,
+            client,
+        }
+    }
+
+    /// Exposes a final prompt below a builder namespace while retaining the
+    /// original upstream name for forwarding. Prompt names are opaque labels,
+    /// unlike final resource URIs, so this rewrite remains exact.
+    pub(crate) fn with_prefix(
+        mut final_definition: FinalPrompt,
+        prefix: &str,
+        client: ProxyClient,
+    ) -> Self {
+        let external_name = final_definition.name.clone();
+        final_definition.name = format!("{prefix}/{}", final_definition.name);
+        let mut handler = Self::new(final_definition, client);
+        handler.external_name = external_name;
+        handler
+    }
+}
+
+impl PromptHandler for FinalProxyPromptHandler {
+    fn definition(&self) -> Prompt {
+        self.legacy.clone()
+    }
+
+    fn final_definition(&self) -> Option<FinalPrompt> {
+        Some(self.final_definition.clone())
+    }
+
+    fn get(
+        &self,
+        ctx: &McpContext,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        self.client.get_prompt(ctx, &self.external_name, arguments)
+    }
+
+    fn get_final(
+        &self,
+        ctx: &McpContext,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+        self.client
+            .get_prompt_final(ctx, &self.external_name, arguments)
+    }
+}
 
 // ============================================================================
 // Mounted Handler Wrappers
@@ -2382,6 +2758,71 @@ mod tests {
         let params = messages[0].params.as_ref().unwrap();
         assert_eq!(params["progress"], 3.0);
         assert_eq!(params["total"], 10.0);
+    }
+
+    #[test]
+    fn public_final_context_progress_preserves_beyond_f64_number_lexemes() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let reporter = ProgressNotificationSender::new_final(
+            ProgressMarker::from("final-progress"),
+            move |request| {
+                sent_clone
+                    .lock()
+                    .expect("notification collection is not poisoned")
+                    .push(request);
+            },
+        )
+        .into_reporter();
+        let context = McpContext::with_progress(Cx::for_testing(), 2715, reporter);
+        let progress: serde_json::Number =
+            serde_json::from_str("1e400").expect("arbitrary-precision progress parses");
+        let total: serde_json::Number =
+            serde_json::from_str("1e400").expect("arbitrary-precision total parses");
+        context.report_progress_exact(progress, Some(total), Some("retained"));
+
+        let notifications = sent
+            .lock()
+            .expect("notification collection is not poisoned");
+        assert_eq!(notifications.len(), 1);
+        let wire = serde_json::to_string(
+            notifications[0]
+                .params
+                .as_ref()
+                .expect("notification has parameters"),
+        )
+        .expect("final progress parameters serialize");
+        assert!(wire.contains("\"progressToken\":\"final-progress\""));
+        assert!(wire.contains("\"progress\":1e400"));
+        assert!(wire.contains("\"total\":1e400"));
+    }
+
+    #[test]
+    fn public_legacy_context_exact_progress_emits_nothing() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let reporter = ProgressNotificationSender::new_final(
+            ProgressMarker::from("ordinary-final-progress"),
+            move |request| {
+                sent_clone
+                    .lock()
+                    .expect("notification collection is not poisoned")
+                    .push(request);
+            },
+        )
+        .into_reporter();
+        let context = McpContext::with_progress(Cx::for_testing(), 2766, reporter);
+        context.report_progress_exact(
+            serde_json::from_str("1e400").expect("arbitrary-precision progress parses"),
+            Some(serde_json::from_str("1e400").expect("arbitrary-precision total parses")),
+            Some("complete"),
+        );
+        assert!(
+            sent.lock()
+                .expect("notification collection is not poisoned")
+                .is_empty(),
+            "the otherwise identical exact progress must not cross a legacy sender"
+        );
     }
 
     #[test]

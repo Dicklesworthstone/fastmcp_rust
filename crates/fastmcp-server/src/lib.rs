@@ -101,7 +101,10 @@ pub use handler::{
     create_context_with_progress, create_context_with_progress_and_senders,
 };
 pub use middleware::{Middleware, MiddlewareDecision};
-pub use proxy::{ProxyBackend, ProxyCatalog, ProxyClient};
+pub use proxy::{
+    FinalProgressCallback, ProxyBackend, ProxyCatalog, ProxyClient, ProxyPromptCatalog,
+    ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
+};
 pub use router::{
     InboundRequestContext, InboundRequestTransport, MountResult, NotificationSender, Router,
     TagFilters,
@@ -164,8 +167,8 @@ use fastmcp_core::{
     McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
-use fastmcp_protocol::common_types::Implementation;
 use fastmcp_protocol::common_types::OpenMetadata;
+use fastmcp_protocol::common_types::{Implementation, LoggingLevel};
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, ExtensionNegotiationError, ExtensionSettingsCompatibilityResolver,
     ExtensionSettingsResolution, McpAppsNegotiationResolver, TasksNegotiationResolver,
@@ -187,7 +190,7 @@ use fastmcp_protocol::{
     ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionId, ExtensionRegistryError,
     ExtensionRegistryReceipt, ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY,
     FINAL_SERVER_INFO_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams,
-    FinalCoreResult, FinalSubscriptionsAcknowledgedNotificationParams,
+    FinalCoreResult, FinalLogMessageParams, FinalSubscriptionsAcknowledgedNotificationParams,
     FinalSubscriptionsListenParams, GetPromptParams, InitializeParams, JsonRpcError,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
     ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
@@ -674,6 +677,7 @@ struct LiveLegacy2024ConnectionRuntime {
     notification_sender: NotificationSender,
     request_sender: Option<RequestSender>,
     supports_sampling: Arc<AtomicBool>,
+    supports_roots: Arc<AtomicBool>,
     log_level: Arc<Mutex<Option<LogLevel>>>,
     logging_ceiling: LevelFilter,
 }
@@ -716,6 +720,7 @@ impl LiveLegacy2024ConnectionRuntime {
             notification_sender,
             request_sender,
             supports_sampling: Arc::new(AtomicBool::new(false)),
+            supports_roots: Arc::new(AtomicBool::new(false)),
             log_level: Arc::new(Mutex::new(None)),
             logging_ceiling,
         }
@@ -752,6 +757,15 @@ impl LiveLegacy2024ConnectionRuntime {
                 .is_some_and(|capabilities| capabilities.sampling.is_some());
         self.supports_sampling
             .store(supports_sampling, Ordering::Release);
+
+        let supports_roots =
+            serde_json::from_slice::<serde_json::Value>(&snapshot.client_capabilities_bytes)
+                .ok()
+                .and_then(|capabilities| {
+                    decode_legacy_2024_11_05_client_capabilities(capabilities).ok()
+                })
+                .is_some_and(|capabilities| capabilities.roots.is_some());
+        self.supports_roots.store(supports_roots, Ordering::Release);
 
         let log_level = snapshot
             .logging_level
@@ -798,7 +812,7 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
             .queue_state
             .as_ref()
             .and_then(|queue| queue.admitted_request_cancellation(&request_id));
-        let request = JsonRpcRequest::new(method, params.cloned(), request_id);
+        let request = JsonRpcRequest::new(method, params.cloned(), request_id.clone());
         let dispatch = self
             .server
             .dispatch_legacy_2024(
@@ -848,6 +862,7 @@ struct HttpLegacy2024RuntimeHandler {
     session_principal: SessionPrincipalBinding,
     active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
     request_cx: Arc<Mutex<Cx>>,
+    runtime: LiveLegacy2024ConnectionRuntime,
     /// The live HTTP connection admits a correlated request before waiting
     /// for the session mutex. Reusing that authority here closes the gap
     /// between a separate cancellation POST and active-request registration.
@@ -872,7 +887,7 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
         let request_id = serde_json::from_value::<RequestId>(request_id.clone()).map_err(|_| {
             Legacy2024HandlerError::new("legacy adapter supplied an invalid request ID")
         })?;
-        let request = JsonRpcRequest::new(method, params.cloned(), request_id);
+        let request = JsonRpcRequest::new(method, params.cloned(), request_id.clone());
         let request_cx = self
             .request_cx
             .lock()
@@ -887,7 +902,7 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
                 &request_cx,
                 self.session_id,
                 &self.session_principal,
-                None,
+                Some(&self.runtime),
                 request_cancellation,
                 &request,
             )
@@ -2437,13 +2452,16 @@ pub struct ServerHttpEndpoint {
 #[must_use = "a ServerHttpSession with admitted work must be closed asynchronously"]
 pub struct ServerHttpSession {
     server: Arc<Server>,
-    endpoint_session: DualEraHttpSession,
+    endpoint_session: Arc<Mutex<DualEraHttpSession>>,
+    legacy_session_id: String,
     legacy_session: Session,
     legacy_binding: LegacyPeerBinding,
     legacy_adapter: Option<Legacy2024ServerAdapter<HttpLegacy2024RuntimeHandler>>,
     legacy_active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
     legacy_request_cx: Arc<Mutex<Cx>>,
     legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
+    legacy_pending_requests: Arc<PendingRequests>,
+    legacy_runtime: LiveLegacy2024ConnectionRuntime,
     /// Owned modern listen dispatches whose SSE bodies were returned to the
     /// embedding caller. Handles are retained because dropping an asupersync
     /// task handle detaches it from the session lifecycle.
@@ -3425,6 +3443,7 @@ impl HttpLegacyRequestAdmissions {
         self: &Arc<Self>,
         request: &HttpRequest,
         max_body_size: usize,
+        principal_binding: &SessionPrincipalBinding,
     ) -> Result<Option<HttpLegacyRequestAdmissionGuard>, ()> {
         let mut codec = Codec::new();
         codec.set_max_message_size(max_body_size);
@@ -3448,6 +3467,11 @@ impl HttpLegacyRequestAdmissions {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Establish the owner while the cancellation control is excluded from
+        // both authentication and map lookup. A control POST therefore cannot
+        // observe a bound owner without the matching per-ID authority, or an
+        // authority whose owner it cannot yet verify.
+        bind_anonymous_connection_principal(principal_binding).map_err(|_| ())?;
         if inner.entries.contains_key(&key) {
             return Err(());
         }
@@ -3470,7 +3494,10 @@ impl HttpLegacyRequestAdmissions {
         }))
     }
 
-    fn admitted_request_cancellation(&self, request_id: &RequestId) -> Option<McpRequestCancellation> {
+    fn admitted_request_cancellation(
+        &self,
+        request_id: &RequestId,
+    ) -> Option<McpRequestCancellation> {
         let key = request_id.correlation_key().ok()?;
         self.inner
             .lock()
@@ -3480,17 +3507,13 @@ impl HttpLegacyRequestAdmissions {
             .map(|entry| entry.cancellation.clone())
     }
 
-    fn cancel(
-        &self,
+    fn cancel_locked(
+        inner: &HttpLegacyRequestAdmissionsInner,
         request_id: &RequestId,
     ) -> HttpLegacyAdmissionCancellationDisposition {
         let Ok(key) = request_id.correlation_key() else {
             return HttpLegacyAdmissionCancellationDisposition::NotOwned;
         };
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(entry) = inner.entries.get(&key) else {
             return HttpLegacyAdmissionCancellationDisposition::NotOwned;
         };
@@ -3603,25 +3626,36 @@ impl HttpLegacyCancellationControl {
             return Some(HttpResponse::bad_request());
         }
 
-        match self.server.authenticate_cancelled_control_notification(
-            cx,
-            &self.session_principal,
-            ProtocolEra::Legacy2024,
-            &mut notification,
+        let (cancellation, disposition) = {
+            // The target admission binds its owner and inserts its exact
+            // authority under this same lock. Holding it through control
+            // authentication makes that transition one ordered operation.
+            let admissions = self
+                .admissions
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cancellation = match self.server.authenticate_cancelled_control_notification(
+                cx,
+                &self.session_principal,
+                ProtocolEra::Legacy2024,
+                &mut notification,
+            ) {
+                Ok(cancellation) => cancellation,
+                Err(_) => return Some(HttpResponse::bad_request()),
+            };
+            let request_id = Server::cancellation_wire_request_id(&cancellation);
+            let disposition = HttpLegacyRequestAdmissions::cancel_locked(&admissions, request_id);
+            (cancellation, disposition)
+        };
+        if matches!(
+            disposition,
+            HttpLegacyAdmissionCancellationDisposition::NotOwned
         ) {
-            Ok(cancellation) => {
-                let request_id = Server::cancellation_wire_request_id(&cancellation);
-                if matches!(
-                    self.admissions.cancel(request_id),
-                    HttpLegacyAdmissionCancellationDisposition::NotOwned
-                ) {
-                    self.server
-                        .handle_cancellation_wire_notification(self.session_id, cancellation);
-                }
-                Some(HttpResponse::new(HttpStatus::ACCEPTED))
-            }
-            Err(_) => Some(HttpResponse::bad_request()),
+            self.server
+                .handle_cancellation_wire_notification(self.session_id, cancellation);
         }
+        Some(HttpResponse::new(HttpStatus::ACCEPTED))
     }
 }
 
@@ -3939,19 +3973,61 @@ impl ServerHttpEndpoint {
         cx: &Cx,
         legacy_origin: &str,
     ) -> Result<ServerHttpSession, DualEraHttpEndpointError> {
-        let endpoint_session = self.transport_endpoint(legacy_origin)?.open_session()?;
+        let endpoint_session = Arc::new(Mutex::new(
+            self.transport_endpoint(legacy_origin)?.open_session()?,
+        ));
+        let legacy_session_id = endpoint_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .session_id()
+            .to_owned();
         let legacy_session =
             Session::new(self.server.info.clone(), self.server.capabilities.clone());
         let legacy_binding = runtime_legacy_binding(legacy_session.id());
+        let legacy_pending_requests = Arc::new(
+            PendingRequests::with_max_in_flight_for_exact_legacy(
+                self.server.max_bidirectional_requests_per_connection,
+            )
+            .expect("ServerBuilder validates the bidirectional request limit"),
+        );
+        let notification_sender: NotificationSender = {
+            let endpoint_session = Arc::clone(&endpoint_session);
+            Arc::new(move |notification| {
+                let _ = endpoint_session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .publish_legacy_message(&JsonRpcMessage::Request(notification));
+            })
+        };
+        let legacy_request_sender = RequestSender::new(Arc::clone(&legacy_pending_requests), {
+            let endpoint_session = Arc::clone(&endpoint_session);
+            Arc::new(move |message| {
+                endpoint_session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .publish_legacy_message(message)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        });
+        let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
+            legacy_session.state().clone(),
+            notification_sender,
+            Some(legacy_request_sender),
+            self.server.logging.level,
+        );
         Ok(ServerHttpSession {
             server: Arc::clone(&self.server),
             endpoint_session,
+            legacy_session_id,
             legacy_session,
             legacy_binding,
             legacy_adapter: None,
             legacy_active_request: Arc::new(Mutex::new(None)),
             legacy_request_cx: Arc::new(Mutex::new(cx.clone())),
             legacy_admissions: Arc::new(HttpLegacyRequestAdmissions::default()),
+            legacy_pending_requests,
+            legacy_runtime,
             modern_dispatches: Vec::new(),
             closed: false,
         })
@@ -3974,7 +4050,7 @@ impl ServerHttpSession {
     /// Returns the exact opaque session value required by the legacy POST URI.
     #[must_use]
     pub fn legacy_session_id(&self) -> &str {
-        self.endpoint_session.session_id()
+        &self.legacy_session_id
     }
 
     /// Routes and dispatches one modern or exact-2024 HTTP request.
@@ -4001,11 +4077,128 @@ impl ServerHttpSession {
                 HttpStatus::BAD_REQUEST,
             )));
         }
-        let endpoint_response = self.endpoint_session.handle(cx, request)?;
+        if let Some(response) = self.legacy_reverse_response_from_http(&request) {
+            return self.handle_legacy_reverse_response(response);
+        }
+        let endpoint_response = self
+            .endpoint_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .handle(cx, request)?;
         if is_modern {
             return self.handle_modern(cx, endpoint_response);
         }
         self.handle_legacy(cx, endpoint_response)
+    }
+
+    /// Returns a transport-backed roots provider after exact-2024 roots
+    /// capability negotiation has completed for this HTTP connection.
+    #[must_use]
+    pub fn legacy_roots_provider(&self) -> Option<TransportRootsProvider> {
+        if !self.legacy_adapter.as_ref().is_some_and(|adapter| {
+            let snapshot = adapter.snapshot();
+            snapshot.operating_transition_count == 1 && snapshot.close_release_count == 0
+        }) {
+            return None;
+        }
+        self.legacy_runtime
+            .supports_roots
+            .load(Ordering::Acquire)
+            .then(|| self.legacy_runtime.request_sender.clone())
+            .flatten()
+            .map(TransportRootsProvider::new)
+    }
+
+    /// Delivers an exact `notifications/resources/updated` message to this
+    /// live legacy HTTP connection when it subscribed to `uri`.
+    ///
+    /// Returns `false` without emitting a message when the connection has not
+    /// subscribed to the URI, has not completed legacy initialization, or its
+    /// SSE stream is not live.
+    pub fn notify_legacy_resource_updated(&mut self, uri: &str) -> bool {
+        let Some(adapter) = self.legacy_adapter.as_mut() else {
+            return false;
+        };
+        if adapter
+            .snapshot()
+            .subscriptions
+            .binary_search_by(|item| item.as_str().cmp(uri))
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(Legacy2024Outbound::ReverseNotification(notification)) = adapter.make_notification(
+            self.legacy_binding,
+            "notifications/resources/updated",
+            Some(serde_json::json!({ "uri": uri })),
+        ) else {
+            return false;
+        };
+        let Ok(notification) = serde_json::from_value::<JsonRpcRequest>(notification) else {
+            return false;
+        };
+        self.endpoint_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .publish_legacy_message(&JsonRpcMessage::Request(notification))
+            .is_ok()
+    }
+
+    fn legacy_reverse_response_from_http(&self, request: &HttpRequest) -> Option<JsonRpcResponse> {
+        if request.method != HttpMethod::Post
+            || request.path != self.server.http_config.legacy_message_path
+            || request.query.len() != 1
+            || request.query.get("session_id").map(String::as_str) != Some(self.legacy_session_id())
+            || !request.content_type().is_some_and(|content_type| {
+                content_type
+                    .split(';')
+                    .next()
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+            })
+        {
+            return None;
+        }
+        let mut codec = Codec::new();
+        codec.set_max_message_size(self.server.http_config.handler_config.max_body_size);
+        match codec.decode_complete_message(&request.body) {
+            Ok(JsonRpcMessage::Response(response)) if response.validate().is_ok() => Some(response),
+            Ok(JsonRpcMessage::Response(_)) | Err(_) | Ok(JsonRpcMessage::Request(_)) => None,
+        }
+    }
+
+    fn handle_legacy_reverse_response(
+        &mut self,
+        response: JsonRpcResponse,
+    ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
+        let disposition = self
+            .legacy_pending_requests
+            .route_response_with_disposition(&response);
+        if matches!(
+            disposition,
+            bidirectional::PendingResponseDisposition::Delivered
+                | bidirectional::PendingResponseDisposition::RetiredGeneric
+        ) {
+            return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
+                HttpStatus::ACCEPTED,
+            )));
+        }
+
+        let accepted_by_adapter = self.legacy_adapter.as_mut().is_some_and(|adapter| {
+            legacy_adapter_accept_response(adapter, self.legacy_binding, &response)
+        });
+        if !accepted_by_adapter {
+            return Ok(ServerHttpEndpointResponse::Immediate(
+                HttpResponse::bad_request(),
+            ));
+        }
+        if let Some(adapter) = self.legacy_adapter.as_ref() {
+            sync_live_legacy_runtime_from_adapter(&self.legacy_runtime, adapter);
+            self.legacy_session
+                .restore_log_level(self.legacy_runtime.log_level());
+        }
+        Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
+            HttpStatus::ACCEPTED,
+        )))
     }
 
     fn handle_modern(
@@ -4013,7 +4206,11 @@ impl ServerHttpSession {
         cx: &Cx,
         endpoint_response: DualEraHttpEndpointResponse,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
-        let request = self.endpoint_session.recv_modern_request(cx)?;
+        let request = self
+            .endpoint_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv_modern_request(cx)?;
 
         // Final Streamable HTTP cancellation is response-body closure. A
         // separate notifications/cancelled POST has no request-body authority
@@ -4057,16 +4254,18 @@ impl ServerHttpSession {
             request_id_to_u64(request.id.as_ref()),
             InboundRequestTransport::Http,
         );
-        let response = self.server.dispatch_with_protocol_policy(
-            self.server.protocol_policy,
-            &inbound,
-            &request,
-        );
 
         match endpoint_response {
             DualEraHttpEndpointResponse::ModernJson(pending) => {
+                let response = self.server.dispatch_with_protocol_policy(
+                    self.server.protocol_policy,
+                    &inbound,
+                    &request,
+                );
                 if let Some(response) = response {
                     self.endpoint_session
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .send_modern_json_response(cx, response)?;
                     let response = pending
                         .try_response()?
@@ -4080,12 +4279,43 @@ impl ServerHttpSession {
             }
             DualEraHttpEndpointResponse::ModernSse(sse) => {
                 let request_cancellation = sse.sender().request_cancellation();
+                let transport_cancellation = sse.cancellation();
+                let notification_sender: NotificationSender = {
+                    let endpoint_session = Arc::clone(&self.endpoint_session);
+                    let notification_cx = cx.clone();
+                    let transport_cancellation = transport_cancellation.clone();
+                    let request_cancellation = request_cancellation.clone();
+                    Arc::new(move |notification| {
+                        if endpoint_session
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .send_modern_sse_notification(
+                                &notification_cx,
+                                &transport_cancellation,
+                                notification,
+                            )
+                            .is_err()
+                        {
+                            request_cancellation.cancel();
+                        }
+                    })
+                };
+                let response = block_on(
+                    Arc::clone(&self.server).dispatch_with_protocol_policy_owned(
+                        self.server.protocol_policy,
+                        &inbound,
+                        request,
+                        None,
+                        request_cancellation.clone(),
+                        None,
+                        notification_sender,
+                    ),
+                );
                 if let Some(response) = response {
-                    self.endpoint_session.send_modern_sse_response(
-                        cx,
-                        &sse.cancellation(),
-                        response,
-                    )?;
+                    self.endpoint_session
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .send_modern_sse_response(cx, &transport_cancellation, response)?;
                 }
                 Ok(ServerHttpEndpointResponse::ModernSse(
                     ServerHttpSseResponse::new(
@@ -4123,11 +4353,19 @@ impl ServerHttpSession {
                 HttpResponse::new(HttpStatus::BAD_REQUEST),
             )));
         }
-        let endpoint_response = self.endpoint_session.handle(cx, request)?;
+        let endpoint_response = self
+            .endpoint_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .handle(cx, request)?;
         let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
             return self.handle_modern(cx, endpoint_response).map(Err);
         };
-        let request = self.endpoint_session.recv_modern_request(cx)?;
+        let request = self
+            .endpoint_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv_modern_request(cx)?;
         if request.method == "notifications/cancelled" {
             return Ok(Err(ServerHttpEndpointResponse::Immediate(
                 HttpResponse::bad_request(),
@@ -4152,7 +4390,12 @@ impl ServerHttpSession {
             }
         };
 
-        let Some(request) = self.endpoint_session.take_legacy_request() else {
+        let Some(request) = self
+            .endpoint_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_legacy_request()
+        else {
             return Ok(ServerHttpEndpointResponse::Immediate(response));
         };
 
@@ -4172,6 +4415,7 @@ impl ServerHttpSession {
                         session_principal: self.legacy_session.principal_binding(),
                         active_request: Arc::clone(&self.legacy_active_request),
                         request_cx: Arc::clone(&self.legacy_request_cx),
+                        runtime: self.legacy_runtime.clone(),
                         legacy_admissions: Arc::clone(&self.legacy_admissions),
                     },
                 )
@@ -4189,6 +4433,9 @@ impl ServerHttpSession {
                     error.to_string(),
                 )))
             })?;
+        sync_live_legacy_runtime_from_adapter(&self.legacy_runtime, adapter);
+        self.legacy_session
+            .restore_log_level(self.legacy_runtime.log_level());
         let active_request = take_live_legacy_active_request(&self.legacy_active_request);
         if request.method == "notifications/cancelled" && request.id.is_none() {
             if let Ok(params) = parse_params::<CancelledParams>(request.params.clone()) {
@@ -4203,6 +4450,8 @@ impl ServerHttpSession {
         handled
             .send_with(&mut self.legacy_session, |response| {
                 self.endpoint_session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .publish_legacy_message(&JsonRpcMessage::Response(response.clone()))
                     .map(|_| ())
                     .map_err(|error| TransportError::Io(std::io::Error::other(error.to_string())))
@@ -4240,7 +4489,10 @@ impl ServerHttpSession {
         if let Some(adapter) = self.legacy_adapter.as_mut() {
             let _ = adapter.close(self.legacy_binding);
         }
-        self.endpoint_session.close();
+        self.endpoint_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close();
         dispatches
             .into_iter()
             .map(|dispatch| dispatch.task)
@@ -4388,8 +4640,8 @@ async fn send_h1_response(
         }
         framed.poll_close(task_cx)
     })
-        .await
-        .map_err(|_| ())
+    .await
+    .map_err(|_| ())
 }
 
 fn legacy_sse_response_head(response: &HttpResponse) -> Result<Vec<u8>, ()> {
@@ -4664,7 +4916,11 @@ fn admit_live_http_legacy_request(
     session
         .cancellation
         .admissions
-        .admit(request, session.cancellation.max_body_size)
+        .admit(
+            request,
+            session.cancellation.max_body_size,
+            &session.cancellation.session_principal,
+        )
         .map_err(|()| HttpResponse::bad_request())
 }
 
@@ -4698,11 +4954,11 @@ fn dispatch_http_request(
         // active guard, and response finalization.
         let _admission = match legacy_admission {
             Some(admission) => Some(admission),
-            None => match session
-                .cancellation
-                .admissions
-                .admit(&request, session.cancellation.max_body_size)
-            {
+            None => match session.cancellation.admissions.admit(
+                &request,
+                session.cancellation.max_body_size,
+                &session.cancellation.session_principal,
+            ) {
                 Ok(admission) => admission,
                 Err(()) => return HttpResponse::bad_request(),
             },
@@ -4817,17 +5073,14 @@ async fn serve_http_connection(
         // dispatch queue. The captured guard keeps this exact authority alive
         // while it waits for the session mutex and then crosses into active
         // dispatch and response finalization.
-        let legacy_admission = match admit_live_http_legacy_request(
-            &endpoint,
-            &legacy_sessions,
-            &request,
-        ) {
-            Ok(admission) => admission,
-            Err(response) => {
-                let _ = send_h1_response(cx, &mut framed, response).await;
-                return;
-            }
-        };
+        let legacy_admission =
+            match admit_live_http_legacy_request(&endpoint, &legacy_sessions, &request) {
+                Ok(admission) => admission,
+                Err(response) => {
+                    let _ = send_h1_response(cx, &mut framed, response).await;
+                    return;
+                }
+            };
         let request_endpoint = Arc::clone(&endpoint);
         let request_legacy_sessions = Arc::clone(&legacy_sessions);
         let mut dispatch = match cx.spawn_blocking(move |request_cx| {
@@ -5818,6 +6071,7 @@ impl Server {
         if let Some(stats) = &self.stats {
             stats.record_request(&method, started_at.elapsed(), result.is_ok());
         }
+        self.maybe_emit_final_log_notification(&request, &notification_sender, result.is_ok());
         if is_notification {
             if let Err(error) = result {
                 error!(
@@ -6246,10 +6500,10 @@ impl Server {
 
     /// Processes a modern request under an explicit protocol policy.
     ///
-    /// `ModernOnly` declines legacy `initialize` before parameter decoding or
-    /// any legacy session lookup. Other requests retain the stateless public
-    /// dispatch behavior, including final `server/discover` as the first
-    /// request.
+    /// `ModernOnly` declines every request that lacks the exact final-era
+    /// marker before parameter decoding or any legacy session lookup. Final
+    /// `server/discover` remains a valid first request when it carries that
+    /// marker.
     #[must_use]
     pub fn dispatch_with_protocol_policy(
         &self,
@@ -6258,6 +6512,26 @@ impl Server {
         request: &JsonRpcRequest,
     ) -> Option<JsonRpcResponse> {
         self.dispatch_with_protocol_policy_and_cancellation(policy, inbound, request, None)
+    }
+
+    /// Processes a modern request and delivers its request-scoped final log
+    /// notification through the same connection-owned output sender.
+    fn dispatch_with_protocol_policy_and_final_logging(
+        &self,
+        policy: ProtocolPolicy,
+        inbound: &InboundRequestContext,
+        request: &JsonRpcRequest,
+        notification_sender: &NotificationSender,
+    ) -> Option<JsonRpcResponse> {
+        let response = self.dispatch_with_protocol_policy(policy, inbound, request);
+        if let Some(response) = &response {
+            self.maybe_emit_final_log_notification(
+                request,
+                notification_sender,
+                response.error.is_none(),
+            );
+        }
+        response
     }
 
     fn dispatch_with_protocol_policy_and_cancellation(
@@ -6273,10 +6547,14 @@ impl Server {
             return protocol_era_refusal(request);
         }
         if matches!(policy, ProtocolPolicy::ModernOnly)
-            && request.method == "initialize"
-            && request.validate().is_ok()
-            && inbound.request_id() == request_id_to_u64(request.id.as_ref())
+            && modern_protocol_version(request) != Some(MODERN_PROTOCOL_VERSION)
         {
+            if request.method != "initialize"
+                || request.validate().is_err()
+                || inbound.request_id() != request_id_to_u64(request.id.as_ref())
+            {
+                return protocol_era_refusal(request);
+            }
             return request.id.clone().map(|id| {
                 JsonRpcResponse::error(
                     Some(id),
@@ -6292,7 +6570,7 @@ impl Server {
     }
 
     /// Maps an explicit-policy modern dispatch result onto the HTTP response
-    /// status required for a legacy initialize refusal.
+    /// status required for an explicit-policy cross-era refusal.
     ///
     /// The transport still owns raw HTTP parsing, origin checks, and
     /// authentication before it constructs [`InboundRequestContext`]. This
@@ -6308,9 +6586,7 @@ impl Server {
         let is_cross_era_request = (matches!(policy, ProtocolPolicy::LegacyOnly)
             && modern_protocol_version(request).is_some())
             || (matches!(policy, ProtocolPolicy::ModernOnly)
-                && request.method == "initialize"
-                && request.validate().is_ok()
-                && inbound.request_id() == request_id_to_u64(request.id.as_ref()));
+                && modern_protocol_version(request) != Some(MODERN_PROTOCOL_VERSION));
         match self.dispatch_with_protocol_policy(policy, inbound, request) {
             Some(response) if is_cross_era_request => {
                 HttpResponse::new(HttpStatus::BAD_REQUEST).with_json(&response)
@@ -7753,10 +8029,29 @@ impl Server {
                         request_id_to_u64(request.id.as_ref()),
                         InboundRequestTransport::Stdio,
                     );
-                    let response = worker_server.dispatch_with_protocol_policy(
-                        worker_server.protocol_policy,
-                        &inbound,
-                        &request,
+                    let notification_send = Arc::clone(&worker_send);
+                    let notification_cx = worker_cx.clone();
+                    let notification_cancellation = request_cancellation.clone();
+                    let notification_sender: NotificationSender = Arc::new(move |notification| {
+                        let mut send_guard = notification_send
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if send_guard(&notification_cx, &JsonRpcMessage::Request(notification))
+                            .is_err()
+                        {
+                            notification_cancellation.cancel();
+                        }
+                    });
+                    let response = block_on(
+                        Arc::clone(&worker_server).dispatch_with_protocol_policy_owned(
+                            worker_server.protocol_policy,
+                            &inbound,
+                            request.clone(),
+                            None,
+                            request_cancellation.clone(),
+                            None,
+                            notification_sender,
+                        ),
                     );
                     let send_result = response.map_or(Ok(()), |response| {
                         let mut send_guard = worker_send
@@ -8055,9 +8350,9 @@ impl Server {
                                 | DispatchCancellationDisposition::AlreadySettled => false,
                                 DispatchCancellationDisposition::NotOwned => server
                                     .handle_cancellation_wire_notification(
-                                    session_id,
-                                    cancellation,
-                                ),
+                                        session_id,
+                                        cancellation,
+                                    ),
                             };
                             if cancellation_accepted {
                                 let interrupted = pending_requests.cancel_cancelled();
@@ -8347,49 +8642,39 @@ impl Server {
                                                 InboundRequestTransport::Stdio,
                                             );
                                             let started = Instant::now();
-                                            let response = if request.method == SUBSCRIPTIONS_LISTEN {
-                                                let notification_send = Arc::clone(&request_send);
-                                                let notification_cx = request_cx.clone();
-                                                let notification_cancellation =
-                                                    request_cancellation.clone();
-                                                let notification_sender: NotificationSender = Arc::new(
-                                                    move |notification| {
-                                                        let mut send_guard = notification_send
-                                                            .lock()
-                                                            .unwrap_or_else(
-                                                                std::sync::PoisonError::into_inner,
-                                                            );
-                                                        if send_guard(
-                                                            &notification_cx,
-                                                            &JsonRpcMessage::Request(notification),
-                                                        )
-                                                        .is_err()
-                                                        {
-                                                            notification_cancellation.cancel();
-                                                        }
-                                                    },
-                                                );
-                                                block_on(
-                                                    Arc::clone(&request_server)
-                                                        .dispatch_with_protocol_policy_owned(
-                                                            request_server.protocol_policy,
-                                                            &inbound,
-                                                            request.clone(),
-                                                            None,
-                                                            request_cancellation.clone(),
-                                                            None,
-                                                            notification_sender,
-                                                        ),
-                                                )
-                                            } else {
-                                                request_server
-                                                    .dispatch_with_protocol_policy_and_cancellation(
+                                            let notification_send = Arc::clone(&request_send);
+                                            let notification_cx = request_cx.clone();
+                                            let notification_cancellation =
+                                                request_cancellation.clone();
+                                            let notification_sender: NotificationSender = Arc::new(
+                                                move |notification| {
+                                                    let mut send_guard = notification_send
+                                                        .lock()
+                                                        .unwrap_or_else(
+                                                            std::sync::PoisonError::into_inner,
+                                                        );
+                                                    if send_guard(
+                                                        &notification_cx,
+                                                        &JsonRpcMessage::Request(notification),
+                                                    )
+                                                    .is_err()
+                                                    {
+                                                        notification_cancellation.cancel();
+                                                    }
+                                                },
+                                            );
+                                            let response = block_on(
+                                                Arc::clone(&request_server)
+                                                    .dispatch_with_protocol_policy_owned(
                                                         request_server.protocol_policy,
                                                         &inbound,
-                                                        &request,
-                                                        Some(request_cancellation.clone()),
-                                                    )
-                                            };
+                                                        request.clone(),
+                                                        None,
+                                                        request_cancellation.clone(),
+                                                        None,
+                                                        notification_sender,
+                                                    ),
+                                            );
                                             let send_result = response.map_or(Ok(()), |mut response| {
                                                 let mut send_guard = request_send
                                                     .lock()
@@ -8471,26 +8756,26 @@ impl Server {
                                 }
                             }
                         } else if let Some(id) = response_id {
-                                let unavailable = JsonRpcResponse::error(
-                                    Some(id),
-                                    JsonRpcError {
-                                        code: McpErrorCode::InternalError.into(),
-                                        message: "Caller runtime could not admit request dispatch"
-                                            .to_string(),
-                                        data: None,
-                                    },
-                                );
-                                if send
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
-                                    cx,
-                                    &JsonRpcMessage::Response(unavailable),
-                                )
-                                .is_err()
-                                {
-                                    exit_code = 1;
-                                    break;
-                                }
+                            let unavailable = JsonRpcResponse::error(
+                                Some(id),
+                                JsonRpcError {
+                                    code: McpErrorCode::InternalError.into(),
+                                    message: "Caller runtime could not admit request dispatch"
+                                        .to_string(),
+                                    data: None,
+                                },
+                            );
+                            if send
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                cx,
+                                &JsonRpcMessage::Response(unavailable),
+                            )
+                            .is_err()
+                            {
+                                exit_code = 1;
+                                break;
+                            }
                         }
                         continue;
                     }
@@ -8577,9 +8862,9 @@ impl Server {
                                 }
                             }
                         }
-                        Err(asupersync_mpsc::SendError::Full(
-                            QueuedDispatchMessage::Request(request),
-                        )) => {
+                        Err(asupersync_mpsc::SendError::Full(QueuedDispatchMessage::Request(
+                            request,
+                        ))) => {
                             queue_state.release_queued_bytes(request.serialized_bytes);
                             if let Some(id) = request.request.id {
                                 queue_state.discard(&id);
@@ -8758,7 +9043,7 @@ impl Server {
         let pending_requests = self.new_pending_requests_for_connection();
         let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
             SessionState::new(),
-            notification_sender,
+            Arc::clone(&notification_sender),
             None,
             self.logging.level,
         );
@@ -8938,8 +9223,13 @@ impl Server {
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                         );
-                        self.dispatch_with_protocol_policy(self.protocol_policy, &inbound, &request)
-                            .map(HandledRequest::untracked)
+                        self.dispatch_with_protocol_policy_and_final_logging(
+                            self.protocol_policy,
+                            &inbound,
+                            &request,
+                            &notification_sender,
+                        )
+                        .map(HandledRequest::untracked)
                     } else {
                         let adapter = match legacy_adapter.as_mut() {
                             Some(adapter) => adapter,
@@ -9092,7 +9382,7 @@ impl Server {
         let pending_requests = self.new_pending_requests_for_connection();
         let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
             SessionState::new(),
-            notification_sender,
+            Arc::clone(&notification_sender),
             None,
             self.logging.level,
         );
@@ -9312,8 +9602,13 @@ impl Server {
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                         );
-                        self.dispatch_with_protocol_policy(self.protocol_policy, &inbound, &request)
-                            .map(HandledRequest::untracked)
+                        self.dispatch_with_protocol_policy_and_final_logging(
+                            self.protocol_policy,
+                            &inbound,
+                            &request,
+                            &notification_sender,
+                        )
+                        .map(HandledRequest::untracked)
                     } else {
                         let adapter = match legacy_adapter.as_mut() {
                             Some(adapter) => adapter,
@@ -11166,6 +11461,108 @@ impl Server {
         }
     }
 
+    fn final_log_level_rank(level: LoggingLevel) -> u8 {
+        match level {
+            LoggingLevel::Debug => 1,
+            LoggingLevel::Info => 2,
+            LoggingLevel::Notice => 3,
+            LoggingLevel::Warning => 4,
+            LoggingLevel::Error => 5,
+            LoggingLevel::Critical => 6,
+            LoggingLevel::Alert => 7,
+            LoggingLevel::Emergency => 8,
+        }
+    }
+
+    fn final_logging_ceiling(&self) -> Option<LoggingLevel> {
+        match self.logging.level {
+            LevelFilter::Off => None,
+            LevelFilter::Trace | LevelFilter::Debug => Some(LoggingLevel::Debug),
+            LevelFilter::Info => Some(LoggingLevel::Info),
+            LevelFilter::Warn => Some(LoggingLevel::Warning),
+            LevelFilter::Error => Some(LoggingLevel::Error),
+        }
+    }
+
+    fn final_request_log_level(&self, request: &JsonRpcRequest) -> Option<LoggingLevel> {
+        if modern_protocol_version(request) != Some(MODERN_PROTOCOL_VERSION) {
+            return None;
+        }
+        let entries: BTreeMap<String, serde_json::Value> = request
+            .params
+            .as_ref()?
+            .get("_meta")?
+            .as_object()?
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let requested = OpenMetadata::try_from_entries(entries)
+            .ok()?
+            .log_level()
+            .ok()??;
+        let ceiling = self.final_logging_ceiling()?;
+        Some(
+            (Self::final_log_level_rank(requested) < Self::final_log_level_rank(ceiling))
+                .then_some(ceiling)
+                .unwrap_or(requested),
+        )
+    }
+
+    fn final_log_notification_metadata(&self) -> Option<OpenMetadata> {
+        let server_info =
+            Implementation::try_new(self.info.name.clone(), self.info.version.clone()).ok()?;
+        OpenMetadata::try_from_entries([(
+            FINAL_SERVER_INFO_META_KEY.to_owned(),
+            serde_json::to_value(server_info).ok()?,
+        )])
+        .ok()
+    }
+
+    fn maybe_emit_final_log_notification(
+        &self,
+        request: &JsonRpcRequest,
+        sender: &NotificationSender,
+        result_is_ok: bool,
+    ) {
+        if request.method.starts_with("notifications/") {
+            return;
+        }
+        let Some(min_level) = self.final_request_log_level(request) else {
+            return;
+        };
+        let level = if result_is_ok {
+            LoggingLevel::Info
+        } else {
+            LoggingLevel::Error
+        };
+        if Self::final_log_level_rank(level) < Self::final_log_level_rank(min_level) {
+            return;
+        }
+        let Some(meta) = self.final_log_notification_metadata() else {
+            return;
+        };
+        let method_key = safe_peer_log_key(&request.method);
+        let message = if result_is_ok {
+            format!("Handled method={method_key}")
+        } else {
+            format!("Error handling method={method_key}")
+        };
+        let notification = ServerNotification::Message(FinalLogMessageParams {
+            level,
+            logger: Some("fastmcp_rust::server".to_owned()),
+            data: serde_json::Value::String(message),
+            meta: Some(meta),
+            additional: BTreeMap::new(),
+        })
+        .encode();
+        let Ok(notification) = notification else {
+            return;
+        };
+        if catch_extension_unwind(|| sender(notification)).is_err() {
+            let _ = extension_panic_error("final_log_notification_sender");
+        }
+    }
+
     fn emit_log_notification_for_level(
         &self,
         min_level: Option<LogLevel>,
@@ -12347,9 +12744,7 @@ mod lib_unit_tests {
         before: usize,
         probe: fn() -> usize,
     ) -> Result<(), String> {
-        let deadline = cx
-            .now()
-            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         while probe() <= before {
             cx.checkpoint()
                 .map_err(|error| format!("live HTTP probe caller stopped: {error}"))?;
@@ -12364,11 +12759,8 @@ mod lib_unit_tests {
     }
 
     async fn wait_for_live_http_test_result<T>(receiver: Receiver<T>) -> Result<T, String> {
-        let cx = Cx::current()
-            .expect("the test runtime must install an ambient Cx while polling");
-        let deadline = cx
-            .now()
-            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let cx = Cx::current().expect("the test runtime must install an ambient Cx while polling");
+        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         loop {
             match receiver.try_recv() {
                 Ok(result) => return Ok(result),
@@ -12497,9 +12889,7 @@ mod lib_unit_tests {
     async fn live_http_exchange(address: SocketAddr, request: Vec<u8>) -> Result<Vec<u8>, String> {
         let cx = Cx::current()
             .expect("the test runtime must install an ambient Cx for live HTTP exchange");
-        let deadline = cx
-            .now()
-            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         let mut stream = asupersync::time::timeout_at(deadline, AsyncTcpStream::connect(address))
             .await
             .map_err(|_| live_http_test_timeout("live HTTP client connection"))?
@@ -12553,9 +12943,7 @@ mod lib_unit_tests {
     ) -> Result<(), String> {
         let cx = Cx::current()
             .expect("the test runtime must install an ambient Cx for live HTTP SSE reads");
-        let deadline = cx
-            .now()
-            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         while !received
             .windows(needle.len())
             .any(|window| window == needle)
@@ -12583,9 +12971,7 @@ mod lib_unit_tests {
     ) -> Result<(), String> {
         let cx = Cx::current()
             .expect("the test runtime must install an ambient Cx for live HTTP EOF reads");
-        let deadline = cx
-            .now()
-            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         asupersync::time::timeout_at(deadline, stream.read_to_end(received))
             .await
             .map_err(|_| live_http_test_timeout(operation))?
@@ -12598,9 +12984,7 @@ mod lib_unit_tests {
     ) -> Result<(AsyncTcpStream, String, Vec<u8>), String> {
         let cx = Cx::current()
             .expect("the test runtime must install an ambient Cx for legacy HTTP SSE setup");
-        let deadline = cx
-            .now()
-            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         let mut stream = asupersync::time::timeout_at(deadline, AsyncTcpStream::connect(address))
             .await
             .map_err(|_| live_http_test_timeout("legacy HTTP SSE connection"))?
@@ -12635,9 +13019,7 @@ mod lib_unit_tests {
         session: &LiveHttpSession,
         request_id: &RequestId,
     ) -> Result<(), String> {
-        let deadline = cx
-            .now()
-            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         while !session.cancellation.admissions.contains(request_id) {
             cx.checkpoint()
                 .map_err(|error| format!("legacy HTTP admission wait stopped: {error}"))?;
@@ -13087,17 +13469,61 @@ mod lib_unit_tests {
         tasks: std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, fastmcp_protocol::Task>,
         generations: std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, u64>,
         next_generation: u64,
+        next_dispatch_fence: u64,
+        work_descriptors:
+            std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, FinalTaskWorkDescriptor>,
+        initial_work:
+            std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, FinalTaskWorkDescriptor>,
         accepted_inputs: std::collections::BTreeMap<
             fastmcp_protocol::FinalTaskId,
             fastmcp_protocol::TaskInputResponses,
         >,
+        handoff_leases:
+            std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, ServerFinalTaskHandoffLease>,
         cancellation_requests: std::collections::BTreeSet<fastmcp_protocol::FinalTaskId>,
         notifications: Vec<fastmcp_protocol::TaskStatusNotification>,
+        expires_at: std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, Instant>,
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ServerFinalTaskHandoffKind {
+        Initial,
+        Resumed,
+    }
+
+    struct ServerFinalTaskHandoffLease {
+        generation: u64,
+        kind: ServerFinalTaskHandoffKind,
+        owner_id: String,
+        dispatch_fence: Option<u64>,
+        expires_at: Instant,
+    }
+
+    const SERVER_FINAL_TASK_HANDOFF_LEASE: Duration = Duration::from_secs(30);
+    const SERVER_FINAL_TASK_HANDOFF_HEARTBEAT: Duration = Duration::from_secs(10);
+
     struct ServerFinalTaskStore {
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
         state: Mutex<ServerFinalTaskState>,
+    }
+
+    impl Default for ServerFinalTaskStore {
+        fn default() -> Self {
+            Self::with_clock(Arc::new(Instant::now))
+        }
+    }
+
+    impl ServerFinalTaskStore {
+        fn with_clock(clock: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
+            Self {
+                clock,
+                state: Mutex::new(ServerFinalTaskState::default()),
+            }
+        }
+
+        fn now(&self) -> Instant {
+            (self.clock)()
+        }
     }
 
     fn next_server_final_task_generation(state: &mut ServerFinalTaskState) -> McpResult<u64> {
@@ -13106,6 +13532,170 @@ mod lib_unit_tests {
         })?;
         state.next_generation = generation;
         Ok(generation)
+    }
+
+    fn next_server_final_task_dispatch_fence(state: &mut ServerFinalTaskState) -> McpResult<u64> {
+        let fence = state.next_dispatch_fence.checked_add(1).ok_or_else(|| {
+            McpError::internal_error(
+                "Server final task test-store dispatch fence space is exhausted",
+            )
+        })?;
+        state.next_dispatch_fence = fence;
+        Ok(fence)
+    }
+
+    fn server_final_task_handoff_expiry(now: Instant) -> McpResult<Instant> {
+        now.checked_add(SERVER_FINAL_TASK_HANDOFF_LEASE)
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "Server final task test-store handoff lease exceeds clock range",
+                )
+            })
+    }
+
+    fn server_final_task_expiry(
+        task: &fastmcp_protocol::Task,
+        now: Instant,
+    ) -> McpResult<Option<Instant>> {
+        let Some(ttl_ms) = task
+            .base()
+            .ttl_ms
+            .as_ref()
+            .map(fastmcp_protocol::TaskDuration::as_millis)
+        else {
+            return Ok(None);
+        };
+        now.checked_add(Duration::from_millis(ttl_ms))
+            .map(Some)
+            .ok_or_else(|| {
+                McpError::internal_error("Server final task test-store TTL exceeds clock range")
+            })
+    }
+
+    fn server_final_task_is_working(
+        state: &ServerFinalTaskState,
+        task_id: &fastmcp_protocol::FinalTaskId,
+        generation: u64,
+    ) -> bool {
+        state.generations.get(task_id) == Some(&generation)
+            && state
+                .tasks
+                .get(task_id)
+                .is_some_and(|task| matches!(task, fastmcp_protocol::Task::Working(_)))
+            && !state.cancellation_requests.contains(task_id)
+    }
+
+    fn reclaim_expired_server_final_task_handoffs(state: &mut ServerFinalTaskState, now: Instant) {
+        let expired = state
+            .handoff_leases
+            .iter()
+            .filter_map(|(task_id, lease)| (lease.expires_at <= now).then(|| task_id.clone()))
+            .collect::<Vec<_>>();
+        for task_id in expired {
+            let Some(lease) = state.handoff_leases.get(&task_id) else {
+                continue;
+            };
+            let recoverable = server_final_task_is_working(state, &task_id, lease.generation);
+            if recoverable {
+                if let Ok(generation) = next_server_final_task_generation(state) {
+                    state.handoff_leases.remove(&task_id);
+                    state.generations.insert(task_id, generation);
+                }
+            } else {
+                state.handoff_leases.remove(&task_id);
+            }
+        }
+
+        let expired_task_ids = state
+            .expires_at
+            .iter()
+            .filter_map(|(task_id, expires_at)| (*expires_at <= now).then(|| task_id.clone()))
+            .collect::<Vec<_>>();
+        for task_id in expired_task_ids {
+            state.expires_at.remove(&task_id);
+            state.tasks.remove(&task_id);
+            state.generations.remove(&task_id);
+            state.work_descriptors.remove(&task_id);
+            state.initial_work.remove(&task_id);
+            state.accepted_inputs.remove(&task_id);
+            state.handoff_leases.remove(&task_id);
+            state.cancellation_requests.remove(&task_id);
+            state
+                .notifications
+                .retain(|notification| notification.params.task.base().task_id != task_id);
+        }
+    }
+
+    fn insert_server_final_task_handoff_lease(
+        state: &mut ServerFinalTaskState,
+        task_id: fastmcp_protocol::FinalTaskId,
+        generation: u64,
+        kind: ServerFinalTaskHandoffKind,
+        owner_id: &str,
+        now: Instant,
+    ) -> McpResult<()> {
+        let expires_at = server_final_task_handoff_expiry(now)?;
+        if state
+            .handoff_leases
+            .insert(
+                task_id,
+                ServerFinalTaskHandoffLease {
+                    generation,
+                    kind,
+                    owner_id: owner_id.to_owned(),
+                    dispatch_fence: None,
+                    expires_at,
+                },
+            )
+            .is_some()
+        {
+            return Err(McpError::internal_error(
+                "Server final task test-store overwrote a live handoff lease",
+            ));
+        }
+        Ok(())
+    }
+
+    fn next_server_final_task_recovery_id(
+        task_ids: impl Iterator<Item = &fastmcp_protocol::FinalTaskId>,
+        after_task_id: Option<&fastmcp_protocol::FinalTaskId>,
+        mut eligible: impl FnMut(&fastmcp_protocol::FinalTaskId) -> bool,
+    ) -> Option<fastmcp_protocol::FinalTaskId> {
+        let task_ids = task_ids.collect::<Vec<_>>();
+        task_ids
+            .iter()
+            .copied()
+            .find(|task_id| {
+                after_task_id.is_none_or(|after| *task_id > after) && eligible(*task_id)
+            })
+            .or_else(|| task_ids.into_iter().find(|task_id| eligible(*task_id)))
+            .cloned()
+    }
+
+    fn record_server_final_task_cancellation(
+        state: &mut ServerFinalTaskState,
+        task_id: &fastmcp_protocol::FinalTaskId,
+    ) -> McpResult<()> {
+        let generation = state.generations.get(task_id).copied().ok_or_else(|| {
+            McpError::internal_error("Server final task test-store is missing a task generation")
+        })?;
+        let dispatch_elected = state
+            .handoff_leases
+            .get(task_id)
+            .is_some_and(|lease| lease.generation == generation && lease.dispatch_fence.is_some());
+        let next_generation = (!dispatch_elected && !state.cancellation_requests.contains(task_id))
+            .then(|| next_server_final_task_generation(state))
+            .transpose()?;
+        state.accepted_inputs.remove(task_id);
+        state.initial_work.remove(task_id);
+        if !dispatch_elected {
+            state.handoff_leases.remove(task_id);
+        }
+        state.cancellation_requests.insert(task_id.clone());
+        if let Some(next_generation) = next_generation {
+            state.generations.insert(task_id.clone(), next_generation);
+        }
+        Ok(())
     }
 
     fn ensure_server_final_task_notification_matches_task(
@@ -13138,17 +13728,60 @@ mod lib_unit_tests {
         ) -> McpResult<()> {
             let task_id = task.base().task_id.clone();
             ensure_server_final_task_notification_matches_task(&task, &notification)?;
+            let now = self.now();
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             if state.tasks.contains_key(&task_id) {
                 return Err(McpError::invalid_params("Task already exists"));
             }
+            let expires_at = server_final_task_expiry(&task, now)?;
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
-            state.generations.insert(task_id, generation);
+            state.generations.insert(task_id.clone(), generation);
             state.notifications.push(notification);
+            if let Some(expires_at) = expires_at {
+                state.expires_at.insert(task_id, expires_at);
+            }
+            Ok(())
+        }
+
+        fn create_task_with_work(
+            &self,
+            task: fastmcp_protocol::Task,
+            notification: fastmcp_protocol::TaskStatusNotification,
+            work_descriptor: FinalTaskWorkDescriptor,
+        ) -> McpResult<()> {
+            let task_id = task.base().task_id.clone();
+            ensure_server_final_task_notification_matches_task(&task, &notification)?;
+            if !matches!(task, fastmcp_protocol::Task::Working(_)) {
+                return Err(McpError::invalid_params(
+                    "Initial application work requires a working final task",
+                ));
+            }
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
+            if state.tasks.contains_key(&task_id) {
+                return Err(McpError::invalid_params("Task already exists"));
+            }
+            let expires_at = server_final_task_expiry(&task, now)?;
+            let generation = next_server_final_task_generation(&mut state)?;
+            state.tasks.insert(task_id.clone(), task);
+            state.generations.insert(task_id.clone(), generation);
+            state
+                .work_descriptors
+                .insert(task_id.clone(), work_descriptor.clone());
+            state.initial_work.insert(task_id.clone(), work_descriptor);
+            state.notifications.push(notification);
+            if let Some(expires_at) = expires_at {
+                state.expires_at.insert(task_id, expires_at);
+            }
             Ok(())
         }
 
@@ -13156,23 +13789,23 @@ mod lib_unit_tests {
             &self,
             task_id: &fastmcp_protocol::FinalTaskId,
         ) -> McpResult<Option<fastmcp_protocol::Task>> {
-            Ok(self
+            let mut state = self
                 .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .tasks
-                .get(task_id)
-                .cloned())
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            Ok(state.tasks.get(task_id).cloned())
         }
 
         fn get_task_snapshot(
             &self,
             task_id: &fastmcp_protocol::FinalTaskId,
         ) -> McpResult<Option<FinalTaskSnapshot>> {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             let Some(task) = state.tasks.get(task_id).cloned() else {
                 return Ok(None);
             };
@@ -13193,6 +13826,7 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             if !state.tasks.contains_key(&task_id) {
                 return Err(McpError::invalid_params("Task not found"));
             }
@@ -13206,6 +13840,8 @@ mod lib_unit_tests {
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
             state.accepted_inputs.remove(&task_id);
+            state.handoff_leases.remove(&task_id);
+            state.initial_work.remove(&task_id);
             state.notifications.push(notification);
             if terminal {
                 state.cancellation_requests.remove(&task_id);
@@ -13230,6 +13866,7 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             if state.generations.get(&task_id) != Some(&expected.generation()) {
                 return Ok(false);
             }
@@ -13243,6 +13880,8 @@ mod lib_unit_tests {
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
             state.accepted_inputs.remove(&task_id);
+            state.handoff_leases.remove(&task_id);
+            state.initial_work.remove(&task_id);
             state.notifications.push(notification);
             if terminal {
                 state.cancellation_requests.remove(&task_id);
@@ -13268,12 +13907,15 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             if state.generations.get(&task_id) != Some(&expected.generation()) {
                 return Ok(false);
             }
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
+            state.handoff_leases.remove(&task_id);
+            state.initial_work.remove(&task_id);
             if !input_responses.is_empty() {
                 state
                     .accepted_inputs
@@ -13302,6 +13944,7 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             if state.generations.get(&task_id) != Some(&expected.generation()) {
                 return Ok(false);
             }
@@ -13315,6 +13958,8 @@ mod lib_unit_tests {
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
             state.accepted_inputs.remove(&task_id);
+            state.handoff_leases.remove(&task_id);
+            state.initial_work.remove(&task_id);
             state.notifications.push(notification);
             if terminal {
                 state.cancellation_requests.remove(&task_id);
@@ -13324,22 +13969,349 @@ mod lib_unit_tests {
 
         fn take_input_if_current(
             &self,
-            expected: &FinalTaskSnapshot,
+            _expected: &FinalTaskSnapshot,
         ) -> McpResult<Option<fastmcp_protocol::TaskInputResponses>> {
+            Err(McpError::internal_error(
+                "Raw final task input claims require an authorized service owner",
+            ))
+        }
+
+        fn take_input_for_owner_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            owner_id: &str,
+        ) -> McpResult<Option<fastmcp_protocol::TaskInputResponses>> {
+            if owner_id.is_empty() {
+                return Err(McpError::invalid_params(
+                    "Final task handoff owner must be non-empty",
+                ));
+            }
             let task_id = &expected.task().base().task_id;
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.generations.get(task_id) != Some(&expected.generation())
-                || !state
-                    .tasks
-                    .get(task_id)
-                    .is_some_and(|task| matches!(task, fastmcp_protocol::Task::Working(_)))
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
+            if !server_final_task_is_working(&state, task_id, expected.generation())
+                || state.handoff_leases.contains_key(task_id)
             {
                 return Ok(None);
             }
-            Ok(state.accepted_inputs.remove(task_id))
+            let Some(input_responses) = state.accepted_inputs.get(task_id).cloned() else {
+                return Ok(None);
+            };
+            insert_server_final_task_handoff_lease(
+                &mut state,
+                task_id.clone(),
+                expected.generation(),
+                ServerFinalTaskHandoffKind::Resumed,
+                owner_id,
+                now,
+            )?;
+            Ok(Some(input_responses))
+        }
+
+        fn work_descriptor_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+        ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+            let task_id = &expected.task().base().task_id;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            if !server_final_task_is_working(&state, task_id, expected.generation()) {
+                return Ok(None);
+            }
+            state
+                .work_descriptors
+                .get(task_id)
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| {
+                    McpError::internal_error(
+                        "Server final task test-store is missing a working task descriptor",
+                    )
+                })
+        }
+
+        fn next_initial_work_snapshot_after(
+            &self,
+            after_task_id: Option<&fastmcp_protocol::FinalTaskId>,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let Some(task_id) = next_server_final_task_recovery_id(
+                state.initial_work.keys(),
+                after_task_id,
+                |task_id| {
+                    state.generations.get(task_id).is_some_and(|generation| {
+                        server_final_task_is_working(&state, task_id, *generation)
+                    }) && !state.handoff_leases.contains_key(task_id)
+                },
+            ) else {
+                return Ok(None);
+            };
+            let task = state.tasks.get(&task_id).cloned().ok_or_else(|| {
+                McpError::internal_error(
+                    "Server final task test-store retained initial work for a missing task",
+                )
+            })?;
+            let generation = state.generations.get(&task_id).copied().ok_or_else(|| {
+                McpError::internal_error(
+                    "Server final task test-store retained initial work without a generation",
+                )
+            })?;
+            Ok(Some(FinalTaskSnapshot::new(task, generation)))
+        }
+
+        fn next_initial_work_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.next_initial_work_snapshot_after(None)
+        }
+
+        fn take_initial_work_for_owner_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            owner_id: &str,
+        ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+            if owner_id.is_empty() {
+                return Err(McpError::invalid_params(
+                    "Final task handoff owner must be non-empty",
+                ));
+            }
+            let task_id = &expected.task().base().task_id;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
+            if !server_final_task_is_working(&state, task_id, expected.generation())
+                || state.handoff_leases.contains_key(task_id)
+            {
+                return Ok(None);
+            }
+            let Some(work_descriptor) = state.initial_work.get(task_id).cloned() else {
+                return Ok(None);
+            };
+            insert_server_final_task_handoff_lease(
+                &mut state,
+                task_id.clone(),
+                expected.generation(),
+                ServerFinalTaskHandoffKind::Initial,
+                owner_id,
+                now,
+            )?;
+            Ok(Some(work_descriptor))
+        }
+
+        fn restore_initial_work_for_owner_if_current(
+            &self,
+            task_id: &fastmcp_protocol::FinalTaskId,
+            generation: u64,
+            owner_id: &str,
+            dispatch_fence: Option<u64>,
+            work_descriptor: FinalTaskWorkDescriptor,
+        ) -> McpResult<bool> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let owns_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
+                lease.generation == generation
+                    && lease.kind == ServerFinalTaskHandoffKind::Initial
+                    && lease.owner_id == owner_id
+                    && lease.dispatch_fence == dispatch_fence
+            });
+            if !owns_lease {
+                return Ok(false);
+            }
+            state.handoff_leases.remove(task_id);
+            Ok(server_final_task_is_working(&state, task_id, generation)
+                && state.initial_work.get(task_id) == Some(&work_descriptor))
+        }
+
+        fn next_accepted_input_snapshot_after(
+            &self,
+            after_task_id: Option<&fastmcp_protocol::FinalTaskId>,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let Some(task_id) = next_server_final_task_recovery_id(
+                state.accepted_inputs.keys(),
+                after_task_id,
+                |task_id| {
+                    state.generations.get(task_id).is_some_and(|generation| {
+                        server_final_task_is_working(&state, task_id, *generation)
+                    }) && !state.handoff_leases.contains_key(task_id)
+                },
+            ) else {
+                return Ok(None);
+            };
+            let task = state.tasks.get(&task_id).cloned().ok_or_else(|| {
+                McpError::internal_error(
+                    "Server final task test-store retained input for a missing task",
+                )
+            })?;
+            let generation = state.generations.get(&task_id).copied().ok_or_else(|| {
+                McpError::internal_error(
+                    "Server final task test-store retained input without a generation",
+                )
+            })?;
+            Ok(Some(FinalTaskSnapshot::new(task, generation)))
+        }
+
+        fn next_accepted_input_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.next_accepted_input_snapshot_after(None)
+        }
+
+        fn restore_input_for_owner_if_current(
+            &self,
+            task_id: &fastmcp_protocol::FinalTaskId,
+            generation: u64,
+            owner_id: &str,
+            dispatch_fence: Option<u64>,
+            input_responses: fastmcp_protocol::TaskInputResponses,
+        ) -> McpResult<bool> {
+            if input_responses.is_empty() {
+                return Err(McpError::internal_error(
+                    "Cannot restore an empty accepted-input handoff",
+                ));
+            }
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let owns_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
+                lease.generation == generation
+                    && lease.kind == ServerFinalTaskHandoffKind::Resumed
+                    && lease.owner_id == owner_id
+                    && lease.dispatch_fence == dispatch_fence
+            });
+            if !owns_lease {
+                return Ok(false);
+            }
+            state.handoff_leases.remove(task_id);
+            Ok(server_final_task_is_working(&state, task_id, generation)
+                && state.accepted_inputs.get(task_id) == Some(&input_responses))
+        }
+
+        fn begin_handoff_dispatch_for_owner_if_current(
+            &self,
+            task_id: &fastmcp_protocol::FinalTaskId,
+            generation: u64,
+            owner_id: &str,
+        ) -> McpResult<Option<u64>> {
+            if owner_id.is_empty() {
+                return Err(McpError::invalid_params(
+                    "Final task handoff owner must be non-empty",
+                ));
+            }
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
+            if !server_final_task_is_working(&state, task_id, generation)
+                || !state.handoff_leases.get(task_id).is_some_and(|lease| {
+                    lease.generation == generation
+                        && lease.owner_id == owner_id
+                        && lease.dispatch_fence.is_none()
+                        && lease.expires_at > now
+                })
+            {
+                return Ok(None);
+            }
+            let dispatch_fence = next_server_final_task_dispatch_fence(&mut state)?;
+            let expires_at = server_final_task_handoff_expiry(now)?;
+            let lease = state.handoff_leases.get_mut(task_id).ok_or_else(|| {
+                McpError::internal_error("Server final task test-store lost a handoff lease")
+            })?;
+            lease.dispatch_fence = Some(dispatch_fence);
+            lease.expires_at = expires_at;
+            Ok(Some(dispatch_fence))
+        }
+
+        fn renew_handoff_dispatch_if_current(
+            &self,
+            task_id: &fastmcp_protocol::FinalTaskId,
+            generation: u64,
+            owner_id: &str,
+            dispatch_fence: u64,
+        ) -> McpResult<bool> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
+            if !server_final_task_is_working(&state, task_id, generation)
+                || !state.handoff_leases.get(task_id).is_some_and(|lease| {
+                    lease.generation == generation
+                        && lease.owner_id == owner_id
+                        && lease.dispatch_fence == Some(dispatch_fence)
+                })
+            {
+                return Ok(false);
+            }
+            let expires_at = server_final_task_handoff_expiry(now)?;
+            let lease = state.handoff_leases.get_mut(task_id).ok_or_else(|| {
+                McpError::internal_error("Server final task test-store lost a handoff lease")
+            })?;
+            lease.expires_at = expires_at;
+            Ok(true)
+        }
+
+        fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<Duration> {
+            Ok(SERVER_FINAL_TASK_HANDOFF_HEARTBEAT)
+        }
+
+        fn finish_handoff_dispatch_for_owner_if_current(
+            &self,
+            task_id: &fastmcp_protocol::FinalTaskId,
+            generation: u64,
+            owner_id: &str,
+            dispatch_fence: u64,
+        ) -> McpResult<bool> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let Some(lease) = state.handoff_leases.get(task_id) else {
+                return Ok(false);
+            };
+            if lease.generation != generation
+                || lease.owner_id != owner_id
+                || lease.dispatch_fence != Some(dispatch_fence)
+            {
+                return Ok(false);
+            }
+            let kind = lease.kind;
+            let still_dispatchable = server_final_task_is_working(&state, task_id, generation);
+            state.handoff_leases.remove(task_id);
+            if still_dispatchable {
+                match kind {
+                    ServerFinalTaskHandoffKind::Initial => {
+                        state.initial_work.remove(task_id);
+                    }
+                    ServerFinalTaskHandoffKind::Resumed => {
+                        state.accepted_inputs.remove(task_id);
+                    }
+                }
+            }
+            Ok(still_dispatchable)
         }
 
         fn request_cancellation(&self, task_id: &fastmcp_protocol::FinalTaskId) -> McpResult<()> {
@@ -13347,15 +14319,11 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             if !state.tasks.contains_key(task_id) {
                 return Err(McpError::invalid_params("Task not found"));
             }
-            if !state.cancellation_requests.contains(task_id) {
-                let generation = next_server_final_task_generation(&mut state)?;
-                state.cancellation_requests.insert(task_id.clone());
-                state.generations.insert(task_id.clone(), generation);
-            }
-            Ok(())
+            record_server_final_task_cancellation(&mut state, task_id)
         }
 
         fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
@@ -13364,14 +14332,28 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             if state.generations.get(task_id) != Some(&expected.generation()) {
                 return Ok(false);
             }
-            if !state.cancellation_requests.contains(task_id) {
-                let generation = next_server_final_task_generation(&mut state)?;
-                state.cancellation_requests.insert(task_id.clone());
-                state.generations.insert(task_id.clone(), generation);
+            record_server_final_task_cancellation(&mut state, task_id)?;
+            Ok(true)
+        }
+
+        fn request_cancellation_and_clear_input_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+        ) -> McpResult<bool> {
+            let task_id = &expected.task().base().task_id;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            if state.generations.get(task_id) != Some(&expected.generation()) {
+                return Ok(false);
             }
+            record_server_final_task_cancellation(&mut state, task_id)?;
             Ok(true)
         }
 
@@ -13379,10 +14361,11 @@ mod lib_unit_tests {
             &self,
             task_id: &fastmcp_protocol::FinalTaskId,
         ) -> McpResult<bool> {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             if !state.tasks.contains_key(task_id) {
                 return Err(McpError::invalid_params("Task not found"));
             }
@@ -13402,11 +14385,12 @@ mod lib_unit_tests {
         }
     }
 
-    /// Holds only the ready-service lease required by route-admission tests.
-    /// Task-service delivery and recovery are exercised against a driven
-    /// runner in `tasks.rs`; these route fixtures deliberately do not claim
-    /// that proof class.
-    fn hold_final_tasks_test_service_readiness(
+    /// Starts an owned Tasks runner and advances it to its receive boundary.
+    ///
+    /// Callers retain the returned future for the server lifetime. Tests that
+    /// claim handoff consumption drive that same future after a durable wakeup
+    /// rather than treating readiness alone as execution evidence.
+    fn start_final_tasks_test_service(
         runtime: &FinalTaskRuntime,
     ) -> std::pin::Pin<Box<dyn Future<Output = McpResult<()>>>> {
         let runner = runtime
@@ -13427,6 +14411,242 @@ mod lib_unit_tests {
             "operation": "server-final-tasks-test",
         }))
         .expect("test final Tasks work descriptor must be valid")
+    }
+
+    struct RecordingServerFinalTaskSupervisor {
+        started: Arc<Mutex<Vec<fastmcp_protocol::FinalTaskId>>>,
+    }
+
+    impl ApplicationTaskSupervisor for RecordingServerFinalTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let started = Arc::clone(&self.started);
+            Box::pin(async move {
+                let FinalTaskSupervisorHandoff::Initial(initial) = handoff else {
+                    return Err(McpError::internal_error(
+                        "server final task test supervisor expected initial work",
+                    ));
+                };
+                started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(initial.task_id().clone());
+                cx.cancel_with(asupersync::CancelKind::User, None);
+                Ok(())
+            })
+        }
+    }
+
+    fn server_final_task_store_runtime(store: Arc<ServerFinalTaskStore>) -> FinalTaskRuntime {
+        FinalTaskRuntime::new(
+            store,
+            FinalTaskRuntimeConfig::new(60_000, None)
+                .expect("server final task test policy is valid"),
+            Arc::new(|_| {}),
+        )
+    }
+
+    fn poll_final_task_service_once<F>(
+        service: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<McpResult<()>>
+    where
+        F: Future<Output = McpResult<()>>,
+    {
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        Future::poll(service, &mut task_cx)
+    }
+
+    #[test]
+    fn server_final_task_store_service_consumes_durable_initial_work() {
+        let store = Arc::new(ServerFinalTaskStore::default());
+        let runtime = server_final_task_store_runtime(Arc::clone(&store));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(RecordingServerFinalTaskSupervisor {
+                    started: Arc::clone(&started),
+                }),
+            )
+            .expect("test task service installs");
+        let service_cx = Cx::for_testing();
+        let mut service = Box::pin(runner.run(&service_cx));
+
+        assert!(matches!(
+            poll_final_task_service_once(service.as_mut()),
+            std::task::Poll::Pending
+        ));
+        let created = runtime
+            .create_task_with_work(final_tasks_test_work_descriptor(), None)
+            .expect("ready service admits durable initial work");
+        let task_id = created.task.base().task_id.clone();
+
+        assert!(matches!(
+            poll_final_task_service_once(service.as_mut()),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[task_id],
+            "the service consumes exactly the initial descriptor retained with task creation"
+        );
+        assert!(
+            FinalTaskStore::next_initial_work_snapshot(&*store)
+                .expect("completed initial-work scan is valid")
+                .is_none(),
+            "successful owner-fenced dispatch consumes the initial handoff"
+        );
+    }
+
+    #[test]
+    fn server_final_task_store_cancellation_before_wakeup_fences_initial_work() {
+        let store = Arc::new(ServerFinalTaskStore::default());
+        let runtime = server_final_task_store_runtime(Arc::clone(&store));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(RecordingServerFinalTaskSupervisor {
+                    started: Arc::clone(&started),
+                }),
+            )
+            .expect("test task service installs");
+        let service_cx = Cx::for_testing();
+        let mut service = Box::pin(runner.run(&service_cx));
+
+        assert!(matches!(
+            poll_final_task_service_once(service.as_mut()),
+            std::task::Poll::Pending
+        ));
+        let created = runtime
+            .create_task_with_work(final_tasks_test_work_descriptor(), None)
+            .expect("ready service admits durable initial work");
+        let task_id = created.task.base().task_id.clone();
+        runtime
+            .cancel_task(&task_id)
+            .expect("changing only cancellation records intent before service polling");
+
+        assert!(matches!(
+            poll_final_task_service_once(service.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "cancellation before dispatch prevents application initial work"
+        );
+        assert!(
+            FinalTaskStore::next_initial_work_snapshot(&*store)
+                .expect("cancelled initial-work scan is valid")
+                .is_none(),
+            "cancellation fences the durable initial handoff instead of allowing recovery"
+        );
+    }
+
+    #[test]
+    fn server_final_task_store_reclaims_finite_ttl_task_and_work_at_creation_expiry() {
+        let start = Instant::now();
+        let clock_now = Arc::new(Mutex::new(start));
+        let clock = {
+            let clock_now = Arc::clone(&clock_now);
+            Arc::new(move || {
+                *clock_now
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+        };
+        let store = ServerFinalTaskStore::with_clock(clock);
+        let task_id = fastmcp_protocol::FinalTaskId::parse("server-store-ttl-test")
+            .expect("fixed final task ID must be valid");
+        let timestamp = fastmcp_protocol::TaskTimestamp::parse("2026-07-28T12:00:00.000Z")
+            .expect("fixed final task timestamp must be valid");
+        let task = fastmcp_protocol::Task::Working(fastmcp_protocol::TaskBase {
+            task_id: task_id.clone(),
+            status: fastmcp_protocol::FinalTaskStatus::Working,
+            status_message: None,
+            created_at: timestamp.clone(),
+            last_updated_at: timestamp,
+            ttl_ms: Some(
+                serde_json::from_value(serde_json::json!(10_u64))
+                    .expect("positive finite task TTL must be valid"),
+            ),
+            poll_interval_ms: None,
+        });
+        let notification = fastmcp_protocol::TaskStatusNotification::new(
+            fastmcp_protocol::tasks_extension::TaskStatusNotificationParams {
+                task: task.clone(),
+                meta: None,
+                additional: BTreeMap::new(),
+            },
+        );
+        store
+            .create_task_with_work(task, notification, final_tasks_test_work_descriptor())
+            .expect("finite task creation atomically retains task and initial work");
+
+        let pre_expiry_snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("pre-expiry task snapshot is readable")
+            .expect("finite task remains readable before its creation-time TTL expires");
+        assert!(
+            store
+                .work_descriptor_if_current(&pre_expiry_snapshot)
+                .expect("pre-expiry work lookup is valid")
+                .is_some(),
+            "the initial descriptor remains readable before expiry"
+        );
+        assert!(
+            store
+                .next_initial_work_snapshot()
+                .expect("pre-expiry initial-work recovery scan is valid")
+                .is_some(),
+            "the initial descriptor remains recoverable before expiry"
+        );
+
+        *clock_now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = start
+            .checked_add(Duration::from_millis(10))
+            .expect("test monotonic clock must represent task expiry");
+
+        assert!(
+            store
+                .get_task(&task_id)
+                .expect("post-expiry task lookup is valid")
+                .is_none(),
+            "changing only the clock to the finite creation-time expiry reclaims the task"
+        );
+        assert!(
+            store
+                .get_task_snapshot(&task_id)
+                .expect("post-expiry task snapshot lookup is valid")
+                .is_none(),
+            "expiry leaves no readable task generation"
+        );
+        assert!(
+            store
+                .next_initial_work_snapshot()
+                .expect("post-expiry initial-work recovery scan is valid")
+                .is_none(),
+            "expiry leaves no recoverable initial work"
+        );
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !state.work_descriptors.contains_key(&task_id)
+                && !state.initial_work.contains_key(&task_id)
+                && !state.expires_at.contains_key(&task_id),
+            "post-expiry reclamation clears only the expired task's private work and expiry state"
+        );
     }
 
     #[test]
@@ -13543,7 +14763,7 @@ mod lib_unit_tests {
         std::pin::Pin<Box<dyn Future<Output = McpResult<()>>>>,
     ) {
         let runtime = final_tasks_test_runtime(delivered);
-        let service = hold_final_tasks_test_service_readiness(&runtime);
+        let service = start_final_tasks_test_service(&runtime);
         let server = Server::new("final-tasks-server", "1.0.0")
             .final_tasks(runtime)
             .expect("final Tasks must install")
@@ -13823,7 +15043,7 @@ mod lib_unit_tests {
                     .push(notification);
             }),
         );
-        let _service = hold_final_tasks_test_service_readiness(&runtime);
+        let _service = start_final_tasks_test_service(&runtime);
         let server = Server::new("final-tool-task-server", "1.0.0")
             .tool(FinalTaskCreatingTool)
             .mask_error_details(true)
@@ -13935,7 +15155,7 @@ mod lib_unit_tests {
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let (handlers, discovery) = unrelated_extension_registry("example/echo");
         let runtime = final_tasks_test_runtime(Arc::clone(&delivered));
-        let _service = hold_final_tasks_test_service_readiness(&runtime);
+        let _service = start_final_tasks_test_service(&runtime);
         let server = Server::new("composed-final-tasks-server", "1.0.0")
             .extension_registry(
                 handlers,
@@ -16888,6 +18108,63 @@ mod lib_unit_tests {
         }
     }
 
+    struct LiveHttpSessionMutexHold {
+        release: Option<std::sync::mpsc::SyncSender<()>>,
+        worker: Option<thread::JoinHandle<Result<(), String>>>,
+    }
+
+    impl LiveHttpSessionMutexHold {
+        fn new(session: Arc<LiveHttpSession>) -> Result<Self, String> {
+            let (started_sender, started_receiver) = sync_channel(1);
+            let (release_sender, release_receiver) = sync_channel(1);
+            let worker = thread::spawn(move || {
+                let _session = session
+                    .session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                started_sender
+                    .send(())
+                    .map_err(|_| "legacy HTTP session holder lost its test owner".to_string())?;
+                release_receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| "legacy HTTP session holder release timed out".to_string())?;
+                Ok(())
+            });
+            let mut hold = Self {
+                release: Some(release_sender),
+                worker: Some(worker),
+            };
+            if started_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .is_err()
+            {
+                let _ = hold.release();
+                return Err("legacy HTTP session holder did not acquire the mutex".to_string());
+            }
+            Ok(hold)
+        }
+
+        fn release(&mut self) -> Result<(), String> {
+            if let Some(sender) = self.release.take() {
+                sender.send(()).map_err(|_| {
+                    "legacy HTTP session holder release was disconnected".to_string()
+                })?;
+            }
+            let Some(worker) = self.worker.take() else {
+                return Ok(());
+            };
+            worker
+                .join()
+                .map_err(|_| "legacy HTTP session holder panicked".to_string())?
+        }
+    }
+
+    impl Drop for LiveHttpSessionMutexHold {
+        fn drop(&mut self) {
+            let _ = self.release();
+        }
+    }
+
     struct LiveLegacyAdmissionBlocker {
         gate: Arc<LiveLegacyRequestGate>,
     }
@@ -16940,23 +18217,6 @@ mod lib_unit_tests {
             ctx.checkpoint()
                 .map_err(|_| McpError::request_cancelled())?;
             Ok(vec![Content::text("legacy admission target entered")])
-        }
-    }
-
-    struct LiveLegacyInitializeGateMiddleware {
-        gate: Arc<LiveLegacyRequestGate>,
-    }
-
-    impl Middleware for LiveLegacyInitializeGateMiddleware {
-        fn on_request(
-            &self,
-            ctx: &McpContext,
-            request: &JsonRpcRequest,
-        ) -> McpResult<MiddlewareDecision> {
-            if request.method == "initialize" {
-                self.gate.enter(ctx)?;
-            }
-            Ok(MiddlewareDecision::Continue)
         }
     }
 
@@ -19392,6 +20652,36 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn public_http_protocol_policy_rejects_metadata_free_modern_request() {
+        // This differs from the matching-metadata positive only by omitting
+        // the final-era protocol marker. Public dispatch must not infer the
+        // modern era merely because the caller selected ModernOnly.
+        let request =
+            JsonRpcRequest::new(SERVER_DISCOVER_METHOD, Some(serde_json::json!({})), 220_i64);
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 220, InboundRequestTransport::Http);
+        let server = Server::new("modern-http-policy", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .build();
+
+        let response = server.dispatch_http_with_protocol_policy(
+            ProtocolPolicy::ModernOnly,
+            &inbound,
+            &request,
+        );
+
+        assert_eq!(response.status, HttpStatus::BAD_REQUEST);
+        let response: JsonRpcResponse =
+            serde_json::from_slice(&response.body).expect("rejection must be JSON-RPC");
+        assert_eq!(response.id, Some(220_i64.into()));
+        assert!(response.result.is_none());
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(McpErrorCode::InvalidRequest.into())
+        );
+    }
+
+    #[test]
     fn live_http_loopback_dispatches_modern_json_over_a_real_socket() {
         run_live_http_test(|cx| async move {
             let bound = Server::new("live-modern-http", "1.0.0")
@@ -20101,8 +21391,7 @@ mod lib_unit_tests {
             ));
         }
         if response.result.as_ref().and_then(|result| {
-            result["_meta"][fastmcp_protocol::SERVER_DISCOVER_SERVER_INFO_META_KEY]["name"]
-                .as_str()
+            result["_meta"][fastmcp_protocol::SERVER_DISCOVER_SERVER_INFO_META_KEY]["name"].as_str()
         }) != Some("live-http-cross-era")
         {
             return Err(format!(
@@ -20549,11 +21838,7 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             const INITIALIZE_ID: i64 = 834;
 
-            let gate = Arc::new(LiveLegacyRequestGate::default());
             let bound = Server::new("live-http-legacy-initialize-protection", "1.0.0")
-                .middleware(LiveLegacyInitializeGateMiddleware {
-                    gate: Arc::clone(&gate),
-                })
                 .build()
                 .bind_http(&cx, "127.0.0.1:0")
                 .await
@@ -20563,7 +21848,6 @@ mod lib_unit_tests {
                 .map_err(|error| format!("legacy initialize HTTP address failed: {error}"))?;
             let legacy_sessions = Arc::clone(&bound.legacy_sessions);
             let caller_cx = cx.clone();
-            let gate_for_client = Arc::clone(&gate);
             let mut client = cx
                 .spawn(move |client_cx| async move {
                     let (mut sse, session_id, mut received) =
@@ -20574,6 +21858,7 @@ mod lib_unit_tests {
                         .get(&session_id)
                         .cloned()
                         .ok_or_else(|| "legacy initialize session was not registered".to_string())?;
+                    let mut session_hold = LiveHttpSessionMutexHold::new(Arc::clone(&session))?;
                     let initialize = JsonRpcRequest::new(
                         "initialize",
                         Some(serde_json::json!({
@@ -20598,26 +21883,8 @@ mod lib_unit_tests {
                         .map_err(|error| {
                             format!("legacy initialize task was not admitted: {error}")
                         })?;
-                    let _release_gate = LiveLegacyRequestGateRelease {
-                        gate: Arc::clone(&gate_for_client),
-                    };
                     let initialize_id = RequestId::Number(INITIALIZE_ID);
                     wait_for_live_http_legacy_admission(&client_cx, &session, &initialize_id).await?;
-
-                    let gate_deadline = client_cx
-                        .now()
-                        .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
-                    while !gate_for_client.entered.load(Ordering::Acquire) {
-                        client_cx
-                            .checkpoint()
-                            .map_err(|error| format!("legacy initialize client stopped: {error}"))?;
-                        asupersync::time::timeout_at(
-                            gate_deadline,
-                            asupersync::time::sleep(client_cx.now(), Duration::from_millis(1)),
-                        )
-                        .await
-                        .map_err(|_| live_http_test_timeout("legacy initialize middleware entry"))?;
-                    }
 
                     let cancellation = JsonRpcRequest::notification(
                         "notifications/cancelled",
@@ -20644,7 +21911,7 @@ mod lib_unit_tests {
                         ));
                     }
 
-                    gate_for_client.release();
+                    session_hold.release()?;
                     let initialize_response = initialize
                         .join(&client_cx)
                         .await
@@ -20884,10 +22151,8 @@ mod lib_unit_tests {
                     )
                     .await
                     {
-                        caller_cx.cancel_with(
-                            CancelKind::User,
-                            Some("idle listener probe timed out"),
-                        );
+                        caller_cx
+                            .cancel_with(CancelKind::User, Some("idle listener probe timed out"));
                         return Err(error);
                     }
                     caller_cx.cancel_with(CancelKind::User, Some("idle listener cancellation"));
@@ -21058,6 +22323,343 @@ mod lib_unit_tests {
                         .as_ref()
                         .is_some_and(|result| result.get("resultType").is_none())
         ));
+    }
+
+    #[test]
+    fn legacy_http_runtime_retains_session_state_progress_and_log_level() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("legacy-http-runtime", "1.0.0")
+            .log_level(Level::Debug)
+            .tool(LiveLegacyRuntimeConnectionTool)
+            .build_http_endpoint("http://legacy.test")
+            .expect("builder must construct the configured dual-era endpoint");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("endpoint must open a bounded live session");
+        let ServerHttpEndpointResponse::LegacySse(mut stream) = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .expect("legacy SSE route must open")
+        else {
+            panic!("legacy GET must open an exact SSE stream");
+        };
+        let _endpoint = stream
+            .recv_event(&cx)
+            .expect("legacy stream must advertise its POST endpoint");
+        let session_id = session.legacy_session_id().to_owned();
+        let post = |message: JsonRpcRequest| {
+            HttpRequest::new(HttpMethod::Post, "/messages")
+                .with_header("content-type", "application/json")
+                .with_query("session_id", session_id.clone())
+                .with_body(serde_json::to_vec(&message).expect("message must serialize"))
+        };
+
+        for request in [
+            JsonRpcRequest::new(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "legacy-http-client", "version": "1.0.0"},
+                })),
+                231_i64,
+            ),
+            JsonRpcRequest::notification("notifications/initialized", None),
+            JsonRpcRequest::new(
+                "logging/setLevel",
+                Some(serde_json::json!({"level": "debug"})),
+                232_i64,
+            ),
+        ] {
+            assert!(matches!(
+                session.handle(&cx, post(request)),
+                Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
+            ));
+        }
+        let codec = Codec::new();
+        let _initialize = stream
+            .recv_event(&cx)
+            .expect("initialize response must be delivered");
+        let _set_level = stream
+            .recv_event(&cx)
+            .expect("logging response must be delivered");
+
+        for id in [233_i64, 234_i64] {
+            let call = JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "live_legacy_runtime_connection_tool",
+                    "arguments": {"sample": false},
+                    "_meta": {"progressToken": "legacy-http-runtime-progress"},
+                })),
+                id,
+            );
+            assert!(matches!(
+                session.handle(&cx, post(call)),
+                Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
+            ));
+        }
+
+        let mut progress_count = 0;
+        let mut log_count = 0;
+        let mut results = Vec::new();
+        for _ in 0..6 {
+            let event = stream
+                .recv_event(&cx)
+                .expect("each legacy handler output must reach the same SSE stream");
+            match codec
+                .decode_complete_message(event.data.as_bytes())
+                .expect("legacy runtime output must remain JSON-RPC")
+            {
+                JsonRpcMessage::Request(notification)
+                    if notification.method == "notifications/progress" =>
+                {
+                    progress_count += 1;
+                }
+                JsonRpcMessage::Request(notification)
+                    if notification.method == "notifications/message" =>
+                {
+                    log_count += 1;
+                }
+                JsonRpcMessage::Response(response) => {
+                    results.push(
+                        response
+                            .result
+                            .and_then(|result| {
+                                result["content"][0]["text"].as_str().map(str::to_owned)
+                            })
+                            .expect("tool response must preserve the runtime counter text"),
+                    );
+                }
+                message => panic!("unexpected legacy HTTP runtime message: {message:?}"),
+            }
+        }
+        assert_eq!(progress_count, 2);
+        assert_eq!(log_count, 2);
+        assert_eq!(
+            results,
+            [
+                "legacy-runtime-1-without-sampling".to_owned(),
+                "legacy-runtime-2-without-sampling".to_owned(),
+            ]
+        );
+        assert_eq!(session.legacy_session.log_level(), Some(LogLevel::Debug));
+    }
+
+    #[test]
+    fn legacy_http_delivers_resource_updates_only_to_the_subscribed_uri() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("legacy-http-resource-update", "1.0.0")
+            .build_http_endpoint("http://legacy.test")
+            .expect("builder must construct the configured dual-era endpoint");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("endpoint must open a bounded live session");
+        let ServerHttpEndpointResponse::LegacySse(mut stream) = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .expect("legacy SSE route must open")
+        else {
+            panic!("legacy GET must open an exact SSE stream");
+        };
+        let _endpoint = stream.recv_event(&cx).expect("legacy endpoint event");
+        let session_id = session.legacy_session_id().to_owned();
+        let post = |message: JsonRpcRequest| {
+            HttpRequest::new(HttpMethod::Post, "/messages")
+                .with_header("content-type", "application/json")
+                .with_query("session_id", session_id.clone())
+                .with_body(serde_json::to_vec(&message).expect("message must serialize"))
+        };
+        for request in [
+            JsonRpcRequest::new(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "legacy-http-client", "version": "1.0.0"},
+                })),
+                241_i64,
+            ),
+            JsonRpcRequest::notification("notifications/initialized", None),
+            JsonRpcRequest::new(
+                "resources/subscribe",
+                Some(serde_json::json!({"uri": "file:///subscribed.txt"})),
+                242_i64,
+            ),
+        ] {
+            assert!(matches!(
+                session.handle(&cx, post(request)),
+                Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
+            ));
+        }
+        let _initialize = stream.recv_event(&cx).expect("initialize response");
+        let _subscribe = stream.recv_event(&cx).expect("subscribe response");
+
+        assert!(session.notify_legacy_resource_updated("file:///subscribed.txt"));
+        let update = stream
+            .recv_event(&cx)
+            .expect("subscribed update must stream");
+        assert!(matches!(
+            Codec::new()
+                .decode_complete_message(update.data.as_bytes())
+                .expect("resource update must remain JSON-RPC"),
+            JsonRpcMessage::Request(notification)
+                if notification.method == "notifications/resources/updated"
+                    && notification.params == Some(serde_json::json!({"uri": "file:///subscribed.txt"}))
+        ));
+
+        let before = session
+            .legacy_adapter
+            .as_ref()
+            .expect("subscription retains the exact adapter")
+            .snapshot();
+        assert!(
+            !session.notify_legacy_resource_updated("file:///other.txt"),
+            "changing only the URI must not emit a resource update"
+        );
+        assert_eq!(
+            session
+                .legacy_adapter
+                .as_ref()
+                .expect("negative must retain the exact adapter")
+                .snapshot(),
+            before,
+            "the rejected URI must leave subscription state unchanged"
+        );
+        assert!(
+            stream
+                .try_recv_event(&cx)
+                .expect("unsubscribed update check must not fail")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_http_roots_provider_requires_only_the_roots_capability() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("legacy-http-roots", "1.0.0")
+            .build_http_endpoint("http://legacy.test")
+            .expect("builder must construct the configured dual-era endpoint");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("endpoint must open a bounded live session");
+        let ServerHttpEndpointResponse::LegacySse(mut stream) = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .expect("legacy SSE route must open")
+        else {
+            panic!("legacy GET must open an exact SSE stream");
+        };
+        let _endpoint = stream.recv_event(&cx).expect("legacy endpoint event");
+        let session_id = session.legacy_session_id().to_owned();
+        let post = |message: JsonRpcRequest| {
+            HttpRequest::new(HttpMethod::Post, "/messages")
+                .with_header("content-type", "application/json")
+                .with_query("session_id", session_id.clone())
+                .with_body(serde_json::to_vec(&message).expect("message must serialize"))
+        };
+        for request in [
+            JsonRpcRequest::new(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {"roots": {}},
+                    "clientInfo": {"name": "legacy-http-client", "version": "1.0.0"},
+                })),
+                251_i64,
+            ),
+            JsonRpcRequest::notification("notifications/initialized", None),
+        ] {
+            assert!(matches!(
+                session.handle(&cx, post(request)),
+                Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
+            ));
+        }
+        let _initialize = stream.recv_event(&cx).expect("initialize response");
+
+        let provider = session
+            .legacy_roots_provider()
+            .expect("roots capability must expose the shipped provider");
+        let roots_task =
+            std::thread::spawn(move || block_on(provider.list_roots(&Cx::for_testing())));
+        let request = stream
+            .recv_event(&cx)
+            .expect("roots provider must emit a reverse request");
+        let JsonRpcMessage::Request(request) = Codec::new()
+            .decode_complete_message(request.data.as_bytes())
+            .expect("roots reverse request must remain JSON-RPC")
+        else {
+            panic!("roots provider must emit a request");
+        };
+        assert_eq!(request.method, "roots/list");
+        let response = JsonRpcResponse::success(
+            request.id.expect("roots request must have an ID"),
+            serde_json::json!({"roots": [{"uri": "file:///work", "name": "work"}]}),
+        );
+        let response_post = HttpRequest::new(HttpMethod::Post, "/messages")
+            .with_header("content-type", "application/json")
+            .with_query("session_id", session.legacy_session_id())
+            .with_body(serde_json::to_vec(&response).expect("response must serialize"));
+        assert!(matches!(
+            session.handle(&cx, response_post),
+            Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
+        ));
+        let roots = roots_task
+            .join()
+            .expect("roots task must not panic")
+            .expect("routed roots response must complete the provider");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].uri, "file:///work");
+    }
+
+    #[test]
+    fn legacy_http_roots_provider_is_absent_without_roots_capability() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("legacy-http-roots", "1.0.0")
+            .build_http_endpoint("http://legacy.test")
+            .expect("builder must construct the configured dual-era endpoint");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("endpoint must open a bounded live session");
+        let ServerHttpEndpointResponse::LegacySse(mut stream) = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .expect("legacy SSE route must open")
+        else {
+            panic!("legacy GET must open an exact SSE stream");
+        };
+        let _endpoint = stream.recv_event(&cx).expect("legacy endpoint event");
+        let session_id = session.legacy_session_id().to_owned();
+        let post = |message: JsonRpcRequest| {
+            HttpRequest::new(HttpMethod::Post, "/messages")
+                .with_header("content-type", "application/json")
+                .with_query("session_id", session_id.clone())
+                .with_body(serde_json::to_vec(&message).expect("message must serialize"))
+        };
+        for request in [
+            JsonRpcRequest::new(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "legacy-http-client", "version": "1.0.0"},
+                })),
+                251_i64,
+            ),
+            JsonRpcRequest::notification("notifications/initialized", None),
+        ] {
+            assert!(matches!(
+                session.handle(&cx, post(request)),
+                Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
+            ));
+        }
+        let _initialize = stream.recv_event(&cx).expect("initialize response");
+        assert!(
+            session.legacy_roots_provider().is_none(),
+            "changing only the negotiated roots capability must withhold the provider"
+        );
+        assert!(
+            stream
+                .try_recv_event(&cx)
+                .expect("capability negative check must not fail")
+                .is_none()
+        );
     }
 
     #[test]
@@ -21330,10 +22932,7 @@ mod lib_unit_tests {
                     // Hold the initialization response attempt so request 80
                     // is certainly the first queued application request when
                     // its cancellation reaches the receive pump.
-                    if self
-                        .initialize_send_started
-                        .wait(Duration::from_secs(2))
-                    {
+                    if self.initialize_send_started.wait(Duration::from_secs(2)) {
                         Ok(legacy_controlled_tool_request(80))
                     } else {
                         Err(TransportError::Timeout)
@@ -21399,10 +22998,7 @@ mod lib_unit_tests {
                 JsonRpcMessage::Response(response) if response.id == Some(75_i64.into())
             ) {
                 self.initialize_send_started.raise();
-                if !self
-                    .initialize_send_release
-                    .wait(Duration::from_secs(2))
-                {
+                if !self.initialize_send_release.wait(Duration::from_secs(2)) {
                     return Err(TransportError::Timeout);
                 }
             }
@@ -24081,6 +25677,140 @@ mod lib_unit_tests {
                 .len(),
             2,
             "acknowledgement and cancellation are the only terminal-stream frames",
+        );
+    }
+
+    #[test]
+    fn final_runtime_emits_typed_log_message_with_server_metadata() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("final-log-runtime", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .log_level(Level::Debug)
+            .build_http_endpoint("http://final.test")
+            .expect("modern endpoint must build");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("modern endpoint session must open");
+        let request = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    "io.modelcontextprotocol/logLevel": "info",
+                },
+            })),
+            91_i64,
+        );
+        let ServerHttpEndpointResponse::ModernSse(sse) = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_header("accept", "text/event-stream")
+                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                    .with_header("mcp-method", "tools/list")
+                    .with_body(serde_json::to_vec(&request).expect("final request must encode")),
+            )
+            .expect("public modern request must dispatch")
+        else {
+            panic!("public modern request must return an SSE body");
+        };
+        let log = sse
+            .recv_event(&cx)
+            .expect("typed final log must arrive before the response");
+        let JsonRpcMessage::Request(log) = Codec::new()
+            .decode_complete_message(log.data.as_bytes())
+            .expect("typed final log must remain JSON-RPC")
+        else {
+            panic!("first SSE frame must be a typed final log notification");
+        };
+        let ServerNotification::Message(message) = ServerNotification::decode(&log)
+            .expect("final runtime logging must use the typed final notification union")
+        else {
+            panic!("final runtime must emit notifications/message");
+        };
+        assert_eq!(message.level, LoggingLevel::Info);
+        assert_eq!(message.logger.as_deref(), Some("fastmcp_rust::server"));
+        assert_eq!(
+            message
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.server_info().ok().flatten())
+                .map(|info| info.name),
+            Some("final-log-runtime".to_owned()),
+            "typed final logging must retain final server metadata",
+        );
+        assert!(matches!(
+            Codec::new()
+                .decode_complete_message(
+                    sse.recv_event(&cx)
+                        .expect("request response must follow the log")
+                        .data
+                        .as_bytes(),
+                )
+                .expect("response must remain JSON-RPC"),
+            JsonRpcMessage::Response(response)
+                if response.id == Some(91_i64.into()) && response.error.is_none()
+        ));
+    }
+
+    #[test]
+    fn final_runtime_suppresses_info_log_when_only_log_level_changes_to_warning() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("final-log-runtime", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .log_level(Level::Debug)
+            .build_http_endpoint("http://final.test")
+            .expect("modern endpoint must build");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("modern endpoint session must open");
+        let request = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    "io.modelcontextprotocol/logLevel": "warning",
+                },
+            })),
+            91_i64,
+        );
+        let ServerHttpEndpointResponse::ModernSse(sse) = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_header("accept", "text/event-stream")
+                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                    .with_header("mcp-method", "tools/list")
+                    .with_body(serde_json::to_vec(&request).expect("final request must encode")),
+            )
+            .expect("public modern request must dispatch")
+        else {
+            panic!("public modern request must return an SSE body");
+        };
+        assert!(
+            matches!(
+                Codec::new()
+                    .decode_complete_message(
+                        sse.recv_event(&cx)
+                            .expect("request response must remain readable")
+                            .data
+                            .as_bytes(),
+                    )
+                    .expect("response must remain JSON-RPC"),
+                JsonRpcMessage::Response(response)
+                    if response.id == Some(91_i64.into()) && response.error.is_none()
+            ),
+            "changing only final logLevel from info to warning must suppress the info notification"
+        );
+        assert!(
+            sse.pop_event()
+                .expect("suppressed logging must not close the response body")
+                .is_none(),
+            "the log-level-only negative must leave no notification queued"
         );
     }
 

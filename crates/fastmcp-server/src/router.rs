@@ -1,6 +1,6 @@
 //! Request router for MCP servers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -28,8 +28,7 @@ use fastmcp_protocol::uri_template::ReversibleResourceTemplate;
 use fastmcp_protocol::{
     AdmittedSchema, CacheScope, CallToolParams, CallToolResult, CompleteResult, Content,
     CoreRequest, CoreResult, FinalCallToolParams, FinalCallToolResult, FinalCompletionParams,
-    FinalCompletionReference, FinalCompletionResult, FinalCompletionValues, FinalCoreRequest,
-    FinalCoreResult,
+    FinalCompletionReference, FinalCompletionResult, FinalCoreRequest, FinalCoreResult,
     FinalGetPromptParams, FinalGetPromptResult, FinalListParams, FinalListPromptsResult,
     FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult, FinalPrompt,
     FinalPromptArgument, FinalReadResourceParams, FinalReadResourceResult, FinalResource,
@@ -41,14 +40,11 @@ use fastmcp_protocol::{
     ListResourcesResult, ListToolsParams, ListToolsResult, MissingRequiredClientCapabilityError,
     PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage, ReadResourceParams,
     ReadResourceResult, Resource, ResourceContent, ResourceTemplate, ServerBehavior,
-    ServerBehaviorRegistry, TemplateValue, Tool, admit_final_schema, exact_json_to_serde,
-    validate, validate_strict,
+    ServerBehaviorRegistry, TemplateValue, Tool, admit_final_schema, exact_json_to_serde, validate,
+    validate_strict,
 };
 #[cfg(test)]
-use fastmcp_protocol::{
-    CancelTaskParams, CancelTaskResult, GetTaskParams, GetTaskResult, ListTasksParams,
-    ListTasksResult, SubmitTaskParams, SubmitTaskResult,
-};
+use fastmcp_protocol::{CancelTaskParams, CancelTaskResult, GetTaskParams, GetTaskResult};
 
 use crate::bidirectional::{
     MrtrCompletedInputs, MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputRequest,
@@ -516,7 +512,7 @@ fn admit_final_tool_schemas<H: ToolHandler + ?Sized>(
         .transpose()?;
     let errors = output
         .as_ref()
-        .map(|output| {
+        .map(|output| -> McpResult<FinalToolErrorStructuredContent> {
             Ok(FinalToolErrorStructuredContent {
                 input_validation: admit_final_tool_error_structured_content(
                     handler,
@@ -544,6 +540,7 @@ struct AdmittedToolRegistration {
     handler: BoxedToolHandler,
     definition: Tool,
     final_registration: Option<AdmittedFinalToolRegistration>,
+    legacy_enabled: bool,
 }
 
 struct AdmittedFinalToolRegistration {
@@ -552,8 +549,26 @@ struct AdmittedFinalToolRegistration {
     declares_final_tasks: bool,
 }
 
+/// Immutable final resource catalog data, including the legacy tag snapshot
+/// used only for server-side list filtering.
+struct AdmittedFinalResourceRegistration {
+    definition: FinalResource,
+    tags: Vec<String>,
+}
+
+/// Immutable final prompt catalog data, including the legacy tag snapshot
+/// used only for server-side list filtering.
+struct AdmittedFinalPromptRegistration {
+    definition: FinalPrompt,
+    tags: Vec<String>,
+}
+
 impl AdmittedToolRegistration {
-    fn admit<H: ToolHandler + 'static>(handler: H, definition: Tool) -> McpResult<Self> {
+    fn admit<H: ToolHandler + 'static>(
+        handler: H,
+        definition: Tool,
+        legacy_enabled: bool,
+    ) -> McpResult<Self> {
         let (exact_final_definition, declares_final_tasks) = crate::catch_extension_unwind(|| {
             (handler.final_definition(), handler.declares_final_tasks())
         })
@@ -606,6 +621,7 @@ impl AdmittedToolRegistration {
                 schemas,
                 declares_final_tasks,
             }),
+            legacy_enabled,
         })
     }
 
@@ -614,6 +630,7 @@ impl AdmittedToolRegistration {
             handler: Box::new(handler),
             definition,
             final_registration: None,
+            legacy_enabled: true,
         }
     }
 
@@ -624,6 +641,7 @@ impl AdmittedToolRegistration {
             handler,
             mut definition,
             mut final_registration,
+            legacy_enabled,
         } = self;
         definition.name.clone_from(&mounted_name);
         if let Some(final_registration) = final_registration.as_mut() {
@@ -636,6 +654,7 @@ impl AdmittedToolRegistration {
             handler: Box::new(MountedToolHandler::new(handler, mounted_name)),
             definition,
             final_registration,
+            legacy_enabled,
         }
     }
 }
@@ -737,6 +756,138 @@ fn project_final_resource_catalog_entry(
         mime_type: resource.mime_type,
         size: None,
         annotations,
+        meta,
+    })
+}
+
+/// Freezes one resource's modern catalog entry during registration.
+///
+/// Discovery must not call application hooks: a catalog observed by a final
+/// peer has to remain the one that was admitted alongside its dispatch target.
+fn admit_final_resource_definition<H: ResourceHandler + ?Sized>(
+    handler: &H,
+    resource: &Resource,
+) -> McpResult<FinalResource> {
+    if let Some(definition) =
+        crate::catch_extension_unwind(|| handler.final_definition()).map_err(|_payload| {
+            McpError::internal_error("resource final-definition hook panicked during admission")
+        })?
+    {
+        if definition.uri.as_str() != resource.uri {
+            return Err(McpError::internal_error(
+                "resource exact final URI differs from its legacy definition URI",
+            ));
+        }
+        return Ok(definition);
+    }
+    let (title, icons, annotations, meta) = crate::catch_extension_unwind(|| {
+        (
+            handler.final_title().map(str::to_owned),
+            handler.final_icons().map(|icons| icons.to_vec()),
+            handler.final_annotations().cloned(),
+            handler.final_metadata().cloned(),
+        )
+    })
+    .map_err(|_payload| {
+        McpError::internal_error("resource metadata hook panicked during admission")
+    })?;
+    project_final_resource_catalog_entry(resource.clone(), title, icons, annotations, meta)
+}
+
+/// Freezes one resource template's final catalog entry during registration.
+fn admit_final_resource_template_definition<H: ResourceHandler + ?Sized>(
+    handler: Option<&H>,
+    template: &ResourceTemplate,
+) -> McpResult<FinalResourceTemplate> {
+    if let Some(handler) = handler {
+        if let Some(definition) =
+            crate::catch_extension_unwind(|| handler.final_template_definition()).map_err(
+                |_payload| {
+                    McpError::internal_error(
+                        "resource final-template-definition hook panicked during admission",
+                    )
+                },
+            )?
+        {
+            if definition.uri_template != template.uri_template {
+                return Err(McpError::internal_error(
+                    "resource exact final template differs from its legacy template URI",
+                ));
+            }
+            return Ok(definition);
+        }
+    }
+    let (title, icons, annotations, meta) = match handler {
+        Some(handler) => crate::catch_extension_unwind(|| {
+            (
+                handler.final_template_title().map(str::to_owned),
+                handler.final_template_icons().map(|icons| icons.to_vec()),
+                handler.final_template_annotations().cloned(),
+                handler.final_template_metadata().cloned(),
+            )
+        })
+        .map_err(|_payload| {
+            McpError::internal_error("resource template metadata hook panicked during admission")
+        })?,
+        None => (None, None, None, None),
+    };
+    Ok(FinalResourceTemplate {
+        uri_template: template.uri_template.clone(),
+        name: template.name.clone(),
+        title,
+        description: template.description.clone(),
+        icons,
+        mime_type: template.mime_type.clone(),
+        annotations,
+        meta,
+    })
+}
+
+/// Freezes one prompt's final catalog entry during registration.
+fn admit_final_prompt_definition<H: PromptHandler + ?Sized>(
+    handler: &H,
+    prompt: &Prompt,
+) -> McpResult<FinalPrompt> {
+    if let Some(definition) =
+        crate::catch_extension_unwind(|| handler.final_definition()).map_err(|_payload| {
+            McpError::internal_error("prompt final-definition hook panicked during admission")
+        })?
+    {
+        if definition.name != prompt.name {
+            return Err(McpError::internal_error(
+                "prompt exact final name differs from its legacy definition name",
+            ));
+        }
+        return Ok(definition);
+    }
+    let (title, icons, meta) = crate::catch_extension_unwind(|| {
+        (
+            handler.final_title().map(str::to_owned),
+            handler.final_icons().map(|icons| icons.to_vec()),
+            handler.final_metadata().cloned(),
+        )
+    })
+    .map_err(|_payload| {
+        McpError::internal_error("prompt metadata hook panicked during admission")
+    })?;
+    let arguments = (!prompt.arguments.is_empty()).then(|| {
+        prompt
+            .arguments
+            .iter()
+            .map(|argument| FinalPromptArgument {
+                name: argument.name.clone(),
+                title: None,
+                description: argument.description.clone(),
+                required: Some(argument.required),
+            })
+            .collect()
+    });
+    Ok(FinalPrompt {
+        name: prompt.name.clone(),
+        title,
+        description: prompt.description.clone(),
+        icons,
+        arguments,
         meta,
     })
 }
@@ -885,30 +1036,6 @@ enum LegacyEmbeddedContent {
     Blob(String),
 }
 
-fn legacy_list_resources_params(params: FinalListParams) -> ListResourcesParams {
-    ListResourcesParams {
-        cursor: params.cursor,
-        include_tags: params.include_tags,
-        exclude_tags: params.exclude_tags,
-    }
-}
-
-fn legacy_list_resource_templates_params(params: FinalListParams) -> ListResourceTemplatesParams {
-    ListResourceTemplatesParams {
-        cursor: params.cursor,
-        include_tags: params.include_tags,
-        exclude_tags: params.exclude_tags,
-    }
-}
-
-fn legacy_list_prompts_params(params: FinalListParams) -> ListPromptsParams {
-    ListPromptsParams {
-        cursor: params.cursor,
-        include_tags: params.include_tags,
-        exclude_tags: params.exclude_tags,
-    }
-}
-
 fn legacy_read_resource_params(params: FinalReadResourceParams) -> ReadResourceParams {
     ReadResourceParams {
         uri: params.uri.as_str().to_owned(),
@@ -920,6 +1047,26 @@ fn encode_cursor_offset(offset: usize) -> String {
     let payload = serde_json::json!({ "offset": offset });
     let bytes = serde_json::to_vec(&payload).expect("cursor state must serialize");
     BASE64_STANDARD.encode(bytes)
+}
+
+/// Pages an already-filtered immutable final catalog.
+///
+/// Filtering must precede cursor arithmetic so an exact-legacy-only entry
+/// cannot create an empty modern page or shift a final peer's cursor.
+fn page_final_catalog<T: Clone>(
+    items: Vec<T>,
+    cursor: Option<&str>,
+    page_size: Option<usize>,
+) -> McpResult<(Vec<T>, Option<String>)> {
+    let Some(page_size) = page_size else {
+        return Ok((items, None));
+    };
+    let offset = decode_cursor_offset(cursor)?;
+    let end = offset.saturating_add(page_size).min(items.len());
+    Ok((
+        items.get(offset..end).unwrap_or_default().to_vec(),
+        (end < items.len()).then(|| encode_cursor_offset(end)),
+    ))
 }
 
 const SANITIZED_HANDLER_PANIC_MESSAGE: &str = "Internal server error";
@@ -1144,6 +1291,7 @@ fn derive_handler_context(
     progress_marker: Option<ProgressMarker>,
     notification_sender: Option<&NotificationSender>,
     bidirectional_senders: Option<&BidirectionalSenders>,
+    protocol_era: ProtocolEra,
 ) -> McpContext {
     trace!(
         target: targets::HANDLER,
@@ -1154,10 +1302,18 @@ fn derive_handler_context(
 
     if let (Some(marker), Some(sender)) = (progress_marker, notification_sender) {
         let sender = sender.clone();
-        let reporter = ProgressNotificationSender::new(marker, move |request| {
-            sender(request);
-        })
-        .into_reporter();
+        let reporter = match protocol_era {
+            ProtocolEra::Legacy2024 => ProgressNotificationSender::new(marker, move |request| {
+                sender(request);
+            })
+            .into_reporter(),
+            ProtocolEra::Modern2026 => {
+                ProgressNotificationSender::new_final(marker, move |request| {
+                    sender(request);
+                })
+                .into_reporter()
+            }
+        };
         handler_ctx = handler_ctx.with_progress_reporter(reporter);
     }
 
@@ -1173,14 +1329,35 @@ fn derive_handler_context(
     handler_ctx
 }
 
+fn final_progress_marker(metadata: &OpenMetadata) -> McpResult<Option<ProgressMarker>> {
+    metadata
+        .get("progressToken")
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|_| {
+                McpError::invalid_params("final progressToken must be a string or integer")
+            })
+        })
+        .transpose()
+}
+
 /// Routes MCP requests to the appropriate handlers.
 pub struct Router {
     tools: HashMap<String, AdmittedToolRegistration>,
     tool_order: Vec<String>,
     completion_handler: Option<BoxedCompletionHandler>,
+    /// Whether the installed completion handler was admitted for final dispatch.
+    final_completion_enabled: bool,
     resources: HashMap<String, BoxedResourceHandler>,
+    /// Static resources visible to exact MCP 2024-11-05 only.
+    final_only_resources: HashSet<String>,
+    /// Immutable final catalog entries. Absence means exact-legacy-only.
+    final_resources: HashMap<String, AdmittedFinalResourceRegistration>,
     resource_order: Vec<String>,
     prompts: HashMap<String, BoxedPromptHandler>,
+    /// Prompts visible to exact MCP 2024-11-05 only.
+    final_only_prompts: HashSet<String>,
+    /// Immutable final catalog entries. Absence means exact-legacy-only.
+    final_prompts: HashMap<String, AdmittedFinalPromptRegistration>,
     prompt_order: Vec<String>,
     resource_templates: HashMap<String, ResourceTemplateEntry>,
     resource_template_order: Vec<String>,
@@ -1212,9 +1389,14 @@ impl Router {
             tools: HashMap::new(),
             tool_order: Vec::new(),
             completion_handler: None,
+            final_completion_enabled: false,
             resources: HashMap::new(),
+            final_only_resources: HashSet::new(),
+            final_resources: HashMap::new(),
             resource_order: Vec::new(),
             prompts: HashMap::new(),
+            final_only_prompts: HashSet::new(),
+            final_prompts: HashMap::new(),
             prompt_order: Vec::new(),
             resource_templates: HashMap::new(),
             resource_template_order: Vec::new(),
@@ -1331,7 +1513,16 @@ impl Router {
         handler: H,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        self.add_tool_registration_with_behavior(handler, behavior, true)
+        self.add_tool_registration_with_behavior(handler, behavior, true, true)
+    }
+
+    /// Adds an exact-final-only tool with duplicate handling.
+    pub(crate) fn add_final_tool_with_behavior<H: ToolHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        self.add_tool_registration_with_behavior(handler, behavior, true, false)
     }
 
     /// Adds an intentionally exact-2024-only tool with duplicate policy.
@@ -1345,7 +1536,7 @@ impl Router {
         handler: H,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        self.add_tool_registration_with_behavior(handler, behavior, false)
+        self.add_tool_registration_with_behavior(handler, behavior, false, true)
     }
 
     fn add_tool_registration_with_behavior<H: ToolHandler + 'static>(
@@ -1353,6 +1544,7 @@ impl Router {
         handler: H,
         behavior: crate::DuplicateBehavior,
         admit_final: bool,
+        legacy_enabled: bool,
     ) -> Result<(), McpError> {
         let def = crate::catch_extension_unwind(|| handler.definition()).map_err(|_payload| {
             McpError::internal_error("tool definition hook panicked during admission")
@@ -1392,7 +1584,7 @@ impl Router {
         // and its admitted schemas for both protocol eras.
         let name = def.name.clone();
         let admitted = if admit_final {
-            AdmittedToolRegistration::admit(handler, def)?
+            AdmittedToolRegistration::admit(handler, def, legacy_enabled)?
         } else {
             AdmittedToolRegistration::legacy_only(handler, def)
         };
@@ -1410,6 +1602,13 @@ impl Router {
     /// component registration semantics.
     pub fn add_completion_handler<H: CompletionHandler + 'static>(&mut self, handler: H) {
         self.completion_handler = Some(Box::new(handler));
+        self.final_completion_enabled = true;
+    }
+
+    /// Registers a completion handler for exact MCP 2024-11-05 dispatch only.
+    pub fn add_legacy_completion_handler<H: CompletionHandler + 'static>(&mut self, handler: H) {
+        self.completion_handler = Some(Box::new(handler));
+        self.final_completion_enabled = false;
     }
 
     /// Returns whether a `completion/complete` handler is installed.
@@ -1424,42 +1623,33 @@ impl Router {
     /// Use [`add_resource_with_behavior`](Self::add_resource_with_behavior) for
     /// finer control over duplicate handling.
     pub fn add_resource<H: ResourceHandler + 'static>(&mut self, handler: H) {
-        let template = handler.template();
-        let def = handler.definition();
-        let boxed: BoxedResourceHandler = Box::new(handler);
+        if let Err(error) = self.add_resource_registration_with_behavior(
+            handler,
+            crate::DuplicateBehavior::Replace,
+            true,
+            true,
+        ) {
+            log::warn!(
+                target: "fastmcp_rust::router",
+                "rejected resource registration; code={:?}",
+                error.code
+            );
+        }
+    }
 
-        if let Some(template) = template {
-            let (matcher, specificity) = match admit_resource_template(&template.uri_template) {
-                Ok(admitted) => admitted,
-                Err(error) => {
-                    log::warn!(
-                        target: "fastmcp_rust::router",
-                        "rejected resource template; template_key={}; code={:?}",
-                        safe_log_label(&template.uri_template),
-                        error.code
-                    );
-                    return;
-                }
-            };
-            let is_new = !self.resource_templates.contains_key(&template.uri_template);
-            let entry = ResourceTemplateEntry {
-                matcher,
-                specificity,
-                template: template.clone(),
-                handler: Some(boxed),
-            };
-            self.resource_templates
-                .insert(template.uri_template.clone(), entry);
-            if is_new {
-                self.resource_template_order.push(template.uri_template);
-            }
-            self.rebuild_sorted_template_keys();
-        } else {
-            let is_new = !self.resources.contains_key(&def.uri);
-            self.resources.insert(def.uri.clone(), boxed);
-            if is_new {
-                self.resource_order.push(def.uri);
-            }
+    /// Adds an intentionally exact-2024-only resource handler.
+    pub fn add_legacy_resource<H: ResourceHandler + 'static>(&mut self, handler: H) {
+        if let Err(error) = self.add_resource_registration_with_behavior(
+            handler,
+            crate::DuplicateBehavior::Replace,
+            false,
+            true,
+        ) {
+            log::warn!(
+                target: "fastmcp_rust::router",
+                "rejected exact-2024-only resource registration; code={:?}",
+                error.code
+            );
         }
     }
 
@@ -1472,8 +1662,40 @@ impl Router {
         handler: H,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        let template = handler.template();
-        let def = handler.definition();
+        self.add_resource_registration_with_behavior(handler, behavior, true, true)
+    }
+
+    /// Adds an exact-final-only resource or resource template with duplicate handling.
+    pub(crate) fn add_final_resource_with_behavior<H: ResourceHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        self.add_resource_registration_with_behavior(handler, behavior, true, false)
+    }
+
+    /// Adds an exact-2024-only resource handler with duplicate handling.
+    pub fn add_legacy_resource_with_behavior<H: ResourceHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        self.add_resource_registration_with_behavior(handler, behavior, false, true)
+    }
+
+    fn add_resource_registration_with_behavior<H: ResourceHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+        admit_final: bool,
+        legacy_enabled: bool,
+    ) -> Result<(), McpError> {
+        let (template, def) =
+            crate::catch_extension_unwind(|| (handler.template(), handler.definition())).map_err(
+                |_payload| {
+                    McpError::internal_error("resource definition hook panicked during admission")
+                },
+            )?;
 
         // Check for duplicates
         let key = match template.as_ref() {
@@ -1516,6 +1738,9 @@ impl Router {
 
         if let Some(template) = template {
             let (matcher, specificity) = admit_resource_template(&template.uri_template)?;
+            let final_definition = admit_final
+                .then(|| admit_final_resource_template_definition(Some(&handler), &template))
+                .transpose()?;
             let boxed: BoxedResourceHandler = Box::new(handler);
             let is_new = !self.resource_templates.contains_key(&template.uri_template);
             let entry = ResourceTemplateEntry {
@@ -1523,6 +1748,8 @@ impl Router {
                 specificity,
                 template: template.clone(),
                 handler: Some(boxed),
+                final_definition,
+                legacy_enabled,
             };
             self.resource_templates
                 .insert(template.uri_template.clone(), entry);
@@ -1531,9 +1758,31 @@ impl Router {
             }
             self.rebuild_sorted_template_keys();
         } else {
+            let final_definition = admit_final
+                .then(|| admit_final_resource_definition(&handler, &def))
+                .transpose()?;
             let boxed: BoxedResourceHandler = Box::new(handler);
             let is_new = !self.resources.contains_key(&def.uri);
             self.resources.insert(def.uri.clone(), boxed);
+            if legacy_enabled {
+                self.final_only_resources.remove(&def.uri);
+            } else {
+                self.final_only_resources.insert(def.uri.clone());
+            }
+            match final_definition {
+                Some(final_definition) => {
+                    self.final_resources.insert(
+                        def.uri.clone(),
+                        AdmittedFinalResourceRegistration {
+                            definition: final_definition,
+                            tags: def.tags.clone(),
+                        },
+                    );
+                }
+                None => {
+                    self.final_resources.remove(&def.uri);
+                }
+            }
             if is_new {
                 self.resource_order.push(def.uri);
             }
@@ -1562,6 +1811,23 @@ impl Router {
         }
     }
 
+    /// Adds an exact-2024-only resource template definition.
+    pub fn add_legacy_resource_template(&mut self, template: ResourceTemplate) {
+        let key = template.uri_template.clone();
+        if let Err(error) = self.add_resource_template_registration_with_behavior(
+            template,
+            crate::DuplicateBehavior::Replace,
+            false,
+        ) {
+            log::warn!(
+                target: "fastmcp_rust::router",
+                "rejected exact-2024-only resource template; template_key={}; code={:?}",
+                safe_log_label(&key),
+                error.code
+            );
+        }
+    }
+
     /// Adds a resource template definition with specified duplicate behavior.
     ///
     /// Replacing a definition retains an existing handler registered for the
@@ -1571,6 +1837,24 @@ impl Router {
         &mut self,
         template: ResourceTemplate,
         behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        self.add_resource_template_registration_with_behavior(template, behavior, true)
+    }
+
+    /// Adds an exact-2024-only resource template with duplicate handling.
+    pub fn add_legacy_resource_template_with_behavior(
+        &mut self,
+        template: ResourceTemplate,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        self.add_resource_template_registration_with_behavior(template, behavior, false)
+    }
+
+    fn add_resource_template_registration_with_behavior(
+        &mut self,
+        template: ResourceTemplate,
+        behavior: crate::DuplicateBehavior,
+        admit_final: bool,
     ) -> Result<(), McpError> {
         let key = template.uri_template.clone();
         let existed = self.resource_templates.contains_key(&key);
@@ -1600,11 +1884,18 @@ impl Router {
         }
 
         let (matcher, specificity) = admit_resource_template(&key)?;
+        let final_definition = admit_final
+            .then(|| {
+                admit_final_resource_template_definition::<dyn ResourceHandler>(None, &template)
+            })
+            .transpose()?;
         let needs_rebuild = match self.resource_templates.get_mut(&key) {
             Some(existing) => {
                 existing.template = template;
                 existing.matcher = matcher;
                 existing.specificity = specificity;
+                existing.final_definition = final_definition;
+                existing.legacy_enabled = true;
                 false // Key already exists, order unchanged
             }
             None => {
@@ -1615,6 +1906,8 @@ impl Router {
                         specificity,
                         template,
                         handler: None,
+                        final_definition,
+                        legacy_enabled: true,
                     },
                 );
                 true // New key added, need to rebuild
@@ -1633,11 +1926,33 @@ impl Router {
     /// Use [`add_prompt_with_behavior`](Self::add_prompt_with_behavior) for
     /// finer control over duplicate handling.
     pub fn add_prompt<H: PromptHandler + 'static>(&mut self, handler: H) {
-        let def = handler.definition();
-        let is_new = !self.prompts.contains_key(&def.name);
-        self.prompts.insert(def.name.clone(), Box::new(handler));
-        if is_new {
-            self.prompt_order.push(def.name);
+        if let Err(error) = self.add_prompt_registration_with_behavior(
+            handler,
+            crate::DuplicateBehavior::Replace,
+            true,
+            true,
+        ) {
+            log::warn!(
+                target: "fastmcp_rust::router",
+                "rejected prompt registration; code={:?}",
+                error.code
+            );
+        }
+    }
+
+    /// Adds an intentionally exact-2024-only prompt handler.
+    pub fn add_legacy_prompt<H: PromptHandler + 'static>(&mut self, handler: H) {
+        if let Err(error) = self.add_prompt_registration_with_behavior(
+            handler,
+            crate::DuplicateBehavior::Replace,
+            false,
+            true,
+        ) {
+            log::warn!(
+                target: "fastmcp_rust::router",
+                "rejected exact-2024-only prompt registration; code={:?}",
+                error.code
+            );
         }
     }
 
@@ -1650,7 +1965,37 @@ impl Router {
         handler: H,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        let def = handler.definition();
+        self.add_prompt_registration_with_behavior(handler, behavior, true, true)
+    }
+
+    /// Adds an exact-final-only prompt with duplicate handling.
+    pub(crate) fn add_final_prompt_with_behavior<H: PromptHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        self.add_prompt_registration_with_behavior(handler, behavior, true, false)
+    }
+
+    /// Adds an exact-2024-only prompt with duplicate handling.
+    pub fn add_legacy_prompt_with_behavior<H: PromptHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        self.add_prompt_registration_with_behavior(handler, behavior, false, true)
+    }
+
+    fn add_prompt_registration_with_behavior<H: PromptHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+        admit_final: bool,
+        legacy_enabled: bool,
+    ) -> Result<(), McpError> {
+        let def = crate::catch_extension_unwind(|| handler.definition()).map_err(|_payload| {
+            McpError::internal_error("prompt definition hook panicked during admission")
+        })?;
         let name = &def.name;
 
         let existed = self.prompts.contains_key(name);
@@ -1681,7 +2026,29 @@ impl Router {
             }
         }
 
+        let final_definition = admit_final
+            .then(|| admit_final_prompt_definition(&handler, &def))
+            .transpose()?;
         self.prompts.insert(def.name.clone(), Box::new(handler));
+        if legacy_enabled {
+            self.final_only_prompts.remove(&def.name);
+        } else {
+            self.final_only_prompts.insert(def.name.clone());
+        }
+        match final_definition {
+            Some(final_definition) => {
+                self.final_prompts.insert(
+                    def.name.clone(),
+                    AdmittedFinalPromptRegistration {
+                        definition: final_definition,
+                        tags: def.tags.clone(),
+                    },
+                );
+            }
+            None => {
+                self.final_prompts.remove(&def.name);
+            }
+        }
         if !existed {
             self.prompt_order.push(def.name);
         }
@@ -1694,6 +2061,7 @@ impl Router {
         self.tool_order
             .iter()
             .filter_map(|name| self.tools.get(name))
+            .filter(|entry| entry.legacy_enabled)
             .map(|entry| entry.definition.clone())
             .collect()
     }
@@ -1712,6 +2080,9 @@ impl Router {
             .iter()
             .filter_map(|name| self.tools.get(name))
             .filter_map(|entry| {
+                if !entry.legacy_enabled {
+                    return None;
+                }
                 let def = &entry.definition;
                 // Check session state filter
                 if let Some(state) = session_state {
@@ -1736,6 +2107,10 @@ impl Router {
         self.resource_order
             .iter()
             .filter_map(|uri| self.resources.get(uri))
+            .filter(|handler| {
+                let uri = handler.definition().uri;
+                !self.final_only_resources.contains(&uri)
+            })
             .map(|h| h.definition())
             .collect()
     }
@@ -1755,6 +2130,9 @@ impl Router {
             .filter_map(|uri| self.resources.get(uri))
             .filter_map(|h| {
                 let def = h.definition();
+                if self.final_only_resources.contains(&def.uri) {
+                    return None;
+                }
                 // Check session state filter
                 if let Some(state) = session_state {
                     if !state.is_resource_enabled(&def.uri) {
@@ -1778,6 +2156,7 @@ impl Router {
         self.resource_template_order
             .iter()
             .filter_map(|t| self.resource_templates.get(t))
+            .filter(|entry| entry.legacy_enabled)
             .map(|entry| entry.template.clone())
             .collect()
     }
@@ -1796,6 +2175,9 @@ impl Router {
             .iter()
             .filter_map(|t| self.resource_templates.get(t))
             .filter_map(|entry| {
+                if !entry.legacy_enabled {
+                    return None;
+                }
                 // Check session state filter
                 if let Some(state) = session_state {
                     if !state.is_resource_enabled(&entry.template.uri_template) {
@@ -1819,6 +2201,10 @@ impl Router {
         self.prompt_order
             .iter()
             .filter_map(|name| self.prompts.get(name))
+            .filter(|handler| {
+                let name = handler.definition().name;
+                !self.final_only_prompts.contains(&name)
+            })
             .map(|h| h.definition())
             .collect()
     }
@@ -1838,6 +2224,9 @@ impl Router {
             .filter_map(|name| self.prompts.get(name))
             .filter_map(|h| {
                 let def = h.definition();
+                if self.final_only_prompts.contains(&def.name) {
+                    return None;
+                }
                 // Check session state filter
                 if let Some(state) = session_state {
                     if !state.is_prompt_enabled(&def.name) {
@@ -1891,7 +2280,7 @@ impl Router {
     pub(crate) fn server_discovery_behavior_registry(&self) -> ServerBehaviorRegistry {
         let mut behaviors = Vec::with_capacity(11);
         behaviors.push(ServerBehavior::SubscriptionsListen);
-        if self.completion_handler.is_some() {
+        if self.final_completion_enabled {
             behaviors.push(ServerBehavior::CompletionComplete);
         }
         if self
@@ -1903,14 +2292,20 @@ impl Router {
             behaviors.push(ServerBehavior::ToolsList);
             behaviors.push(ServerBehavior::ToolsListChangedNotification);
         }
-        if !self.resource_order.is_empty() || !self.resource_template_order.is_empty() {
+        if !self.final_resources.is_empty()
+            || self
+                .resource_template_order
+                .iter()
+                .filter_map(|key| self.resource_templates.get(key))
+                .any(|entry| entry.final_definition.is_some())
+        {
             behaviors.push(ServerBehavior::ResourcesList);
             behaviors.push(ServerBehavior::ResourcesListChangedNotification);
         }
-        if !self.resource_order.is_empty() {
+        if !self.final_resources.is_empty() {
             behaviors.push(ServerBehavior::ResourceUpdateDelivery);
         }
-        if !self.prompt_order.is_empty() {
+        if !self.final_prompts.is_empty() {
             behaviors.push(ServerBehavior::PromptsList);
             behaviors.push(ServerBehavior::PromptsListChangedNotification);
         }
@@ -1948,6 +2343,8 @@ impl Router {
             return Some(ResolvedResource {
                 handler,
                 params: UriParams::new(),
+                final_enabled: self.final_resources.contains_key(uri),
+                legacy_enabled: !self.final_only_resources.contains(uri),
             });
         }
 
@@ -1967,7 +2364,12 @@ impl Router {
                 };
                 params.insert(name, value);
             }
-            return Some(ResolvedResource { handler, params });
+            return Some(ResolvedResource {
+                handler,
+                params,
+                final_enabled: entry.final_definition.is_some(),
+                legacy_enabled: entry.legacy_enabled,
+            });
         }
 
         None
@@ -2062,7 +2464,8 @@ impl Router {
             .completion_handler
             .as_ref()
             .ok_or_else(|| McpError::method_not_found(COMPLETION_COMPLETE))?;
-        let handler_ctx = derive_handler_context(request_ctx, None, None, None);
+        let handler_ctx =
+            derive_handler_context(request_ctx, None, None, None, ProtocolEra::Legacy2024);
         let handler_timeout =
             read_handler_timeout(request_ctx.cx(), "completion_timeout", || handler.timeout())?;
         let effective_budget = compose_handler_budget(
@@ -2110,6 +2513,9 @@ impl Router {
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
+        if !self.final_completion_enabled {
+            return Err(McpError::method_not_found(COMPLETION_COMPLETE));
+        }
 
         match &params.reference {
             FinalCompletionReference::Prompt { name }
@@ -2121,7 +2527,8 @@ impl Router {
                 ));
             }
             FinalCompletionReference::Resource { uri }
-                if !self.resources.contains_key(uri) && !self.resource_templates.contains_key(uri) =>
+                if !self.resources.contains_key(uri)
+                    && !self.resource_templates.contains_key(uri) =>
             {
                 return Err(McpError::invalid_params(
                     "completion resource reference is not registered",
@@ -2136,7 +2543,8 @@ impl Router {
             .completion_handler
             .as_ref()
             .ok_or_else(|| McpError::method_not_found(COMPLETION_COMPLETE))?;
-        let handler_ctx = derive_handler_context(request_ctx, None, None, None);
+        let handler_ctx =
+            derive_handler_context(request_ctx, None, None, None, ProtocolEra::Modern2026);
         let handler_timeout =
             read_handler_timeout(request_ctx.cx(), "completion_timeout", || handler.timeout())?;
         let effective_budget = compose_handler_budget(
@@ -2247,7 +2655,11 @@ impl Router {
 
         let params = request.params.as_ref();
         let result = match request.method.as_str() {
-            "ping" => encode_stateless_handler_result(Ok(serde_json::json!({})))?,
+            // `ping` remains an exact 2024-11-05 connection method.  The
+            // stateless endpoint is exclusively the final 2026 surface, so
+            // accepting it here would make a legacy-only method appear in
+            // final dispatch.
+            "ping" => return Err(McpError::method_not_found("ping")),
             COMPLETION_COMPLETE => {
                 let request =
                     CoreRequest::decode(ProtocolEra::Modern2026, COMPLETION_COMPLETE, params)
@@ -2332,19 +2744,8 @@ impl Router {
                         "modern resources/list dispatch selected another core request",
                     ));
                 };
-                let result = self.handle_resources_list(
-                    request_ctx,
-                    legacy_list_resources_params(params.clone()),
-                    None,
-                );
                 encode_final_core_result(
-                    result.and_then(|result| {
-                        self.project_final_resources_list(
-                            request_ctx,
-                            result,
-                            self.final_cache_hints,
-                        )
-                    }),
+                    self.handle_final_resources_list(request_ctx, params.clone()),
                     |result| FinalCoreResult::ResourcesList {
                         result,
                         diagnostic: None,
@@ -2364,19 +2765,8 @@ impl Router {
                         "modern resources/templates/list dispatch selected another core request",
                     ));
                 };
-                let result = self.handle_resource_templates_list(
-                    request_ctx,
-                    legacy_list_resource_templates_params(params.clone()),
-                    None,
-                );
                 encode_final_core_result(
-                    result.and_then(|result| {
-                        self.project_final_resource_templates_list(
-                            request_ctx,
-                            result,
-                            self.final_cache_hints,
-                        )
-                    }),
+                    self.handle_final_resource_templates_list(request_ctx, params.clone()),
                     |result| FinalCoreResult::ResourceTemplatesList {
                         result,
                         diagnostic: None,
@@ -2435,15 +2825,8 @@ impl Router {
                         "modern prompts/list dispatch selected another core request",
                     ));
                 };
-                let result = self.handle_prompts_list(
-                    request_ctx,
-                    legacy_list_prompts_params(params.clone()),
-                    None,
-                );
                 encode_final_core_result(
-                    result.and_then(|result| {
-                        self.project_final_prompts_list(request_ctx, result, self.final_cache_hints)
-                    }),
+                    self.handle_final_prompts_list(request_ctx, params.clone()),
                     |result| FinalCoreResult::PromptsList {
                         result,
                         diagnostic: None,
@@ -2823,165 +3206,104 @@ impl Router {
         })
     }
 
-    fn project_final_resources_list(
+    fn handle_final_resources_list(
         &self,
         request_ctx: &McpContext,
-        result: ListResourcesResult,
-        cache_hints: FinalCacheHintPolicy,
+        params: FinalListParams,
     ) -> McpResult<FinalListResourcesResult> {
-        let resources = result
-            .resources
-            .into_iter()
-            .map(|resource| {
-                let handler = self.resources.get(&resource.uri).ok_or_else(|| {
-                    McpError::internal_error("listed resource is absent from the router catalog")
-                })?;
-                let (title, icons, annotations, meta) = crate::catch_extension_unwind(|| {
-                    (
-                        handler.final_title().map(str::to_owned),
-                        handler.final_icons().map(|icons| icons.to_vec()),
-                        handler.final_annotations().cloned(),
-                        handler.final_metadata().cloned(),
-                    )
-                })
-                .map_err(|_payload| {
-                    sanitized_handler_panic(request_ctx.cx(), "resource_definition")
-                })?;
-                project_final_resource_catalog_entry(resource, title, icons, annotations, meta)
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        let filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let filters =
+            (params.include_tags.is_some() || params.exclude_tags.is_some()).then_some(filters);
+        let resources = self
+            .resource_order
+            .iter()
+            .filter_map(|uri| self.final_resources.get(uri))
+            .filter(|entry| {
+                filters
+                    .as_ref()
+                    .is_none_or(|filters| filters.matches(&entry.tags))
             })
-            .collect::<McpResult<Vec<_>>>()?;
+            .map(|entry| entry.definition.clone())
+            .collect();
+        let (resources, next_cursor) =
+            page_final_catalog(resources, params.cursor.as_deref(), self.list_page_size)?;
         Ok(FinalListResourcesResult {
             resources,
-            next_cursor: result.next_cursor,
-            ttl_ms: cache_hints.list_ttl_ms,
-            cache_scope: cache_hints.scope,
+            next_cursor,
+            ttl_ms: self.final_cache_hints.list_ttl_ms,
+            cache_scope: self.final_cache_hints.scope,
         })
     }
 
-    fn project_final_resource_templates_list(
+    fn handle_final_resource_templates_list(
         &self,
         request_ctx: &McpContext,
-        result: ListResourceTemplatesResult,
-        cache_hints: FinalCacheHintPolicy,
+        params: FinalListParams,
     ) -> McpResult<FinalListResourceTemplatesResult> {
-        let resource_templates = result
-            .resource_templates
-            .into_iter()
-            .map(|template| {
-                let entry = self
-                    .resource_templates
-                    .get(&template.uri_template)
-                    .ok_or_else(|| {
-                        McpError::internal_error(
-                            "listed resource template is absent from the router catalog",
-                        )
-                    })?;
-                let (title, icons, annotations, meta) = match entry.handler.as_deref() {
-                    Some(handler) => crate::catch_extension_unwind(|| {
-                        (
-                            handler.final_template_title().map(str::to_owned),
-                            handler.final_template_icons().map(|icons| icons.to_vec()),
-                            handler.final_template_annotations().cloned(),
-                            handler.final_template_metadata().cloned(),
-                        )
-                    })
-                    .map_err(|_payload| {
-                        sanitized_handler_panic(request_ctx.cx(), "resource_definition")
-                    })?,
-                    None => (None, None, None, None),
-                };
-
-                Ok(FinalResourceTemplate {
-                    uri_template: template.uri_template,
-                    name: template.name,
-                    title,
-                    description: template.description,
-                    icons,
-                    mime_type: template.mime_type,
-                    annotations,
-                    meta,
-                })
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        let filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let filters =
+            (params.include_tags.is_some() || params.exclude_tags.is_some()).then_some(filters);
+        let resource_templates = self
+            .resource_template_order
+            .iter()
+            .filter_map(|key| self.resource_templates.get(key))
+            .filter_map(|entry| {
+                entry
+                    .final_definition
+                    .as_ref()
+                    .map(|definition| (definition, &entry.template.tags))
             })
-            .collect::<McpResult<Vec<_>>>()?;
+            .filter(|(_, tags)| filters.as_ref().is_none_or(|filters| filters.matches(tags)))
+            .map(|(definition, _)| definition.clone())
+            .collect();
+        let (resource_templates, next_cursor) = page_final_catalog(
+            resource_templates,
+            params.cursor.as_deref(),
+            self.list_page_size,
+        )?;
         Ok(FinalListResourceTemplatesResult {
             resource_templates,
-            next_cursor: result.next_cursor,
-            ttl_ms: cache_hints.list_ttl_ms,
-            cache_scope: cache_hints.scope,
+            next_cursor,
+            ttl_ms: self.final_cache_hints.list_ttl_ms,
+            cache_scope: self.final_cache_hints.scope,
         })
     }
 
-    fn project_final_prompts_list(
+    fn handle_final_prompts_list(
         &self,
         request_ctx: &McpContext,
-        result: ListPromptsResult,
-        cache_hints: FinalCacheHintPolicy,
+        params: FinalListParams,
     ) -> McpResult<FinalListPromptsResult> {
-        let prompts = result
-            .prompts
-            .into_iter()
-            .map(|prompt| {
-                let handler = self.prompts.get(&prompt.name).ok_or_else(|| {
-                    McpError::internal_error("listed prompt is absent from the router catalog")
-                })?;
-                let (title, icons, meta) = crate::catch_extension_unwind(|| {
-                    (
-                        handler.final_title().map(str::to_owned),
-                        handler.final_icons().map(|icons| icons.to_vec()),
-                        handler.final_metadata().cloned(),
-                    )
-                })
-                .map_err(|_payload| {
-                    sanitized_handler_panic(request_ctx.cx(), "prompt_definition")
-                })?;
-                let Prompt {
-                    name,
-                    description,
-                    arguments,
-                    ..
-                } = prompt;
-                let arguments = (!arguments.is_empty()).then(|| {
-                    arguments
-                        .into_iter()
-                        .map(|argument| FinalPromptArgument {
-                            name: argument.name,
-                            title: None,
-                            description: argument.description,
-                            required: Some(argument.required),
-                        })
-                        .collect()
-                });
-                Ok(FinalPrompt {
-                    name,
-                    title,
-                    description,
-                    icons,
-                    arguments,
-                    meta,
-                })
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        let filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let filters =
+            (params.include_tags.is_some() || params.exclude_tags.is_some()).then_some(filters);
+        let prompts = self
+            .prompt_order
+            .iter()
+            .filter_map(|name| self.final_prompts.get(name))
+            .filter(|entry| {
+                filters
+                    .as_ref()
+                    .is_none_or(|filters| filters.matches(&entry.tags))
             })
-            .collect::<McpResult<Vec<_>>>()?;
+            .map(|entry| entry.definition.clone())
+            .collect();
+        let (prompts, next_cursor) =
+            page_final_catalog(prompts, params.cursor.as_deref(), self.list_page_size)?;
         Ok(FinalListPromptsResult {
             prompts,
-            next_cursor: result.next_cursor,
-            ttl_ms: cache_hints.list_ttl_ms,
-            cache_scope: cache_hints.scope,
-        })
-    }
-
-    fn project_final_resources_read(
-        result: ReadResourceResult,
-        cache_hints: FinalCacheHintPolicy,
-    ) -> McpResult<FinalReadResourceResult> {
-        let contents = result
-            .contents
-            .into_iter()
-            .map(promote_legacy_resource_content)
-            .collect::<McpResult<Vec<_>>>()?;
-        Ok(FinalReadResourceResult {
-            contents,
-            ttl_ms: cache_hints.resource_read_ttl_ms,
-            cache_scope: cache_hints.scope,
+            next_cursor,
+            ttl_ms: self.final_cache_hints.list_ttl_ms,
+            cache_scope: self.final_cache_hints.scope,
         })
     }
 
@@ -3030,6 +3352,12 @@ impl Router {
             .tools
             .get(&params.name)
             .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", params.name)))?;
+        if !entry.legacy_enabled {
+            return Err(McpError::method_not_found(&format!(
+                "tool: {}",
+                params.name
+            )));
+        }
         let handler = &entry.handler;
 
         // Validate arguments against the tool's input schema
@@ -3064,6 +3392,7 @@ impl Router {
             progress_marker,
             notification_sender,
             bidirectional_senders,
+            ProtocolEra::Legacy2024,
         );
 
         let handler_timeout =
@@ -3144,6 +3473,12 @@ impl Router {
             .tools
             .get(&params.name)
             .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", params.name)))?;
+        if !entry.legacy_enabled {
+            return Err(McpError::method_not_found(&format!(
+                "tool: {}",
+                params.name
+            )));
+        }
         let handler = &entry.handler;
         let arguments = params.arguments.unwrap_or_else(|| serde_json::json!({}));
         let validation_result = if self.strict_input_validation {
@@ -3171,6 +3506,7 @@ impl Router {
             progress_marker,
             notification_sender,
             bidirectional_senders,
+            ProtocolEra::Legacy2024,
         );
         let handler_timeout =
             read_handler_timeout(request_ctx.cx(), "tool_timeout", || handler.timeout())?;
@@ -3245,6 +3581,7 @@ impl Router {
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
+        let progress_marker = final_progress_marker(&params.meta)?;
         if !session_state.is_tool_enabled(&params.name) {
             return Err(McpError::new(
                 McpErrorCode::MethodNotFound,
@@ -3291,9 +3628,10 @@ impl Router {
 
         let ctx = derive_handler_context(
             request_ctx,
-            None,
+            progress_marker,
             notification_sender,
             bidirectional_senders,
+            ProtocolEra::Modern2026,
         );
         let handler_timeout =
             read_handler_timeout(request_ctx.cx(), "tool_timeout", || handler.timeout())?;
@@ -3497,6 +3835,9 @@ impl Router {
         let resolved = self
             .resolve_resource(&params.uri)
             .ok_or_else(|| McpError::resource_not_found(&params.uri))?;
+        if !resolved.legacy_enabled {
+            return Err(McpError::resource_not_found(&params.uri));
+        }
 
         // Extract progress marker from request metadata
         let progress_marker: Option<ProgressMarker> =
@@ -3509,6 +3850,7 @@ impl Router {
             progress_marker,
             notification_sender,
             bidirectional_senders,
+            ProtocolEra::Legacy2024,
         );
 
         let handler_timeout = read_handler_timeout(request_ctx.cx(), "resource_timeout", || {
@@ -3577,6 +3919,9 @@ impl Router {
         let resolved = self
             .resolve_resource(&params.uri)
             .ok_or_else(|| McpError::resource_not_found(&params.uri))?;
+        if !resolved.legacy_enabled {
+            return Err(McpError::resource_not_found(&params.uri));
+        }
         let progress_marker = params
             .meta
             .as_ref()
@@ -3586,6 +3931,7 @@ impl Router {
             progress_marker,
             notification_sender,
             bidirectional_senders,
+            ProtocolEra::Legacy2024,
         );
         let handler_timeout = read_handler_timeout(request_ctx.cx(), "resource_timeout", || {
             resolved.handler.timeout()
@@ -3642,6 +3988,7 @@ impl Router {
         bidirectional_senders: Option<&BidirectionalSenders>,
         resume_inputs: Option<&MrtrCompletedInputs>,
     ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        let progress_marker = final_progress_marker(&params.meta)?;
         let uri = params.uri.as_str();
         debug!(
             target: targets::HANDLER,
@@ -3670,11 +4017,17 @@ impl Router {
                 serde_json::json!({"uri": uri}),
             )
         })?;
+        if !resolved.final_enabled {
+            return Err(McpError::invalid_params(
+                "resource is registered only for exact MCP 2024-11-05 dispatch",
+            ));
+        }
         let ctx = derive_handler_context(
             request_ctx,
-            None,
+            progress_marker,
             notification_sender,
             bidirectional_senders,
+            ProtocolEra::Modern2026,
         );
         let handler_timeout = read_handler_timeout(request_ctx.cx(), "resource_timeout", || {
             resolved.handler.timeout()
@@ -3811,6 +4164,12 @@ impl Router {
                 format!("Prompt not found: {}", params.name),
             )
         })?;
+        if self.final_only_prompts.contains(&params.name) {
+            return Err(McpError::new(
+                fastmcp_core::McpErrorCode::PromptNotFound,
+                format!("Prompt not found: {}", params.name),
+            ));
+        }
         let description = crate::catch_extension_unwind(|| handler.definition().description)
             .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "prompt_definition"))?;
 
@@ -3825,6 +4184,7 @@ impl Router {
             progress_marker,
             notification_sender,
             bidirectional_senders,
+            ProtocolEra::Legacy2024,
         );
 
         let handler_timeout =
@@ -3896,6 +4256,12 @@ impl Router {
                 format!("Prompt not found: {}", params.name),
             )
         })?;
+        if self.final_only_prompts.contains(&params.name) {
+            return Err(McpError::new(
+                McpErrorCode::PromptNotFound,
+                format!("Prompt not found: {}", params.name),
+            ));
+        }
         let description = crate::catch_extension_unwind(|| handler.definition().description)
             .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "prompt_definition"))?;
         let progress_marker = params
@@ -3907,6 +4273,7 @@ impl Router {
             progress_marker,
             notification_sender,
             bidirectional_senders,
+            ProtocolEra::Legacy2024,
         );
         let handler_timeout =
             read_handler_timeout(request_ctx.cx(), "prompt_timeout", || handler.timeout())?;
@@ -3973,6 +4340,7 @@ impl Router {
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
+        let progress_marker = final_progress_marker(&params.meta)?;
         if !session_state.is_prompt_enabled(&params.name) {
             return Err(McpError::new(
                 McpErrorCode::PromptNotFound,
@@ -3984,24 +4352,33 @@ impl Router {
             .prompts
             .get(&params.name)
             .ok_or_else(|| McpError::invalid_params(format!("Unknown prompt: {}", params.name)))?;
+        let final_registration = self.final_prompts.get(&params.name).ok_or_else(|| {
+            McpError::invalid_params("prompt is registered only for exact MCP 2024-11-05 dispatch")
+        })?;
         if params.arguments.is_explicit_null() {
             return Err(McpError::invalid_params(
                 "prompts/get arguments must not be null",
             ));
         }
-        let definition = crate::catch_extension_unwind(|| handler.definition())
-            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "prompt_definition"))?;
         let arguments = params.arguments.into_value().unwrap_or_default();
-        if definition
+        if final_registration
+            .definition
             .arguments
+            .as_deref()
+            .unwrap_or_default()
             .iter()
-            .any(|argument| argument.required && !arguments.contains_key(&argument.name))
+            .any(|argument| {
+                argument.required == Some(true) && !arguments.contains_key(&argument.name)
+            })
         {
             return Err(McpError::invalid_params("Missing required prompt argument"));
         }
         if arguments.keys().any(|name| {
-            !definition
+            !final_registration
+                .definition
                 .arguments
+                .as_deref()
+                .unwrap_or_default()
                 .iter()
                 .any(|argument| &argument.name == name)
         }) {
@@ -4009,9 +4386,10 @@ impl Router {
         }
         let ctx = derive_handler_context(
             request_ctx,
-            None,
+            progress_marker,
             notification_sender,
             bidirectional_senders,
+            ProtocolEra::Modern2026,
         );
         let handler_timeout =
             read_handler_timeout(request_ctx.cx(), "prompt_timeout", || handler.timeout())?;
@@ -4049,56 +4427,6 @@ impl Router {
     // ========================================================================
     // Task Dispatch Methods (Docket/SEP-1686)
     // ========================================================================
-
-    /// Handles the tasks/list request.
-    ///
-    /// Lists all background tasks, optionally filtered by status.
-    #[cfg(test)]
-    pub fn handle_tasks_list(
-        &self,
-        request_ctx: &McpContext,
-        params: ListTasksParams,
-        task_manager: Option<&SharedTaskManager>,
-    ) -> McpResult<ListTasksResult> {
-        if let Some(error) = budget_error(request_ctx) {
-            return Err(error);
-        }
-
-        let task_manager = task_manager.ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::MethodNotFound,
-                "Background tasks not enabled on this server",
-            )
-        })?;
-
-        debug!(
-            target: targets::HANDLER,
-            "listing tasks; status_filter_present={}",
-            params.status.is_some()
-        );
-
-        let mut tasks = task_manager.list_tasks(params.status);
-        // Stable ordering for pagination: created_at then id.
-        tasks.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.id.0.cmp(&b.id.0))
-        });
-
-        let limit = params.limit.unwrap_or(50).max(1) as usize;
-        let offset = decode_cursor_offset(params.cursor.as_deref())?;
-        let end = offset.saturating_add(limit).min(tasks.len());
-        let next_cursor = if end < tasks.len() {
-            Some(encode_cursor_offset(end))
-        } else {
-            None
-        };
-
-        Ok(ListTasksResult {
-            tasks: tasks.get(offset..end).unwrap_or_default().to_vec(),
-            next_cursor,
-        })
-    }
 
     /// Handles the tasks/get request.
     ///
@@ -4170,42 +4498,6 @@ impl Router {
             cancelled: true,
             task,
         })
-    }
-
-    /// Handles the tasks/submit request.
-    ///
-    /// Submits a new background task for execution.
-    #[cfg(test)]
-    pub fn handle_tasks_submit(
-        &self,
-        request_ctx: &McpContext,
-        params: SubmitTaskParams,
-        task_manager: Option<&SharedTaskManager>,
-    ) -> McpResult<SubmitTaskResult> {
-        if let Some(error) = budget_error(request_ctx) {
-            return Err(error);
-        }
-
-        let task_manager = task_manager.ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::MethodNotFound,
-                "Background tasks not enabled on this server",
-            )
-        })?;
-
-        debug!(
-            target: targets::HANDLER,
-            "submitting task; task_type_key={}; params_present={}",
-            safe_log_label(&params.task_type),
-            params.params.is_some()
-        );
-
-        let task_id = task_manager.submit(request_ctx.cx(), &params.task_type, params.params)?;
-        let task = task_manager
-            .get_info(&task_id)
-            .ok_or_else(|| McpError::internal_error("Task created but not found"))?;
-
-        Ok(SubmitTaskResult { task })
     }
 }
 
@@ -4454,8 +4746,12 @@ impl Router {
             tools,
             tool_order,
             resources,
+            final_only_resources,
+            final_resources,
             resource_order,
             prompts,
+            final_only_prompts,
+            final_prompts,
             prompt_order,
             resource_templates,
             resource_template_order,
@@ -4466,7 +4762,14 @@ impl Router {
         result.merge(self.mount_tools_from(tools, tool_order, prefix, behavior));
 
         // Mount resources
-        result.merge(self.mount_resources_from(resources, resource_order, prefix, behavior));
+        result.merge(self.mount_resources_from(
+            resources,
+            final_only_resources,
+            final_resources,
+            resource_order,
+            prefix,
+            behavior,
+        ));
 
         // Mount resource templates
         result.merge(self.mount_resource_templates_from(
@@ -4477,7 +4780,14 @@ impl Router {
         ));
 
         // Mount prompts
-        result.merge(self.mount_prompts_from(prompts, prompt_order, prefix, behavior));
+        result.merge(self.mount_prompts_from(
+            prompts,
+            final_only_prompts,
+            final_prompts,
+            prompt_order,
+            prefix,
+            behavior,
+        ));
 
         // Log mount result
         if result.has_components() {
@@ -4605,13 +4915,22 @@ impl Router {
 
         let Router {
             resources,
+            final_only_resources,
+            final_resources,
             resource_order,
             resource_templates,
             resource_template_order,
             ..
         } = other;
         let mut result = preflight;
-        result.merge(self.mount_resources_from(resources, resource_order, prefix, behavior));
+        result.merge(self.mount_resources_from(
+            resources,
+            final_only_resources,
+            final_resources,
+            resource_order,
+            prefix,
+            behavior,
+        ));
         let template_result = self.mount_resource_templates_from(
             resource_templates,
             resource_template_order,
@@ -4626,6 +4945,8 @@ impl Router {
     fn mount_resources_from(
         &mut self,
         mut resources: HashMap<String, BoxedResourceHandler>,
+        final_only_resources: HashSet<String>,
+        mut final_resources: HashMap<String, AdmittedFinalResourceRegistration>,
         resource_order: Vec<String>,
         prefix: Option<&str>,
         behavior: crate::DuplicateBehavior,
@@ -4660,6 +4981,23 @@ impl Router {
                 !existed && !self.resource_order.iter().any(|u| u == &mounted_uri);
             self.resources
                 .insert(mounted_uri.clone(), Box::new(mounted));
+            if prefix.is_none() {
+                if let Some(final_registration) = final_resources.remove(&uri) {
+                    self.final_resources
+                        .insert(mounted_uri.clone(), final_registration);
+                } else {
+                    self.final_resources.remove(&mounted_uri);
+                }
+            } else {
+                // Prefixed resource URIs are intentionally legacy-only: the
+                // mounting namespace is not an absolute final URI.
+                self.final_resources.remove(&mounted_uri);
+            }
+            if prefix.is_none() && final_only_resources.contains(&uri) {
+                self.final_only_resources.insert(mounted_uri.clone());
+            } else {
+                self.final_only_resources.remove(&mounted_uri);
+            }
             if needs_order_push {
                 self.resource_order.push(mounted_uri);
             }
@@ -4685,9 +5023,25 @@ impl Router {
                     continue;
                 }
 
-                let mounted = MountedResourceHandler::new(handler, uri, mounted_uri.clone());
+                let mounted =
+                    MountedResourceHandler::new(handler, uri.clone(), mounted_uri.clone());
                 self.resources
                     .insert(mounted_uri.clone(), Box::new(mounted));
+                if prefix.is_none() {
+                    if let Some(final_registration) = final_resources.remove(&uri) {
+                        self.final_resources
+                            .insert(mounted_uri.clone(), final_registration);
+                    } else {
+                        self.final_resources.remove(&mounted_uri);
+                    }
+                } else {
+                    self.final_resources.remove(&mounted_uri);
+                }
+                if prefix.is_none() && final_only_resources.contains(&uri) {
+                    self.final_only_resources.insert(mounted_uri.clone());
+                } else {
+                    self.final_only_resources.remove(&mounted_uri);
+                }
                 if !existed && !self.resource_order.iter().any(|u| u == &mounted_uri) {
                     self.resource_order.push(mounted_uri);
                 }
@@ -4768,6 +5122,11 @@ impl Router {
                 specificity,
                 template: mounted_template,
                 handler: mounted_handler,
+                final_definition: entry.final_definition.map(|mut definition| {
+                    definition.uri_template = mounted_uri_template.clone();
+                    definition
+                }),
+                legacy_enabled: entry.legacy_enabled,
             };
 
             let needs_order_push = !existed
@@ -4816,8 +5175,7 @@ impl Router {
                     wrapped
                 });
 
-                let (matcher, specificity) = match admit_resource_template(&mounted_uri_template)
-                {
+                let (matcher, specificity) = match admit_resource_template(&mounted_uri_template) {
                     Ok(admitted) => admitted,
                     Err(error) => {
                         result.errors.push(format!(
@@ -4833,6 +5191,11 @@ impl Router {
                     specificity,
                     template: mounted_template,
                     handler: mounted_handler,
+                    final_definition: entry.final_definition.map(|mut definition| {
+                        definition.uri_template = mounted_uri_template.clone();
+                        definition
+                    }),
+                    legacy_enabled: entry.legacy_enabled,
                 };
 
                 self.resource_templates
@@ -4874,13 +5237,22 @@ impl Router {
         if !preflight.is_success() {
             return preflight;
         }
-        self.mount_prompts_from(other.prompts, other.prompt_order, prefix, behavior)
+        self.mount_prompts_from(
+            other.prompts,
+            other.final_only_prompts,
+            other.final_prompts,
+            other.prompt_order,
+            prefix,
+            behavior,
+        )
     }
 
     /// Internal: mount prompts from a HashMap.
     fn mount_prompts_from(
         &mut self,
         mut prompts: HashMap<String, BoxedPromptHandler>,
+        final_only_prompts: HashSet<String>,
+        mut final_prompts: HashMap<String, AdmittedFinalPromptRegistration>,
         prompt_order: Vec<String>,
         prefix: Option<&str>,
         behavior: crate::DuplicateBehavior,
@@ -4914,6 +5286,21 @@ impl Router {
             let needs_order_push =
                 !existed && !self.prompt_order.iter().any(|n| n == &mounted_name);
             self.prompts.insert(mounted_name.clone(), Box::new(mounted));
+            match final_prompts.remove(&name) {
+                Some(mut final_registration) => {
+                    final_registration.definition.name.clone_from(&mounted_name);
+                    self.final_prompts
+                        .insert(mounted_name.clone(), final_registration);
+                }
+                None => {
+                    self.final_prompts.remove(&mounted_name);
+                }
+            }
+            if final_only_prompts.contains(&name) {
+                self.final_only_prompts.insert(mounted_name.clone());
+            } else {
+                self.final_only_prompts.remove(&mounted_name);
+            }
             if needs_order_push {
                 self.prompt_order.push(mounted_name);
             }
@@ -4935,6 +5322,21 @@ impl Router {
 
                 let mounted = MountedPromptHandler::new(handler, mounted_name.clone());
                 self.prompts.insert(mounted_name.clone(), Box::new(mounted));
+                match final_prompts.remove(&name) {
+                    Some(mut final_registration) => {
+                        final_registration.definition.name.clone_from(&mounted_name);
+                        self.final_prompts
+                            .insert(mounted_name.clone(), final_registration);
+                    }
+                    None => {
+                        self.final_prompts.remove(&mounted_name);
+                    }
+                }
+                if final_only_prompts.contains(&name) {
+                    self.final_only_prompts.insert(mounted_name.clone());
+                } else {
+                    self.final_only_prompts.remove(&mounted_name);
+                }
                 if !existed && !self.prompt_order.iter().any(|n| n == &mounted_name) {
                     self.prompt_order.push(mounted_name);
                 }
@@ -4970,6 +5372,8 @@ impl Router {
 struct ResolvedResource<'a> {
     handler: &'a BoxedResourceHandler,
     params: UriParams,
+    final_enabled: bool,
+    legacy_enabled: bool,
 }
 
 /// Entry for a resource template with its matcher and optional handler.
@@ -4978,6 +5382,8 @@ pub(crate) struct ResourceTemplateEntry {
     specificity: (usize, usize, usize),
     pub(crate) template: ResourceTemplate,
     pub(crate) handler: Option<BoxedResourceHandler>,
+    final_definition: Option<FinalResourceTemplate>,
+    legacy_enabled: bool,
 }
 
 /// Parses a resource template with the canonical RFC 6570 implementation and
@@ -4988,9 +5394,9 @@ fn admit_resource_template(
     let template = fastmcp_protocol::UriTemplate::parse(source)
         .map_err(|_| McpError::invalid_params("resource template is not valid RFC 6570"))?;
     let specificity = resource_template_specificity(&template);
-    let matcher = template.compile_reversible().map_err(|_| {
-        McpError::invalid_params("resource template cannot be matched reversibly")
-    })?;
+    let matcher = template
+        .compile_reversible()
+        .map_err(|_| McpError::invalid_params("resource template cannot be matched reversibly"))?;
     Ok((matcher, specificity))
 }
 
@@ -5289,6 +5695,9 @@ impl ToolCaller for RouterToolCaller {
                 .tools
                 .get(&name)
                 .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", name)))?;
+            if !entry.legacy_enabled {
+                return Err(McpError::method_not_found(&format!("tool: {}", name)));
+            }
             let handler = &entry.handler;
 
             // Validate arguments against the tool's input schema
@@ -5430,445 +5839,6 @@ mod safe_log_label_tests {
     }
 }
 
-#[cfg(any())]
-mod uri_template_tests {
-    use super::{
-        MAX_URI_TEMPLATE_INPUT_BYTES, MAX_URI_TEMPLATE_MATCH_SEGMENTS, UriTemplate,
-        UriTemplateError,
-    };
-
-    #[test]
-    fn uri_template_matches_simple_param() {
-        let matcher = UriTemplate::new("file://{path}");
-        let params = matcher.matches("file://foo").expect("match");
-        assert_eq!(params.get("path").map(String::as_str), Some("foo"));
-    }
-
-    #[test]
-    fn uri_template_simple_trailing_param_rejects_raw_slash() {
-        let matcher = UriTemplate::new("file://{path}");
-        assert!(matcher.matches("file://foo/bar").is_none());
-
-        let params = matcher
-            .matches("file://foo%2Fbar")
-            .expect("percent-encoded slash remains part of a simple expansion");
-        assert_eq!(params.get("path").map(String::as_str), Some("foo/bar"));
-    }
-
-    #[test]
-    fn uri_template_simple_capture_enforces_rfc6570_raw_grammar() {
-        let matcher = UriTemplate::new("file://{path}");
-        let params = matcher
-            .matches("file://alpha-._~09%2Ftail")
-            .expect("unreserved ASCII and encoded reserved bytes are valid");
-        assert_eq!(
-            params.get("path").map(String::as_str),
-            Some("alpha-._~09/tail")
-        );
-
-        for raw in [
-            "a:b",
-            "a?b",
-            "a#b",
-            "a@b",
-            "a b",
-            "a\\b",
-            "a\u{0001}b",
-            "café",
-            "%",
-            "%2",
-            "%2G",
-            "%FF",
-        ] {
-            let uri = format!("file://{raw}");
-            assert!(
-                matcher.matches(&uri).is_none(),
-                "invalid simple capture was accepted: {raw:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn uri_template_reserved_capture_enforces_rfc6570_raw_grammar() {
-        let matcher = UriTemplate::new("file://{+path}");
-        let raw = "a:/?#[]@!$&'()*+,;=z%2Ftail";
-        let params = matcher
-            .matches(&format!("file://{raw}"))
-            .expect("reserved expansion should admit RFC 3986 reserved ASCII");
-        assert_eq!(
-            params.get("path").map(String::as_str),
-            Some("a:/?#[]@!$&'()*+,;=z/tail")
-        );
-
-        for raw in ["a b", "a\\b", "a\u{007f}b", "café", "%", "%GG"] {
-            let uri = format!("file://{raw}");
-            assert!(
-                matcher.matches(&uri).is_none(),
-                "invalid reserved capture was accepted: {raw:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn uri_template_matches_multiple_params() {
-        let matcher = UriTemplate::new("db://{table}/{id}");
-        let params = matcher.matches("db://users/42").expect("match");
-        assert_eq!(params.get("table").map(String::as_str), Some("users"));
-        assert_eq!(params.get("id").map(String::as_str), Some("42"));
-    }
-
-    #[test]
-    fn uri_template_rejects_extra_segments() {
-        let matcher = UriTemplate::new("db://{table}/{id}");
-        assert!(matcher.matches("db://users/42/extra").is_none());
-    }
-
-    #[test]
-    fn uri_template_rejects_extra_segments_with_literal_path() {
-        let matcher = UriTemplate::new("db://{table}/items/{id}");
-        let params = matcher.matches("db://users/items/42").expect("match");
-        assert_eq!(params.get("table").map(String::as_str), Some("users"));
-        assert_eq!(params.get("id").map(String::as_str), Some("42"));
-        assert!(matcher.matches("db://users/items/42/extra").is_none());
-    }
-
-    #[test]
-    fn uri_template_decodes_percent_encoded_values() {
-        let matcher = UriTemplate::new("file://{path}");
-        let params = matcher.matches("file://foo%2Fbar").expect("match");
-        assert_eq!(params.get("path").map(String::as_str), Some("foo/bar"));
-    }
-
-    #[test]
-    fn uri_template_reserved_trailing_param_matches_nested_path() {
-        let matcher = UriTemplate::new("asset://{bucket}/{+path}");
-        let params = matcher
-            .matches("asset://public/images/icons/mark.svg")
-            .expect("reserved trailing expansion should consume slashes");
-
-        assert_eq!(params.get("bucket").map(String::as_str), Some("public"));
-        assert_eq!(
-            params.get("path").map(String::as_str),
-            Some("images/icons/mark.svg")
-        );
-        assert!(params.get("+path").is_none());
-    }
-
-    #[test]
-    fn uri_template_simple_trailing_param_preserves_multi_param_slash_rule() {
-        let matcher = UriTemplate::new("asset://{bucket}/{path}");
-
-        assert!(
-            matcher
-                .matches("asset://public/images/icons/mark.svg")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn uri_template_simple_interior_param_cannot_cross_path_segments() {
-        let simple = UriTemplate::new("db://{tenant}/items/{id}");
-        assert!(simple.matches("db://a/b/items/1").is_none());
-
-        let encoded = simple
-            .matches("db://a%2Fb/items/1")
-            .expect("an encoded slash remains part of one simple expansion");
-        assert_eq!(encoded.get("tenant").map(String::as_str), Some("a/b"));
-        assert_eq!(encoded.get("id").map(String::as_str), Some("1"));
-
-        let reserved = UriTemplate::new("db://{+tenant}/items/{id}");
-        let params = reserved
-            .matches("db://a/b/items/1")
-            .expect("reserved expansion may consume path separators");
-        assert_eq!(params.get("tenant").map(String::as_str), Some("a/b"));
-        assert_eq!(params.get("id").map(String::as_str), Some("1"));
-    }
-
-    #[test]
-    fn uri_template_reserved_interior_param_backtracks_greedily() {
-        let matcher = UriTemplate::new("db://{+tenant}/items/{id}");
-        let params = matcher
-            .matches("db://a/items/b/items/1")
-            .expect("reserved expansion should use the last viable delimiter");
-
-        assert_eq!(params.get("tenant").map(String::as_str), Some("a/items/b"));
-        assert_eq!(params.get("id").map(String::as_str), Some("1"));
-    }
-
-    #[test]
-    fn uri_template_reserved_param_percent_decodes_exactly_once() {
-        let matcher = UriTemplate::new("file://{+path}");
-        let params = matcher
-            .matches("file://dir%20one/nested%252Fname")
-            .expect("match");
-
-        assert_eq!(
-            params.get("path").map(String::as_str),
-            Some("dir one/nested%2Fname")
-        );
-        assert!(matcher.matches("file://nested%2Gname").is_none());
-    }
-
-    #[test]
-    fn uri_template_supports_escaped_braces() {
-        let matcher = UriTemplate::new("file://{{literal}}/{id}");
-        let params = matcher.matches("file://{literal}/123").expect("match");
-        assert_eq!(params.get("id").map(String::as_str), Some("123"));
-    }
-
-    #[test]
-    fn uri_template_rejects_empty_param() {
-        let err = UriTemplate::parse("file://{}/x").unwrap_err();
-        assert_eq!(err, UriTemplateError::EmptyParam);
-    }
-
-    #[test]
-    fn uri_template_rejects_unmatched_close() {
-        let err = UriTemplate::parse("file://}x").unwrap_err();
-        assert_eq!(err, UriTemplateError::UnmatchedClose);
-    }
-
-    #[test]
-    fn uri_template_rejects_duplicate_params() {
-        let err = UriTemplate::parse("db://{id}/{id}").unwrap_err();
-        assert_eq!(err, UriTemplateError::DuplicateParam("id".to_string()));
-    }
-
-    #[test]
-    fn uri_template_rejects_duplicate_simple_and_reserved_params() {
-        let err = UriTemplate::parse("db://{id}/{+id}").unwrap_err();
-        assert_eq!(err, UriTemplateError::DuplicateParam("id".to_string()));
-    }
-
-    #[test]
-    fn uri_template_rejects_unsupported_operators() {
-        for operator in ['#', '.', '/', ';', '?', '&'] {
-            let pattern = format!("resource://{{{operator}name}}");
-            assert_eq!(
-                UriTemplate::parse(&pattern).unwrap_err(),
-                UriTemplateError::UnsupportedOperator,
-                "operator {operator} should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn uri_template_rejects_invalid_parameter_names_and_modifiers() {
-        for pattern in [
-            "resource://{bad-name}",
-            "resource://{bad.}",
-            "resource://{bad..name}",
-            "resource://{name,other}",
-            "resource://{name*}",
-            "resource://{name:3}",
-            "resource://{+bad-name}",
-        ] {
-            assert_eq!(
-                UriTemplate::parse(pattern).unwrap_err(),
-                UriTemplateError::InvalidParamName,
-                "invalid parameter expression should be rejected: {pattern}"
-            );
-        }
-
-        assert_eq!(
-            UriTemplate::parse("resource://{+}").unwrap_err(),
-            UriTemplateError::EmptyParam
-        );
-    }
-
-    #[test]
-    fn uri_template_rejects_unclosed_param() {
-        let err = UriTemplate::parse("file://{path").unwrap_err();
-        assert_eq!(err, UriTemplateError::UnclosedParam);
-    }
-
-    #[test]
-    fn uri_template_parse_rejects_excessive_segment_count() {
-        let mut boundary = String::new();
-        for index in 0..(MAX_URI_TEMPLATE_MATCH_SEGMENTS / 2) {
-            boundary.push('x');
-            boundary.push_str(&format!("{{value_{index}}}"));
-        }
-        let parsed = UriTemplate::parse(&boundary).expect("segment boundary should be accepted");
-        assert_eq!(parsed.segments.len(), MAX_URI_TEMPLATE_MATCH_SEGMENTS);
-
-        boundary.push('x');
-        boundary.push_str("{one_more}");
-        assert_eq!(
-            UriTemplate::parse(&boundary).unwrap_err(),
-            UriTemplateError::TooComplex
-        );
-    }
-
-    #[test]
-    fn uri_template_match_rejects_input_above_byte_limit() {
-        let matcher = UriTemplate::new("{+value}");
-        let boundary = "a".repeat(MAX_URI_TEMPLATE_INPUT_BYTES);
-        let params = matcher
-            .matches(&boundary)
-            .expect("input at the byte boundary should match");
-        assert_eq!(
-            params.get("value").map(String::len),
-            Some(MAX_URI_TEMPLATE_INPUT_BYTES)
-        );
-
-        let oversized = "a".repeat(MAX_URI_TEMPLATE_INPUT_BYTES + 1);
-        assert!(matcher.matches(&oversized).is_none());
-    }
-
-    #[test]
-    fn uri_template_repeated_literal_attack_fails_closed() {
-        let matcher = UriTemplate::new("{+left}x{middle}/END");
-        let mut attack = "x/".repeat((MAX_URI_TEMPLATE_INPUT_BYTES - 3) / 2);
-        attack.push_str("END");
-
-        assert!(attack.len() <= MAX_URI_TEMPLATE_INPUT_BYTES);
-        assert!(matcher.matches(&attack).is_none());
-    }
-
-    #[test]
-    fn uri_template_specificity_literal_only() {
-        let t = UriTemplate::new("file://exact/path");
-        let (lit_len, lit_segs, total_segs) = t.specificity();
-        assert_eq!(lit_len, "file://exact/path".len());
-        assert_eq!(lit_segs, 1);
-        assert_eq!(total_segs, 1);
-    }
-
-    #[test]
-    fn uri_template_specificity_with_params() {
-        let t = UriTemplate::new("db://{table}/items/{id}");
-        let (lit_len, lit_segs, total_segs) = t.specificity();
-        assert_eq!(lit_len, "db://".len() + "/items/".len());
-        assert_eq!(lit_segs, 2);
-        assert_eq!(total_segs, 4); // "db://", {table}, "/items/", {id}
-    }
-
-    #[test]
-    fn uri_template_no_match_on_literal_mismatch() {
-        let t = UriTemplate::new("file://exact");
-        assert!(t.matches("file://other").is_none());
-    }
-
-    #[test]
-    fn uri_template_rejects_empty_param_value() {
-        let t = UriTemplate::new("db://{table}/items/{id}");
-        // table would be empty
-        assert!(t.matches("db:///items/42").is_none());
-    }
-
-    #[test]
-    fn uri_template_debug_and_clone() {
-        let t = UriTemplate::new("file://{path}");
-        let debug = format!("{:?}", t);
-        assert!(debug.contains("file://{path}"));
-        let cloned = t.clone();
-        assert!(cloned.matches("file://test").is_some());
-    }
-
-    #[test]
-    fn uri_template_escaped_close_brace() {
-        let t = UriTemplate::new("file://{{a}}/{id}");
-        let params = t.matches("file://{a}/42").expect("match");
-        assert_eq!(params.get("id").map(String::as_str), Some("42"));
-    }
-
-    #[test]
-    fn uri_template_try_new_ok() {
-        let t = UriTemplate::try_new("file://{path}");
-        assert!(t.is_ok());
-    }
-
-    #[test]
-    fn uri_template_try_new_err() {
-        let t = UriTemplate::try_new("file://{");
-        assert!(t.is_err());
-    }
-
-    #[test]
-    fn uri_template_new_invalid_returns_non_matching() {
-        // Invalid template: UriTemplate::new should log a warning and return
-        // a template that never matches any URI (fail-safe).
-        let t = UriTemplate::new("file://{");
-        assert!(t.matches("file://anything").is_none());
-        assert!(t.matches("").is_none());
-    }
-
-    #[test]
-    fn uri_template_literal_only_no_match_empty() {
-        let t = UriTemplate::new("file://exact");
-        assert!(t.matches("").is_none());
-        assert!(t.matches("file://exact").is_some());
-    }
-
-    #[test]
-    fn uri_template_multiple_params_empty_last() {
-        // Last param must not be empty
-        let t = UriTemplate::new("db://{table}/{id}");
-        assert!(t.matches("db://users/").is_none());
-    }
-
-    #[test]
-    fn uri_template_adjacent_params_not_supported() {
-        // Two adjacent params (no literal between them) should fail to match
-        let t = UriTemplate::new("{a}{b}");
-        assert!(t.matches("xy").is_none());
-    }
-
-    #[test]
-    fn uri_template_escaped_double_close_brace() {
-        // Escaped closing braces: }} -> }
-        let t = UriTemplate::new("a}}b/{id}");
-        let params = t.matches("a}b/42").expect("match");
-        assert_eq!(params.get("id").map(String::as_str), Some("42"));
-    }
-
-    #[test]
-    fn uri_template_specificity_param_only() {
-        let t = UriTemplate::new("{all}");
-        let (lit_len, lit_segs, total_segs) = t.specificity();
-        assert_eq!(lit_len, 0);
-        assert_eq!(lit_segs, 0);
-        assert_eq!(total_segs, 1);
-    }
-}
-
-#[cfg(any())]
-mod percent_decode_tests {
-    use super::{from_hex, percent_decode};
-
-    #[test]
-    fn no_percent_passthrough() {
-        assert_eq!(percent_decode("hello"), Some("hello".to_string()));
-    }
-
-    #[test]
-    fn basic_percent_decode() {
-        assert_eq!(percent_decode("foo%20bar"), Some("foo bar".to_string()));
-    }
-
-    #[test]
-    fn truncated_percent_returns_none() {
-        assert!(percent_decode("foo%2").is_none());
-    }
-
-    #[test]
-    fn invalid_hex_returns_none() {
-        assert!(percent_decode("foo%GG").is_none());
-    }
-
-    #[test]
-    fn from_hex_digits() {
-        assert_eq!(from_hex(b'0'), Some(0));
-        assert_eq!(from_hex(b'9'), Some(9));
-        assert_eq!(from_hex(b'a'), Some(10));
-        assert_eq!(from_hex(b'f'), Some(15));
-        assert_eq!(from_hex(b'A'), Some(10));
-        assert_eq!(from_hex(b'F'), Some(15));
-        assert_eq!(from_hex(b'G'), None);
-    }
-}
-
 #[cfg(test)]
 mod cursor_tests {
     use super::{decode_cursor_offset, encode_cursor_offset};
@@ -6003,7 +5973,7 @@ mod router_tests {
     use std::collections::BTreeMap;
     use std::fmt;
     use std::future::Future;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
 
@@ -6258,6 +6228,37 @@ mod router_tests {
         }
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
             Ok(vec![Content::text(format!("called {}", self.name))])
+        }
+    }
+
+    struct RouterProgressTool;
+
+    impl ToolHandler for RouterProgressTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "router-progress-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["total"],
+                    "properties": {"total": {"type": "number"}},
+                    "additionalProperties": false,
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+            let total = args
+                .get("total")
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| McpError::invalid_params("router progress total is required"))?;
+            ctx.report_progress_with_total(12_000.0, total, Some("router-final"));
+            Ok(vec![Content::text("progress emitted")])
         }
     }
 
@@ -6687,6 +6688,89 @@ mod router_tests {
             })),
             id,
         )
+    }
+
+    #[test]
+    fn final_router_progress_uses_exact_numbers_and_rejects_one_smaller_total() {
+        let mut router = Router::new();
+        router
+            .add_tool(RouterProgressTool)
+            .expect("router progress tool registers for both eras");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 177, Budget::INFINITE, &state);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let notification_sender: NotificationSender = Arc::new(move |notification| {
+            sent_clone
+                .lock()
+                .expect("notification collection is not poisoned")
+                .push(notification);
+        });
+        let baseline = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "progressToken": "router-final-progress",
+            },
+            "name": "router-progress-tool",
+            "arguments": {"total": 12000.0},
+        });
+        let mut planted = baseline.clone();
+        planted["arguments"]["total"] = serde_json::json!(11999.0);
+        assert_eq!(
+            baseline["_meta"], planted["_meta"],
+            "the progress total is the sole planted request dimension"
+        );
+        assert_eq!(baseline["name"], planted["name"]);
+
+        let baseline: FinalCallToolParams =
+            serde_json::from_value(baseline).expect("baseline final request is valid");
+        let outcome = block_on(router.handle_tools_call_final_in_request(
+            &request_ctx,
+            request_ctx.cx(),
+            baseline,
+            state.clone(),
+            Some(&notification_sender),
+            None,
+            None,
+        ))
+        .expect("ordinary final router dispatch completes");
+        assert!(matches!(outcome, FinalToolOutcome::Complete(_)));
+        let notification = sent
+            .lock()
+            .expect("notification collection is not poisoned")[0]
+            .clone();
+        let wire = serde_json::to_string(
+            notification
+                .params
+                .as_ref()
+                .expect("ordinary final progress has parameters"),
+        )
+        .expect("ordinary final progress parameters serialize");
+        assert!(wire.contains("\"progress\":12000"));
+        assert!(wire.contains("\"total\":12000"));
+
+        let planted: FinalCallToolParams =
+            serde_json::from_value(planted).expect("one-variable planted request is valid");
+        let outcome = block_on(router.handle_tools_call_final_in_request(
+            &request_ctx,
+            request_ctx.cx(),
+            planted,
+            state,
+            Some(&notification_sender),
+            None,
+            None,
+        ))
+        .expect("the handler result remains valid when only total is smaller");
+        assert!(matches!(outcome, FinalToolOutcome::Complete(_)));
+        assert_eq!(
+            sent.lock()
+                .expect("notification collection is not poisoned")
+                .len(),
+            1,
+            "the one-variable progress violation emits no second final notification"
+        );
     }
 
     struct TaskCapableRouterTool {
@@ -7138,6 +7222,62 @@ mod router_tests {
         }
     }
 
+    /// Deliberately changes its legacy definition after registration. Modern
+    /// prompt validation must use the admission snapshot instead.
+    struct MutablePromptDefinition {
+        expose_admitted_argument: Arc<AtomicBool>,
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl PromptHandler for MutablePromptDefinition {
+        fn definition(&self) -> Prompt {
+            let argument = if self.expose_admitted_argument.load(Ordering::SeqCst) {
+                PromptArgument {
+                    name: "topic".to_owned(),
+                    description: Some("admitted required argument".to_owned()),
+                    required: true,
+                }
+            } else {
+                PromptArgument {
+                    name: "mutated".to_owned(),
+                    description: Some("must not affect final validation".to_owned()),
+                    required: false,
+                }
+            };
+            Prompt {
+                name: "mutable-prompt-definition".to_owned(),
+                description: None,
+                arguments: vec![argument],
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn get_final(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CompleteResult::new(
+                FinalGetPromptResult {
+                    description: None,
+                    messages: Vec::new(),
+                },
+                empty_final_result_meta()?,
+            ))
+        }
+    }
+
     fn input_required_result(forged_request_state: &str) -> InputRequiredResult {
         let encoded = serde_json::json!({
             "resultType": "input_required",
@@ -7247,7 +7387,9 @@ mod router_tests {
         }
 
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
-            Ok(vec![Content::text("legacy task-capable input-required result")])
+            Ok(vec![Content::text(
+                "legacy task-capable input-required result",
+            )])
         }
 
         fn call_final_outcome(
@@ -7509,8 +7651,8 @@ mod router_tests {
             &self,
             _ctx: &McpContext,
             params: FinalCompletionParams,
-        ) -> McpResult<FinalCompletionValues> {
-            Ok(FinalCompletionValues {
+        ) -> McpResult<fastmcp_protocol::FinalCompletionValues> {
+            Ok(fastmcp_protocol::FinalCompletionValues {
                 values: vec![format!("{}ging", params.argument.value)],
                 total: Some(fastmcp_protocol::JsonInteger::from(1_i64)),
                 has_more: Some(false),
@@ -8446,6 +8588,106 @@ mod router_tests {
             .expect_err("modern dispatch cannot resolve an explicit legacy-only tool");
         assert_eq!(modern_error.code, McpErrorCode::InvalidParams);
         assert_eq!(router.tools_count(), 1);
+    }
+
+    #[test]
+    fn explicit_legacy_resource_and_prompt_are_inert_on_final_routes() {
+        let mut router = Router::new();
+        router.add_legacy_resource(NamedResource::new("file:///legacy-only"));
+        router.add_legacy_resource_template(marked_template("file:///{name}", "legacy-only"));
+        router.add_legacy_prompt(NamedPrompt::new("legacy-only-prompt"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 181, Budget::INFINITE, &state);
+
+        let legacy_resource = router
+            .handle_resources_read(
+                &request_ctx,
+                &ReadResourceParams {
+                    uri: "file:///legacy-only".to_owned(),
+                    meta: None,
+                },
+                state.clone(),
+                None,
+                None,
+            )
+            .expect("the exact legacy resource route retains its explicit registration");
+        assert_eq!(legacy_resource.contents.len(), 1);
+        let legacy_prompt = router
+            .handle_prompts_get(
+                &request_ctx,
+                GetPromptParams {
+                    name: "legacy-only-prompt".to_owned(),
+                    arguments: None,
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("the exact legacy prompt route retains its explicit registration");
+        assert!(legacy_prompt.messages.is_empty());
+
+        let modern_resources = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/list",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    })),
+                    182_i64,
+                ),
+            )
+            .expect("final discovery remains valid with only legacy resources");
+        assert_eq!(modern_resources["resources"], serde_json::json!([]));
+        let modern_templates = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/templates/list",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    })),
+                    183_i64,
+                ),
+            )
+            .expect("final template discovery remains valid with only legacy templates");
+        assert_eq!(modern_templates["resourceTemplates"], serde_json::json!([]));
+
+        let modern_prompt = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "prompts/get",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                        "name": "legacy-only-prompt",
+                    })),
+                    184_i64,
+                ),
+            )
+            .expect_err("changing only the dispatch era refuses the legacy-only prompt");
+        assert_eq!(modern_prompt.code, McpErrorCode::InvalidParams);
+        assert!(
+            !router
+                .server_discovery_behavior_registry()
+                .contains(ServerBehavior::ResourcesList)
+        );
+        assert!(
+            !router
+                .server_discovery_behavior_registry()
+                .contains(ServerBehavior::PromptsList)
+        );
     }
 
     // ── add_tool_with_behavior ─────────────────────────────────────────
@@ -9955,21 +10197,7 @@ mod router_tests {
         assert!(result.instructions.is_none());
     }
 
-    // ── handle_tasks_list/get/cancel/submit without manager ────────────
-
-    #[test]
-    fn handle_tasks_list_no_manager_errors() {
-        let r = Router::new();
-        let cx = Cx::for_testing();
-        let params = ListTasksParams {
-            cursor: None,
-            status: None,
-            limit: None,
-        };
-        let request_ctx = McpContext::new(cx, 1);
-        let err = r.handle_tasks_list(&request_ctx, params, None).unwrap_err();
-        assert!(err.message.contains("not enabled"));
-    }
+    // ── handle_tasks_get/cancel without manager ─────────────────────────
 
     #[test]
     fn handle_tasks_get_no_manager_errors() {
@@ -9994,21 +10222,6 @@ mod router_tests {
         let request_ctx = McpContext::new(cx, 1);
         let err = r
             .handle_tasks_cancel(&request_ctx, params, None)
-            .unwrap_err();
-        assert!(err.message.contains("not enabled"));
-    }
-
-    #[test]
-    fn handle_tasks_submit_no_manager_errors() {
-        let r = Router::new();
-        let cx = Cx::for_testing();
-        let params = SubmitTaskParams {
-            task_type: "test".to_string(),
-            params: None,
-        };
-        let request_ctx = McpContext::new(cx, 1);
-        let err = r
-            .handle_tasks_submit(&request_ctx, params, None)
             .unwrap_err();
         assert!(err.message.contains("not enabled"));
     }
@@ -11883,31 +12096,7 @@ mod router_tests {
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
 
-    // ── handle_tasks with real task manager ──────────────────────────────
-
-    #[test]
-    fn handle_tasks_list_with_manager_returns_tasks() {
-        use crate::tasks::TaskManager;
-        let r = Router::new();
-        let cx = Cx::for_testing();
-        let tm = TaskManager::new_for_testing();
-        tm.register_handler("analyze", |_cx, _params| async {
-            Ok(serde_json::json!({}))
-        });
-        let _ = tm.submit(&cx, "analyze", None).unwrap();
-        let _ = tm.submit(&cx, "analyze", None).unwrap();
-        let shared = tm.into_shared();
-        let params = ListTasksParams {
-            cursor: None,
-            status: None,
-            limit: None,
-        };
-        let request_ctx = McpContext::new(cx, 1);
-        let result = r
-            .handle_tasks_list(&request_ctx, params, Some(&shared))
-            .unwrap();
-        assert_eq!(result.tasks.len(), 2);
-    }
+    // ── handle_tasks_get/cancel with real task manager ───────────────────
 
     #[test]
     fn handle_tasks_get_with_manager_returns_task() {
@@ -12004,6 +12193,52 @@ mod router_tests {
             Some(&serde_json::json!("complete"))
         );
         assert_eq!(modern.get("completion"), legacy.get("completion"));
+    }
+
+    #[test]
+    fn explicit_legacy_completion_is_not_discovered_or_dispatched_as_final() {
+        let mut router = Router::new();
+        router.add_legacy_completion_handler(EchoCompletion);
+        router.add_prompt(NamedPrompt::new("deploy"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 184, Budget::INFINITE, &state);
+        let request = JsonRpcRequest::new(
+            COMPLETION_COMPLETE,
+            Some(serde_json::json!({
+                "ref": {"type": "ref/prompt", "name": "deploy"},
+                "argument": {"name": "environment", "value": "sta"},
+            })),
+            184_i64,
+        );
+        assert!(
+            router
+                .dispatch_legacy_completion(&request_ctx, &request)
+                .is_ok()
+        );
+
+        let mut final_request = request.clone();
+        final_request
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion parameters are an object")
+            .insert(
+                "_meta".to_owned(),
+                serde_json::json!({
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                }),
+            );
+        let error = router
+            .dispatch_stateless(&request_ctx, &final_request)
+            .expect_err("only the selected protocol era changes completion availability");
+        assert_eq!(error.code, McpErrorCode::MethodNotFound);
+        assert!(
+            !router
+                .server_discovery_behavior_registry()
+                .contains(ServerBehavior::CompletionComplete)
+        );
     }
 
     #[test]
@@ -12144,7 +12379,10 @@ mod router_tests {
             }
 
             fn template(&self) -> Option<ResourceTemplate> {
-                Some(marked_template("mcp://resource/{first}{second}", "ambiguous"))
+                Some(marked_template(
+                    "mcp://resource/{first}{second}",
+                    "ambiguous",
+                ))
             }
 
             fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
@@ -14316,6 +14554,91 @@ mod router_tests {
             "legacy prompt-argument-boundary result"
         );
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn final_prompt_argument_snapshot_is_immutable_after_registration() {
+        let expose_admitted_argument = Arc::new(AtomicBool::new(true));
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_prompt(MutablePromptDefinition {
+            expose_admitted_argument: Arc::clone(&expose_admitted_argument),
+            final_calls: Arc::clone(&final_calls),
+        });
+        expose_admitted_argument.store(false, Ordering::SeqCst);
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 156, Budget::INFINITE, &state);
+        let accepted = final_prompt_get_request(
+            "mutable-prompt-definition",
+            serde_json::json!({"topic": "release"}),
+            156_i64,
+        );
+        let mut missing_required = accepted.clone();
+        let removed = missing_required
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("arguments"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("prompt arguments are an object")
+            .remove("topic");
+        assert_eq!(removed, Some(serde_json::json!("release")));
+        assert_eq!(accepted.method, missing_required.method);
+        assert_eq!(accepted.id, missing_required.id);
+        assert_eq!(
+            accepted
+                .params
+                .as_ref()
+                .and_then(|params| params.get("_meta")),
+            missing_required
+                .params
+                .as_ref()
+                .and_then(|params| params.get("_meta")),
+            "the required argument is the sole planted dimension"
+        );
+        assert_eq!(
+            accepted
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name")),
+            missing_required
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name")),
+            "the required argument is the sole planted dimension"
+        );
+
+        let catalog = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "prompts/list",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    })),
+                    157_i64,
+                ),
+            )
+            .expect("the final prompt catalog retains its admitted argument metadata");
+        assert_eq!(catalog["prompts"][0]["arguments"][0]["name"], "topic");
+        assert_eq!(catalog["prompts"][0]["arguments"][0]["required"], true);
+
+        let response = router
+            .dispatch_stateless(&request_ctx, &accepted)
+            .expect("the admitted final argument remains accepted after the legacy hook changes");
+        assert_eq!(response["resultType"], "complete");
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+
+        let error = router
+            .dispatch_stateless(&request_ctx, &missing_required)
+            .expect_err("removing only the admitted required argument is rejected");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

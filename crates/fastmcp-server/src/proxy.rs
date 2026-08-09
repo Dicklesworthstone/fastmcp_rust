@@ -23,18 +23,28 @@ use fastmcp_protocol::protocol_policy::{
 use fastmcp_protocol::{
     CallToolResult, CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo,
     CompleteResult, Content, CoreRequest, CoreResult, CreateMessageParams, FinalCallToolResult,
-    FinalCoreResult, FinalGetPromptResult, FinalReadResourceResult, FinalRequestMeta,
-    GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, LegacyContent, LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent,
-    ListRootsParams, ListRootsResult, Prompt, PromptArgument, PromptMessage, ReadResourceResult,
-    RequestId, Resource, ResourceContent, ResourceTemplate, Tool, ToolAnnotations,
-    decode_strict_jsonrpc_message,
+    FinalCoreResult, FinalGetPromptResult, FinalProgressNotificationParams,
+    FinalReadResourceResult, FinalRequestMeta, GetPromptResult, InitializeParams, InitializeResult,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyCoreResult,
+    LegacyPromptMessage, LegacyResourceContent, ListRootsParams, ListRootsResult, Prompt,
+    PromptMessage, ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate,
+    ServerNotification, Tool, ToolAnnotations, decode_strict_jsonrpc_message,
 };
+use serde::Deserialize;
+use serde_json::value::RawValue;
 
 use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
 
 /// Progress callback signature used by proxy backends.
 pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<String>);
+
+/// Exact-final progress callback signature used by typed proxy calls.
+///
+/// This is intentionally separate from [`ProgressCallback`]: the legacy
+/// callback's `f64` fields cannot retain exact final JSON-number spellings.
+/// Callers that selected the modern upstream receive the admitted final
+/// parameters, including their raw decimal/exponent lexemes.
+pub type FinalProgressCallback<'a> = &'a mut dyn FnMut(FinalProgressNotificationParams);
 
 /// Tool definitions returned by a proxy backend's selected protocol era.
 ///
@@ -47,6 +57,126 @@ pub enum ProxyToolCatalog {
     Legacy(Vec<Tool>),
     /// Exact MCP 2026-07-28 tool definitions.
     Final(Vec<fastmcp_protocol::FinalTool>),
+}
+
+/// Resource definitions returned by a proxy backend's selected protocol era.
+///
+/// Final entries stay disjoint from [`Resource`]: their title, icon set,
+/// annotations, size, and `_meta` members have no lossless legacy model.
+#[derive(Debug, Clone)]
+pub enum ProxyResourceCatalog {
+    /// Exact MCP 2024-11-05 resource definitions.
+    Legacy(Vec<Resource>),
+    /// Exact MCP 2026-07-28 resource definitions.
+    Final(Vec<fastmcp_protocol::FinalResource>),
+}
+
+/// Resource-template definitions returned by a proxy backend's selected era.
+#[derive(Debug, Clone)]
+pub enum ProxyResourceTemplateCatalog {
+    /// Exact MCP 2024-11-05 resource template definitions.
+    Legacy(Vec<ResourceTemplate>),
+    /// Exact MCP 2026-07-28 resource template definitions.
+    Final(Vec<fastmcp_protocol::FinalResourceTemplate>),
+}
+
+/// Prompt definitions returned by a proxy backend's selected protocol era.
+#[derive(Debug, Clone)]
+pub enum ProxyPromptCatalog {
+    /// Exact MCP 2024-11-05 prompt definitions.
+    Legacy(Vec<Prompt>),
+    /// Exact MCP 2026-07-28 prompt definitions.
+    Final(Vec<fastmcp_protocol::FinalPrompt>),
+}
+
+/// Complete proxy catalog without projecting its selected upstream era.
+///
+/// This is the public discovery surface for automatic dual-era proxies. It
+/// deliberately contains disjoint per-method variants rather than a caller
+/// supplied era switch: a live backend selects its era during initialization
+/// and each catalog response retains that exact representation.
+#[derive(Debug, Clone)]
+pub struct ProxyTypedCatalog {
+    /// Exact selected-era tool catalog.
+    pub tools: ProxyToolCatalog,
+    /// Exact selected-era resource catalog.
+    pub resources: ProxyResourceCatalog,
+    /// Exact selected-era resource-template catalog.
+    pub resource_templates: ProxyResourceTemplateCatalog,
+    /// Exact selected-era prompt catalog.
+    pub prompts: ProxyPromptCatalog,
+}
+
+impl ProxyTypedCatalog {
+    /// Returns final tools when the upstream negotiation selected MCP 2026-07-28.
+    #[must_use]
+    pub fn final_tools(&self) -> Option<&[fastmcp_protocol::FinalTool]> {
+        match &self.tools {
+            ProxyToolCatalog::Legacy(_) => None,
+            ProxyToolCatalog::Final(tools) => Some(tools),
+        }
+    }
+
+    /// Returns final resources when the upstream negotiation selected MCP 2026-07-28.
+    #[must_use]
+    pub fn final_resources(&self) -> Option<&[fastmcp_protocol::FinalResource]> {
+        match &self.resources {
+            ProxyResourceCatalog::Legacy(_) => None,
+            ProxyResourceCatalog::Final(resources) => Some(resources),
+        }
+    }
+
+    /// Returns final resource templates when the upstream selected MCP 2026-07-28.
+    #[must_use]
+    pub fn final_resource_templates(&self) -> Option<&[fastmcp_protocol::FinalResourceTemplate]> {
+        match &self.resource_templates {
+            ProxyResourceTemplateCatalog::Legacy(_) => None,
+            ProxyResourceTemplateCatalog::Final(templates) => Some(templates),
+        }
+    }
+
+    /// Returns final prompts when the upstream negotiation selected MCP 2026-07-28.
+    #[must_use]
+    pub fn final_prompts(&self) -> Option<&[fastmcp_protocol::FinalPrompt]> {
+        match &self.prompts {
+            ProxyPromptCatalog::Legacy(_) => None,
+            ProxyPromptCatalog::Final(prompts) => Some(prompts),
+        }
+    }
+
+    /// Returns the single era shared by every upstream catalog response.
+    ///
+    /// A backend is one negotiated upstream session, so a mixed catalog would
+    /// prove either a stale/replaced connection or an invalid backend rather
+    /// than a valid bridge result.
+    pub fn era(&self) -> McpResult<ProtocolEra> {
+        let tools = match &self.tools {
+            ProxyToolCatalog::Legacy(_) => ProtocolEra::Legacy2024,
+            ProxyToolCatalog::Final(_) => ProtocolEra::Modern2026,
+        };
+        let resources = match &self.resources {
+            ProxyResourceCatalog::Legacy(_) => ProtocolEra::Legacy2024,
+            ProxyResourceCatalog::Final(_) => ProtocolEra::Modern2026,
+        };
+        let templates = match &self.resource_templates {
+            ProxyResourceTemplateCatalog::Legacy(_) => ProtocolEra::Legacy2024,
+            ProxyResourceTemplateCatalog::Final(_) => ProtocolEra::Modern2026,
+        };
+        let prompts = match &self.prompts {
+            ProxyPromptCatalog::Legacy(_) => ProtocolEra::Legacy2024,
+            ProxyPromptCatalog::Final(_) => ProtocolEra::Modern2026,
+        };
+        if [resources, templates, prompts]
+            .into_iter()
+            .all(|era| era == tools)
+        {
+            Ok(tools)
+        } else {
+            Err(McpError::invalid_request(
+                "Proxy upstream returned mixed-era catalog responses",
+            ))
+        }
+    }
 }
 
 /// Backend interface used by proxy handlers.
@@ -66,10 +196,23 @@ pub trait ProxyBackend: Send {
 
     /// Lists available resources.
     fn list_resources(&mut self) -> McpResult<Vec<Resource>>;
+    /// Lists resource definitions without changing their selected protocol-era model.
+    fn list_resource_catalog(&mut self) -> McpResult<ProxyResourceCatalog> {
+        self.list_resources().map(ProxyResourceCatalog::Legacy)
+    }
     /// Lists available resource templates.
     fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>>;
+    /// Lists resource-template definitions without changing their selected protocol-era model.
+    fn list_resource_template_catalog(&mut self) -> McpResult<ProxyResourceTemplateCatalog> {
+        self.list_resource_templates()
+            .map(ProxyResourceTemplateCatalog::Legacy)
+    }
     /// Lists available prompts.
     fn list_prompts(&mut self) -> McpResult<Vec<Prompt>>;
+    /// Lists prompt definitions without changing their selected protocol-era model.
+    fn list_prompt_catalog(&mut self) -> McpResult<ProxyPromptCatalog> {
+        self.list_prompts().map(ProxyPromptCatalog::Legacy)
+    }
     /// Calls a tool.
     fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> McpResult<Vec<Content>>;
     /// Calls a tool with progress callback support.
@@ -106,6 +249,19 @@ pub trait ProxyBackend: Send {
                 additional: BTreeMap::new(),
             },
         )))
+    }
+
+    /// Calls a tool while forwarding exact-final progress notifications.
+    ///
+    /// Legacy backends retain their separate progress callback behavior and
+    /// therefore ignore this final-only callback by default.
+    fn call_tool_result_with_final_progress(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+        _on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        self.call_tool_result(name, arguments)
     }
 
     /// Reads a resource while retaining the exact response model selected upstream.
@@ -455,6 +611,30 @@ impl ProxyBackend for Client {
         Client::list_resources(self)
     }
 
+    fn list_resource_catalog(&mut self) -> McpResult<ProxyResourceCatalog> {
+        self.ensure_initialized()?;
+        let era = self.selected_protocol_era().ok_or_else(|| {
+            McpError::invalid_request(
+                "Proxy client has no selected protocol era for resources/list",
+            )
+        })?;
+        if self.server_capabilities().resources.is_none() {
+            return Ok(match era {
+                ProtocolEra::Legacy2024 => ProxyResourceCatalog::Legacy(Vec::new()),
+                ProtocolEra::Modern2026 => ProxyResourceCatalog::Final(Vec::new()),
+            });
+        }
+        match Client::list_resources_typed(self, None)? {
+            CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+                Ok(ProxyResourceCatalog::Legacy(result.resources))
+            }
+            CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
+                Ok(ProxyResourceCatalog::Final(result.payload.resources))
+            }
+            _ => Err(unexpected_proxy_result("resources/list")),
+        }
+    }
+
     fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
         self.ensure_initialized()?;
         if self.server_capabilities().resources.is_none() {
@@ -463,12 +643,58 @@ impl ProxyBackend for Client {
         Client::list_resource_templates(self)
     }
 
+    fn list_resource_template_catalog(&mut self) -> McpResult<ProxyResourceTemplateCatalog> {
+        self.ensure_initialized()?;
+        let era = self.selected_protocol_era().ok_or_else(|| {
+            McpError::invalid_request(
+                "Proxy client has no selected protocol era for resources/templates/list",
+            )
+        })?;
+        if self.server_capabilities().resources.is_none() {
+            return Ok(match era {
+                ProtocolEra::Legacy2024 => ProxyResourceTemplateCatalog::Legacy(Vec::new()),
+                ProtocolEra::Modern2026 => ProxyResourceTemplateCatalog::Final(Vec::new()),
+            });
+        }
+        match Client::list_resource_templates_typed(self, None)? {
+            CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => Ok(
+                ProxyResourceTemplateCatalog::Legacy(result.resource_templates),
+            ),
+            CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) => Ok(
+                ProxyResourceTemplateCatalog::Final(result.payload.resource_templates),
+            ),
+            _ => Err(unexpected_proxy_result("resources/templates/list")),
+        }
+    }
+
     fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
         self.ensure_initialized()?;
         if self.server_capabilities().prompts.is_none() {
             return Ok(Vec::new());
         }
         Client::list_prompts(self)
+    }
+
+    fn list_prompt_catalog(&mut self) -> McpResult<ProxyPromptCatalog> {
+        self.ensure_initialized()?;
+        let era = self.selected_protocol_era().ok_or_else(|| {
+            McpError::invalid_request("Proxy client has no selected protocol era for prompts/list")
+        })?;
+        if self.server_capabilities().prompts.is_none() {
+            return Ok(match era {
+                ProtocolEra::Legacy2024 => ProxyPromptCatalog::Legacy(Vec::new()),
+                ProtocolEra::Modern2026 => ProxyPromptCatalog::Final(Vec::new()),
+            });
+        }
+        match Client::list_prompts_typed(self, None)? {
+            CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+                Ok(ProxyPromptCatalog::Legacy(result.prompts))
+            }
+            CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
+                Ok(ProxyPromptCatalog::Final(result.payload.prompts))
+            }
+            _ => Err(unexpected_proxy_result("prompts/list")),
+        }
     }
 
     fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
@@ -540,12 +766,13 @@ impl ProxyBackend for Client {
 /// Catalog of remote definitions used to register proxy handlers.
 #[derive(Debug, Clone, Default)]
 pub struct ProxyCatalog {
-    /// Exact protocol era selected for the upstream `tools/list` catalog.
+    /// Exact protocol era selected for every upstream catalog response.
     ///
-    /// This remains independent from the tool vectors so a caller cannot
-    /// mistake an empty final catalog for a legacy one. Admission requires an
-    /// explicit marker and rejects a marker/vector combination that mixes the
-    /// two eras.
+    /// The historical field name is retained, but it is a catalog-wide marker:
+    /// a single upstream session must not combine legacy and final component
+    /// definitions. Admission requires this explicit marker even when every
+    /// component catalog is empty, so an empty final catalog is never guessed
+    /// to be legacy.
     pub tool_catalog_era: Option<ProtocolEra>,
     /// Exact legacy remote tool definitions.
     pub tools: Vec<Tool>,
@@ -555,12 +782,18 @@ pub struct ProxyCatalog {
     /// every serializable `FinalTool` member rather than being downgraded to
     /// the legacy component model.
     pub final_tools: Vec<fastmcp_protocol::FinalTool>,
-    /// Remote resource definitions.
+    /// Exact legacy remote resource definitions.
     pub resources: Vec<Resource>,
-    /// Remote resource templates.
+    /// Exact final remote resource definitions.
+    pub final_resources: Vec<fastmcp_protocol::FinalResource>,
+    /// Exact legacy remote resource-template definitions.
     pub resource_templates: Vec<ResourceTemplate>,
-    /// Remote prompt definitions.
+    /// Exact final remote resource-template definitions.
+    pub final_resource_templates: Vec<fastmcp_protocol::FinalResourceTemplate>,
+    /// Exact legacy remote prompt definitions.
     pub prompts: Vec<Prompt>,
+    /// Exact final remote prompt definitions.
+    pub final_prompts: Vec<fastmcp_protocol::FinalPrompt>,
 }
 
 impl ProxyCatalog {
@@ -570,14 +803,36 @@ impl ProxyCatalog {
             ProxyToolCatalog::Legacy(tools) => (Some(ProtocolEra::Legacy2024), tools, Vec::new()),
             ProxyToolCatalog::Final(tools) => (Some(ProtocolEra::Modern2026), Vec::new(), tools),
         };
-        Ok(Self {
+        let (resources, final_resources) = match backend.list_resource_catalog()? {
+            ProxyResourceCatalog::Legacy(resources) => (resources, Vec::new()),
+            ProxyResourceCatalog::Final(resources) => (Vec::new(), resources),
+        };
+        let (resource_templates, final_resource_templates) =
+            match backend.list_resource_template_catalog()? {
+                ProxyResourceTemplateCatalog::Legacy(resource_templates) => {
+                    (resource_templates, Vec::new())
+                }
+                ProxyResourceTemplateCatalog::Final(resource_templates) => {
+                    (Vec::new(), resource_templates)
+                }
+            };
+        let (prompts, final_prompts) = match backend.list_prompt_catalog()? {
+            ProxyPromptCatalog::Legacy(prompts) => (prompts, Vec::new()),
+            ProxyPromptCatalog::Final(prompts) => (Vec::new(), prompts),
+        };
+        let catalog = Self {
             tool_catalog_era,
             tools,
             final_tools,
-            resources: backend.list_resources()?,
-            resource_templates: backend.list_resource_templates()?,
-            prompts: backend.list_prompts()?,
-        })
+            resources,
+            final_resources,
+            resource_templates,
+            final_resource_templates,
+            prompts,
+            final_prompts,
+        };
+        catalog.admit_catalog_shape()?;
+        Ok(catalog)
     }
 
     /// Builds a catalog by querying a client.
@@ -599,38 +854,59 @@ impl ProxyCatalog {
             .collect()
     }
 
-    /// Admits only one exact tool-catalog representation.
+    /// Returns the one exact era selected by every catalog component.
     ///
-    /// A catalog produced by a selected legacy route contains legacy [`Tool`]
-    /// entries only; a selected final route contains [`fastmcp_protocol::FinalTool`]
-    /// entries only. The marker is mandatory even when the selected catalog is
-    /// empty, because an empty final catalog must never be guessed to be legacy.
+    /// A catalog produced by a selected legacy route contains legacy entries
+    /// only; a selected final route contains final entries only. The marker is
+    /// mandatory even when the selected catalog is empty, because an empty
+    /// final catalog must never be guessed to be legacy.
+    pub fn era(&self) -> McpResult<ProtocolEra> {
+        self.admit_catalog_shape()?;
+        self.tool_catalog_era
+            .ok_or_else(|| McpError::internal_error("admitted proxy catalog has no selected era"))
+    }
+
+    /// Refuses a catalog that combines representations from more than one era.
     ///
     /// This validation intentionally precedes route-binding admission and every
     /// builder registration path. `ProxyCatalog` remains public for callers that
     /// assemble a catalog themselves, so its vectors cannot be trusted merely
     /// because the era marker matches a bound client.
-    fn admit_tool_catalog_shape(&self) -> McpResult<()> {
+    fn admit_catalog_shape(&self) -> McpResult<()> {
         match self.tool_catalog_era {
-            Some(ProtocolEra::Legacy2024) if self.final_tools.is_empty() => Ok(()),
+            Some(ProtocolEra::Legacy2024)
+                if self.final_tools.is_empty()
+                    && self.final_resources.is_empty()
+                    && self.final_resource_templates.is_empty()
+                    && self.final_prompts.is_empty() =>
+            {
+                Ok(())
+            }
             Some(ProtocolEra::Legacy2024) => Err(McpError::invalid_request(
-                "An exact legacy proxy tool catalog must not contain final tools",
+                "An exact legacy proxy catalog must not contain final tools, resources, resource templates, or prompts",
             )),
-            Some(ProtocolEra::Modern2026) if self.tools.is_empty() => Ok(()),
+            Some(ProtocolEra::Modern2026)
+                if self.tools.is_empty()
+                    && self.resources.is_empty()
+                    && self.resource_templates.is_empty()
+                    && self.prompts.is_empty() =>
+            {
+                Ok(())
+            }
             Some(ProtocolEra::Modern2026) => Err(McpError::invalid_request(
-                "An exact final proxy tool catalog must not contain legacy tools",
+                "An exact final proxy catalog must not contain legacy tools, resources, resource templates, or prompts",
             )),
             None => Err(McpError::invalid_request(
-                "Proxy tool catalog must declare an exact legacy or final era",
+                "Proxy catalog must declare an exact legacy or final era",
             )),
         }
     }
 
     fn admit_upstream_binding(&self, binding: ProxyUpstreamBinding) -> McpResult<()> {
-        self.admit_tool_catalog_shape()?;
+        self.admit_catalog_shape()?;
         if self.tool_catalog_era != Some(binding.era()) {
             return Err(McpError::invalid_request(
-                "Proxy tools/list catalog era contradicts the immutable route binding",
+                "Proxy catalog era contradicts the immutable route binding",
             ));
         }
         Ok(())
@@ -973,6 +1249,16 @@ impl ProxyHttpClient {
         method: &str,
         parameters: serde_json::Value,
     ) -> McpResult<CoreResult> {
+        let mut ignore_final_progress = |_| {};
+        self.request_result_with_final_progress(method, parameters, &mut ignore_final_progress)
+    }
+
+    fn request_result_with_final_progress(
+        &mut self,
+        method: &str,
+        parameters: serde_json::Value,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
         if self.binding.era() == ProtocolEra::Legacy2024 {
             self.ensure_legacy_initialized()?;
         }
@@ -986,9 +1272,14 @@ impl ProxyHttpClient {
         )?;
         let request_id = self.next_request_id()?;
         let response = match &mut self.connection {
-            ClientHttpConnection::Modern(client) => {
-                receive_modern_response(client, &self.cx, method, parameters, &request_id)?
-            }
+            ClientHttpConnection::Modern(client) => receive_modern_response(
+                client,
+                &self.cx,
+                method,
+                parameters,
+                &request_id,
+                on_progress,
+            )?,
             ClientHttpConnection::LegacySse { client, .. } => {
                 let message = JsonRpcMessage::Request(JsonRpcRequest::new(
                     method,
@@ -1042,51 +1333,73 @@ impl ProxyBackend for ProxyHttpClient {
     }
 
     fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
+        match self.list_resource_catalog()? {
+            ProxyResourceCatalog::Legacy(resources) => Ok(resources),
+            ProxyResourceCatalog::Final(_) => Err(McpError::invalid_request(
+                "Proxy cannot project a final resources/list catalog to the legacy resource surface",
+            )),
+        }
+    }
+
+    fn list_resource_catalog(&mut self) -> McpResult<ProxyResourceCatalog> {
         match self.request_result(
             fastmcp_protocol::methods::RESOURCES_LIST,
             serde_json::json!({}),
         )? {
-            CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => Ok(result.resources),
-            CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => Ok(result
-                .payload
-                .resources
-                .into_iter()
-                .map(final_resource_to_legacy)
-                .collect()),
+            CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+                Ok(ProxyResourceCatalog::Legacy(result.resources))
+            }
+            CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
+                Ok(ProxyResourceCatalog::Final(result.payload.resources))
+            }
             _ => Err(unexpected_proxy_result("resources/list")),
         }
     }
 
     fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
+        match self.list_resource_template_catalog()? {
+            ProxyResourceTemplateCatalog::Legacy(templates) => Ok(templates),
+            ProxyResourceTemplateCatalog::Final(_) => Err(McpError::invalid_request(
+                "Proxy cannot project a final resources/templates/list catalog to the legacy resource-template surface",
+            )),
+        }
+    }
+
+    fn list_resource_template_catalog(&mut self) -> McpResult<ProxyResourceTemplateCatalog> {
         match self.request_result(
             fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
             serde_json::json!({}),
         )? {
-            CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => {
-                Ok(result.resource_templates)
-            }
-            CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) => Ok(result
-                .payload
-                .resource_templates
-                .into_iter()
-                .map(final_resource_template_to_legacy)
-                .collect()),
+            CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => Ok(
+                ProxyResourceTemplateCatalog::Legacy(result.resource_templates),
+            ),
+            CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) => Ok(
+                ProxyResourceTemplateCatalog::Final(result.payload.resource_templates),
+            ),
             _ => Err(unexpected_proxy_result("resources/templates/list")),
         }
     }
 
     fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
+        match self.list_prompt_catalog()? {
+            ProxyPromptCatalog::Legacy(prompts) => Ok(prompts),
+            ProxyPromptCatalog::Final(_) => Err(McpError::invalid_request(
+                "Proxy cannot project a final prompts/list catalog to the legacy prompt surface",
+            )),
+        }
+    }
+
+    fn list_prompt_catalog(&mut self) -> McpResult<ProxyPromptCatalog> {
         match self.request_result(
             fastmcp_protocol::methods::PROMPTS_LIST,
             serde_json::json!({}),
         )? {
-            CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => Ok(result.prompts),
-            CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => Ok(result
-                .payload
-                .prompts
-                .into_iter()
-                .map(final_prompt_to_legacy)
-                .collect()),
+            CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+                Ok(ProxyPromptCatalog::Legacy(result.prompts))
+            }
+            CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
+                Ok(ProxyPromptCatalog::Final(result.payload.prompts))
+            }
             _ => Err(unexpected_proxy_result("prompts/list")),
         }
     }
@@ -1155,6 +1468,19 @@ impl ProxyBackend for ProxyHttpClient {
         )
     }
 
+    fn call_tool_result_with_final_progress(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        self.request_result_with_final_progress(
+            fastmcp_protocol::methods::TOOLS_CALL,
+            serde_json::json!({"name": name, "arguments": arguments}),
+            on_progress,
+        )
+    }
+
     fn read_resource_result(&mut self, uri: &str) -> McpResult<CoreResult> {
         self.request_result(
             fastmcp_protocol::methods::RESOURCES_READ,
@@ -1180,6 +1506,7 @@ fn receive_modern_response(
     method: &str,
     parameters: serde_json::Value,
     request_id: &RequestId,
+    on_progress: FinalProgressCallback<'_>,
 ) -> McpResult<JsonRpcResponse> {
     let response = block_on(client.request(cx, method, parameters, Some(request_id.clone())))
         .map_err(|error| {
@@ -1226,7 +1553,14 @@ fn receive_modern_response(
                 .map_err(|_| {
                     McpError::invalid_request("Proxy HTTP modern SSE event was not JSON-RPC")
                 })?;
-                if matches!(&message, JsonRpcMessage::Request(request) if request.id.is_none()) {
+                if let JsonRpcMessage::Request(request) = &message
+                    && request.is_notification()
+                {
+                    forward_modern_progress_notification(
+                        event.as_bytes(),
+                        request,
+                        &mut *on_progress,
+                    )?;
                     continue;
                 }
                 return response_for_request(message, request_id);
@@ -1239,6 +1573,45 @@ fn receive_modern_response(
             "Proxy HTTP modern request received an unsuccessful HTTP response",
         )),
     }
+}
+
+/// Decodes a modern upstream server notification while retaining its original
+/// `params` slice. This matters for progress notifications: their exact number
+/// spelling is part of the final protocol model and is lost if the frame is
+/// first reduced to a `serde_json::Value`.
+fn decode_modern_server_notification(
+    raw_frame: &[u8],
+    request: &JsonRpcRequest,
+) -> McpResult<ServerNotification> {
+    #[derive(Deserialize)]
+    struct RawNotificationParams<'a> {
+        #[serde(borrow)]
+        params: Option<&'a RawValue>,
+    }
+
+    let raw = serde_json::from_slice::<RawNotificationParams<'_>>(raw_frame).map_err(|_| {
+        McpError::invalid_request("Proxy HTTP modern notification was not a JSON-RPC object")
+    })?;
+    let raw_params = raw.params.map(RawValue::get).unwrap_or("null");
+    ServerNotification::decode_with_raw_params(request, raw_params)
+        .map_err(|_| McpError::invalid_request("Proxy HTTP modern server notification was invalid"))
+}
+
+/// Decodes and forwards one exact-final upstream progress notification.
+///
+/// This boundary deliberately takes the raw SSE frame and a final-only
+/// callback. It therefore cannot silently route modern progress through the
+/// legacy floating-point callback surface.
+fn forward_modern_progress_notification(
+    raw_frame: &[u8],
+    request: &JsonRpcRequest,
+    on_progress: FinalProgressCallback<'_>,
+) -> McpResult<()> {
+    let notification = decode_modern_server_notification(raw_frame, request)?;
+    if let ServerNotification::Progress(params) = notification {
+        on_progress(params);
+    }
+    Ok(())
 }
 
 /// Maximum interleaved control frames accepted while one exact-2024 request
@@ -1469,52 +1842,6 @@ fn final_tool_legacy_fallback(tool: &fastmcp_protocol::FinalTool) -> Tool {
                 read_only: annotations.read_only,
                 open_world_hint: annotations.open_world_hint,
             }),
-    }
-}
-
-fn final_resource_to_legacy(resource: fastmcp_protocol::FinalResource) -> Resource {
-    Resource {
-        uri: resource.uri.as_str().to_owned(),
-        name: resource.name,
-        description: resource.description,
-        mime_type: resource.mime_type,
-        icon: legacy_icon(resource.icons),
-        version: None,
-        tags: Vec::new(),
-    }
-}
-
-fn final_resource_template_to_legacy(
-    template: fastmcp_protocol::FinalResourceTemplate,
-) -> ResourceTemplate {
-    ResourceTemplate {
-        uri_template: template.uri_template,
-        name: template.name,
-        description: template.description,
-        mime_type: template.mime_type,
-        icon: legacy_icon(template.icons),
-        version: None,
-        tags: Vec::new(),
-    }
-}
-
-fn final_prompt_to_legacy(prompt: fastmcp_protocol::FinalPrompt) -> Prompt {
-    Prompt {
-        name: prompt.name,
-        description: prompt.description,
-        arguments: prompt
-            .arguments
-            .unwrap_or_default()
-            .into_iter()
-            .map(|argument| PromptArgument {
-                name: argument.name,
-                description: argument.description,
-                required: argument.required.unwrap_or(false),
-            })
-            .collect(),
-        icon: legacy_icon(prompt.icons),
-        version: None,
-        tags: Vec::new(),
     }
 }
 
@@ -2021,11 +2348,38 @@ impl ProxyClient {
         Ok(catalog)
     }
 
+    /// Discovers every upstream catalog without asking the caller to choose an era.
+    ///
+    /// The backend performs its normal initialization/negotiation first. Final
+    /// catalogs remain in their exact final models, including display metadata,
+    /// annotations, icon collections, and open metadata; legacy catalogs stay
+    /// legacy. A mixed-era response is rejected before any caller can compose
+    /// it into a downstream route.
+    pub fn catalog_typed(&self) -> McpResult<ProxyTypedCatalog> {
+        let catalog = self.with_backend(|backend| {
+            Ok(ProxyTypedCatalog {
+                tools: backend.list_tool_catalog()?,
+                resources: backend.list_resource_catalog()?,
+                resource_templates: backend.list_resource_template_catalog()?,
+                prompts: backend.list_prompt_catalog()?,
+            })
+        })?;
+        let era = catalog.era()?;
+        if let Some(binding) = self.upstream_binding
+            && binding.era() != era
+        {
+            return Err(McpError::invalid_request(
+                "Proxy typed catalog era contradicts the immutable route binding",
+            ));
+        }
+        Ok(catalog)
+    }
+
     /// Admits a catalog only when it agrees with this client's immutable route
     /// binding. This also protects builder callers that supply a catalog
     /// directly rather than obtaining it through [`Self::catalog`].
     pub(crate) fn admit_catalog(&self, catalog: &ProxyCatalog) -> McpResult<()> {
-        catalog.admit_tool_catalog_shape()?;
+        catalog.admit_catalog_shape()?;
         if let Some(binding) = self.upstream_binding {
             catalog.admit_upstream_binding(binding)?;
         }
@@ -2123,8 +2477,28 @@ impl ProxyClient {
         name: &str,
         arguments: serde_json::Value,
     ) -> McpResult<CoreResult> {
+        let mut ignore_final_progress = |_| {};
+        self.call_tool_typed_with_final_progress(ctx, name, arguments, &mut ignore_final_progress)
+    }
+
+    /// Calls a tool without erasing exact result state or final progress
+    /// notifications.
+    ///
+    /// The final callback receives [`FinalProgressNotificationParams`] rather
+    /// than IEEE-754 values, preserving the exact JSON-number lexemes admitted
+    /// from a modern upstream SSE frame. Exact-2024 backends remain on the
+    /// separate [`ProgressCallback`] path and do not invoke this callback.
+    pub fn call_tool_typed_with_final_progress(
+        &self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
-        let result = self.with_backend(|backend| backend.call_tool_result(name, arguments))?;
+        let result = self.with_backend(|backend| {
+            backend.call_tool_result_with_final_progress(name, arguments, on_progress)
+        })?;
         self.admit_upstream_result("tools/call", result)
     }
 
@@ -2514,18 +2888,95 @@ mod tests {
     };
     use fastmcp_protocol::{
         CallToolResult, ClientCapabilities, ClientInfo, CompleteResult, Content, CoreResult,
-        FinalCallToolResult, FinalCoreResult, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
-        LegacyResourceContent, Prompt, PromptMessage, Resource, ResourceContent, Tool,
+        FinalCallToolResult, FinalCoreResult, FinalProgressNotificationParams, JsonRpcMessage,
+        LegacyContent, LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent, Prompt,
+        PromptMessage, Resource, ResourceContent, ServerNotification, Tool,
+        decode_strict_jsonrpc_message,
     };
 
     use super::{
         MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES, ProxyBackend, ProxyCatalog, ProxyClient,
-        ProxyHttpClient, ProxyPromptHandler, ProxyToolCatalog, ProxyToolHandler,
-        ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
-        admit_legacy_interleaved_control_frame, legacy_contents_to_handler,
-        legacy_prompt_messages_to_handler, legacy_resource_to_handler,
+        ProxyHttpClient, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
+        ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler, ProxyUpstreamAdapter,
+        ProxyUpstreamBinding, ProxyUpstreamBindingRegistry, admit_legacy_interleaved_control_frame,
+        decode_modern_server_notification, forward_modern_progress_notification,
+        legacy_contents_to_handler, legacy_prompt_messages_to_handler, legacy_resource_to_handler,
     };
     use crate::handler::{PromptHandler, ToolHandler};
+
+    #[test]
+    fn proxy_modern_sse_progress_callback_preserves_raw_progress_lexemes() {
+        let wire = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"job-17","progress":1.20e+4,"total":12000.0}}"#;
+        let JsonRpcMessage::Request(request) = decode_strict_jsonrpc_message(wire.as_bytes(), 4096)
+            .expect("exact modern progress notification parses")
+        else {
+            panic!("fixture is a JSON-RPC notification");
+        };
+
+        let mut delivered = Vec::new();
+        forward_modern_progress_notification(wire.as_bytes(), &request, &mut |params| {
+            delivered.push(params);
+        })
+        .expect("proxy forwards the exact modern progress notification");
+        assert_eq!(delivered.len(), 1);
+        let params = &delivered[0];
+        assert_eq!(params.progress.as_str(), "1.20e+4");
+        assert_eq!(
+            params.total.as_ref().map(|total| total.as_str()),
+            Some("12000.0")
+        );
+        let notification = ServerNotification::Progress(params.clone());
+        assert_eq!(
+            serde_json::to_string(&notification.encode().expect("notification re-encodes"))
+                .expect("notification serializes"),
+            wire,
+            "modern proxy notification handling preserves exact progress lexemes"
+        );
+    }
+
+    #[test]
+    fn proxy_modern_sse_progress_callback_rejects_one_invalid_progress_value() {
+        let baseline = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"job-17","progress":1.20e+4,"total":12000.0}}"#;
+        let JsonRpcMessage::Request(baseline_request) =
+            decode_strict_jsonrpc_message(baseline.as_bytes(), 4096)
+                .expect("baseline modern progress notification parses")
+        else {
+            panic!("baseline is a JSON-RPC notification");
+        };
+        let baseline_notification =
+            decode_modern_server_notification(baseline.as_bytes(), &baseline_request)
+                .expect("baseline final progress is admitted");
+
+        let negative = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"job-17","progress":-1,"total":12000.0}}"#;
+        let JsonRpcMessage::Request(negative_request) =
+            decode_strict_jsonrpc_message(negative.as_bytes(), 4096)
+                .expect("one-variable negative progress notification parses")
+        else {
+            panic!("negative is a JSON-RPC notification");
+        };
+        let mut delivered = Vec::new();
+        let error = forward_modern_progress_notification(
+            negative.as_bytes(),
+            &negative_request,
+            &mut |params| delivered.push(params),
+        )
+        .expect_err("changing only progress to a negative number must be rejected");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(
+            delivered.is_empty(),
+            "a rejected modern progress frame must not reach the exact callback"
+        );
+        assert_eq!(
+            serde_json::to_string(
+                &baseline_notification
+                    .encode()
+                    .expect("baseline notification re-encodes"),
+            )
+            .expect("baseline notification serializes"),
+            baseline,
+            "the rejected frame cannot alter the admitted raw-parameter baseline"
+        );
+    }
 
     #[test]
     fn proxy_projects_closed_exact_legacy_handler_values() {
@@ -2621,6 +3072,7 @@ mod tests {
 
     struct TypedToolBackend {
         result: CoreResult,
+        final_progress: Option<FinalProgressNotificationParams>,
     }
 
     impl ProxyBackend for TypedToolBackend {
@@ -2680,6 +3132,18 @@ mod tests {
             _name: &str,
             _arguments: serde_json::Value,
         ) -> fastmcp_core::McpResult<CoreResult> {
+            Ok(self.result.clone())
+        }
+
+        fn call_tool_result_with_final_progress(
+            &mut self,
+            _name: &str,
+            _arguments: serde_json::Value,
+            on_progress: super::FinalProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<CoreResult> {
+            if let Some(params) = &self.final_progress {
+                on_progress(params.clone());
+            }
             Ok(self.result.clone())
         }
     }
@@ -2794,11 +3258,59 @@ mod tests {
     }
 
     #[test]
+    fn typed_modern_proxy_forwards_exact_progress_to_its_final_callback() {
+        let wire = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"job-19","progress":1.20e+4,"total":12000.0}}"#;
+        let JsonRpcMessage::Request(request) = decode_strict_jsonrpc_message(wire.as_bytes(), 4096)
+            .expect("exact final progress fixture parses")
+        else {
+            panic!("fixture is a JSON-RPC notification");
+        };
+        let ServerNotification::Progress(progress) =
+            decode_modern_server_notification(wire.as_bytes(), &request)
+                .expect("exact final progress fixture is admitted")
+        else {
+            panic!("fixture decodes as final progress");
+        };
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            TypedToolBackend {
+                result: final_tool_result_with_open_members(),
+                final_progress: Some(progress),
+            },
+            proxy_binding(ProtocolEra::Modern2026),
+            "2026-07-28",
+        )
+        .expect("matching final upstream binding");
+        let context = McpContext::new(Cx::for_testing(), 500);
+        let mut delivered = Vec::new();
+
+        let result = proxy
+            .call_tool_typed_with_final_progress(
+                &context,
+                "exact-result",
+                serde_json::json!({}),
+                &mut |params| delivered.push(params),
+            )
+            .expect("typed modern proxy accepts progress rather than using a legacy projection");
+
+        assert!(matches!(
+            result,
+            CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+        ));
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].progress.as_str(), "1.20e+4");
+        assert_eq!(
+            delivered[0].total.as_ref().map(|total| total.as_str()),
+            Some("12000.0")
+        );
+    }
+
+    #[test]
     fn proxy_final_handler_preserves_modern_result_and_rejects_one_era_contradiction() {
         let upstream_result = final_tool_result_with_open_members();
         let modern_proxy = ProxyClient::from_backend_with_upstream_binding(
             TypedToolBackend {
                 result: upstream_result.clone(),
+                final_progress: None,
             },
             proxy_binding(ProtocolEra::Modern2026),
             "2026-07-28",
@@ -2823,6 +3335,7 @@ mod tests {
         let contradictory_proxy = ProxyClient::from_backend_with_upstream_binding(
             TypedToolBackend {
                 result: upstream_result,
+                final_progress: None,
             },
             proxy_binding(ProtocolEra::Legacy2024),
             fastmcp_protocol::PROTOCOL_VERSION,
@@ -2857,6 +3370,7 @@ mod tests {
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             TypedToolBackend {
                 result: upstream_result,
+                final_progress: None,
             },
             proxy_binding(ProtocolEra::Legacy2024),
             fastmcp_protocol::PROTOCOL_VERSION,
@@ -3034,6 +3548,90 @@ mod tests {
         }
     }
 
+    struct FinalTypedCatalogBackend {
+        tool: fastmcp_protocol::FinalTool,
+        resource: fastmcp_protocol::FinalResource,
+        template: fastmcp_protocol::FinalResourceTemplate,
+        prompt: fastmcp_protocol::FinalPrompt,
+    }
+
+    impl ProxyBackend for FinalTypedCatalogBackend {
+        fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
+            Err(fastmcp_core::McpError::internal_error(
+                "final catalog must not be projected to legacy tools",
+            ))
+        }
+
+        fn list_tool_catalog(&mut self) -> fastmcp_core::McpResult<ProxyToolCatalog> {
+            Ok(ProxyToolCatalog::Final(vec![self.tool.clone()]))
+        }
+
+        fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> {
+            Err(fastmcp_core::McpError::internal_error(
+                "final catalog must not be projected to legacy resources",
+            ))
+        }
+
+        fn list_resource_catalog(&mut self) -> fastmcp_core::McpResult<ProxyResourceCatalog> {
+            Ok(ProxyResourceCatalog::Final(vec![self.resource.clone()]))
+        }
+
+        fn list_resource_templates(
+            &mut self,
+        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceTemplate>> {
+            Err(fastmcp_core::McpError::internal_error(
+                "final catalog must not be projected to legacy resource templates",
+            ))
+        }
+
+        fn list_resource_template_catalog(
+            &mut self,
+        ) -> fastmcp_core::McpResult<ProxyResourceTemplateCatalog> {
+            Ok(ProxyResourceTemplateCatalog::Final(vec![
+                self.template.clone(),
+            ]))
+        }
+
+        fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> {
+            Err(fastmcp_core::McpError::internal_error(
+                "final catalog must not be projected to legacy prompts",
+            ))
+        }
+
+        fn list_prompt_catalog(&mut self) -> fastmcp_core::McpResult<ProxyPromptCatalog> {
+            Ok(ProxyPromptCatalog::Final(vec![self.prompt.clone()]))
+        }
+
+        fn call_tool(
+            &mut self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Err(fastmcp_core::McpError::internal_error("not used"))
+        }
+
+        fn call_tool_with_progress(
+            &mut self,
+            _name: &str,
+            _arguments: serde_json::Value,
+            _on_progress: super::ProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Err(fastmcp_core::McpError::internal_error("not used"))
+        }
+
+        fn read_resource(&mut self, _uri: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+            Err(fastmcp_core::McpError::internal_error("not used"))
+        }
+
+        fn get_prompt(
+            &mut self,
+            _name: &str,
+            _arguments: HashMap<String, String>,
+        ) -> fastmcp_core::McpResult<Vec<PromptMessage>> {
+            Err(fastmcp_core::McpError::internal_error("not used"))
+        }
+    }
+
     fn final_catalog_tool() -> fastmcp_protocol::FinalTool {
         serde_json::from_value(serde_json::json!({
             "name": "weather",
@@ -3063,6 +3661,58 @@ mod tests {
         .expect("the final tool fixture is exact-schema valid")
     }
 
+    fn final_catalog_resource() -> fastmcp_protocol::FinalResource {
+        serde_json::from_value(serde_json::json!({
+            "uri": "https://example.test/forecast/today",
+            "name": "today-forecast",
+            "title": "Today's Forecast",
+            "description": "The current forecast.",
+            "icons": [{
+                "src": "https://example.test/icons/forecast.svg",
+                "mimeType": "image/svg+xml",
+                "sizes": ["16x16", "32x32"],
+                "theme": "dark",
+                "com.example/icon": {"retained": true}
+            }],
+            "mimeType": "application/json",
+            "size": 256,
+            "annotations": {"audience": ["assistant"], "priority": 0.75},
+            "_meta": {"com.example/resource": {"retained": true}}
+        }))
+        .expect("the final resource fixture is exact-schema valid")
+    }
+
+    fn final_catalog_resource_template() -> fastmcp_protocol::FinalResourceTemplate {
+        serde_json::from_value(serde_json::json!({
+            "uriTemplate": "https://example.test/forecast/{city}",
+            "name": "city-forecast",
+            "title": "City Forecast",
+            "description": "A forecast for one city.",
+            "icons": [{"src": "https://example.test/icons/city.svg"}],
+            "mimeType": "application/json",
+            "annotations": {"audience": ["user"]},
+            "_meta": {"com.example/template": {"retained": true}}
+        }))
+        .expect("the final resource template fixture is exact-schema valid")
+    }
+
+    fn final_catalog_prompt() -> fastmcp_protocol::FinalPrompt {
+        serde_json::from_value(serde_json::json!({
+            "name": "forecast-summary",
+            "title": "Forecast Summary",
+            "description": "Summarize one forecast.",
+            "icons": [{"src": "https://example.test/icons/prompt.svg"}],
+            "arguments": [{
+                "name": "city",
+                "title": "City Name",
+                "description": "The city to summarize.",
+                "required": true
+            }],
+            "_meta": {"com.example/prompt": {"retained": true}}
+        }))
+        .expect("the final prompt fixture is exact-schema valid")
+    }
+
     #[test]
     fn proxy_catalog_preserves_final_tool_bytes_without_legacy_projection() {
         let tool = final_catalog_tool();
@@ -3082,6 +3732,169 @@ mod tests {
             expected_wire,
             "final-only tool members must remain byte-for-byte serializable"
         );
+    }
+
+    #[test]
+    fn typed_catalog_autodiscovers_final_metadata_without_prebinding() {
+        let tool = final_catalog_tool();
+        let resource = final_catalog_resource();
+        let template = final_catalog_resource_template();
+        let prompt = final_catalog_prompt();
+        let expected_tool = serde_json::to_vec(&tool).expect("final tool serializes");
+        let expected_resource = serde_json::to_vec(&resource).expect("final resource serializes");
+        let expected_template =
+            serde_json::to_vec(&template).expect("final resource template serializes");
+        let expected_prompt = serde_json::to_vec(&prompt).expect("final prompt serializes");
+
+        let catalog = ProxyClient::from_backend(FinalTypedCatalogBackend {
+            tool,
+            resource,
+            template,
+            prompt,
+        })
+        .catalog_typed()
+        .expect("automatic final discovery does not require a caller-supplied era");
+
+        assert_eq!(
+            catalog.era().expect("catalog has one era"),
+            ProtocolEra::Modern2026
+        );
+        let tools = catalog
+            .final_tools()
+            .expect("automatic discovery must retain the final tool model");
+        let resources = catalog
+            .final_resources()
+            .expect("automatic discovery must retain the final resource model");
+        let templates = catalog
+            .final_resource_templates()
+            .expect("automatic discovery must retain the final resource-template model");
+        let prompts = catalog
+            .final_prompts()
+            .expect("automatic discovery must retain the final prompt model");
+        assert_eq!(
+            serde_json::to_vec(&tools[0]).expect("tool serializes"),
+            expected_tool
+        );
+        assert_eq!(
+            serde_json::to_vec(&resources[0]).expect("resource serializes"),
+            expected_resource
+        );
+        assert_eq!(
+            serde_json::to_vec(&templates[0]).expect("template serializes"),
+            expected_template
+        );
+        assert_eq!(
+            serde_json::to_vec(&prompts[0]).expect("prompt serializes"),
+            expected_prompt
+        );
+    }
+
+    #[test]
+    fn proxy_catalog_retains_every_exact_final_component_without_projection() {
+        let tool = final_catalog_tool();
+        let resource = final_catalog_resource();
+        let template = final_catalog_resource_template();
+        let prompt = final_catalog_prompt();
+        let expected_tool = serde_json::to_vec(&tool).expect("tool serializes");
+        let expected_resource = serde_json::to_vec(&resource).expect("resource serializes");
+        let expected_template = serde_json::to_vec(&template).expect("template serializes");
+        let expected_prompt = serde_json::to_vec(&prompt).expect("prompt serializes");
+        let mut backend = FinalTypedCatalogBackend {
+            tool,
+            resource,
+            template,
+            prompt,
+        };
+
+        let catalog = ProxyCatalog::from_backend(&mut backend)
+            .expect("the complete final catalog is retained without legacy projections");
+
+        assert_eq!(
+            catalog.era().expect("catalog has one exact era"),
+            ProtocolEra::Modern2026
+        );
+        assert!(catalog.tools.is_empty());
+        assert!(catalog.resources.is_empty());
+        assert!(catalog.resource_templates.is_empty());
+        assert!(catalog.prompts.is_empty());
+        assert_eq!(
+            serde_json::to_vec(&catalog.final_tools[0]).expect("tool serializes"),
+            expected_tool
+        );
+        assert_eq!(
+            serde_json::to_vec(&catalog.final_resources[0]).expect("resource serializes"),
+            expected_resource
+        );
+        assert_eq!(
+            serde_json::to_vec(&catalog.final_resource_templates[0]).expect("template serializes"),
+            expected_template
+        );
+        assert_eq!(
+            serde_json::to_vec(&catalog.final_prompts[0]).expect("prompt serializes"),
+            expected_prompt
+        );
+    }
+
+    #[test]
+    fn proxy_catalog_rejects_one_legacy_component_added_to_a_final_catalog() {
+        let baseline = ProxyCatalog {
+            tool_catalog_era: Some(ProtocolEra::Modern2026),
+            final_tools: vec![final_catalog_tool()],
+            final_resources: vec![final_catalog_resource()],
+            final_resource_templates: vec![final_catalog_resource_template()],
+            final_prompts: vec![final_catalog_prompt()],
+            ..ProxyCatalog::default()
+        };
+        assert_eq!(
+            baseline.era().expect("complete final baseline is admitted"),
+            ProtocolEra::Modern2026
+        );
+        let baseline_wire = serde_json::to_vec(&baseline.final_resources[0])
+            .expect("baseline final resource serializes");
+
+        let mut mixed = baseline.clone();
+        mixed.resources.push(Resource {
+            uri: "mcp://legacy-only/resource".to_owned(),
+            name: "legacy-only-resource".to_owned(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        });
+
+        let error = mixed
+            .era()
+            .expect_err("adding only a legacy resource must reject the mixed-era catalog");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(error.message.contains("legacy tools, resources"));
+        assert_eq!(
+            serde_json::to_vec(&baseline.final_resources[0])
+                .expect("baseline final resource remains serializable"),
+            baseline_wire,
+            "rejected mixed state cannot mutate the admitted final baseline"
+        );
+    }
+
+    #[test]
+    fn typed_catalog_rejects_one_field_legacy_binding_contradiction() {
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            FinalTypedCatalogBackend {
+                tool: final_catalog_tool(),
+                resource: final_catalog_resource(),
+                template: final_catalog_resource_template(),
+                prompt: final_catalog_prompt(),
+            },
+            proxy_binding(ProtocolEra::Legacy2024),
+            ProtocolEra::Legacy2024.version().as_str(),
+        )
+        .expect("only the immutable binding era differs from the positive path");
+
+        let error = proxy
+            .catalog_typed()
+            .expect_err("a final catalog cannot cross a legacy route binding");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(error.message.contains("contradicts"));
     }
 
     #[test]
@@ -3734,14 +4547,18 @@ exec sleep 2
         assert_eq!(binding.adapter(), super::ProxyUpstreamAdapter::ModernHttp);
         assert_eq!(binding.policy(), ProtocolPolicy::Auto);
         let catalog = proxy
-            .catalog()
-            .expect("public proxy catalog uses modern HTTP");
-        assert!(catalog.tools.is_empty());
-        let final_tool = catalog
-            .final_tools
+            .catalog_typed()
+            .expect("typed public proxy catalog uses the negotiated modern HTTP era");
+        assert_eq!(
+            catalog.era().expect("one negotiated catalog era"),
+            ProtocolEra::Modern2026
+        );
+        let ProxyToolCatalog::Final(tools) = catalog.tools else {
+            panic!("modern HTTP catalog must retain its exact final tool model");
+        };
+        let final_tool = tools
             .first()
-            .expect("modern HTTP catalog returns the remote tool")
-            .clone();
+            .expect("modern HTTP catalog returns the remote tool");
         assert_eq!(final_tool.name, "echo");
         let handler = ProxyToolHandler::new(proxy_test_tool(), proxy.clone());
         assert_forwarded_final_tool(
