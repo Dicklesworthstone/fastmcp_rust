@@ -228,8 +228,12 @@ fn block_until_cancelled(ctx: &McpContext) -> McpResult<String> {
         started.store(true, Ordering::Release);
     }
     state.barrier.wait();
+    // Sleep between liveness checks: a hot yield_now spin charges the
+    // request's poll quota fast enough to exhaust it before an in-band
+    // cancellation notification can arrive, which turns this fixture into a
+    // budget-death probe instead of a cancellation probe.
     while !ctx.is_cancelled() {
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(1));
     }
     if let Some(completed) = state.completed {
         completed.store(true, Ordering::Release);
@@ -7004,7 +7008,15 @@ mod helper_function_tests {
                                 1_i64,
                             ),
                         )),
+                        // Operating requests are refused with -32600 until the
+                        // initialized notification completes the handshake.
                         1 => Ok(JsonRpcMessage::Request(
+                            fastmcp_protocol::JsonRpcRequest::notification(
+                                "notifications/initialized",
+                                None,
+                            ),
+                        )),
+                        2 => Ok(JsonRpcMessage::Request(
                             fastmcp_protocol::JsonRpcRequest::new(
                                 "tools/call",
                                 Some(
@@ -7018,7 +7030,7 @@ mod helper_function_tests {
                                 2_i64,
                             ),
                         )),
-                        2 => {
+                        3 => {
                             let deadline = Instant::now() + Duration::from_secs(2);
                             while !started_for_receive.load(Ordering::Acquire)
                                 && Instant::now() < deadline
@@ -7124,7 +7136,15 @@ mod helper_function_tests {
                                 1_i64,
                             ),
                         )),
+                        // Operating requests are refused with -32600 until the
+                        // initialized notification completes the handshake.
                         1 => Ok(JsonRpcMessage::Request(
+                            fastmcp_protocol::JsonRpcRequest::notification(
+                                "notifications/initialized",
+                                None,
+                            ),
+                        )),
+                        2 => Ok(JsonRpcMessage::Request(
                             fastmcp_protocol::JsonRpcRequest::new(
                                 "tools/call",
                                 Some(
@@ -7138,7 +7158,7 @@ mod helper_function_tests {
                                 2_i64,
                             ),
                         )),
-                        2 => loop {
+                        3 => loop {
                             match outbound_rx.recv_timeout(Duration::from_secs(2)) {
                                 Ok(JsonRpcMessage::Request(request))
                                     if request.method == "sampling/createMessage" =>

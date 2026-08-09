@@ -8326,12 +8326,17 @@ mod tests {
             .update_task(&task_id, &ignored_responses)
             .expect("unknown and already-satisfied input keys are acknowledged as a no-op");
 
+        // Task carries no PartialEq; wire-value equality is the semantic
+        // identity for these serialized snapshots.
         assert_eq!(
-            runtime
-                .get_task(&task_id)
-                .expect("read task after ignored replay")
-                .task,
-            before,
+            serde_json::to_value(
+                &runtime
+                    .get_task(&task_id)
+                    .expect("read task after ignored replay")
+                    .task
+            )
+            .expect("task snapshot serializes"),
+            serde_json::to_value(&before).expect("baseline task serializes"),
             "ignored keys cannot change outstanding input state"
         );
         assert_eq!(
@@ -8344,8 +8349,14 @@ mod tests {
             "ignored keys cannot advance the durable task generation"
         );
         assert_eq!(
-            store.latest_notification(&task_id),
-            Some(notification_before),
+            store
+                .latest_notification(&task_id)
+                .map(|notification| serde_json::to_value(&notification)
+                    .expect("notification serializes")),
+            Some(
+                serde_json::to_value(&notification_before)
+                    .expect("baseline notification serializes")
+            ),
             "ignored keys cannot emit a replacement task notification"
         );
     }
@@ -8403,11 +8414,14 @@ mod tests {
             "changing only the stale key to an outstanding roots key preserves wrong-kind rejection"
         );
         assert_eq!(
-            runtime
-                .get_task(&task_id)
-                .expect("read task after rejected response")
-                .task,
-            before,
+            serde_json::to_value(
+                &runtime
+                    .get_task(&task_id)
+                    .expect("read task after rejected response")
+                    .task
+            )
+            .expect("task snapshot serializes"),
+            serde_json::to_value(&before).expect("baseline task serializes"),
             "wrong-kind outstanding input cannot mutate task state"
         );
         assert_eq!(

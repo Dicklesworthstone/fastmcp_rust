@@ -195,6 +195,13 @@ impl CacheKey {
         let mut projection = params.cloned();
         if let Some(serde_json::Value::Object(object)) = projection.as_mut() {
             object.remove("cursor");
+            // A cursor-only request has an empty semantic parameter set; it
+            // must share the invalidation identity of the parameterless
+            // request, or `invalidate(method, None)` can never remove cached
+            // continuation pages after a catalog mutation.
+            if object.is_empty() {
+                projection = None;
+            }
         }
         Self::try_digest(CACHE_INVALIDATION_KEY_DOMAIN, method, projection.as_ref())
     }

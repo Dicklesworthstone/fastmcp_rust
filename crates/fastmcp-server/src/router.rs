@@ -335,14 +335,17 @@ fn final_mrtr_binding(
     method: &'static str,
     target: String,
     arguments: &impl serde::Serialize,
-) -> McpResult<MrtrExchangeBinding> {
+) -> McpResult<Option<MrtrExchangeBinding>> {
     if target.len() > MAX_MRTR_BINDING_BYTES {
         return Err(McpError::invalid_params("MRTR target exceeds its limit"));
     }
-    let session_partition = request_ctx
-        .session_cache_partition()
-        .map(|(partition, _revision)| partition)
-        .ok_or_else(|| McpError::invalid_params("MRTR retries require session state"))?;
+    // A binding is only consumable where retry state can live. Fresh
+    // dispatches on a session-less context stay valid; the binding is
+    // demanded again at the points that actually need it (retry resolution
+    // and input_required issuance).
+    let Some((session_partition, _revision)) = request_ctx.session_cache_partition() else {
+        return Ok(None);
+    };
     let principal_digest = request_ctx
         .auth()
         .map(|auth| {
@@ -351,13 +354,13 @@ fn final_mrtr_binding(
                 .unwrap_or_else(|| mrtr_digest(&auth))
         })
         .transpose()?;
-    Ok(MrtrExchangeBinding::new(
+    Ok(Some(MrtrExchangeBinding::new(
         method,
         target,
         mrtr_digest(arguments)?,
         session_partition,
         principal_digest,
-    ))
+    )))
 }
 
 fn handler_mrtr_input_requests(result: &InputRequiredResult) -> McpResult<MrtrInputRequests> {
@@ -2703,7 +2706,7 @@ impl Router {
                 let resume_inputs = match self.resolve_final_mrtr_retry(
                     params.request_state.as_deref(),
                     params.input_responses.as_ref(),
-                    &binding,
+                    binding.as_ref(),
                 )? {
                     FinalMrtrDispatch::InputRequired(result) => result,
                     FinalMrtrDispatch::Fresh => {
@@ -2786,7 +2789,7 @@ impl Router {
                 match self.resolve_final_mrtr_retry(
                     params.request_state.as_deref(),
                     params.input_responses.as_ref(),
-                    &binding,
+                    binding.as_ref(),
                 )? {
                     FinalMrtrDispatch::InputRequired(result) => result,
                     FinalMrtrDispatch::Fresh => {
@@ -2845,7 +2848,7 @@ impl Router {
                 match self.resolve_final_mrtr_retry(
                     params.request_state.as_deref(),
                     params.input_responses.as_ref(),
-                    &binding,
+                    binding.as_ref(),
                 )? {
                     FinalMrtrDispatch::InputRequired(result) => result,
                     FinalMrtrDispatch::Fresh => {
@@ -2963,11 +2966,14 @@ impl Router {
         &self,
         request_state: Option<&str>,
         input_responses: Option<&BTreeMap<String, serde_json::Value>>,
-        binding: &MrtrExchangeBinding,
+        binding: Option<&MrtrExchangeBinding>,
     ) -> McpResult<FinalMrtrDispatch> {
         match (request_state, input_responses) {
             (None, None) => Ok(FinalMrtrDispatch::Fresh),
             (Some(request_state), Some(input_responses)) => {
+                let binding = binding.ok_or_else(|| {
+                    McpError::invalid_params("MRTR retries require session state")
+                })?;
                 match self.mrtr_exchanges.accept_wire_bound(
                     request_state,
                     binding,
@@ -2989,7 +2995,7 @@ impl Router {
         request_ctx: &McpContext,
         request_cx: &Cx,
         params: FinalCallToolParams,
-        binding: MrtrExchangeBinding,
+        binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
     ) -> McpResult<serde_json::Value> {
         let request_metadata = params.meta.clone();
@@ -3007,6 +3013,11 @@ impl Router {
         match outcome {
             FinalToolOutcome::Complete(result) => encode_final_tools_call_result(Ok(result)),
             FinalToolOutcome::InputRequired(result) => {
+                let binding = binding.ok_or_else(|| {
+                    McpError::internal_error(
+                        "MRTR input_required requires session state to bind retries",
+                    )
+                })?;
                 self.issue_final_mrtr_input_required(binding, result)
             }
             FinalToolOutcome::CreateTask {
@@ -3031,7 +3042,7 @@ impl Router {
         request_ctx: &McpContext,
         request_cx: &Cx,
         params: FinalReadResourceParams,
-        binding: MrtrExchangeBinding,
+        binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
     ) -> McpResult<serde_json::Value> {
         match self
@@ -3048,6 +3059,11 @@ impl Router {
         {
             FinalMethodOutcome::Complete(result) => encode_final_resources_read_result(Ok(result)),
             FinalMethodOutcome::InputRequired(result) => {
+                let binding = binding.ok_or_else(|| {
+                    McpError::internal_error(
+                        "MRTR input_required requires session state to bind retries",
+                    )
+                })?;
                 self.issue_final_mrtr_input_required(binding, result)
             }
         }
@@ -3058,7 +3074,7 @@ impl Router {
         request_ctx: &McpContext,
         request_cx: &Cx,
         params: FinalGetPromptParams,
-        binding: MrtrExchangeBinding,
+        binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
     ) -> McpResult<serde_json::Value> {
         match self
@@ -3075,6 +3091,11 @@ impl Router {
         {
             FinalMethodOutcome::Complete(result) => encode_final_prompts_get_result(Ok(result)),
             FinalMethodOutcome::InputRequired(result) => {
+                let binding = binding.ok_or_else(|| {
+                    McpError::internal_error(
+                        "MRTR input_required requires session state to bind retries",
+                    )
+                })?;
                 self.issue_final_mrtr_input_required(binding, result)
             }
         }
@@ -6085,7 +6106,13 @@ mod router_tests {
                         .send_blocking(request_cx.clone())
                         .expect("the cancellation controller remains available");
                 }
-                let request_ctx = McpContext::new(request_cx, request_context_id);
+                // Modern tools/call computes an MRTR exchange binding, which
+                // requires a session cache partition on the request context.
+                let request_ctx = McpContext::with_state(
+                    request_cx,
+                    request_context_id,
+                    SessionState::new(),
+                );
                 let request = JsonRpcRequest::new(
                     "tools/call",
                     Some(serde_json::json!({
@@ -7613,12 +7640,15 @@ mod router_tests {
             ))
         }
 
-        fn call_async_in_request<'a>(
+        // The modern stateless in-request path consults the disjoint final
+        // outcome hook, not `call_async_in_request`; override the hook the
+        // router actually dispatches through.
+        fn call_final_outcome_async_in_request<'a>(
             &'a self,
             ctx: &'a McpContext,
             request_cx: &'a Cx,
             arguments: serde_json::Value,
-        ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
             Box::pin(async move {
                 let label = arguments
                     .get("request")
@@ -7656,7 +7686,10 @@ mod router_tests {
                     .lock()
                     .expect("completion probe lock is not poisoned")
                     .push(label.clone());
-                Outcome::Ok(vec![Content::text(label)])
+                match crate::handler::promote_legacy_tool_content(vec![Content::text(label)]) {
+                    Ok(result) => Outcome::Ok(FinalToolOutcome::Complete(result)),
+                    Err(error) => Outcome::Err(error),
+                }
             })
         }
     }
@@ -15362,7 +15395,14 @@ mod router_tests {
                 .recv(&observer_cx)
                 .await
                 .expect("the request owner exposes its cancellation context");
+            // Bounded so a dispatch rejection fails the test loudly instead of
+            // spinning this observer loop forever.
+            let admission_deadline = std::time::Instant::now() + Duration::from_secs(10);
             while started.load(Ordering::SeqCst) < 2 {
+                assert!(
+                    std::time::Instant::now() < admission_deadline,
+                    "both owned modern requests must start before the admission deadline"
+                );
                 yield_once().await;
             }
             cancelled_cx.cancel_with(CancelKind::User, Some("test single-request cancellation"));

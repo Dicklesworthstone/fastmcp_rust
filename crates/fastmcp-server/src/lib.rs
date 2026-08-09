@@ -8856,7 +8856,12 @@ impl Server {
                             let principal_result = response_id.as_ref().map_or(Ok(()), |_| {
                                 bind_anonymous_connection_principal(&session_principal)
                             });
-                            principal_admission.resolve(principal_result.is_ok());
+                            // Id-less messages construct the admission already
+                            // admitted; resolving again would trip the
+                            // single-transition invariant.
+                            if response_id.is_some() {
+                                principal_admission.resolve(principal_result.is_ok());
+                            }
                             if let Err(error) = principal_result
                                 && let Some(id) = response_id
                             {
@@ -8962,7 +8967,12 @@ impl Server {
                             let principal_result = response_id.as_ref().map_or(Ok(()), |_| {
                                 bind_anonymous_connection_principal(&session_principal)
                             });
-                            principal_admission.resolve(principal_result.is_ok());
+                            // Id-less messages construct the admission already
+                            // admitted; resolving again would trip the
+                            // single-transition invariant.
+                            if response_id.is_some() {
+                                principal_admission.resolve(principal_result.is_ok());
+                            }
                             if let Err(error) = principal_result
                                 && let Some(id) = response_id
                             {
@@ -10042,11 +10052,20 @@ impl Server {
 
         let active_guard = match id.clone() {
             Some(request_id) => {
-                match ActiveRequestGuard::try_new(
+                // Reuse the queue-admitted cancellation token when this
+                // request came through the dispatch queue. `cancel_reserved`
+                // cancels the admitted token, so an in-band cancellation that
+                // arrives while the request is dispatching must act on the
+                // same token the dispatch observes and finalizes against.
+                let admitted_cancellation = dispatch_queue
+                    .and_then(|queue| queue.admitted_request_cancellation(&request_id))
+                    .unwrap_or_default();
+                match ActiveRequestGuard::try_new_with_cancellation(
                     Arc::clone(&self.active_requests),
                     session.id(),
                     request_id.clone(),
                     request_cx.clone(),
+                    admitted_cancellation,
                 ) {
                     Ok(guard) => Some(guard),
                     Err(_duplicate_id) => {
@@ -10174,6 +10193,11 @@ impl Server {
                 request_cx,
                 budget,
             )
+            // An accepted in-band notifications/cancelled must suppress the
+            // request's response entirely (2024-11-05 cancellation contract);
+            // ambient cancellation and deadline expiry still produce their
+            // ordinary terminal error responses.
+            .suppress_cancelled_response()
             .with_deferred_stats(deferred_stats),
         )
     }
@@ -12155,6 +12179,20 @@ impl HandledRequest {
     /// explicit request cancellation won. Ambient cancellation and deadline
     /// expiry still produce their ordinary terminal error response.
     fn resolve_commit_race(&mut self, session: &mut Session) -> bool {
+        // An explicit in-band cancellation that already linearized wins
+        // outright: its suppression contract holds even when ambient shutdown
+        // or deadline expiry lands concurrently with response finalization.
+        // This must not eagerly CAS to FINALIZING, because ambient death below
+        // still needs to propagate into the token for `cancelled()` waiters.
+        let explicit_cancellation_linearized = self
+            .cancellation
+            .as_ref()
+            .is_some_and(McpRequestCancellation::is_cancel_requested);
+        if explicit_cancellation_linearized {
+            self.replace_with_terminal_error(session, McpError::request_cancelled());
+            return true;
+        }
+
         if let Some(error) = self.commit_liveness_error() {
             if let Some(cancellation) = &self.cancellation {
                 let _ = cancellation.cancel();
@@ -13805,8 +13843,8 @@ mod lib_unit_tests {
         Ok(())
     }
 
-    fn next_server_final_task_recovery_id(
-        task_ids: impl Iterator<Item = &fastmcp_protocol::FinalTaskId>,
+    fn next_server_final_task_recovery_id<'a>(
+        task_ids: impl Iterator<Item = &'a fastmcp_protocol::FinalTaskId>,
         after_task_id: Option<&fastmcp_protocol::FinalTaskId>,
         mut eligible: impl FnMut(&fastmcp_protocol::FinalTaskId) -> bool,
     ) -> Option<fastmcp_protocol::FinalTaskId> {
@@ -17931,6 +17969,7 @@ mod lib_unit_tests {
                             "arguments": {},
                             "_meta": {
                                 MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                             },
                         })),
                         710_i64,
@@ -18600,6 +18639,7 @@ mod lib_unit_tests {
                         "arguments": {},
                         "_meta": {
                             MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                         },
                     })),
                     709_i64,
@@ -19561,8 +19601,13 @@ mod lib_unit_tests {
             Some(serde_json::json!({
                 "name": "live_modern_controlled_tool",
                 "arguments": {},
+                // Modern REQUESTS must carry clientCapabilities alongside
+                // protocolVersion or reserved-value validation rejects them
+                // with -32602 before dispatch (notifications stay
+                // protocolVersion-only by contract).
                 "_meta": {
                     MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                 },
             })),
             id,
