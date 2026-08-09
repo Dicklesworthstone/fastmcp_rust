@@ -125,7 +125,12 @@ pub fn decode_strict_jsonrpc_message(
     document_byte_limit: usize,
 ) -> Result<JsonRpcMessage, JsonRpcAdmissionError> {
     admit_raw_jsonrpc_document(bytes, document_byte_limit).map_err(JsonRpcAdmissionError::Raw)?;
-    serde_json::from_slice(bytes).map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)
+    match serde_json::from_slice::<JsonRpcRequest>(bytes) {
+        Ok(request) => Ok(JsonRpcMessage::Request(request)),
+        Err(_) => serde_json::from_slice::<JsonRpcResponse>(bytes)
+            .map(JsonRpcMessage::Response)
+            .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope),
+    }
 }
 
 /// One strictly admitted JSON-RPC response paired with the exact source JSON
@@ -835,7 +840,7 @@ impl std::fmt::Display for RequestId {
 }
 
 /// JSON-RPC 2.0 request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct JsonRpcRequest {
     /// Protocol version (always "2.0").
@@ -859,6 +864,44 @@ pub struct JsonRpcRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub id: Option<RequestId>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonRpcRequestRawWire<'a> {
+    #[serde(deserialize_with = "deserialize_jsonrpc_version")]
+    jsonrpc: Cow<'static, str>,
+    method: String,
+    #[serde(borrow, default)]
+    params: Option<Cow<'a, RawValue>>,
+    #[serde(default, deserialize_with = "deserialize_request_id")]
+    id: Option<RequestId>,
+}
+
+impl<'de> Deserialize<'de> for JsonRpcRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = JsonRpcRequestRawWire::deserialize(deserializer)?;
+        let params = wire
+            .params
+            .as_deref()
+            .map(RawValue::get)
+            .map(|source| {
+                crate::messages::validate_raw_final_completion_params(&wire.method, source)
+                    .map_err(D::Error::custom)?;
+                serde_json::from_str(source).map_err(D::Error::custom)
+            })
+            .transpose()?;
+
+        Ok(Self {
+            jsonrpc: wire.jsonrpc,
+            method: wire.method,
+            params,
+            id: wire.id,
+        })
+    }
 }
 
 impl JsonRpcRequest {

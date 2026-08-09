@@ -1638,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn final_result_discriminator_compatibility_preserves_exact_wire_and_legacy_behavior() {
+    fn generic_peer_result_missing_type_compatibility_is_era_diagnostic_only() {
         let accepted = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"extension":true}"#;
         let (baseline, diagnostic) = decode_peer_result(
             accepted,
@@ -1671,14 +1671,30 @@ mod tests {
         assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidDiscriminator);
         assert_eq!(error.path(), "$.resultType");
 
+        let legacy_missing = r#"{"extension":true}"#;
+        let legacy_complete = r#"{"resultType":"complete","extension":true}"#;
         let (legacy_compatibility, diagnostic) = decode_peer_result(
-            missing,
+            legacy_missing,
             ResultPeerEra::Legacy,
             &CoreResultDiscriminatorPolicy,
         )
-        .expect("the existing legacy compatibility behavior remains unchanged");
+        .expect("generic legacy peer ingestion defaults an omitted discriminator to complete");
         assert_eq!(diagnostic, None);
-        assert_eq!(encode_result(&legacy_compatibility), accepted);
+        assert_eq!(encode_result(&legacy_compatibility), legacy_complete);
+
+        let legacy_dispatch = crate::messages::CoreRequest::decode(
+            ProtocolEra::Legacy2024,
+            crate::methods::TOOLS_LIST,
+            None,
+        )
+        .expect("legacy tools/list request");
+        assert!(legacy_dispatch.decode_result(r#"{"tools":[]}"#).is_ok());
+        assert!(matches!(
+            legacy_dispatch.decode_result(r#"{"tools":[],"resultType":"complete"}"#),
+            Err(crate::messages::CoreDispatchError::CrossEraResultType {
+                method: crate::methods::TOOLS_LIST
+            })
+        ));
 
         let top_level_server_info = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"serverInfo":{"name":"legacy-location","version":"0.1"},"extension":true}"#;
         let error = decode_peer_result(

@@ -4,13 +4,13 @@
 
 use std::collections::BTreeMap;
 
-use serde::de::{DeserializeOwned, Visitor};
+use serde::de::{DeserializeOwned, DeserializeSeed, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::common_types::{
-    AbsoluteUri, ContentBlock, EmbeddedResourceContents, LoggingLevel, OpenMetadata,
+    AbsoluteUri, ContentBlock, EmbeddedResourceContents, JsonInteger, LoggingLevel, OpenMetadata,
 };
 use crate::jsonrpc::{JsonRpcRequest, JsonRpcResponse, RequestId};
 use crate::methods::{
@@ -479,12 +479,676 @@ pub struct FinalCompletionArgument {
 }
 
 /// Optional final completion context.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalCompletionContext {
     /// Previously resolved prompt or URI-template variables.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_completion_context_arguments",
+        deserialize_with = "deserialize_optional_completion_context_arguments"
+    )]
     pub arguments: Option<BTreeMap<String, String>>,
+}
+
+/// Maximum number of previously resolved variables in one final completion context.
+pub const MAX_COMPLETION_CONTEXT_ARGUMENTS: usize = 256;
+/// Maximum UTF-8 bytes in one final completion-context variable name.
+pub const MAX_COMPLETION_CONTEXT_ARGUMENT_KEY_BYTES: usize = 1024;
+/// Maximum UTF-8 bytes in one final completion-context variable value.
+pub const MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES: usize = 16 * 1024;
+/// Maximum encoded JSON bytes occupied by one final completion-context argument map.
+pub const MAX_COMPLETION_CONTEXT_ARGUMENT_BYTES: usize = 256 * 1024;
+
+/// Validates final completion parameters directly from retained JSON source.
+///
+/// JSON-RPC ingress invokes this before it materializes `params` as a
+/// [`Value`]. The `_meta` member identifies the final-only parameter surface;
+/// legacy completion parameters without it keep the established `Value` path.
+///
+/// The context argument object is inspected lexically before serde can decode
+/// its strings. This preserves the received JSON spelling for the bounds: a
+/// `\\u0061` occupies six received bytes, while `a` occupies one.
+pub(crate) fn validate_raw_final_completion_params(
+    method: &str,
+    source: &str,
+) -> Result<(), &'static str> {
+    if method != COMPLETION_COMPLETE {
+        return Ok(());
+    }
+
+    let has_metadata = raw_completion_params_layout(source)?;
+    if !has_metadata {
+        return Ok(());
+    }
+
+    // Scan every occurrence before serde visits the final parameter map. A
+    // duplicate `context` is invalid at the typed layer, but serde would
+    // deserialize its first value before noticing the second member. Keeping
+    // only the final raw range here would therefore let an oversized first
+    // context allocate before its received-byte bounds were checked.
+    validate_raw_final_completion_contexts(source)?;
+
+    FinalCompletionParams::deserialize(&mut serde_json::Deserializer::from_str(source))
+        .map(|_| ())
+        .map_err(|_| "invalid final completion parameters")
+}
+
+fn raw_completion_params_layout(source: &str) -> Result<bool, &'static str> {
+    let mut cursor = RawJsonCursor::new(source);
+    cursor.skip_whitespace();
+    if !cursor.consume(b'{') {
+        return Err("invalid completion parameters");
+    }
+    cursor.skip_whitespace();
+
+    let mut has_metadata = false;
+    if cursor.consume(b'}') {
+        return Ok(has_metadata);
+    }
+
+    loop {
+        let key = cursor.parse_string()?;
+        cursor.skip_whitespace();
+        if !cursor.consume(b':') {
+            return Err("invalid completion parameters");
+        }
+        cursor.skip_whitespace();
+        cursor.raw_value_range()?;
+        if raw_json_string_is(source, key, "_meta") {
+            has_metadata = true;
+        }
+        cursor.skip_whitespace();
+        if cursor.consume(b'}') {
+            cursor.skip_whitespace();
+            if cursor.position != source.len() {
+                return Err("invalid completion parameters");
+            }
+            return Ok(has_metadata);
+        }
+        if !cursor.consume(b',') {
+            return Err("invalid completion parameters");
+        }
+        cursor.skip_whitespace();
+    }
+}
+
+fn validate_raw_final_completion_contexts(source: &str) -> Result<(), &'static str> {
+    let mut cursor = RawJsonCursor::new(source);
+    cursor.skip_whitespace();
+    if !cursor.consume(b'{') {
+        return Err("invalid completion parameters");
+    }
+    cursor.skip_whitespace();
+    if cursor.consume(b'}') {
+        return Ok(());
+    }
+
+    loop {
+        let key = cursor.parse_string()?;
+        cursor.skip_whitespace();
+        if !cursor.consume(b':') {
+            return Err("invalid completion parameters");
+        }
+        cursor.skip_whitespace();
+        let context = cursor.raw_value_range()?;
+        if raw_json_string_is(source, key, "context") {
+            let mut context_cursor = RawJsonCursor::at(source, context.start);
+            validate_raw_completion_context(&mut context_cursor)?;
+            if context_cursor.position != context.end {
+                return Err("invalid final completion context");
+            }
+        }
+        cursor.skip_whitespace();
+        if cursor.consume(b'}') {
+            cursor.skip_whitespace();
+            if cursor.position != source.len() {
+                return Err("invalid completion parameters");
+            }
+            return Ok(());
+        }
+        if !cursor.consume(b',') {
+            return Err("invalid completion parameters");
+        }
+        cursor.skip_whitespace();
+    }
+}
+
+fn validate_raw_completion_context(cursor: &mut RawJsonCursor<'_>) -> Result<(), &'static str> {
+    cursor.skip_whitespace();
+    if cursor.peek() != Some(b'{') {
+        cursor.skip_raw_value()?;
+        return Ok(());
+    }
+    cursor.consume(b'{');
+    cursor.skip_whitespace();
+    if cursor.consume(b'}') {
+        return Ok(());
+    }
+
+    loop {
+        let key = cursor.parse_string()?;
+        cursor.skip_whitespace();
+        if !cursor.consume(b':') {
+            return Err("invalid final completion context");
+        }
+        cursor.skip_whitespace();
+        if raw_json_string_is(cursor.source, key, "arguments") {
+            validate_raw_completion_context_arguments(cursor)?;
+        } else {
+            cursor.skip_raw_value()?;
+        }
+        cursor.skip_whitespace();
+        if cursor.consume(b'}') {
+            return Ok(());
+        }
+        if !cursor.consume(b',') {
+            return Err("invalid final completion context");
+        }
+        cursor.skip_whitespace();
+    }
+}
+
+fn validate_raw_completion_context_arguments(
+    cursor: &mut RawJsonCursor<'_>,
+) -> Result<(), &'static str> {
+    cursor.skip_whitespace();
+    if cursor.peek() != Some(b'{') {
+        cursor.skip_raw_value()?;
+        return Ok(());
+    }
+    let object_start = cursor.position;
+    cursor.consume(b'{');
+    cursor.skip_whitespace();
+    if cursor.consume(b'}') {
+        return raw_completion_context_object_within_limit(cursor, object_start);
+    }
+
+    let mut entries = 0_usize;
+    loop {
+        let key = cursor.parse_string()?;
+        if raw_json_string_content_bytes(cursor.source, key)
+            > MAX_COMPLETION_CONTEXT_ARGUMENT_KEY_BYTES
+        {
+            return Err("completion context argument key exceeds the maximum raw JSON byte limit");
+        }
+        entries = entries
+            .checked_add(1)
+            .ok_or("completion context arguments exceed the maximum entry count")?;
+        if entries > MAX_COMPLETION_CONTEXT_ARGUMENTS {
+            return Err("completion context arguments exceed the maximum of 256 entries");
+        }
+
+        cursor.skip_whitespace();
+        if !cursor.consume(b':') {
+            return Err("invalid final completion context arguments");
+        }
+        cursor.skip_whitespace();
+        if cursor.peek() == Some(b'"') {
+            let value = cursor.parse_string()?;
+            if raw_json_string_content_bytes(cursor.source, value)
+                > MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES
+            {
+                return Err(
+                    "completion context argument value exceeds the maximum raw JSON byte limit",
+                );
+            }
+        } else {
+            cursor.skip_raw_value()?;
+        }
+        if cursor.position.saturating_sub(object_start) > MAX_COMPLETION_CONTEXT_ARGUMENT_BYTES {
+            return Err("completion context arguments exceed the maximum received JSON byte limit");
+        }
+        cursor.skip_whitespace();
+        if cursor.consume(b'}') {
+            return raw_completion_context_object_within_limit(cursor, object_start);
+        }
+        if !cursor.consume(b',') {
+            return Err("invalid final completion context arguments");
+        }
+        cursor.skip_whitespace();
+    }
+}
+
+fn raw_completion_context_object_within_limit(
+    cursor: &RawJsonCursor<'_>,
+    object_start: usize,
+) -> Result<(), &'static str> {
+    if cursor.position - object_start > MAX_COMPLETION_CONTEXT_ARGUMENT_BYTES {
+        Err("completion context arguments exceed the maximum received JSON byte limit")
+    } else {
+        Ok(())
+    }
+}
+
+fn raw_json_string_content_bytes(source: &str, token: std::ops::Range<usize>) -> usize {
+    token.end.saturating_sub(token.start.saturating_add(2))
+}
+
+fn raw_json_string_is(source: &str, token: std::ops::Range<usize>, expected: &str) -> bool {
+    let bytes = source.as_bytes();
+    if bytes.get(token.start) != Some(&b'"')
+        || token.end <= token.start + 1
+        || bytes.get(token.end - 1) != Some(&b'"')
+    {
+        return false;
+    }
+
+    let mut position = token.start + 1;
+    let mut expected_bytes = expected.bytes();
+    while position < token.end - 1 {
+        let byte = bytes[position];
+        let decoded = if byte == b'\\' {
+            position += 1;
+            let Some(escape) = bytes.get(position).copied() else {
+                return false;
+            };
+            match escape {
+                b'"' => b'"',
+                b'\\' => b'\\',
+                b'/' => b'/',
+                b'b' => 0x08,
+                b'f' => 0x0c,
+                b'n' => b'\n',
+                b'r' => b'\r',
+                b't' => b'\t',
+                b'u' => {
+                    let Some(digits) = bytes.get(position + 1..position + 5) else {
+                        return false;
+                    };
+                    let mut value = 0_u16;
+                    for digit in digits {
+                        let nibble = match digit {
+                            b'0'..=b'9' => u16::from(*digit - b'0'),
+                            b'a'..=b'f' => u16::from(*digit - b'a' + 10),
+                            b'A'..=b'F' => u16::from(*digit - b'A' + 10),
+                            _ => return false,
+                        };
+                        value = (value << 4) | nibble;
+                    }
+                    position += 4;
+                    let Ok(value) = u8::try_from(value) else {
+                        return false;
+                    };
+                    value
+                }
+                _ => return false,
+            }
+        } else {
+            if !byte.is_ascii() {
+                return false;
+            }
+            byte
+        };
+        if expected_bytes.next() != Some(decoded) {
+            return false;
+        }
+        position += 1;
+    }
+    expected_bytes.next().is_none()
+}
+
+struct RawJsonCursor<'a> {
+    source: &'a str,
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> RawJsonCursor<'a> {
+    fn new(source: &'a str) -> Self {
+        Self::at(source, 0)
+    }
+
+    fn at(source: &'a str, position: usize) -> Self {
+        Self {
+            source,
+            bytes: source.as_bytes(),
+            position,
+        }
+    }
+
+    fn raw_value_range(&mut self) -> Result<std::ops::Range<usize>, &'static str> {
+        let start = self.position;
+        self.skip_raw_value()?;
+        Ok(start..self.position)
+    }
+
+    fn skip_raw_value(&mut self) -> Result<(), &'static str> {
+        match self.peek() {
+            Some(b'"') => {
+                self.parse_string()?;
+                Ok(())
+            }
+            Some(b'{' | b'[') => self.skip_raw_container(),
+            Some(b't') => self.consume_literal(b"true"),
+            Some(b'f') => self.consume_literal(b"false"),
+            Some(b'n') => self.consume_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => {
+                while !matches!(
+                    self.peek(),
+                    None | Some(b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n')
+                ) {
+                    self.position += 1;
+                }
+                Ok(())
+            }
+            _ => Err("invalid completion parameters"),
+        }
+    }
+
+    fn skip_raw_container(&mut self) -> Result<(), &'static str> {
+        let mut depth = 0_usize;
+        loop {
+            match self.peek() {
+                Some(b'"') => {
+                    self.parse_string()?;
+                }
+                Some(b'{' | b'[') => {
+                    depth = depth
+                        .checked_add(1)
+                        .ok_or("invalid completion parameters")?;
+                    self.position += 1;
+                }
+                Some(b'}' | b']') => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or("invalid completion parameters")?;
+                    self.position += 1;
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                }
+                Some(_) => self.position += 1,
+                None => return Err("invalid completion parameters"),
+            }
+        }
+    }
+
+    fn consume_literal(&mut self, literal: &[u8]) -> Result<(), &'static str> {
+        let end = self
+            .position
+            .checked_add(literal.len())
+            .ok_or("invalid completion parameters")?;
+        if self.bytes.get(self.position..end) == Some(literal) {
+            self.position = end;
+            Ok(())
+        } else {
+            Err("invalid completion parameters")
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<std::ops::Range<usize>, &'static str> {
+        let start = self.position;
+        if !self.consume(b'"') {
+            return Err("invalid completion parameters");
+        }
+        loop {
+            match self.peek() {
+                Some(b'"') => {
+                    self.position += 1;
+                    return Ok(start..self.position);
+                }
+                Some(b'\\') => {
+                    self.position += 1;
+                    match self.peek() {
+                        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
+                            self.position += 1;
+                        }
+                        Some(b'u') => {
+                            let end = self
+                                .position
+                                .checked_add(5)
+                                .ok_or("invalid completion parameters")?;
+                            if self.bytes.get(self.position + 1..end).is_none() {
+                                return Err("invalid completion parameters");
+                            }
+                            self.position = end;
+                        }
+                        _ => return Err("invalid completion parameters"),
+                    }
+                }
+                Some(0x20..=0x7f) => self.position += 1,
+                Some(_) => {
+                    let character = self.source[self.position..]
+                        .chars()
+                        .next()
+                        .ok_or("invalid completion parameters")?;
+                    self.position += character.len_utf8();
+                }
+                None => return Err("invalid completion parameters"),
+            }
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            self.position += 1;
+        }
+    }
+
+    fn consume(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.position).copied()
+    }
+}
+
+fn deserialize_optional_final_completion_context<'de, D>(
+    deserializer: D,
+) -> Result<Option<FinalCompletionContext>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    FinalCompletionContext::deserialize(deserializer).map(Some)
+}
+
+fn serialize_optional_completion_context_arguments<S>(
+    arguments: &Option<BTreeMap<String, String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if let Some(arguments) = arguments {
+        validate_completion_context_arguments(arguments).map_err(serde::ser::Error::custom)?;
+    }
+    arguments.serialize(serializer)
+}
+
+fn deserialize_optional_completion_context_arguments<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedStringSeed {
+        maximum: usize,
+        field: &'static str,
+    }
+
+    impl BoundedStringSeed {
+        const fn new(maximum: usize, field: &'static str) -> Self {
+            Self { maximum, field }
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for BoundedStringSeed {
+        type Value = String;
+
+        fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_str(BoundedStringVisitor {
+                maximum: self.maximum,
+                field: self.field,
+            })
+        }
+    }
+
+    struct BoundedStringVisitor {
+        maximum: usize,
+        field: &'static str,
+    }
+
+    impl BoundedStringVisitor {
+        fn admit<E: serde::de::Error>(&self, value: &str) -> Result<(), E> {
+            if value.len() > self.maximum {
+                return Err(E::custom(format_args!(
+                    "completion context argument {} exceeds the maximum of {} bytes",
+                    self.field, self.maximum
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    impl<'de> Visitor<'de> for BoundedStringVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a completion context argument {} no longer than {} bytes",
+                self.field, self.maximum
+            )
+        }
+
+        fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.admit(value)?;
+            Ok(value.to_owned())
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.admit(value)?;
+            Ok(value.to_owned())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.admit(&value)?;
+            Ok(value)
+        }
+    }
+
+    struct ArgumentsVisitor;
+
+    impl<'de> Visitor<'de> for ArgumentsVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded object of completion context string arguments")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut arguments = BTreeMap::new();
+            let mut encoded_bytes = 2_usize; // `{}` for an empty JSON object.
+
+            while let Some(key) = map.next_key_seed(BoundedStringSeed::new(
+                MAX_COMPLETION_CONTEXT_ARGUMENT_KEY_BYTES,
+                "key",
+            ))? {
+                if arguments.len() == MAX_COMPLETION_CONTEXT_ARGUMENTS {
+                    return Err(serde::de::Error::custom(
+                        "completion context arguments exceed the maximum of 256 entries",
+                    ));
+                }
+                if arguments.contains_key(&key) {
+                    return Err(serde::de::Error::custom(
+                        "duplicate completion context argument key",
+                    ));
+                }
+
+                let value = map.next_value_seed(BoundedStringSeed::new(
+                    MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES,
+                    "value",
+                ))?;
+
+                encoded_bytes = next_completion_context_encoded_bytes(
+                    encoded_bytes,
+                    !arguments.is_empty(),
+                    &key,
+                    &value,
+                )
+                .ok_or_else(|| {
+                    serde::de::Error::custom(
+                        "completion context arguments exceed the maximum of 262144 encoded bytes",
+                    )
+                })?;
+                arguments.insert(key, value);
+            }
+
+            Ok(arguments)
+        }
+    }
+
+    deserializer.deserialize_map(ArgumentsVisitor).map(Some)
+}
+
+fn validate_completion_context_arguments(
+    arguments: &BTreeMap<String, String>,
+) -> Result<(), &'static str> {
+    if arguments.len() > MAX_COMPLETION_CONTEXT_ARGUMENTS {
+        return Err("completion context arguments exceed the maximum of 256 entries");
+    }
+
+    let mut encoded_bytes = 2_usize; // `{}` for an empty JSON object.
+    for (index, (key, value)) in arguments.iter().enumerate() {
+        if key.len() > MAX_COMPLETION_CONTEXT_ARGUMENT_KEY_BYTES {
+            return Err("completion context argument key exceeds the maximum of 1024 bytes");
+        }
+        if value.len() > MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES {
+            return Err("completion context argument value exceeds the maximum of 16384 bytes");
+        }
+        encoded_bytes =
+            next_completion_context_encoded_bytes(encoded_bytes, index != 0, key, value)
+                .ok_or("completion context arguments exceed the maximum of 262144 encoded bytes")?;
+    }
+    Ok(())
+}
+
+fn next_completion_context_encoded_bytes(
+    current: usize,
+    has_previous_entry: bool,
+    key: &str,
+    value: &str,
+) -> Option<usize> {
+    current
+        .checked_add(usize::from(has_previous_entry))
+        .and_then(|total| total.checked_add(encoded_json_string_bytes(key)))
+        .and_then(|total| total.checked_add(1)) // `:`
+        .and_then(|total| total.checked_add(encoded_json_string_bytes(value)))
+        .filter(|total| *total <= MAX_COMPLETION_CONTEXT_ARGUMENT_BYTES)
+}
+
+fn encoded_json_string_bytes(value: &str) -> usize {
+    2 + value
+        .bytes()
+        .map(|byte| match byte {
+            b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        })
+        .sum::<usize>()
 }
 
 /// Final `completion/complete` request parameters.
@@ -500,7 +1164,11 @@ pub struct FinalCompletionParams {
     /// Argument being completed.
     pub argument: FinalCompletionArgument,
     /// Previously resolved prompt or URI-template variables.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_final_completion_context"
+    )]
     pub context: Option<FinalCompletionContext>,
 }
 
@@ -1739,7 +2407,7 @@ fn notification_method_literal(request: &JsonRpcRequest) -> &'static str {
     }
 }
 
-/// Completion candidates returned by either protocol era.
+/// Completion candidates returned by the legacy protocol era.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionValues {
     /// Completion values selected by the server.
@@ -1754,6 +2422,53 @@ pub struct CompletionValues {
     /// Whether further completion values are available.
     #[serde(rename = "hasMore", default, skip_serializing_if = "Option::is_none")]
     pub has_more: Option<bool>,
+}
+
+/// Completion candidates returned by the final protocol era.
+///
+/// The final schema's `total` is a mathematical JSON integer, so it retains
+/// [`JsonInteger`] rather than narrowing a peer value to a machine integer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalCompletionValues {
+    /// Completion values selected by the server.
+    #[serde(
+        serialize_with = "serialize_completion_values",
+        deserialize_with = "deserialize_completion_values"
+    )]
+    pub values: Vec<String>,
+    /// Exact total number of available values, when the peer supplied one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_final_completion_total"
+    )]
+    pub total: Option<JsonInteger>,
+    /// Whether further completion values are available.
+    #[serde(
+        rename = "hasMore",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_final_completion_has_more"
+    )]
+    pub has_more: Option<bool>,
+}
+
+fn deserialize_optional_final_completion_total<'de, D>(
+    deserializer: D,
+) -> Result<Option<JsonInteger>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    JsonInteger::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_optional_final_completion_has_more<'de, D>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(Some)
 }
 
 /// Maximum completion candidates allowed on the wire by either supported era.
@@ -1871,7 +2586,7 @@ impl<'de> Deserialize<'de> for LegacyOpaqueMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalCompletionResult {
     /// Completion candidates.
-    pub completion: CompletionValues,
+    pub completion: FinalCompletionValues,
 }
 
 /// Empty final `subscriptions/listen` result body.
@@ -4629,10 +5344,15 @@ mod tests {
             CoreResult::Legacy(LegacyCoreResult::SamplingCreateMessage(_))
         ));
         assert_eq!(
-            legacy_result
-                .encode()
-                .expect("legacy sampling result encodes"),
-            legacy_result_wire
+            serde_json::from_str::<Value>(
+                &legacy_result
+                    .encode()
+                    .expect("legacy sampling result encodes"),
+            )
+            .expect("legacy sampling encoding is JSON"),
+            serde_json::from_str::<Value>(legacy_result_wire)
+                .expect("legacy sampling fixture is JSON"),
+            "legacy sampling preserves decoded result semantics without asserting member order"
         );
 
         let final_params_wire = serde_json::json!({
@@ -5019,18 +5739,22 @@ mod tests {
             "only the final resultType field changes the accepted legacy sampling result"
         );
         assert_eq!(
-            request
-                .decode_result(accepted)
-                .expect("legacy baseline remains admitted")
-                .encode()
-                .expect("legacy baseline encodes"),
-            baseline.encode().expect("baseline encodes"),
-            "the cross-era rejection leaves legacy sampling state unchanged"
+            serde_json::from_str::<Value>(
+                &request
+                    .decode_result(accepted)
+                    .expect("legacy baseline remains admitted")
+                    .encode()
+                    .expect("legacy baseline encodes"),
+            )
+            .expect("reaccepted legacy sampling result is JSON"),
+            serde_json::from_str::<Value>(&baseline.encode().expect("baseline encodes"))
+                .expect("baseline legacy sampling result is JSON"),
+            "the cross-era rejection leaves legacy sampling semantics unchanged"
         );
     }
 
     #[test]
-    fn final_catalog_results_require_typed_cache_hints() {
+    fn final_catalog_results_preserve_typed_cache_hints() {
         let params = serde_json::json!({
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
@@ -5078,26 +5802,17 @@ mod tests {
                 .decode_result(wire)
                 .expect("required final cache fields decode");
             assert_eq!(
-                result.encode().expect("final cached result encodes"),
-                wire,
-                "{method} preserves its exact final cache result"
+                serde_json::from_str::<Value>(
+                    &result.encode().expect("final cached result encodes")
+                )
+                .expect("final cached result encoding is JSON"),
+                serde_json::from_str::<Value>(wire).expect("final cached result fixture is JSON"),
+                "{method} preserves final cache-result semantics"
             );
         }
 
         let tools_request = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_LIST, Some(&params))
             .expect("tools/list request");
-        assert!(
-            matches!(
-                tools_request.decode_result(
-                    r#"{"resultType":"complete","tools":[],"cacheScope":"private"}"#
-                ),
-                Err(CoreDispatchError::InvalidResult {
-                    era: ProtocolEra::Modern2026,
-                    method: TOOLS_LIST,
-                })
-            ),
-            "missing only ttlMs rejects a final cacheable catalog result"
-        );
         assert!(
             matches!(
                 tools_request.decode_result(
@@ -5108,7 +5823,7 @@ mod tests {
                     method: TOOLS_LIST,
                 })
             ),
-            "only an invalid cacheScope changes the otherwise valid final catalog result"
+            "only an invalid cacheScope changes the otherwise valid final catalog result; peer TTL omission/negativity is normalized as immediately stale at client ingress"
         );
     }
 
@@ -5636,6 +6351,41 @@ mod tests {
             "changing only resultType cannot reinterpret a task result as a complete tools/call result"
         );
 
+        let mut missing_ttl = accepted.clone();
+        missing_ttl
+            .as_object_mut()
+            .expect("task result is an object")
+            .remove("ttlMs");
+        assert!(
+            matches!(
+                call.decode_result(
+                    &serde_json::to_string(&missing_ttl)
+                        .expect("one-field missing TTL task serializes")
+                ),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_CALL,
+                })
+            ),
+            "unlike cacheable catalog peers, Tasks keep ttlMs required"
+        );
+
+        let mut negative_ttl = accepted.clone();
+        negative_ttl["ttlMs"] = serde_json::json!(-1);
+        assert!(
+            matches!(
+                call.decode_result(
+                    &serde_json::to_string(&negative_ttl)
+                        .expect("one-field negative TTL task serializes")
+                ),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_CALL,
+                })
+            ),
+            "unlike cacheable catalog peers, Tasks reject a negative ttlMs"
+        );
+
         let list_params = serde_json::json!({
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
@@ -5719,7 +6469,7 @@ mod tests {
                 }),
             ),
         ];
-        let wire = r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"retry-7","com.example/opaque":{"retained":true}}"#;
+        let wire = r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"retry-7","ttlMs":-1,"cacheScope":"private","com.example/opaque":{"retained":true}}"#;
 
         for (method, params) in requests {
             let request = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params))
@@ -5752,10 +6502,25 @@ mod tests {
                 "{method} preserves the exact MRTR input request map"
             );
             assert_eq!(input_required.request_state(), Some("retry-7"));
+            let extras = input_required.extras.members();
             assert_eq!(
-                result.encode().expect("input-required result re-encodes"),
-                wire,
-                "{method} retains input-required state and open siblings"
+                extras.len(),
+                3,
+                "{method} keeps complete-result cache lookalikes inert on input_required"
+            );
+            for name in ["ttlMs", "cacheScope", "com.example/opaque"] {
+                assert!(
+                    extras.iter().any(|member| member.name == name),
+                    "{method} retains inert {name} on input_required"
+                );
+            }
+            assert_eq!(
+                serde_json::from_str::<Value>(
+                    &result.encode().expect("input-required result re-encodes")
+                )
+                .expect("input-required result encoding is JSON"),
+                serde_json::from_str::<Value>(wire).expect("input-required result fixture is JSON"),
+                "{method} retains input-required state and inert lookalikes"
             );
         }
     }
@@ -5793,7 +6558,7 @@ mod tests {
     }
 
     #[test]
-    fn core_completion_round_trips_exact_legacy_and_final_payloads() {
+    fn core_completion_preserves_legacy_and_final_payload_semantics() {
         let legacy_params = serde_json::json!({
             "ref": {"type": "ref/prompt", "name": "deploy"},
             "argument": {"name": "environment", "value": "sta"}
@@ -5824,12 +6589,18 @@ mod tests {
         assert_eq!(result.completion.values, vec!["staging".to_owned()]);
         assert_eq!(result.completion.total, Some(1));
         assert_eq!(result.completion.has_more, Some(false));
-        assert_eq!(
-            legacy_result
+        let encoded_legacy: Value = serde_json::from_str(
+            &legacy_result
                 .encode()
                 .expect("legacy completion re-encodes"),
-            legacy_wire
+        )
+        .expect("legacy completion encoding is JSON");
+        assert_eq!(
+            encoded_legacy["completion"]["values"],
+            serde_json::json!(["staging"])
         );
+        assert_eq!(encoded_legacy["completion"]["total"], 1);
+        assert_eq!(encoded_legacy["completion"]["hasMore"], false);
 
         let final_params = serde_json::json!({
             "_meta": {
@@ -5880,7 +6651,10 @@ mod tests {
             result.payload.completion.values,
             vec!["production".to_owned()]
         );
-        assert_eq!(result.payload.completion.total, Some(1));
+        assert_eq!(
+            result.payload.completion.total,
+            Some(JsonInteger::from(1_i64))
+        );
         assert_eq!(result.payload.completion.has_more, Some(false));
         assert_eq!(
             result
@@ -5891,9 +6665,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["extension"]
         );
+        let encoded_final: Value =
+            serde_json::from_str(&final_result.encode().expect("final completion re-encodes"))
+                .expect("final completion encoding is JSON");
+        let completion = encoded_final["completion"]
+            .as_object()
+            .expect("final completion remains an object");
+        assert_eq!(encoded_final["resultType"], "complete");
+        assert_eq!(completion["values"], serde_json::json!(["production"]));
         assert_eq!(
-            final_result.encode().expect("final completion re-encodes"),
-            final_wire
+            completion["total"]
+                .as_number()
+                .map(serde_json::Number::as_str),
+            Some("1")
+        );
+        assert_eq!(completion.get("hasMore"), Some(&Value::Bool(false)));
+        assert!(
+            completion.contains_key("total") && completion.contains_key("hasMore"),
+            "present final completion optionals remain present after re-encoding"
+        );
+        assert_eq!(
+            encoded_final["extension"],
+            serde_json::json!({"opaque": true})
         );
     }
 
@@ -5936,6 +6729,575 @@ mod tests {
     }
 
     #[test]
+    fn final_completion_values_preserve_arbitrary_precision_totals_at_the_value_bound() {
+        let admitted = FinalCompletionValues {
+            values: (0..MAX_COMPLETION_VALUES)
+                .map(|index| format!("value-{index}"))
+                .collect(),
+            total: Some(
+                serde_json::from_str("922337203685477580812345678901234567890")
+                    .expect("an arbitrary-precision JSON integer"),
+            ),
+            has_more: Some(false),
+        };
+        let wire = serde_json::to_value(&admitted).expect("100 final completion values serialize");
+        assert_eq!(
+            wire["values"].as_array().map(Vec::len),
+            Some(MAX_COMPLETION_VALUES)
+        );
+        assert_eq!(
+            wire["total"].as_number().map(serde_json::Number::as_str),
+            Some("922337203685477580812345678901234567890")
+        );
+        assert!(
+            serde_json::to_value(FinalCompletionValues {
+                values: (0..=MAX_COMPLETION_VALUES)
+                    .map(|index| format!("value-{index}"))
+                    .collect(),
+                total: None,
+                has_more: None,
+            })
+            .is_err(),
+            "a locally authored final result cannot emit 101 completion values"
+        );
+    }
+
+    #[test]
+    fn final_completion_context_preserves_presence_and_exact_bounds() {
+        let meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        let request_without_context = serde_json::json!({
+            "_meta": meta,
+            "ref": {"type": "ref/prompt", "name": "deploy"},
+            "argument": {"name": "environment", "value": "pro"}
+        });
+        let CoreRequest::Final(FinalCoreRequest::Completion(without_context)) =
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                COMPLETION_COMPLETE,
+                Some(&request_without_context),
+            )
+            .expect("an absent final completion context is valid")
+        else {
+            panic!("final completion request");
+        };
+        assert!(without_context.context.is_none());
+
+        let request_with_empty_context = serde_json::json!({
+            "_meta": meta,
+            "ref": {"type": "ref/prompt", "name": "deploy"},
+            "argument": {"name": "environment", "value": "pro"},
+            "context": {"arguments": {}}
+        });
+        let CoreRequest::Final(FinalCoreRequest::Completion(with_empty_context)) =
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                COMPLETION_COMPLETE,
+                Some(&request_with_empty_context),
+            )
+            .expect("a present empty final completion context is valid")
+        else {
+            panic!("final completion request");
+        };
+        assert!(
+            with_empty_context
+                .context
+                .as_ref()
+                .and_then(|context| context.arguments.as_ref())
+                .is_some_and(BTreeMap::is_empty),
+            "present empty context arguments remain distinct from an absent context"
+        );
+
+        let mut bounded_arguments = serde_json::Map::new();
+        for index in 0..MAX_COMPLETION_CONTEXT_ARGUMENTS {
+            bounded_arguments.insert(format!("key-{index}"), Value::String("value".to_owned()));
+        }
+        let request_at_bound = serde_json::json!({
+            "_meta": meta,
+            "ref": {"type": "ref/prompt", "name": "deploy"},
+            "argument": {"name": "environment", "value": "pro"},
+            "context": {"arguments": bounded_arguments}
+        });
+        let at_bound = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            COMPLETION_COMPLETE,
+            Some(&request_at_bound),
+        )
+        .expect("the exact completion-context entry limit is valid");
+        assert_eq!(
+            at_bound
+                .encode_params()
+                .expect("bounded final completion context re-encodes")
+                .expect("completion has parameters"),
+            request_at_bound,
+            "the admitted context map retains every exact string entry"
+        );
+    }
+
+    #[test]
+    fn final_completion_context_encoded_bytes_honor_short_escapes_and_exact_boundary() {
+        assert_eq!(
+            encoded_json_string_bytes("\u{0008}\t\n\u{000c}\r\u{0000}\"\\"),
+            22,
+            "JSON uses two-byte escapes for backspace, tab, newline, form feed, carriage return, quote, and backslash"
+        );
+
+        let mut arguments = BTreeMap::new();
+        let mut encoded_bytes = 2_usize;
+        for index in 0..15 {
+            let key = format!("key-{index}");
+            let value = "v".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES);
+            encoded_bytes = next_completion_context_encoded_bytes(
+                encoded_bytes,
+                !arguments.is_empty(),
+                &key,
+                &value,
+            )
+            .expect("the first fifteen maximum values fit the aggregate bound");
+            arguments.insert(key, value);
+        }
+        let final_key = "last".to_owned();
+        let encoded_empty_final_value =
+            next_completion_context_encoded_bytes(encoded_bytes, true, &final_key, "")
+                .expect("an empty final value fits the aggregate bound");
+        let final_value =
+            "v".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_BYTES - encoded_empty_final_value);
+        assert!(final_value.len() <= MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES);
+        assert_eq!(
+            next_completion_context_encoded_bytes(encoded_bytes, true, &final_key, &final_value,),
+            Some(MAX_COMPLETION_CONTEXT_ARGUMENT_BYTES),
+            "the final value reaches the aggregate bound exactly"
+        );
+        arguments.insert(final_key.clone(), final_value.clone());
+        let admitted = FinalCompletionContext {
+            arguments: Some(arguments),
+        };
+        let wire = serde_json::to_string(&admitted).expect("the exact aggregate bound serializes");
+        let decoded: FinalCompletionContext =
+            serde_json::from_str(&wire).expect("bounded string seeds admit the exact bound");
+        assert_eq!(decoded, admitted);
+
+        let mut one_byte_over = admitted;
+        one_byte_over
+            .arguments
+            .as_mut()
+            .expect("context arguments are present")
+            .get_mut(&final_key)
+            .expect("final boundary value is present")
+            .push('v');
+        assert!(
+            serde_json::to_string(&one_byte_over).is_err(),
+            "one additional encoded byte must reject"
+        );
+
+        let oversized_key_wire = format!(
+            r#"{{"arguments":{{"{}":"value"}}}}"#,
+            "k".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_KEY_BYTES + 1)
+        );
+        assert!(
+            serde_json::from_str::<FinalCompletionContext>(&oversized_key_wire).is_err(),
+            "the bounded key seed rejects before retaining an oversized key"
+        );
+
+        let maximum_key_wire = format!(
+            r#"{{"arguments":{{"{}":"value"}}}}"#,
+            "k".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_KEY_BYTES)
+        );
+        assert!(
+            serde_json::from_str::<FinalCompletionContext>(&maximum_key_wire).is_ok(),
+            "the bounded key seed admits exactly 1024 key bytes"
+        );
+
+        let maximum_value_wire = format!(
+            r#"{{"arguments":{{"key":"{}"}}}}"#,
+            "v".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES)
+        );
+        assert!(
+            serde_json::from_str::<FinalCompletionContext>(&maximum_value_wire).is_ok(),
+            "the bounded value seed admits exactly 16384 value bytes"
+        );
+        let oversized_value_wire = format!(
+            r#"{{"arguments":{{"key":"{}"}}}}"#,
+            "v".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES + 1)
+        );
+        assert!(
+            serde_json::from_str::<FinalCompletionContext>(&oversized_value_wire).is_err(),
+            "the bounded value seed rejects before retaining an oversized value"
+        );
+    }
+
+    #[test]
+    fn jsonrpc_ingress_validates_final_completion_context_from_raw_params() {
+        let final_request = format!(
+            r#"{{"jsonrpc":"2.0","method":"completion/complete","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{FINAL_PROTOCOL_VERSION}","io.modelcontextprotocol/clientCapabilities":{{}}}},"ref":{{"type":"ref/prompt","name":"deploy"}},"argument":{{"name":"environment","value":"pro"}},"context":{{"arguments":{{"key":"{}"}}}}}},"id":1}}"#,
+            "v".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES)
+        );
+        assert!(
+            crate::jsonrpc::decode_strict_jsonrpc_message(
+                final_request.as_bytes(),
+                MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES * 2,
+            )
+            .is_ok(),
+            "strict JSON-RPC ingress admits a final context value at the raw-source bound"
+        );
+
+        let oversized_final_request = format!(
+            r#"{{"jsonrpc":"2.0","method":"completion/complete","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{FINAL_PROTOCOL_VERSION}","io.modelcontextprotocol/clientCapabilities":{{}}}},"ref":{{"type":"ref/prompt","name":"deploy"}},"argument":{{"name":"environment","value":"pro"}},"context":{{"arguments":{{"key":"{}"}}}}}},"id":1}}"#,
+            "v".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES + 1)
+        );
+        assert!(
+            crate::jsonrpc::decode_strict_jsonrpc_message(
+                oversized_final_request.as_bytes(),
+                MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES * 2,
+            )
+            .is_err(),
+            "strict JSON-RPC ingress rejects an oversized final context before params become Value"
+        );
+
+        let legacy_request = format!(
+            r#"{{"jsonrpc":"2.0","method":"completion/complete","params":{{"ref":{{"type":"ref/prompt","name":"deploy"}},"argument":{{"name":"environment","value":"sta"}},"context":{{"arguments":{{"key":"{}"}}}}}},"id":1}}"#,
+            "v".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES + 1)
+        );
+        assert!(
+            serde_json::from_str::<JsonRpcRequest>(&legacy_request).is_ok(),
+            "legacy completion parameters without final metadata retain their existing wire path"
+        );
+    }
+
+    #[test]
+    fn jsonrpc_ingress_bounds_every_duplicate_final_completion_context_before_serde() {
+        fn final_completion_request(first: &str, second: &str) -> String {
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"completion/complete","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{FINAL_PROTOCOL_VERSION}","io.modelcontextprotocol/clientCapabilities":{{}}}},"ref":{{"type":"ref/prompt","name":"deploy"}},"argument":{{"name":"environment","value":"pro"}},"context":{{"arguments":{{"key":"{first}"}}}},"context":{{"arguments":{{"key":"{second}"}}}}}},"id":1}}"#
+            )
+        }
+
+        let small = "small";
+        let oversized = r"\/".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES / 2 + 1);
+        assert_eq!(
+            oversized.len(),
+            MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES + 2,
+            "the fixture exceeds only the received raw value-byte bound"
+        );
+
+        for (first, second, case) in [
+            (
+                oversized.as_str(),
+                small,
+                "oversized-first/small-second",
+            ),
+            (
+                small,
+                oversized.as_str(),
+                "small-first/oversized-second",
+            ),
+        ] {
+            let error = serde_json::from_str::<JsonRpcRequest>(&final_completion_request(
+                first, second,
+            ))
+            .expect_err("every final context occurrence must be raw-bounded before serde");
+            assert!(
+                error
+                    .to_string()
+                    .contains("completion context argument value exceeds the maximum raw JSON byte limit"),
+                "{case} must fail at the raw bound rather than after serde reaches a duplicate context"
+            );
+        }
+    }
+
+    #[test]
+    fn jsonrpc_ingress_measures_received_completion_context_json_bytes() {
+        fn final_completion_request(arguments: &str) -> String {
+            let mut request = format!(
+                r#"{{"jsonrpc":"2.0","method":"completion/complete","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{FINAL_PROTOCOL_VERSION}","io.modelcontextprotocol/clientCapabilities":{{}}}},"ref":{{"type":"ref/prompt","name":"deploy"}},"argument":{{"name":"environment","value":"pro"}},"context":{{"arguments":"#
+            );
+            request.push_str(arguments);
+            request.push_str(r#"}},"id":1}"#);
+            request
+        }
+
+        let escaped_key_at_bound = format!("{}{}", r"\u006b".repeat(170), "k".repeat(4));
+        assert_eq!(
+            escaped_key_at_bound.len(),
+            MAX_COMPLETION_CONTEXT_ARGUMENT_KEY_BYTES
+        );
+        let accepted_key =
+            final_completion_request(&format!(r#"{{"{escaped_key_at_bound}":"value"}}"#));
+        assert!(
+            crate::jsonrpc::decode_strict_jsonrpc_message(
+                accepted_key.as_bytes(),
+                accepted_key.len(),
+            )
+            .is_ok(),
+            "an escaped context key at the received-byte limit is admitted"
+        );
+        let rejected_key =
+            final_completion_request(&format!(r#"{{"{escaped_key_at_bound}\u006b":"value"}}"#));
+        assert!(
+            crate::jsonrpc::decode_strict_jsonrpc_message(
+                rejected_key.as_bytes(),
+                rejected_key.len(),
+            )
+            .is_err(),
+            "adding only one escaped key spelling crosses the raw key-byte limit"
+        );
+
+        let escaped_value_at_bound = r"\/".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES / 2);
+        assert_eq!(
+            escaped_value_at_bound.len(),
+            MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES
+        );
+        let accepted_value =
+            final_completion_request(&format!(r#"{{"key":"{escaped_value_at_bound}"}}"#));
+        assert!(
+            crate::jsonrpc::decode_strict_jsonrpc_message(
+                accepted_value.as_bytes(),
+                accepted_value.len(),
+            )
+            .is_ok(),
+            "an escaped context value at the received-byte limit is admitted"
+        );
+        let rejected_value =
+            final_completion_request(&format!(r#"{{"key":"{escaped_value_at_bound}x"}}"#));
+        assert!(
+            crate::jsonrpc::decode_strict_jsonrpc_message(
+                rejected_value.as_bytes(),
+                rejected_value.len(),
+            )
+            .is_err(),
+            "adding only one raw value byte crosses the received value-byte limit"
+        );
+
+        let escaped_maximum_value = r"\/".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES / 2);
+        let entries = (0..15)
+            .map(|index| format!(r#""key-{index}":"{escaped_maximum_value}""#))
+            .collect::<Vec<_>>();
+        let prefix = format!(r#"{{{},"tail":"#, entries.join(","));
+        let suffix = r#""}"#;
+        let tail_bytes = MAX_COMPLETION_CONTEXT_ARGUMENT_BYTES - prefix.len() - suffix.len();
+        assert!(tail_bytes <= MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES);
+        let tail = format!(
+            "{}{}",
+            r"\/".repeat(tail_bytes / 2),
+            "x".repeat(tail_bytes % 2)
+        );
+        let aggregate_at_bound = format!("{prefix}{tail}{suffix}");
+        assert_eq!(
+            aggregate_at_bound.len(),
+            MAX_COMPLETION_CONTEXT_ARGUMENT_BYTES,
+            "the fixture counts the exact received arguments-object bytes, including \\/ escapes"
+        );
+        let accepted_aggregate = final_completion_request(&aggregate_at_bound);
+        assert!(
+            crate::jsonrpc::decode_strict_jsonrpc_message(
+                accepted_aggregate.as_bytes(),
+                accepted_aggregate.len(),
+            )
+            .is_ok(),
+            "an alternate-escape arguments object at the received-byte limit is admitted"
+        );
+        let rejected_aggregate = final_completion_request(&format!("{prefix}{tail}x{suffix}"));
+        assert!(
+            crate::jsonrpc::decode_strict_jsonrpc_message(
+                rejected_aggregate.as_bytes(),
+                rejected_aggregate.len(),
+            )
+            .is_err(),
+            "adding only one raw JSON byte makes the arguments object too large"
+        );
+    }
+
+    #[test]
+    fn final_completion_context_rejects_one_field_null_and_one_entry_over_bound() {
+        let meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        let accepted = serde_json::json!({
+            "_meta": meta,
+            "ref": {"type": "ref/resource", "uri": "file:///templates/{name}"},
+            "argument": {"name": "name", "value": "prod"},
+            "context": {"arguments": {"region": "us-east-1"}}
+        });
+        let baseline = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            COMPLETION_COMPLETE,
+            Some(&accepted),
+        )
+        .expect("baseline final completion context is valid");
+
+        let mut null_arguments = accepted.clone();
+        null_arguments["context"]["arguments"] = Value::Null;
+        assert!(
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                COMPLETION_COMPLETE,
+                Some(&null_arguments),
+            )
+            .is_err(),
+            "changing only context.arguments to null must reject"
+        );
+
+        let mut null_context = accepted.clone();
+        null_context["context"] = Value::Null;
+        assert!(
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                COMPLETION_COMPLETE,
+                Some(&null_context),
+            )
+            .is_err(),
+            "changing only context to null must reject"
+        );
+
+        let mut at_bound_arguments = serde_json::Map::new();
+        for index in 0..MAX_COMPLETION_CONTEXT_ARGUMENTS {
+            at_bound_arguments.insert(format!("key-{index}"), Value::String("value".to_owned()));
+        }
+        let mut one_over_bound = accepted.clone();
+        one_over_bound["context"]["arguments"] = Value::Object(at_bound_arguments);
+        one_over_bound["context"]["arguments"]["one-too-many"] = Value::String("value".to_owned());
+        assert!(
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                COMPLETION_COMPLETE,
+                Some(&one_over_bound),
+            )
+            .is_err(),
+            "adding only a 257th context argument must reject"
+        );
+
+        let mut oversized_key = accepted.clone();
+        let mut oversized_key_arguments = serde_json::Map::new();
+        oversized_key_arguments.insert(
+            "k".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_KEY_BYTES + 1),
+            Value::String("value".to_owned()),
+        );
+        oversized_key["context"]["arguments"] = Value::Object(oversized_key_arguments);
+        assert!(
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                COMPLETION_COMPLETE,
+                Some(&oversized_key),
+            )
+            .is_err(),
+            "changing only the context map to contain an oversized key must reject"
+        );
+
+        let mut oversized_value = accepted.clone();
+        oversized_value["context"]["arguments"] = serde_json::json!({
+            "key": "v".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES + 1)
+        });
+        assert!(
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                COMPLETION_COMPLETE,
+                Some(&oversized_value),
+            )
+            .is_err(),
+            "changing only the context map to contain an oversized value must reject"
+        );
+
+        let mut aggregate_over_bound_arguments = serde_json::Map::new();
+        for index in 0..17 {
+            aggregate_over_bound_arguments.insert(
+                format!("key-{index}"),
+                Value::String("v".repeat(MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES)),
+            );
+        }
+        let mut aggregate_over_bound = accepted.clone();
+        aggregate_over_bound["context"]["arguments"] =
+            Value::Object(aggregate_over_bound_arguments);
+        assert!(
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                COMPLETION_COMPLETE,
+                Some(&aggregate_over_bound),
+            )
+            .is_err(),
+            "changing only the context map to exceed its aggregate encoded-byte bound must reject"
+        );
+        assert_eq!(
+            baseline
+                .encode_params()
+                .expect("accepted context remains encodable")
+                .expect("completion has parameters"),
+            accepted,
+            "rejected context mutations leave the accepted request unchanged"
+        );
+    }
+
+    #[test]
+    fn final_completion_total_is_exact_and_rejects_one_field_invalid_forms() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "ref": {"type": "ref/prompt", "name": "deploy"},
+            "argument": {"name": "environment", "value": "pro"}
+        });
+        let request =
+            CoreRequest::decode(ProtocolEra::Modern2026, COMPLETION_COMPLETE, Some(&params))
+                .expect("final completion request");
+        let accepted = r#"{"resultType":"complete","completion":{"values":["production"],"total":922337203685477580812345678901234567890,"hasMore":false}}"#;
+        let baseline = request
+            .decode_result(accepted)
+            .expect("an arbitrary-precision exact total is valid");
+        let CoreResult::Final(FinalCoreResult::Completion { result, .. }) = &baseline else {
+            panic!("final completion result");
+        };
+        assert_eq!(
+            result
+                .payload
+                .completion
+                .total
+                .as_ref()
+                .map(JsonInteger::as_str),
+            Some("922337203685477580812345678901234567890")
+        );
+
+        for planted_total in ["null", "1.5"] {
+            let planted = format!(
+                r#"{{"resultType":"complete","completion":{{"values":["production"],"total":{planted_total},"hasMore":false}}}}"#
+            );
+            assert!(
+                request.decode_result(&planted).is_err(),
+                "changing only total to {planted_total} must reject"
+            );
+        }
+        let planted_has_more = r#"{"resultType":"complete","completion":{"values":["production"],"total":922337203685477580812345678901234567890,"hasMore":null}}"#;
+        assert!(
+            request.decode_result(planted_has_more).is_err(),
+            "changing only hasMore to null must reject"
+        );
+        let encoded: Value = serde_json::from_str(
+            &baseline
+                .encode()
+                .expect("accepted exact total remains encodable"),
+        )
+        .expect("accepted exact total encoding is JSON");
+        let completion = encoded["completion"]
+            .as_object()
+            .expect("accepted exact total retains its completion object");
+        assert_eq!(encoded["resultType"], "complete");
+        assert_eq!(completion["values"], serde_json::json!(["production"]));
+        assert_eq!(
+            completion["total"]
+                .as_number()
+                .map(serde_json::Number::as_str),
+            Some("922337203685477580812345678901234567890")
+        );
+        assert_eq!(completion.get("hasMore"), Some(&Value::Bool(false)));
+        assert!(
+            completion.contains_key("total") && completion.contains_key("hasMore"),
+            "present final completion optionals remain present after re-encoding"
+        );
+    }
+
+    #[test]
     fn legacy_completion_result_retains_meta_during_round_trip() {
         let request = CoreRequest::decode(
             ProtocolEra::Legacy2024,
@@ -5963,18 +7325,10 @@ mod tests {
             Some(&serde_json::json!({"attempt": 1}))
         );
         assert_eq!(
-            metadata
-                .entries()
-                .iter()
-                .map(|(key, _)| key.as_str())
-                .collect::<Vec<_>>(),
-            ["trace", "cache"],
-            "received legacy _meta key order remains observable"
-        );
-        assert_eq!(
-            result.encode().expect("legacy completion re-encodes"),
-            wire,
-            "legacy completion _meta is not discarded or rewritten"
+            serde_json::from_str::<Value>(&result.encode().expect("legacy completion re-encodes"))
+                .expect("legacy completion encoding is JSON"),
+            serde_json::from_str::<Value>(wire).expect("legacy completion fixture is JSON"),
+            "legacy completion _meta is retained without asserting source member order"
         );
     }
 
@@ -6285,14 +7639,18 @@ mod tests {
         });
         let request = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_LIST, Some(&params))
             .expect("final tools/list request");
-        let result = r#"{"resultType":"complete","tools":[],"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"final-server","version":"1.0.0"}}}"#;
+        let result = r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"final-server","version":"1.0.0"}}}"#;
 
         let decoded = request
             .decode_result(result)
             .expect("final serverInfo is admitted by the final result envelope");
         assert_eq!(
-            decoded.encode().expect("admitted final result encodes"),
-            result
+            serde_json::from_str::<Value>(
+                &decoded.encode().expect("admitted final result encodes")
+            )
+            .expect("admitted final result encoding is JSON"),
+            serde_json::from_str::<Value>(result).expect("final serverInfo fixture is JSON"),
+            "serverInfo is admitted only through _meta on a complete valid catalog"
         );
     }
 

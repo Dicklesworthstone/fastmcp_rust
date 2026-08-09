@@ -375,20 +375,22 @@ impl TaskInputLedger {
                 .collect(),
         ))
     }
-    /// Requires each supplied response to match an outstanding request key.
+    /// Requires each supplied response for an outstanding key to match its
+    /// request descriptor.
     ///
     /// Task updates may acknowledge a strict subset of outstanding requests;
     /// the task remains `input_required` until all required input arrives.
+    /// Unknown or already-satisfied keys are intentionally ignored by this
+    /// shape check; the state machine filters them before mutating its ledger.
     pub fn validate_responses(&self, responses: &TaskInputResponses) -> Result<(), TaskWireError> {
         if responses.len() > MAX_TASK_INPUT_MAP_ENTRIES {
             return Err(TaskWireError::Invalid("inputResponses"));
         }
         for (key, response) in responses {
-            if !self
-                .0
-                .get(key)
-                .is_some_and(|kind| response.matches_kind(*kind))
-            {
+            let Some(kind) = self.0.get(key) else {
+                continue;
+            };
+            if !response.matches_kind(*kind) {
                 return Err(TaskWireError::InputResponseKind);
             }
         }
@@ -1369,6 +1371,44 @@ mod tests {
     }
 
     #[test]
+    fn tasks_ledger_ignores_unknown_response_keys_before_validating_outstanding_input() {
+        let requests = serde_json::from_value::<TaskInputRequests>(
+            serde_json::json!({ "roots": { "method": "roots/list" } }),
+        )
+        .expect("request");
+        let ledger = TaskInputLedger::from_requests(&requests).expect("ledger");
+        let responses = serde_json::from_value::<TaskInputResponses>(serde_json::json!({
+            "roots": { "roots": [] },
+            "already-satisfied": { "action": "accept" }
+        }))
+        .expect("well-formed mixed response map");
+
+        ledger
+            .validate_responses(&responses)
+            .expect("an unknown key is ignored before a matching outstanding key is validated");
+    }
+
+    #[test]
+    fn tasks_ledger_still_rejects_wrong_kind_for_outstanding_key_with_unknown_key_present() {
+        let requests = serde_json::from_value::<TaskInputRequests>(
+            serde_json::json!({ "roots": { "method": "roots/list" } }),
+        )
+        .expect("request");
+        let ledger = TaskInputLedger::from_requests(&requests).expect("ledger");
+        let responses = serde_json::from_value::<TaskInputResponses>(serde_json::json!({
+            "roots": { "action": "accept" },
+            "already-satisfied": { "roots": [] }
+        }))
+        .expect("well-formed mixed response map");
+
+        assert_eq!(
+            ledger.validate_responses(&responses),
+            Err(TaskWireError::InputResponseKind),
+            "changing only the outstanding response kind preserves strict validation"
+        );
+    }
+
+    #[test]
     fn completed_task_flattens_inner_result_and_preserves_open_fields() {
         let wire = serde_json::json!({
             "resultType": "complete",
@@ -1416,7 +1456,7 @@ mod tests {
         let accepted: GetTaskResult =
             serde_json::from_value(wire.clone()).expect("unlimited TTL is valid");
         assert_eq!(
-            serde_json::to_value(accepted).expect("unlimited TTL serializes"),
+            serde_json::to_value(&accepted).expect("unlimited TTL serializes"),
             wire
         );
 
@@ -1426,6 +1466,11 @@ mod tests {
             .expect("result object")
             .remove("ttlMs");
         assert!(serde_json::from_value::<GetTaskResult>(missing_ttl).is_err());
+        assert_eq!(
+            serde_json::to_value(&accepted).expect("valid nullable TTL remains serializable"),
+            wire,
+            "rejecting only ttlMs omission does not change the valid nullable-TTL baseline"
+        );
 
         let mut null_poll_interval = wire.clone();
         null_poll_interval["pollIntervalMs"] = Value::Null;

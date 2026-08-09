@@ -52,6 +52,11 @@ pub const OFFICIAL_TASKS_RESULT_DISCRIMINATOR: &str = "task";
 
 /// Official MCP Apps extension identifier.
 pub const OFFICIAL_MCP_APPS_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
+/// Pinned MCP Apps Host/View protocol version represented by this vocabulary.
+///
+/// This version belongs to the Apps postMessage protocol. It does not alter
+/// the MCP client/server protocol era or add an extension-owned RPC method.
+pub const MCP_APPS_PROTOCOL_VERSION: &str = "2026-01-26";
 /// MCP Apps HTML resource MIME type required for activation.
 pub const MCP_APPS_HTML_MIME_TYPE: &str = "text/html;profile=mcp-app";
 /// Stable MCP Apps client settings schema identity.
@@ -61,6 +66,8 @@ pub const MCP_APPS_SERVER_SETTINGS_SCHEMA_ID: &str =
     "fastmcp-2026-07-28-apps-empty-server-marker-v1";
 /// Stable MCP Apps bilateral compatibility resolver identity.
 pub const MCP_APPS_NEGOTIATION_RESOLVER_ID: &str = "fastmcp-apps-bilateral-resolver-v1";
+/// Stable resolver-version component of the frozen MCP Apps descriptor.
+pub const MCP_APPS_NEGOTIATION_RESOLVER_VERSION: u32 = 1;
 /// Stable MCP Apps activation predicate identity.
 pub const MCP_APPS_ACTIVATION_PREDICATE_ID: &str = "fastmcp-2026-07-28-apps-bilateral-mime-v1";
 /// Maximum MIME types retained in one MCP Apps client advertisement.
@@ -329,7 +336,7 @@ pub fn official_mcp_apps_descriptor() -> ExtensionDescriptor {
         },
         resolver: ExtensionNegotiationResolver {
             id: MCP_APPS_NEGOTIATION_RESOLVER_ID.to_owned(),
-            version: 1,
+            version: MCP_APPS_NEGOTIATION_RESOLVER_VERSION,
             fallback: ExtensionFallbackPolicy::InactiveOnEitherPeer,
         },
         method: None,
@@ -337,6 +344,22 @@ pub fn official_mcp_apps_descriptor() -> ExtensionDescriptor {
         result_discriminator: None,
         routing_headers: Vec::new(),
         stdio_correlation: None,
+    }
+}
+
+/// Validates the complete, method-free MCP Apps capability descriptor.
+///
+/// The official Apps extension advertises bilateral MIME support only. View
+/// lifecycle and result messages use a separate Host/View channel, so an Apps
+/// descriptor must not acquire a JSON-RPC method, notification, result
+/// discriminator, routing header, or stdio-correlation owner by mutation.
+pub fn validate_official_mcp_apps_descriptor(
+    descriptor: &ExtensionDescriptor,
+) -> Result<(), ExtensionRegistryError> {
+    if descriptor == &official_mcp_apps_descriptor() {
+        Ok(())
+    } else {
+        Err(ExtensionRegistryError::OfficialMcpAppsDescriptorMismatch)
     }
 }
 
@@ -349,7 +372,9 @@ pub fn register_official_mcp_apps_extension(
     registry: &mut ExtensionDescriptorRegistry,
 ) -> Result<ExtensionId, ExtensionRegistryError> {
     let id = official_mcp_apps_extension_id();
-    registry.register(official_mcp_apps_descriptor())?;
+    let descriptor = official_mcp_apps_descriptor();
+    validate_official_mcp_apps_descriptor(&descriptor)?;
+    registry.register(descriptor)?;
     Ok(id)
 }
 
@@ -413,15 +438,7 @@ pub fn resolve_official_mcp_apps_settings(
     client: &ExtensionSettings,
     server: &ExtensionSettings,
 ) -> Result<ExtensionSettingsResolution, ExtensionNegotiationError> {
-    if descriptor.id.as_str() != OFFICIAL_MCP_APPS_EXTENSION_ID
-        || descriptor.client_settings.schema_id != MCP_APPS_CLIENT_SETTINGS_SCHEMA_ID
-        || descriptor.client_settings.codec_id != MCP_APPS_CLIENT_SETTINGS_SCHEMA_ID
-        || descriptor.server_settings.schema_id != MCP_APPS_SERVER_SETTINGS_SCHEMA_ID
-        || descriptor.server_settings.codec_id != MCP_APPS_SERVER_SETTINGS_SCHEMA_ID
-        || descriptor.resolver.id != MCP_APPS_NEGOTIATION_RESOLVER_ID
-        || descriptor.resolver.version != 1
-        || descriptor.resolver.fallback != ExtensionFallbackPolicy::InactiveOnEitherPeer
-    {
+    if validate_official_mcp_apps_descriptor(descriptor).is_err() {
         return Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
             descriptor.id.to_string(),
         ));
@@ -749,6 +766,8 @@ pub enum ExtensionRegistryError {
     SettingsCodecRejected,
     /// Official MCP Apps server settings must be the exact empty marker.
     OfficialMcpAppsServerSettingsNotEmpty,
+    /// The official MCP Apps descriptor differed from its frozen method-free shape.
+    OfficialMcpAppsDescriptorMismatch,
     /// Generic settings exceeded the fixed number of retained members.
     SettingsTooManyEntries,
     /// A generic settings key exceeded its fixed byte limit.
@@ -802,6 +821,9 @@ impl fmt::Display for ExtensionRegistryError {
             }
             Self::OfficialMcpAppsServerSettingsNotEmpty => {
                 formatter.write_str("official MCP Apps server settings must be empty")
+            }
+            Self::OfficialMcpAppsDescriptorMismatch => {
+                formatter.write_str("official MCP Apps descriptor differs from its frozen shape")
             }
             Self::SettingsTooManyEntries => {
                 formatter.write_str("extension settings exceed their entry limit")
@@ -1891,6 +1913,9 @@ fn validate_dispatch_name(name: &str) -> Result<(), ExtensionDispatchError> {
 }
 
 fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), ExtensionRegistryError> {
+    if descriptor.id.as_str() == OFFICIAL_MCP_APPS_EXTENSION_ID {
+        validate_official_mcp_apps_descriptor(descriptor)?;
+    }
     for (field, value) in [
         (
             "client settings schema",
@@ -3218,6 +3243,11 @@ mod tests {
         );
         let mut registry = ExtensionDescriptorRegistry::new();
         registry.register(first).expect("baseline owner registers");
+
+        let mut non_colliding_baseline = registry.clone();
+        non_colliding_baseline
+            .register(candidate.clone())
+            .expect("the unmodified candidate is a genuinely non-colliding extension");
         let baseline_count = registry.descriptors().len();
 
         let mut planted = candidate.clone();
@@ -3235,9 +3265,6 @@ mod tests {
             baseline_count,
             "rejected registration cannot mutate the frozen dispatch owner set"
         );
-        registry
-            .register(candidate)
-            .expect("the unmodified one-variable baseline remains registrable");
     }
 
     #[test]

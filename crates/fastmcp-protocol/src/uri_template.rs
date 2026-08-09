@@ -29,6 +29,11 @@ pub const MAX_URI_TEMPLATE_VALUE_BYTES: usize = 16 * 1024;
 pub const MAX_URI_TEMPLATE_COMPOSITE_ITEMS: usize = 1_024;
 /// Maximum UTF-8 output bytes emitted by one expansion.
 pub const MAX_URI_TEMPLATE_EXPANSION_OUTPUT_BYTES: usize = 64 * 1024;
+/// Maximum UTF-8 bytes accepted by a reverse match candidate.
+///
+/// A successful reverse match must re-expand under the ordinary output bound,
+/// so accepting a longer candidate could never produce a valid result.
+pub const MAX_URI_TEMPLATE_MATCH_INPUT_BYTES: usize = MAX_URI_TEMPLATE_EXPANSION_OUTPUT_BYTES;
 
 /// Values supplied to a [`UriTemplate`] expansion.
 pub type TemplateValues = BTreeMap<String, TemplateValue>;
@@ -282,6 +287,15 @@ impl UriTemplate {
         }
         Ok(output)
     }
+
+    /// Compiles this template for deterministic, byte-exact reverse matching.
+    ///
+    /// RFC 6570 permits expansions that do not have a unique inverse. This
+    /// operation deliberately admits only the scalar dispatch subset whose
+    /// captures can be reconstructed without normalization or guessing.
+    pub fn compile_reversible(&self) -> Result<ReversibleResourceTemplate, UriTemplateError> {
+        ReversibleResourceTemplate::from_template(self)
+    }
 }
 
 impl AsRef<str> for UriTemplate {
@@ -301,6 +315,256 @@ impl FromStr for UriTemplate {
 
     fn from_str(source: &str) -> Result<Self, Self::Err> {
         Self::parse(source)
+    }
+}
+
+/// A compiled, deterministic RFC 6570 template suitable for local dispatch.
+///
+/// This is intentionally stricter than [`UriTemplate`]. It accepts one scalar
+/// variable per expression, requires unambiguous expression boundaries, and
+/// decodes captured percent triplets once. The resulting value map always
+/// contains scalar values; list and associative inputs are rejected before
+/// expansion because their compact and exploded forms are not generally
+/// invertible.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReversibleResourceTemplate {
+    template: UriTemplate,
+    parts: Vec<ReversibleTemplatePart>,
+}
+
+impl ReversibleResourceTemplate {
+    /// Compiles an owned template for deterministic reverse matching.
+    pub fn compile(template: UriTemplate) -> Result<Self, UriTemplateError> {
+        Self::from_template(&template)
+    }
+
+    /// Compiles a borrowed template for deterministic reverse matching.
+    pub fn from_template(template: &UriTemplate) -> Result<Self, UriTemplateError> {
+        let mut parts = Vec::with_capacity(template.parts.len());
+        let mut variable_names = BTreeSet::new();
+
+        for (index, part) in template.parts.iter().enumerate() {
+            match part {
+                UriTemplatePart::Literal(literal) => {
+                    let mut encoded = String::new();
+                    append_encoded_literal(
+                        &mut encoded,
+                        literal,
+                        UriTemplateExpansionLimits::default(),
+                    )?;
+                    parts.push(ReversibleTemplatePart::Literal(encoded));
+                }
+                UriTemplatePart::Expression(expression) => {
+                    let variable = expression.variables().first().ok_or(
+                        UriTemplateError::NonReversibleTemplate {
+                            reason: UriTemplateMatchRejection::MultipleVariables,
+                        },
+                    )?;
+                    if expression.variables().len() != 1 {
+                        return Err(UriTemplateError::NonReversibleTemplate {
+                            reason: UriTemplateMatchRejection::MultipleVariables,
+                        });
+                    }
+                    if matches!(variable.modifier(), Some(UriTemplateModifier::Prefix(_))) {
+                        return Err(UriTemplateError::NonReversibleTemplate {
+                            reason: UriTemplateMatchRejection::LossyPrefix {
+                                variable: variable.name().to_owned(),
+                            },
+                        });
+                    }
+                    if matches!(variable.modifier(), Some(UriTemplateModifier::Explode)) {
+                        return Err(UriTemplateError::NonReversibleTemplate {
+                            reason: UriTemplateMatchRejection::ExplodedComposite {
+                                variable: variable.name().to_owned(),
+                            },
+                        });
+                    }
+                    if !variable_names.insert(variable.name().to_owned()) {
+                        return Err(UriTemplateError::NonReversibleTemplate {
+                            reason: UriTemplateMatchRejection::DuplicateVariable {
+                                variable: variable.name().to_owned(),
+                            },
+                        });
+                    }
+
+                    let next_boundary = match template.parts.get(index + 1) {
+                        Some(UriTemplatePart::Literal(literal)) => {
+                            let mut encoded = String::new();
+                            append_encoded_literal(
+                                &mut encoded,
+                                literal,
+                                UriTemplateExpansionLimits::default(),
+                            )?;
+                            Some(ReversibleBoundary::Literal(encoded))
+                        }
+                        Some(UriTemplatePart::Expression(next)) => Some(
+                            reversible_adjacent_expression_boundary(expression, next)?,
+                        ),
+                        None => None,
+                    };
+
+                    validate_reversible_expression(
+                        expression,
+                        next_boundary.as_ref(),
+                    )?;
+                    parts.push(ReversibleTemplatePart::Expression(
+                        ReversibleTemplateExpression {
+                            operator: expression.operator(),
+                            variable: variable.name().to_owned(),
+                            next_boundary,
+                        },
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            template: template.clone(),
+            parts,
+        })
+    }
+
+    /// Returns the original RFC 6570 template.
+    #[must_use]
+    pub fn template(&self) -> &UriTemplate {
+        &self.template
+    }
+
+    /// Expands only the scalar value shape declared by this compiled matcher.
+    pub fn expand(&self, values: &TemplateValues) -> Result<String, UriTemplateError> {
+        for part in &self.parts {
+            let ReversibleTemplatePart::Expression(expression) = part else {
+                continue;
+            };
+            let Some(value) = values.get(&expression.variable) else {
+                continue;
+            };
+            let TemplateValue::Scalar(value) = value else {
+                return Err(UriTemplateError::NonScalarMatchValue {
+                    variable: expression.variable.clone(),
+                });
+            };
+            if value.is_empty()
+                && matches!(
+                    expression.operator,
+                    UriTemplateOperator::Simple | UriTemplateOperator::Reserved
+                )
+            {
+                return Err(UriTemplateError::AmbiguousEmptyScalar {
+                    variable: expression.variable.clone(),
+                });
+            }
+            if matches!(
+                expression.operator,
+                UriTemplateOperator::Reserved | UriTemplateOperator::Fragment
+            ) && contains_pct_encoded_triplet(value)
+            {
+                return Err(UriTemplateError::PreescapedReservedMatchValue {
+                    variable: expression.variable.clone(),
+                });
+            }
+        }
+        self.template.expand(values)
+    }
+
+    /// Reverse-matches an exact URI wire string and returns its scalar bindings.
+    ///
+    /// `Ok(None)` means the URI is outside this template's language. Any
+    /// successful result is replayed through [`Self::expand`] and compared to
+    /// the original bytes before it is returned.
+    pub fn match_uri(&self, uri: &str) -> Result<Option<TemplateValues>, UriTemplateError> {
+        if uri.len() > MAX_URI_TEMPLATE_MATCH_INPUT_BYTES {
+            return Err(UriTemplateError::MatchInputTooLong {
+                actual: uri.len(),
+                maximum: MAX_URI_TEMPLATE_MATCH_INPUT_BYTES,
+            });
+        }
+
+        let mut offset = 0;
+        let mut values = TemplateValues::new();
+        for part in &self.parts {
+            match part {
+                ReversibleTemplatePart::Literal(literal) => {
+                    let Some(remainder) = uri.get(offset..) else {
+                        return Ok(None);
+                    };
+                    let Some(remainder) = remainder.strip_prefix(literal) else {
+                        return Ok(None);
+                    };
+                    offset = uri.len() - remainder.len();
+                }
+                ReversibleTemplatePart::Expression(expression) => {
+                    let Some(remainder) = uri.get(offset..) else {
+                        return Ok(None);
+                    };
+                    let Some((capture, consumed)) = reverse_match_expression(expression, remainder)
+                    else {
+                        return Ok(None);
+                    };
+                    offset = offset.saturating_add(consumed);
+                    if let Some(capture) = capture {
+                        values.insert(expression.variable.clone(), TemplateValue::Scalar(capture));
+                    }
+                }
+            }
+        }
+        if offset != uri.len() {
+            return Ok(None);
+        }
+        if self.expand(&values)? != uri {
+            return Ok(None);
+        }
+        Ok(Some(values))
+    }
+}
+
+impl TryFrom<UriTemplate> for ReversibleResourceTemplate {
+    type Error = UriTemplateError;
+
+    fn try_from(template: UriTemplate) -> Result<Self, Self::Error> {
+        Self::compile(template)
+    }
+}
+
+impl TryFrom<&UriTemplate> for ReversibleResourceTemplate {
+    type Error = UriTemplateError;
+
+    fn try_from(template: &UriTemplate) -> Result<Self, Self::Error> {
+        Self::from_template(template)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReversibleTemplatePart {
+    Literal(String),
+    Expression(ReversibleTemplateExpression),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReversibleTemplateExpression {
+    operator: UriTemplateOperator,
+    variable: String,
+    next_boundary: Option<ReversibleBoundary>,
+}
+
+/// A wire boundary that separates one reversible capture from the next part.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReversibleBoundary {
+    /// Literal source text following the capture.
+    Literal(String),
+    /// The distinctive opening bytes of a following expression.
+    ExpressionPrefix(String),
+}
+
+impl ReversibleBoundary {
+    const fn as_str(&self) -> &str {
+        match self {
+            Self::Literal(value) | Self::ExpressionPrefix(value) => value,
+        }
+    }
+
+    const fn permits_absent_following_expression(&self) -> bool {
+        matches!(self, Self::ExpressionPrefix(_))
     }
 }
 
@@ -413,6 +677,34 @@ pub enum UriTemplateModifier {
     Prefix(usize),
     /// Expand every list member or associative pair independently.
     Explode,
+}
+
+/// A reason a syntactically valid template cannot be used for reverse match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UriTemplateMatchRejection {
+    /// An expression binds more than one value without an invertible shape.
+    MultipleVariables,
+    /// Two captures touch without a literal boundary.
+    AdjacentCaptures,
+    /// A variable is bound more than once by the same matcher.
+    DuplicateVariable {
+        /// The repeated variable name.
+        variable: String,
+    },
+    /// A prefix modifier discards data that a reverse match cannot restore.
+    LossyPrefix {
+        /// The affected variable name.
+        variable: String,
+    },
+    /// An explode modifier has no declared, unique composite inverse.
+    ExplodedComposite {
+        /// The affected variable name.
+        variable: String,
+    },
+    /// A following literal can also occur inside the capture language.
+    AmbiguousBoundary,
+    /// A reserved or fragment expansion has a following capture boundary.
+    UnboundedReservedCapture,
 }
 
 /// One typed reason template parsing or expansion failed.
@@ -529,6 +821,33 @@ pub enum UriTemplateError {
         /// The repeated key.
         key: String,
     },
+    /// A template is valid RFC 6570 syntax but has no deterministic inverse.
+    NonReversibleTemplate {
+        /// The specific reason compilation was rejected.
+        reason: UriTemplateMatchRejection,
+    },
+    /// A reversible expansion received a list or associative value.
+    NonScalarMatchValue {
+        /// The variable that requires a scalar value.
+        variable: String,
+    },
+    /// An empty simple or reserved scalar is indistinguishable from undefined.
+    AmbiguousEmptyScalar {
+        /// The affected variable name.
+        variable: String,
+    },
+    /// A candidate URI exceeded the fixed reverse-match input bound.
+    MatchInputTooLong {
+        /// Observed UTF-8 bytes.
+        actual: usize,
+        /// Fixed maximum UTF-8 bytes.
+        maximum: usize,
+    },
+    /// A reversible reserved or fragment value contained a pre-escaped triplet.
+    PreescapedReservedMatchValue {
+        /// The affected variable name.
+        variable: String,
+    },
 }
 
 impl fmt::Display for UriTemplateError {
@@ -623,11 +942,65 @@ impl fmt::Display for UriTemplateError {
                     "URI template associative key {key:?} is duplicated"
                 )
             }
+            Self::NonReversibleTemplate { reason } => {
+                write!(
+                    formatter,
+                    "URI template cannot be reverse matched: {reason}"
+                )
+            }
+            Self::NonScalarMatchValue { variable } => write!(
+                formatter,
+                "reversible URI template variable {variable:?} requires a scalar value"
+            ),
+            Self::AmbiguousEmptyScalar { variable } => write!(
+                formatter,
+                "reversible URI template variable {variable:?} cannot use an empty scalar"
+            ),
+            Self::MatchInputTooLong { actual, maximum } => write!(
+                formatter,
+                "URI template match input is {actual} bytes; maximum is {maximum}"
+            ),
+            Self::PreescapedReservedMatchValue { variable } => write!(
+                formatter,
+                "reversible URI template variable {variable:?} cannot contain a pre-escaped percent triplet"
+            ),
         }
     }
 }
 
 impl std::error::Error for UriTemplateError {}
+
+impl fmt::Display for UriTemplateMatchRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MultipleVariables => {
+                formatter.write_str("an expression binds multiple variables")
+            }
+            Self::AdjacentCaptures => formatter.write_str("adjacent expressions have no boundary"),
+            Self::DuplicateVariable { variable } => {
+                write!(formatter, "variable {variable:?} is bound more than once")
+            }
+            Self::LossyPrefix { variable } => {
+                write!(
+                    formatter,
+                    "variable {variable:?} uses a lossy prefix modifier"
+                )
+            }
+            Self::ExplodedComposite { variable } => {
+                write!(
+                    formatter,
+                    "variable {variable:?} uses an exploded composite modifier"
+                )
+            }
+            Self::AmbiguousBoundary => {
+                formatter.write_str("a capture overlaps its following literal boundary")
+            }
+            Self::UnboundedReservedCapture => {
+                formatter.write_str("a reserved capture must be terminal")
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct OperatorProperties {
@@ -655,7 +1028,7 @@ impl OperatorProperties {
         }
     }
 
-    const fn is_form_style(self) -> bool {
+    fn is_form_style(self) -> bool {
         matches!(self.first, "?" | "&")
     }
 }
@@ -1396,6 +1769,256 @@ const fn is_reserved(byte: u8) -> bool {
     )
 }
 
+fn validate_reversible_expression(
+    expression: &UriTemplateExpression,
+    next_boundary: Option<&ReversibleBoundary>,
+) -> Result<(), UriTemplateError> {
+    match expression.operator() {
+        UriTemplateOperator::Reserved | UriTemplateOperator::Fragment
+            if next_boundary.is_some() =>
+        {
+            Err(UriTemplateError::NonReversibleTemplate {
+                reason: UriTemplateMatchRejection::UnboundedReservedCapture,
+            })
+        }
+        UriTemplateOperator::Simple
+        | UriTemplateOperator::Label
+        | UriTemplateOperator::Path
+        | UriTemplateOperator::PathParameter
+        | UriTemplateOperator::Query
+        | UriTemplateOperator::QueryContinuation => {
+            if next_boundary.is_some_and(|boundary| {
+                !boundary
+                    .as_str()
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| is_reserved(*byte))
+            }) {
+                return Err(UriTemplateError::NonReversibleTemplate {
+                    reason: UriTemplateMatchRejection::AmbiguousBoundary,
+                });
+            }
+            Ok(())
+        }
+        UriTemplateOperator::Reserved | UriTemplateOperator::Fragment => Ok(()),
+    }
+}
+
+fn reversible_adjacent_expression_boundary(
+    expression: &UriTemplateExpression,
+    next: &UriTemplateExpression,
+) -> Result<ReversibleBoundary, UriTemplateError> {
+    let variable = next.variables().first().ok_or(UriTemplateError::NonReversibleTemplate {
+        reason: UriTemplateMatchRejection::MultipleVariables,
+    })?;
+    if next.variables().len() != 1 {
+        return Err(UriTemplateError::NonReversibleTemplate {
+            reason: UriTemplateMatchRejection::MultipleVariables,
+        });
+    }
+
+    let prefix = match next.operator() {
+        // These expansions emit no leading wire marker, so an adjacent prior
+        // scalar has no unique point at which to stop.
+        UriTemplateOperator::Simple | UriTemplateOperator::Reserved => {
+            return Err(UriTemplateError::NonReversibleTemplate {
+                reason: UriTemplateMatchRejection::AdjacentCaptures,
+            });
+        }
+        UriTemplateOperator::Fragment => "#".to_owned(),
+        UriTemplateOperator::Label => ".".to_owned(),
+        UriTemplateOperator::Path => {
+            // `{/first}{/second}` cannot distinguish a present first value
+            // from a present second value when the other value is absent.
+            if expression.operator() == UriTemplateOperator::Path {
+                return Err(UriTemplateError::NonReversibleTemplate {
+                    reason: UriTemplateMatchRejection::AmbiguousBoundary,
+                });
+            }
+            "/".to_owned()
+        }
+        UriTemplateOperator::PathParameter => {
+            reversible_named_expression_prefix(";", variable)?
+        }
+        UriTemplateOperator::Query => reversible_named_expression_prefix("?", variable)?,
+        UriTemplateOperator::QueryContinuation => {
+            reversible_named_expression_prefix("&", variable)?
+        }
+    };
+
+    Ok(ReversibleBoundary::ExpressionPrefix(prefix))
+}
+
+fn reversible_named_expression_prefix(
+    marker: &str,
+    variable: &UriTemplateVariable,
+) -> Result<String, UriTemplateError> {
+    let mut prefix = marker.to_owned();
+    append_variable_name(
+        &mut prefix,
+        variable.name(),
+        UriTemplateExpansionLimits::default(),
+    )?;
+    Ok(prefix)
+}
+
+fn reverse_match_expression(
+    expression: &ReversibleTemplateExpression,
+    remainder: &str,
+) -> Option<(Option<String>, usize)> {
+    match expression.operator {
+        UriTemplateOperator::Simple => {
+            reverse_match_unprefixed(remainder, expression.next_boundary.as_ref())
+        }
+        UriTemplateOperator::Reserved => reverse_match_unprefixed(remainder, None),
+        UriTemplateOperator::Fragment => {
+            reverse_match_prefixed(remainder, "#", expression.next_boundary.as_ref())
+        }
+        UriTemplateOperator::Label => {
+            reverse_match_prefixed(remainder, ".", expression.next_boundary.as_ref())
+        }
+        UriTemplateOperator::Path => {
+            reverse_match_prefixed(remainder, "/", expression.next_boundary.as_ref())
+        }
+        UriTemplateOperator::PathParameter => reverse_match_named(
+            remainder,
+            ";",
+            &expression.variable,
+            false,
+            expression.next_boundary.as_ref(),
+        ),
+        UriTemplateOperator::Query => reverse_match_named(
+            remainder,
+            "?",
+            &expression.variable,
+            true,
+            expression.next_boundary.as_ref(),
+        ),
+        UriTemplateOperator::QueryContinuation => reverse_match_named(
+            remainder,
+            "&",
+            &expression.variable,
+            true,
+            expression.next_boundary.as_ref(),
+        ),
+    }
+}
+
+fn reverse_match_unprefixed(
+    remainder: &str,
+    next_boundary: Option<&ReversibleBoundary>,
+) -> Option<(Option<String>, usize)> {
+    let (capture, consumed) = reverse_capture_to_boundary(remainder, next_boundary)?;
+    if capture.is_empty() {
+        return Some((None, 0));
+    }
+    Some((Some(decode_percent_triplets_once(capture)?), consumed))
+}
+
+fn reverse_match_prefixed(
+    remainder: &str,
+    prefix: &str,
+    next_boundary: Option<&ReversibleBoundary>,
+) -> Option<(Option<String>, usize)> {
+    let Some(after_prefix) = remainder.strip_prefix(prefix) else {
+        return Some((None, 0));
+    };
+    let Some((capture, consumed)) = reverse_capture_to_boundary(after_prefix, next_boundary) else {
+        // A path expression and its following literal may both begin with
+        // `/`. If no complete literal boundary follows the consumed marker,
+        // leave it for the literal part: the expression is undefined.
+        return Some((None, 0));
+    };
+    Some((
+        Some(decode_percent_triplets_once(capture)?),
+        prefix.len().saturating_add(consumed),
+    ))
+}
+
+fn reverse_match_named(
+    remainder: &str,
+    marker: &str,
+    variable: &str,
+    requires_equals: bool,
+    next_boundary: Option<&ReversibleBoundary>,
+) -> Option<(Option<String>, usize)> {
+    let mut prefix = String::with_capacity(marker.len() + variable.len() + 1);
+    prefix.push_str(marker);
+    prefix.push_str(variable);
+    let Some(after_name) = remainder.strip_prefix(&prefix) else {
+        return Some((None, 0));
+    };
+
+    let (after_equals, equals_len) = if requires_equals {
+        if let Some(after_equals) = after_name.strip_prefix('=') {
+            (after_equals, 1)
+        } else if after_name.is_empty() {
+            (after_name, 0)
+        } else {
+            return Some((None, 0));
+        }
+    } else if let Some(after_equals) = after_name.strip_prefix('=') {
+        (after_equals, 1)
+    } else if after_name.is_empty() {
+        (after_name, 0)
+    } else {
+        return Some((None, 0));
+    };
+    let Some((capture, consumed)) = reverse_capture_to_boundary(after_equals, next_boundary) else {
+        return Some((None, 0));
+    };
+    Some((
+        Some(decode_percent_triplets_once(capture)?),
+        prefix
+            .len()
+            .saturating_add(equals_len)
+            .saturating_add(consumed),
+    ))
+}
+
+fn reverse_capture_to_boundary<'a>(
+    remainder: &'a str,
+    next_boundary: Option<&ReversibleBoundary>,
+) -> Option<(&'a str, usize)> {
+    match next_boundary {
+        Some(boundary) => {
+            if let Some(offset) = remainder.find(boundary.as_str()) {
+                Some((&remainder[..offset], offset))
+            } else if boundary.permits_absent_following_expression() {
+                Some((remainder, remainder.len()))
+            } else {
+                None
+            }
+        }
+        None => Some((remainder, remainder.len())),
+    }
+}
+
+fn decode_percent_triplets_once(capture: &str) -> Option<String> {
+    let bytes = capture.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            decoded.push((hex_value(high)? << 4) | hex_value(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn contains_pct_encoded_triplet(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.windows(3).any(|window| {
+        window[0] == b'%' && window[1].is_ascii_hexdigit() && window[2].is_ascii_hexdigit()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1674,6 +2297,318 @@ mod tests {
         assert_eq!(
             values, before,
             "rejected expansion leaves caller values unchanged"
+        );
+    }
+
+    #[test]
+    fn reversible_resource_template_decodes_populated_and_absent_path_captures() {
+        let template = UriTemplate::parse("mcp://resource{/collection}/manifest{?revision}")
+            .expect("the RFC 6570 template parses");
+        let matcher = template
+            .compile_reversible()
+            .expect("separated scalar captures compile deterministically");
+        let mut values = TemplateValues::new();
+        values.insert(
+            "collection".to_owned(),
+            TemplateValue::scalar("books/fiction"),
+        );
+        values.insert("revision".to_owned(), TemplateValue::scalar("2026-08-09"));
+
+        let uri = matcher
+            .expand(&values)
+            .expect("declared scalar values expand");
+        assert_eq!(
+            uri,
+            "mcp://resource/books%2Ffiction/manifest?revision=2026-08-09"
+        );
+        assert_eq!(
+            matcher
+                .match_uri(&uri)
+                .expect("reverse matching is bounded"),
+            Some(values),
+            "a populated path capture decodes its percent triplet exactly once"
+        );
+
+        let omitted = TemplateValues::new();
+        let omitted_uri = matcher
+            .expand(&omitted)
+            .expect("undefined values omit their whole expressions");
+        assert_eq!(omitted_uri, "mcp://resource/manifest");
+        assert_eq!(
+            matcher
+                .match_uri(&omitted_uri)
+                .expect("omitted values reverse match"),
+            Some(omitted),
+            "an omitted path capture does not consume its following literal"
+        );
+    }
+
+    #[test]
+    fn reversible_resource_template_round_trips_raw_scalar_input() {
+        let matcher = UriTemplate::parse("mcp://resource/{value}")
+            .expect("the simple template parses")
+            .compile_reversible()
+            .expect("a terminal simple capture is deterministic");
+        let mut values = TemplateValues::new();
+        values.insert("value".to_owned(), TemplateValue::scalar("books/fiction"));
+
+        let uri = matcher
+            .expand(&values)
+            .expect("simple expansion percent-encodes a raw slash");
+        assert_eq!(uri, "mcp://resource/books%2Ffiction");
+        assert_eq!(
+            matcher
+                .match_uri(&uri)
+                .expect("reverse matching is bounded"),
+            Some(values),
+            "reverse matching decodes the URI triplet back to the raw scalar"
+        );
+    }
+
+    #[test]
+    fn reversible_resource_template_preescaped_simple_scalar_is_not_preescaped() {
+        let matcher = UriTemplate::parse("mcp://resource/{value}")
+            .expect("the simple template parses")
+            .compile_reversible()
+            .expect("a terminal simple capture is deterministic");
+        let mut values = TemplateValues::new();
+        values.insert("value".to_owned(), TemplateValue::scalar("books%2Ffiction"));
+
+        let uri = matcher
+            .expand(&values)
+            .expect("simple expansion encodes a percent as data");
+        assert_eq!(uri, "mcp://resource/books%252Ffiction");
+        assert_ne!(uri, "mcp://resource/books%2Ffiction");
+        assert_eq!(
+            matcher
+                .match_uri(&uri)
+                .expect("reverse matching is bounded"),
+            Some(values),
+            "one decode restores the preescaped scalar without treating it as wire syntax"
+        );
+    }
+
+    #[test]
+    fn reversible_resource_template_reserved_and_fragment_raw_values_round_trip() {
+        let cases = [
+            (
+                "mcp://resource/{+value}",
+                "docs/guide?draft=true",
+                "mcp://resource/docs/guide?draft=true",
+            ),
+            (
+                "mcp://resource{#value}",
+                "docs/guide?draft=true",
+                "mcp://resource#docs/guide?draft=true",
+            ),
+        ];
+
+        for (template, raw_value, expected_uri) in cases {
+            let matcher = UriTemplate::parse(template)
+                .expect("the reserved or fragment template parses")
+                .compile_reversible()
+                .expect("a terminal reserved or fragment capture is deterministic");
+            let mut values = TemplateValues::new();
+            values.insert("value".to_owned(), TemplateValue::scalar(raw_value));
+
+            let uri = matcher
+                .expand(&values)
+                .expect("raw reserved characters expand without pre-escaping");
+            assert_eq!(uri, expected_uri);
+            assert_eq!(
+                matcher
+                    .match_uri(&uri)
+                    .expect("reverse matching is bounded"),
+                Some(values),
+                "the raw scalar round-trips through the {template} inverse"
+            );
+        }
+    }
+
+    #[test]
+    fn reversible_resource_template_reserved_and_fragment_preescaped_scalars_reject_without_mutation(
+    ) {
+        for template in ["mcp://resource/{+value}", "mcp://resource{#value}"] {
+            let matcher = UriTemplate::parse(template)
+                .expect("the reserved or fragment template parses")
+                .compile_reversible()
+                .expect("a terminal reserved or fragment capture is deterministic");
+            let matcher_before = matcher.clone();
+            let mut values = TemplateValues::new();
+            values.insert("value".to_owned(), TemplateValue::scalar("docs%2Fguide"));
+            let values_before = values.clone();
+
+            assert_eq!(
+                matcher.expand(&values),
+                Err(UriTemplateError::PreescapedReservedMatchValue {
+                    variable: "value".to_owned(),
+                }),
+                "a preescaped scalar is ambiguous for the {template} inverse"
+            );
+            assert_eq!(
+                matcher, matcher_before,
+                "rejected expansion changes no matcher state"
+            );
+            assert_eq!(
+                values, values_before,
+                "rejected expansion changes no caller values"
+            );
+        }
+    }
+
+    #[test]
+    fn reversible_resource_template_near_negative_rejects_lossy_or_composite_without_mutation() {
+        let accepted = "mcp://resource{/collection}/manifest{?revision}";
+        let planted_lossy = "mcp://resource{/collection:3}/manifest{?revision}";
+        let planted_exploded = "mcp://resource{/collection*}/manifest{?revision}";
+        let matcher = UriTemplate::parse(accepted)
+            .expect("positive control parses")
+            .compile_reversible()
+            .expect("positive control compiles");
+        let matcher_before = matcher.clone();
+        let mut values = TemplateValues::new();
+        values.insert("collection".to_owned(), TemplateValue::scalar("books"));
+        values.insert("revision".to_owned(), TemplateValue::scalar("1"));
+        let values_before = values.clone();
+
+        let error = UriTemplate::parse(planted_lossy)
+            .expect("changing only the scalar modifier remains valid RFC 6570")
+            .compile_reversible()
+            .expect_err("a lossy prefix has no deterministic reverse match");
+        assert_eq!(
+            error,
+            UriTemplateError::NonReversibleTemplate {
+                reason: UriTemplateMatchRejection::LossyPrefix {
+                    variable: "collection".to_owned(),
+                },
+            }
+        );
+        assert_eq!(
+            matcher, matcher_before,
+            "rejected compilation changes no matcher state"
+        );
+        assert_eq!(
+            values, values_before,
+            "rejected compilation changes no caller values"
+        );
+
+        let error = UriTemplate::parse(planted_exploded)
+            .expect("changing only the modifier remains valid RFC 6570")
+            .compile_reversible()
+            .expect_err("an exploded composite has no declared inverse shape");
+        assert_eq!(
+            error,
+            UriTemplateError::NonReversibleTemplate {
+                reason: UriTemplateMatchRejection::ExplodedComposite {
+                    variable: "collection".to_owned(),
+                },
+            }
+        );
+        assert_eq!(
+            matcher, matcher_before,
+            "rejected compilation changes no matcher state"
+        );
+        assert_eq!(
+            values, values_before,
+            "rejected compilation changes no caller values"
+        );
+
+        values.insert(
+            "collection".to_owned(),
+            TemplateValue::list(vec!["books".to_owned()]),
+        );
+        let planted_values_before = values.clone();
+        assert_eq!(
+            matcher.expand(&values),
+            Err(UriTemplateError::NonScalarMatchValue {
+                variable: "collection".to_owned(),
+            }),
+            "changing only the declared scalar into a composite must reject"
+        );
+        assert_eq!(
+            values, planted_values_before,
+            "rejected composite expansion leaves caller values unchanged"
+        );
+    }
+
+    #[test]
+    fn reversible_resource_template_adjacent_path_query_round_trips_exactly() {
+        let accepted = "mcp://resource{/collection}{?revision}";
+        let planted_ambiguous = "mcp://resource{/collection}{.revision}";
+        let matcher = UriTemplate::parse(accepted)
+            .expect("the positive control parses")
+            .compile_reversible()
+            .expect("a path capture is separable from the following query marker");
+        let matcher_before = matcher.clone();
+        let mut values = TemplateValues::new();
+        values.insert(
+            "collection".to_owned(),
+            TemplateValue::scalar("books/fiction"),
+        );
+        values.insert("revision".to_owned(), TemplateValue::scalar("2026-08-09"));
+        let values_before = values.clone();
+
+        let uri = matcher
+            .expand(&values)
+            .expect("the separated scalar values expand");
+        assert_eq!(uri, "mcp://resource/books%2Ffiction?revision=2026-08-09");
+        let round_tripped = matcher
+            .match_uri(&uri)
+            .expect("reverse matching is bounded")
+            .expect("the exact expansion belongs to the matcher language");
+        assert_eq!(round_tripped, values);
+        assert_eq!(
+            matcher
+                .expand(&round_tripped)
+                .expect("the recovered bindings re-expand"),
+            uri,
+            "a reversible match must preserve the exact wire URI"
+        );
+
+        let mut path_only = TemplateValues::new();
+        path_only.insert("collection".to_owned(), TemplateValue::scalar("books"));
+        let path_only_uri = matcher
+            .expand(&path_only)
+            .expect("the query expression may be absent");
+        assert_eq!(path_only_uri, "mcp://resource/books");
+        assert_eq!(
+            matcher
+                .match_uri(&path_only_uri)
+                .expect("matching an absent following expression is bounded"),
+            Some(path_only),
+            "the first capture remains exact when the query marker is absent"
+        );
+
+        let error = UriTemplate::parse(planted_ambiguous)
+            .expect("changing only the following query marker to a label remains valid RFC 6570")
+            .compile_reversible()
+            .expect_err("a raw dot can belong to the preceding path scalar");
+        assert_eq!(
+            error,
+            UriTemplateError::NonReversibleTemplate {
+                reason: UriTemplateMatchRejection::AmbiguousBoundary,
+            }
+        );
+        assert_eq!(
+            matcher, matcher_before,
+            "rejected adjacent syntax changes no admitted matcher state"
+        );
+        assert_eq!(
+            values, values_before,
+            "rejected adjacent syntax changes no caller bindings"
+        );
+    }
+
+    #[test]
+    fn reversible_resource_template_rejects_adjacent_captures() {
+        let template = UriTemplate::parse("mcp://resource/{first}{second}")
+            .expect("the syntactically valid template parses");
+        assert_eq!(
+            template.compile_reversible(),
+            Err(UriTemplateError::NonReversibleTemplate {
+                reason: UriTemplateMatchRejection::AdjacentCaptures,
+            }),
+            "adjacent captures admit multiple splits and cannot become a handler matcher"
         );
     }
 }
