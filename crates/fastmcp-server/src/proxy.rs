@@ -4570,7 +4570,10 @@ exec sleep 2
             .first()
             .expect("modern HTTP catalog returns the remote tool");
         assert_eq!(final_tool.name, "echo");
-        let handler = ProxyToolHandler::new(proxy_test_tool(), proxy.clone());
+        // The handler must forward under the DISCOVERED catalog tool's
+        // external name, so it is built from that tool, not a local fixture.
+        let handler = ProxyToolHandler::from_final(final_tool.clone(), proxy.clone())
+            .expect("the discovered final tool builds a proxy handler");
         assert_forwarded_final_tool(
             handler
                 .call_final(
