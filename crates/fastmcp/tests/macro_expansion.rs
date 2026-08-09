@@ -715,7 +715,11 @@ fn final_tool_outcome(mode: &str) -> FinalToolOutcome {
     }
 }
 
-fn facade_final_tool_outcome_request(mode: &str, declare_tasks: bool) -> JsonRpcRequest {
+fn facade_final_tool_outcome_request(
+    tool_name: &str,
+    mode: &str,
+    declare_tasks: bool,
+) -> JsonRpcRequest {
     let client_capabilities = if declare_tasks {
         json!({
             "extensions": { "io.modelcontextprotocol/tasks": {} },
@@ -730,7 +734,7 @@ fn facade_final_tool_outcome_request(mode: &str, declare_tasks: bool) -> JsonRpc
                 "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
                 "io.modelcontextprotocol/clientCapabilities": client_capabilities,
             },
-            "name": "final_tool_outcome_direct",
+            "name": tool_name,
             "arguments": { "mode": mode },
         })),
         64_i64,
@@ -842,12 +846,16 @@ fn tool_final_outcome_variants_reach_the_final_outcome_hook() {
 #[test]
 fn facade_final_tool_outcome_encodes_input_required_through_modern_wire() {
     let server = Server::new("facade-final-outcome", "1.0.0")
-        .tool(FinalToolOutcomeDirect)
+        .tool(FinalToolOutcomeResult)
         .build();
     let response = server
         .dispatch_stateless(
             &facade_final_inbound(),
-            &facade_final_tool_outcome_request("input-required", false),
+            &facade_final_tool_outcome_request(
+                "final_tool_outcome_result",
+                "input-required",
+                false,
+            ),
         )
         .expect("facade final tools/call returns an input-required wire response");
     let result = response
@@ -883,7 +891,7 @@ fn facade_final_tool_outcome_creates_task_through_modern_wire() {
     let response = server
         .dispatch_stateless(
             &facade_final_inbound(),
-            &facade_final_tool_outcome_request("create-task", true),
+            &facade_final_tool_outcome_request("final_tool_outcome_direct", "create-task", true),
         )
         .expect("task-capable facade final tools/call returns a wire response");
     let result = response.result.expect("task final tools/call has a result");
@@ -918,7 +926,7 @@ fn facade_final_tool_outcome_rejects_task_without_declared_capability() {
     let response = server
         .dispatch_stateless(
             &facade_final_inbound(),
-            &facade_final_tool_outcome_request("create-task", false),
+            &facade_final_tool_outcome_request("final_tool_outcome_direct", "create-task", false),
         )
         .expect("missing task capability returns a JSON-RPC error response");
 
