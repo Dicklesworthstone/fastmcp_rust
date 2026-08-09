@@ -2801,7 +2801,7 @@ mod tests {
     fn public_legacy_context_exact_progress_emits_nothing() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_clone = Arc::clone(&sent);
-        let reporter = ProgressNotificationSender::new_final(
+        let reporter = ProgressNotificationSender::new(
             ProgressMarker::from("ordinary-final-progress"),
             move |request| {
                 sent_clone
@@ -2822,6 +2822,42 @@ mod tests {
                 .expect("notification collection is not poisoned")
                 .is_empty(),
             "the otherwise identical exact progress must not cross a legacy sender"
+        );
+    }
+
+    #[test]
+    fn public_final_context_exact_progress_rejects_one_smaller_total_without_emission() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let reporter = ProgressNotificationSender::new_final(
+            ProgressMarker::from("invalid-final-progress"),
+            move |request| {
+                sent_clone
+                    .lock()
+                    .expect("notification collection is not poisoned")
+                    .push(request);
+            },
+        )
+        .into_reporter();
+        let context = McpContext::with_progress(Cx::for_testing(), 2804, reporter);
+
+        context.report_progress_exact(
+            serde_json::from_str("1e400").expect("baseline progress parses"),
+            Some(serde_json::from_str("1e400").expect("baseline total parses")),
+            Some("complete"),
+        );
+        context.report_progress_exact(
+            serde_json::from_str("1e400").expect("unchanged progress parses"),
+            Some(serde_json::from_str("1e399").expect("one-variable smaller total parses")),
+            Some("complete"),
+        );
+
+        assert_eq!(
+            sent.lock()
+                .expect("notification collection is not poisoned")
+                .len(),
+            1,
+            "changing only total below progress must not emit a second notification"
         );
     }
 
