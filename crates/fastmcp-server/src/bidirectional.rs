@@ -47,7 +47,9 @@ use fastmcp_core::{
     SamplingRole, SamplingSender, SamplingStopReason, draw_security_identifier,
 };
 use fastmcp_protocol::protocol_policy::ProtocolEra;
-use fastmcp_protocol::{JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
+use fastmcp_protocol::{
+    CorrelationKey, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeStruct;
@@ -95,6 +97,10 @@ pub const DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES: usize = 64 * 1024;
 pub const HARD_MAX_MRTR_REQUEST_STATE_BYTES: usize = 256 * 1024;
 
 const FIRST_SERVER_REQUEST_ID: i64 = 1_000_000;
+/// The first exact-legacy ID is exactly representable by a JavaScript `Number`.
+const FIRST_EXACT_LEGACY_SERVER_REQUEST_ID: i64 = -1;
+/// The inclusive lower bound of JavaScript's integer-safe `Number` range.
+const LAST_EXACT_LEGACY_SERVER_REQUEST_ID: i64 = -9_007_199_254_740_991;
 const INVALID_LIMIT_ERROR: &str = "Invalid bidirectional request limit";
 const IN_FLIGHT_LIMIT_ERROR: &str = "Bidirectional request limit reached";
 const REQUEST_ID_EXHAUSTED_ERROR: &str = "Bidirectional request IDs exhausted";
@@ -123,9 +129,76 @@ type PendingResponse = McpResult<serde_json::Value>;
 type ResponseSender = oneshot::Sender<PendingResponse>;
 type ResponseReceiver = oneshot::Receiver<PendingResponse>;
 
+/// Immutable wire-ID domain assigned to one pending-request tracker.
+///
+/// Exact legacy reverse requests descend from
+/// [`FIRST_EXACT_LEGACY_SERVER_REQUEST_ID`] through JavaScript's negative safe
+/// integer range. A response from the already issued suffix of that range can
+/// therefore be retired without retaining one tombstone per completed request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingIdDomain {
+    Positive,
+    ExactLegacyNegative,
+}
+
+impl PendingIdDomain {
+    const fn first_id(self) -> i64 {
+        match self {
+            Self::Positive => FIRST_SERVER_REQUEST_ID,
+            Self::ExactLegacyNegative => FIRST_EXACT_LEGACY_SERVER_REQUEST_ID,
+        }
+    }
+
+    fn next_id_after(self, candidate: i64) -> Option<i64> {
+        match self {
+            Self::Positive => candidate.checked_add(1),
+            Self::ExactLegacyNegative => candidate
+                .checked_sub(1)
+                .filter(|next| *next >= LAST_EXACT_LEGACY_SERVER_REQUEST_ID),
+        }
+    }
+
+    fn is_issued_negative_suffix(self, next_id: Option<i64>, id: &CorrelationKey) -> bool {
+        let Self::ExactLegacyNegative = self else {
+            return false;
+        };
+        let CorrelationKey::Integer(integer) = id else {
+            return false;
+        };
+        let Ok(id) = integer.parse::<i64>() else {
+            return false;
+        };
+
+        match next_id {
+            // `next_id` itself has not yet been issued, so the issued suffix
+            // is open at its lower end: `(next_id..=-1)`.
+            Some(next_id) => {
+                (LAST_EXACT_LEGACY_SERVER_REQUEST_ID..=FIRST_EXACT_LEGACY_SERVER_REQUEST_ID)
+                    .contains(&next_id)
+                    && (next_id < id)
+                    && (id <= FIRST_EXACT_LEGACY_SERVER_REQUEST_ID)
+            }
+            None => (LAST_EXACT_LEGACY_SERVER_REQUEST_ID..=FIRST_EXACT_LEGACY_SERVER_REQUEST_ID)
+                .contains(&id),
+        }
+    }
+}
+
+/// Result of routing one response through [`PendingRequests`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingResponseDisposition {
+    /// The response reached its live pending request.
+    Delivered,
+    /// The response belongs to an issued exact-legacy negative ID that has
+    /// already left the pending set.
+    RetiredGeneric,
+    /// The response ID was not issued by this tracker or is absent.
+    Unmatched,
+}
+
 #[derive(Debug)]
 struct PendingState {
-    requests: HashMap<RequestId, PendingRequest>,
+    requests: HashMap<CorrelationKey, PendingRequest>,
     next_id: Option<i64>,
     closed: bool,
 }
@@ -143,6 +216,7 @@ struct PendingRequest {
 #[derive(Debug)]
 pub struct PendingRequests {
     state: Mutex<PendingState>,
+    id_domain: PendingIdDomain,
     max_in_flight: usize,
 }
 
@@ -165,17 +239,22 @@ impl PendingRequests {
         }
     }
 
-    /// Creates a new pending request tracker.
-    #[must_use]
-    pub fn new() -> Self {
+    fn new_in_domain(id_domain: PendingIdDomain, max_in_flight: usize) -> Self {
         Self {
             state: Mutex::new(PendingState {
                 requests: HashMap::new(),
-                next_id: Some(FIRST_SERVER_REQUEST_ID),
+                next_id: Some(id_domain.first_id()),
                 closed: false,
             }),
-            max_in_flight: DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+            id_domain,
+            max_in_flight,
         }
+    }
+
+    /// Creates a new pending request tracker.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::new_in_domain(PendingIdDomain::Positive, DEFAULT_MAX_IN_FLIGHT_REQUESTS)
     }
 
     /// Creates a tracker with a caller-selected finite in-flight limit.
@@ -187,14 +266,25 @@ impl PendingRequests {
     pub fn with_max_in_flight(max_in_flight: usize) -> McpResult<Self> {
         Self::validate_max_in_flight(max_in_flight)?;
 
-        Ok(Self {
-            state: Mutex::new(PendingState {
-                requests: HashMap::new(),
-                next_id: Some(FIRST_SERVER_REQUEST_ID),
-                closed: false,
-            }),
+        Ok(Self::new_in_domain(
+            PendingIdDomain::Positive,
             max_in_flight,
-        })
+        ))
+    }
+
+    /// Creates the exact-legacy tracker whose request IDs descend from
+    /// [`FIRST_EXACT_LEGACY_SERVER_REQUEST_ID`] through the JavaScript-safe
+    /// negative domain.
+    ///
+    /// The domain is fixed for the tracker's full lifetime so a response for
+    /// an issued-but-retired negative ID can be classified in O(1) space.
+    pub(crate) fn with_max_in_flight_for_exact_legacy(max_in_flight: usize) -> McpResult<Self> {
+        Self::validate_max_in_flight(max_in_flight)?;
+
+        Ok(Self::new_in_domain(
+            PendingIdDomain::ExactLegacyNegative,
+            max_in_flight,
+        ))
     }
 
     /// Returns the configured maximum number of in-flight requests.
@@ -232,9 +322,12 @@ impl PendingRequests {
                 return Err(McpError::internal_error(REQUEST_ID_EXHAUSTED_ERROR));
             };
             let id = RequestId::Number(candidate);
-            state.next_id = candidate.checked_add(1);
+            let key = id
+                .correlation_key()
+                .map_err(|_| McpError::internal_error(REQUEST_ID_EXHAUSTED_ERROR))?;
+            state.next_id = self.id_domain.next_id_after(candidate);
 
-            if let Entry::Vacant(entry) = state.requests.entry(id.clone()) {
+            if let Entry::Vacant(entry) = state.requests.entry(key) {
                 let (sender, receiver) = oneshot::channel();
                 entry.insert(PendingRequest {
                     sender,
@@ -249,37 +342,62 @@ impl PendingRequests {
 
     /// Routes a response to the appropriate pending request.
     ///
-    /// Returns `true` if the response was routed, `false` if no matching request was found.
+    /// Returns `true` only when the response was delivered to a live pending
+    /// request, preserving the established public boolean contract.
     pub fn route_response(&self, response: &JsonRpcResponse) -> bool {
+        matches!(
+            self.route_response_with_disposition(response),
+            PendingResponseDisposition::Delivered
+        )
+    }
+
+    /// Routes a response and reports whether it was delivered, retired from
+    /// the exact-legacy negative ID suffix, or unmatched.
+    pub(crate) fn route_response_with_disposition(
+        &self,
+        response: &JsonRpcResponse,
+    ) -> PendingResponseDisposition {
         let Some(ref id) = response.id else {
-            return false;
+            return PendingResponseDisposition::Unmatched;
+        };
+        let Ok(key) = id.correlation_key() else {
+            return PendingResponseDisposition::Unmatched;
         };
 
-        // Validate every response invariant before consuming the waiter. This
-        // also rejects manually-constructed values that bypass serde's guards.
-        let validated = ValidatedResponse::from_response(response);
-
-        let sender = {
+        let (pending, retired_generic) = {
             let mut state = self.lock_state();
-            state.requests.remove(id)
+            let pending = state.requests.remove(&key);
+            let retired_generic = pending.is_none()
+                && self
+                    .id_domain
+                    .is_issued_negative_suffix(state.next_id, &key);
+            (pending, retired_generic)
         };
 
-        if let Some(pending) = sender {
+        if let Some(pending) = pending {
+            // Validate every response invariant before consuming the waiter.
+            // This also rejects manually-constructed values that bypass serde's guards.
+            let validated = ValidatedResponse::from_response(response);
             let outcome = validated.into_pending_response();
             // The response path is synchronous, so use the immediate bounded
             // oneshot bridge. Receiver dropout returns the value and is safe to
             // ignore after the map entry has been removed.
             let _ = pending.sender.send_blocking(outcome);
-            true
+            PendingResponseDisposition::Delivered
+        } else if retired_generic {
+            PendingResponseDisposition::RetiredGeneric
         } else {
-            false
+            PendingResponseDisposition::Unmatched
         }
     }
 
     /// Removes a pending request (e.g., on timeout or cancellation).
     pub fn remove(&self, id: &RequestId) {
+        let Ok(key) = id.correlation_key() else {
+            return;
+        };
         let mut state = self.lock_state();
-        state.requests.remove(id);
+        state.requests.remove(&key);
     }
 
     /// Wakes pending server-to-client calls whose owning incoming request is
@@ -287,7 +405,7 @@ impl PendingRequests {
     pub(crate) fn cancel_cancelled(&self) -> usize {
         let cancelled = {
             let mut state = self.lock_state();
-            let ids: Vec<RequestId> = state
+            let ids: Vec<CorrelationKey> = state
                 .requests
                 .iter()
                 .filter_map(|(id, pending)| {
@@ -2514,6 +2632,173 @@ mod tests {
         assert!(!pending.route_response(&response));
     }
 
+    #[test]
+    fn exact_legacy_negative_response_disposition_delivers_issued_waiter() {
+        let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
+        let (id, receiver) = pending.register().unwrap();
+        assert_eq!(id, RequestId::Number(-1));
+
+        let RequestId::Number(first_emitted_id) = id.clone() else {
+            panic!("exact-legacy IDs must be numeric");
+        };
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let f64_round_trip = (first_emitted_id as f64) as i64;
+        assert_eq!(f64_round_trip, first_emitted_id);
+
+        let response = JsonRpcResponse::success(id, serde_json::json!({"result": "ok"}));
+        assert_eq!(
+            pending.route_response_with_disposition(&response),
+            PendingResponseDisposition::Delivered
+        );
+        assert_eq!(
+            receive_pending(receiver).unwrap(),
+            serde_json::json!({"result": "ok"})
+        );
+    }
+
+    #[test]
+    fn exact_legacy_negative_ids_descend_from_minus_one() {
+        let pending = PendingRequests::with_max_in_flight_for_exact_legacy(2).unwrap();
+
+        let (first_id, _first_receiver) = pending.register().unwrap();
+        let (next_id, _next_receiver) = pending.register().unwrap();
+
+        assert_eq!(first_id, RequestId::Number(-1));
+        assert_eq!(next_id, RequestId::Number(-2));
+    }
+
+    #[test]
+    fn exact_legacy_negative_response_disposition_retires_issued_removed_id() {
+        let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
+        let (id, _receiver) = pending.register().unwrap();
+        pending.remove(&id);
+
+        let response = JsonRpcResponse::success(id, serde_json::json!(null));
+        assert_eq!(
+            pending.route_response_with_disposition(&response),
+            PendingResponseDisposition::RetiredGeneric
+        );
+        assert!(
+            !pending.route_response(&response),
+            "the public bool wrapper remains false for a retired response"
+        );
+    }
+
+    #[test]
+    fn exact_legacy_negative_response_disposition_rejects_unissued_nearby_id() {
+        let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
+        let (issued_id, _receiver) = pending.register().unwrap();
+        assert_eq!(issued_id, RequestId::Number(-1));
+
+        let unissued_id = RequestId::Number(-2);
+        let response = JsonRpcResponse::success(unissued_id, serde_json::json!(null));
+        assert_eq!(
+            pending.route_response_with_disposition(&response),
+            PendingResponseDisposition::Unmatched
+        );
+        assert!(
+            !pending.route_response(&response),
+            "the public bool wrapper remains false for an unissued response"
+        );
+    }
+
+    #[test]
+    fn pending_requests_deliver_equivalent_numeric_response_spelling() {
+        let pending = PendingRequests::new();
+        let (id, receiver) = pending.register().unwrap();
+        assert_eq!(id, RequestId::Number(FIRST_SERVER_REQUEST_ID));
+
+        let response = JsonRpcResponse::success(
+            RequestId::Integer(format!("{FIRST_SERVER_REQUEST_ID}e0")),
+            serde_json::json!({"result": "canonical"}),
+        );
+        assert_eq!(
+            pending.route_response_with_disposition(&response),
+            PendingResponseDisposition::Delivered
+        );
+        assert_eq!(
+            receive_pending(receiver).unwrap(),
+            serde_json::json!({"result": "canonical"})
+        );
+    }
+
+    #[test]
+    fn exact_legacy_retires_equivalent_numeric_response_spelling() {
+        let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
+        let (id, _receiver) = pending.register().unwrap();
+        assert_eq!(id, RequestId::Number(-1));
+        pending.remove(&id);
+
+        let response = JsonRpcResponse::success(
+            RequestId::Integer(format!("{FIRST_EXACT_LEGACY_SERVER_REQUEST_ID}e0")),
+            serde_json::json!(null),
+        );
+        assert_eq!(
+            pending.route_response_with_disposition(&response),
+            PendingResponseDisposition::RetiredGeneric
+        );
+    }
+
+    #[test]
+    fn removed_positive_id_remains_unmatched() {
+        let pending = PendingRequests::new();
+        let (id, _receiver) = pending.register().unwrap();
+        pending.remove(&id);
+
+        let response = JsonRpcResponse::success(id, serde_json::json!(null));
+        assert_eq!(
+            pending.route_response_with_disposition(&response),
+            PendingResponseDisposition::Unmatched
+        );
+        assert!(!pending.route_response(&response));
+    }
+
+    #[test]
+    fn exact_legacy_negative_ids_exhaust_at_js_safe_boundary_and_remain_retired() {
+        let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
+        pending.set_next_id_for_test(LAST_EXACT_LEGACY_SERVER_REQUEST_ID);
+        let (last_id, _receiver) = pending.register().unwrap();
+        assert_eq!(
+            last_id,
+            RequestId::Number(LAST_EXACT_LEGACY_SERVER_REQUEST_ID)
+        );
+        pending.remove(&last_id);
+
+        let exhausted = pending
+            .register()
+            .expect_err("the exact-legacy negative ID domain ends at the JavaScript safe boundary");
+        assert_eq!(exhausted.message, REQUEST_ID_EXHAUSTED_ERROR);
+
+        let response = JsonRpcResponse::success(last_id.clone(), serde_json::json!(null));
+        assert_eq!(
+            pending.route_response_with_disposition(&response),
+            PendingResponseDisposition::RetiredGeneric
+        );
+
+        let first_response =
+            JsonRpcResponse::success(RequestId::Number(-1), serde_json::json!(null));
+        assert_eq!(
+            pending.route_response_with_disposition(&first_response),
+            PendingResponseDisposition::RetiredGeneric,
+            "after exhaustion the entire JavaScript-safe negative range is retired"
+        );
+
+        let out_of_range_response = JsonRpcResponse::success(
+            RequestId::Number(LAST_EXACT_LEGACY_SERVER_REQUEST_ID - 1),
+            serde_json::json!(null),
+        );
+        assert_eq!(
+            pending.route_response_with_disposition(&out_of_range_response),
+            PendingResponseDisposition::Unmatched,
+            "a negative ID outside the JavaScript-safe range is never retired"
+        );
+
+        let permanently_exhausted = pending
+            .register()
+            .expect_err("retiring the final negative ID must not permit reuse");
+        assert_eq!(permanently_exhausted.message, REQUEST_ID_EXHAUSTED_ERROR);
+    }
+
     // ── PendingRequests additional coverage ───────────────────────────
 
     #[test]
@@ -2599,6 +2884,10 @@ mod tests {
 
         // Routing should fail now
         let response = JsonRpcResponse::success(id, serde_json::json!(null));
+        assert_eq!(
+            pr.route_response_with_disposition(&response),
+            PendingResponseDisposition::Unmatched
+        );
         assert!(!pr.route_response(&response));
     }
 
