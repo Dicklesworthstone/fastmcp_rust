@@ -896,6 +896,36 @@ fn generate_final_tool_outcome_conversion(output: &syn::ReturnType) -> Option<To
     }
 }
 
+/// Validates the explicit final-Tasks opt-in before expansion.
+///
+/// A tool may only advertise task creation when its exact result algebra can
+/// actually emit `FinalToolOutcome::CreateTask`. Keeping this opt-in separate
+/// from ordinary final-result handlers prevents an accidental capability claim
+/// from widening router admission.
+fn validate_tool_tasks_return(output: &syn::ReturnType) -> syn::Result<()> {
+    if final_tool_outcome_return_kind(output).is_some() {
+        return Ok(());
+    }
+
+    Err(syn::Error::new_spanned(
+        output,
+        "#[tool(tasks)] requires a canonical FinalToolOutcome return type: fastmcp_rust::FinalToolOutcome, Result<fastmcp_rust::FinalToolOutcome, E>, or McpResult<fastmcp_rust::FinalToolOutcome>",
+    ))
+}
+
+/// Emits the capability declaration only for the validated explicit opt-in.
+fn generate_tool_tasks_declaration(tasks: bool) -> TokenStream2 {
+    if tasks {
+        quote! {
+            fn declares_final_tasks(&self) -> bool {
+                true
+            }
+        }
+    } else {
+        TokenStream2::new()
+    }
+}
+
 fn generate_tool_execution_methods(
     is_async: bool,
     expects_context: bool,
@@ -2199,11 +2229,12 @@ fn generate_resource_execution_methods(
 #[allow(clippy::items_after_test_module)]
 mod async_handler_expansion_tests {
     use super::{
-        found_crate_path, generate_final_prompt_result_conversion,
+        ToolAttrs, found_crate_path, generate_final_prompt_result_conversion,
         generate_final_resource_result_conversion, generate_final_tool_outcome_conversion,
         generate_final_tool_payload_projection, generate_final_tool_result_conversion,
         generate_prompt_execution_methods, generate_resource_execution_methods,
-        generate_tool_execution_methods, validate_final_handler_return,
+        generate_tool_execution_methods, generate_tool_tasks_declaration,
+        validate_final_handler_return, validate_tool_tasks_return,
     };
     use proc_macro_crate::FoundCrate;
     use quote::{format_ident, quote};
@@ -2452,6 +2483,39 @@ mod async_handler_expansion_tests {
             );
             assert!(!tokens.contains("fn call_final ("), "{tokens}");
         }
+    }
+
+    #[test]
+    fn tool_tasks_opt_in_is_bound_to_canonical_final_tool_outcomes() {
+        let attrs: ToolAttrs = syn::parse_str("tasks").expect("the bare tasks opt-in parses");
+        assert!(attrs.tasks);
+
+        for output in [
+            syn::parse_quote!(-> fastmcp_rust::FinalToolOutcome),
+            syn::parse_quote!(-> Result<fastmcp_rust::FinalToolOutcome, std::io::Error>),
+            syn::parse_quote!(-> fastmcp_core::McpResult<fastmcp_rust::FinalToolOutcome>),
+        ] {
+            validate_tool_tasks_return(&output)
+                .expect("each canonical final tool outcome return enables the tasks opt-in");
+        }
+
+        let incompatible: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_rust::CompleteResult<fastmcp_rust::FinalCallToolResult>
+        );
+        let error = validate_tool_tasks_return(&incompatible)
+            .expect_err("changing only the return algebra must reject the tasks opt-in");
+        assert_eq!(
+            error.to_string(),
+            "#[tool(tasks)] requires a canonical FinalToolOutcome return type: fastmcp_rust::FinalToolOutcome, Result<fastmcp_rust::FinalToolOutcome, E>, or McpResult<fastmcp_rust::FinalToolOutcome>",
+        );
+
+        let declaration = generate_tool_tasks_declaration(true).to_string();
+        assert!(
+            declaration.contains("fn declares_final_tasks"),
+            "{declaration}"
+        );
+        assert!(declaration.contains("true"), "{declaration}");
+        assert!(generate_tool_tasks_declaration(false).is_empty());
     }
 
     #[test]
@@ -2978,6 +3042,8 @@ struct ToolAttrs {
     name: Option<String>,
     description: Option<String>,
     timeout: Option<String>,
+    /// Opts a canonical final tool-outcome handler into final Tasks creation.
+    tasks: bool,
     tags: Vec<String>,
     defaults: HashMap<String, Lit>,
     /// Output schema as a JSON literal or type name
@@ -2998,6 +3064,7 @@ impl Parse for ToolAttrs {
         let mut name = None;
         let mut description = None;
         let mut timeout = None;
+        let mut tasks = false;
         let mut tags = Vec::new();
         let mut defaults: HashMap<String, Lit> = HashMap::new();
         let mut output_schema = None;
@@ -3025,6 +3092,18 @@ impl Parse for ToolAttrs {
                     input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
                     timeout = Some(lit.value());
+                }
+                "tasks" => {
+                    if input.peek(Token![=]) {
+                        return Err(syn::Error::new(
+                            ident.span(),
+                            "tasks is a bare opt-in; write #[tool(tasks)]",
+                        ));
+                    }
+                    if tasks {
+                        return Err(syn::Error::new(ident.span(), "duplicate tasks opt-in"));
+                    }
+                    tasks = true;
                 }
                 "version" => {
                     input.parse::<Token![=]>()?;
@@ -3114,6 +3193,7 @@ impl Parse for ToolAttrs {
             name,
             description,
             timeout,
+            tasks,
             tags,
             defaults,
             output_schema,
@@ -3310,6 +3390,8 @@ mod schema_bound_tool_expansion_tests {
 /// - `tags` - List of tool tags for filtering (`tags = ["api", "read"]`)
 /// - `output_schema` - An inline JSON object (legacy form), or a bare return
 ///   type path with `json_schema()` (typed result form)
+/// - `tasks` - Opt a canonical `FinalToolOutcome` return into final Tasks
+///   creation; incompatible return types are rejected at compile time
 ///
 /// # Parameter Defaults
 ///
@@ -3341,6 +3423,14 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(paths) => paths,
         Err(error) => return error.to_compile_error().into(),
     };
+
+    if attrs.tasks
+        && let Err(error) = validate_tool_tasks_return(&input_fn.sig.output)
+    {
+        return syn::Error::new_spanned(&input_fn.sig.ident, error.to_string())
+            .to_compile_error()
+            .into();
+    }
 
     if let Err(error) = validate_final_handler_return(
         &input_fn.sig.output,
@@ -3614,6 +3704,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     let result_conversion = generate_tool_result_conversion(return_type, typed_output_schema);
     let final_result_conversion = generate_final_tool_result_conversion(return_type);
     let final_outcome_conversion = generate_final_tool_outcome_conversion(return_type);
+    let tasks_declaration = generate_tool_tasks_declaration(attrs.tasks);
 
     let execution_methods = generate_tool_execution_methods(
         is_async,
@@ -3671,6 +3762,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #timeout_tokens
 
                 #output_schema_method
+
+                #tasks_declaration
 
                 #execution_methods
             }

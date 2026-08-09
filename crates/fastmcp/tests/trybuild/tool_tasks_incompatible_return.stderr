@@ -1,0 +1,5 @@
+error: #[tool(tasks)] requires a canonical FinalToolOutcome return type: fastmcp_rust::FinalToolOutcome, Result<fastmcp_rust::FinalToolOutcome, E>, or McpResult<fastmcp_rust::FinalToolOutcome>
+ --> tests/trybuild/tool_tasks_incompatible_return.rs:7:4
+  |
+7 | fn task_tool() -> fastmcp_rust::CompleteResult<fastmcp_rust::FinalCallToolResult> {
+  |    ^^^^^^^^^

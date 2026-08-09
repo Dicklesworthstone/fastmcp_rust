@@ -5,8 +5,19 @@ use std::collections::BTreeMap;
 use fastmcp_rust::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, CompletionContext,
     CompletionHandler, CompletionParams, CompletionReference, SubscriptionFilter, auto,
-    legacy_2024, modern,
+    legacy_2024, modern, tool,
 };
+
+#[tool(tasks)]
+fn downstream_final_task_tool() -> fastmcp_rust::FinalToolOutcome {
+    unreachable!("the downstream macro probe only compiles the task opt-in")
+}
+
+fn assert_task_opt_in_macro_surface() {
+    assert!(fastmcp_rust::ToolHandler::declares_final_tasks(
+        &DownstreamFinalTaskTool
+    ));
+}
 
 struct DownstreamCompletionHandler;
 
@@ -639,6 +650,7 @@ mod prelude_directional_notification_reachability {
 }
 
 fn main() {
+    assert_task_opt_in_macro_surface();
     let _ = assert_legacy_sse_method_signatures;
     assert_completion_handler_reachability();
     prelude_completion_handler_reachability::assert_reachable();

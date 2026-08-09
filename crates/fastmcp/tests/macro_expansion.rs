@@ -23,18 +23,20 @@
 
 use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
 use fastmcp_rust::{
-    AbsoluteUri, CacheScope, CompleteResult, Content, ContentBlock, Cx, EmbeddedResourceContents,
-    FinalCallToolResult, FinalGetPromptResult, FinalPromptMessage, FinalReadResourceResult,
-    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalToolOutcome, Implementation,
-    InboundRequestContext, InboundRequestTransport, InputRequiredResult, JsonRpcRequest,
-    JsonSchema, LabConfig, LabRuntime, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
-    MODERN_PROTOCOL_VERSION, McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler,
-    PromptMessage, ResourceContent, ResourceHandler, ResultMeta, Role, Server, ToolHandler, prompt,
-    resource, tool,
+    ApplicationTaskSupervisor, CacheScope, CompleteResult, Content, ContentBlock, Cx,
+    EmbeddedResourceContents, FinalAbsoluteUri, FinalCallToolResult, FinalGetPromptResult,
+    FinalPromptMessage, FinalReadResourceResult, FinalTaskRuntime, FinalTaskRuntimeConfig,
+    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+    FinalToolOutcome, Implementation, InboundRequestContext, InboundRequestTransport,
+    InputRequiredResult, JsonRpcRequest, JsonSchema, LabConfig, LabRuntime,
+    MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MODERN_PROTOCOL_VERSION, McpContext, McpError,
+    McpOutcome, McpResult, Outcome, PromptHandler, PromptMessage, ResourceContent, ResourceHandler,
+    ResultMeta, Role, Server, ToolHandler, prompt, resource, tool,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::task::Poll;
 
 fn test_ctx() -> McpContext {
     McpContext::new(Cx::for_testing(), 1)
@@ -658,7 +660,7 @@ fn tool_final_complete_results_project_exact_legacy_content_and_output_schema() 
         let Content::Resource { resource } = &content[3] else {
             panic!("embedded final resource must preserve the legacy content variant");
         };
-        assert_eq!(resource.uri, "final://tool/embedded-resource");
+        assert_eq!(resource.uri.as_str(), "final://tool/embedded-resource");
         assert_eq!(resource.mime_type.as_deref(), Some("text/plain"));
         assert_eq!(resource.text.as_deref(), Some("embedded"));
         assert!(resource.blob.is_none());
@@ -703,6 +705,10 @@ fn final_tool_outcome(mode: &str) -> FinalToolOutcome {
                 .expect("request state makes input-required valid"),
         ),
         "create-task" => FinalToolOutcome::CreateTask {
+            work_descriptor: FinalTaskWorkDescriptor::new(json!({
+                "operation": "macro-expansion-final-task"
+            }))
+            .expect("non-null final task work descriptor"),
             status_message: Some("queued".to_string()),
         },
         _ => unreachable!("test calls only supported final tool outcome modes"),
@@ -735,7 +741,19 @@ fn facade_final_inbound() -> InboundRequestContext {
     InboundRequestContext::new(Cx::for_testing(), 64, InboundRequestTransport::Memory)
 }
 
-#[tool]
+struct NoopFinalTaskSupervisor;
+
+impl ApplicationTaskSupervisor for NoopFinalTaskSupervisor {
+    fn resume<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tool(tasks)]
 fn final_tool_outcome_direct(mode: String) -> fastmcp_rust::FinalToolOutcome {
     final_tool_outcome(&mode)
 }
@@ -767,6 +785,14 @@ async fn final_tool_outcome_async_input_required(
 #[test]
 fn tool_final_outcome_variants_reach_the_final_outcome_hook() {
     let ctx = test_ctx();
+    assert!(
+        FinalToolOutcomeDirect.declares_final_tasks(),
+        "the explicit tasks opt-in declares final Tasks support"
+    );
+    assert!(
+        !FinalToolOutcomeResult.declares_final_tasks(),
+        "canonical final outcomes do not declare final Tasks without the opt-in"
+    );
     let handlers: [Box<dyn ToolHandler>; 3] = [
         Box::new(FinalToolOutcomeDirect),
         Box::new(FinalToolOutcomeResult),
@@ -803,8 +829,12 @@ fn tool_final_outcome_variants_reach_the_final_outcome_hook() {
                 .call_final_outcome(&ctx, json!({"mode": "create-task"}))
                 .expect("task creation outcome is preserved"),
             FinalToolOutcome::CreateTask {
+                work_descriptor,
                 status_message: Some(ref message),
             } if message == "queued"
+                && work_descriptor.as_value() == &json!({
+                    "operation": "macro-expansion-final-task"
+                })
         ));
     }
 }
@@ -835,6 +865,16 @@ fn facade_final_tool_outcome_creates_task_through_modern_wire() {
         FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
         std::sync::Arc::new(|_| {}),
     );
+    let service_runner = runtime
+        .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
+        .expect("the facade installs an application-owned task service");
+    let service_cx = Cx::for_testing();
+    let mut running_service = Box::pin(service_runner.run(&service_cx));
+    let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        Future::poll(running_service.as_mut(), &mut task_cx),
+        Poll::Pending
+    ));
     let server = Server::new("facade-final-task", "1.0.0")
         .tool(FinalToolOutcomeDirect)
         .final_tasks(runtime)
@@ -860,6 +900,16 @@ fn facade_final_tool_outcome_rejects_task_without_declared_capability() {
         FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
         std::sync::Arc::new(|_| {}),
     );
+    let service_runner = runtime
+        .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
+        .expect("the facade installs an application-owned task service");
+    let service_cx = Cx::for_testing();
+    let mut running_service = Box::pin(service_runner.run(&service_cx));
+    let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        Future::poll(running_service.as_mut(), &mut task_cx),
+        Poll::Pending
+    ));
     let server = Server::new("facade-final-task", "1.0.0")
         .tool(FinalToolOutcomeDirect)
         .final_tasks(runtime)
@@ -1486,7 +1536,7 @@ fn final_resource_payload(text: &str) -> CompleteResult<FinalReadResourceResult>
     CompleteResult::new(
         FinalReadResourceResult {
             contents: vec![EmbeddedResourceContents::Text {
-                uri: AbsoluteUri::parse("final://resource/content").expect("valid final URI"),
+                uri: FinalAbsoluteUri::parse("final://resource/content").expect("valid final URI"),
                 text: text.to_string(),
                 mime_type: Some("application/json".to_string()),
                 meta: None,
