@@ -4017,7 +4017,7 @@ fn legacy_sse_response_head(response: &HttpResponse) -> Result<Vec<u8>, ()> {
 async fn send_legacy_sse_stream(
     cx: &Cx,
     stream: &mut AsyncTcpStream,
-    mut response: DualEraHttpLegacySseResponse,
+    response: DualEraHttpLegacySseResponse,
 ) -> Result<(), ()> {
     stream
         .write_all(&legacy_sse_response_head(response.response())?)

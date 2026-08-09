@@ -1661,7 +1661,7 @@ mod router_tests {
     }
 
     #[test]
-    fn test_cancelled_notification_await_cleanup_waits_for_completion() {
+    fn test_cancelled_notification_await_cleanup_remains_nonblocking() {
         let server = Server::new("test-server", "1.0.0").build();
         let session_id = 1;
         let request_id = RequestId::Number(100);
@@ -1682,22 +1682,21 @@ mod router_tests {
             );
         }
 
-        let completion_for_thread = completion.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(25));
-            completion_for_thread.mark_done();
-        });
-
         let params = CancelledParams {
             request_id: request_id.clone(),
             reason: Some("await cleanup".to_string()),
             await_cleanup: Some(true),
         };
+        let start = Instant::now();
         server.handle_cancelled_notification(session_id, params);
 
-        assert!(completion.is_done());
+        assert!(!completion.is_done());
         assert!(cancellation.is_cancel_requested());
         assert!(!cx.is_cancel_requested());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "awaitCleanup must not block the receive path"
+        );
     }
 
     #[test]
