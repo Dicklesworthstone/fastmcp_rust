@@ -3012,7 +3012,7 @@ mod tests {
     fn cache_03_tolerates_missing_and_negative_cache_ttl_as_immediately_stale() {
         let request = CoreRequest::Final(fastmcp_protocol::FinalCoreRequest::ToolsList(
             fastmcp_protocol::FinalListParams {
-                meta: fastmcp_protocol::OpenMetadata::default(),
+                meta: fastmcp_protocol::common_types::OpenMetadata::default(),
                 cursor: None,
                 include_tags: None,
                 exclude_tags: None,

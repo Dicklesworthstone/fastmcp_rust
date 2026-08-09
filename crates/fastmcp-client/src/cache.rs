@@ -581,7 +581,8 @@ pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(u64, CacheScope)
 mod tests {
     use std::time::{Duration, Instant};
 
-    use fastmcp_protocol::{CoreRequest, FinalCoreRequest, FinalListParams, OpenMetadata};
+    use fastmcp_protocol::common_types::OpenMetadata;
+    use fastmcp_protocol::{CoreRequest, FinalCoreRequest, FinalListParams};
 
     use super::*;
 
