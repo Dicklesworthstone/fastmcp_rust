@@ -4705,7 +4705,8 @@ impl HttpClient {
         let Some(input_required) = mrtr_input_required_for_method("tools/call", &result) else {
             return Ok(result);
         };
-        let retry = mrtr_retry_parameters(parameters, input_required, respond(input_required)?)
+        let input_responses = respond(input_required).map_err(HttpClientError::CoreResult)?;
+        let retry = mrtr_retry_parameters(parameters, input_required, input_responses)
             .map_err(HttpClientError::CoreResult)?;
         self.request_final_core(cx, "tools/call", retry).await
     }
@@ -4731,7 +4732,8 @@ impl HttpClient {
         let Some(input_required) = mrtr_input_required_for_method("resources/read", &result) else {
             return Ok(result);
         };
-        let retry = mrtr_retry_parameters(parameters, input_required, respond(input_required)?)
+        let input_responses = respond(input_required).map_err(HttpClientError::CoreResult)?;
+        let retry = mrtr_retry_parameters(parameters, input_required, input_responses)
             .map_err(HttpClientError::CoreResult)?;
         self.request_final_core(cx, "resources/read", retry).await
     }
@@ -4773,7 +4775,8 @@ impl HttpClient {
         let Some(input_required) = mrtr_input_required_for_method("prompts/get", &result) else {
             return Ok(result);
         };
-        let retry = mrtr_retry_parameters(parameters, input_required, respond(input_required)?)
+        let input_responses = respond(input_required).map_err(HttpClientError::CoreResult)?;
+        let retry = mrtr_retry_parameters(parameters, input_required, input_responses)
             .map_err(HttpClientError::CoreResult)?;
         self.request_final_core(cx, "prompts/get", retry).await
     }
@@ -6496,49 +6499,7 @@ impl Client {
             }
         };
 
-        let response = match (method, result) {
-            (
-                fastmcp_protocol::McpAppsRoutedMethod::ToolsCall,
-                CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }),
-            ) => serde_json::to_value(result.payload),
-            (
-                fastmcp_protocol::McpAppsRoutedMethod::ToolsCall,
-                CoreResult::Final(FinalCoreResult::ToolsCallTask { result }),
-            ) => serde_json::to_value(result),
-            (
-                fastmcp_protocol::McpAppsRoutedMethod::ToolsCall,
-                CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }),
-            ) => serde_json::to_value(result),
-            (
-                fastmcp_protocol::McpAppsRoutedMethod::ResourcesRead,
-                CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }),
-            ) => serde_json::to_value(result.payload),
-            (
-                fastmcp_protocol::McpAppsRoutedMethod::ResourcesRead,
-                CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }),
-            ) => serde_json::to_value(result),
-            (
-                fastmcp_protocol::McpAppsRoutedMethod::ResourcesList,
-                CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }),
-            ) => serde_json::to_value(result.payload),
-            (
-                fastmcp_protocol::McpAppsRoutedMethod::ResourceTemplatesList,
-                CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }),
-            ) => serde_json::to_value(result.payload),
-            (
-                fastmcp_protocol::McpAppsRoutedMethod::PromptsList,
-                CoreResult::Final(FinalCoreResult::PromptsList { result, .. }),
-            ) => serde_json::to_value(result.payload),
-            _ => {
-                return Err(McpError::invalid_request(
-                    "Apps reused request received a contradictory selected-era core result",
-                ));
-            }
-        }
-        .map_err(|_| {
-            McpError::internal_error("Apps core result could not form a bridge response")
-        })?;
-        Ok(response)
+        mcp_apps::project_reused_core_result(method, result)
     }
 
     fn send_typed_core_request_with_tasks<P: serde::Serialize>(
@@ -6659,7 +6620,9 @@ impl Client {
         let key = self.final_cache_key(method, semantic_parameters, cursor, result_set)?;
         match self.final_result_cache.lookup_page_at(&key, Instant::now()) {
             FinalCachePageLookup::Fresh(page) => {
-                self.checkpoint_task_poll()?;
+                if self.cx.checkpoint().is_err() {
+                    return Err(McpError::request_cancelled());
+                }
                 self.last_final_cache_page = Some(FinalCachePageState {
                     generation: page.generation,
                     scope: page.scope,
@@ -6710,20 +6673,10 @@ impl Client {
         }
     }
 
-    /// Drains immediately available stdio frames before a cache hit can be
-    /// served, so an already-delivered list/resource invalidation wins over a
-    /// fresh entry. Targets without a nonblocking child-pipe primitive discard
-    /// retained entries instead of serving an unread notification stale.
-    /// Observes caller cancellation between cached task-poll steps.
-    fn checkpoint_task_poll(&mut self) -> McpResult<()> {
+    fn drain_final_cache_invalidations(&mut self) -> McpResult<()> {
         if self.cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
-        Ok(())
-    }
-
-    fn drain_final_cache_invalidations(&mut self) -> McpResult<()> {
-        self.checkpoint_task_poll()?;
 
         #[cfg(unix)]
         {

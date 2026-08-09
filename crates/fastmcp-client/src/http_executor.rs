@@ -5676,7 +5676,10 @@ mod tests {
                 3,
             );
             assert_eq!(update_request["params"]["taskId"], "task-73");
-            assert_eq!(update_request["params"]["inputResponses"], serde_json::json!({}));
+            assert_eq!(
+                update_request["params"]["inputResponses"],
+                serde_json::json!({})
+            );
             write_response(
                 &mut update,
                 200,

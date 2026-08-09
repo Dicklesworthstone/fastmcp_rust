@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use fastmcp_protocol::extensions::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionLocalEnablement,
     ExtensionSettings, McpAppsActivationReceipt, McpAppsClientSettings, ServerExtensionDiscovery,
-    official_mcp_apps_empty_server_settings, official_mcp_apps_extension_id,
-    official_mcp_apps_negotiation_resolver, register_official_mcp_apps_extension,
+    official_mcp_apps_extension_id, official_mcp_apps_negotiation_resolver,
+    register_official_mcp_apps_extension,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
