@@ -4024,7 +4024,24 @@ async fn send_legacy_sse_stream(
         .await
         .map_err(|_| ())?;
     stream.flush().await.map_err(|_| ())?;
-    while let Ok(event) = response.recv_event(cx) {
+    // `recv_event` blocks (and polls) until the next session event arrives.
+    // Receiving on the executor thread starves the accept loop and reactor,
+    // so hop each receive onto the blocking pool exactly like ordinary
+    // request dispatch does.
+    let mut response = response;
+    loop {
+        let mut receive = match cx.spawn_blocking(move |receive_cx| {
+            let event = response.recv_event(&receive_cx);
+            (response, event)
+        }) {
+            Ok(receive) => receive,
+            Err(_) => return Err(()),
+        };
+        let (returned, event) = receive.join(cx).await.map_err(|_| ())?;
+        response = returned;
+        let Ok(event) = event else {
+            break;
+        };
         let bytes = event.to_bytes().map_err(|_| ())?;
         let prefix = format!("{:X}\r\n", bytes.len());
         stream.write_all(prefix.as_bytes()).await.map_err(|_| ())?;
