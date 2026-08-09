@@ -13805,8 +13805,8 @@ mod lib_unit_tests {
         Ok(())
     }
 
-    fn next_server_final_task_recovery_id(
-        task_ids: impl Iterator<Item = &fastmcp_protocol::FinalTaskId>,
+    fn next_server_final_task_recovery_id<'a>(
+        task_ids: impl Iterator<Item = &'a fastmcp_protocol::FinalTaskId>,
         after_task_id: Option<&fastmcp_protocol::FinalTaskId>,
         mut eligible: impl FnMut(&fastmcp_protocol::FinalTaskId) -> bool,
     ) -> Option<fastmcp_protocol::FinalTaskId> {

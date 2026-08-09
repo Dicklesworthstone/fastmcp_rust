@@ -8295,18 +8295,20 @@ mod tests {
         runtime
             .update_task(&task_id, &first_response)
             .expect("first outstanding input response is accepted");
-        let before = runtime
-            .get_task(&task_id)
-            .expect("read task before ignored replay")
-            .task;
+        let before = serde_json::to_value(
+            &runtime
+                .get_task(&task_id)
+                .expect("read task before ignored replay")
+                .task,
+        )
+        .expect("encode task before ignored replay");
         let generation_before = store
             .get_task_snapshot(&task_id)
             .expect("read task generation before ignored replay")
             .expect("task is retained before ignored replay")
             .generation();
-        let notification_before = store
-            .latest_notification(&task_id)
-            .expect("task retains notification before ignored replay");
+        let notification_before = serde_json::to_value(store.latest_notification(&task_id))
+            .expect("encode notification before ignored replay");
         let ignored_responses: FinalTaskInputResponses =
             serde_json::from_value(serde_json::json!({
                 "roots": {
@@ -8327,10 +8329,13 @@ mod tests {
             .expect("unknown and already-satisfied input keys are acknowledged as a no-op");
 
         assert_eq!(
-            runtime
-                .get_task(&task_id)
-                .expect("read task after ignored replay")
-                .task,
+            serde_json::to_value(
+                &runtime
+                    .get_task(&task_id)
+                    .expect("read task after ignored replay")
+                    .task,
+            )
+            .expect("encode task after ignored replay"),
             before,
             "ignored keys cannot change outstanding input state"
         );
@@ -8344,8 +8349,9 @@ mod tests {
             "ignored keys cannot advance the durable task generation"
         );
         assert_eq!(
-            store.latest_notification(&task_id),
-            Some(notification_before),
+            serde_json::to_value(store.latest_notification(&task_id))
+                .expect("encode notification after ignored replay"),
+            notification_before,
             "ignored keys cannot emit a replacement task notification"
         );
     }
@@ -8374,10 +8380,13 @@ mod tests {
         runtime
             .update_task(&task_id, &first_response)
             .expect("first outstanding input response is accepted");
-        let before = runtime
-            .get_task(&task_id)
-            .expect("read task before planted wrong-kind response")
-            .task;
+        let before = serde_json::to_value(
+            &runtime
+                .get_task(&task_id)
+                .expect("read task before planted wrong-kind response")
+                .task,
+        )
+        .expect("encode task before planted wrong-kind response");
         let generation_before = store
             .get_task_snapshot(&task_id)
             .expect("read generation before planted wrong-kind response")
@@ -8403,10 +8412,13 @@ mod tests {
             "changing only the stale key to an outstanding roots key preserves wrong-kind rejection"
         );
         assert_eq!(
-            runtime
-                .get_task(&task_id)
-                .expect("read task after rejected response")
-                .task,
+            serde_json::to_value(
+                &runtime
+                    .get_task(&task_id)
+                    .expect("read task after rejected response")
+                    .task,
+            )
+            .expect("encode task after rejected response"),
             before,
             "wrong-kind outstanding input cannot mutate task state"
         );

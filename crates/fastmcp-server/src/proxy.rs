@@ -4761,15 +4761,15 @@ exec sleep 2
         let server = thread::spawn(move || {
             let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
             let sse_request = read_http_request(&mut sse);
-            let body = format!(concat!(
-                "event: endpoint\ndata: {expected_message_target}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[],\"maxTokens\":1}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"roots/list\",\"params\":{}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"elicitation/create\",\"params\":{}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}\n\n",
-            ));
+            let body = format!("event: endpoint\ndata: {expected_message_target}\n\n")
+                + concat!(
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[],\"maxTokens\":1}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"roots/list\",\"params\":{}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"elicitation/create\",\"params\":{}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}\n\n",
+                );
             write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
 
             let mut posts = Vec::new();
@@ -4864,15 +4864,15 @@ exec sleep 2
         let server = thread::spawn(move || {
             let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
             let sse_request = read_http_request(&mut sse);
-            let body = format!(concat!(
-                "event: endpoint\ndata: {expected_message_target}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[],\"maxTokens\":1}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"roots/list\",\"params\":{}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"elicitation/create\",\"params\":{}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}\n\n",
-            ));
+            let body = format!("event: endpoint\ndata: {expected_message_target}\n\n")
+                + concat!(
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[],\"maxTokens\":1}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"roots/list\",\"params\":{}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"elicitation/create\",\"params\":{}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}\n\n",
+                );
             write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
 
             let mut posts = Vec::new();
@@ -4960,10 +4960,14 @@ exec sleep 2
             let server = thread::spawn(move || {
                 let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
                 let sse_request = read_http_request(&mut sse);
-                let body = format!(concat!(
-                    "event: endpoint\ndata: {expected_message_target}\n\n",
+                let mut body = format!("event: endpoint\ndata: {expected_message_target}\n\n");
+                body.push_str(concat!(
                     "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
-                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":{cancellation_request_id}}}\n\n",
+                ));
+                body.push_str(&format!(
+                    "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{cancellation_request_id}}}}}\n\n"
+                ));
+                body.push_str(concat!(
                     "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"active\",\"inputSchema\":{}}]}}\n\n",
                     "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[{\"name\":\"follow-up\",\"inputSchema\":{}}]}}\n\n",
                 ));
