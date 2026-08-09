@@ -65,7 +65,6 @@ use fastmcp_protocol::protocol_version::{
 };
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 
-use crate::event_store::{EventStore, EventStoreConfig, EventStoreError};
 use crate::sse::{
     ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits, ModernSseParseError,
     ModernSsePushError, SseEvent,
@@ -3695,8 +3694,6 @@ pub struct DualEraHttpEndpointConfig {
     pub legacy_origin: String,
     /// Maximum legacy POST requests retained before application dispatch.
     pub legacy_request_capacity: usize,
-    /// Bounded retention configuration for resumable legacy SSE messages.
-    pub event_store: EventStoreConfig,
 }
 
 impl DualEraHttpEndpointConfig {
@@ -3712,7 +3709,6 @@ impl DualEraHttpEndpointConfig {
             legacy_message_path: legacy_message_path.into(),
             legacy_origin: legacy_origin.into(),
             legacy_request_capacity: DEFAULT_STREAMABLE_QUEUE_CAPACITY,
-            event_store: EventStoreConfig::default(),
         }
     }
 }
@@ -3726,8 +3722,6 @@ pub enum DualEraHttpEndpointError {
     Http(HttpError),
     /// A bounded transport operation failed.
     Transport(TransportError),
-    /// Event retention or bounded replay failed.
-    EventStore(EventStoreError),
     /// The session identifier could not be generated.
     Session(HttpSessionError),
     /// The session has been closed and can no longer admit work.
@@ -3745,7 +3739,6 @@ impl std::fmt::Display for DualEraHttpEndpointError {
             }
             Self::Http(error) => write!(formatter, "modern HTTP admission failed: {error}"),
             Self::Transport(error) => write!(formatter, "HTTP transport failed: {error}"),
-            Self::EventStore(error) => write!(formatter, "legacy SSE replay failed: {error}"),
             Self::Session(error) => write!(formatter, "HTTP session setup failed: {error}"),
             Self::Closed => formatter.write_str("dual-era HTTP session is closed"),
         }
@@ -3769,12 +3762,6 @@ impl From<TransportError> for DualEraHttpEndpointError {
 impl From<CodecError> for DualEraHttpEndpointError {
     fn from(error: CodecError) -> Self {
         Self::Transport(TransportError::Codec(error))
-    }
-}
-
-impl From<EventStoreError> for DualEraHttpEndpointError {
-    fn from(error: EventStoreError) -> Self {
-        Self::EventStore(error)
     }
 }
 
@@ -3802,7 +3789,7 @@ impl DualEraHttpEndpoint {
     ///
     /// Returns an error when any route is malformed or overlaps another route,
     /// when the legacy origin cannot be used by [`LegacySseHttpPostSink`], or
-    /// when a configured queue or event store bound is invalid.
+    /// when the configured legacy request queue bound is invalid.
     pub fn new(
         handler: HttpRequestHandler,
         config: DualEraHttpEndpointConfig,
@@ -3817,12 +3804,6 @@ impl DualEraHttpEndpoint {
                 "legacy request capacity is outside the supported range".to_string(),
             ));
         }
-        if config.event_store.max_stream_id_bytes < 64 {
-            return Err(DualEraHttpEndpointError::InvalidConfiguration(
-                "event-store stream identifier bound cannot retain a session identifier"
-                    .to_string(),
-            ));
-        }
         let modern_path = &handler.config().base_path;
         if config.legacy_sse_path == config.legacy_message_path
             || config.legacy_sse_path == *modern_path
@@ -3832,9 +3813,6 @@ impl DualEraHttpEndpoint {
                 "modern, legacy SSE, and legacy POST routes must be distinct".to_string(),
             ));
         }
-
-        EventStore::with_config(config.event_store.clone())?;
-
         Ok(Self {
             handler: Arc::new(handler),
             config,
@@ -3844,7 +3822,7 @@ impl DualEraHttpEndpoint {
     /// Opens one independently bounded endpoint session.
     ///
     /// The session owns its modern request/response transport, legacy request
-    /// queue, and legacy replay retention. Dropping or closing it clears all
+    /// queue, and one live legacy SSE stream. Dropping or closing it clears all
     /// three deterministically.
     pub fn open_session(&self) -> Result<DualEraHttpSession, DualEraHttpEndpointError> {
         let session_id = generate_session_id()?;
@@ -3866,8 +3844,6 @@ impl DualEraHttpEndpoint {
             legacy_message_endpoint,
             legacy_request_capacity: self.config.legacy_request_capacity,
             legacy_requests: VecDeque::new(),
-            legacy_events: EventStore::with_config(self.config.event_store.clone())?,
-            legacy_stream_id: session_id,
             legacy_codec,
             legacy_live_sender: None,
             legacy_live_active: Arc::new(AtomicBool::new(false)),
@@ -3946,7 +3922,7 @@ pub enum DualEraHttpEndpointResponse {
     ModernJson(DualEraHttpJsonResponse),
     /// A modern request-scoped SSE response body.
     ModernSse(DualEraHttpSseResponse),
-    /// A legacy SSE stream that begins with its endpoint and bounded replay.
+    /// A live legacy SSE stream that begins with its endpoint.
     LegacySse(DualEraHttpLegacySseResponse),
 }
 
@@ -4020,8 +3996,8 @@ impl DualEraHttpSseResponse {
     /// SSE `message` event.
     ///
     /// Modern notifications and the final response are ordered within this
-    /// request body. These events deliberately have no resumable ID; resumable
-    /// IDs belong only to the separately retained legacy SSE stream.
+    /// request body. These events deliberately have no resumable ID because
+    /// this request-scoped body is not resumable.
     pub fn recv_event(&self, cx: &Cx) -> Result<SseEvent, DualEraHttpEndpointError> {
         Self::frame_message(&self.codec, self.body.recv_message(cx)?)
     }
@@ -4057,16 +4033,14 @@ impl DualEraHttpSseResponse {
 }
 
 struct LegacySseLiveMessage {
-    id: String,
     data: String,
 }
 
 /// One live legacy SSE response body for an exact MCP 2024-11-05 session.
 ///
-/// The stream starts with its endpoint event and a bounded retained replay.
-/// Subsequent server messages arrive only through the session that admitted
-/// this stream. Waiting for them checks the caller context between bounded
-/// nonblocking channel polls.
+/// The stream starts with its endpoint event. Subsequent server messages arrive
+/// only through the session that admitted this stream. Waiting for them checks
+/// the caller context between bounded nonblocking channel polls.
 pub struct DualEraHttpLegacySseResponse {
     response: HttpResponse,
     initial_events: VecDeque<SseEvent>,
@@ -4083,10 +4057,9 @@ impl DualEraHttpLegacySseResponse {
         &self.response
     }
 
-    /// Receives the next endpoint, replayed, or live legacy SSE event.
+    /// Receives the next endpoint or live legacy SSE event.
     ///
-    /// The returned event retains its replay ID when applicable. Once the
-    /// session or this response body closes, the method returns
+    /// Once the session or this response body closes, the method returns
     /// [`TransportError::Closed`].
     pub fn recv_event(&mut self, cx: &Cx) -> Result<SseEvent, DualEraHttpEndpointError> {
         http_checkpoint(cx)?;
@@ -4106,7 +4079,7 @@ impl DualEraHttpLegacySseResponse {
                 Ok(message) => {
                     let previous = self.pending.fetch_sub(1, Ordering::AcqRel);
                     debug_assert!(previous > 0, "legacy SSE live-event count underflow");
-                    return Ok(SseEvent::message(message.data).with_id(message.id));
+                    return Ok(SseEvent::message(message.data));
                 }
                 Err(mpsc::RecvError::Empty) => {}
                 Err(mpsc::RecvError::Disconnected) => {
@@ -4139,8 +4112,6 @@ pub struct DualEraHttpSession {
     legacy_message_endpoint: String,
     legacy_request_capacity: usize,
     legacy_requests: VecDeque<JsonRpcRequest>,
-    legacy_events: EventStore,
-    legacy_stream_id: String,
     legacy_codec: Codec,
     legacy_live_sender: Option<mpsc::Sender<LegacySseLiveMessage>>,
     legacy_live_active: Arc<AtomicBool>,
@@ -4173,8 +4144,8 @@ impl DualEraHttpSession {
     /// Handles one request against exactly one modern or legacy route.
     ///
     /// Modern requests are admitted through the existing final HTTP boundary.
-    /// Legacy GET returns a live stream beginning with its endpoint and bounded
-    /// replay; legacy POST accepts only the URI advertised for this exact session.
+    /// Legacy GET returns a fresh live stream beginning with its endpoint;
+    /// legacy POST accepts only the URI advertised for this exact session.
     pub fn handle(
         &mut self,
         cx: &Cx,
@@ -4250,40 +4221,11 @@ impl DualEraHttpSession {
             )));
         }
 
-        let mut after_id = request.header("last-event-id").map(str::to_owned);
+        // Exact MCP 2024-11-05 reconnects establish a fresh SSE endpoint
+        // lifecycle. `Last-Event-ID` is intentionally ignored: it neither
+        // replays messages nor selects or mutates session state.
         let mut initial_events = VecDeque::new();
         initial_events.push_back(SseEvent::endpoint(&self.legacy_message_endpoint));
-        loop {
-            let replay = self
-                .legacy_events
-                .replay_bounded(&self.legacy_stream_id, after_id.as_deref())?;
-            let complete = replay.is_complete();
-            let next_after_id = replay.next_after_id().map(str::to_owned);
-            for event in replay.events() {
-                let data = event
-                    .data
-                    .as_ref()
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        DualEraHttpEndpointError::Transport(TransportError::Io(
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "legacy SSE retention contained a non-string message payload",
-                            ),
-                        ))
-                    })?;
-                initial_events.push_back(SseEvent::message(data).with_id(&event.id));
-            }
-            if complete {
-                break;
-            }
-            after_id = Some(next_after_id.ok_or_else(|| {
-                DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "partial legacy SSE replay omitted its continuation cursor",
-                )))
-            })?);
-        }
         if self
             .legacy_live_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -4431,14 +4373,15 @@ impl DualEraHttpSession {
         Ok(())
     }
 
-    /// Retains and publishes one legacy server-to-client SSE message.
+    /// Publishes one legacy server-to-client message to the live SSE stream.
     ///
-    /// Each successful call returns the event ID rendered on subsequent GET
-    /// responses and accepted by `Last-Event-ID` for bounded resumption.
+    /// Exact MCP 2024-11-05 does not retain legacy SSE events or assign event
+    /// IDs. If no legacy stream is live, the message is not persisted for a
+    /// later GET.
     pub fn publish_legacy_message(
         &self,
         message: &JsonRpcMessage,
-    ) -> Result<String, DualEraHttpEndpointError> {
+    ) -> Result<(), DualEraHttpEndpointError> {
         if self.closed {
             return Err(DualEraHttpEndpointError::Closed);
         }
@@ -4461,30 +4404,16 @@ impl DualEraHttpSession {
             )))
         })?;
         let reserves_live_delivery = self.reserve_legacy_live_delivery()?;
-        let event_id = match self.legacy_events.store_event(
-            &self.legacy_stream_id,
-            Some(serde_json::Value::String(data.clone())),
-        ) {
-            Ok(event_id) => event_id,
-            Err(error) => {
-                if reserves_live_delivery {
-                    self.release_legacy_live_delivery();
-                }
-                return Err(error.into());
-            }
-        };
         if reserves_live_delivery {
             let Some(sender) = self.legacy_live_sender.as_ref() else {
                 self.release_legacy_live_delivery();
-                return Ok(event_id);
+                return Ok(());
             };
-            if let Err(error) = sender.try_send(LegacySseLiveMessage {
-                id: event_id.clone(),
-                data,
-            }) {
+            if let Err(error) = sender.try_send(LegacySseLiveMessage { data }) {
                 self.release_legacy_live_delivery();
                 if matches!(&error, mpsc::SendError::Disconnected(_)) {
                     self.legacy_live_active.store(false, Ordering::Release);
+                    return Ok(());
                 } else {
                     return Err(DualEraHttpEndpointError::Transport(
                         map_streamable_send_error(error, "legacy SSE live queue is full"),
@@ -4492,7 +4421,7 @@ impl DualEraHttpSession {
                 }
             }
         }
-        Ok(event_id)
+        Ok(())
     }
 
     fn reserve_legacy_live_delivery(&self) -> Result<bool, DualEraHttpEndpointError> {
@@ -4530,16 +4459,8 @@ impl DualEraHttpSession {
                 });
     }
 
-    /// Returns the number of retained messages for this legacy SSE session.
-    #[must_use]
-    pub fn retained_legacy_event_count(&self) -> usize {
-        self.legacy_events
-            .get_events_after(&self.legacy_stream_id, None)
-            .len()
-    }
-
     /// Closes the session, cancels all live modern response bodies, and clears
-    /// queued modern work plus retained legacy request and replay state.
+    /// queued modern work plus legacy request and live-stream state.
     pub fn close(&mut self) {
         if self.closed {
             return;
@@ -4552,7 +4473,6 @@ impl DualEraHttpSession {
         self.legacy_live_pending.store(0, Ordering::Release);
         self.legacy_live_sender = None;
         self.legacy_requests.clear();
-        self.legacy_events.clear_stream(&self.legacy_stream_id);
     }
 }
 
@@ -8247,9 +8167,8 @@ X-Checksum: abc123\r\n\
             base_path: "/mcp".to_string(),
             ..HttpHandlerConfig::default()
         });
-        let mut config =
+        let config =
             DualEraHttpEndpointConfig::new("/legacy/sse", "/legacy/messages", "http://legacy.test");
-        config.event_store = EventStoreConfig::no_expiry().max_replay_events(8);
         DualEraHttpEndpoint::new(handler, config).expect("dual-era endpoint configuration is valid")
     }
 
@@ -8393,24 +8312,18 @@ X-Checksum: abc123\r\n\
     }
 
     #[test]
-    fn dual_era_endpoint_composes_resumable_legacy_sse_with_modern_request_bodies() {
+    fn dual_era_endpoint_composes_fresh_legacy_sse_with_modern_request_bodies() {
         let endpoint = dual_era_endpoint();
         let mut session = endpoint.open_session().expect("endpoint opens a session");
         let cx = Cx::for_testing();
         let codec = Codec::new();
 
-        let first_id = session
+        session
             .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
                 RequestId::Number(41),
-                serde_json::json!({"phase": "first"}),
+                serde_json::json!({"phase": "before-stream"}),
             )))
-            .expect("first legacy message is retained");
-        let second_id = session
-            .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
-                RequestId::Number(42),
-                serde_json::json!({"phase": "second"}),
-            )))
-            .expect("second legacy message is retained");
+            .expect("a message without a live stream is not retained");
 
         let legacy_get = session
             .handle(&cx, HttpRequest::new(HttpMethod::Get, "/legacy/sse"))
@@ -8436,52 +8349,30 @@ X-Checksum: abc123\r\n\
             Some(&"no".to_string())
         );
 
-        assert_eq!(
-            legacy_get
-                .recv_event(&cx)
-                .expect("legacy endpoint event is available")
-                .data,
-            session.legacy_message_endpoint()
-        );
-        let first_event = legacy_get
+        let endpoint_event = legacy_get
             .recv_event(&cx)
-            .expect("first retained legacy event is available");
-        assert_eq!(first_event.id.as_deref(), Some(first_id.as_str()));
+            .expect("fresh legacy endpoint event is available");
+        assert_eq!(endpoint_event.data, session.legacy_message_endpoint());
+        assert!(endpoint_event.id.is_none());
+
+        session
+            .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(42),
+                serde_json::json!({"phase": "live"}),
+            )))
+            .expect("a message is delivered to the live legacy stream");
+        let live_event = legacy_get
+            .recv_event(&cx)
+            .expect("the live legacy event is available");
+        assert!(live_event.id.is_none());
         assert!(matches!(
             codec
-                .decode_complete_message(first_event.data.as_bytes())
-                .expect("first retained data remains JSON-RPC"),
-            JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(41))
+                .decode_complete_message(live_event.data.as_bytes())
+                .expect("live legacy data remains JSON-RPC"),
+            JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(42))
         ));
-        let second_event = legacy_get
-            .recv_event(&cx)
-            .expect("second retained legacy event is available");
-        assert_eq!(second_event.id.as_deref(), Some(second_id.as_str()));
 
         drop(legacy_get);
-
-        let resumed_get = session
-            .handle(
-                &cx,
-                HttpRequest::new(HttpMethod::Get, "/legacy/sse")
-                    .with_header("last-event-id", first_id.clone()),
-            )
-            .expect("retained legacy cursor resumes the stream");
-        let DualEraHttpEndpointResponse::LegacySse(mut resumed_get) = resumed_get else {
-            panic!("resumed legacy GET returns a live SSE response body");
-        };
-        assert_eq!(
-            resumed_get
-                .recv_event(&cx)
-                .expect("resumed stream begins with its endpoint event")
-                .data,
-            session.legacy_message_endpoint()
-        );
-        let resumed_event = resumed_get
-            .recv_event(&cx)
-            .expect("one event remains after the cursor");
-        assert_eq!(resumed_event.id.as_deref(), Some(second_id.as_str()));
-        drop(resumed_get);
 
         let legacy_request =
             JsonRpcRequest::new("ping", Some(serde_json::json!({"value": 1})), 77_i64);
@@ -8620,8 +8511,96 @@ X-Checksum: abc123\r\n\
         session.close();
         assert!(session.is_closed());
         assert!(abandoned_cancellation.is_cancelled());
-        assert_eq!(session.retained_legacy_event_count(), 0);
         assert!(session.take_legacy_request().is_none());
+    }
+
+    #[test]
+    fn dual_era_endpoint_ignores_last_event_id_and_starts_a_fresh_legacy_stream() {
+        let cx = Cx::for_testing();
+        let codec = Codec::new();
+
+        let fresh_reconnect = |last_event_id: Option<&str>| {
+            let endpoint = dual_era_endpoint();
+            let mut session = endpoint.open_session().expect("endpoint opens a session");
+
+            let first_get = session
+                .handle(&cx, HttpRequest::new(HttpMethod::Get, "/legacy/sse"))
+                .expect("baseline legacy GET is admitted");
+            let DualEraHttpEndpointResponse::LegacySse(mut first_get) = first_get else {
+                panic!("baseline legacy GET creates a live SSE response body");
+            };
+            let first_endpoint = first_get
+                .recv_event(&cx)
+                .expect("baseline stream begins with its endpoint event");
+            assert_eq!(first_endpoint.data, session.legacy_message_endpoint());
+            assert!(first_endpoint.id.is_none());
+
+            session
+                .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                    RequestId::Number(81),
+                    serde_json::json!({"phase": "closed-stream"}),
+                )))
+                .expect("the baseline stream accepts one live message");
+            drop(first_get);
+
+            let session_id_before = session.session_id().to_owned();
+            let endpoint_before = session.legacy_message_endpoint().to_owned();
+            let legacy_request_count_before = session.legacy_requests.len();
+            let pending_before = session.legacy_live_pending.load(Ordering::Acquire);
+            assert_eq!(pending_before, 0);
+
+            let reconnect = match last_event_id {
+                Some(last_event_id) => HttpRequest::new(HttpMethod::Get, "/legacy/sse")
+                    .with_header("last-event-id", last_event_id),
+                None => HttpRequest::new(HttpMethod::Get, "/legacy/sse"),
+            };
+            let resumed_get = session
+                .handle(&cx, reconnect)
+                .expect("the primed reconnect opens a fresh legacy GET");
+            let DualEraHttpEndpointResponse::LegacySse(mut resumed_get) = resumed_get else {
+                panic!("the primed reconnect creates a fresh live SSE response body");
+            };
+            assert_eq!(session.session_id(), session_id_before);
+            assert_eq!(session.legacy_message_endpoint(), endpoint_before);
+            assert_eq!(session.legacy_requests.len(), legacy_request_count_before);
+            assert_eq!(
+                session.legacy_live_pending.load(Ordering::Acquire),
+                pending_before
+            );
+
+            let fresh_endpoint = resumed_get
+                .recv_event(&cx)
+                .expect("fresh stream begins with its endpoint instead of a replay");
+            assert_eq!(fresh_endpoint.data, endpoint_before);
+            assert!(fresh_endpoint.id.is_none());
+
+            session
+                .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                    RequestId::Number(82),
+                    serde_json::json!({"phase": "fresh-stream"}),
+                )))
+                .expect("the fresh stream accepts a new live message");
+            let fresh_event = resumed_get
+                .recv_event(&cx)
+                .expect("only the new live message arrives after the endpoint event");
+            assert!(fresh_event.id.is_none());
+            let JsonRpcMessage::Response(response) = codec
+                .decode_complete_message(fresh_event.data.as_bytes())
+                .expect("fresh legacy data remains JSON-RPC")
+            else {
+                panic!("fresh legacy event must be the new response");
+            };
+            assert_eq!(response.id, Some(RequestId::Number(82)));
+
+            (fresh_endpoint.id, fresh_event.id, response.result)
+        };
+
+        let control = fresh_reconnect(None);
+        let with_last_event_id = fresh_reconnect(Some("legacy-cursor-that-cannot-replay"));
+        assert_eq!(
+            with_last_event_id, control,
+            "Last-Event-ID must produce the same fresh-only stream as the equivalently primed control"
+        );
     }
 
     #[test]
@@ -8670,16 +8649,16 @@ X-Checksum: abc123\r\n\
             Some(RequestId::Number(71))
         );
 
-        let response_id = session
+        session
             .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
                 RequestId::Number(71),
                 serde_json::json!({"pong": true}),
             )))
-            .expect("the dispatch response is retained and sent to the live stream");
+            .expect("the dispatch response is sent to the live stream");
         let response_event = legacy_sse
             .recv_event(&cx)
             .expect("the open legacy stream receives the response after POST");
-        assert_eq!(response_event.id.as_deref(), Some(response_id.as_str()));
+        assert!(response_event.id.is_none());
         assert!(matches!(
             codec
                 .decode_complete_message(response_event.data.as_bytes())
@@ -8689,77 +8668,7 @@ X-Checksum: abc123\r\n\
     }
 
     #[test]
-    fn dual_era_endpoint_delivers_all_replay_pages_before_live_messages() {
-        let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
-            base_path: "/mcp".to_string(),
-            ..HttpHandlerConfig::default()
-        });
-        let mut config =
-            DualEraHttpEndpointConfig::new("/legacy/sse", "/legacy/messages", "http://legacy.test");
-        config.event_store = EventStoreConfig::no_expiry().max_replay_events(1);
-        let endpoint =
-            DualEraHttpEndpoint::new(handler, config).expect("single-event replay pages are valid");
-        let mut session = endpoint.open_session().expect("endpoint opens a session");
-        let cx = Cx::for_testing();
-
-        let replay_ids = [81, 82, 83]
-            .into_iter()
-            .map(|id| {
-                session
-                    .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
-                        RequestId::Number(id),
-                        serde_json::json!({"phase": "replay", "id": id}),
-                    )))
-                    .expect("retained replay message is admitted")
-            })
-            .collect::<Vec<_>>();
-        let legacy_sse = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/legacy/sse"))
-            .expect("legacy SSE GET is admitted");
-        let DualEraHttpEndpointResponse::LegacySse(mut legacy_sse) = legacy_sse else {
-            panic!("legacy GET creates a live SSE response body");
-        };
-        assert_eq!(
-            legacy_sse
-                .recv_event(&cx)
-                .expect("endpoint event is available before replay")
-                .data,
-            session.legacy_message_endpoint()
-        );
-
-        let live_id = session
-            .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
-                RequestId::Number(84),
-                serde_json::json!({"phase": "live"}),
-            )))
-            .expect("live message is admitted after replay capture");
-        let delivered_ids = (0..4)
-            .map(|_| {
-                legacy_sse
-                    .recv_event(&cx)
-                    .expect("replay or live event is delivered")
-                    .id
-                    .expect("all retained and live messages have an event ID")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(delivered_ids, [replay_ids, vec![live_id]].concat());
-    }
-
-    #[test]
-    fn dual_era_endpoint_recovers_live_capacity_after_retention_rejection() {
-        let codec = Codec::new();
-        let recovered_response =
-            JsonRpcResponse::success(RequestId::Number(85), serde_json::json!({"ok": true}));
-        let mut encoded = codec
-            .encode_response(&recovered_response)
-            .expect("recovery response serializes");
-        assert_eq!(encoded.pop(), Some(b'\n'));
-        let recovery_payload_bytes = serde_json::to_vec(&serde_json::Value::String(
-            String::from_utf8(encoded).expect("JSON-RPC output is UTF-8"),
-        ))
-        .expect("retained payload measures")
-        .len();
-
+    fn dual_era_endpoint_recovers_live_capacity_after_queue_rejection() {
         let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
             base_path: "/mcp".to_string(),
             ..HttpHandlerConfig::default()
@@ -8767,9 +8676,6 @@ X-Checksum: abc123\r\n\
         let mut config =
             DualEraHttpEndpointConfig::new("/legacy/sse", "/legacy/messages", "http://legacy.test");
         config.legacy_request_capacity = 1;
-        config.event_store = EventStoreConfig::no_expiry()
-            .max_event_payload_bytes(recovery_payload_bytes)
-            .max_replay_events(1);
         let endpoint = DualEraHttpEndpoint::new(handler, config)
             .expect("capacity-one live stream configuration is valid");
         let mut session = endpoint.open_session().expect("endpoint opens a session");
@@ -8784,27 +8690,40 @@ X-Checksum: abc123\r\n\
             .recv_event(&cx)
             .expect("endpoint event is available before live messages");
 
+        session
+            .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(85),
+                serde_json::json!({"queued": true}),
+            )))
+            .expect("the first live message fills the capacity-one queue");
         let rejected = session
             .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
                 RequestId::Number(86),
-                serde_json::json!({"oversize": "x".repeat(recovery_payload_bytes)}),
+                serde_json::json!({"queued": false}),
             )))
-            .expect_err("oversize retained message is rejected before enqueue");
+            .expect_err("the second live message is rejected before enqueue");
         assert!(matches!(
-            rejected,
-            DualEraHttpEndpointError::EventStore(EventStoreError::EventPayloadTooLarge {
-                max_bytes
-            }) if max_bytes == recovery_payload_bytes
+            &rejected,
+            DualEraHttpEndpointError::Transport(TransportError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && error.to_string().contains("legacy SSE live queue is full")
         ));
-        assert_eq!(session.retained_legacy_event_count(), 0);
 
-        let recovered_id = session
-            .publish_legacy_message(&JsonRpcMessage::Response(recovered_response))
-            .expect("retention rejection releases the capacity-one live reservation");
+        let first_event = legacy_sse
+            .recv_event(&cx)
+            .expect("the first queued message reaches the live stream");
+        assert!(first_event.id.is_none());
+
+        session
+            .publish_legacy_message(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(86),
+                serde_json::json!({"queued": false}),
+            )))
+            .expect("consuming the first message releases live capacity");
         let recovered_event = legacy_sse
             .recv_event(&cx)
-            .expect("recovered message reaches the live stream");
-        assert_eq!(recovered_event.id.as_deref(), Some(recovered_id.as_str()));
+            .expect("the retried message reaches the live stream");
+        assert!(recovered_event.id.is_none());
     }
 
     #[test]
@@ -8833,7 +8752,6 @@ X-Checksum: abc123\r\n\
         assert_eq!(wrong_session.query.len(), accepted.query.len());
         assert_ne!(wrong_session.query, accepted.query);
 
-        let retained_before = session.retained_legacy_event_count();
         let rejected = session
             .handle(&cx, wrong_session)
             .expect("wrong-session legacy POST becomes an HTTP rejection");
@@ -8841,7 +8759,6 @@ X-Checksum: abc123\r\n\
             panic!("wrong-session POST cannot create a streaming response");
         };
         assert_eq!(rejected.status, HttpStatus::NOT_FOUND);
-        assert_eq!(session.retained_legacy_event_count(), retained_before);
         assert!(session.take_legacy_request().is_none());
 
         let accepted = session
@@ -8876,7 +8793,6 @@ X-Checksum: abc123\r\n\
             panic!("baseline legacy SSE route returns a live response body");
         };
         assert_eq!(allowed.response().status, HttpStatus::OK);
-        let event_count_before = session.retained_legacy_event_count();
 
         let rejected = session
             .handle(&cx, rejected)
@@ -8886,7 +8802,6 @@ X-Checksum: abc123\r\n\
         };
         assert_eq!(rejected.status, HttpStatus::METHOD_NOT_ALLOWED);
         assert_eq!(rejected.headers.get("allow"), Some(&"GET".to_string()));
-        assert_eq!(session.retained_legacy_event_count(), event_count_before);
         assert!(session.take_legacy_request().is_none());
     }
 
