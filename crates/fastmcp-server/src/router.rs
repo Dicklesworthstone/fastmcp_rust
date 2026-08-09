@@ -1221,8 +1221,20 @@ fn run_handler<'a, T>(
             "Request timeout exceeded",
         )),
         Ok(Ok(outcome)) => {
-            if let Some(error) = budget_error(ctx) {
-                Err(error)
+            if budget_error(ctx).is_some() {
+                // A synchronous handler cannot be preempted by timeout_at, so
+                // a late completion surfaces here; deadline expiry keeps its
+                // distinguishable timeout message.
+                if budget
+                    .is_past_deadline(ctx.cx().now())
+                {
+                    Err(McpError::new(
+                        McpErrorCode::RequestCancelled,
+                        "Request timeout exceeded",
+                    ))
+                } else {
+                    Err(McpError::request_cancelled())
+                }
             } else {
                 Ok(outcome)
             }
@@ -3464,9 +3476,22 @@ impl Router {
                     additional: BTreeMap::new(),
                 })
             }
-            Outcome::Cancelled(_) => {
-                // Cancelled requests are reported as JSON-RPC errors
-                Err(McpError::request_cancelled())
+            Outcome::Cancelled(reason) => {
+                // Cancelled requests are reported as JSON-RPC errors; a
+                // deadline-driven cancellation keeps its distinguishable
+                // timeout message rather than collapsing into the generic
+                // cancel report.
+                if matches!(
+                    reason.kind,
+                    asupersync::CancelKind::Timeout | asupersync::CancelKind::Deadline
+                ) {
+                    Err(McpError::new(
+                        McpErrorCode::RequestCancelled,
+                        "Request timeout exceeded",
+                    ))
+                } else {
+                    Err(McpError::request_cancelled())
+                }
             }
             Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "tool")),
         }
@@ -4095,7 +4120,19 @@ impl Router {
             .await?;
 
         match outcome {
-            Outcome::Ok(result) => Ok(result),
+            Outcome::Ok(mut result) => {
+                // The legacy read bridge stamps fixed default cache hints; the
+                // router's configured policy replaces exactly those defaults,
+                // while direct final handlers keep their own explicit hints.
+                if let FinalMethodOutcome::Complete(complete) = &mut result
+                    && complete.payload.ttl_ms == crate::handler::DEFAULT_FINAL_RESOURCE_TTL_MS
+                    && matches!(complete.payload.cache_scope, CacheScope::Private)
+                {
+                    complete.payload.ttl_ms = self.final_cache_hints.resource_read_ttl_ms;
+                    complete.payload.cache_scope = self.final_cache_hints.scope;
+                }
+                Ok(result)
+            }
             Outcome::Err(error) => Err(sanitize_handler_error(request_ctx.cx(), "resource", error)),
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => {
@@ -6359,6 +6396,9 @@ mod router_tests {
     }
 
     static MACRO_DUAL_ERA_TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// Serializes the tests that reset and assert the shared call counter;
+    /// concurrent resets interleave and turn the absolute counts flaky.
+    static MACRO_DUAL_ERA_TOOL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn final_tool_complete_result(
         payload: FinalCallToolResult,
@@ -8076,6 +8116,7 @@ mod router_tests {
         }
 
         fn call(&self, ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            eprintln!("WM-BUDGET call entered deadline={:?}", ctx.budget().deadline);
             *self
                 .observed_deadline
                 .lock()
@@ -8967,17 +9008,23 @@ mod router_tests {
             .add_tool_with_behavior(NamedTool::new(canary), crate::DuplicateBehavior::Error)
             .unwrap_err();
 
+        // Resource identities must be scheme-valid to survive final-catalog
+        // projection; the canary stays the peer-controlled URI component.
+        let canary_uri = format!("resource://{canary}");
         let mut resources = Router::new();
-        resources.add_resource(NamedResource::new(canary));
+        resources.add_resource(NamedResource::new(&canary_uri));
         let resource_error = resources
-            .add_resource_with_behavior(NamedResource::new(canary), crate::DuplicateBehavior::Error)
+            .add_resource_with_behavior(
+                NamedResource::new(&canary_uri),
+                crate::DuplicateBehavior::Error,
+            )
             .unwrap_err();
 
         let mut templates = Router::new();
-        templates.add_resource_template(marked_template(canary, "original"));
+        templates.add_resource_template(marked_template(&canary_uri, "original"));
         let template_error = templates
             .add_resource_template_with_behavior(
-                marked_template(canary, "incoming"),
+                marked_template(&canary_uri, "incoming"),
                 crate::DuplicateBehavior::Error,
             )
             .unwrap_err();
@@ -11307,7 +11354,10 @@ mod router_tests {
             .expect_err("alternating recursion must stop at the shared depth limit");
 
         assert_eq!(error.code, McpErrorCode::InternalError);
-        assert!(error.message.contains("Maximum resource read depth"));
+        // Internal errors crossing the handler boundary are sanitized, so the
+        // depth diagnosis never reaches the peer; the call count proves the
+        // shared limit stopped the alternating recursion.
+        assert_eq!(error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
         assert_eq!(calls.load(Ordering::Relaxed), 11);
     }
 
@@ -11394,10 +11444,13 @@ mod router_tests {
         let observed_deadline = Arc::new(Mutex::new(None));
         let timeout_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut router = Router::new();
+        // The timeout must outlive dispatch admission (a too-tight deadline
+        // rejects before the handler starts, proving nothing about read
+        // exposure) while still expiring before the handler's delay finishes.
         router
             .add_tool(BudgetProbeTool {
-                timeout: Some(Duration::from_millis(1)),
-                delay: Duration::from_millis(15),
+                timeout: Some(Duration::from_millis(10)),
+                delay: Duration::from_millis(100),
                 observed_deadline: Arc::clone(&observed_deadline),
                 timeout_read: Arc::clone(&timeout_read),
             })
@@ -12401,6 +12454,9 @@ mod router_tests {
 
     #[test]
     fn macro_tool_dispatches_exact_legacy_and_final_complete_results() {
+        let _counter_guard = MACRO_DUAL_ERA_TOOL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut router = Router::new();
         MACRO_DUAL_ERA_TOOL_CALLS.store(0, Ordering::SeqCst);
         router
@@ -13600,6 +13656,9 @@ mod router_tests {
 
     #[test]
     fn macro_tool_final_metadata_negative_is_non_mutating() {
+        let _counter_guard = MACRO_DUAL_ERA_TOOL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut router = Router::new();
         MACRO_DUAL_ERA_TOOL_CALLS.store(0, Ordering::SeqCst);
         router
