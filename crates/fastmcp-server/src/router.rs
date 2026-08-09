@@ -10967,7 +10967,10 @@ mod router_tests {
         let err = r
             .handle_tools_call(&request_ctx, params, state, None, None)
             .unwrap_err();
-        assert!(err.message.contains("missing"));
+        // The refusal deliberately does not echo the peer-controlled tool
+        // name; only the sanitized method-not-found classification surfaces.
+        assert_eq!(err.code, McpErrorCode::MethodNotFound);
+        assert!(!err.message.contains("missing"));
     }
 
     // ── handle_tools_call: zero poll balance without poll admission ──────
