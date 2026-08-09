@@ -46,7 +46,7 @@ use fastmcp_client::{
 use fastmcp_console::console::{is_credential_key, redact_free_text_credentials_with};
 use fastmcp_core::McpResult;
 use fastmcp_protocol::TaskStatus;
-use fastmcp_protocol::protocol_policy::ProtocolPolicy;
+use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy, ProtocolVersion};
 
 const MAX_TEST_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 const MAX_TEST_ABSOLUTE_TIMEOUT_SECS: u64 = 15 * 60;
@@ -720,6 +720,43 @@ impl CliProtocolPolicy {
             Self::Auto => "auto",
             Self::ModernOnly => "modern-only",
             Self::LegacyOnly => "legacy-only",
+        }
+    }
+}
+
+/// The immutable policy selected by the CLI and the exact protocol revision
+/// negotiated by an inspect connection. Both values are emitted together so
+/// consumers never have to infer a legacy or modern result from a version
+/// string alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InspectProtocolStatus {
+    policy: CliProtocolPolicy,
+    version: ProtocolVersion,
+}
+
+impl InspectProtocolStatus {
+    fn new(policy: CliProtocolPolicy, version: &str) -> McpResult<Self> {
+        let version = ProtocolVersion::parse(version).map_err(|_| {
+            fastmcp_core::McpError::internal_error(
+                "inspect received an unsupported negotiated protocol version",
+            )
+        })?;
+
+        if !policy.protocol_policy().permits(version) {
+            return Err(fastmcp_core::McpError::internal_error(format!(
+                "inspect policy {} does not permit negotiated protocol version {}",
+                policy.server_launch_value(),
+                version.as_str()
+            )));
+        }
+
+        Ok(Self { policy, version })
+    }
+
+    const fn era_name(self) -> &'static str {
+        match self.version.era() {
+            ProtocolEra::Modern2026 => "modern-2026",
+            ProtocolEra::Legacy2024 => "legacy-2024",
         }
     }
 }
@@ -5693,6 +5730,7 @@ fn cmd_inspect(
     // Connect to the server
     let mut client =
         client_builder_for_protocol_policy(protocol_policy).connect_stdio(server, &args_refs)?;
+    let negotiated_protocol_version = client.protocol_version().to_owned();
 
     // Gather server information
     let server_info = client.server_info().clone();
@@ -5738,6 +5776,8 @@ fn cmd_inspect(
 
     // Close the client
     client.close()?;
+    let protocol_status =
+        InspectProtocolStatus::new(protocol_policy, &negotiated_protocol_version)?;
 
     // Format output
     let output_text = match format {
@@ -5749,6 +5789,7 @@ fn cmd_inspect(
             &resource_templates,
             &prompts,
             acquisition_truncated,
+            protocol_status,
         ),
         InspectFormat::Json => format_inspect_json_with_truncation(
             &server_info,
@@ -5758,6 +5799,7 @@ fn cmd_inspect(
             &resource_templates,
             &prompts,
             acquisition_truncated,
+            protocol_status,
         )?,
     };
 
@@ -5784,6 +5826,7 @@ fn format_inspect_text(
     resources: &[fastmcp_protocol::Resource],
     resource_templates: &[fastmcp_protocol::ResourceTemplate],
     prompts: &[fastmcp_protocol::Prompt],
+    protocol_status: InspectProtocolStatus,
 ) -> String {
     format_inspect_text_with_truncation(
         server_info,
@@ -5793,6 +5836,7 @@ fn format_inspect_text(
         resource_templates,
         prompts,
         false,
+        protocol_status,
     )
 }
 
@@ -5804,6 +5848,7 @@ fn format_inspect_text_with_truncation(
     resource_templates: &[fastmcp_protocol::ResourceTemplate],
     prompts: &[fastmcp_protocol::Prompt],
     acquisition_truncated: bool,
+    protocol_status: InspectProtocolStatus,
 ) -> String {
     let mut out = String::new();
 
@@ -5813,6 +5858,15 @@ fn format_inspect_text_with_truncation(
             "Server: {} v{}",
             sanitize_peer_text(&server_info.name, PEER_FIELD_LIMIT),
             sanitize_peer_text(&server_info.version, PEER_FIELD_LIMIT)
+        ),
+    );
+    let _ = push_output_line(
+        &mut out,
+        &format!(
+            "Protocol: policy={} version={} era={}",
+            protocol_status.policy.server_launch_value(),
+            protocol_status.version.as_str(),
+            protocol_status.era_name(),
         ),
     );
     let _ = push_output_line(
@@ -6154,6 +6208,7 @@ fn format_inspect_json(
     resources: &[fastmcp_protocol::Resource],
     resource_templates: &[fastmcp_protocol::ResourceTemplate],
     prompts: &[fastmcp_protocol::Prompt],
+    protocol_status: InspectProtocolStatus,
 ) -> McpResult<String> {
     format_inspect_json_with_truncation(
         server_info,
@@ -6163,6 +6218,7 @@ fn format_inspect_json(
         resource_templates,
         prompts,
         false,
+        protocol_status,
     )
 }
 
@@ -6174,6 +6230,7 @@ fn format_inspect_json_with_truncation(
     resource_templates: &[fastmcp_protocol::ResourceTemplate],
     prompts: &[fastmcp_protocol::Prompt],
     acquisition_truncated: bool,
+    protocol_status: InspectProtocolStatus,
 ) -> McpResult<String> {
     let mut budget = JsonPreviewBudget::default();
     let server_name = bounded_json_string(&server_info.name, &mut budget);
@@ -6209,6 +6266,11 @@ fn format_inspect_json_with_truncation(
         "server": {
             "name": server_name,
             "version": server_version,
+        },
+        "protocol": {
+            "policy": protocol_status.policy.server_launch_value(),
+            "version": protocol_status.version.as_str(),
+            "era": protocol_status.era_name(),
         },
         "capabilities": {
             "tools": capabilities.tools.is_some(),
@@ -10445,6 +10507,7 @@ mod tests {
         #[test]
         fn protocol_policy_choices_route_to_shipped_builders() {
             for (argument, expected) in [
+                ("auto", ProtocolPolicy::Auto),
                 ("modern-only", ProtocolPolicy::ModernOnly),
                 ("legacy-only", ProtocolPolicy::LegacyOnly),
             ] {
@@ -10477,6 +10540,79 @@ mod tests {
                     .find(|(key, _)| *key == OsStr::new(FASTMCP_PROTOCOL_POLICY_ENV))
                     .and_then(|(_, value)| value.and_then(OsStr::to_str).map(str::to_owned));
                 assert_eq!(launch_policy.as_deref(), Some(argument));
+            }
+        }
+
+        #[test]
+        fn inspect_protocol_status_renders_each_supported_selection_exactly() {
+            let server_info = make_test_server_info();
+            let capabilities = make_test_capabilities(false, false, false);
+
+            for (policy, version, era) in [
+                (CliProtocolPolicy::Auto, "2026-07-28", "modern-2026"),
+                (CliProtocolPolicy::Auto, "2024-11-05", "legacy-2024"),
+                (
+                    CliProtocolPolicy::ModernOnly,
+                    "2026-07-28",
+                    "modern-2026",
+                ),
+                (
+                    CliProtocolPolicy::LegacyOnly,
+                    "2024-11-05",
+                    "legacy-2024",
+                ),
+            ] {
+                let status = InspectProtocolStatus::new(policy, version)
+                    .expect("each policy must report its exact admitted protocol version");
+                let text = format_inspect_text(
+                    &server_info,
+                    &capabilities,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    status,
+                );
+                assert!(text.contains(&format!(
+                    "Protocol: policy={} version={version} era={era}",
+                    policy.server_launch_value()
+                )));
+
+                let json = format_inspect_json(
+                    &server_info,
+                    &capabilities,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    status,
+                )
+                .expect("inspect status serializes");
+                let value: serde_json::Value =
+                    serde_json::from_str(&json).expect("inspect status is JSON");
+                assert_eq!(value["protocol"]["policy"], policy.server_launch_value());
+                assert_eq!(value["protocol"]["version"], version);
+                assert_eq!(value["protocol"]["era"], era);
+            }
+        }
+
+        #[test]
+        fn inspect_protocol_status_rejects_only_cross_policy_or_unsupported_versions() {
+            for (policy, accepted_version, rejected_version) in [
+                (CliProtocolPolicy::Auto, "2026-07-28", "2025-11-25"),
+                (CliProtocolPolicy::ModernOnly, "2026-07-28", "2024-11-05"),
+                (CliProtocolPolicy::LegacyOnly, "2024-11-05", "2026-07-28"),
+            ] {
+                let accepted = InspectProtocolStatus::new(policy, accepted_version)
+                    .expect("the baseline policy/version pair is admitted");
+                let accepted_before = accepted;
+
+                let error = InspectProtocolStatus::new(policy, rejected_version).expect_err(
+                    "changing only the negotiated protocol version must be rejected",
+                );
+
+                assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+                assert_eq!(accepted, accepted_before);
             }
         }
 
@@ -12823,6 +12959,11 @@ mod tests {
             }
         }
 
+        fn make_test_protocol_status() -> InspectProtocolStatus {
+            InspectProtocolStatus::new(CliProtocolPolicy::Auto, "2026-07-28")
+                .expect("the modern exact version is admitted under Auto")
+        }
+
         fn make_test_tool(name: &str, description: Option<&str>) -> fastmcp_protocol::Tool {
             fastmcp_protocol::Tool {
                 name: name.to_string(),
@@ -12879,7 +13020,15 @@ mod tests {
             let server_info = make_test_server_info();
             let capabilities = make_test_capabilities(true, true, true);
 
-            let output = format_inspect_text(&server_info, &capabilities, &[], &[], &[], &[]);
+            let output = format_inspect_text(
+                &server_info,
+                &capabilities,
+                &[],
+                &[],
+                &[],
+                &[],
+                make_test_protocol_status(),
+            );
 
             assert!(output.contains("test-server"));
             assert!(output.contains("v1.0.0"));
@@ -12895,7 +13044,15 @@ mod tests {
 
             let tools = vec![make_test_tool("my_tool", Some("A test tool"))];
 
-            let output = format_inspect_text(&server_info, &capabilities, &tools, &[], &[], &[]);
+            let output = format_inspect_text(
+                &server_info,
+                &capabilities,
+                &tools,
+                &[],
+                &[],
+                &[],
+                make_test_protocol_status(),
+            );
 
             assert!(output.contains("Tools (1)"));
             assert!(output.contains("my_tool"));
@@ -12909,8 +13066,15 @@ mod tests {
 
             let resources = vec![make_test_resource("file:///test.txt", "test file")];
 
-            let output =
-                format_inspect_text(&server_info, &capabilities, &[], &resources, &[], &[]);
+            let output = format_inspect_text(
+                &server_info,
+                &capabilities,
+                &[],
+                &resources,
+                &[],
+                &[],
+                make_test_protocol_status(),
+            );
 
             assert!(output.contains("Resources (1)"));
             assert!(output.contains("file:///test.txt"));
@@ -12924,7 +13088,15 @@ mod tests {
 
             let prompts = vec![make_test_prompt("greeting", Some("A greeting prompt"))];
 
-            let output = format_inspect_text(&server_info, &capabilities, &[], &[], &[], &prompts);
+            let output = format_inspect_text(
+                &server_info,
+                &capabilities,
+                &[],
+                &[],
+                &[],
+                &prompts,
+                make_test_protocol_status(),
+            );
 
             assert!(output.contains("Prompts (1)"));
             assert!(output.contains("greeting"));
@@ -12944,7 +13116,15 @@ mod tests {
                 Some("Authorization: Bearer INSPECT_TEXT_SECRET_CANARY"),
             )];
 
-            let output = format_inspect_text(&server_info, &capabilities, &tools, &[], &[], &[]);
+            let output = format_inspect_text(
+                &server_info,
+                &capabilities,
+                &tools,
+                &[],
+                &[],
+                &[],
+                make_test_protocol_status(),
+            );
 
             assert!(output.contains("[literal]"));
             assert!(output.contains("[tool]"));
@@ -12961,7 +13141,15 @@ mod tests {
             let server_info = make_test_server_info();
             let capabilities = make_test_capabilities(true, true, false);
 
-            let result = format_inspect_json(&server_info, &capabilities, &[], &[], &[], &[]);
+            let result = format_inspect_json(
+                &server_info,
+                &capabilities,
+                &[],
+                &[],
+                &[],
+                &[],
+                make_test_protocol_status(),
+            );
 
             assert!(result.is_ok());
             let json = result.unwrap();
@@ -12974,6 +13162,9 @@ mod tests {
             assert_eq!(value["redacted"], false);
             assert_eq!(value["sanitized"], false);
             assert_eq!(value["truncated"], false);
+            assert_eq!(value["protocol"]["policy"], "auto");
+            assert_eq!(value["protocol"]["version"], "2026-07-28");
+            assert_eq!(value["protocol"]["era"], "modern-2026");
         }
 
         #[test]
@@ -13009,6 +13200,7 @@ mod tests {
                 &resources,
                 &resource_templates,
                 &prompts,
+                make_test_protocol_status(),
             )
             .unwrap();
             let json: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -13052,8 +13244,16 @@ mod tests {
             });
             let tools = std::iter::repeat_n(tool, CLI_OUTPUT_MAX_ITEMS + 5).collect::<Vec<_>>();
 
-            let output =
-                format_inspect_json(&server_info, &capabilities, &tools, &[], &[], &[]).unwrap();
+            let output = format_inspect_json(
+                &server_info,
+                &capabilities,
+                &tools,
+                &[],
+                &[],
+                &[],
+                make_test_protocol_status(),
+            )
+            .unwrap();
             let json: serde_json::Value = serde_json::from_str(&output).unwrap();
 
             assert_eq!(
@@ -13087,9 +13287,16 @@ mod tests {
                 JSON_PREVIEW_MAX_CONTAINER_ITEMS + 1
             ];
 
-            let output =
-                format_inspect_json(&server_info, &capabilities, &[tool], &[], &[], &[prompt])
-                    .expect("inspect JSON");
+            let output = format_inspect_json(
+                &server_info,
+                &capabilities,
+                &[tool],
+                &[],
+                &[],
+                &[prompt],
+                make_test_protocol_status(),
+            )
+            .expect("inspect JSON");
             let value: serde_json::Value = serde_json::from_str(&output).unwrap();
 
             assert_eq!(value["truncated"], true);
@@ -13115,6 +13322,7 @@ mod tests {
                 &[],
                 &[],
                 true,
+                make_test_protocol_status(),
             );
             let json = format_inspect_json_with_truncation(
                 &server_info,
@@ -13124,6 +13332,7 @@ mod tests {
                 &[],
                 &[],
                 true,
+                make_test_protocol_status(),
             )
             .expect("inspect JSON");
 

@@ -25,9 +25,12 @@ use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
 use fastmcp_rust::{
     AbsoluteUri, CacheScope, CompleteResult, Content, ContentBlock, Cx, EmbeddedResourceContents,
     FinalCallToolResult, FinalGetPromptResult, FinalPromptMessage, FinalReadResourceResult,
-    FinalToolOutcome, Implementation, InputRequiredResult, JsonSchema, LabConfig, LabRuntime,
-    McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler, PromptMessage,
-    ResourceContent, ResourceHandler, ResultMeta, Role, ToolHandler, prompt, resource, tool,
+    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalToolOutcome, Implementation,
+    InboundRequestContext, InboundRequestTransport, InputRequiredResult, JsonRpcRequest,
+    JsonSchema, LabConfig, LabRuntime, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+    MODERN_PROTOCOL_VERSION, McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler,
+    PromptMessage, ResourceContent, ResourceHandler, ResultMeta, Role, Server, ToolHandler, prompt,
+    resource, tool,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -706,6 +709,32 @@ fn final_tool_outcome(mode: &str) -> FinalToolOutcome {
     }
 }
 
+fn facade_final_tool_outcome_request(mode: &str, declare_tasks: bool) -> JsonRpcRequest {
+    let client_capabilities = if declare_tasks {
+        json!({
+            "extensions": { "io.modelcontextprotocol/tasks": {} },
+        })
+    } else {
+        json!({})
+    };
+    JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": client_capabilities,
+            },
+            "name": "final_tool_outcome_direct",
+            "arguments": { "mode": mode },
+        })),
+        64_i64,
+    )
+}
+
+fn facade_final_inbound() -> InboundRequestContext {
+    InboundRequestContext::new(Cx::for_testing(), 64, InboundRequestTransport::Memory)
+}
+
 #[tool]
 fn final_tool_outcome_direct(mode: String) -> fastmcp_rust::FinalToolOutcome {
     final_tool_outcome(&mode)
@@ -778,6 +807,84 @@ fn tool_final_outcome_variants_reach_the_final_outcome_hook() {
             } if message == "queued"
         ));
     }
+}
+
+#[test]
+fn facade_final_tool_outcome_encodes_input_required_through_modern_wire() {
+    let server = Server::new("facade-final-outcome", "1.0.0")
+        .tool(FinalToolOutcomeDirect)
+        .build();
+    let response = server
+        .dispatch_stateless(
+            &facade_final_inbound(),
+            &facade_final_tool_outcome_request("input-required", false),
+        )
+        .expect("facade final tools/call returns an input-required wire response");
+    let result = response
+        .result
+        .expect("input-required final tools/call has a result");
+
+    assert!(response.error.is_none());
+    assert_eq!(result["resultType"], "input_required");
+    assert_eq!(result["requestState"], "retry-state");
+}
+
+#[test]
+fn facade_final_tool_outcome_creates_task_through_modern_wire() {
+    let runtime = FinalTaskRuntime::in_memory(
+        FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
+        std::sync::Arc::new(|_| {}),
+    );
+    let server = Server::new("facade-final-task", "1.0.0")
+        .tool(FinalToolOutcomeDirect)
+        .final_tasks(runtime)
+        .expect("final Tasks install through the facade builder")
+        .build();
+    let response = server
+        .dispatch_stateless(
+            &facade_final_inbound(),
+            &facade_final_tool_outcome_request("create-task", true),
+        )
+        .expect("task-capable facade final tools/call returns a wire response");
+    let result = response.result.expect("task final tools/call has a result");
+
+    assert!(response.error.is_none());
+    assert_eq!(result["resultType"], "task");
+    assert_eq!(result["status"], "working");
+    assert_eq!(result["statusMessage"], "queued");
+}
+
+#[test]
+fn facade_final_tool_outcome_rejects_task_without_declared_capability() {
+    let runtime = FinalTaskRuntime::in_memory(
+        FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
+        std::sync::Arc::new(|_| {}),
+    );
+    let server = Server::new("facade-final-task", "1.0.0")
+        .tool(FinalToolOutcomeDirect)
+        .final_tasks(runtime)
+        .expect("final Tasks install through the facade builder")
+        .build();
+    let response = server
+        .dispatch_stateless(
+            &facade_final_inbound(),
+            &facade_final_tool_outcome_request("create-task", false),
+        )
+        .expect("missing task capability returns a JSON-RPC error response");
+
+    assert!(response.result.is_none());
+    let error = response
+        .error
+        .expect("missing task capability returns the final capability error");
+    assert_eq!(error.code, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE);
+    assert_eq!(
+        error.data,
+        Some(json!({
+            "requiredCapabilities": {
+                "extensions": { "io.modelcontextprotocol/tasks": {} },
+            },
+        }))
+    );
 }
 
 #[test]

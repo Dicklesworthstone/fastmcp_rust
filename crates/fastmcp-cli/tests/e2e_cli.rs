@@ -1050,6 +1050,7 @@ fn e2e_cli_inspect_text_lists_server_capabilities_and_items() {
 
     let stdout = stdout_str(&output);
     assert!(stdout.contains("Server: echo-server v1.0.0"));
+    assert!(stdout.contains("Protocol: policy=auto version=2024-11-05 era=legacy-2024"));
     assert!(stdout.contains("Capabilities: tools=true resources=true prompts=true"));
 
     assert!(stdout.contains("Tools (4):"));
@@ -1081,6 +1082,9 @@ fn e2e_cli_inspect_json_lists_tools_resources_and_prompts() {
 
     assert_eq!(json["server"]["name"], "echo-server");
     assert_eq!(json["server"]["version"], "1.0.0");
+    assert_eq!(json["protocol"]["policy"], "auto");
+    assert_eq!(json["protocol"]["version"], "2024-11-05");
+    assert_eq!(json["protocol"]["era"], "legacy-2024");
     assert_eq!(json["capabilities"]["tools"], true);
     assert_eq!(json["capabilities"]["resources"], true);
     assert_eq!(json["capabilities"]["prompts"], true);
