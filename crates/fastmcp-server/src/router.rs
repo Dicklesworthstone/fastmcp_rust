@@ -2618,15 +2618,30 @@ impl Router {
 
         let join_cx = request_ctx.cx().clone();
         let dispatch_ctx = request_ctx.clone();
-        let mut task = request_ctx
-            .cx()
-            .spawn(move |child_cx| async move {
-                self.dispatch_stateless_in_request(&dispatch_ctx, &child_cx, &request)
-                    .await
-            })
-            .map_err(|_error| {
-                McpError::internal_error("request-owned modern dispatch could not be scheduled")
-            })?;
+        let spawn_self = Arc::clone(&self);
+        let spawn_request = request.clone();
+        let mut task = match request_ctx.cx().spawn(move |child_cx| async move {
+            spawn_self
+                .dispatch_stateless_in_request(&dispatch_ctx, &child_cx, &spawn_request)
+                .await
+        }) {
+            Ok(task) => task,
+            // A context without a spawn gateway (lab/test contexts, plain
+            // synchronous callers) cannot host the request-owned child; the
+            // in-request dispatch on the caller's own Cx preserves the same
+            // cancellation observations without child isolation. Every other
+            // spawn failure (region closed, quota) stays a scheduling error.
+            Err(asupersync::runtime::state::SpawnError::RuntimeUnavailable) => {
+                return self
+                    .dispatch_stateless_in_request(&request_ctx, request_ctx.cx(), &request)
+                    .await;
+            }
+            Err(_error) => {
+                return Err(McpError::internal_error(
+                    "request-owned modern dispatch could not be scheduled",
+                ));
+            }
+        };
 
         match task.join(&join_cx).await {
             Ok(result) => result,

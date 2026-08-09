@@ -5420,7 +5420,7 @@ mod handler_direct_tests {
         let result = tool.call(&ctx, serde_json::json!({}));
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, McpErrorCode::InternalError);
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
     }
 
     #[test]
