@@ -1643,7 +1643,8 @@ mod router_tests {
                 .lock()
                 .expect("active_requests lock poisoned");
             guard.insert(
-                ActiveRequestKey::new(session_id, request_id.clone()),
+                ActiveRequestKey::new(session_id, &request_id)
+                    .expect("test request ID must have a canonical correlation key"),
                 active,
             );
         }
@@ -1675,7 +1676,8 @@ mod router_tests {
                 .lock()
                 .expect("active_requests lock poisoned");
             guard.insert(
-                ActiveRequestKey::new(session_id, request_id.clone()),
+                ActiveRequestKey::new(session_id, &request_id)
+                    .expect("test request ID must have a canonical correlation key"),
                 active,
             );
         }
@@ -1704,7 +1706,8 @@ mod router_tests {
         let session_id = 1;
         let request_id = RequestId::Number(77);
         let cx = Cx::for_testing();
-        let key = ActiveRequestKey::new(session_id, request_id.clone());
+        let key = ActiveRequestKey::new(session_id, &request_id)
+            .expect("test request ID must have a canonical correlation key");
 
         let guard = ActiveRequestGuard::try_new(
             Arc::clone(&server.active_requests),
