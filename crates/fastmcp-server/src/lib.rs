@@ -2270,6 +2270,7 @@ impl ServerHttpRequestCancellation {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.transport.is_cancelled()
+            || self.terminal_delivery.is_settled()
             || self.request.is_cancel_requested() && !self.terminal_delivery.is_enqueued()
     }
 
@@ -2287,7 +2288,9 @@ impl ServerHttpRequestCancellation {
     /// when MCP cancellation has closed the response body.
     pub fn checkpoint(&self, cx: &Cx) -> Result<(), TransportError> {
         self.transport.checkpoint(cx)?;
-        if self.request.is_cancel_requested() && !self.terminal_delivery.is_enqueued() {
+        if self.terminal_delivery.is_settled()
+            || self.request.is_cancel_requested() && !self.terminal_delivery.is_enqueued()
+        {
             return Err(TransportError::Cancelled);
         }
         Ok(())
@@ -21247,6 +21250,32 @@ mod lib_unit_tests {
             {
                 return Err("HTTP cancellation POST affected a response body".to_owned());
             }
+
+            let mut streaming_rejected_session = endpoint
+                .open_session(&cx)
+                .map_err(|error| format!("streaming cancellation session failed: {error}"))?;
+            let streaming_rejected = streaming_rejected_session
+                .begin_modern_sse(
+                    &cx,
+                    HttpRequest::new(HttpMethod::Post, "/mcp")
+                        .with_header("content-type", "application/json")
+                        .with_header("accept", "text/event-stream")
+                        .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                        .with_header("mcp-method", "notifications/cancelled")
+                        .with_body(
+                            serde_json::to_vec(&cancellation)
+                                .expect("typed cancellation notification must serialize"),
+                        ),
+                )
+                .map_err(|error| format!("streaming cancellation rejection failed: {error}"))?;
+            let Err(ServerHttpEndpointResponse::Immediate(streaming_rejected)) = streaming_rejected
+            else {
+                return Err("live SSE cancellation POST was not rejected immediately".to_owned());
+            };
+            if streaming_rejected.status != HttpStatus::BAD_REQUEST {
+                return Err("live SSE cancellation POST used the wrong status".to_owned());
+            }
+            streaming_rejected_session.close(&cx).await;
 
             drop(first_sse);
             if first_guard.checkpoint(&cx).is_ok() || second_guard.checkpoint(&cx).is_err() {
