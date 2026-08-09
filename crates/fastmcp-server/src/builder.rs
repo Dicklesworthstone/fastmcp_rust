@@ -642,9 +642,31 @@ impl ServerBuilder {
     /// definitions before calling this method.
     #[must_use]
     pub fn proxy(mut self, client: ProxyClient, catalog: ProxyCatalog) -> Self {
-        let has_tools = !catalog.tools.is_empty();
+        if let Err(error) = client.admit_catalog(&catalog) {
+            log::error!(
+                target: "fastmcp_rust::builder",
+                "Rejected proxied catalog that contradicts the immutable route binding; code={:?}",
+                error.code
+            );
+            return self;
+        }
+
+        // Preserve the existing legacy capability behavior. Exact-final tools
+        // contribute only after immutable final registration succeeds.
+        let mut has_tools = !catalog.tools.is_empty();
         let has_resources = !catalog.resources.is_empty() || !catalog.resource_templates.is_empty();
         let has_prompts = !catalog.prompts.is_empty();
+        let final_handlers = match catalog.final_tool_handlers(client.clone()) {
+            Ok(handlers) => handlers,
+            Err(error) => {
+                log::error!(
+                    target: "fastmcp_rust::builder",
+                    "Failed to construct exact-final proxied tools; code={:?}",
+                    error.code
+                );
+                Vec::new()
+            }
+        };
 
         for tool in catalog.tools {
             if let Err(error) = self.router.add_tool_with_behavior(
@@ -656,6 +678,20 @@ impl ServerBuilder {
                     "Failed to register proxied tool; code={:?}",
                     error.code
                 );
+            }
+        }
+
+        for handler in final_handlers {
+            match self
+                .router
+                .add_tool_with_behavior(handler, self.on_duplicate)
+            {
+                Ok(()) => has_tools = true,
+                Err(error) => log::error!(
+                    target: "fastmcp_rust::builder",
+                    "Failed to register exact-final proxied tool; code={:?}",
+                    error.code
+                ),
             }
         }
 
@@ -750,7 +786,7 @@ impl ServerBuilder {
         let catalog = proxy_client.catalog()?;
 
         // Capture counts before consuming
-        let tool_count = catalog.tools.len();
+        let tool_count = catalog.tools.len() + catalog.final_tools.len();
         let resource_count = catalog.resources.len();
         let template_count = catalog.resource_templates.len();
         let prompt_count = catalog.prompts.len();
@@ -767,6 +803,20 @@ impl ServerBuilder {
             );
             self.router.add_tool_with_behavior(
                 ProxyToolHandler::with_prefix(tool, prefix, proxy_client.clone()),
+                self.on_duplicate,
+            )?;
+        }
+
+        // Register final tools with the exact catalog definition. Prefixing
+        // changes only the exposed name; the handler retains the original
+        // upstream name for forwarding.
+        for tool in catalog.final_tools {
+            log::debug!(
+                target: "fastmcp_rust::proxy",
+                "Registering exact-final proxied tool with configured prefix"
+            );
+            self.router.add_tool_with_behavior(
+                ProxyToolHandler::with_prefix_final(tool, prefix, proxy_client.clone())?,
                 self.on_duplicate,
             )?;
         }
@@ -872,15 +922,22 @@ impl ServerBuilder {
         proxy_client: ProxyClient,
         catalog: ProxyCatalog,
     ) -> Result<Self, fastmcp_core::McpError> {
-        let has_tools = !catalog.tools.is_empty();
+        proxy_client.admit_catalog(&catalog)?;
+        let has_tools = !catalog.tools.is_empty() || !catalog.final_tools.is_empty();
         let has_resources = !catalog.resources.is_empty() || !catalog.resource_templates.is_empty();
         let has_prompts = !catalog.prompts.is_empty();
+        let final_handlers = catalog.final_tool_handlers(proxy_client.clone())?;
 
         for tool in catalog.tools {
             self.router.add_tool_with_behavior(
                 ProxyToolHandler::new(tool, proxy_client.clone()),
                 self.on_duplicate,
             )?;
+        }
+
+        for handler in final_handlers {
+            self.router
+                .add_tool_with_behavior(handler, self.on_duplicate)?;
         }
 
         for resource in catalog.resources {
@@ -1483,9 +1540,11 @@ impl ServerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::Cx;
     use fastmcp_core::{McpContext, McpResult};
     use fastmcp_protocol::extensions::ExtensionNegotiationError;
-    use fastmcp_protocol::{Content, Prompt, Resource, ResourceContent, Tool};
+    use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy, StdioOpeningFrame};
+    use fastmcp_protocol::{Content, JsonRpcRequest, Prompt, Resource, ResourceContent, Tool};
 
     // ── Stub handlers ────────────────────────────────────────────────
 
@@ -1591,10 +1650,10 @@ mod tests {
             &self,
             _ctx: &McpContext,
             _params: fastmcp_protocol::FinalCompletionParams,
-        ) -> McpResult<fastmcp_protocol::CompletionValues> {
-            Ok(fastmcp_protocol::CompletionValues {
+        ) -> McpResult<fastmcp_protocol::FinalCompletionValues> {
+            Ok(fastmcp_protocol::FinalCompletionValues {
                 values: vec!["staging".to_string()],
-                total: Some(1),
+                total: Some(fastmcp_protocol::JsonInteger::from(1_i64)),
                 has_more: Some(false),
             })
         }
@@ -1620,11 +1679,11 @@ mod tests {
             &self,
             _ctx: &McpContext,
             _params: fastmcp_protocol::FinalCompletionParams,
-        ) -> McpResult<fastmcp_protocol::CompletionValues> {
+        ) -> McpResult<fastmcp_protocol::FinalCompletionValues> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(fastmcp_protocol::CompletionValues {
+            Ok(fastmcp_protocol::FinalCompletionValues {
                 values: vec!["staging".to_string()],
-                total: Some(1),
+                total: Some(fastmcp_protocol::JsonInteger::from(1_i64)),
                 has_more: Some(false),
             })
         }
@@ -1775,6 +1834,7 @@ mod tests {
 
     fn duplicate_policy_proxy_catalog() -> ProxyCatalog {
         ProxyCatalog {
+            tool_catalog_era: Some(ProtocolEra::Legacy2024),
             tools: vec![Tool {
                 name: "test_tool".to_string(),
                 description: Some("proxied tool".to_string()),
@@ -2782,6 +2842,216 @@ mod tests {
 
     // ── Proxy registration ─────────────────────────────────────────
 
+    fn final_proxy_catalog() -> ProxyCatalog {
+        ProxyCatalog {
+            tool_catalog_era: Some(ProtocolEra::Modern2026),
+            final_tools: vec![
+                serde_json::from_value(serde_json::json!({
+                    "name": "weather",
+                    "title": "Weather Forecast",
+                    "description": "Returns a precise forecast.",
+                    "icons": [{
+                        "src": "https://example.test/icons/weather.svg",
+                        "mimeType": "image/svg+xml",
+                        "sizes": ["16x16", "32x32"],
+                        "theme": "light",
+                        "com.example/icon": {"retained": true}
+                    }],
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}}
+                    },
+                    "outputSchema": {"type": "object"},
+                    "annotations": {
+                        "title": "Forecast",
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "readOnlyHint": true,
+                        "openWorldHint": false
+                    },
+                    "_meta": {"com.example/catalog": {"retained": true}}
+                }))
+                .expect("the exact final tool fixture is valid"),
+            ],
+            ..ProxyCatalog::default()
+        }
+    }
+
+    fn legacy_proxy_catalog() -> ProxyCatalog {
+        ProxyCatalog {
+            tool_catalog_era: Some(ProtocolEra::Legacy2024),
+            tools: vec![Tool {
+                name: "legacy-weather".to_owned(),
+                description: Some("Exact legacy proxy fixture".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }],
+            ..ProxyCatalog::default()
+        }
+    }
+
+    fn final_tools_list_request(id: i64) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            id,
+        )
+    }
+
+    fn final_catalog_proxy_client(era: ProtocolEra) -> ProxyClient {
+        let mut bindings = ProxyClient::upstream_binding_registry();
+        let policy = match era {
+            ProtocolEra::Modern2026 => ProtocolPolicy::ModernOnly,
+            ProtocolEra::Legacy2024 => ProtocolPolicy::LegacyOnly,
+        };
+        let opening = match era {
+            ProtocolEra::Modern2026 => StdioOpeningFrame::ModernRequest {
+                protocol_version: era.version().as_str().to_owned(),
+            },
+            ProtocolEra::Legacy2024 => StdioOpeningFrame::LegacyInitialize,
+        };
+        let binding = bindings
+            .bind_stdio(
+                "weather-route",
+                "stdio:weather",
+                "final-catalog-receipt",
+                1,
+                policy,
+                opening,
+            )
+            .expect("the route selects the requested exact era");
+        let upstream_protocol_version = era.version().as_str().to_owned();
+        ProxyClient::from_backend_with_upstream_binding(
+            DuplicatePolicyProxyBackend,
+            binding,
+            &upstream_protocol_version,
+        )
+        .expect("the selected upstream version matches its immutable binding")
+    }
+
+    fn assert_rejected_proxy_catalog_preserves_local_registration(catalog: ProxyCatalog) {
+        let baseline = ServerBuilder::new("srv", "1.0").tool(TestTool).build();
+        let baseline_tools =
+            serde_json::to_value(baseline.tools()).expect("baseline tool catalog serializes");
+
+        let server = ServerBuilder::new("srv", "1.0")
+            .tool(TestTool)
+            .proxy(ProxyClient::from_backend(DuplicatePolicyProxyBackend), catalog)
+            .build();
+
+        assert_eq!(
+            serde_json::to_value(server.tools()).expect("rejected builder catalog serializes"),
+            baseline_tools,
+            "rejected proxy catalog input must not mutate an earlier router registration"
+        );
+        assert_eq!(
+            server.has_tools(),
+            baseline.has_tools(),
+            "rejected proxy catalog input must not alter the existing tools capability"
+        );
+    }
+
+    #[test]
+    fn builder_proxy_accepts_a_coherent_legacy_catalog() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .proxy(
+                final_catalog_proxy_client(ProtocolEra::Legacy2024),
+                legacy_proxy_catalog(),
+            )
+            .build();
+
+        assert!(server.has_tools());
+        let tools = server.tools();
+        assert_eq!(
+            tools[0].name,
+            "legacy-weather",
+            "the public builder path registers a catalog whose marker and entries select legacy"
+        );
+    }
+
+    #[test]
+    fn builder_proxy_rejects_legacy_tools_when_only_the_marker_changes_to_modern() {
+        let mut catalog = legacy_proxy_catalog();
+        catalog.tool_catalog_era = Some(ProtocolEra::Modern2026);
+
+        assert_rejected_proxy_catalog_preserves_local_registration(catalog);
+    }
+
+    #[test]
+    fn builder_proxy_rejects_final_tools_when_only_the_marker_changes_to_legacy() {
+        let mut catalog = final_proxy_catalog();
+        catalog.tool_catalog_era = Some(ProtocolEra::Legacy2024);
+
+        assert_rejected_proxy_catalog_preserves_local_registration(catalog);
+    }
+
+    #[test]
+    fn builder_proxy_rejects_mixed_vectors_when_only_final_tools_are_added() {
+        let mut catalog = legacy_proxy_catalog();
+        catalog.final_tools = final_proxy_catalog().final_tools;
+
+        assert_rejected_proxy_catalog_preserves_local_registration(catalog);
+    }
+
+    #[test]
+    fn builder_proxy_rejects_a_missing_marker_without_mutating_local_registration() {
+        let mut catalog = legacy_proxy_catalog();
+        catalog.tool_catalog_era = None;
+
+        assert_rejected_proxy_catalog_preserves_local_registration(catalog);
+    }
+
+    #[test]
+    fn builder_proxy_registers_the_exact_final_tool_catalog() {
+        let catalog = final_proxy_catalog();
+        let expected =
+            serde_json::to_value(&catalog.final_tools[0]).expect("the final fixture serializes");
+        let server = ServerBuilder::new("srv", "1.0")
+            .proxy(final_catalog_proxy_client(ProtocolEra::Modern2026), catalog)
+            .build();
+
+        assert!(server.has_tools());
+        assert_eq!(server.tools().len(), 1);
+        let inbound = crate::InboundRequestContext::new(
+            Cx::for_testing(),
+            701,
+            crate::InboundRequestTransport::Memory,
+        );
+        let response = server
+            .dispatch_stateless(&inbound, &final_tools_list_request(701))
+            .expect("the public server path responds to the modern tools/list request");
+        assert!(response.error.is_none());
+        let catalog = response
+            .result
+            .expect("the modern tools/list response has a result payload");
+        assert_eq!(catalog["tools"][0], expected);
+    }
+
+    #[test]
+    fn builder_proxy_drops_the_same_final_catalog_for_a_legacy_binding() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .proxy(
+                final_catalog_proxy_client(ProtocolEra::Legacy2024),
+                final_proxy_catalog(),
+            )
+            .build();
+
+        assert!(server.tools().is_empty());
+        assert!(
+            !server.has_tools(),
+            "changing only the immutable route era must drop the final catalog entry"
+        );
+    }
+
     #[test]
     fn builder_proxy_with_catalog() {
         use crate::proxy::{ProxyCatalog, ProxyClient};
@@ -2825,6 +3095,7 @@ mod tests {
 
         let client = ProxyClient::from_backend(DummyBackend);
         let catalog = ProxyCatalog {
+            tool_catalog_era: Some(ProtocolEra::Legacy2024),
             tools: vec![Tool {
                 name: "proxy-tool".to_string(),
                 description: None,
@@ -3077,6 +3348,7 @@ mod tests {
 
         let client = ProxyClient::from_backend(DummyBackend2);
         let catalog = ProxyCatalog {
+            tool_catalog_era: Some(ProtocolEra::Legacy2024),
             resources: vec![Resource {
                 uri: "file:///proxy-res".to_string(),
                 name: "proxy-res".to_string(),

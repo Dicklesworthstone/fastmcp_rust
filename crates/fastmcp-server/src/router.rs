@@ -1,6 +1,7 @@
 //! Request router for MCP servers.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::Poll;
@@ -23,10 +24,12 @@ use fastmcp_protocol::common_types::{
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID;
 use fastmcp_protocol::methods::COMPLETION_COMPLETE;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
+use fastmcp_protocol::uri_template::ReversibleResourceTemplate;
 use fastmcp_protocol::{
     AdmittedSchema, CacheScope, CallToolParams, CallToolResult, CompleteResult, Content,
     CoreRequest, CoreResult, FinalCallToolParams, FinalCallToolResult, FinalCompletionParams,
-    FinalCompletionReference, FinalCompletionResult, FinalCoreRequest, FinalCoreResult,
+    FinalCompletionReference, FinalCompletionResult, FinalCompletionValues, FinalCoreRequest,
+    FinalCoreResult,
     FinalGetPromptParams, FinalGetPromptResult, FinalListParams, FinalListPromptsResult,
     FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult, FinalPrompt,
     FinalPromptArgument, FinalReadResourceParams, FinalReadResourceResult, FinalResource,
@@ -38,7 +41,8 @@ use fastmcp_protocol::{
     ListResourcesResult, ListToolsParams, ListToolsResult, MissingRequiredClientCapabilityError,
     PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage, ReadResourceParams,
     ReadResourceResult, Resource, ResourceContent, ResourceTemplate, ServerBehavior,
-    ServerBehaviorRegistry, Tool, admit_final_schema, validate, validate_strict,
+    ServerBehaviorRegistry, TemplateValue, Tool, admit_final_schema, exact_json_to_serde,
+    validate, validate_strict,
 };
 #[cfg(test)]
 use fastmcp_protocol::{
@@ -46,6 +50,10 @@ use fastmcp_protocol::{
     ListTasksResult, SubmitTaskParams, SubmitTaskResult,
 };
 
+use crate::bidirectional::{
+    MrtrCompletedInputs, MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputRequest,
+    MrtrInputRequests, MrtrInputRequired, MrtrRetry,
+};
 use crate::handler::{
     BidirectionalSenders, BoxFuture, FinalMethodOutcome, FinalToolOutcome,
     ProgressNotificationSender, UriParams, empty_final_result_meta, encode_final_complete_result,
@@ -243,17 +251,145 @@ fn encode_final_tools_call_result(
     serde_json::from_str(&encoded).map_err(McpError::from)
 }
 
-/// Encodes a handler-authored final input-required result through the selected
-/// method's exact result-algebra branch without passing through a legacy
-/// complete projection.
-fn encode_final_input_required_result(
-    result: InputRequiredResult,
-    select: impl FnOnce(InputRequiredResult) -> FinalCoreResult,
-) -> McpResult<serde_json::Value> {
-    let encoded = CoreResult::Final(select(result))
-        .encode()
-        .map_err(|error| McpError::internal_error(error.to_string()))?;
-    serde_json::from_str(&encoded).map_err(McpError::from)
+/// Encodes a framework-minted MRTR continuation without allowing a handler to
+/// select or replay its opaque request state.
+fn encode_mrtr_input_required_result(result: MrtrInputRequired) -> McpResult<serde_json::Value> {
+    serde_json::to_value(result)
+        .map_err(|_| McpError::internal_error("failed to encode MRTR input_required result"))
+}
+
+const MAX_MRTR_BINDING_BYTES: usize = 64 * 1024;
+const MAX_MRTR_RAW_PARAMS_BYTES: usize = 256 * 1024;
+const MAX_MRTR_RAW_INPUT_RESPONSES_BYTES: usize = 192 * 1024;
+const MAX_MRTR_RAW_JSON_DEPTH: usize = 32;
+const MAX_MRTR_RAW_JSON_VALUES: usize = 4_096;
+
+struct MrtrRawJsonCounter {
+    max_bytes: usize,
+    bytes: usize,
+}
+
+impl Write for MrtrRawJsonCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let remaining = self.max_bytes.saturating_sub(self.bytes);
+        if buffer.len() > remaining {
+            return Err(io::Error::other("MRTR JSON byte limit exceeded"));
+        }
+        self.bytes += buffer.len();
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn admit_mrtr_raw_json_value(value: &serde_json::Value, max_bytes: usize) -> McpResult<()> {
+    fn count_values(value: &serde_json::Value, depth: usize, values: &mut usize) -> McpResult<()> {
+        if depth > MAX_MRTR_RAW_JSON_DEPTH {
+            return Err(McpError::invalid_params(
+                "MRTR JSON exceeds its nesting limit",
+            ));
+        }
+        *values = values.saturating_add(1);
+        if *values > MAX_MRTR_RAW_JSON_VALUES {
+            return Err(McpError::invalid_params(
+                "MRTR JSON exceeds its value limit",
+            ));
+        }
+        match value {
+            serde_json::Value::Array(items) => {
+                for value in items {
+                    count_values(value, depth + 1, values)?;
+                }
+            }
+            serde_json::Value::Object(members) => {
+                for value in members.values() {
+                    count_values(value, depth + 1, values)?;
+                }
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {}
+        }
+        Ok(())
+    }
+
+    let mut values = 0;
+    count_values(value, 0, &mut values)?;
+    let mut counter = MrtrRawJsonCounter {
+        max_bytes,
+        bytes: 0,
+    };
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|_| McpError::invalid_params("MRTR JSON exceeds its byte limit"))
+}
+
+enum FinalMrtrDispatch {
+    Fresh,
+    Resume(MrtrCompletedInputs),
+    InputRequired(serde_json::Value),
+}
+
+fn mrtr_digest(value: &impl serde::Serialize) -> McpResult<[u8; 32]> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|_| McpError::invalid_params("invalid MRTR operation binding"))?;
+    let digest = sha256_bounded(&bytes, MAX_MRTR_BINDING_BYTES)
+        .map_err(|_| McpError::invalid_params("MRTR operation binding exceeds its limit"))?;
+    Ok(*digest.as_bytes())
+}
+
+fn final_mrtr_binding(
+    request_ctx: &McpContext,
+    method: &'static str,
+    target: String,
+    arguments: &impl serde::Serialize,
+) -> McpResult<MrtrExchangeBinding> {
+    if target.len() > MAX_MRTR_BINDING_BYTES {
+        return Err(McpError::invalid_params("MRTR target exceeds its limit"));
+    }
+    let session_partition = request_ctx
+        .session_cache_partition()
+        .map(|(partition, _revision)| partition)
+        .ok_or_else(|| McpError::invalid_params("MRTR retries require session state"))?;
+    let principal_digest = request_ctx
+        .auth()
+        .map(|auth| {
+            auth.session_owner()
+                .map(|owner| Ok(*owner.as_bytes()))
+                .unwrap_or_else(|| mrtr_digest(&auth))
+        })
+        .transpose()?;
+    Ok(MrtrExchangeBinding::new(
+        method,
+        target,
+        mrtr_digest(arguments)?,
+        session_partition,
+        principal_digest,
+    ))
+}
+
+fn handler_mrtr_input_requests(result: &InputRequiredResult) -> McpResult<MrtrInputRequests> {
+    let input_requests = result
+        .input_requests()
+        .ok_or_else(|| McpError::invalid_params("MRTR input_required requires inputRequests"))?;
+    if input_requests.members().is_empty() {
+        return Err(McpError::invalid_params(
+            "MRTR inputRequests must not be empty",
+        ));
+    }
+    MrtrInputRequests::new(
+        input_requests
+            .members()
+            .iter()
+            .map(|member| {
+                let value = exact_json_to_serde(&member.value)
+                    .map_err(|_| McpError::invalid_params("invalid MRTR input request"))?;
+                Ok((member.name.clone(), MrtrInputRequest::from_wire(&value)?))
+            })
+            .collect::<McpResult<Vec<_>>>()?,
+    )
 }
 
 fn encode_final_task_result(
@@ -1063,6 +1199,9 @@ pub struct Router {
     /// Application-owned durable final Tasks runtime used only after the
     /// request metadata has admitted the official extension.
     final_task_runtime: Option<FinalTaskRuntime>,
+    /// Bounded, process-local final request-state records for tool, resource,
+    /// and prompt retries. A state is accepted only if this router issued it.
+    mrtr_exchanges: Arc<MrtrExchangeRegistry>,
 }
 
 impl Router {
@@ -1084,6 +1223,7 @@ impl Router {
             list_page_size: None,
             final_cache_hints: FinalCacheHintPolicy::default(),
             final_task_runtime: None,
+            mrtr_exchanges: Arc::new(MrtrExchangeRegistry::new()),
         }
     }
 
@@ -1151,8 +1291,8 @@ impl Router {
         self.sorted_template_keys.sort_by(|a, b| {
             let entry_a = &self.resource_templates[a];
             let entry_b = &self.resource_templates[b];
-            let (a_literals, a_literal_segments, a_segments) = entry_a.matcher.specificity();
-            let (b_literals, b_literal_segments, b_segments) = entry_b.matcher.specificity();
+            let (a_literals, a_literal_segments, a_segments) = entry_a.specificity;
+            let (b_literals, b_literal_segments, b_segments) = entry_b.specificity;
             b_literals
                 .cmp(&a_literals)
                 .then(b_literal_segments.cmp(&a_literal_segments))
@@ -1289,9 +1429,22 @@ impl Router {
         let boxed: BoxedResourceHandler = Box::new(handler);
 
         if let Some(template) = template {
+            let (matcher, specificity) = match admit_resource_template(&template.uri_template) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    log::warn!(
+                        target: "fastmcp_rust::router",
+                        "rejected resource template; template_key={}; code={:?}",
+                        safe_log_label(&template.uri_template),
+                        error.code
+                    );
+                    return;
+                }
+            };
             let is_new = !self.resource_templates.contains_key(&template.uri_template);
             let entry = ResourceTemplateEntry {
-                matcher: UriTemplate::new(&template.uri_template),
+                matcher,
+                specificity,
                 template: template.clone(),
                 handler: Some(boxed),
             };
@@ -1361,13 +1514,13 @@ impl Router {
             }
         }
 
-        // Actually add the resource
-        let boxed: BoxedResourceHandler = Box::new(handler);
-
         if let Some(template) = template {
+            let (matcher, specificity) = admit_resource_template(&template.uri_template)?;
+            let boxed: BoxedResourceHandler = Box::new(handler);
             let is_new = !self.resource_templates.contains_key(&template.uri_template);
             let entry = ResourceTemplateEntry {
-                matcher: UriTemplate::new(&template.uri_template),
+                matcher,
+                specificity,
                 template: template.clone(),
                 handler: Some(boxed),
             };
@@ -1378,6 +1531,7 @@ impl Router {
             }
             self.rebuild_sorted_template_keys();
         } else {
+            let boxed: BoxedResourceHandler = Box::new(handler);
             let is_new = !self.resources.contains_key(&def.uri);
             self.resources.insert(def.uri.clone(), boxed);
             if is_new {
@@ -1395,8 +1549,17 @@ impl Router {
     /// [`add_resource_template_with_behavior`](Self::add_resource_template_with_behavior)
     /// for finer control over duplicate handling.
     pub fn add_resource_template(&mut self, template: ResourceTemplate) {
-        let _ =
-            self.add_resource_template_with_behavior(template, crate::DuplicateBehavior::Replace);
+        let key = template.uri_template.clone();
+        if let Err(error) =
+            self.add_resource_template_with_behavior(template, crate::DuplicateBehavior::Replace)
+        {
+            log::warn!(
+                target: "fastmcp_rust::router",
+                "rejected resource template definition; template_key={}; code={:?}",
+                safe_log_label(&key),
+                error.code
+            );
+        }
     }
 
     /// Adds a resource template definition with specified duplicate behavior.
@@ -1436,20 +1599,24 @@ impl Router {
             }
         }
 
-        let matcher = UriTemplate::new(&key);
-        let entry = ResourceTemplateEntry {
-            matcher,
-            template: template.clone(),
-            handler: None,
-        };
+        let (matcher, specificity) = admit_resource_template(&key)?;
         let needs_rebuild = match self.resource_templates.get_mut(&key) {
             Some(existing) => {
                 existing.template = template;
-                existing.matcher = entry.matcher;
+                existing.matcher = matcher;
+                existing.specificity = specificity;
                 false // Key already exists, order unchanged
             }
             None => {
-                self.resource_templates.insert(key.clone(), entry);
+                self.resource_templates.insert(
+                    key.clone(),
+                    ResourceTemplateEntry {
+                        matcher,
+                        specificity,
+                        template,
+                        handler: None,
+                    },
+                );
                 true // New key added, need to rebuild
             }
         };
@@ -1785,14 +1952,22 @@ impl Router {
         }
 
         // Use pre-sorted template keys to avoid sorting on every lookup
-        for key in &self.sorted_template_keys {
+        'templates: for key in &self.sorted_template_keys {
             let entry = &self.resource_templates[key];
             let Some(handler) = entry.handler.as_ref() else {
                 continue;
             };
-            if let Some(params) = entry.matcher.matches(uri) {
-                return Some(ResolvedResource { handler, params });
+            let Some(values) = entry.matcher.match_uri(uri).ok().flatten() else {
+                continue;
+            };
+            let mut params = UriParams::with_capacity(values.len());
+            for (name, value) in values {
+                let TemplateValue::Scalar(value) = value else {
+                    continue 'templates;
+                };
+                params.insert(name, value);
             }
+            return Some(ResolvedResource { handler, params });
         }
 
         None
@@ -1946,10 +2121,10 @@ impl Router {
                 ));
             }
             FinalCompletionReference::Resource { uri }
-                if !self.resource_templates.contains_key(uri) =>
+                if !self.resources.contains_key(uri) && !self.resource_templates.contains_key(uri) =>
             {
                 return Err(McpError::invalid_params(
-                    "completion resource reference is not a registered resource template",
+                    "completion resource reference is not registered",
                 ));
             }
             FinalCompletionReference::Prompt { .. }
@@ -2070,16 +2245,13 @@ impl Router {
             return Err(error);
         }
 
-        let params = request.params.clone();
+        let params = request.params.as_ref();
         let result = match request.method.as_str() {
             "ping" => encode_stateless_handler_result(Ok(serde_json::json!({})))?,
             COMPLETION_COMPLETE => {
-                let request = CoreRequest::decode(
-                    ProtocolEra::Modern2026,
-                    COMPLETION_COMPLETE,
-                    params.as_ref(),
-                )
-                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let request =
+                    CoreRequest::decode(ProtocolEra::Modern2026, COMPLETION_COMPLETE, params)
+                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 let CoreRequest::Final(FinalCoreRequest::Completion(params)) = request else {
                     return Err(McpError::internal_error(
                         "modern completion dispatch selected another core request",
@@ -2091,9 +2263,8 @@ impl Router {
                 )?
             }
             "tools/list" => {
-                let request =
-                    CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", params.as_ref())
-                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", params)
+                    .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 let CoreRequest::Final(FinalCoreRequest::ToolsList(params)) = request else {
                     return Err(McpError::internal_error(
                         "modern tools/list dispatch selected another core request",
@@ -2108,56 +2279,53 @@ impl Router {
                 )?
             }
             "tools/call" => {
-                let request =
-                    CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", params.as_ref())
-                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                self.admit_final_mrtr_response_map(params)?;
+                let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", params)
+                    .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 let CoreRequest::Final(FinalCoreRequest::ToolsCall(params)) = request else {
                     return Err(McpError::internal_error(
                         "modern tools/call dispatch selected another core request",
                     ));
                 };
-                let request_metadata = params.meta.clone();
-                let outcome = self
-                    .handle_tools_call_final_in_request(
-                        request_ctx,
-                        request_cx,
-                        params,
-                        SessionState::new(),
-                        None,
-                        None,
-                    )
-                    .await?;
-                match outcome {
-                    FinalToolOutcome::Complete(result) => {
-                        encode_final_tools_call_result(Ok(result))?
+                let binding = final_mrtr_binding(
+                    request_ctx,
+                    "tools/call",
+                    params.name.clone(),
+                    &params.arguments,
+                )?;
+                self.admit_final_tool_retry_metadata(&params)?;
+                let resume_inputs = match self.resolve_final_mrtr_retry(
+                    params.request_state.as_deref(),
+                    params.input_responses.as_ref(),
+                    &binding,
+                )? {
+                    FinalMrtrDispatch::InputRequired(result) => result,
+                    FinalMrtrDispatch::Fresh => {
+                        self.dispatch_final_tools_call(
+                            request_ctx,
+                            request_cx,
+                            params,
+                            binding,
+                            None,
+                        )
+                        .await?
                     }
-                    FinalToolOutcome::InputRequired(result) => {
-                        encode_final_input_required_result(result, |result| {
-                            FinalCoreResult::ToolsCallInputRequired {
-                                result,
-                                diagnostic: None,
-                            }
-                        })?
+                    FinalMrtrDispatch::Resume(resume_inputs) => {
+                        self.dispatch_final_tools_call(
+                            request_ctx,
+                            request_cx,
+                            params,
+                            binding,
+                            Some(resume_inputs),
+                        )
+                        .await?
                     }
-                    FinalToolOutcome::CreateTask {
-                        work_descriptor,
-                        status_message,
-                    } => {
-                        require_final_tasks_capability(&request_metadata)?;
-                        let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
-                            McpError::internal_error(
-                                "task-capable tool requires an installed final Tasks runtime",
-                            )
-                        })?;
-                        encode_final_task_result(
-                            runtime.create_task_with_work(work_descriptor, status_message)?,
-                        )?
-                    }
-                }
+                };
+                resume_inputs
             }
             "resources/list" => {
                 let request =
-                    CoreRequest::decode(ProtocolEra::Modern2026, "resources/list", params.as_ref())
+                    CoreRequest::decode(ProtocolEra::Modern2026, "resources/list", params)
                         .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 let CoreRequest::Final(FinalCoreRequest::ResourcesList(params)) = &request else {
                     return Err(McpError::internal_error(
@@ -2187,7 +2355,7 @@ impl Router {
                 let request = CoreRequest::decode(
                     ProtocolEra::Modern2026,
                     "resources/templates/list",
-                    params.as_ref(),
+                    params,
                 )
                 .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 let CoreRequest::Final(FinalCoreRequest::ResourceTemplatesList(params)) = &request
@@ -2216,42 +2384,52 @@ impl Router {
                 )?
             }
             "resources/read" => {
+                self.admit_final_mrtr_response_map(params)?;
                 let request =
-                    CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", params.as_ref())
+                    CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", params)
                         .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 let CoreRequest::Final(FinalCoreRequest::ResourcesRead(params)) = &request else {
                     return Err(McpError::internal_error(
                         "modern resources/read dispatch selected another core request",
                     ));
                 };
-                let outcome = self
-                    .handle_resources_read_final_in_request(
-                        request_ctx,
-                        request_cx,
-                        params.clone(),
-                        SessionState::new(),
-                        None,
-                        None,
-                    )
-                    .await?;
-                match outcome {
-                    FinalMethodOutcome::Complete(result) => {
-                        encode_final_resources_read_result(Ok(result))?
+                let binding = final_mrtr_binding(
+                    request_ctx,
+                    "resources/read",
+                    params.uri.as_str().to_owned(),
+                    &(),
+                )?;
+                match self.resolve_final_mrtr_retry(
+                    params.request_state.as_deref(),
+                    params.input_responses.as_ref(),
+                    &binding,
+                )? {
+                    FinalMrtrDispatch::InputRequired(result) => result,
+                    FinalMrtrDispatch::Fresh => {
+                        self.dispatch_final_resources_read(
+                            request_ctx,
+                            request_cx,
+                            params.clone(),
+                            binding,
+                            None,
+                        )
+                        .await?
                     }
-                    FinalMethodOutcome::InputRequired(result) => {
-                        encode_final_input_required_result(result, |result| {
-                            FinalCoreResult::ResourcesReadInputRequired {
-                                result,
-                                diagnostic: None,
-                            }
-                        })?
+                    FinalMrtrDispatch::Resume(resume_inputs) => {
+                        self.dispatch_final_resources_read(
+                            request_ctx,
+                            request_cx,
+                            params.clone(),
+                            binding,
+                            Some(resume_inputs),
+                        )
+                        .await?
                     }
                 }
             }
             "prompts/list" => {
-                let request =
-                    CoreRequest::decode(ProtocolEra::Modern2026, "prompts/list", params.as_ref())
-                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let request = CoreRequest::decode(ProtocolEra::Modern2026, "prompts/list", params)
+                    .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 let CoreRequest::Final(FinalCoreRequest::PromptsList(params)) = &request else {
                     return Err(McpError::internal_error(
                         "modern prompts/list dispatch selected another core request",
@@ -2273,35 +2451,45 @@ impl Router {
                 )?
             }
             "prompts/get" => {
-                let request =
-                    CoreRequest::decode(ProtocolEra::Modern2026, "prompts/get", params.as_ref())
-                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                self.admit_final_mrtr_response_map(params)?;
+                let request = CoreRequest::decode(ProtocolEra::Modern2026, "prompts/get", params)
+                    .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 let CoreRequest::Final(FinalCoreRequest::PromptsGet(params)) = request else {
                     return Err(McpError::internal_error(
                         "modern prompts/get dispatch selected another core request",
                     ));
                 };
-                let outcome = self
-                    .handle_prompts_get_final_in_request(
-                        request_ctx,
-                        request_cx,
-                        params,
-                        SessionState::new(),
-                        None,
-                        None,
-                    )
-                    .await?;
-                match outcome {
-                    FinalMethodOutcome::Complete(result) => {
-                        encode_final_prompts_get_result(Ok(result))?
+                let binding = final_mrtr_binding(
+                    request_ctx,
+                    "prompts/get",
+                    params.name.clone(),
+                    &params.arguments,
+                )?;
+                match self.resolve_final_mrtr_retry(
+                    params.request_state.as_deref(),
+                    params.input_responses.as_ref(),
+                    &binding,
+                )? {
+                    FinalMrtrDispatch::InputRequired(result) => result,
+                    FinalMrtrDispatch::Fresh => {
+                        self.dispatch_final_prompts_get(
+                            request_ctx,
+                            request_cx,
+                            params,
+                            binding,
+                            None,
+                        )
+                        .await?
                     }
-                    FinalMethodOutcome::InputRequired(result) => {
-                        encode_final_input_required_result(result, |result| {
-                            FinalCoreResult::PromptsGetInputRequired {
-                                result,
-                                diagnostic: None,
-                            }
-                        })?
+                    FinalMrtrDispatch::Resume(resume_inputs) => {
+                        self.dispatch_final_prompts_get(
+                            request_ctx,
+                            request_cx,
+                            params,
+                            binding,
+                            Some(resume_inputs),
+                        )
+                        .await?
                     }
                 }
             }
@@ -2315,6 +2503,204 @@ impl Router {
             return Err(error);
         }
         Ok(result)
+    }
+
+    /// Admits bounded raw retry values before final parameter decoding clones
+    /// them into method-specific fields or materializes `inputResponses`.
+    fn admit_final_mrtr_response_map(&self, params: Option<&serde_json::Value>) -> McpResult<()> {
+        let Some(params) = params else {
+            return Ok(());
+        };
+        admit_mrtr_raw_json_value(params, MAX_MRTR_RAW_PARAMS_BYTES)?;
+        let Some(input_responses) = params
+            .as_object()
+            .and_then(|members| members.get("inputResponses"))
+        else {
+            return Ok(());
+        };
+        admit_mrtr_raw_json_value(input_responses, MAX_MRTR_RAW_INPUT_RESPONSES_BYTES)?;
+        let Some(input_responses) = input_responses.as_object() else {
+            return Ok(());
+        };
+        if input_responses.len() > self.mrtr_exchanges.max_inputs_per_round() {
+            return Err(McpError::invalid_params(
+                "MRTR inputResponses exceeds the configured bound",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verifies operation-relevant normalized metadata before an MRTR retry
+    /// consumes its continuation. A task-capable tool performs capability and
+    /// runtime readiness admission after normal dispatch too, but doing that
+    /// only after state resolution would let altered retry metadata burn a
+    /// valid state.
+    fn admit_final_tool_retry_metadata(&self, params: &FinalCallToolParams) -> McpResult<()> {
+        if params.request_state.is_none() || params.input_responses.is_none() {
+            return Ok(());
+        }
+        let Some(final_registration) = self
+            .tools
+            .get(&params.name)
+            .and_then(|entry| entry.final_registration.as_ref())
+        else {
+            return Ok(());
+        };
+        if final_registration.declares_final_tasks {
+            self.admit_final_task_tool(&params.meta)?;
+        }
+        Ok(())
+    }
+
+    fn admit_final_task_tool(&self, metadata: &OpenMetadata) -> McpResult<()> {
+        require_final_tasks_capability(metadata)?;
+        let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
+            McpError::internal_error("task-capable tool requires an installed final Tasks runtime")
+        })?;
+        runtime.ensure_task_service_ready()
+    }
+
+    fn issue_final_mrtr_input_required(
+        &self,
+        binding: MrtrExchangeBinding,
+        handler_result: InputRequiredResult,
+    ) -> McpResult<serde_json::Value> {
+        // The handler may describe the input it needs, but it never controls
+        // requestState. Its former state member and open result siblings are
+        // intentionally not forwarded across this framework boundary.
+        let input_requests = handler_mrtr_input_requests(&handler_result)?;
+        let required = self.mrtr_exchanges.issue_bound(
+            fastmcp_core::McpRequestCancellation::new(),
+            binding,
+            input_requests,
+        )?;
+        encode_mrtr_input_required_result(required)
+    }
+
+    /// Resolves a final embedded-input retry before its method handler runs.
+    ///
+    /// Only a framework-issued state whose immutable operation binding still
+    /// matches may yield resume inputs. A complete retry passes those typed
+    /// values into the handler's resume-aware final hook exactly once.
+    fn resolve_final_mrtr_retry(
+        &self,
+        request_state: Option<&str>,
+        input_responses: Option<&BTreeMap<String, serde_json::Value>>,
+        binding: &MrtrExchangeBinding,
+    ) -> McpResult<FinalMrtrDispatch> {
+        match (request_state, input_responses) {
+            (None, None) => Ok(FinalMrtrDispatch::Fresh),
+            (Some(request_state), Some(input_responses)) => {
+                match self.mrtr_exchanges.accept_wire_bound(
+                    request_state,
+                    binding,
+                    input_responses,
+                )? {
+                    MrtrRetry::Complete(inputs) => Ok(FinalMrtrDispatch::Resume(inputs)),
+                    MrtrRetry::InputRequired(result) => encode_mrtr_input_required_result(result)
+                        .map(FinalMrtrDispatch::InputRequired),
+                }
+            }
+            _ => Err(McpError::invalid_params(
+                "final MRTR retries require both inputResponses and requestState",
+            )),
+        }
+    }
+
+    async fn dispatch_final_tools_call(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: FinalCallToolParams,
+        binding: MrtrExchangeBinding,
+        resume_inputs: Option<MrtrCompletedInputs>,
+    ) -> McpResult<serde_json::Value> {
+        let request_metadata = params.meta.clone();
+        let outcome = self
+            .handle_tools_call_final_in_request(
+                request_ctx,
+                request_cx,
+                params,
+                SessionState::new(),
+                None,
+                None,
+                resume_inputs.as_ref(),
+            )
+            .await?;
+        match outcome {
+            FinalToolOutcome::Complete(result) => encode_final_tools_call_result(Ok(result)),
+            FinalToolOutcome::InputRequired(result) => {
+                self.issue_final_mrtr_input_required(binding, result)
+            }
+            FinalToolOutcome::CreateTask {
+                work_descriptor,
+                status_message,
+            } => {
+                require_final_tasks_capability(&request_metadata)?;
+                let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
+                    McpError::internal_error(
+                        "task-capable tool requires an installed final Tasks runtime",
+                    )
+                })?;
+                encode_final_task_result(
+                    runtime.create_task_with_work(work_descriptor, status_message)?,
+                )
+            }
+        }
+    }
+
+    async fn dispatch_final_resources_read(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: FinalReadResourceParams,
+        binding: MrtrExchangeBinding,
+        resume_inputs: Option<MrtrCompletedInputs>,
+    ) -> McpResult<serde_json::Value> {
+        match self
+            .handle_resources_read_final_in_request(
+                request_ctx,
+                request_cx,
+                params,
+                SessionState::new(),
+                None,
+                None,
+                resume_inputs.as_ref(),
+            )
+            .await?
+        {
+            FinalMethodOutcome::Complete(result) => encode_final_resources_read_result(Ok(result)),
+            FinalMethodOutcome::InputRequired(result) => {
+                self.issue_final_mrtr_input_required(binding, result)
+            }
+        }
+    }
+
+    async fn dispatch_final_prompts_get(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: FinalGetPromptParams,
+        binding: MrtrExchangeBinding,
+        resume_inputs: Option<MrtrCompletedInputs>,
+    ) -> McpResult<serde_json::Value> {
+        match self
+            .handle_prompts_get_final_in_request(
+                request_ctx,
+                request_cx,
+                params,
+                SessionState::new(),
+                None,
+                None,
+                resume_inputs.as_ref(),
+            )
+            .await?
+        {
+            FinalMethodOutcome::Complete(result) => encode_final_prompts_get_result(Ok(result)),
+            FinalMethodOutcome::InputRequired(result) => {
+                self.issue_final_mrtr_input_required(binding, result)
+            }
+        }
     }
 
     /// Handles the tools/list request.
@@ -2843,6 +3229,7 @@ impl Router {
         session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
+        resume_inputs: Option<&MrtrCompletedInputs>,
     ) -> McpResult<FinalToolOutcome> {
         debug!(
             target: targets::HANDLER,
@@ -2883,13 +3270,7 @@ impl Router {
         }
         let declares_final_tasks = final_registration.declares_final_tasks;
         if declares_final_tasks {
-            require_final_tasks_capability(&params.meta)?;
-            let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
-                McpError::internal_error(
-                    "task-capable tool requires an installed final Tasks runtime",
-                )
-            })?;
-            runtime.ensure_task_service_ready()?;
+            self.admit_final_task_tool(&params.meta)?;
         }
         let arguments = params
             .arguments
@@ -2925,7 +3306,16 @@ impl Router {
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
         let outcome =
             run_handler_in_request(&ctx, request_cx, effective_budget, "tool", |child_cx| {
-                handler.call_final_outcome_async_in_request(&ctx, child_cx, arguments)
+                if let Some(resume_inputs) = resume_inputs {
+                    handler.call_final_outcome_async_resuming_in_request(
+                        &ctx,
+                        child_cx,
+                        arguments,
+                        Some(resume_inputs),
+                    )
+                } else {
+                    handler.call_final_outcome_async_in_request(&ctx, child_cx, arguments)
+                }
             })
             .await?;
 
@@ -3250,6 +3640,7 @@ impl Router {
         session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
+        resume_inputs: Option<&MrtrCompletedInputs>,
     ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
         let uri = params.uri.as_str();
         debug!(
@@ -3297,14 +3688,26 @@ impl Router {
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
         let outcome =
             run_handler_in_request(&ctx, request_cx, effective_budget, "resource", |child_cx| {
-                resolved
-                    .handler
-                    .read_final_outcome_async_with_uri_in_request(
-                        &ctx,
-                        child_cx,
-                        uri,
-                        &resolved.params,
-                    )
+                if let Some(resume_inputs) = resume_inputs {
+                    resolved
+                        .handler
+                        .read_final_outcome_async_with_uri_resuming_in_request(
+                            &ctx,
+                            child_cx,
+                            uri,
+                            &resolved.params,
+                            Some(resume_inputs),
+                        )
+                } else {
+                    resolved
+                        .handler
+                        .read_final_outcome_async_with_uri_in_request(
+                            &ctx,
+                            child_cx,
+                            uri,
+                            &resolved.params,
+                        )
+                }
             })
             .await?;
 
@@ -3554,6 +3957,7 @@ impl Router {
         session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
+        resume_inputs: Option<&MrtrCompletedInputs>,
     ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
         debug!(
             target: targets::HANDLER,
@@ -3621,7 +4025,16 @@ impl Router {
         let arguments = arguments.into_iter().collect();
         let outcome =
             run_handler_in_request(&ctx, request_cx, effective_budget, "prompt", |child_cx| {
-                handler.get_final_outcome_async_in_request(&ctx, child_cx, arguments)
+                if let Some(resume_inputs) = resume_inputs {
+                    handler.get_final_outcome_async_resuming_in_request(
+                        &ctx,
+                        child_cx,
+                        arguments,
+                        Some(resume_inputs),
+                    )
+                } else {
+                    handler.get_final_outcome_async_in_request(&ctx, child_cx, arguments)
+                }
             })
             .await?;
 
@@ -4339,8 +4752,20 @@ impl Router {
             });
 
             // Create new entry with mounted template
+            let (matcher, specificity) = match admit_resource_template(&mounted_uri_template) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    result.errors.push(format!(
+                        "Mount rejected resource template; template_key={}; code={:?}",
+                        safe_log_label(&mounted_uri_template),
+                        error.code
+                    ));
+                    continue;
+                }
+            };
             let mounted_entry = ResourceTemplateEntry {
-                matcher: UriTemplate::new(&mounted_uri_template),
+                matcher,
+                specificity,
                 template: mounted_template,
                 handler: mounted_handler,
             };
@@ -4391,8 +4816,21 @@ impl Router {
                     wrapped
                 });
 
+                let (matcher, specificity) = match admit_resource_template(&mounted_uri_template)
+                {
+                    Ok(admitted) => admitted,
+                    Err(error) => {
+                        result.errors.push(format!(
+                            "Mount rejected resource template; template_key={}; code={:?}",
+                            safe_log_label(&mounted_uri_template),
+                            error.code
+                        ));
+                        continue;
+                    }
+                };
                 let mounted_entry = ResourceTemplateEntry {
-                    matcher: UriTemplate::new(&mounted_uri_template),
+                    matcher,
+                    specificity,
                     template: mounted_template,
                     handler: mounted_handler,
                 };
@@ -4536,436 +4974,38 @@ struct ResolvedResource<'a> {
 
 /// Entry for a resource template with its matcher and optional handler.
 pub(crate) struct ResourceTemplateEntry {
-    pub(crate) matcher: UriTemplate,
+    pub(crate) matcher: ReversibleResourceTemplate,
+    specificity: (usize, usize, usize),
     pub(crate) template: ResourceTemplate,
     pub(crate) handler: Option<BoxedResourceHandler>,
 }
 
-/// A parsed URI template for matching resource URIs.
-#[derive(Debug, Clone)]
-pub(crate) struct UriTemplate {
-    pattern: String,
-    segments: Vec<UriSegment>,
+/// Parses a resource template with the canonical RFC 6570 implementation and
+/// admits only templates the protocol can reverse-match exactly for routing.
+fn admit_resource_template(
+    source: &str,
+) -> McpResult<(ReversibleResourceTemplate, (usize, usize, usize))> {
+    let template = fastmcp_protocol::UriTemplate::parse(source)
+        .map_err(|_| McpError::invalid_params("resource template is not valid RFC 6570"))?;
+    let specificity = resource_template_specificity(&template);
+    let matcher = template.compile_reversible().map_err(|_| {
+        McpError::invalid_params("resource template cannot be matched reversibly")
+    })?;
+    Ok((matcher, specificity))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum UriTemplateError {
-    UnclosedParam,
-    UnmatchedClose,
-    EmptyParam,
-    UnsupportedOperator,
-    InvalidParamName,
-    DuplicateParam(String),
-    TooComplex,
-}
-
-impl UriTemplateError {
-    const fn log_class(&self) -> &'static str {
-        match self {
-            Self::UnclosedParam => "unclosed_parameter",
-            Self::UnmatchedClose => "unmatched_close",
-            Self::EmptyParam => "empty_parameter",
-            Self::UnsupportedOperator => "unsupported_operator",
-            Self::InvalidParamName => "invalid_parameter_name",
-            Self::DuplicateParam(_) => "duplicate_parameter",
-            Self::TooComplex => "too_complex",
+fn resource_template_specificity(
+    template: &fastmcp_protocol::UriTemplate,
+) -> (usize, usize, usize) {
+    let mut literal_bytes = 0usize;
+    let mut literal_parts = 0usize;
+    for part in template.parts() {
+        if let fastmcp_protocol::UriTemplatePart::Literal(literal) = part {
+            literal_bytes = literal_bytes.saturating_add(literal.len());
+            literal_parts = literal_parts.saturating_add(1);
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UriExpansion {
-    Simple,
-    Reserved,
-}
-
-#[derive(Debug, Clone)]
-enum UriSegment {
-    Literal(String),
-    Param {
-        name: String,
-        expansion: UriExpansion,
-    },
-}
-
-// Matching an interior reserved expansion may require trying more than one
-// occurrence of its following literal. Bound recursion, input bytes, literal
-// scans, capture validation, decoding, and aggregate split work so an
-// adversarial URI cannot turn template matching into unbounded work.
-const MAX_URI_TEMPLATE_MATCH_SEGMENTS: usize = 256;
-const MAX_URI_TEMPLATE_INPUT_BYTES: usize = 64 * 1_024;
-const MAX_URI_TEMPLATE_MATCH_WORK_BYTES: usize = 1_024 * 1_024;
-const MAX_URI_TEMPLATE_SPLIT_ATTEMPTS: usize = 4_096;
-
-impl UriTemplate {
-    /// Creates a new URI template from a pattern.
-    ///
-    /// If the pattern is invalid, logs a warning and returns a template
-    /// that will never match any URI (fail-safe behavior).
-    fn new(pattern: &str) -> Self {
-        Self::try_new(pattern).unwrap_or_else(|err| {
-            fastmcp_core::logging::warn!(
-                target: targets::HANDLER,
-                "invalid URI template; template_key={}; error_class={}; using non-matching fallback",
-                safe_log_label(pattern),
-                err.log_class()
-            );
-            // Return a template with no segments that can never match
-            Self {
-                pattern: pattern.to_string(),
-                segments: vec![UriSegment::Literal("\0INVALID\0".to_string())],
-            }
-        })
-    }
-
-    /// Attempts to create a URI template, returning an error if invalid.
-    fn try_new(pattern: &str) -> Result<Self, UriTemplateError> {
-        Self::parse(pattern)
-    }
-
-    fn parse(pattern: &str) -> Result<Self, UriTemplateError> {
-        let mut segments = Vec::new();
-        let mut literal = String::new();
-        let mut chars = pattern.chars().peekable();
-        let mut seen = std::collections::HashSet::new();
-
-        while let Some(ch) = chars.next() {
-            match ch {
-                '{' => {
-                    if matches!(chars.peek(), Some('{')) {
-                        let _ = chars.next();
-                        literal.push('{');
-                        continue;
-                    }
-
-                    if !literal.is_empty() {
-                        segments.push(UriSegment::Literal(std::mem::take(&mut literal)));
-                        if segments.len() > MAX_URI_TEMPLATE_MATCH_SEGMENTS {
-                            return Err(UriTemplateError::TooComplex);
-                        }
-                    }
-
-                    let mut expression = String::new();
-                    let mut closed = false;
-                    for next in chars.by_ref() {
-                        if next == '}' {
-                            closed = true;
-                            break;
-                        }
-                        expression.push(next);
-                    }
-
-                    if !closed {
-                        return Err(UriTemplateError::UnclosedParam);
-                    }
-
-                    if expression.is_empty() {
-                        return Err(UriTemplateError::EmptyParam);
-                    }
-
-                    let (expansion, name) = match expression.as_bytes().first().copied() {
-                        Some(b'+') => (UriExpansion::Reserved, &expression[1..]),
-                        Some(b'#' | b'.' | b'/' | b';' | b'?' | b'&') => {
-                            return Err(UriTemplateError::UnsupportedOperator);
-                        }
-                        Some(_) => (UriExpansion::Simple, expression.as_str()),
-                        None => return Err(UriTemplateError::EmptyParam),
-                    };
-
-                    if name.is_empty() {
-                        return Err(UriTemplateError::EmptyParam);
-                    }
-                    if !is_valid_uri_variable_name(name) {
-                        return Err(UriTemplateError::InvalidParamName);
-                    }
-                    if !seen.insert(name.to_string()) {
-                        return Err(UriTemplateError::DuplicateParam(name.to_string()));
-                    }
-                    segments.push(UriSegment::Param {
-                        name: name.to_string(),
-                        expansion,
-                    });
-                    if segments.len() > MAX_URI_TEMPLATE_MATCH_SEGMENTS {
-                        return Err(UriTemplateError::TooComplex);
-                    }
-                }
-                '}' => {
-                    if matches!(chars.peek(), Some('}')) {
-                        let _ = chars.next();
-                        literal.push('}');
-                        continue;
-                    }
-                    return Err(UriTemplateError::UnmatchedClose);
-                }
-                _ => literal.push(ch),
-            }
-        }
-
-        if !literal.is_empty() {
-            segments.push(UriSegment::Literal(literal));
-            if segments.len() > MAX_URI_TEMPLATE_MATCH_SEGMENTS {
-                return Err(UriTemplateError::TooComplex);
-            }
-        }
-
-        Ok(Self {
-            pattern: pattern.to_string(),
-            segments,
-        })
-    }
-
-    fn specificity(&self) -> (usize, usize, usize) {
-        let mut literal_len = 0usize;
-        let mut literal_segments = 0usize;
-        for segment in &self.segments {
-            if let UriSegment::Literal(lit) = segment {
-                literal_len += lit.len();
-                literal_segments += 1;
-            }
-        }
-        (literal_len, literal_segments, self.segments.len())
-    }
-
-    fn matches(&self, uri: &str) -> Option<UriParams> {
-        if self.segments.len() > MAX_URI_TEMPLATE_MATCH_SEGMENTS
-            || uri.len() > MAX_URI_TEMPLATE_INPUT_BYTES
-        {
-            return None;
-        }
-
-        let mut captures = Vec::new();
-        captures.try_reserve(self.segments.len()).ok()?;
-        let mut split_attempts = 0usize;
-        let mut remaining_work = MAX_URI_TEMPLATE_MATCH_WORK_BYTES;
-        match_uri_segments(
-            &self.segments,
-            0,
-            uri,
-            0,
-            &mut captures,
-            &mut split_attempts,
-            &mut remaining_work,
-        )
-    }
-}
-
-fn match_uri_segments<'template, 'uri>(
-    segments: &'template [UriSegment],
-    segment_index: usize,
-    uri: &'uri str,
-    offset: usize,
-    captures: &mut Vec<(&'template str, &'uri str)>,
-    split_attempts: &mut usize,
-    remaining_work: &mut usize,
-) -> Option<UriParams> {
-    let Some(segment) = segments.get(segment_index) else {
-        if offset != uri.len() {
-            return None;
-        }
-
-        // Delay decoding and allocation until a complete structural match is
-        // found. Failed backtracking candidates therefore retain only slices
-        // into the pattern and input URI.
-        let mut params = UriParams::new();
-        params.try_reserve(captures.len()).ok()?;
-        for &(name, raw_value) in captures.iter() {
-            consume_uri_template_match_work(remaining_work, raw_value.len())?;
-            params.insert(name.to_string(), percent_decode(raw_value)?);
-        }
-        return Some(params);
-    };
-
-    let remainder = uri.get(offset..)?;
-    match segment {
-        UriSegment::Literal(literal) => {
-            consume_uri_template_match_work(remaining_work, literal.len())?;
-            remainder.strip_prefix(literal)?;
-            match_uri_segments(
-                segments,
-                segment_index + 1,
-                uri,
-                offset.checked_add(literal.len())?,
-                captures,
-                split_attempts,
-                remaining_work,
-            )
-        }
-        UriSegment::Param { name, expansion } => match segments.get(segment_index + 1) {
-            Some(UriSegment::Param { .. }) => None,
-            Some(UriSegment::Literal(literal)) => {
-                // Try delimiters from right to left. Reserved expansions are
-                // greedy, but a later delimiter may make the remaining
-                // template impossible, so retain bounded backtracking.
-                consume_uri_template_match_work(remaining_work, remainder.len())?;
-                for (delimiter_offset, _) in remainder.rmatch_indices(literal.as_str()) {
-                    *split_attempts = split_attempts.checked_add(1)?;
-                    if *split_attempts > MAX_URI_TEMPLATE_SPLIT_ATTEMPTS {
-                        return None;
-                    }
-
-                    let raw_value = &remainder[..delimiter_offset];
-                    if raw_value.is_empty() {
-                        continue;
-                    }
-                    consume_uri_template_match_work(remaining_work, raw_value.len())?;
-                    if !raw_capture_is_valid(raw_value, *expansion) {
-                        continue;
-                    }
-
-                    captures.push((name.as_str(), raw_value));
-                    let matched = match_uri_segments(
-                        segments,
-                        segment_index + 1,
-                        uri,
-                        offset.checked_add(delimiter_offset)?,
-                        captures,
-                        split_attempts,
-                        remaining_work,
-                    );
-                    captures.pop();
-                    if matched.is_some() {
-                        return matched;
-                    }
-                }
-                None
-            }
-            None => {
-                if remainder.is_empty() {
-                    return None;
-                }
-                consume_uri_template_match_work(remaining_work, remainder.len())?;
-                if !raw_capture_is_valid(remainder, *expansion) {
-                    return None;
-                }
-
-                captures.push((name.as_str(), remainder));
-                let matched = match_uri_segments(
-                    segments,
-                    segment_index + 1,
-                    uri,
-                    uri.len(),
-                    captures,
-                    split_attempts,
-                    remaining_work,
-                );
-                captures.pop();
-                matched
-            }
-        },
-    }
-}
-
-fn consume_uri_template_match_work(remaining_work: &mut usize, bytes: usize) -> Option<()> {
-    *remaining_work = (*remaining_work).checked_sub(bytes)?;
-    Some(())
-}
-
-/// Validates the raw character grammar for the supported RFC 6570 expansion
-/// subset. Simple expansions admit only unreserved ASCII or valid `%HH`
-/// triplets; reserved expansions additionally admit RFC 3986 reserved ASCII.
-fn raw_capture_is_valid(raw: &str, expansion: UriExpansion) -> bool {
-    let bytes = raw.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == b'%' {
-            if index + 2 >= bytes.len()
-                || from_hex(bytes[index + 1]).is_none()
-                || from_hex(bytes[index + 2]).is_none()
-            {
-                return false;
-            }
-            index += 3;
-            continue;
-        }
-
-        if is_uri_unreserved(byte) || (expansion == UriExpansion::Reserved && is_uri_reserved(byte))
-        {
-            index += 1;
-            continue;
-        }
-        return false;
-    }
-    true
-}
-
-const fn is_uri_unreserved(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
-}
-
-const fn is_uri_reserved(byte: u8) -> bool {
-    matches!(
-        byte,
-        b':' | b'/'
-            | b'?'
-            | b'#'
-            | b'['
-            | b']'
-            | b'@'
-            | b'!'
-            | b'$'
-            | b'&'
-            | b'\''
-            | b'('
-            | b')'
-            | b'*'
-            | b'+'
-            | b','
-            | b';'
-            | b'='
-    )
-}
-
-/// Validates the unencoded ASCII subset of an RFC 6570 variable name.
-///
-/// A variable name is one or more non-empty dot-separated components made up
-/// of ASCII letters, digits, or `_`. Percent-encoded names, variable lists,
-/// explode modifiers, and prefix modifiers are intentionally outside the
-/// narrow template subset implemented by this matcher.
-fn is_valid_uri_variable_name(name: &str) -> bool {
-    name.split('.').all(|component| {
-        !component.is_empty()
-            && component
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    })
-}
-
-fn percent_decode(input: &str) -> Option<String> {
-    if !input.as_bytes().contains(&b'%') {
-        return Some(input.to_string());
-    }
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' => {
-                if i + 2 >= bytes.len() {
-                    return None;
-                }
-                let hi = bytes[i + 1];
-                let lo = bytes[i + 2];
-                let value = (from_hex(hi)? << 4) | from_hex(lo)?;
-                out.push(value);
-                i += 3;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn from_hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    (literal_bytes, literal_parts, template.parts().len())
 }
 
 // ============================================================================
@@ -5345,7 +5385,7 @@ impl ToolCaller for RouterToolCaller {
 
 #[cfg(test)]
 mod safe_log_label_tests {
-    use super::{LOG_LABEL_HASH_INPUT_LIMIT, UriTemplateError, safe_log_label};
+    use super::{LOG_LABEL_HASH_INPUT_LIMIT, safe_log_label};
 
     #[test]
     fn safe_label_is_deterministic_non_verbatim_metadata() {
@@ -5371,16 +5411,6 @@ mod safe_log_label_tests {
     }
 
     #[test]
-    fn uri_template_error_log_class_never_exposes_parameter() {
-        let canary = "template-parameter-canary-secret";
-        let error = UriTemplateError::DuplicateParam(canary.to_string());
-        let class = error.log_class();
-
-        assert_eq!(class, "duplicate_parameter");
-        assert!(!class.contains(canary));
-    }
-
-    #[test]
     fn source_has_no_verbatim_argument_or_label_log_formats() {
         let source = include_str!("router.rs");
         let forbidden = [
@@ -5400,7 +5430,7 @@ mod safe_log_label_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod uri_template_tests {
     use super::{
         MAX_URI_TEMPLATE_INPUT_BYTES, MAX_URI_TEMPLATE_MATCH_SEGMENTS, UriTemplate,
@@ -5803,7 +5833,7 @@ mod uri_template_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod percent_decode_tests {
     use super::{from_hex, percent_decode};
 
@@ -5950,6 +5980,7 @@ mod tag_filter_tests {
 #[cfg(test)]
 mod router_tests {
     use super::*;
+    use crate::bidirectional::MrtrInputResponse;
     use crate::handler::{CompletionHandler, PromptHandler, ResourceHandler, ToolHandler};
     use crate::tasks::{
         ApplicationTaskSupervisor, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
@@ -5964,9 +5995,10 @@ mod router_tests {
         Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
     };
     use fastmcp_protocol::{
-        CompleteResult, CompletionValues, Content, FinalCallToolResult, FinalCompletionParams,
-        FinalGetPromptResult, FinalPromptMessage, LegacyCompletionParams, LegacyResourceContent,
-        Prompt, PromptArgument, PromptMessage, Resource, ResourceContent, ResourceTemplate, Tool,
+        CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy, DecodedResult,
+        FinalCallToolResult, FinalCompletionParams, FinalGetPromptResult, FinalPromptMessage,
+        LegacyCompletionParams, LegacyResourceContent, Prompt, PromptArgument, PromptMessage,
+        Resource, ResourceContent, ResourceTemplate, ResultPeerEra, Tool, decode_peer_result,
     };
     use std::collections::BTreeMap;
     use std::fmt;
@@ -7106,13 +7138,32 @@ mod router_tests {
         }
     }
 
-    fn input_required_result(request_state: &str) -> InputRequiredResult {
-        InputRequiredResult::new(
-            None,
-            Some(request_state.to_owned()),
-            empty_final_result_meta().expect("empty final metadata is valid"),
+    fn input_required_result(forged_request_state: &str) -> InputRequiredResult {
+        let encoded = serde_json::json!({
+            "resultType": "input_required",
+            "inputRequests": {"roots": {"method": "roots/list"}},
+            "requestState": forged_request_state,
+        })
+        .to_string();
+        let (decoded, diagnostic) = decode_peer_result(
+            &encoded,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
         )
-        .expect("request state makes the final input-required result valid")
+        .expect("test input-required result decodes");
+        assert!(diagnostic.is_none());
+        let DecodedResult::InputRequired(result) = decoded else {
+            panic!("test result is input_required");
+        };
+        result
+    }
+
+    fn router_roots_response_wire() -> serde_json::Value {
+        serde_json::to_value(
+            MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
+                .expect("roots response serializes"),
+        )
+        .expect("roots response converts to a wire value")
     }
 
     struct InputRequiredTool {
@@ -7147,6 +7198,66 @@ mod router_tests {
             self.final_calls.fetch_add(1, Ordering::SeqCst);
             Ok(FinalToolOutcome::InputRequired(input_required_result(
                 "tool-retry-state",
+            )))
+        }
+
+        fn call_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            arguments: serde_json::Value,
+            resume_inputs: Option<&'a MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+            Box::pin(async move {
+                let Some(resume_inputs) = resume_inputs else {
+                    return Outcome::Err(McpError::internal_error("MRTR resume inputs were lost"));
+                };
+                match resume_inputs.roots("roots") {
+                    Ok(Some(_)) => match self.call_final_outcome(ctx, arguments) {
+                        Ok(result) => Outcome::Ok(result),
+                        Err(error) => Outcome::Err(error),
+                    },
+                    Ok(None) => Outcome::Err(McpError::internal_error("MRTR roots input was lost")),
+                    Err(error) => Outcome::Err(error),
+                }
+            })
+        }
+    }
+
+    struct TaskCapableInputRequiredTool {
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for TaskCapableInputRequiredTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "task-capable-input-required-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn declares_final_tasks(&self) -> bool {
+            true
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("legacy task-capable input-required result")])
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalToolOutcome::InputRequired(input_required_result(
+                "task-capable-tool-retry-state",
             )))
         }
     }
@@ -7188,6 +7299,29 @@ mod router_tests {
                 "resource-retry-state",
             )))
         }
+
+        fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            _uri: &'a str,
+            _params: &'a UriParams,
+            resume_inputs: Option<&'a MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+            Box::pin(async move {
+                let Some(resume_inputs) = resume_inputs else {
+                    return Outcome::Err(McpError::internal_error("MRTR resume inputs were lost"));
+                };
+                match resume_inputs.roots("roots") {
+                    Ok(Some(_)) => match self.read_final_outcome(ctx) {
+                        Ok(result) => Outcome::Ok(result),
+                        Err(error) => Outcome::Err(error),
+                    },
+                    Ok(None) => Outcome::Err(McpError::internal_error("MRTR roots input was lost")),
+                    Err(error) => Outcome::Err(error),
+                }
+            })
+        }
     }
 
     struct InputRequiredPrompt {
@@ -7225,6 +7359,28 @@ mod router_tests {
             Ok(FinalMethodOutcome::InputRequired(input_required_result(
                 "prompt-retry-state",
             )))
+        }
+
+        fn get_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            arguments: std::collections::HashMap<String, String>,
+            resume_inputs: Option<&'a MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+            Box::pin(async move {
+                let Some(resume_inputs) = resume_inputs else {
+                    return Outcome::Err(McpError::internal_error("MRTR resume inputs were lost"));
+                };
+                match resume_inputs.roots("roots") {
+                    Ok(Some(_)) => match self.get_final_outcome(ctx, arguments) {
+                        Ok(result) => Outcome::Ok(result),
+                        Err(error) => Outcome::Err(error),
+                    },
+                    Ok(None) => Outcome::Err(McpError::internal_error("MRTR roots input was lost")),
+                    Err(error) => Outcome::Err(error),
+                }
+            })
         }
     }
 
@@ -7353,10 +7509,10 @@ mod router_tests {
             &self,
             _ctx: &McpContext,
             params: FinalCompletionParams,
-        ) -> McpResult<CompletionValues> {
-            Ok(CompletionValues {
+        ) -> McpResult<FinalCompletionValues> {
+            Ok(FinalCompletionValues {
                 values: vec![format!("{}ging", params.argument.value)],
-                total: Some(1),
+                total: Some(fastmcp_protocol::JsonInteger::from(1_i64)),
                 has_more: Some(false),
             })
         }
@@ -11851,9 +12007,10 @@ mod router_tests {
     }
 
     #[test]
-    fn final_completion_resource_reference_requires_registered_template() {
+    fn final_completion_resource_reference_accepts_static_and_template_resources() {
         let mut router = Router::new();
         router.add_completion_handler(EchoCompletion);
+        router.add_resource(NamedResource::new("resource://static"));
         router.add_resource_template(marked_template("resource://{id}", "registered"));
         let cx = Cx::for_testing();
         let state = SessionState::new();
@@ -11870,13 +12027,26 @@ mod router_tests {
             })),
             188_i64,
         );
-        let catalog_before = serde_json::to_vec(&router.resource_templates())
+        let templates_before = serde_json::to_vec(&router.resource_templates())
             .expect("resource-template catalog serializes");
-        let accepted = router
+        let template_accepted = router
             .dispatch_stateless(&request_ctx, &baseline)
             .expect("a registered final resource-template reference is accepted");
 
-        let mut planted = baseline.clone();
+        let mut static_reference = baseline.clone();
+        static_reference
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("ref"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion reference is an object")
+            .insert("uri".to_owned(), serde_json::json!("resource://static"));
+        let static_accepted = router
+            .dispatch_stateless(&request_ctx, &static_reference)
+            .expect("a registered final static resource reference is accepted");
+
+        let mut planted = static_reference.clone();
         planted
             .params
             .as_mut()
@@ -11884,23 +12054,141 @@ mod router_tests {
             .and_then(|params| params.get_mut("ref"))
             .and_then(serde_json::Value::as_object_mut)
             .expect("completion reference is an object")
-            .insert("uri".to_owned(), serde_json::json!("resource://{other}"));
+            .insert("uri".to_owned(), serde_json::json!("resource://missing"));
         let error = router
             .dispatch_stateless(&request_ctx, &planted)
-            .expect_err("an otherwise identical unregistered template is refused");
+            .expect_err("changing only the resource URI to an unregistered value is refused");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(
             serde_json::to_vec(&router.resource_templates())
                 .expect("resource-template catalog serializes after refusal"),
-            catalog_before,
+            templates_before,
             "completion reference refusal cannot mutate the registered catalog"
         );
         assert_eq!(
             router
                 .dispatch_stateless(&request_ctx, &baseline)
                 .expect("the registered reference remains accepted after refusal"),
-            accepted,
+            template_accepted,
             "the planted URI is the only changed observable"
+        );
+        assert_eq!(
+            router
+                .dispatch_stateless(&request_ctx, &static_reference)
+                .expect("the registered static resource remains accepted after refusal"),
+            static_accepted,
+            "the planted URI is the only changed observable"
+        );
+    }
+
+    #[test]
+    fn resource_template_registration_uses_the_protocol_rfc6570_matcher() {
+        struct LevelFourTemplateResource;
+
+        impl ResourceHandler for LevelFourTemplateResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "mcp://resource/template".to_owned(),
+                    name: "level-four-template".to_owned(),
+                    description: None,
+                    mime_type: Some("text/plain".to_owned()),
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                }
+            }
+
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(marked_template(
+                    "mcp://resource{/collection}/manifest{?revision}",
+                    "level-four-template",
+                ))
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                unreachable!("templated reads receive their URI parameters")
+            }
+
+            fn read_with_uri(
+                &self,
+                _ctx: &McpContext,
+                uri: &str,
+                params: &UriParams,
+            ) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![ResourceContent {
+                    uri: uri.to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    text: Some(format!(
+                        "{}:{}",
+                        params.get("collection").expect("collection is captured"),
+                        params.get("revision").expect("revision is captured")
+                    )),
+                    blob: None,
+                }])
+            }
+        }
+
+        struct AmbiguousTemplateResource;
+
+        impl ResourceHandler for AmbiguousTemplateResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "mcp://resource/ambiguous".to_owned(),
+                    name: "ambiguous-template".to_owned(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                }
+            }
+
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(marked_template("mcp://resource/{first}{second}", "ambiguous"))
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let mut router = Router::new();
+        router
+            .add_resource_with_behavior(
+                LevelFourTemplateResource,
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("a reversible level-four template is admitted");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 189, Budget::INFINITE, &state);
+        let result = router
+            .handle_resources_read(
+                &request_ctx,
+                &fastmcp_protocol::ReadResourceParams {
+                    uri: "mcp://resource/books/manifest?revision=stable".to_owned(),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("the canonical matcher reaches the registered handler");
+        let wire = serde_json::to_value(result).expect("resource result serializes");
+        assert_eq!(wire["contents"][0]["text"], "books:stable");
+
+        let template_count = router.resource_templates_count();
+        let error = router
+            .add_resource_with_behavior(
+                AmbiguousTemplateResource,
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect_err("changing only the adjacent scalar boundary remains ambiguous");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            router.resource_templates_count(),
+            template_count,
+            "rejected template admission cannot mutate the registered catalog"
         );
     }
 
@@ -13305,12 +13593,16 @@ mod router_tests {
             .dispatch_stateless(&request_ctx, &tool_request)
             .expect("public final tools/call dispatch encodes input_required");
         assert_eq!(tool_response["resultType"], "input_required");
-        assert_eq!(tool_response["requestState"], "tool-retry-state");
+        assert_ne!(tool_response["requestState"], "tool-retry-state");
+        assert_eq!(
+            tool_response["inputRequests"]["roots"]["method"],
+            "roots/list"
+        );
         let tool_wire = serde_json::to_string(&tool_response).expect("tool response serializes");
         assert!(matches!(
             tool_typed.decode_result(&tool_wire),
             Ok(CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }))
-                if result.request_state() == Some("tool-retry-state")
+                if result.request_state().is_some()
         ));
 
         let resource_request = JsonRpcRequest::new(
@@ -13331,13 +13623,17 @@ mod router_tests {
             .dispatch_stateless(&request_ctx, &resource_request)
             .expect("public final resources/read dispatch encodes input_required");
         assert_eq!(resource_response["resultType"], "input_required");
-        assert_eq!(resource_response["requestState"], "resource-retry-state");
+        assert_ne!(resource_response["requestState"], "resource-retry-state");
+        assert_eq!(
+            resource_response["inputRequests"]["roots"]["method"],
+            "roots/list"
+        );
         let resource_wire =
             serde_json::to_string(&resource_response).expect("resource response serializes");
         assert!(matches!(
             resource_typed.decode_result(&resource_wire),
             Ok(CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }))
-                if result.request_state() == Some("resource-retry-state")
+                if result.request_state().is_some()
         ));
 
         let prompt_request = JsonRpcRequest::new(
@@ -13358,13 +13654,17 @@ mod router_tests {
             .dispatch_stateless(&request_ctx, &prompt_request)
             .expect("public final prompts/get dispatch encodes input_required");
         assert_eq!(prompt_response["resultType"], "input_required");
-        assert_eq!(prompt_response["requestState"], "prompt-retry-state");
+        assert_ne!(prompt_response["requestState"], "prompt-retry-state");
+        assert_eq!(
+            prompt_response["inputRequests"]["roots"]["method"],
+            "roots/list"
+        );
         let prompt_wire =
             serde_json::to_string(&prompt_response).expect("prompt response serializes");
         assert!(matches!(
             prompt_typed.decode_result(&prompt_wire),
             Ok(CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }))
-                if result.request_state() == Some("prompt-retry-state")
+                if result.request_state().is_some()
         ));
 
         assert_eq!(tool_legacy_calls.load(Ordering::SeqCst), 0);
@@ -13373,6 +13673,406 @@ mod router_tests {
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(resource_final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn modern_mrtr_retries_resume_each_method_once_and_refuse_replay_or_kind_mismatch() {
+        let tool_final_calls = Arc::new(AtomicUsize::new(0));
+        let resource_final_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(InputRequiredTool {
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::clone(&tool_final_calls),
+            })
+            .expect("tool registration succeeds");
+        router.add_resource(InputRequiredResource {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&resource_final_calls),
+        });
+        router.add_prompt(InputRequiredPrompt {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&prompt_final_calls),
+        });
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 145, Budget::INFINITE, &state);
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+
+        let tool_initial = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "name": "input-required-tool",
+                "arguments": {},
+            })),
+            145_i64,
+        );
+        let tool_initial_result = router
+            .dispatch_stateless(&request_ctx, &tool_initial)
+            .expect("normal final dispatch mints the tool request state");
+        let tool_state = tool_initial_result["requestState"]
+            .as_str()
+            .expect("framework result carries opaque tool state")
+            .to_owned();
+        let tool_retry = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "name": "input-required-tool",
+                "arguments": {},
+                "inputResponses": {"roots": router_roots_response_wire()},
+                "requestState": tool_state,
+            })),
+            145_i64,
+        );
+        let mut kind_mismatch = tool_retry.clone();
+        kind_mismatch
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("inputResponses"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("tool retry contains an inputResponses object")
+            .insert(
+                "roots".to_owned(),
+                serde_json::to_value(
+                    MrtrInputResponse::sampling(fastmcp_protocol::CreateMessageResult::text(
+                        "not roots",
+                        "test-model",
+                    ))
+                    .expect("sampling response serializes"),
+                )
+                .expect("sampling response converts to a wire value"),
+            );
+        let kind_error = router
+            .dispatch_stateless(&request_ctx, &kind_mismatch)
+            .expect_err("changing only the response kind is refused before handler invocation");
+        assert_eq!(kind_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            tool_final_calls.load(Ordering::SeqCst),
+            1,
+            "a wrong-kind retry must leave the matching state unconsumed"
+        );
+
+        let mut unknown_only = tool_retry.clone();
+        *unknown_only
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("inputResponses"))
+            .expect("tool retry contains inputResponses") = serde_json::json!({"inert": null});
+        let unknown_error = router
+            .dispatch_stateless(&request_ctx, &unknown_only)
+            .expect_err("unknown-only inputResponses cannot consume a tool continuation");
+        assert_eq!(unknown_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+
+        let mut oversized_map = tool_retry.clone();
+        let responses = oversized_map
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("inputResponses"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("tool retry contains an inputResponses object");
+        for index in 0..crate::bidirectional::DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND {
+            responses.insert(format!("inert-{index}"), serde_json::Value::Null);
+        }
+        let oversized_error = router
+            .dispatch_stateless(&request_ctx, &oversized_map)
+            .expect_err("an oversized raw response map is refused before retry decoding");
+        assert_eq!(oversized_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+
+        let mut tool_oversized_bytes = tool_retry.clone();
+        tool_oversized_bytes
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("inputResponses"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("tool retry contains an inputResponses object")
+            .insert(
+                "roots".to_owned(),
+                serde_json::Value::String("x".repeat(MAX_MRTR_RAW_INPUT_RESPONSES_BYTES + 1)),
+            );
+        let tool_bytes_error = router
+            .dispatch_stateless(&request_ctx, &tool_oversized_bytes)
+            .expect_err("only an oversized tool response value is refused before retry decoding");
+        assert_eq!(tool_bytes_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+
+        let mut target_mismatch = tool_retry.clone();
+        target_mismatch
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("tool retry parameters are an object")
+            .insert("name".to_owned(), serde_json::json!("other-tool"));
+        let target_error = router
+            .dispatch_stateless(&request_ctx, &target_mismatch)
+            .expect_err("changing only the target cannot consume a tool state");
+        assert_eq!(target_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+
+        let other_session = SessionState::new();
+        let other_session_ctx = request_context(&cx, 145, Budget::INFINITE, &other_session);
+        let session_error = router
+            .dispatch_stateless(&other_session_ctx, &tool_retry)
+            .expect_err("changing only the session cannot consume a tool state");
+        assert_eq!(session_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+
+        let principal_ctx = request_context(&cx, 145, Budget::INFINITE, &state);
+        assert!(principal_ctx.set_auth(fastmcp_core::AuthContext::with_subject("other-user")));
+        let principal_error = router
+            .dispatch_stateless(&principal_ctx, &tool_retry)
+            .expect_err("changing only the principal cannot consume a tool state");
+        assert_eq!(principal_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+
+        let tool_response = router
+            .dispatch_stateless(&request_ctx, &tool_retry)
+            .expect("a framework-minted tool state resumes through the final handler");
+        assert_eq!(tool_response["resultType"], "input_required");
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 2);
+
+        let resource_initial = JsonRpcRequest::new(
+            "resources/read",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "uri": "file:///input-required-resource",
+            })),
+            146_i64,
+        );
+        let resource_initial_result = router
+            .dispatch_stateless(&request_ctx, &resource_initial)
+            .expect("normal final dispatch mints the resource request state");
+        let resource_state = resource_initial_result["requestState"]
+            .as_str()
+            .expect("framework result carries opaque resource state")
+            .to_owned();
+        let resource_retry = JsonRpcRequest::new(
+            "resources/read",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "uri": "file:///input-required-resource",
+                "inputResponses": {"roots": router_roots_response_wire()},
+                "requestState": resource_state,
+            })),
+            146_i64,
+        );
+        let mut resource_unknown_only = resource_retry.clone();
+        *resource_unknown_only
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("inputResponses"))
+            .expect("resource retry contains inputResponses") = serde_json::json!({"inert": null});
+        let resource_unknown_error = router
+            .dispatch_stateless(&request_ctx, &resource_unknown_only)
+            .expect_err("unknown-only inputResponses cannot consume a resource continuation");
+        assert_eq!(resource_unknown_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(resource_final_calls.load(Ordering::SeqCst), 1);
+
+        let mut resource_nested_value = serde_json::Value::Null;
+        for _ in 0..=MAX_MRTR_RAW_JSON_DEPTH {
+            resource_nested_value = serde_json::Value::Array(vec![resource_nested_value]);
+        }
+        let mut resource_oversized_depth = resource_retry.clone();
+        resource_oversized_depth
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("inputResponses"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("resource retry contains an inputResponses object")
+            .insert("roots".to_owned(), resource_nested_value);
+        let resource_depth_error = router
+            .dispatch_stateless(&request_ctx, &resource_oversized_depth)
+            .expect_err("only excessive response nesting is refused before retry decoding");
+        assert_eq!(resource_depth_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(resource_final_calls.load(Ordering::SeqCst), 1);
+
+        let resource_response = router
+            .dispatch_stateless(&request_ctx, &resource_retry)
+            .expect("a framework-minted resource state resumes through the final handler");
+        assert_eq!(resource_response["resultType"], "input_required");
+        assert_eq!(resource_final_calls.load(Ordering::SeqCst), 2);
+
+        let prompt_initial = JsonRpcRequest::new(
+            "prompts/get",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "name": "input-required-prompt",
+            })),
+            147_i64,
+        );
+        let prompt_initial_result = router
+            .dispatch_stateless(&request_ctx, &prompt_initial)
+            .expect("normal final dispatch mints the prompt request state");
+        let prompt_state = prompt_initial_result["requestState"]
+            .as_str()
+            .expect("framework result carries opaque prompt state")
+            .to_owned();
+        let prompt_retry = JsonRpcRequest::new(
+            "prompts/get",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "name": "input-required-prompt",
+                "inputResponses": {"roots": router_roots_response_wire()},
+                "requestState": prompt_state,
+            })),
+            147_i64,
+        );
+        let mut prompt_unknown_only = prompt_retry.clone();
+        *prompt_unknown_only
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("inputResponses"))
+            .expect("prompt retry contains inputResponses") = serde_json::json!({"inert": null});
+        let prompt_unknown_error = router
+            .dispatch_stateless(&request_ctx, &prompt_unknown_only)
+            .expect_err("unknown-only inputResponses cannot consume a prompt continuation");
+        assert_eq!(prompt_unknown_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
+
+        let mut prompt_oversized_values = prompt_retry.clone();
+        prompt_oversized_values
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("inputResponses"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("prompt retry contains an inputResponses object")
+            .insert(
+                "roots".to_owned(),
+                serde_json::Value::Array(vec![serde_json::Value::Null; MAX_MRTR_RAW_JSON_VALUES]),
+            );
+        let prompt_values_error = router
+            .dispatch_stateless(&request_ctx, &prompt_oversized_values)
+            .expect_err(
+                "only an oversized prompt response value set is refused before retry decoding",
+            );
+        assert_eq!(prompt_values_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
+
+        let prompt_response = router
+            .dispatch_stateless(&request_ctx, &prompt_retry)
+            .expect("a framework-minted prompt state resumes through the final handler");
+        assert_eq!(prompt_response["resultType"], "input_required");
+        assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 2);
+
+        let replay = router
+            .dispatch_stateless(&request_ctx, &tool_retry)
+            .expect_err("replaying only the already consumed tool state is refused");
+        assert_eq!(replay.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            tool_final_calls.load(Ordering::SeqCst),
+            2,
+            "replay must fail before the tool handler is invoked again"
+        );
+    }
+
+    #[test]
+    fn task_capability_metadata_rejection_preserves_the_mrtr_continuation() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = task_runtime_for_router(Arc::clone(&store));
+        let service_runner = runtime
+            .install_task_service(1, Arc::new(NoopFinalTaskSupervisor))
+            .expect("a bounded application-owned task service is installed");
+        let service_cx = Cx::for_testing();
+        let mut running_service = Box::pin(service_runner.run(&service_cx));
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(running_service.as_mut(), &mut task_cx),
+            Poll::Pending
+        ));
+
+        let mut router = Router::new();
+        router.set_final_task_runtime(Some(runtime));
+        router
+            .add_tool(TaskCapableInputRequiredTool {
+                final_calls: Arc::clone(&final_calls),
+            })
+            .expect("task-capable input-required tool registration succeeds");
+        let cx = Cx::for_testing();
+        let session_state = SessionState::new();
+        let request_ctx = request_context(&cx, 148, Budget::INFINITE, &session_state);
+        let task_metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            },
+        });
+
+        let initial = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": task_metadata.clone(),
+                "name": "task-capable-input-required-tool",
+                "arguments": {},
+            })),
+            148_i64,
+        );
+        let initial_result = router
+            .dispatch_stateless(&request_ctx, &initial)
+            .expect("task-capable tool mints an MRTR continuation after admission");
+        let request_state = initial_result["requestState"]
+            .as_str()
+            .expect("framework result carries opaque task-capable state")
+            .to_owned();
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+
+        let retry = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": task_metadata,
+                "name": "task-capable-input-required-tool",
+                "arguments": {},
+                "inputResponses": {"roots": router_roots_response_wire()},
+                "requestState": request_state,
+            })),
+            149_i64,
+        );
+        let mut missing_task_capability = retry.clone();
+        missing_task_capability
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("task-capability retry parameters are an object")
+            .insert(
+                "_meta".to_owned(),
+                serde_json::json!({
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                }),
+            );
+        let capability_error = router
+            .dispatch_stateless(&request_ctx, &missing_task_capability)
+            .expect_err("altered Tasks capability is rejected before MRTR state consumption");
+        assert!(matches!(capability_error.code, McpErrorCode::Custom(_)));
+        assert_eq!(
+            final_calls.load(Ordering::SeqCst),
+            1,
+            "the metadata rejection cannot invoke the resumed handler"
+        );
+        assert_eq!(store.task_count(), 0);
+
+        let resumed = router
+            .dispatch_stateless(&request_ctx, &retry)
+            .expect("the original task-capable retry remains usable after rejection");
+        assert_eq!(resumed["resultType"], "input_required");
+        assert_eq!(final_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(store.task_count(), 0);
     }
 
     #[test]
@@ -13448,12 +14148,13 @@ mod router_tests {
         );
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            router
-                .dispatch_stateless(&request_ctx, &baseline)
-                .expect("the negotiated baseline remains accepted after rejection"),
-            accepted,
-            "one-field no-negotiation rejection cannot alter the final input-required response"
+        let retried = router
+            .dispatch_stateless(&request_ctx, &baseline)
+            .expect("the negotiated baseline remains accepted after rejection");
+        assert_eq!(retried["resultType"], "input_required");
+        assert_ne!(
+            retried["requestState"], accepted["requestState"],
+            "every framework-issued MRTR continuation has fresh opaque state"
         );
         assert_eq!(final_calls.load(Ordering::SeqCst), 2);
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);

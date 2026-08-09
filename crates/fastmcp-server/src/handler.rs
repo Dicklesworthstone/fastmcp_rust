@@ -25,13 +25,15 @@ use fastmcp_protocol::common_types::{
 };
 use fastmcp_protocol::{
     CacheScope, CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy,
-    DecodedResult, FinalCallToolResult, FinalCompletionParams, FinalGetPromptResult,
+    DecodedResult, FinalCallToolResult, FinalCompletionParams, FinalCompletionValues,
+    FinalGetPromptResult,
     FinalPromptMessage, FinalReadResourceResult, FinalTool, Icon, InputRequiredResult,
     JsonRpcRequest, LegacyCompletionParams, ProgressMarker, ProgressParams, Prompt, PromptMessage,
     Resource, ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations,
     decode_peer_result, encode_result,
 };
 
+use crate::bidirectional::MrtrCompletedInputs;
 use crate::tasks::FinalTaskWorkDescriptor;
 
 // ============================================================================
@@ -237,11 +239,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// One application-authored result of a final method that may require input.
 ///
-/// The `InputRequired` branch carries the protocol-owned value directly, so
-/// its exact request state, metadata, and open members remain intact until
-/// the router selects the final response envelope. Legacy handler defaults
-/// continue to produce only the exact legacy projection promoted as
-/// [`Self::Complete`](FinalMethodOutcome::Complete).
+/// The `InputRequired` branch lets a handler describe its embedded input map.
+/// The router validates those descriptors, discards any handler-authored
+/// request state or open result members, and mints the only retry state it
+/// will later accept. Legacy handler defaults continue to produce only the
+/// exact legacy projection promoted as [`Self::Complete`](FinalMethodOutcome::Complete).
 #[derive(Debug, Clone)]
 pub enum FinalMethodOutcome<T> {
     /// Complete the request with its method-specific final payload.
@@ -267,8 +269,8 @@ pub enum FinalToolOutcome {
     Complete(CompleteResult<FinalCallToolResult>),
     /// Ask the final peer for additional input before retrying this tool call.
     ///
-    /// This retains the protocol-owned input-required result without trying
-    /// to coerce it into the legacy complete-result projection.
+    /// The router extracts and validates its input descriptors, then mints the
+    /// retry state without coercing the result into a legacy projection.
     InputRequired(InputRequiredResult),
     /// Create one durable working task after negotiated capability admission.
     CreateTask {
@@ -819,6 +821,22 @@ pub trait ToolHandler: Send + Sync {
             }
         })
     }
+
+    /// Resumes a final tool invocation after framework-admitted MRTR input.
+    ///
+    /// `resume_inputs` exists only after the router consumed a
+    /// framework-minted request state bound to the original modern operation.
+    /// Handlers inspect its typed accessors rather than decoding client wire
+    /// values. Existing handlers preserve their normal final hook by default.
+    fn call_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+        _resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        self.call_final_outcome_async_in_request(ctx, request_cx, arguments)
+    }
 }
 
 /// Handler for a resource.
@@ -1140,6 +1158,18 @@ pub trait ResourceHandler: Send + Sync {
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
         self.read_final_outcome_async_with_uri(ctx, uri, params)
     }
+
+    /// Resumes a final resource read after framework-admitted MRTR input.
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+        _resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        self.read_final_outcome_async_with_uri_in_request(ctx, request_cx, uri, params)
+    }
 }
 
 /// Handler for a prompt.
@@ -1332,14 +1362,25 @@ pub trait PromptHandler: Send + Sync {
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
         self.get_final_outcome_async(ctx, arguments)
     }
+
+    /// Resumes a final prompt invocation after framework-admitted MRTR input.
+    fn get_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: std::collections::HashMap<String, String>,
+        _resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        self.get_final_outcome_async_in_request(ctx, request_cx, arguments)
+    }
 }
 
 /// Handler for `completion/complete` in both supported protocol eras.
 ///
 /// The two request parameter types deliberately remain distinct: the final
 /// form carries required request metadata and optional completion context,
-/// while the exact legacy form does not. Both callbacks return the shared
-/// completion value payload; the router selects the era-specific result
+/// while the exact legacy form does not. Each callback returns its exact
+/// era-specific completion payload; the router selects the matching result
 /// envelope and final `resultType` contract.
 pub trait CompletionHandler: Send + Sync {
     /// Returns an optional handler-specific timeout.
@@ -1362,7 +1403,7 @@ pub trait CompletionHandler: Send + Sync {
         &self,
         ctx: &McpContext,
         params: FinalCompletionParams,
-    ) -> McpResult<CompletionValues>;
+    ) -> McpResult<FinalCompletionValues>;
 
     /// Asynchronously completes one exact legacy request.
     ///
@@ -1387,7 +1428,7 @@ pub trait CompletionHandler: Send + Sync {
         &'a self,
         ctx: &'a McpContext,
         params: FinalCompletionParams,
-    ) -> BoxFuture<'a, McpOutcome<CompletionValues>> {
+    ) -> BoxFuture<'a, McpOutcome<FinalCompletionValues>> {
         Box::pin(async move {
             match self.complete_final(ctx, params) {
                 Ok(values) => Outcome::Ok(values),
@@ -1405,7 +1446,7 @@ pub trait CompletionHandler: Send + Sync {
         ctx: &'a McpContext,
         _request_cx: &'a Cx,
         params: FinalCompletionParams,
-    ) -> BoxFuture<'a, McpOutcome<CompletionValues>> {
+    ) -> BoxFuture<'a, McpOutcome<FinalCompletionValues>> {
         self.complete_final_async(ctx, params)
     }
 }
@@ -1575,6 +1616,21 @@ impl ToolHandler for MountedToolHandler {
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
         self.inner
             .call_final_outcome_async_in_request(ctx, request_cx, arguments)
+    }
+
+    fn call_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        self.inner.call_final_outcome_async_resuming_in_request(
+            ctx,
+            request_cx,
+            arguments,
+            resume_inputs,
+        )
     }
 }
 
@@ -2029,6 +2085,33 @@ impl ResourceHandler for MountedResourceHandler {
             )
         })
     }
+
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            let source_uri = match self.translate_incoming_uri(uri) {
+                Ok(source_uri) => source_uri,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.translate_outgoing_final_method_outcome_async(
+                self.inner
+                    .read_final_outcome_async_with_uri_resuming_in_request(
+                        ctx,
+                        request_cx,
+                        &source_uri,
+                        params,
+                        resume_inputs,
+                    )
+                    .await,
+            )
+        })
+    }
 }
 
 /// A wrapper for a prompt handler that overrides its name.
@@ -2159,6 +2242,21 @@ impl PromptHandler for MountedPromptHandler {
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
         self.inner
             .get_final_outcome_async_in_request(ctx, request_cx, arguments)
+    }
+
+    fn get_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: std::collections::HashMap<String, String>,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        self.inner.get_final_outcome_async_resuming_in_request(
+            ctx,
+            request_cx,
+            arguments,
+            resume_inputs,
+        )
     }
 }
 

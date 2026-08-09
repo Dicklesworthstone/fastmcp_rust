@@ -3,7 +3,7 @@
 //! This module provides lightweight proxy handlers that forward tool/resource/prompt
 //! calls to another MCP server via a backend client.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
@@ -21,13 +21,14 @@ use fastmcp_protocol::protocol_policy::{
     StdioEraDecision, StdioOpeningFrame,
 };
 use fastmcp_protocol::{
-    CallToolResult, ClientCapabilities, ClientInfo, CompleteResult, Content, CoreRequest,
-    CoreResult, FinalCallToolResult, FinalCoreResult, FinalGetPromptResult,
-    FinalReadResourceResult, FinalRequestMeta, GetPromptResult, InitializeParams, InitializeResult,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyCoreResult,
-    LegacyPromptMessage, LegacyResourceContent, Prompt, PromptArgument, PromptMessage,
-    ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate, Tool,
-    ToolAnnotations, decode_strict_jsonrpc_message,
+    CallToolResult, CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo,
+    CompleteResult, Content, CoreRequest, CoreResult, CreateMessageParams, FinalCallToolResult,
+    FinalCoreResult, FinalGetPromptResult, FinalReadResourceResult, FinalRequestMeta,
+    GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, LegacyContent, LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent,
+    ListRootsParams, ListRootsResult, Prompt, PromptArgument, PromptMessage, ReadResourceResult,
+    RequestId, Resource, ResourceContent, ResourceTemplate, Tool, ToolAnnotations,
+    decode_strict_jsonrpc_message,
 };
 
 use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
@@ -35,10 +36,34 @@ use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
 /// Progress callback signature used by proxy backends.
 pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<String>);
 
+/// Tool definitions returned by a proxy backend's selected protocol era.
+///
+/// The two variants deliberately remain disjoint: converting a final tool to
+/// the legacy type would erase final-only catalog state such as its title,
+/// complete icon collection, and `_meta` members.
+#[derive(Debug, Clone)]
+pub enum ProxyToolCatalog {
+    /// Exact MCP 2024-11-05 tool definitions.
+    Legacy(Vec<Tool>),
+    /// Exact MCP 2026-07-28 tool definitions.
+    Final(Vec<fastmcp_protocol::FinalTool>),
+}
+
 /// Backend interface used by proxy handlers.
 pub trait ProxyBackend: Send {
     /// Lists available tools.
     fn list_tools(&mut self) -> McpResult<Vec<Tool>>;
+
+    /// Lists tool definitions without changing their selected protocol-era model.
+    ///
+    /// Existing backends that implement only the legacy handler surface retain
+    /// their exact behavior through the default implementation. Backends that
+    /// can select the final era override this method instead of projecting
+    /// [`fastmcp_protocol::FinalTool`] into [`Tool`].
+    fn list_tool_catalog(&mut self) -> McpResult<ProxyToolCatalog> {
+        self.list_tools().map(ProxyToolCatalog::Legacy)
+    }
+
     /// Lists available resources.
     fn list_resources(&mut self) -> McpResult<Vec<Resource>>;
     /// Lists available resource templates.
@@ -395,6 +420,33 @@ impl ProxyBackend for Client {
         Client::list_tools(self)
     }
 
+    fn list_tool_catalog(&mut self) -> McpResult<ProxyToolCatalog> {
+        self.ensure_initialized()?;
+        let era = self.selected_protocol_era().ok_or_else(|| {
+            McpError::invalid_request("Proxy client has no selected protocol era for tools/list")
+        })?;
+        if self.server_capabilities().tools.is_none() {
+            return Ok(match era {
+                ProtocolEra::Legacy2024 => ProxyToolCatalog::Legacy(Vec::new()),
+                ProtocolEra::Modern2026 => ProxyToolCatalog::Final(Vec::new()),
+            });
+        }
+        match era {
+            ProtocolEra::Legacy2024 => Client::list_tools(self).map(ProxyToolCatalog::Legacy),
+            ProtocolEra::Modern2026 => match Client::list_tools_typed(self, None)? {
+                CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
+                    Ok(ProxyToolCatalog::Final(result.payload.tools))
+                }
+                CoreResult::Legacy(LegacyCoreResult::ToolsList(_)) => {
+                    Err(McpError::invalid_request(
+                        "Modern proxy client received a legacy tools/list result",
+                    ))
+                }
+                _ => Err(unexpected_proxy_result("tools/list")),
+            },
+        }
+    }
+
     fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
         self.ensure_initialized()?;
         if self.server_capabilities().resources.is_none() {
@@ -488,8 +540,21 @@ impl ProxyBackend for Client {
 /// Catalog of remote definitions used to register proxy handlers.
 #[derive(Debug, Clone, Default)]
 pub struct ProxyCatalog {
-    /// Remote tool definitions.
+    /// Exact protocol era selected for the upstream `tools/list` catalog.
+    ///
+    /// This remains independent from the tool vectors so a caller cannot
+    /// mistake an empty final catalog for a legacy one. Admission requires an
+    /// explicit marker and rejects a marker/vector combination that mixes the
+    /// two eras.
+    pub tool_catalog_era: Option<ProtocolEra>,
+    /// Exact legacy remote tool definitions.
     pub tools: Vec<Tool>,
+    /// Exact final remote tool definitions.
+    ///
+    /// This remains separate from [`Self::tools`] so the final catalog keeps
+    /// every serializable `FinalTool` member rather than being downgraded to
+    /// the legacy component model.
+    pub final_tools: Vec<fastmcp_protocol::FinalTool>,
     /// Remote resource definitions.
     pub resources: Vec<Resource>,
     /// Remote resource templates.
@@ -501,8 +566,14 @@ pub struct ProxyCatalog {
 impl ProxyCatalog {
     /// Builds a catalog by querying a proxy backend.
     pub fn from_backend<B: ProxyBackend + ?Sized>(backend: &mut B) -> McpResult<Self> {
+        let (tool_catalog_era, tools, final_tools) = match backend.list_tool_catalog()? {
+            ProxyToolCatalog::Legacy(tools) => (Some(ProtocolEra::Legacy2024), tools, Vec::new()),
+            ProxyToolCatalog::Final(tools) => (Some(ProtocolEra::Modern2026), Vec::new(), tools),
+        };
         Ok(Self {
-            tools: backend.list_tools()?,
+            tool_catalog_era,
+            tools,
+            final_tools,
             resources: backend.list_resources()?,
             resource_templates: backend.list_resource_templates()?,
             prompts: backend.list_prompts()?,
@@ -512,6 +583,57 @@ impl ProxyCatalog {
     /// Builds a catalog by querying a client.
     pub fn from_client(client: &mut Client) -> McpResult<Self> {
         Self::from_backend(client)
+    }
+
+    /// Creates exact-final proxy handlers without projecting their catalog
+    /// definitions through the legacy [`Tool`] model.
+    pub(crate) fn final_tool_handlers(
+        &self,
+        client: ProxyClient,
+    ) -> McpResult<Vec<ProxyToolHandler>> {
+        client.admit_catalog(self)?;
+        self.final_tools
+            .iter()
+            .cloned()
+            .map(|tool| ProxyToolHandler::from_final(tool, client.clone()))
+            .collect()
+    }
+
+    /// Admits only one exact tool-catalog representation.
+    ///
+    /// A catalog produced by a selected legacy route contains legacy [`Tool`]
+    /// entries only; a selected final route contains [`fastmcp_protocol::FinalTool`]
+    /// entries only. The marker is mandatory even when the selected catalog is
+    /// empty, because an empty final catalog must never be guessed to be legacy.
+    ///
+    /// This validation intentionally precedes route-binding admission and every
+    /// builder registration path. `ProxyCatalog` remains public for callers that
+    /// assemble a catalog themselves, so its vectors cannot be trusted merely
+    /// because the era marker matches a bound client.
+    fn admit_tool_catalog_shape(&self) -> McpResult<()> {
+        match self.tool_catalog_era {
+            Some(ProtocolEra::Legacy2024) if self.final_tools.is_empty() => Ok(()),
+            Some(ProtocolEra::Legacy2024) => Err(McpError::invalid_request(
+                "An exact legacy proxy tool catalog must not contain final tools",
+            )),
+            Some(ProtocolEra::Modern2026) if self.tools.is_empty() => Ok(()),
+            Some(ProtocolEra::Modern2026) => Err(McpError::invalid_request(
+                "An exact final proxy tool catalog must not contain legacy tools",
+            )),
+            None => Err(McpError::invalid_request(
+                "Proxy tool catalog must declare an exact legacy or final era",
+            )),
+        }
+    }
+
+    fn admit_upstream_binding(&self, binding: ProxyUpstreamBinding) -> McpResult<()> {
+        self.admit_tool_catalog_shape()?;
+        if self.tool_catalog_era != Some(binding.era()) {
+            return Err(McpError::invalid_request(
+                "Proxy tools/list catalog era contradicts the immutable route binding",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -694,6 +816,7 @@ pub struct ProxyHttpClient {
     client_capabilities: ClientCapabilities,
     next_request_id: i64,
     legacy_initialized: bool,
+    legacy_retired_request_ids: VecDeque<RequestId>,
 }
 
 impl std::fmt::Debug for ProxyHttpClient {
@@ -732,6 +855,7 @@ impl ProxyHttpClient {
             client_capabilities,
             next_request_id,
             legacy_initialized: false,
+            legacy_retired_request_ids: VecDeque::new(),
         }
     }
 
@@ -795,7 +919,13 @@ impl ProxyHttpClient {
         let response = match &mut self.connection {
             ClientHttpConnection::LegacySse { client, .. } => {
                 block_on(client.send(&self.cx, &message)).map_err(legacy_http_error)?;
-                receive_legacy_response(client, &self.cx, &request_id)?
+                receive_legacy_response(
+                    client,
+                    &self.cx,
+                    &self.client_capabilities,
+                    &request_id,
+                    &mut self.legacy_retired_request_ids,
+                )?
             }
             ClientHttpConnection::Modern(_) => {
                 return Err(McpError::internal_error(
@@ -866,7 +996,13 @@ impl ProxyHttpClient {
                     request_id.clone(),
                 ));
                 block_on(client.send(&self.cx, &message)).map_err(legacy_http_error)?;
-                receive_legacy_response(client, &self.cx, &request_id)?
+                receive_legacy_response(
+                    client,
+                    &self.cx,
+                    &self.client_capabilities,
+                    &request_id,
+                    &mut self.legacy_retired_request_ids,
+                )?
             }
         };
         if let Some(error) = response.error.as_ref() {
@@ -885,14 +1021,22 @@ impl ProxyHttpClient {
 
 impl ProxyBackend for ProxyHttpClient {
     fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
+        match self.list_tool_catalog()? {
+            ProxyToolCatalog::Legacy(tools) => Ok(tools),
+            ProxyToolCatalog::Final(_) => Err(McpError::invalid_request(
+                "Proxy cannot project a final tools/list catalog to the legacy tool surface",
+            )),
+        }
+    }
+
+    fn list_tool_catalog(&mut self) -> McpResult<ProxyToolCatalog> {
         match self.request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}))? {
-            CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => Ok(result.tools),
-            CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => Ok(result
-                .payload
-                .tools
-                .into_iter()
-                .map(final_tool_to_legacy)
-                .collect()),
+            CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
+                Ok(ProxyToolCatalog::Legacy(result.tools))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
+                Ok(ProxyToolCatalog::Final(result.payload.tools))
+            }
             _ => Err(unexpected_proxy_result("tools/list")),
         }
     }
@@ -1097,11 +1241,22 @@ fn receive_modern_response(
     }
 }
 
+/// Maximum interleaved control frames accepted while one exact-2024 request
+/// waits for its correlated upstream response.
+const MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES: usize = 64;
+
+/// Maximum cancelled request IDs retained to discard a late response before a
+/// later request consumes the shared exact-2024 SSE stream.
+const MAX_RETIRED_LEGACY_REQUEST_IDS: usize = 64;
+
 fn receive_legacy_response(
     client: &mut LegacySseHttpClient,
     cx: &Cx,
+    client_capabilities: &ClientCapabilities,
     request_id: &RequestId,
+    retired_request_ids: &mut VecDeque<RequestId>,
 ) -> McpResult<JsonRpcResponse> {
+    let mut interleaved_control_frames = 0_usize;
     loop {
         let message = block_on(client.next_message(cx)).map_err(legacy_http_error)?;
         let Some(message) = message else {
@@ -1109,10 +1264,148 @@ fn receive_legacy_response(
                 "Proxy HTTP legacy SSE stream ended before its correlated result",
             ));
         };
-        if matches!(&message, JsonRpcMessage::Request(request) if request.id.is_none()) {
-            continue;
+        match message {
+            JsonRpcMessage::Request(request) if request.is_notification() => {
+                admit_legacy_interleaved_control_frame(&mut interleaved_control_frames)?;
+                if request.method == fastmcp_protocol::methods::NOTIFICATIONS_CANCELLED {
+                    let cancellation = CancellationWireMessage::decode(
+                        ProtocolEra::Legacy2024,
+                        CancellationSender::Server,
+                        &request,
+                    )
+                    .map_err(|_| {
+                        McpError::invalid_request(
+                            "Proxy HTTP legacy cancellation notification was invalid",
+                        )
+                    })?;
+                    let CancellationWireMessage::Legacy2024 { params, .. } = cancellation else {
+                        return Err(McpError::invalid_request(
+                            "Proxy HTTP legacy cancellation selected a non-legacy payload",
+                        ));
+                    };
+                    if params.request_id.correlates_with(request_id) {
+                        retire_legacy_request_id(retired_request_ids, request_id)?;
+                        return Err(McpError::request_cancelled());
+                    }
+                }
+            }
+            JsonRpcMessage::Request(request) => {
+                admit_legacy_interleaved_control_frame(&mut interleaved_control_frames)?;
+                let Some(reply) = legacy_reverse_request_reply(&request, client_capabilities)
+                else {
+                    return Err(McpError::invalid_request(
+                        "Proxy HTTP legacy upstream request omitted its JSON-RPC ID",
+                    ));
+                };
+                block_on(client.send(cx, &reply)).map_err(legacy_http_error)?;
+            }
+            JsonRpcMessage::Response(response) => {
+                if response.id.as_ref().is_some_and(|response_id| {
+                    consume_retired_legacy_response(retired_request_ids, response_id)
+                }) {
+                    continue;
+                }
+                return response_for_request(JsonRpcMessage::Response(response), request_id);
+            }
         }
-        return response_for_request(message, request_id);
+    }
+}
+
+fn admit_legacy_interleaved_control_frame(count: &mut usize) -> McpResult<()> {
+    if *count >= MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES {
+        return Err(McpError::invalid_request(
+            "Proxy HTTP legacy request exceeded its interleaved control-frame bound",
+        ));
+    }
+    *count = count.checked_add(1).ok_or_else(|| {
+        McpError::invalid_request("Proxy HTTP legacy interleaved control frame count overflowed")
+    })?;
+    Ok(())
+}
+
+fn retire_legacy_request_id(
+    retired_request_ids: &mut VecDeque<RequestId>,
+    request_id: &RequestId,
+) -> McpResult<()> {
+    if retired_request_ids
+        .iter()
+        .any(|retired| retired.correlates_with(request_id))
+    {
+        return Ok(());
+    }
+    if retired_request_ids.len() >= MAX_RETIRED_LEGACY_REQUEST_IDS {
+        return Err(McpError::invalid_request(
+            "Proxy HTTP legacy retired-response capacity exceeded",
+        ));
+    }
+    retired_request_ids.push_back(request_id.clone());
+    Ok(())
+}
+
+fn consume_retired_legacy_response(
+    retired_request_ids: &mut VecDeque<RequestId>,
+    response_id: &RequestId,
+) -> bool {
+    let Some(index) = retired_request_ids
+        .iter()
+        .position(|retired| retired.correlates_with(response_id))
+    else {
+        return false;
+    };
+    retired_request_ids.remove(index);
+    true
+}
+
+fn legacy_reverse_request_reply(
+    request: &JsonRpcRequest,
+    client_capabilities: &ClientCapabilities,
+) -> Option<JsonRpcMessage> {
+    let request_id = request.id.clone()?;
+    let result = match request.method.as_str() {
+        fastmcp_protocol::methods::SAMPLING_CREATE_MESSAGE
+            if client_capabilities.sampling.is_some() =>
+        {
+            decode_legacy_reverse_request_params::<CreateMessageParams>(request).and_then(|_| {
+                Err(McpError::internal_error(
+                    "Proxy HTTP legacy sampling callback is unavailable",
+                ))
+            })
+        }
+        fastmcp_protocol::methods::ROOTS_LIST if client_capabilities.roots.is_some() => {
+            decode_legacy_reverse_request_params::<ListRootsParams>(request)
+                .map(|_| ListRootsResult::empty())
+        }
+        "elicitation/create" => Err(McpError::method_not_found(&request.method)),
+        _ => Err(McpError::method_not_found(&request.method)),
+    };
+    Some(legacy_reverse_request_response(request_id, result))
+}
+
+fn decode_legacy_reverse_request_params<T>(request: &JsonRpcRequest) -> McpResult<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let parameters = request
+        .params
+        .clone()
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    serde_json::from_value(parameters)
+        .map_err(|_| McpError::invalid_params("Invalid legacy reverse request parameters"))
+}
+
+fn legacy_reverse_request_response<T>(request_id: RequestId, result: McpResult<T>) -> JsonRpcMessage
+where
+    T: serde::Serialize,
+{
+    match result.and_then(|result| {
+        serde_json::to_value(result).map_err(|_| {
+            McpError::internal_error("Proxy HTTP legacy reverse response could not be encoded")
+        })
+    }) {
+        Ok(result) => JsonRpcMessage::Response(JsonRpcResponse::success(request_id, result)),
+        Err(error) => {
+            JsonRpcMessage::Response(JsonRpcResponse::error(Some(request_id), error.into()))
+        }
     }
 }
 
@@ -1153,21 +1446,29 @@ fn legacy_icon(icons: Option<Vec<RawIcon>>) -> Option<fastmcp_protocol::Icon> {
         })
 }
 
-fn final_tool_to_legacy(tool: fastmcp_protocol::FinalTool) -> Tool {
+/// Supplies the mandatory legacy handler shape for a final proxy tool.
+///
+/// This is intentionally not a catalog conversion: modern registration reads
+/// the exact `FinalTool` retained by [`ProxyToolHandler`]. The fallback exists
+/// solely for the legacy base method on [`ToolHandler`].
+fn final_tool_legacy_fallback(tool: &fastmcp_protocol::FinalTool) -> Tool {
     Tool {
-        name: tool.name,
-        description: tool.description,
-        input_schema: tool.input_schema,
-        output_schema: tool.output_schema,
-        icon: legacy_icon(tool.icons),
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        input_schema: tool.input_schema.clone(),
+        output_schema: tool.output_schema.clone(),
+        icon: legacy_icon(tool.icons.clone()),
         version: None,
         tags: Vec::new(),
-        annotations: tool.annotations.map(|annotations| ToolAnnotations {
-            destructive: annotations.destructive,
-            idempotent: annotations.idempotent,
-            read_only: annotations.read_only,
-            open_world_hint: annotations.open_world_hint,
-        }),
+        annotations: tool
+            .annotations
+            .as_ref()
+            .map(|annotations| ToolAnnotations {
+                destructive: annotations.destructive,
+                idempotent: annotations.idempotent,
+                read_only: annotations.read_only,
+                open_world_hint: annotations.open_world_hint,
+            }),
     }
 }
 
@@ -1240,6 +1541,98 @@ pub struct ProxyUpstreamBindingRegistry {
 }
 
 impl ProxyUpstreamBindingRegistry {
+    /// Invalidates cached selections for one exact configured upstream binding.
+    ///
+    /// The route, transport, adapter receipt, and complete immutable binding
+    /// (including its configuration generation) must all match. Other
+    /// generations and sibling cache keys remain cacheable. Any selected HTTP
+    /// era associated with the removed exact binding is invalidated with its
+    /// full endpoint bundle key as well. Live clients have no adapter receipt
+    /// in their key and must be evicted through
+    /// [`Self::invalidate_live_cached_binding`] instead.
+    pub fn invalidate_cached_binding(
+        &mut self,
+        route_identity: &str,
+        transport_identity: &str,
+        adapter_receipt_identity: &str,
+        binding: ProxyUpstreamBinding,
+    ) -> McpResult<usize> {
+        validate_binding_key(route_identity, transport_identity, adapter_receipt_identity)?;
+
+        let mut removed = 0;
+        self.stdio.retain(|key, cached| {
+            let matches = key.route_identity == route_identity
+                && key.transport_identity == transport_identity
+                && key.adapter_receipt_identity == adapter_receipt_identity
+                && key.configuration_generation == binding.configuration_generation
+                && *cached == binding;
+            if matches {
+                removed += 1;
+            }
+            !matches
+        });
+        let mut http_era_keys = HashSet::new();
+        self.http.retain(|key, cached| {
+            let matches = key.route_identity == route_identity
+                && key.transport_identity == transport_identity
+                && key.adapter_receipt_identity == adapter_receipt_identity
+                && key.configuration_generation == binding.configuration_generation
+                && *cached == binding;
+            if matches {
+                http_era_keys.insert(key.bundle.clone());
+                removed += 1;
+            }
+            !matches
+        });
+        for key in http_era_keys {
+            self.http_eras.invalidate(&key);
+        }
+        Ok(removed)
+    }
+
+    /// Invalidates live upstream clients for one route-local binding generation.
+    ///
+    /// Live client keys deliberately omit the adapter receipt, but include the
+    /// immutable route, transport, policy, and configuration generation. The
+    /// retained client binding is checked as well, so another era or policy is
+    /// never evicted by this generation-scoped operation.
+    pub fn invalidate_live_cached_binding(
+        &mut self,
+        route_identity: &str,
+        transport_identity: &str,
+        binding: ProxyUpstreamBinding,
+    ) -> McpResult<usize> {
+        if route_identity.is_empty() || transport_identity.is_empty() {
+            return Err(McpError::invalid_params(
+                "Upstream route and transport identities must be non-empty",
+            ));
+        }
+
+        let mut removed = 0;
+        self.live_stdio.retain(|key, cached| {
+            let matches = key.route_identity == route_identity
+                && key.transport_identity == transport_identity
+                && key.policy == binding.policy
+                && key.configuration_generation == binding.configuration_generation
+                && cached.upstream_binding() == Some(binding);
+            if matches {
+                removed += 1;
+            }
+            !matches
+        });
+        self.live_http.retain(|key, cached| {
+            let matches = key.route_identity == route_identity
+                && key.transport_identity == transport_identity
+                && key.configuration_generation == binding.configuration_generation
+                && cached.upstream_binding() == Some(binding);
+            if matches {
+                removed += 1;
+            }
+            !matches
+        });
+        Ok(removed)
+    }
+
     /// Opens a real stdio upstream from an immutable client protocol plan.
     ///
     /// The binding is derived from the connected client's selected era, never
@@ -1623,7 +2016,20 @@ impl ProxyClient {
 
     /// Fetches a catalog by querying the backend.
     pub fn catalog(&self) -> McpResult<ProxyCatalog> {
-        self.with_backend(|backend| ProxyCatalog::from_backend(backend))
+        let catalog = self.with_backend(|backend| ProxyCatalog::from_backend(backend))?;
+        self.admit_catalog(&catalog)?;
+        Ok(catalog)
+    }
+
+    /// Admits a catalog only when it agrees with this client's immutable route
+    /// binding. This also protects builder callers that supply a catalog
+    /// directly rather than obtaining it through [`Self::catalog`].
+    pub(crate) fn admit_catalog(&self, catalog: &ProxyCatalog) -> McpResult<()> {
+        catalog.admit_tool_catalog_shape()?;
+        if let Some(binding) = self.upstream_binding {
+            catalog.admit_upstream_binding(binding)?;
+        }
+        Ok(())
     }
 
     fn with_backend<F, R>(&self, f: F) -> McpResult<R>
@@ -1803,8 +2209,14 @@ impl ProxyClient {
 }
 
 pub(crate) struct ProxyToolHandler {
-    /// The tool definition as exposed to clients (may have prefixed name).
+    /// Legacy fallback definition exposed to legacy clients.
+    ///
+    /// For a final catalog this is only the framework-required legacy handler
+    /// shape. [`Self::final_tool`] remains the authoritative catalog entry.
     tool: Tool,
+    /// Exact final definition exposed to modern clients, when this handler was
+    /// constructed from a final upstream catalog.
+    final_tool: Option<fastmcp_protocol::FinalTool>,
     /// The original tool name on the remote server (for forwarding).
     external_name: String,
     client: ProxyClient,
@@ -1815,6 +2227,7 @@ impl ProxyToolHandler {
         let external_name = tool.name.clone();
         Self {
             tool,
+            final_tool: None,
             external_name,
             client,
         }
@@ -1829,15 +2242,58 @@ impl ProxyToolHandler {
         tool.name = format!("{}/{}", prefix, tool.name);
         Self {
             tool,
+            final_tool: None,
             external_name,
             client,
         }
+    }
+
+    /// Creates a handler from an exact final catalog entry.
+    ///
+    /// The legacy definition is present only because [`ToolHandler`] has a
+    /// legacy base method. Modern catalog registration obtains the unmodified
+    /// final definition from [`ToolHandler::final_definition`].
+    pub(crate) fn from_final(
+        tool: fastmcp_protocol::FinalTool,
+        client: ProxyClient,
+    ) -> McpResult<Self> {
+        if let Some(binding) = client.upstream_binding
+            && binding.era() != ProtocolEra::Modern2026
+        {
+            return Err(McpError::invalid_request(
+                "Proxy final tool catalog contradicts the immutable route binding",
+            ));
+        }
+        let external_name = tool.name.clone();
+        Ok(Self {
+            tool: final_tool_legacy_fallback(&tool),
+            final_tool: Some(tool),
+            external_name,
+            client,
+        })
+    }
+
+    /// Creates a prefixed handler from an exact final catalog entry.
+    pub(crate) fn with_prefix_final(
+        mut tool: fastmcp_protocol::FinalTool,
+        prefix: &str,
+        client: ProxyClient,
+    ) -> McpResult<Self> {
+        let external_name = tool.name.clone();
+        tool.name = format!("{prefix}/{}", tool.name);
+        let mut handler = Self::from_final(tool, client)?;
+        handler.external_name = external_name;
+        Ok(handler)
     }
 }
 
 impl ToolHandler for ProxyToolHandler {
     fn definition(&self) -> Tool {
         self.tool.clone()
+    }
+
+    fn final_definition(&self) -> Option<fastmcp_protocol::FinalTool> {
+        self.final_tool.clone()
     }
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
@@ -2050,8 +2506,8 @@ mod tests {
     use asupersync::Cx;
     #[cfg(unix)]
     use fastmcp_client::RequestTimeoutPolicy;
-    use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan};
-    use fastmcp_core::{McpContext, McpErrorCode};
+    use fastmcp_client::{CanonicalHttpUrl, ClientHttpConnection, ClientProtocolPlan};
+    use fastmcp_core::{McpContext, McpErrorCode, block_on};
     use fastmcp_protocol::common_types::ContentBlock;
     use fastmcp_protocol::protocol_policy::{
         HttpModernProbe, HttpProbeBody, ProtocolEra, ProtocolPolicy,
@@ -2063,9 +2519,11 @@ mod tests {
     };
 
     use super::{
-        ProxyBackend, ProxyCatalog, ProxyClient, ProxyPromptHandler, ProxyToolHandler,
+        MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES, ProxyBackend, ProxyCatalog, ProxyClient,
+        ProxyHttpClient, ProxyPromptHandler, ProxyToolCatalog, ProxyToolHandler,
         ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
-        legacy_contents_to_handler, legacy_prompt_messages_to_handler, legacy_resource_to_handler,
+        admit_legacy_interleaved_control_frame, legacy_contents_to_handler,
+        legacy_prompt_messages_to_handler, legacy_resource_to_handler,
     };
     use crate::handler::{PromptHandler, ToolHandler};
 
@@ -2511,6 +2969,362 @@ mod tests {
         }
     }
 
+    struct FinalCatalogBackend {
+        tool: fastmcp_protocol::FinalTool,
+        reject_exact_catalog: bool,
+    }
+
+    impl ProxyBackend for FinalCatalogBackend {
+        fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
+            Err(fastmcp_core::McpError::internal_error(
+                "final catalog must not be projected to legacy tools",
+            ))
+        }
+
+        fn list_tool_catalog(&mut self) -> fastmcp_core::McpResult<ProxyToolCatalog> {
+            if self.reject_exact_catalog {
+                return Err(fastmcp_core::McpError::invalid_request(
+                    "final catalog is unavailable",
+                ));
+            }
+            Ok(ProxyToolCatalog::Final(vec![self.tool.clone()]))
+        }
+
+        fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> {
+            Ok(Vec::new())
+        }
+
+        fn list_resource_templates(
+            &mut self,
+        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceTemplate>> {
+            Ok(Vec::new())
+        }
+
+        fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> {
+            Ok(Vec::new())
+        }
+
+        fn call_tool(
+            &mut self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Err(fastmcp_core::McpError::internal_error("not used"))
+        }
+
+        fn call_tool_with_progress(
+            &mut self,
+            _name: &str,
+            _arguments: serde_json::Value,
+            _on_progress: super::ProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Err(fastmcp_core::McpError::internal_error("not used"))
+        }
+
+        fn read_resource(&mut self, _uri: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+            Err(fastmcp_core::McpError::internal_error("not used"))
+        }
+
+        fn get_prompt(
+            &mut self,
+            _name: &str,
+            _arguments: HashMap<String, String>,
+        ) -> fastmcp_core::McpResult<Vec<PromptMessage>> {
+            Err(fastmcp_core::McpError::internal_error("not used"))
+        }
+    }
+
+    fn final_catalog_tool() -> fastmcp_protocol::FinalTool {
+        serde_json::from_value(serde_json::json!({
+            "name": "weather",
+            "title": "Weather Forecast",
+            "description": "Returns a precise forecast.",
+            "icons": [{
+                "src": "https://example.test/icons/weather.svg",
+                "mimeType": "image/svg+xml",
+                "sizes": ["16x16", "32x32"],
+                "theme": "light",
+                "com.example/icon": {"retained": true}
+            }],
+            "inputSchema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}}
+            },
+            "outputSchema": {"type": "object"},
+            "annotations": {
+                "title": "Forecast",
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "readOnlyHint": true,
+                "openWorldHint": false
+            },
+            "_meta": {"com.example/catalog": {"retained": true}}
+        }))
+        .expect("the final tool fixture is exact-schema valid")
+    }
+
+    #[test]
+    fn proxy_catalog_preserves_final_tool_bytes_without_legacy_projection() {
+        let tool = final_catalog_tool();
+        let expected_wire = serde_json::to_vec(&tool).expect("final tool serializes");
+        let mut backend = FinalCatalogBackend {
+            tool,
+            reject_exact_catalog: false,
+        };
+
+        let catalog = ProxyCatalog::from_backend(&mut backend)
+            .expect("exact final tool catalog is accepted without a legacy projection");
+
+        assert!(catalog.tools.is_empty());
+        assert_eq!(catalog.final_tools.len(), 1);
+        assert_eq!(
+            serde_json::to_vec(&catalog.final_tools[0]).expect("catalog final tool serializes"),
+            expected_wire,
+            "final-only tool members must remain byte-for-byte serializable"
+        );
+    }
+
+    #[test]
+    fn proxy_catalog_rejects_a_final_catalog_failure_without_legacy_fallback() {
+        let mut backend = FinalCatalogBackend {
+            tool: final_catalog_tool(),
+            reject_exact_catalog: true,
+        };
+
+        let error = ProxyCatalog::from_backend(&mut backend)
+            .expect_err("a failed final catalog must not be silently downgraded");
+
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(error.message.contains("final catalog is unavailable"));
+    }
+
+    #[test]
+    fn final_catalog_creates_lossless_proxy_tool_handlers_for_a_modern_binding() {
+        let expected_tool = final_catalog_tool();
+        let expected_wire = serde_json::to_vec(&expected_tool).expect("final tool serializes");
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            FinalCatalogBackend {
+                tool: expected_tool,
+                reject_exact_catalog: false,
+            },
+            proxy_binding(ProtocolEra::Modern2026),
+            ProtocolEra::Modern2026.version().as_str(),
+        )
+        .expect("the modern route binding accepts the final upstream version");
+
+        let catalog = proxy.catalog().expect("modern catalog matches its binding");
+        let handlers = catalog
+            .final_tool_handlers(proxy)
+            .expect("final catalog entries are consumable by proxy handlers");
+
+        assert!(catalog.tools.is_empty());
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(
+            serde_json::to_vec(
+                &handlers[0]
+                    .final_definition()
+                    .expect("final proxy handler retains its final definition"),
+            )
+            .expect("handler final definition serializes"),
+            expected_wire,
+            "the handler must expose the upstream final definition without a legacy projection"
+        );
+    }
+
+    #[test]
+    fn final_catalog_rejects_the_same_entry_for_a_legacy_binding() {
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            FinalCatalogBackend {
+                tool: final_catalog_tool(),
+                reject_exact_catalog: false,
+            },
+            proxy_binding(ProtocolEra::Legacy2024),
+            ProtocolEra::Legacy2024.version().as_str(),
+        )
+        .expect("the unchanged legacy route binding accepts its legacy upstream version");
+
+        let error = proxy
+            .catalog()
+            .expect_err("only the route era differs, so the final catalog must be rejected");
+
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(error.message.contains("catalog era contradicts"));
+    }
+
+    #[test]
+    fn cached_binding_invalidation_removes_only_the_exact_generation() {
+        let selected = proxy_binding(ProtocolEra::Modern2026);
+        let retained = ProxyUpstreamBinding {
+            configuration_generation: selected.configuration_generation + 1,
+            ..selected
+        };
+        let mut registry = ProxyUpstreamBindingRegistry::default();
+        registry.stdio.insert(
+            super::StdioBindingKey {
+                route_identity: "weather-route".to_owned(),
+                transport_identity: "stdio:weather".to_owned(),
+                adapter_receipt_identity: "receipt-b".to_owned(),
+                policy: selected.policy,
+                configuration_generation: selected.configuration_generation,
+            },
+            selected,
+        );
+        registry.stdio.insert(
+            super::StdioBindingKey {
+                route_identity: "weather-route".to_owned(),
+                transport_identity: "stdio:weather".to_owned(),
+                adapter_receipt_identity: "receipt-a".to_owned(),
+                policy: selected.policy,
+                configuration_generation: selected.configuration_generation,
+            },
+            selected,
+        );
+        registry.stdio.insert(
+            super::StdioBindingKey {
+                route_identity: "weather-route".to_owned(),
+                transport_identity: "stdio:weather".to_owned(),
+                adapter_receipt_identity: "receipt-a".to_owned(),
+                policy: retained.policy,
+                configuration_generation: retained.configuration_generation,
+            },
+            retained,
+        );
+
+        let removed = registry
+            .invalidate_cached_binding("weather-route", "stdio:weather", "receipt-a", selected)
+            .expect("the exact configured binding can be invalidated");
+
+        assert_eq!(removed, 1);
+        assert_eq!(registry.stdio.len(), 2);
+        assert!(registry.stdio.contains_key(&super::StdioBindingKey {
+            route_identity: "weather-route".to_owned(),
+            transport_identity: "stdio:weather".to_owned(),
+            adapter_receipt_identity: "receipt-b".to_owned(),
+            policy: selected.policy,
+            configuration_generation: selected.configuration_generation,
+        }));
+        assert!(registry.stdio.values().any(|binding| *binding == retained));
+    }
+
+    #[test]
+    fn cached_binding_invalidation_keeps_an_identical_other_generation() {
+        let selected = proxy_binding(ProtocolEra::Modern2026);
+        let retained = ProxyUpstreamBinding {
+            configuration_generation: selected.configuration_generation + 1,
+            ..selected
+        };
+        let mut registry = ProxyUpstreamBindingRegistry::default();
+        registry.stdio.insert(
+            super::StdioBindingKey {
+                route_identity: "weather-route".to_owned(),
+                transport_identity: "stdio:weather".to_owned(),
+                adapter_receipt_identity: "receipt-a".to_owned(),
+                policy: retained.policy,
+                configuration_generation: retained.configuration_generation,
+            },
+            retained,
+        );
+
+        let removed = registry
+            .invalidate_cached_binding("weather-route", "stdio:weather", "receipt-a", selected)
+            .expect("the missing exact generation has no cache entry to remove");
+
+        assert_eq!(removed, 0);
+        assert_eq!(registry.stdio.len(), 1);
+        assert!(registry.stdio.values().all(|binding| *binding == retained));
+    }
+
+    #[test]
+    fn live_cached_binding_invalidation_removes_only_the_exact_generation() {
+        let selected = proxy_binding(ProtocolEra::Modern2026);
+        let retained = ProxyUpstreamBinding {
+            configuration_generation: selected.configuration_generation + 1,
+            ..selected
+        };
+        let selected_client = ProxyClient::from_backend_with_upstream_binding(
+            TestBackend::default(),
+            selected,
+            ProtocolEra::Modern2026.version().as_str(),
+        )
+        .expect("the selected modern live client is admitted");
+        let retained_client = ProxyClient::from_backend_with_upstream_binding(
+            TestBackend::default(),
+            retained,
+            ProtocolEra::Modern2026.version().as_str(),
+        )
+        .expect("the other generation modern live client is admitted");
+        let mut registry = ProxyUpstreamBindingRegistry::default();
+        registry.live_stdio.insert(
+            super::LiveStdioBindingKey {
+                route_identity: "weather-route".to_owned(),
+                transport_identity: "stdio:weather".to_owned(),
+                policy: selected.policy,
+                configuration_generation: selected.configuration_generation,
+            },
+            selected_client,
+        );
+        registry.live_stdio.insert(
+            super::LiveStdioBindingKey {
+                route_identity: "weather-route".to_owned(),
+                transport_identity: "stdio:weather".to_owned(),
+                policy: retained.policy,
+                configuration_generation: retained.configuration_generation,
+            },
+            retained_client,
+        );
+
+        let removed = registry
+            .invalidate_live_cached_binding("weather-route", "stdio:weather", selected)
+            .expect("the exact live binding generation can be invalidated");
+
+        assert_eq!(removed, 1);
+        assert_eq!(registry.live_stdio.len(), 1);
+        assert!(
+            registry
+                .live_stdio
+                .values()
+                .all(|client| client.upstream_binding() == Some(retained))
+        );
+    }
+
+    #[test]
+    fn live_cached_binding_invalidation_keeps_an_identical_other_generation() {
+        let selected = proxy_binding(ProtocolEra::Modern2026);
+        let retained = ProxyUpstreamBinding {
+            configuration_generation: selected.configuration_generation + 1,
+            ..selected
+        };
+        let retained_client = ProxyClient::from_backend_with_upstream_binding(
+            TestBackend::default(),
+            retained,
+            ProtocolEra::Modern2026.version().as_str(),
+        )
+        .expect("the other generation modern live client is admitted");
+        let mut registry = ProxyUpstreamBindingRegistry::default();
+        registry.live_stdio.insert(
+            super::LiveStdioBindingKey {
+                route_identity: "weather-route".to_owned(),
+                transport_identity: "stdio:weather".to_owned(),
+                policy: retained.policy,
+                configuration_generation: retained.configuration_generation,
+            },
+            retained_client,
+        );
+
+        let removed = registry
+            .invalidate_live_cached_binding("weather-route", "stdio:weather", selected)
+            .expect("the missing live binding generation has no cache entry to remove");
+
+        assert_eq!(removed, 0);
+        assert_eq!(registry.live_stdio.len(), 1);
+        assert!(
+            registry
+                .live_stdio
+                .values()
+                .all(|client| client.upstream_binding() == Some(retained))
+        );
+    }
+
     #[cfg(unix)]
     fn scripted_response_line(id: i64, result: serde_json::Value) -> String {
         let message =
@@ -2781,6 +3595,76 @@ exec sleep 2
         }
     }
 
+    fn legacy_only_http_proxy_plan(
+        legacy_sse_target: &str,
+        legacy_message_target: &str,
+    ) -> ClientProtocolPlan {
+        ClientProtocolPlan::http(
+            ProtocolPolicy::LegacyOnly,
+            None,
+            Some(CanonicalHttpUrl::parse(legacy_sse_target).expect("canonical legacy SSE target")),
+            Some(
+                CanonicalHttpUrl::parse(legacy_message_target)
+                    .expect("canonical legacy message target"),
+            ),
+            "proxy-http-legacy-callback-credential-partition".to_owned(),
+            "proxy-http-legacy-callback-security-partition".to_owned(),
+            "proxy-http-legacy-callback-native-h1".to_owned(),
+            1,
+            1,
+            0,
+        )
+        .expect("complete legacy-only HTTP plan must be accepted")
+    }
+
+    fn legacy_http_proxy_client(
+        legacy_sse_target: &str,
+        legacy_message_target: &str,
+        client_capabilities: ClientCapabilities,
+    ) -> ProxyHttpClient {
+        let cx = Cx::for_request();
+        let client_info = proxy_http_client_info();
+        let connection = block_on(ClientHttpConnection::connect(
+            &cx,
+            legacy_only_http_proxy_plan(legacy_sse_target, legacy_message_target),
+            client_info.clone(),
+            client_capabilities.clone(),
+        ))
+        .expect("legacy-only HTTP plan opens the exact legacy SSE client");
+        ProxyHttpClient::new(
+            ProxyUpstreamBinding {
+                era: ProtocolEra::Legacy2024,
+                adapter: ProxyUpstreamAdapter::LegacyHttpSse,
+                policy: ProtocolPolicy::LegacyOnly,
+                configuration_generation: 91,
+            },
+            connection,
+            cx,
+            client_info,
+            client_capabilities,
+        )
+    }
+
+    fn legacy_tools_list_names(result: CoreResult) -> Vec<String> {
+        let CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) = result else {
+            panic!("exact legacy proxy request must retain a legacy tools/list result");
+        };
+        result.tools.into_iter().map(|tool| tool.name).collect()
+    }
+
+    #[test]
+    fn proxy_legacy_http_refuses_one_interleaved_control_frame_past_its_bound_unchanged() {
+        let mut accepted = 0;
+        for _ in 0..MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES {
+            admit_legacy_interleaved_control_frame(&mut accepted)
+                .expect("the configured control-frame bound is admitted exactly");
+        }
+        let error = admit_legacy_interleaved_control_frame(&mut accepted)
+            .expect_err("one additional interleaved control frame must be refused");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(accepted, MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES);
+    }
+
     #[derive(Clone, Copy)]
     enum HttpProxyPublicPath {
         Catalog,
@@ -2852,12 +3736,14 @@ exec sleep 2
         let catalog = proxy
             .catalog()
             .expect("public proxy catalog uses modern HTTP");
-        let tool = catalog
-            .tools
+        assert!(catalog.tools.is_empty());
+        let final_tool = catalog
+            .final_tools
             .first()
             .expect("modern HTTP catalog returns the remote tool")
             .clone();
-        let handler = ProxyToolHandler::new(tool, proxy.clone());
+        assert_eq!(final_tool.name, "echo");
+        let handler = ProxyToolHandler::new(proxy_test_tool(), proxy.clone());
         assert_forwarded_final_tool(
             handler
                 .call_final(
@@ -3044,6 +3930,288 @@ exec sleep 2
             initialize["params"]["clientInfo"]["name"],
             "proxy-http-test-client"
         );
+    }
+
+    #[test]
+    fn proxy_legacy_http_replies_to_authorized_reverse_requests_without_losing_follow_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read native HTTP listener address");
+        let legacy_sse_target = format!("http://{address}/legacy-sse");
+        let legacy_message_target = format!("http://{address}/legacy-message?session=reverse");
+        let expected_message_target = legacy_message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_http_request(&mut sse);
+            let body = format!(concat!(
+                "event: endpoint\ndata: {expected_message_target}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[],\"maxTokens\":1}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"roots/list\",\"params\":{}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"elicitation/create\",\"params\":{}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}\n\n",
+            ));
+            write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
+
+            let mut posts = Vec::new();
+            for _ in 0..7 {
+                let (mut post, _) = listener.accept().expect("accept legacy proxy POST");
+                let request = read_http_request(&mut post);
+                write_http_response(&mut post, 202, "application/json", b"");
+                posts.push(request);
+            }
+            (sse_request, posts)
+        });
+        let mut proxy = legacy_http_proxy_client(
+            &legacy_sse_target,
+            &legacy_message_target,
+            ClientCapabilities {
+                sampling: Some(fastmcp_protocol::SamplingCapability {}),
+                elicitation: None,
+                roots: Some(fastmcp_protocol::RootsCapability {
+                    list_changed: false,
+                }),
+            },
+        );
+
+        assert!(
+            legacy_tools_list_names(
+                proxy
+                    .request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}))
+                    .expect("authorized reverse requests retain their upstream result"),
+            )
+            .is_empty()
+        );
+        assert!(
+            legacy_tools_list_names(
+                proxy
+                    .request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}))
+                    .expect("the following request remains aligned after reverse replies"),
+            )
+            .is_empty()
+        );
+
+        let (sse, posts) = server
+            .join()
+            .expect("legacy reverse-request server must join");
+        assert!(sse.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+        let messages: Vec<serde_json::Value> = posts
+            .iter()
+            .map(|post| {
+                serde_json::from_slice(&post.body).expect("legacy proxy POST remains JSON-RPC")
+            })
+            .collect();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message["method"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("initialize"),
+                Some("notifications/initialized"),
+                Some("tools/list"),
+                None,
+                None,
+                None,
+                Some("tools/list"),
+            ],
+        );
+        assert_eq!(
+            messages[0]["params"]["capabilities"]["sampling"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            messages[0]["params"]["capabilities"]["roots"],
+            serde_json::json!({})
+        );
+        assert_eq!(messages[3]["id"], serde_json::json!(80));
+        assert_eq!(messages[3]["error"]["code"], serde_json::json!(-32603));
+        assert_eq!(messages[4]["id"], serde_json::json!(81));
+        assert_eq!(messages[4]["result"], serde_json::json!({"roots": []}));
+        assert_eq!(messages[5]["id"], serde_json::json!(82));
+        assert_eq!(messages[5]["error"]["code"], serde_json::json!(-32601));
+        assert_eq!(messages[6]["id"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn proxy_legacy_http_rejects_sampling_when_only_its_capability_is_removed() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read native HTTP listener address");
+        let legacy_sse_target = format!("http://{address}/legacy-sse");
+        let legacy_message_target = format!("http://{address}/legacy-message?session=reverse");
+        let expected_message_target = legacy_message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_http_request(&mut sse);
+            let body = format!(concat!(
+                "event: endpoint\ndata: {expected_message_target}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[],\"maxTokens\":1}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"roots/list\",\"params\":{}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"elicitation/create\",\"params\":{}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}\n\n",
+            ));
+            write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
+
+            let mut posts = Vec::new();
+            for _ in 0..7 {
+                let (mut post, _) = listener
+                    .accept()
+                    .expect("accept unchanged legacy proxy POST");
+                let request = read_http_request(&mut post);
+                write_http_response(&mut post, 202, "application/json", b"");
+                posts.push(request);
+            }
+            (sse_request, posts)
+        });
+        let mut proxy = legacy_http_proxy_client(
+            &legacy_sse_target,
+            &legacy_message_target,
+            ClientCapabilities {
+                sampling: None,
+                elicitation: None,
+                roots: Some(fastmcp_protocol::RootsCapability {
+                    list_changed: false,
+                }),
+            },
+        );
+
+        assert!(
+            legacy_tools_list_names(
+                proxy
+                    .request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}))
+                    .expect("the sampling refusal must not replace the active result"),
+            )
+            .is_empty()
+        );
+        assert!(
+            legacy_tools_list_names(
+                proxy
+                    .request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}))
+                    .expect("the sampling refusal must not alter the next request"),
+            )
+            .is_empty()
+        );
+
+        let (sse, posts) = server
+            .join()
+            .expect("legacy reverse-request server must join");
+        assert!(sse.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+        let messages: Vec<serde_json::Value> = posts
+            .iter()
+            .map(|post| {
+                serde_json::from_slice(&post.body).expect("legacy proxy POST remains JSON-RPC")
+            })
+            .collect();
+        assert!(
+            messages[0]["params"]["capabilities"]
+                .get("sampling")
+                .is_none()
+        );
+        assert_eq!(
+            messages[0]["params"]["capabilities"]["roots"],
+            serde_json::json!({})
+        );
+        assert_eq!(messages[3]["id"], serde_json::json!(80));
+        assert_eq!(messages[3]["error"]["code"], serde_json::json!(-32601));
+        assert_eq!(messages[4]["id"], serde_json::json!(81));
+        assert_eq!(messages[4]["result"], serde_json::json!({"roots": []}));
+        assert_eq!(messages[5]["id"], serde_json::json!(82));
+        assert_eq!(messages[5]["error"]["code"], serde_json::json!(-32601));
+        assert_eq!(messages[6]["id"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn proxy_legacy_http_cancellation_matches_only_the_active_request() {
+        for (name, cancellation_request_id, first_is_cancelled) in
+            [("matching", "2e0", true), ("unrelated", "99", false)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .expect("bind native HTTP listener for cancellation case");
+            let address = listener
+                .local_addr()
+                .expect("read native HTTP listener address");
+            let legacy_sse_target = format!("http://{address}/legacy-sse");
+            let legacy_message_target =
+                format!("http://{address}/legacy-message?session=cancellation-{name}");
+            let expected_message_target = legacy_message_target.clone();
+            let server = thread::spawn(move || {
+                let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+                let sse_request = read_http_request(&mut sse);
+                let body = format!(concat!(
+                    "event: endpoint\ndata: {expected_message_target}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":{cancellation_request_id}}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"active\",\"inputSchema\":{}}]}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[{\"name\":\"follow-up\",\"inputSchema\":{}}]}}\n\n",
+                ));
+                write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
+
+                let mut posts = Vec::new();
+                for _ in 0..4 {
+                    let (mut post, _) = listener.accept().expect("accept legacy proxy POST");
+                    let request = read_http_request(&mut post);
+                    write_http_response(&mut post, 202, "application/json", b"");
+                    posts.push(request);
+                }
+                (sse_request, posts)
+            });
+            let mut proxy = legacy_http_proxy_client(
+                &legacy_sse_target,
+                &legacy_message_target,
+                ClientCapabilities::default(),
+            );
+
+            let first =
+                proxy.request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}));
+            if first_is_cancelled {
+                assert_eq!(
+                    first
+                        .expect_err("only the matching cancellation retires the active request")
+                        .code,
+                    McpErrorCode::RequestCancelled,
+                );
+            } else {
+                assert_eq!(
+                    legacy_tools_list_names(
+                        first.expect("an unrelated cancellation must not alter the active request"),
+                    ),
+                    vec!["active"],
+                );
+            }
+            assert_eq!(
+                legacy_tools_list_names(
+                    proxy
+                        .request_result(
+                            fastmcp_protocol::methods::TOOLS_LIST,
+                            serde_json::json!({}),
+                        )
+                        .expect("the subsequent exact-2024 request remains aligned"),
+                ),
+                vec!["follow-up"],
+            );
+
+            let (sse, posts) = server.join().expect("legacy cancellation server must join");
+            assert!(sse.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            let messages: Vec<serde_json::Value> = posts
+                .iter()
+                .map(|post| {
+                    serde_json::from_slice(&post.body).expect("legacy proxy POST remains JSON-RPC")
+                })
+                .collect();
+            assert_eq!(messages[0]["method"], serde_json::json!("initialize"));
+            assert_eq!(
+                messages[1]["method"],
+                serde_json::json!("notifications/initialized")
+            );
+            assert_eq!(messages[2]["id"], serde_json::json!(2));
+            assert_eq!(messages[3]["id"], serde_json::json!(3));
+        }
     }
 
     #[test]
@@ -3365,19 +4533,14 @@ exec sleep 2
                     let catalog = proxy
                         .catalog()
                         .expect("only the later handler response ID is mismatched");
-                    ProxyToolHandler::new(
-                        catalog
-                            .tools
-                            .first()
-                            .expect("catalog returns the remote tool before the mismatch")
-                            .clone(),
-                        proxy.clone(),
-                    )
-                    .call(
-                        &McpContext::new(Cx::for_testing(), 710),
-                        serde_json::json!({}),
-                    )
-                    .expect_err("changing only the handler response ID must fail closed")
+                    assert!(catalog.tools.is_empty());
+                    assert_eq!(catalog.final_tools.len(), 1);
+                    ProxyToolHandler::new(proxy_test_tool(), proxy.clone())
+                        .call(
+                            &McpContext::new(Cx::for_testing(), 710),
+                            serde_json::json!({}),
+                        )
+                        .expect_err("changing only the handler response ID must fail closed")
                 }
             };
 

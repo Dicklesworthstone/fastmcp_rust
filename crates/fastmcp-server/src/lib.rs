@@ -797,7 +797,7 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
         let request_cancellation = self
             .queue_state
             .as_ref()
-            .and_then(|queue| queue.legacy_request_cancellation(&request_id));
+            .and_then(|queue| queue.admitted_request_cancellation(&request_id));
         let request = JsonRpcRequest::new(method, params.cloned(), request_id);
         let dispatch = self
             .server
@@ -848,6 +848,10 @@ struct HttpLegacy2024RuntimeHandler {
     session_principal: SessionPrincipalBinding,
     active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
     request_cx: Arc<Mutex<Cx>>,
+    /// The live HTTP connection admits a correlated request before waiting
+    /// for the session mutex. Reusing that authority here closes the gap
+    /// between a separate cancellation POST and active-request registration.
+    legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
 }
 
 impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
@@ -874,6 +878,9 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let request_cancellation = self
+            .legacy_admissions
+            .admitted_request_cancellation(&request_id);
         let dispatch = self
             .server
             .dispatch_legacy_2024(
@@ -881,7 +888,7 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
                 self.session_id,
                 &self.session_principal,
                 None,
-                None,
+                request_cancellation,
                 &request,
             )
             .map_err(|error| {
@@ -1448,9 +1455,11 @@ struct DispatchQueueStateInner {
     /// connection shutdown path. Peer cancellation cannot erase the request
     /// that establishes the selected legacy lifecycle.
     peer_cancellation_protected: HashSet<CorrelationKey>,
-    /// Exact-2024 requests retain one cancellation authority across queue,
-    /// dispatch transition, handler execution, and response finalization.
-    legacy_cancellations: HashMap<CorrelationKey, McpRequestCancellation>,
+    /// Every correlated request retains one cancellation authority from queue
+    /// admission through active dispatch and response finalization. The
+    /// modern child and exact-2024 adapter must both receive this same handle
+    /// so a control notification cannot be lost in the queued-to-active gap.
+    admitted_cancellations: HashMap<CorrelationKey, McpRequestCancellation>,
     /// Reserved requests that a worker has begun dispatching.
     dispatching: HashSet<CorrelationKey>,
     cancelled: HashSet<CorrelationKey>,
@@ -1493,12 +1502,7 @@ enum QueuedDispatchMessage {
 }
 
 impl DispatchQueueState {
-    fn admit(
-        &self,
-        id: &RequestId,
-        era: ProtocolEra,
-        peer_cancellation_allowed: bool,
-    ) -> bool {
+    fn admit(&self, id: &RequestId, peer_cancellation_allowed: bool) -> bool {
         let Ok(key) = id.correlation_key() else {
             return false;
         };
@@ -1509,12 +1513,10 @@ impl DispatchQueueState {
         if inner.stopping || !inner.reserved.insert(key.clone()) {
             return false;
         }
-        if matches!(era, ProtocolEra::Legacy2024) {
-            let previous = inner
-                .legacy_cancellations
-                .insert(key.clone(), McpRequestCancellation::new());
-            debug_assert!(previous.is_none());
-        }
+        let previous = inner
+            .admitted_cancellations
+            .insert(key.clone(), McpRequestCancellation::new());
+        debug_assert!(previous.is_none());
         if !peer_cancellation_allowed {
             inner.peer_cancellation_protected.insert(key);
         }
@@ -1531,17 +1533,17 @@ impl DispatchQueueState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.reserved.remove(&key);
         inner.peer_cancellation_protected.remove(&key);
-        inner.legacy_cancellations.remove(&key);
+        inner.admitted_cancellations.remove(&key);
         inner.dispatching.remove(&key);
         inner.cancelled.remove(&key);
     }
 
-    fn legacy_request_cancellation(&self, id: &RequestId) -> Option<McpRequestCancellation> {
+    fn admitted_request_cancellation(&self, id: &RequestId) -> Option<McpRequestCancellation> {
         let key = id.correlation_key().ok()?;
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .legacy_cancellations
+            .admitted_cancellations
             .get(&key)
             .cloned()
     }
@@ -1665,7 +1667,7 @@ impl DispatchQueueState {
         if inner.peer_cancellation_protected.contains(&key) {
             return DispatchCancellationDisposition::Protected;
         }
-        if let Some(cancellation) = inner.legacy_cancellations.get(&key).cloned() {
+        if let Some(cancellation) = inner.admitted_cancellations.get(&key).cloned() {
             if !inner.dispatching.contains(&key) {
                 inner.cancelled.insert(key);
             }
@@ -1744,7 +1746,7 @@ impl DispatchQueueState {
             inner
                 .modern_cancellations
                 .values()
-                .chain(inner.legacy_cancellations.values())
+                .chain(inner.admitted_cancellations.values())
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -1822,7 +1824,14 @@ impl ModernDispatchReservation {
         serialized_bytes: usize,
         failed: Arc<AtomicBool>,
     ) -> Self {
-        let cancellation = McpRequestCancellation::new();
+        let cancellation = request_id.as_ref().map_or_else(
+            McpRequestCancellation::new,
+            |id| {
+                queue.admitted_request_cancellation(id).expect(
+                    "a correlated modern child must retain its queue-admission cancellation authority",
+                )
+            },
+        );
         let cancellation_id = queue.register_modern_cancellation(cancellation.clone());
         Self {
             queue,
@@ -2434,6 +2443,7 @@ pub struct ServerHttpSession {
     legacy_adapter: Option<Legacy2024ServerAdapter<HttpLegacy2024RuntimeHandler>>,
     legacy_active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
     legacy_request_cx: Arc<Mutex<Cx>>,
+    legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
     /// Owned modern listen dispatches whose SSE bodies were returned to the
     /// embedding caller. Handles are retained because dropping an asupersync
     /// task handle detaches it from the session lifecycle.
@@ -3366,18 +3376,194 @@ fn tag_task_subscription_notification(
         .map_err(McpError::from)
 }
 
+/// One exact-2024 HTTP request admitted before it waits for the session mutex.
+///
+/// The generation binds cleanup to this precise admission. It prevents a late
+/// response finalizer from removing a future admission that reused the same
+/// wire ID.
+struct HttpLegacyRequestAdmission {
+    generation: u64,
+    cancellation: McpRequestCancellation,
+    peer_cancellation_protected: bool,
+}
+
+#[derive(Default)]
+struct HttpLegacyRequestAdmissionsInner {
+    next_generation: u64,
+    entries: HashMap<CorrelationKey, HttpLegacyRequestAdmission>,
+}
+
+/// Session-scoped legacy HTTP cancellation authorities.
+///
+/// The target POST enters this registry before it waits for the serialized
+/// adapter/session path. A separate cancellation POST can therefore select the
+/// exact authority throughout admission, mutex wait, active dispatch, and
+/// response finalization without taking the session mutex.
+#[derive(Default)]
+struct HttpLegacyRequestAdmissions {
+    inner: Mutex<HttpLegacyRequestAdmissionsInner>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpLegacyAdmissionCancellationDisposition {
+    NotOwned,
+    Protected,
+    Accepted,
+    AlreadySettled,
+}
+
+/// Retains an HTTP admission until its target POST has completed response
+/// finalization. Dropping the guard releases only its matching generation.
+struct HttpLegacyRequestAdmissionGuard {
+    admissions: Arc<HttpLegacyRequestAdmissions>,
+    key: CorrelationKey,
+    generation: u64,
+}
+
+impl HttpLegacyRequestAdmissions {
+    fn admit(
+        self: &Arc<Self>,
+        request: &HttpRequest,
+        max_body_size: usize,
+    ) -> Result<Option<HttpLegacyRequestAdmissionGuard>, ()> {
+        let mut codec = Codec::new();
+        codec.set_max_message_size(max_body_size);
+        let Ok(request) = codec.decode_complete_request(&request.body) else {
+            return Ok(None);
+        };
+        if request.validate().is_err()
+            || request.id.is_none()
+            || request.method == "notifications/cancelled"
+        {
+            return Ok(None);
+        }
+        let request_id = request
+            .id
+            .as_ref()
+            .expect("a correlated legacy HTTP request retains its ID");
+        let key = request_id.correlation_key().map_err(|_| ())?;
+        let peer_cancellation_protected = request.method == "initialize";
+
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.entries.contains_key(&key) {
+            return Err(());
+        }
+        let generation = inner.next_generation;
+        inner.next_generation = inner.next_generation.wrapping_add(1);
+        let previous = inner.entries.insert(
+            key.clone(),
+            HttpLegacyRequestAdmission {
+                generation,
+                cancellation: McpRequestCancellation::new(),
+                peer_cancellation_protected,
+            },
+        );
+        debug_assert!(previous.is_none());
+        drop(inner);
+        Ok(Some(HttpLegacyRequestAdmissionGuard {
+            admissions: Arc::clone(self),
+            key,
+            generation,
+        }))
+    }
+
+    fn admitted_request_cancellation(&self, request_id: &RequestId) -> Option<McpRequestCancellation> {
+        let key = request_id.correlation_key().ok()?;
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .get(&key)
+            .map(|entry| entry.cancellation.clone())
+    }
+
+    fn cancel(
+        &self,
+        request_id: &RequestId,
+    ) -> HttpLegacyAdmissionCancellationDisposition {
+        let Ok(key) = request_id.correlation_key() else {
+            return HttpLegacyAdmissionCancellationDisposition::NotOwned;
+        };
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = inner.entries.get(&key) else {
+            return HttpLegacyAdmissionCancellationDisposition::NotOwned;
+        };
+        if entry.peer_cancellation_protected {
+            return HttpLegacyAdmissionCancellationDisposition::Protected;
+        }
+        if entry.cancellation.cancel() {
+            HttpLegacyAdmissionCancellationDisposition::Accepted
+        } else {
+            HttpLegacyAdmissionCancellationDisposition::AlreadySettled
+        }
+    }
+
+    fn cancel_all(&self) {
+        let cancellations = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .values()
+            .map(|entry| entry.cancellation.clone())
+            .collect::<Vec<_>>();
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, request_id: &RequestId) -> bool {
+        let Ok(key) = request_id.correlation_key() else {
+            return false;
+        };
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .contains_key(&key)
+    }
+
+    fn release(&self, key: &CorrelationKey, generation: u64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            inner.entries.remove(key);
+        }
+    }
+}
+
+impl Drop for HttpLegacyRequestAdmissionGuard {
+    fn drop(&mut self) {
+        self.admissions.release(&self.key, self.generation);
+    }
+}
+
 /// Cancellation authority deliberately kept outside the session mutex.
 ///
 /// A legacy client sends cancellation on a separate POST connection while the
-/// request it targets may be running synchronously under the session lock. The
-/// control frame must therefore authenticate and cancel through the server's
-/// request registry without waiting for that lock.
+/// request it targets may be queued for or running under the session lock. The
+/// control frame authenticates first, then resolves the session admission map
+/// before falling back to the server active-request registry.
 #[derive(Clone)]
 struct HttpLegacyCancellationControl {
     server: Arc<Server>,
     session_id: u64,
     session_principal: SessionPrincipalBinding,
     max_body_size: usize,
+    admissions: Arc<HttpLegacyRequestAdmissions>,
 }
 
 impl HttpLegacyCancellationControl {
@@ -3424,8 +3610,14 @@ impl HttpLegacyCancellationControl {
             &mut notification,
         ) {
             Ok(cancellation) => {
-                self.server
-                    .handle_cancellation_wire_notification(self.session_id, cancellation);
+                let request_id = Server::cancellation_wire_request_id(&cancellation);
+                if matches!(
+                    self.admissions.cancel(request_id),
+                    HttpLegacyAdmissionCancellationDisposition::NotOwned
+                ) {
+                    self.server
+                        .handle_cancellation_wire_notification(self.session_id, cancellation);
+                }
                 Some(HttpResponse::new(HttpStatus::ACCEPTED))
             }
             Err(_) => Some(HttpResponse::bad_request()),
@@ -3537,6 +3729,40 @@ impl HttpConnectionChildren {
     }
 }
 
+/// Closes every exact-2024 session still retained by the live listener.
+///
+/// A connection abort can interrupt `serve_http_connection` before its normal
+/// post-SSE removal path runs. Evacuating the registry prevents a late legacy
+/// POST from observing a detached-but-still-routable session. A busy legacy
+/// handler may hold its session mutex while observing the server's earlier
+/// cancellation signal, so this cleanup never waits on that mutex.
+async fn close_live_http_sessions(cx: &Cx, sessions: &LiveHttpSessionRegistry) {
+    let sessions = {
+        let mut sessions = sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *sessions)
+    };
+    let mut dispatches = Vec::new();
+    for session in sessions.into_values() {
+        match session.session.try_lock() {
+            Ok(mut session) => dispatches.extend(session.begin_close()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut session = poisoned.into_inner();
+                dispatches.extend(session.begin_close());
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // The owning connection child is cancelled and joined below.
+                // Its local `ServerHttpSession` then closes on drop without
+                // reintroducing this registry entry.
+            }
+        }
+    }
+    for mut dispatch in dispatches {
+        let _ = dispatch.join(cx).await;
+    }
+}
+
 /// A bound, caller-owned HTTP server lifecycle.
 ///
 /// The listener and every accepted connection stay in the caller's [`Cx`]
@@ -3618,6 +3844,8 @@ impl BoundHttpServer {
         // children a bounded scheduling window to flush and close before
         // aborting any unrelated or uncooperative connection.
         let terminal_receipt = server.final_subscriptions.terminate_with_receipt();
+        server.cancel_active_requests(CancelKind::Shutdown, false);
+        close_live_http_sessions(cx, &self.legacy_sessions).await;
         connection_children
             .drain_terminal_controls_then_cancel_and_join(cx, &terminal_receipt)
             .await;
@@ -3723,6 +3951,7 @@ impl ServerHttpEndpoint {
             legacy_adapter: None,
             legacy_active_request: Arc::new(Mutex::new(None)),
             legacy_request_cx: Arc::new(Mutex::new(cx.clone())),
+            legacy_admissions: Arc::new(HttpLegacyRequestAdmissions::default()),
             modern_dispatches: Vec::new(),
             closed: false,
         })
@@ -3943,6 +4172,7 @@ impl ServerHttpSession {
                         session_principal: self.legacy_session.principal_binding(),
                         active_request: Arc::clone(&self.legacy_active_request),
                         request_cx: Arc::clone(&self.legacy_request_cx),
+                        legacy_admissions: Arc::clone(&self.legacy_admissions),
                     },
                 )
                 .map_err(|error| {
@@ -4006,6 +4236,7 @@ impl ServerHttpSession {
             dispatch.request_cancellation.cancel();
             dispatch.task.abort();
         }
+        self.legacy_admissions.cancel_all();
         if let Some(adapter) = self.legacy_adapter.as_mut() {
             let _ = adapter.close(self.legacy_binding);
         }
@@ -4033,6 +4264,7 @@ impl ServerHttpSession {
             session_id: self.legacy_binding.generation(),
             session_principal: self.legacy_session.principal_binding(),
             max_body_size: self.server.http_config.handler_config.max_body_size,
+            admissions: Arc::clone(&self.legacy_admissions),
         }
     }
 }
@@ -4135,11 +4367,27 @@ fn h1_response(mut response: HttpResponse) -> Http1Response {
 }
 
 async fn send_h1_response(
+    cx: &Cx,
     framed: &mut Framed<AsyncTcpStream, Http1Codec>,
     response: HttpResponse,
 ) -> Result<(), ()> {
+    // The listener's shutdown cancellation owns every ordinary H1 connection.
+    // Unlike SSE terminal controls, an immediate response has no protected
+    // drain phase and must never begin a new wire write after cancellation.
+    cx.checkpoint().map_err(|_| ())?;
     framed.send(h1_response(response)).map_err(|_| ())?;
-    std::future::poll_fn(|task_cx| framed.poll_close(task_cx))
+    // `Framed::send` only accepts the response into its codec buffer; the
+    // socket commit happens while closing. Re-check so a shutdown that wins
+    // between encoding and that commit suppresses the buffered response.
+    cx.checkpoint().map_err(|_| ())?;
+    std::future::poll_fn(|task_cx| {
+        if cx.is_cancel_requested() {
+            // Drop the framed connection with its buffered response rather
+            // than allowing a shutdown-cancelled task to commit it.
+            return std::task::Poll::Ready(Ok(()));
+        }
+        framed.poll_close(task_cx)
+    })
         .await
         .map_err(|_| ())
 }
@@ -4394,11 +4642,38 @@ fn http_endpoint_response_to_static(cx: &Cx, response: ServerHttpEndpointRespons
     }
 }
 
+fn admit_live_http_legacy_request(
+    endpoint: &ServerHttpEndpoint,
+    legacy_sessions: &LiveHttpSessionRegistry,
+    request: &HttpRequest,
+) -> Result<Option<HttpLegacyRequestAdmissionGuard>, HttpResponse> {
+    if request.method != HttpMethod::Post
+        || request.path != endpoint.server.http_config.legacy_message_path
+    {
+        return Ok(None);
+    }
+    let Some(session_id) = request.query.get("session_id") else {
+        return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
+    };
+    let session = legacy_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| HttpResponse::new(HttpStatus::NOT_FOUND))?;
+    session
+        .cancellation
+        .admissions
+        .admit(request, session.cancellation.max_body_size)
+        .map_err(|()| HttpResponse::bad_request())
+}
+
 fn dispatch_http_request(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
     legacy_sessions: &LiveHttpSessionRegistry,
     request: HttpRequest,
+    legacy_admission: Option<HttpLegacyRequestAdmissionGuard>,
 ) -> HttpResponse {
     let is_legacy_message = request.method == HttpMethod::Post
         && request.path == endpoint.server.http_config.legacy_message_path;
@@ -4417,6 +4692,21 @@ fn dispatch_http_request(
         if let Some(response) = session.cancellation.handle(cx, &request) {
             return response;
         }
+        // The connection creates this authority before queueing the blocking
+        // dispatch. Direct embedding callers create it here instead. In both
+        // cases it remains live through the serialized adapter/session mutex,
+        // active guard, and response finalization.
+        let _admission = match legacy_admission {
+            Some(admission) => Some(admission),
+            None => match session
+                .cancellation
+                .admissions
+                .admit(&request, session.cancellation.max_body_size)
+            {
+                Ok(admission) => admission,
+                Err(()) => return HttpResponse::bad_request(),
+            },
+        };
         let response = session
             .session
             .lock()
@@ -4458,18 +4748,18 @@ async fn serve_http_connection(
     let request = match request {
         Ok(request) => request,
         Err(_) => {
-            let _ = send_h1_response(&mut framed, HttpResponse::bad_request()).await;
+            let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
             return;
         }
     };
     if !framed.read_buffer().is_empty() {
-        let _ = send_h1_response(&mut framed, HttpResponse::bad_request()).await;
+        let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
         return;
     }
     let request = match h1_request_to_transport(&request) {
         Ok(request) => request,
         Err(response) => {
-            let _ = send_h1_response(&mut framed, response).await;
+            let _ = send_h1_response(cx, &mut framed, response).await;
             return;
         }
     };
@@ -4487,7 +4777,7 @@ async fn serve_http_connection(
         let mut session = match endpoint.open_session(cx) {
             Ok(session) => session,
             Err(_) => {
-                let _ = send_h1_response(&mut framed, HttpResponse::internal_error()).await;
+                let _ = send_h1_response(cx, &mut framed, HttpResponse::internal_error()).await;
                 return;
             }
         };
@@ -4508,18 +4798,36 @@ async fn serve_http_connection(
                 return;
             }
             Ok(Err(response)) => {
-                let _ =
-                    send_h1_response(&mut framed, http_endpoint_response_to_static(cx, response))
-                        .await;
+                let _ = send_h1_response(
+                    cx,
+                    &mut framed,
+                    http_endpoint_response_to_static(cx, response),
+                )
+                .await;
                 return;
             }
             Err(_) => {
-                let _ = send_h1_response(&mut framed, HttpResponse::bad_request()).await;
+                let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
                 return;
             }
         }
     }
     if !is_legacy_sse {
+        // Admit correlated legacy work before it enters the bounded blocking
+        // dispatch queue. The captured guard keeps this exact authority alive
+        // while it waits for the session mutex and then crosses into active
+        // dispatch and response finalization.
+        let legacy_admission = match admit_live_http_legacy_request(
+            &endpoint,
+            &legacy_sessions,
+            &request,
+        ) {
+            Ok(admission) => admission,
+            Err(response) => {
+                let _ = send_h1_response(cx, &mut framed, response).await;
+                return;
+            }
+        };
         let request_endpoint = Arc::clone(&endpoint);
         let request_legacy_sessions = Arc::clone(&legacy_sessions);
         let mut dispatch = match cx.spawn_blocking(move |request_cx| {
@@ -4528,11 +4836,12 @@ async fn serve_http_connection(
                 &request_endpoint,
                 &request_legacy_sessions,
                 request,
+                legacy_admission,
             )
         }) {
             Ok(dispatch) => dispatch,
             Err(_) => {
-                let _ = send_h1_response(&mut framed, HttpResponse::internal_error()).await;
+                let _ = send_h1_response(cx, &mut framed, HttpResponse::internal_error()).await;
                 return;
             }
         };
@@ -4540,14 +4849,14 @@ async fn serve_http_connection(
             Ok(response) => response,
             Err(_) => HttpResponse::internal_error(),
         };
-        let _ = send_h1_response(&mut framed, response).await;
+        let _ = send_h1_response(cx, &mut framed, response).await;
         return;
     }
 
     let mut session = match endpoint.open_session_for_legacy_sse(cx, &request) {
         Ok(session) => session,
         Err(_) => {
-            let _ = send_h1_response(&mut framed, HttpResponse::internal_error()).await;
+            let _ = send_h1_response(cx, &mut framed, HttpResponse::internal_error()).await;
             return;
         }
     };
@@ -4555,12 +4864,16 @@ async fn serve_http_connection(
     let response = match session.handle(cx, request) {
         Ok(ServerHttpEndpointResponse::LegacySse(response)) => response,
         Ok(response) => {
-            let _ =
-                send_h1_response(&mut framed, http_endpoint_response_to_static(cx, response)).await;
+            let _ = send_h1_response(
+                cx,
+                &mut framed,
+                http_endpoint_response_to_static(cx, response),
+            )
+            .await;
             return;
         }
         Err(_) => {
-            let _ = send_h1_response(&mut framed, HttpResponse::bad_request()).await;
+            let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
             return;
         }
     };
@@ -7848,11 +8161,7 @@ impl Server {
                     let request_id = request.id.clone();
                     if let Some(id) = request_id.as_ref()
                         && (server.request_id_is_active(session_id, id)
-                            || !queue_state.admit(
-                                id,
-                                era,
-                                request.method != "initialize",
-                            ))
+                            || !queue_state.admit(id, request.method != "initialize"))
                     {
                         let duplicate = JsonRpcResponse::error(
                             Some(id.clone()),
@@ -11719,6 +12028,11 @@ mod lib_unit_tests {
     static HTTP_OVERLAP_CONTROL: OnceLock<HttpOverlapControl> = OnceLock::new();
     static LIVE_HTTP_LISTENER_WAITS: AtomicUsize = AtomicUsize::new(0);
     static LIVE_HTTP_CONNECTION_READ_WAITS: AtomicUsize = AtomicUsize::new(0);
+    const LIVE_HTTP_TEST_TIMEOUT_NANOS: u64 = 2_000_000_000;
+
+    fn live_http_test_timeout(operation: &str) -> String {
+        format!("Timeout while waiting for {operation}")
+    }
 
     #[test]
     fn boxed_extension_settings_resolver_preserves_inactive_disposition() {
@@ -12028,25 +12342,46 @@ mod lib_unit_tests {
         LIVE_HTTP_CONNECTION_READ_WAITS.load(Ordering::Acquire)
     }
 
-    async fn wait_for_live_http_probe(cx: &Cx, before: usize, probe: fn() -> usize) {
+    async fn wait_for_live_http_probe(
+        cx: &Cx,
+        before: usize,
+        probe: fn() -> usize,
+    ) -> Result<(), String> {
+        let deadline = cx
+            .now()
+            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         while probe() <= before {
             cx.checkpoint()
-                .expect("test caller context must remain live while awaiting HTTP probe");
-            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                .map_err(|error| format!("live HTTP probe caller stopped: {error}"))?;
+            asupersync::time::timeout_at(
+                deadline,
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
+            )
+            .await
+            .map_err(|_| live_http_test_timeout("live HTTP probe"))?;
         }
+        Ok(())
     }
 
-    async fn wait_for_live_http_test_result<T>(receiver: Receiver<T>) -> T {
+    async fn wait_for_live_http_test_result<T>(receiver: Receiver<T>) -> Result<T, String> {
+        let cx = Cx::current()
+            .expect("the test runtime must install an ambient Cx while polling");
+        let deadline = cx
+            .now()
+            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         loop {
             match receiver.try_recv() {
-                Ok(result) => return result,
+                Ok(result) => return Ok(result),
                 Err(TryRecvError::Disconnected) => {
                     panic!("live HTTP test task exited without reporting its result");
                 }
                 Err(TryRecvError::Empty) => {
-                    let cx = Cx::current()
-                        .expect("the test runtime must install an ambient Cx while polling");
-                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    asupersync::time::timeout_at(
+                        deadline,
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
+                    )
+                    .await
+                    .map_err(|_| live_http_test_timeout("live HTTP test result"))?;
                 }
             }
         }
@@ -12070,7 +12405,9 @@ mod lib_unit_tests {
             })
             .expect("live HTTP test task must be admitted");
 
-        let result = runtime.block_on(wait_for_live_http_test_result(receiver));
+        let result = runtime
+            .block_on(wait_for_live_http_test_result(receiver))
+            .unwrap();
         result.unwrap();
     }
 
@@ -12116,6 +12453,7 @@ mod lib_unit_tests {
 
         runtime
             .block_on(wait_for_live_http_test_result(receiver))
+            .expect("live modern pump timed out")
             .expect("live modern pump must complete")
     }
 
@@ -12153,26 +12491,29 @@ mod lib_unit_tests {
             })
             .expect("live split transport task must be admitted");
 
-        runtime.block_on(wait_for_live_http_test_result(receiver))
+        runtime.block_on(wait_for_live_http_test_result(receiver))?
     }
 
     async fn live_http_exchange(address: SocketAddr, request: Vec<u8>) -> Result<Vec<u8>, String> {
-        let mut stream = AsyncTcpStream::connect(address)
+        let cx = Cx::current()
+            .expect("the test runtime must install an ambient Cx for live HTTP exchange");
+        let deadline = cx
+            .now()
+            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let mut stream = asupersync::time::timeout_at(deadline, AsyncTcpStream::connect(address))
             .await
+            .map_err(|_| live_http_test_timeout("live HTTP client connection"))?
             .map_err(|error| format!("live HTTP client connect failed: {error}"))?;
-        stream
-            .write_all(&request)
+        asupersync::time::timeout_at(deadline, stream.write_all(&request))
             .await
+            .map_err(|_| live_http_test_timeout("live HTTP client request write"))?
             .map_err(|error| format!("live HTTP client write failed: {error}"))?;
-        stream
-            .flush()
+        asupersync::time::timeout_at(deadline, stream.flush())
             .await
+            .map_err(|_| live_http_test_timeout("live HTTP client request flush"))?
             .map_err(|error| format!("live HTTP client flush failed: {error}"))?;
         let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .map_err(|error| format!("live HTTP client read failed: {error}"))?;
+        read_live_http_to_end(&mut stream, &mut response, "live HTTP client response EOF").await?;
         Ok(response)
     }
 
@@ -12210,6 +12551,11 @@ mod lib_unit_tests {
         received: &mut Vec<u8>,
         needle: &[u8],
     ) -> Result<(), String> {
+        let cx = Cx::current()
+            .expect("the test runtime must install an ambient Cx for live HTTP SSE reads");
+        let deadline = cx
+            .now()
+            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         while !received
             .windows(needle.len())
             .any(|window| window == needle)
@@ -12218,14 +12564,89 @@ mod lib_unit_tests {
                 return Err("live HTTP SSE response exceeded the test bound".to_string());
             }
             let mut chunk = [0_u8; 2048];
-            let read = stream
-                .read(&mut chunk)
+            let read = asupersync::time::timeout_at(deadline, stream.read(&mut chunk))
                 .await
+                .map_err(|_| live_http_test_timeout("live HTTP SSE response"))?
                 .map_err(|error| format!("live HTTP SSE read failed: {error}"))?;
             if read == 0 {
                 return Err("live HTTP SSE connection closed before expected event".to_string());
             }
             received.extend_from_slice(&chunk[..read]);
+        }
+        Ok(())
+    }
+
+    async fn read_live_http_to_end(
+        stream: &mut AsyncTcpStream,
+        received: &mut Vec<u8>,
+        operation: &str,
+    ) -> Result<(), String> {
+        let cx = Cx::current()
+            .expect("the test runtime must install an ambient Cx for live HTTP EOF reads");
+        let deadline = cx
+            .now()
+            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        asupersync::time::timeout_at(deadline, stream.read_to_end(received))
+            .await
+            .map_err(|_| live_http_test_timeout(operation))?
+            .map_err(|error| format!("{operation} failed: {error}"))?;
+        Ok(())
+    }
+
+    async fn open_live_legacy_http_session(
+        address: SocketAddr,
+    ) -> Result<(AsyncTcpStream, String, Vec<u8>), String> {
+        let cx = Cx::current()
+            .expect("the test runtime must install an ambient Cx for legacy HTTP SSE setup");
+        let deadline = cx
+            .now()
+            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let mut stream = asupersync::time::timeout_at(deadline, AsyncTcpStream::connect(address))
+            .await
+            .map_err(|_| live_http_test_timeout("legacy HTTP SSE connection"))?
+            .map_err(|error| format!("legacy HTTP SSE connect failed: {error}"))?;
+        let request = format!(
+            "GET /sse HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+        );
+        asupersync::time::timeout_at(deadline, stream.write_all(request.as_bytes()))
+            .await
+            .map_err(|_| live_http_test_timeout("legacy HTTP SSE request write"))?
+            .map_err(|error| format!("legacy HTTP SSE write failed: {error}"))?;
+        asupersync::time::timeout_at(deadline, stream.flush())
+            .await
+            .map_err(|_| live_http_test_timeout("legacy HTTP SSE request flush"))?
+            .map_err(|error| format!("legacy HTTP SSE flush failed: {error}"))?;
+
+        let mut received = Vec::new();
+        let endpoint_prefix = format!("data: http://{address}/messages?session_id=");
+        read_live_http_until(&mut stream, &mut received, endpoint_prefix.as_bytes()).await?;
+        let received_text = std::str::from_utf8(&received)
+            .map_err(|error| format!("legacy HTTP SSE endpoint was not UTF-8: {error}"))?;
+        let session_id = received_text
+            .split_once(&endpoint_prefix)
+            .and_then(|(_, remainder)| remainder.split_whitespace().next())
+            .ok_or_else(|| "legacy HTTP SSE endpoint omitted its session identifier".to_string())?
+            .to_owned();
+        Ok((stream, session_id, received))
+    }
+
+    async fn wait_for_live_http_legacy_admission(
+        cx: &Cx,
+        session: &LiveHttpSession,
+        request_id: &RequestId,
+    ) -> Result<(), String> {
+        let deadline = cx
+            .now()
+            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        while !session.cancellation.admissions.contains(request_id) {
+            cx.checkpoint()
+                .map_err(|error| format!("legacy HTTP admission wait stopped: {error}"))?;
+            asupersync::time::timeout_at(
+                deadline,
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
+            )
+            .await
+            .map_err(|_| live_http_test_timeout("legacy HTTP request admission"))?;
         }
         Ok(())
     }
@@ -14855,21 +15276,25 @@ mod lib_unit_tests {
         let queue = DispatchQueueState::default();
         let request_id = RequestId::String("linearized-request".to_string());
 
-        assert!(queue.admit(&request_id, ProtocolEra::Modern2026, true));
+        assert!(queue.admit(&request_id, true));
+        let cancellation = queue
+            .admitted_request_cancellation(&request_id)
+            .expect("admitted requests retain their cancellation authority");
         assert!(!queue.begin_dispatch(&request_id));
         assert!(
-            !queue.admit(&request_id, ProtocolEra::Modern2026, true),
+            !queue.admit(&request_id, true),
             "an active request must retain its queue reservation"
         );
         assert_eq!(
             queue.cancel_reserved(&request_id),
-            DispatchCancellationDisposition::NotOwned,
-            "active cancellation must route through ActiveRequestGuard"
+            DispatchCancellationDisposition::Accepted,
+            "an active request must retain the authority admitted at queue entry"
         );
+        assert!(cancellation.is_cancel_requested());
 
         queue.discard(&request_id);
         assert!(
-            queue.admit(&request_id, ProtocolEra::Modern2026, true),
+            queue.admit(&request_id, true),
             "the id may be reused only after response completion releases it"
         );
     }
@@ -14879,7 +15304,7 @@ mod lib_unit_tests {
         let queue = DispatchQueueState::default();
         let initialize_id = RequestId::Number(6);
 
-        assert!(queue.admit(&initialize_id, ProtocolEra::Legacy2024, false));
+        assert!(queue.admit(&initialize_id, false));
         assert_eq!(
             queue.cancel_reserved(&initialize_id),
             DispatchCancellationDisposition::Protected,
@@ -14892,41 +15317,128 @@ mod lib_unit_tests {
         queue.discard(&initialize_id);
     }
 
-    #[test]
-    fn exact_legacy_cancellation_authority_spans_the_queued_to_active_handoff() {
-        let queue = DispatchQueueState::default();
+    #[derive(Clone, Copy)]
+    enum QueuedToActiveProbeEra {
+        Legacy2024,
+        Modern2026,
+    }
+
+    fn queued_to_active_cancellation_probe(
+        era: QueuedToActiveProbeEra,
+        cancelled_id: RequestId,
+    ) -> (DispatchCancellationDisposition, bool, bool) {
+        let queue = Arc::new(DispatchQueueState::default());
         let request_id = RequestId::Integer("7e0".to_owned());
+        assert!(queue.admit(&request_id, true));
 
-        assert!(queue.admit(&request_id, ProtocolEra::Legacy2024, true));
-        let cancellation = queue
-            .legacy_request_cancellation(&RequestId::Number(7))
-            .expect("numeric aliases must select the admitted cancellation authority");
-        assert!(!queue.begin_dispatch(&request_id));
-
-        assert_eq!(
-            queue.cancel_reserved(&RequestId::Integer("7.0".to_owned())),
-            DispatchCancellationDisposition::Accepted,
-            "a cancellation in the dispatching-before-active interval must not be lost"
+        // The modern child must share the request authority created at queue
+        // admission; exact-2024 obtains that authority through its adapter.
+        let modern_reservation = matches!(era, QueuedToActiveProbeEra::Modern2026).then(|| {
+            assert!(queue.reserve_modern_slot());
+            ModernDispatchReservation::new(
+                Arc::clone(&queue),
+                Some(request_id.clone()),
+                0,
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let cancellation = modern_reservation.as_ref().map_or_else(
+            || {
+                queue
+                    .admitted_request_cancellation(&RequestId::Number(7))
+                    .expect("numeric aliases must select the admitted cancellation authority")
+            },
+            ModernDispatchReservation::cancellation,
         );
-        assert!(cancellation.is_cancel_requested());
-        queue.discard(&request_id);
+        let (started_sender, started_receiver) = sync_channel(1);
+        let (release_sender, release_receiver) = sync_channel(1);
+        let (result_sender, result_receiver) = sync_channel(1);
+        let worker_queue = Arc::clone(&queue);
+        let worker_request_id = request_id.clone();
+
+        let worker = thread::spawn(move || {
+            started_sender
+                .send(())
+                .expect("queued-to-active worker must report its gate");
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("queued-to-active worker release must be bounded");
+            let cancelled = match era {
+                QueuedToActiveProbeEra::Legacy2024 => {
+                    worker_queue.begin_dispatch(&worker_request_id)
+                }
+                QueuedToActiveProbeEra::Modern2026 => matches!(
+                    worker_queue.begin_modern_dispatch(Some(&worker_request_id)),
+                    ModernDispatchStart::Cancelled
+                ),
+            };
+            result_sender
+                .send(cancelled)
+                .expect("queued-to-active worker must report its dispatch outcome");
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("queued-to-active worker must reach the cancellation gate");
+        let disposition = queue.cancel_reserved(&cancelled_id);
+        release_sender
+            .send(())
+            .expect("queued-to-active worker must remain available for release");
+        let cancelled_before_dispatch = result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("queued-to-active dispatch result must be bounded");
+        worker
+            .join()
+            .expect("queued-to-active worker must not panic");
+
+        (
+            disposition,
+            cancelled_before_dispatch,
+            cancellation.is_cancel_requested(),
+        )
+    }
+
+    #[test]
+    fn queued_to_active_cancellation_admits_the_exact_id_for_modern_and_legacy() {
+        for era in [
+            QueuedToActiveProbeEra::Legacy2024,
+            QueuedToActiveProbeEra::Modern2026,
+        ] {
+            let (disposition, cancelled_before_dispatch, cancellation_observed) =
+                queued_to_active_cancellation_probe(era, RequestId::Integer("7.0".to_owned()));
+
+            assert_eq!(disposition, DispatchCancellationDisposition::Accepted);
+            assert!(cancelled_before_dispatch);
+            assert!(cancellation_observed);
+        }
+    }
+
+    #[test]
+    fn queued_to_active_cancellation_rejects_one_id_negative_for_modern_and_legacy() {
+        for era in [
+            QueuedToActiveProbeEra::Legacy2024,
+            QueuedToActiveProbeEra::Modern2026,
+        ] {
+            let (disposition, cancelled_before_dispatch, cancellation_observed) =
+                queued_to_active_cancellation_probe(era, RequestId::Integer("8e0".to_owned()));
+
+            assert_eq!(disposition, DispatchCancellationDisposition::NotOwned);
+            assert!(!cancelled_before_dispatch);
+            assert!(!cancellation_observed);
+        }
     }
 
     #[test]
     fn dispatch_queue_stop_rejects_admission_and_cancels_queued_start() {
         let queue = DispatchQueueState::default();
         let queued = RequestId::Number(7);
-        assert!(queue.admit(&queued, ProtocolEra::Modern2026, true));
+        assert!(queue.admit(&queued, true));
 
         queue.stop();
 
         assert!(queue.is_stopping());
         assert!(queue.begin_dispatch(&queued));
-        assert!(!queue.admit(
-            &RequestId::Number(8),
-            ProtocolEra::Modern2026,
-            true
-        ));
+        assert!(!queue.admit(&RequestId::Number(8), true));
     }
 
     #[test]
@@ -16267,7 +16779,7 @@ mod lib_unit_tests {
             &self,
             _ctx: &McpContext,
             _params: FinalCompletionParams,
-        ) -> McpResult<CompletionValues> {
+        ) -> McpResult<fastmcp_protocol::FinalCompletionValues> {
             Err(McpError::method_not_found("completion/complete"))
         }
     }
@@ -16294,7 +16806,7 @@ mod lib_unit_tests {
             &self,
             _ctx: &McpContext,
             _params: FinalCompletionParams,
-        ) -> McpResult<CompletionValues> {
+        ) -> McpResult<fastmcp_protocol::FinalCompletionValues> {
             Err(McpError::method_not_found("completion/complete"))
         }
     }
@@ -16333,6 +16845,118 @@ mod lib_unit_tests {
             Err(McpError::internal_error(
                 "exact legacy cancellation did not reach the live handler",
             ))
+        }
+    }
+
+    #[derive(Default)]
+    struct LiveLegacyRequestGate {
+        entered: AtomicBool,
+        released: AtomicBool,
+    }
+
+    impl LiveLegacyRequestGate {
+        fn enter(&self, ctx: &McpContext) -> McpResult<()> {
+            self.entered.store(true, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !self.released.load(Ordering::Acquire) && Instant::now() < deadline {
+                if ctx.is_cancelled() {
+                    return Err(McpError::request_cancelled());
+                }
+                thread::yield_now();
+            }
+            if self.released.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(McpError::internal_error(
+                    "bounded legacy HTTP request gate was not released",
+                ))
+            }
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+        }
+    }
+
+    struct LiveLegacyRequestGateRelease {
+        gate: Arc<LiveLegacyRequestGate>,
+    }
+
+    impl Drop for LiveLegacyRequestGateRelease {
+        fn drop(&mut self) {
+            self.gate.release();
+        }
+    }
+
+    struct LiveLegacyAdmissionBlocker {
+        gate: Arc<LiveLegacyRequestGate>,
+    }
+
+    impl ToolHandler for LiveLegacyAdmissionBlocker {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "live_legacy_admission_blocker".to_owned(),
+                description: Some(
+                    "Holds the exact legacy HTTP session mutex at a bounded test gate".to_owned(),
+                ),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.gate.enter(ctx)?;
+            Ok(vec![Content::text("legacy admission blocker released")])
+        }
+    }
+
+    struct LiveLegacyAdmissionTarget {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for LiveLegacyAdmissionTarget {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "live_legacy_admission_target".to_owned(),
+                description: Some(
+                    "Records whether a queued exact legacy HTTP request entered its handler"
+                        .to_owned(),
+                ),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
+            Ok(vec![Content::text("legacy admission target entered")])
+        }
+    }
+
+    struct LiveLegacyInitializeGateMiddleware {
+        gate: Arc<LiveLegacyRequestGate>,
+    }
+
+    impl Middleware for LiveLegacyInitializeGateMiddleware {
+        fn on_request(
+            &self,
+            ctx: &McpContext,
+            request: &JsonRpcRequest,
+        ) -> McpResult<MiddlewareDecision> {
+            if request.method == "initialize" {
+                self.gate.enter(ctx)?;
+            }
+            Ok(MiddlewareDecision::Continue)
         }
     }
 
@@ -18635,6 +19259,7 @@ mod lib_unit_tests {
             &endpoint,
             &legacy_sessions,
             extension_tasks_get_http_request(LEGACY_PROTOCOL_VERSION),
+            None,
         );
 
         assert_eq!(response.status, HttpStatus::BAD_REQUEST);
@@ -19091,9 +19716,12 @@ mod lib_unit_tests {
                             format!("overflow peer {peer} failed to connect: {error}")
                         })?;
                         let mut response = Vec::new();
-                        stream.read_to_end(&mut response).await.map_err(|error| {
-                            format!("overflow peer {peer} failed while awaiting close: {error}")
-                        })?;
+                        read_live_http_to_end(
+                            &mut stream,
+                            &mut response,
+                            &format!("overflow peer {peer} close"),
+                        )
+                        .await?;
                         if !response.is_empty() {
                             return Err(format!(
                                 "overflow peer {peer} received a response instead of an immediate close: {response:?}"
@@ -19370,6 +19998,694 @@ mod lib_unit_tests {
         });
     }
 
+    async fn live_bound_http_cross_era_transcript(
+        cx: &Cx,
+        policy: ProtocolPolicy,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let bound = Server::new("live-http-cross-era", "1.0.0")
+            .protocol_policy(policy)
+            .build()
+            .bind_http(cx, "127.0.0.1:0")
+            .await
+            .map_err(|error| format!("cross-era HTTP bind failed: {error}"))?;
+        let address = bound
+            .local_addr()
+            .map_err(|error| format!("cross-era HTTP address failed: {error}"))?;
+        let caller_cx = cx.clone();
+        let mut client = cx
+            .spawn(move |client_cx| async move {
+                let legacy_request = format!(
+                    "GET /sse HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes();
+                let deadline = client_cx
+                    .now()
+                    .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                let mut legacy = asupersync::time::timeout_at(
+                    deadline,
+                    AsyncTcpStream::connect(address),
+                )
+                    .await
+                    .map_err(|_| live_http_test_timeout("cross-era legacy connection"))?
+                    .map_err(|error| format!("cross-era legacy connect failed: {error}"))?;
+                asupersync::time::timeout_at(deadline, legacy.write_all(&legacy_request))
+                    .await
+                    .map_err(|_| live_http_test_timeout("cross-era legacy request write"))?
+                    .map_err(|error| format!("cross-era legacy write failed: {error}"))?;
+                asupersync::time::timeout_at(deadline, legacy.flush())
+                    .await
+                    .map_err(|_| live_http_test_timeout("cross-era legacy request flush"))?
+                    .map_err(|error| format!("cross-era legacy flush failed: {error}"))?;
+
+                let modern = JsonRpcRequest::new(
+                    SERVER_DISCOVER_METHOD,
+                    Some(serde_json::json!({
+                        "_meta": {
+                            MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        },
+                    })),
+                    891_i64,
+                );
+                let modern_body = serde_json::to_vec(&modern)
+                    .map_err(|error| format!("cross-era modern request did not serialize: {error}"))?;
+                let modern_request = live_http_post(
+                    "/mcp",
+                    &modern_body,
+                    &[
+                        ("Accept", "application/json"),
+                        ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                        ("Mcp-Method", SERVER_DISCOVER_METHOD),
+                    ],
+                );
+
+                let mut legacy_bytes = Vec::new();
+                if matches!(policy, ProtocolPolicy::Auto) {
+                    let endpoint_prefix = format!("data: http://{address}/messages?session_id=");
+                    read_live_http_until(&mut legacy, &mut legacy_bytes, endpoint_prefix.as_bytes())
+                        .await?;
+                } else {
+                    read_live_http_to_end(
+                        &mut legacy,
+                        &mut legacy_bytes,
+                        "cross-era legacy rejection EOF",
+                    )
+                    .await?;
+                }
+
+                let modern_response = live_http_exchange(address, modern_request).await?;
+                caller_cx.cancel_with(CancelKind::User, Some("cross-era HTTP transcript complete"));
+                Ok::<_, String>((legacy_bytes, modern_response))
+            })
+            .map_err(|error| format!("cross-era HTTP client admission failed: {error}"))?;
+
+        let serve = bound.serve(cx).await;
+        let transcript = client
+            .join(cx)
+            .await
+            .map_err(|error| format!("cross-era HTTP client failed: {error:?}"))??;
+        serve.map_err(|error| format!("cross-era HTTP server failed: {error}"))?;
+        Ok(transcript)
+    }
+
+    fn assert_cross_era_modern_discovery(response: &[u8]) -> Result<(), String> {
+        if !response.starts_with(b"HTTP/1.1 200") {
+            return Err(format!(
+                "cross-era modern request did not receive HTTP 200: {response:?}"
+            ));
+        }
+        let response: JsonRpcResponse = serde_json::from_slice(live_http_response_body(response)?)
+            .map_err(|error| format!("cross-era modern response was invalid: {error}"))?;
+        if response.id != Some(891_i64.into()) || response.error.is_some() {
+            return Err(format!(
+                "cross-era modern request was rejected: {response:?}"
+            ));
+        }
+        if response.result.as_ref().and_then(|result| {
+            result["_meta"][fastmcp_protocol::SERVER_DISCOVER_SERVER_INFO_META_KEY]["name"]
+                .as_str()
+        }) != Some("live-http-cross-era")
+        {
+            return Err(format!(
+                "cross-era modern discovery result changed its server identity: {response:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn live_non_sse_shutdown_fence_transcript(
+        cx: &Cx,
+        cancel_before_response: bool,
+    ) -> Result<Vec<u8>, String> {
+        const REQUEST_ID: i64 = 892;
+
+        let control = Arc::new(LiveModernControl::default());
+        let bound = Server::new("live-http-shutdown-fence", "1.0.0")
+            .tool(LiveModernControlledTool {
+                control: Arc::clone(&control),
+            })
+            .build()
+            .bind_http(cx, "127.0.0.1:0")
+            .await
+            .map_err(|error| format!("shutdown-fence HTTP bind failed: {error}"))?;
+        let address = bound
+            .local_addr()
+            .map_err(|error| format!("shutdown-fence HTTP address failed: {error}"))?;
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "live_modern_controlled_tool",
+                "arguments": {},
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                },
+            })),
+            REQUEST_ID,
+        );
+        let request = live_http_post(
+            "/mcp",
+            &serde_json::to_vec(&request)
+                .map_err(|error| format!("shutdown-fence request did not serialize: {error}"))?,
+            &[
+                ("Accept", "application/json"),
+                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                ("Mcp-Method", "tools/call"),
+            ],
+        );
+        let cancellation = cx.clone();
+        let controller = Arc::clone(&control);
+        let client = thread::spawn(move || -> Result<Vec<u8>, String> {
+            let mut stream = std::net::TcpStream::connect(address)
+                .map_err(|error| format!("shutdown-fence client connect failed: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|error| format!("shutdown-fence client timeout setup failed: {error}"))?;
+            std::io::Write::write_all(&mut stream, &request)
+                .map_err(|error| format!("shutdown-fence client write failed: {error}"))?;
+            std::io::Write::flush(&mut stream)
+                .map_err(|error| format!("shutdown-fence client flush failed: {error}"))?;
+            if !controller.wait_for_started(1, Duration::from_secs(2)) {
+                return Err("shutdown-fence tool did not enter before its deadline".to_owned());
+            }
+            if cancel_before_response {
+                cancellation.cancel_with(
+                    CancelKind::Shutdown,
+                    Some("shutdown-fence cancellation before H1 response"),
+                );
+            } else {
+                controller.release(REQUEST_ID as u64);
+            }
+
+            let mut response = Vec::new();
+            match std::io::Read::read_to_end(&mut stream, &mut response) {
+                Ok(_) => {}
+                Err(error)
+                    if cancel_before_response
+                        && response.is_empty()
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::UnexpectedEof
+                        ) => {}
+                Err(error) => {
+                    return Err(format!("shutdown-fence client read failed: {error}"));
+                }
+            }
+            if !cancel_before_response {
+                cancellation.cancel_with(
+                    CancelKind::Shutdown,
+                    Some("shutdown-fence response committed"),
+                );
+            }
+            Ok(response)
+        });
+
+        let serve = bound.serve(cx).await;
+        let response = client
+            .join()
+            .map_err(|_| "shutdown-fence client panicked".to_owned())??;
+        serve.map_err(|error| format!("shutdown-fence server failed: {error}"))?;
+        Ok(response)
+    }
+
+    #[test]
+    fn live_bound_http_auto_coexists_with_exact_legacy_and_modern_requests() {
+        run_live_http_test(|cx| async move {
+            let (legacy, modern) =
+                live_bound_http_cross_era_transcript(&cx, ProtocolPolicy::Auto).await?;
+            if !legacy.starts_with(b"HTTP/1.1 200")
+                || !legacy
+                    .windows(b"/messages?session_id=".len())
+                    .any(|window| window == b"/messages?session_id=")
+            {
+                return Err(format!(
+                    "Auto did not retain the exact legacy SSE route: {legacy:?}"
+                ));
+            }
+            assert_cross_era_modern_discovery(&modern)?;
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_bound_http_modern_only_rejects_the_identical_legacy_half() {
+        run_live_http_test(|cx| async move {
+            // This transcript differs from the Auto positive only in the
+            // policy selected at server construction.
+            let (legacy, modern) =
+                live_bound_http_cross_era_transcript(&cx, ProtocolPolicy::ModernOnly).await?;
+            if !legacy.starts_with(b"HTTP/1.1 400") {
+                return Err(format!(
+                    "ModernOnly admitted the legacy SSE route: {legacy:?}"
+                ));
+            }
+            assert_cross_era_modern_discovery(&modern)?;
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_non_sse_response_commits_before_shutdown() {
+        run_live_http_test(|cx| async move {
+            let response = live_non_sse_shutdown_fence_transcript(&cx, false).await?;
+            if !response.starts_with(b"HTTP/1.1 200")
+                || !response
+                    .windows(b"modern request 892".len())
+                    .any(|window| window == b"modern request 892")
+            {
+                return Err(format!(
+                    "a non-SSE response did not commit before shutdown: {response:?}"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_non_sse_shutdown_suppresses_the_pending_response() {
+        run_live_http_test(|cx| async move {
+            // This differs from the positive only by cancelling after the
+            // handler enters and before the ordinary H1 response can commit.
+            let response = live_non_sse_shutdown_fence_transcript(&cx, true).await?;
+            if !response.is_empty() {
+                return Err(format!(
+                    "shutdown wrote a non-SSE response after cancellation: {response:?}"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    async fn live_http_legacy_admission_cancellation_probe(
+        cx: &Cx,
+        cancellation_request_id: i64,
+    ) -> Result<usize, String> {
+        const INITIALIZE_ID: i64 = 830;
+        const BLOCKER_ID: i64 = 831;
+        const TARGET_ID: i64 = 832;
+
+        let gate = Arc::new(LiveLegacyRequestGate::default());
+        let target_calls = Arc::new(AtomicUsize::new(0));
+        let bound = Server::new("live-http-legacy-admission-cancellation", "1.0.0")
+            .tool(LiveLegacyAdmissionBlocker {
+                gate: Arc::clone(&gate),
+            })
+            .tool(LiveLegacyAdmissionTarget {
+                calls: Arc::clone(&target_calls),
+            })
+            .build()
+            .bind_http(cx, "127.0.0.1:0")
+            .await
+            .map_err(|error| format!("legacy admission HTTP bind failed: {error}"))?;
+        let address = bound
+            .local_addr()
+            .map_err(|error| format!("legacy admission HTTP address failed: {error}"))?;
+        let legacy_sessions = Arc::clone(&bound.legacy_sessions);
+        let caller_cx = cx.clone();
+        let gate_for_client = Arc::clone(&gate);
+        let target_calls_for_client = Arc::clone(&target_calls);
+        let mut client = cx
+            .spawn(move |client_cx| async move {
+                let (mut sse, session_id, mut received) = open_live_legacy_http_session(address).await?;
+                let session = legacy_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&session_id)
+                    .cloned()
+                    .ok_or_else(|| "legacy admission session was not registered".to_string())?;
+
+                for request in [
+                    JsonRpcRequest::new(
+                        "initialize",
+                        Some(serde_json::json!({
+                            "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "clientInfo": {"name": "legacy-admission-client", "version": "1.0.0"},
+                        })),
+                        INITIALIZE_ID,
+                    ),
+                    JsonRpcRequest::notification("notifications/initialized", None),
+                ] {
+                    let body = serde_json::to_vec(&request).map_err(|error| {
+                        format!("legacy admission setup request did not serialize: {error}")
+                    })?;
+                    let response = live_http_exchange(
+                        address,
+                        live_http_post(&format!("/messages?session_id={session_id}"), &body, &[]),
+                    )
+                    .await?;
+                    if !response.starts_with(b"HTTP/1.1 202") {
+                        return Err(format!(
+                            "legacy admission setup request was not accepted: {response:?}"
+                        ));
+                    }
+                }
+
+                let blocker = JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "live_legacy_admission_blocker",
+                        "arguments": {},
+                    })),
+                    BLOCKER_ID,
+                );
+                let blocker_body = serde_json::to_vec(&blocker).map_err(|error| {
+                    format!("legacy admission blocker request did not serialize: {error}")
+                })?;
+                let blocker_request = live_http_post(
+                    &format!("/messages?session_id={session_id}"),
+                    &blocker_body,
+                    &[],
+                );
+                let mut blocker = client_cx
+                    .spawn(move |_blocker_cx| async move {
+                        live_http_exchange(address, blocker_request).await
+                    })
+                    .map_err(|error| {
+                        format!("legacy admission blocker task was not admitted: {error}")
+                    })?;
+                let _release_blocker = LiveLegacyRequestGateRelease {
+                    gate: Arc::clone(&gate_for_client),
+                };
+
+                let blocker_deadline = client_cx
+                    .now()
+                    .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                while !gate_for_client.entered.load(Ordering::Acquire) {
+                    client_cx
+                        .checkpoint()
+                        .map_err(|error| format!("legacy admission client stopped: {error}"))?;
+                    asupersync::time::timeout_at(
+                        blocker_deadline,
+                        asupersync::time::sleep(client_cx.now(), Duration::from_millis(1)),
+                    )
+                    .await
+                    .map_err(|_| live_http_test_timeout("legacy admission blocker entry"))?;
+                }
+
+                let target_id = RequestId::Number(TARGET_ID);
+                let target = JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "live_legacy_admission_target",
+                        "arguments": {},
+                    })),
+                    TARGET_ID,
+                );
+                let target_body = serde_json::to_vec(&target).map_err(|error| {
+                    format!("legacy admission target request did not serialize: {error}")
+                })?;
+                let target_request = live_http_post(
+                    &format!("/messages?session_id={session_id}"),
+                    &target_body,
+                    &[],
+                );
+                let mut target = client_cx
+                    .spawn(move |_target_cx| async move {
+                        live_http_exchange(address, target_request).await
+                    })
+                    .map_err(|error| {
+                        format!("legacy admission target task was not admitted: {error}")
+                    })?;
+                wait_for_live_http_legacy_admission(&client_cx, &session, &target_id).await?;
+
+                let cancellation = JsonRpcRequest::notification(
+                    "notifications/cancelled",
+                    Some(serde_json::json!({
+                        "requestId": cancellation_request_id,
+                        "reason": "legacy HTTP admission cancellation",
+                    })),
+                );
+                let cancellation_body = serde_json::to_vec(&cancellation).map_err(|error| {
+                    format!("legacy admission cancellation did not serialize: {error}")
+                })?;
+                let cancellation_response = live_http_exchange(
+                    address,
+                    live_http_post(
+                        &format!("/messages?session_id={session_id}"),
+                        &cancellation_body,
+                        &[],
+                    ),
+                )
+                .await?;
+                if !cancellation_response.starts_with(b"HTTP/1.1 202") {
+                    return Err(format!(
+                        "legacy admission cancellation control POST was not accepted: {cancellation_response:?}"
+                    ));
+                }
+
+                gate_for_client.release();
+                let blocker_response = blocker
+                    .join(&client_cx)
+                    .await
+                    .map_err(|error| format!("legacy admission blocker task failed: {error:?}"))??;
+                if !blocker_response.starts_with(b"HTTP/1.1 202") {
+                    return Err(format!(
+                        "legacy admission blocker acknowledgement was unexpected: {blocker_response:?}"
+                    ));
+                }
+                let target_response = target
+                    .join(&client_cx)
+                    .await
+                    .map_err(|error| format!("legacy admission target task failed: {error:?}"))??;
+                if !target_response.starts_with(b"HTTP/1.1 202") {
+                    return Err(format!(
+                        "legacy admission target acknowledgement was unexpected: {target_response:?}"
+                    ));
+                }
+
+                let blocker_marker = format!("\"id\":{BLOCKER_ID}");
+                read_live_http_until(&mut sse, &mut received, blocker_marker.as_bytes()).await?;
+                let target_marker = format!("\"id\":{TARGET_ID}");
+                if cancellation_request_id == TARGET_ID {
+                    if target_calls_for_client.load(Ordering::Acquire) != 0
+                        || received
+                            .windows(target_marker.len())
+                            .any(|window| window == target_marker.as_bytes())
+                    {
+                        return Err(
+                            "a cancellation admitted before the session mutex still entered its target"
+                                .to_string(),
+                        );
+                    }
+                    let probe_deadline = client_cx
+                        .now()
+                        .saturating_add_nanos(100_000_000);
+                    let mut chunk = [0_u8; 1024];
+                    match asupersync::time::timeout_at(probe_deadline, sse.read(&mut chunk)).await {
+                        Err(_) => {}
+                        Ok(Ok(0)) => {
+                            return Err(
+                                "legacy admission SSE stream closed before the bounded silence probe"
+                                    .to_string(),
+                            );
+                        }
+                        Ok(Ok(read)) => {
+                            received.extend_from_slice(&chunk[..read]);
+                            return Err(format!(
+                                "cancelled queued legacy request emitted an SSE frame: {received:?}"
+                            ));
+                        }
+                        Ok(Err(error)) => {
+                            return Err(format!(
+                                "legacy admission SSE silence probe failed: {error}"
+                            ));
+                        }
+                    }
+                } else {
+                    read_live_http_until(&mut sse, &mut received, target_marker.as_bytes()).await?;
+                    if target_calls_for_client.load(Ordering::Acquire) != 1 {
+                        return Err(
+                            "one-ID-negative cancellation altered the exact target request"
+                                .to_string(),
+                        );
+                    }
+                }
+
+                caller_cx.cancel_with(CancelKind::User, Some("legacy admission probe complete"));
+                Ok::<_, String>(())
+            })
+            .map_err(|error| format!("legacy admission client task was not admitted: {error}"))?;
+
+        let serve = bound.serve(cx).await;
+        client
+            .join(cx)
+            .await
+            .map_err(|error| format!("legacy admission client task failed: {error:?}"))??;
+        serve.map_err(|error| format!("legacy admission HTTP server failed: {error}"))?;
+        Ok(target_calls.load(Ordering::Acquire))
+    }
+
+    #[test]
+    fn live_http_legacy_cancellation_survives_admission_to_active_transition() {
+        run_live_http_test(|cx| async move {
+            let calls = live_http_legacy_admission_cancellation_probe(&cx, 832).await?;
+            if calls != 0 {
+                return Err(format!(
+                    "cancelled queued legacy HTTP request entered its handler {calls} time(s)"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_legacy_cancellation_rejects_the_one_id_negative() {
+        run_live_http_test(|cx| async move {
+            // This differs from the positive only in the cancellation request
+            // ID. It must not affect the queued request with ID 832.
+            let calls = live_http_legacy_admission_cancellation_probe(&cx, 833).await?;
+            if calls != 1 {
+                return Err(format!(
+                    "one-ID-negative cancellation changed target handler calls to {calls}"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_legacy_initialize_is_peer_cancellation_protected() {
+        run_live_http_test(|cx| async move {
+            const INITIALIZE_ID: i64 = 834;
+
+            let gate = Arc::new(LiveLegacyRequestGate::default());
+            let bound = Server::new("live-http-legacy-initialize-protection", "1.0.0")
+                .middleware(LiveLegacyInitializeGateMiddleware {
+                    gate: Arc::clone(&gate),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("legacy initialize HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("legacy initialize HTTP address failed: {error}"))?;
+            let legacy_sessions = Arc::clone(&bound.legacy_sessions);
+            let caller_cx = cx.clone();
+            let gate_for_client = Arc::clone(&gate);
+            let mut client = cx
+                .spawn(move |client_cx| async move {
+                    let (mut sse, session_id, mut received) =
+                        open_live_legacy_http_session(address).await?;
+                    let session = legacy_sessions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&session_id)
+                        .cloned()
+                        .ok_or_else(|| "legacy initialize session was not registered".to_string())?;
+                    let initialize = JsonRpcRequest::new(
+                        "initialize",
+                        Some(serde_json::json!({
+                            "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "clientInfo": {"name": "legacy-initialize-client", "version": "1.0.0"},
+                        })),
+                        INITIALIZE_ID,
+                    );
+                    let initialize_body = serde_json::to_vec(&initialize).map_err(|error| {
+                        format!("legacy initialize request did not serialize: {error}")
+                    })?;
+                    let initialize_request = live_http_post(
+                        &format!("/messages?session_id={session_id}"),
+                        &initialize_body,
+                        &[],
+                    );
+                    let mut initialize = client_cx
+                        .spawn(move |_initialize_cx| async move {
+                            live_http_exchange(address, initialize_request).await
+                        })
+                        .map_err(|error| {
+                            format!("legacy initialize task was not admitted: {error}")
+                        })?;
+                    let _release_gate = LiveLegacyRequestGateRelease {
+                        gate: Arc::clone(&gate_for_client),
+                    };
+                    let initialize_id = RequestId::Number(INITIALIZE_ID);
+                    wait_for_live_http_legacy_admission(&client_cx, &session, &initialize_id).await?;
+
+                    let gate_deadline = client_cx
+                        .now()
+                        .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                    while !gate_for_client.entered.load(Ordering::Acquire) {
+                        client_cx
+                            .checkpoint()
+                            .map_err(|error| format!("legacy initialize client stopped: {error}"))?;
+                        asupersync::time::timeout_at(
+                            gate_deadline,
+                            asupersync::time::sleep(client_cx.now(), Duration::from_millis(1)),
+                        )
+                        .await
+                        .map_err(|_| live_http_test_timeout("legacy initialize middleware entry"))?;
+                    }
+
+                    let cancellation = JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(serde_json::json!({
+                            "requestId": INITIALIZE_ID,
+                            "reason": "initialize must be peer-cancellation protected",
+                        })),
+                    );
+                    let cancellation_body = serde_json::to_vec(&cancellation).map_err(|error| {
+                        format!("legacy initialize cancellation did not serialize: {error}")
+                    })?;
+                    let cancellation_response = live_http_exchange(
+                        address,
+                        live_http_post(
+                            &format!("/messages?session_id={session_id}"),
+                            &cancellation_body,
+                            &[],
+                        ),
+                    )
+                    .await?;
+                    if !cancellation_response.starts_with(b"HTTP/1.1 202") {
+                        return Err(format!(
+                            "legacy initialize cancellation control POST was not accepted: {cancellation_response:?}"
+                        ));
+                    }
+
+                    gate_for_client.release();
+                    let initialize_response = initialize
+                        .join(&client_cx)
+                        .await
+                        .map_err(|error| format!("legacy initialize task failed: {error:?}"))??;
+                    if !initialize_response.starts_with(b"HTTP/1.1 202") {
+                        return Err(format!(
+                            "legacy initialize acknowledgement was unexpected: {initialize_response:?}"
+                        ));
+                    }
+                    let initialize_marker = format!("\"id\":{INITIALIZE_ID}");
+                    read_live_http_until(&mut sse, &mut received, initialize_marker.as_bytes())
+                        .await?;
+                    let received = std::str::from_utf8(&received).map_err(|error| {
+                        format!("legacy initialize SSE response was not UTF-8: {error}")
+                    })?;
+                    if !received.contains(LEGACY_PROTOCOL_VERSION) {
+                        return Err(
+                            "peer cancellation suppressed the exact legacy initialize response"
+                                .to_string(),
+                        );
+                    }
+                    caller_cx.cancel_with(
+                        CancelKind::User,
+                        Some("legacy initialize protection probe complete"),
+                    );
+                    Ok::<_, String>(())
+                })
+                .map_err(|error| {
+                    format!("legacy initialize client task was not admitted: {error}")
+                })?;
+
+            let serve = bound.serve(&cx).await;
+            client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("legacy initialize client task failed: {error:?}"))??;
+            serve.map_err(|error| format!("legacy initialize HTTP server failed: {error}"))?;
+            Ok(())
+        });
+    }
+
     #[test]
     fn live_http_legacy_cancellation_bypasses_the_busy_session_lock() {
         run_live_http_test(|cx| async move {
@@ -19561,13 +20877,21 @@ mod lib_unit_tests {
             let caller_cx = cx.clone();
             let mut canceller = cx
                 .spawn(move |canceller_cx| async move {
-                    wait_for_live_http_probe(
+                    if let Err(error) = wait_for_live_http_probe(
                         &canceller_cx,
                         listener_wait_before,
                         live_http_listener_wait_count,
                     )
-                    .await;
+                    .await
+                    {
+                        caller_cx.cancel_with(
+                            CancelKind::User,
+                            Some("idle listener probe timed out"),
+                        );
+                        return Err(error);
+                    }
                     caller_cx.cancel_with(CancelKind::User, Some("idle listener cancellation"));
+                    Ok(())
                 })
                 .map_err(|error| format!("idle listener canceller admission failed: {error}"))?;
             listener
@@ -19577,7 +20901,7 @@ mod lib_unit_tests {
             canceller
                 .join(&cx)
                 .await
-                .map_err(|error| format!("idle listener canceller failed: {error:?}"))?;
+                .map_err(|error| format!("idle listener canceller failed: {error:?}"))??;
             Ok(())
         });
 
@@ -19605,12 +20929,19 @@ mod lib_unit_tests {
                         .flush()
                         .await
                         .map_err(|error| format!("idle client partial flush failed: {error}"))?;
-                    wait_for_live_http_probe(
+                    if let Err(error) = wait_for_live_http_probe(
                         &client_cx,
                         read_wait_before,
                         live_http_connection_read_wait_count,
                     )
-                    .await;
+                    .await
+                    {
+                        caller_cx.cancel_with(
+                            CancelKind::User,
+                            Some("idle connection probe timed out"),
+                        );
+                        return Err(error);
+                    }
                     caller_cx.cancel_with(CancelKind::User, Some("idle connection cancellation"));
 
                     let mut byte = [0_u8; 1];

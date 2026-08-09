@@ -118,6 +118,40 @@ const MRTR_REQUEST_STATE_UNAVAILABLE_ERROR: &str = "Unable to create MRTR reques
 const MRTR_INPUT_MAP_ERROR: &str = "Invalid MRTR input request or response map";
 const MRTR_RESPONSE_KIND_ERROR: &str = "MRTR input response does not match its request";
 const MRTR_ROUND_LIMIT_ERROR: &str = "MRTR exchange limit reached";
+
+/// The immutable request facts a router binds to one opaque MRTR state.
+///
+/// This is deliberately server-local: it is never serialized and prevents a
+/// state minted for one modern operation from resuming another operation that
+/// happens to request the same embedded input kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MrtrExchangeBinding {
+    method: &'static str,
+    target: String,
+    arguments_digest: [u8; 32],
+    session_partition: [u8; 32],
+    principal_digest: Option<[u8; 32]>,
+}
+
+impl MrtrExchangeBinding {
+    /// Captures the router-admitted operation identity for a future retry.
+    #[must_use]
+    pub(crate) fn new(
+        method: &'static str,
+        target: String,
+        arguments_digest: [u8; 32],
+        session_partition: [u8; 32],
+        principal_digest: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            method,
+            target,
+            arguments_digest,
+            session_partition,
+            principal_digest,
+        }
+    }
+}
 const LEGACY_INPUT_RETRY_ERROR: &str = "MCP 2024-11-05 does not support input retries";
 
 // ============================================================================
@@ -1045,6 +1079,44 @@ impl MrtrInputRequest {
         self.kind
     }
 
+    /// Decodes one handler-declared embedded input descriptor.
+    ///
+    /// Only the three final MRTR methods are admitted. In particular, a
+    /// handler cannot smuggle an arbitrary JSON-RPC request or outer metadata
+    /// through the framework-minted input-required result.
+    pub(crate) fn from_wire(value: &serde_json::Value) -> McpResult<Self> {
+        let Some(object) = value.as_object() else {
+            return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
+        };
+        if object.len() > 2 || object.keys().any(|key| key != "method" && key != "params") {
+            return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
+        }
+        let Some(method) = object.get("method").and_then(serde_json::Value::as_str) else {
+            return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
+        };
+        let params = object.get("params");
+        match method {
+            "elicitation/create" => {
+                let params =
+                    params.ok_or_else(|| McpError::invalid_params(MRTR_INPUT_MAP_ERROR))?;
+                Self::elicitation(
+                    serde_json::from_value(params.clone())
+                        .map_err(|_| McpError::invalid_params(MRTR_INPUT_MAP_ERROR))?,
+                )
+            }
+            "sampling/createMessage" => {
+                let params =
+                    params.ok_or_else(|| McpError::invalid_params(MRTR_INPUT_MAP_ERROR))?;
+                Self::sampling(
+                    serde_json::from_value(params.clone())
+                        .map_err(|_| McpError::invalid_params(MRTR_INPUT_MAP_ERROR))?,
+                )
+            }
+            "roots/list" if params.is_none() => Ok(Self::roots()),
+            _ => Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR)),
+        }
+    }
+
     fn with_params<T: Serialize>(kind: MrtrInputKind, params: T) -> McpResult<Self> {
         let params = serde_json::to_value(params)
             .map_err(|_| McpError::internal_error(REQUEST_PAYLOAD_ERROR))?;
@@ -1115,6 +1187,56 @@ impl MrtrInputResponse {
     #[must_use]
     pub const fn kind(&self) -> MrtrInputKind {
         self.kind
+    }
+
+    /// Returns this value as the elicitation result it was admitted as.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` when the caller asks for the wrong response
+    /// kind. This is a handler-facing resume surface, not a wire decoder.
+    pub fn elicitation_result(&self) -> McpResult<fastmcp_protocol::ElicitResult> {
+        if self.kind != MrtrInputKind::Elicitation {
+            return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
+        }
+        serde_json::from_value(self.value.clone())
+            .map_err(|_| McpError::internal_error(MRTR_RESPONSE_KIND_ERROR))
+    }
+
+    /// Returns this value as the sampling result it was admitted as.
+    pub fn sampling_result(&self) -> McpResult<fastmcp_protocol::CreateMessageResult> {
+        if self.kind != MrtrInputKind::Sampling {
+            return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
+        }
+        serde_json::from_value(self.value.clone())
+            .map_err(|_| McpError::internal_error(MRTR_RESPONSE_KIND_ERROR))
+    }
+
+    /// Returns this value as the roots result it was admitted as.
+    pub fn roots_result(&self) -> McpResult<fastmcp_protocol::ListRootsResult> {
+        if self.kind != MrtrInputKind::Roots {
+            return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
+        }
+        serde_json::from_value(self.value.clone())
+            .map_err(|_| McpError::internal_error(MRTR_RESPONSE_KIND_ERROR))
+    }
+
+    fn from_wire(kind: MrtrInputKind, value: serde_json::Value) -> McpResult<Self> {
+        let response = match kind {
+            MrtrInputKind::Elicitation => Self::elicitation(
+                serde_json::from_value(value)
+                    .map_err(|_| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?,
+            )?,
+            MrtrInputKind::Sampling => Self::sampling(
+                serde_json::from_value(value)
+                    .map_err(|_| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?,
+            )?,
+            MrtrInputKind::Roots => Self::roots(
+                serde_json::from_value(value)
+                    .map_err(|_| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?,
+            )?,
+        };
+        Ok(response)
     }
 
     fn with_value<T: Serialize>(kind: MrtrInputKind, value: T) -> McpResult<Self> {
@@ -1361,6 +1483,30 @@ impl MrtrCompletedInputs {
     pub fn responses(&self) -> &MrtrInputResponses {
         &self.responses
     }
+
+    /// Returns one framework-admitted elicitation response by its issued key.
+    pub fn elicitation(&self, key: &str) -> McpResult<Option<fastmcp_protocol::ElicitResult>> {
+        self.responses
+            .get(key)
+            .map(MrtrInputResponse::elicitation_result)
+            .transpose()
+    }
+
+    /// Returns one framework-admitted sampling response by its issued key.
+    pub fn sampling(&self, key: &str) -> McpResult<Option<fastmcp_protocol::CreateMessageResult>> {
+        self.responses
+            .get(key)
+            .map(MrtrInputResponse::sampling_result)
+            .transpose()
+    }
+
+    /// Returns one framework-admitted roots response by its issued key.
+    pub fn roots(&self, key: &str) -> McpResult<Option<fastmcp_protocol::ListRootsResult>> {
+        self.responses
+            .get(key)
+            .map(MrtrInputResponse::roots_result)
+            .transpose()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1397,6 +1543,7 @@ struct MrtrExchange {
     requests: MrtrInputRequests,
     expected: ExpectedInputLedger,
     responses: MrtrInputResponses,
+    binding: Option<MrtrExchangeBinding>,
 }
 
 #[derive(Debug, Default)]
@@ -1482,7 +1629,23 @@ impl MrtrExchangeRegistry {
         owner_cancellation: McpRequestCancellation,
         input_requests: MrtrInputRequests,
     ) -> McpResult<MrtrInputRequired> {
-        self.issue_at(owner_cancellation, input_requests, Instant::now())
+        self.issue_at(owner_cancellation, None, input_requests, Instant::now())
+    }
+
+    /// Issues an `input_required` result bound to one router-admitted modern
+    /// operation. Only [`Self::accept_wire_bound`] can consume such a state.
+    pub(crate) fn issue_bound(
+        &self,
+        owner_cancellation: McpRequestCancellation,
+        binding: MrtrExchangeBinding,
+        input_requests: MrtrInputRequests,
+    ) -> McpResult<MrtrInputRequired> {
+        self.issue_at(
+            owner_cancellation,
+            Some(binding),
+            input_requests,
+            Instant::now(),
+        )
     }
 
     /// Consumes one client retry's input-response map.
@@ -1502,7 +1665,103 @@ impl MrtrExchangeRegistry {
         request_state: &str,
         input_responses: MrtrInputResponses,
     ) -> McpResult<MrtrRetry> {
-        self.accept_at(request_state, input_responses, Instant::now())
+        self.accept_at(request_state, None, input_responses, Instant::now())
+    }
+
+    /// Decodes and consumes one router-admitted final `inputResponses` map.
+    ///
+    /// Final request parameter types retain input responses as JSON values.
+    /// This boundary keeps router code from selecting a response kind itself:
+    /// each recognized value is decoded using the kind retained for its
+    /// server-issued input key. Unknown keys remain inert, and malformed or
+    /// cross-kind values leave the request state available for a valid retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` if the state is invalid, the response map
+    /// exceeds this registry's configured bound, or a recognized response
+    /// cannot be decoded as the kind that was issued for its key.
+    pub fn accept_wire(
+        &self,
+        request_state: &str,
+        input_responses: &BTreeMap<String, serde_json::Value>,
+    ) -> McpResult<MrtrRetry> {
+        self.accept_wire_with_binding(request_state, None, input_responses)
+    }
+
+    /// Decodes and consumes a router retry only when its immutable request
+    /// facts exactly match the state that issued it.
+    pub(crate) fn accept_wire_bound(
+        &self,
+        request_state: &str,
+        binding: &MrtrExchangeBinding,
+        input_responses: &BTreeMap<String, serde_json::Value>,
+    ) -> McpResult<MrtrRetry> {
+        self.accept_wire_with_binding(request_state, Some(binding), input_responses)
+    }
+
+    /// Returns the configured response-map admission ceiling so the router can
+    /// reject an oversized raw map before typed request decoding allocates it.
+    #[must_use]
+    pub(crate) const fn max_inputs_per_round(&self) -> usize {
+        self.max_inputs_per_round
+    }
+
+    fn accept_wire_with_binding(
+        &self,
+        request_state: &str,
+        binding: Option<&MrtrExchangeBinding>,
+        input_responses: &BTreeMap<String, serde_json::Value>,
+    ) -> McpResult<MrtrRetry> {
+        if request_state.len() > DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES {
+            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+        }
+        if input_responses.len() > self.max_inputs_per_round {
+            return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
+        }
+
+        let expected = {
+            let mut state = self.lock_state();
+            let now = Instant::now();
+            let exchange = state
+                .exchanges
+                .get(request_state)
+                .cloned()
+                .ok_or_else(|| McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))?;
+            if now >= exchange.expires_at || exchange.owner_cancellation.is_cancel_requested() {
+                state.exchanges.remove(request_state);
+                return if exchange.owner_cancellation.is_cancel_requested() {
+                    Err(McpError::request_cancelled())
+                } else {
+                    Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))
+                };
+            }
+            if exchange.binding.as_ref() != binding {
+                return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+            }
+            Self::purge_stale(&mut state, now);
+            exchange.expected
+        };
+
+        let mut typed_responses = MrtrInputResponses::default();
+        for (key, value) in input_responses {
+            let Some(kind) = expected.get(key) else {
+                continue;
+            };
+            typed_responses.insert(
+                key.clone(),
+                MrtrInputResponse::from_wire(kind, value.clone())?,
+            )?;
+        }
+
+        // A map that names none of the outstanding inputs is not a partial
+        // retry. Rotating it would burn a valid continuation without making
+        // progress, so reject it before the current state can be consumed.
+        if typed_responses.is_empty() {
+            return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
+        }
+
+        self.accept_at(request_state, binding, typed_responses, Instant::now())
     }
 
     /// Returns the number of non-expired, non-cancelled exchanges currently
@@ -1517,6 +1776,7 @@ impl MrtrExchangeRegistry {
     fn issue_at(
         &self,
         owner_cancellation: McpRequestCancellation,
+        binding: Option<MrtrExchangeBinding>,
         input_requests: MrtrInputRequests,
         now: Instant,
     ) -> McpResult<MrtrInputRequired> {
@@ -1549,6 +1809,7 @@ impl MrtrExchangeRegistry {
                 expected,
                 requests: input_requests.clone().unwrap_or_default(),
                 responses: MrtrInputResponses::default(),
+                binding,
             },
         );
         Ok(MrtrInputRequired {
@@ -1560,17 +1821,24 @@ impl MrtrExchangeRegistry {
     fn accept_at(
         &self,
         request_state: &str,
+        binding: Option<&MrtrExchangeBinding>,
         input_responses: MrtrInputResponses,
         now: Instant,
     ) -> McpResult<MrtrRetry> {
         if request_state.len() > DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         }
+        if input_responses.len() > self.max_inputs_per_round {
+            return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
+        }
 
         let mut state = self.lock_state();
         let Some(exchange) = state.exchanges.get(request_state).cloned() else {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         };
+        if exchange.binding.as_ref() != binding {
+            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+        }
         if now >= exchange.expires_at || exchange.owner_cancellation.is_cancel_requested() {
             state.exchanges.remove(request_state);
             return if exchange.owner_cancellation.is_cancel_requested() {
@@ -1581,21 +1849,32 @@ impl MrtrExchangeRegistry {
         }
 
         let mut accepted_responses = exchange.responses.clone();
+        let mut made_progress = false;
         for (key, response) in input_responses.iter() {
             if let Some(expected_kind) = exchange.expected.get(key) {
                 if expected_kind != response.kind() {
                     return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
                 }
-                accepted_responses
-                    .entries
-                    .entry(key.to_owned())
-                    .or_insert_with(|| response.clone());
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    accepted_responses.entries.entry(key.to_owned())
+                {
+                    entry.insert(response.clone());
+                    made_progress = true;
+                }
             }
         }
 
         if exchange.owner_cancellation.is_cancel_requested() {
             state.exchanges.remove(request_state);
             return Err(McpError::request_cancelled());
+        }
+
+        // Unknown-only (or otherwise no-progress) typed retries must be as
+        // inert as their wire-decoded counterparts. Rotating here would burn
+        // the caller's valid continuation without accepting any outstanding
+        // input response.
+        if !exchange.requests.is_empty() && !made_progress {
+            return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
         }
 
         let missing_requests = exchange.requests.unresolved_after(&accepted_responses);
@@ -1634,6 +1913,7 @@ impl MrtrExchangeRegistry {
             expected: ExpectedInputLedger::from_requests(&missing_requests),
             requests: missing_requests.clone(),
             responses: accepted_responses,
+            binding: exchange.binding,
         };
         state.exchanges.remove(request_state);
         state.exchanges.insert(next_state.0.clone(), successor);
@@ -2098,6 +2378,92 @@ mod tests {
     }
 
     #[test]
+    fn mrtr_typed_unknown_only_retry_preserves_the_original_continuation() {
+        let registry = MrtrExchangeRegistry::new();
+        let required = registry
+            .issue(
+                McpRequestCancellation::new(),
+                MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())])
+                    .expect("unique MRTR input map"),
+            )
+            .expect("MRTR input result must issue");
+        let request_state = mrtr_state_from_wire(&required);
+
+        let unknown_only = MrtrInputResponses::new([(
+            "inert".to_owned(),
+            mrtr_roots_response(),
+        )])
+        .expect("typed response map permits an inert key");
+        let error = registry
+            .accept(&request_state, unknown_only)
+            .expect_err("unknown-only typed input must not rotate a continuation");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            registry.active_len(),
+            1,
+            "the rejected unknown-only retry must retain the original state"
+        );
+
+        let matching = MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())])
+            .expect("unique matching response map");
+        assert!(matches!(
+            registry.accept(&request_state, matching),
+            Ok(MrtrRetry::Complete(_))
+        ));
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn mrtr_accept_wire_decodes_the_issued_kind_before_consuming_state() {
+        let registry = MrtrExchangeRegistry::new();
+        let required = registry
+            .issue(
+                McpRequestCancellation::new(),
+                MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())])
+                    .expect("unique MRTR input map"),
+            )
+            .expect("MRTR input result must issue");
+        let request_state = mrtr_state_from_wire(&required);
+
+        let wrong_kind = BTreeMap::from([(
+            "roots".to_owned(),
+            serde_json::to_value(
+                MrtrInputResponse::sampling(fastmcp_protocol::CreateMessageResult::text(
+                    "not roots",
+                    "test-model",
+                ))
+                .expect("sampling response must serialize"),
+            )
+            .expect("sampling response must convert to a wire value"),
+        )]);
+        let error = registry
+            .accept_wire(&request_state, &wrong_kind)
+            .expect_err("a sampling wire value cannot fulfill a roots request");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            registry.active_len(),
+            1,
+            "wrong-kind wire input must not consume state"
+        );
+
+        let matching = BTreeMap::from([(
+            "roots".to_owned(),
+            serde_json::to_value(mrtr_roots_response())
+                .expect("roots response must convert to a wire value"),
+        )]);
+        assert!(matches!(
+            registry.accept_wire(&request_state, &matching),
+            Ok(MrtrRetry::Complete(_))
+        ));
+        assert_eq!(registry.active_len(), 0);
+
+        let replay = registry
+            .accept_wire(&request_state, &matching)
+            .expect_err("a consumed wire request state must not replay");
+        assert_eq!(replay.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
     fn mrtr_expiry_and_owning_request_cancellation_prevent_resolution() {
         let registry = MrtrExchangeRegistry::with_limits(
             16,
@@ -2119,6 +2485,7 @@ mod tests {
         let expiry_error = registry
             .accept_at(
                 &expired_state,
+                None,
                 MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())])
                     .expect("unique MRTR response map"),
                 Instant::now() + Duration::from_millis(1),
