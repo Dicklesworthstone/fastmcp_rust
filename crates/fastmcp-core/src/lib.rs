@@ -80,9 +80,9 @@ pub mod limits {
     /// Hard maximum encoded state bytes admitted in one logical exchange.
     pub const HARD_LOGICAL_EXCHANGE_MAX_STATE_BYTES: usize = 256 * 1024;
     /// Default absolute wall-clock allowance for one logical exchange.
-    pub const DEFAULT_LOGICAL_EXCHANGE_MAX_WALL_CLOCK: Duration = Duration::from_secs(15 * 60);
+    pub const DEFAULT_LOGICAL_EXCHANGE_MAX_WALL_CLOCK: Duration = Duration::from_mins(15);
     /// Hard absolute wall-clock allowance for one logical exchange.
-    pub const HARD_LOGICAL_EXCHANGE_MAX_WALL_CLOCK: Duration = Duration::from_secs(60 * 60);
+    pub const HARD_LOGICAL_EXCHANGE_MAX_WALL_CLOCK: Duration = Duration::from_hours(1);
 
     /// A configurable logical-exchange limit in [`ProtocolLimits`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,11 +147,11 @@ pub mod limits {
     /// allowing an already-created snapshot to change.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ProtocolLimits {
-        logical_exchange_max_rounds: u16,
-        logical_exchange_max_inputs_per_round: u16,
-        logical_exchange_max_inputs: u16,
-        logical_exchange_max_state_bytes: usize,
-        logical_exchange_max_wall_clock: Duration,
+        max_rounds: u16,
+        max_inputs_per_round: u16,
+        max_inputs: u16,
+        max_state_bytes: usize,
+        max_wall_clock: Duration,
     }
 
     impl ProtocolLimits {
@@ -164,31 +164,31 @@ pub mod limits {
         /// Returns the cumulative logical-exchange round limit.
         #[must_use]
         pub const fn logical_exchange_max_rounds(&self) -> u16 {
-            self.logical_exchange_max_rounds
+            self.max_rounds
         }
 
         /// Returns the logical-exchange per-round input limit.
         #[must_use]
         pub const fn logical_exchange_max_inputs_per_round(&self) -> u16 {
-            self.logical_exchange_max_inputs_per_round
+            self.max_inputs_per_round
         }
 
         /// Returns the cumulative logical-exchange input limit.
         #[must_use]
         pub const fn logical_exchange_max_inputs(&self) -> u16 {
-            self.logical_exchange_max_inputs
+            self.max_inputs
         }
 
         /// Returns the cumulative encoded-state-byte limit for one exchange.
         #[must_use]
         pub const fn logical_exchange_max_state_bytes(&self) -> usize {
-            self.logical_exchange_max_state_bytes
+            self.max_state_bytes
         }
 
         /// Returns the absolute wall-clock allowance for one exchange.
         #[must_use]
         pub const fn logical_exchange_max_wall_clock(&self) -> Duration {
-            self.logical_exchange_max_wall_clock
+            self.max_wall_clock
         }
 
         /// Returns the componentwise stricter snapshot of `self` and `other`.
@@ -200,21 +200,11 @@ pub mod limits {
         #[must_use]
         pub fn meet(&self, other: &Self) -> Self {
             Self {
-                logical_exchange_max_rounds: self
-                    .logical_exchange_max_rounds
-                    .min(other.logical_exchange_max_rounds),
-                logical_exchange_max_inputs_per_round: self
-                    .logical_exchange_max_inputs_per_round
-                    .min(other.logical_exchange_max_inputs_per_round),
-                logical_exchange_max_inputs: self
-                    .logical_exchange_max_inputs
-                    .min(other.logical_exchange_max_inputs),
-                logical_exchange_max_state_bytes: self
-                    .logical_exchange_max_state_bytes
-                    .min(other.logical_exchange_max_state_bytes),
-                logical_exchange_max_wall_clock: self
-                    .logical_exchange_max_wall_clock
-                    .min(other.logical_exchange_max_wall_clock),
+                max_rounds: self.max_rounds.min(other.max_rounds),
+                max_inputs_per_round: self.max_inputs_per_round.min(other.max_inputs_per_round),
+                max_inputs: self.max_inputs.min(other.max_inputs),
+                max_state_bytes: self.max_state_bytes.min(other.max_state_bytes),
+                max_wall_clock: self.max_wall_clock.min(other.max_wall_clock),
             }
         }
 
@@ -228,12 +218,11 @@ pub mod limits {
     impl Default for ProtocolLimits {
         fn default() -> Self {
             Self {
-                logical_exchange_max_rounds: DEFAULT_LOGICAL_EXCHANGE_MAX_ROUNDS,
-                logical_exchange_max_inputs_per_round:
-                    DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND,
-                logical_exchange_max_inputs: DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS,
-                logical_exchange_max_state_bytes: DEFAULT_LOGICAL_EXCHANGE_MAX_STATE_BYTES,
-                logical_exchange_max_wall_clock: DEFAULT_LOGICAL_EXCHANGE_MAX_WALL_CLOCK,
+                max_rounds: DEFAULT_LOGICAL_EXCHANGE_MAX_ROUNDS,
+                max_inputs_per_round: DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND,
+                max_inputs: DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS,
+                max_state_bytes: DEFAULT_LOGICAL_EXCHANGE_MAX_STATE_BYTES,
+                max_wall_clock: DEFAULT_LOGICAL_EXCHANGE_MAX_WALL_CLOCK,
             }
         }
     }
@@ -241,22 +230,21 @@ pub mod limits {
     /// Builder for an immutable [`ProtocolLimits`] snapshot.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ProtocolLimitsBuilder {
-        logical_exchange_max_rounds: u16,
-        logical_exchange_max_inputs_per_round: u16,
-        logical_exchange_max_inputs: u16,
-        logical_exchange_max_state_bytes: usize,
-        logical_exchange_max_wall_clock: Duration,
+        max_rounds: u16,
+        max_inputs_per_round: u16,
+        max_inputs: u16,
+        max_state_bytes: usize,
+        max_wall_clock: Duration,
     }
 
     impl Default for ProtocolLimitsBuilder {
         fn default() -> Self {
             Self {
-                logical_exchange_max_rounds: DEFAULT_LOGICAL_EXCHANGE_MAX_ROUNDS,
-                logical_exchange_max_inputs_per_round:
-                    DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND,
-                logical_exchange_max_inputs: DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS,
-                logical_exchange_max_state_bytes: DEFAULT_LOGICAL_EXCHANGE_MAX_STATE_BYTES,
-                logical_exchange_max_wall_clock: DEFAULT_LOGICAL_EXCHANGE_MAX_WALL_CLOCK,
+                max_rounds: DEFAULT_LOGICAL_EXCHANGE_MAX_ROUNDS,
+                max_inputs_per_round: DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND,
+                max_inputs: DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS,
+                max_state_bytes: DEFAULT_LOGICAL_EXCHANGE_MAX_STATE_BYTES,
+                max_wall_clock: DEFAULT_LOGICAL_EXCHANGE_MAX_WALL_CLOCK,
             }
         }
     }
@@ -265,100 +253,94 @@ pub mod limits {
         /// Sets the cumulative logical-exchange round limit.
         #[must_use]
         pub const fn logical_exchange_max_rounds(mut self, value: u16) -> Self {
-            self.logical_exchange_max_rounds = value;
+            self.max_rounds = value;
             self
         }
 
         /// Sets the logical-exchange per-round input limit.
         #[must_use]
         pub const fn logical_exchange_max_inputs_per_round(mut self, value: u16) -> Self {
-            self.logical_exchange_max_inputs_per_round = value;
+            self.max_inputs_per_round = value;
             self
         }
 
         /// Sets the cumulative logical-exchange input limit.
         #[must_use]
         pub const fn logical_exchange_max_inputs(mut self, value: u16) -> Self {
-            self.logical_exchange_max_inputs = value;
+            self.max_inputs = value;
             self
         }
 
         /// Sets the cumulative encoded-state-byte limit for one exchange.
         #[must_use]
         pub const fn logical_exchange_max_state_bytes(mut self, value: usize) -> Self {
-            self.logical_exchange_max_state_bytes = value;
+            self.max_state_bytes = value;
             self
         }
 
         /// Sets the absolute wall-clock allowance for one exchange.
         #[must_use]
         pub const fn logical_exchange_max_wall_clock(mut self, value: Duration) -> Self {
-            self.logical_exchange_max_wall_clock = value;
+            self.max_wall_clock = value;
             self
         }
 
         /// Validates and creates an immutable limit snapshot.
         pub fn build(self) -> Result<ProtocolLimits, ProtocolLimitsError> {
-            validate_positive_u16(
-                self.logical_exchange_max_rounds,
-                ProtocolLimit::LogicalExchangeRounds,
-            )?;
+            validate_positive_u16(self.max_rounds, ProtocolLimit::LogicalExchangeRounds)?;
             validate_u16_ceiling(
-                self.logical_exchange_max_rounds,
+                self.max_rounds,
                 HARD_LOGICAL_EXCHANGE_MAX_ROUNDS,
                 ProtocolLimit::LogicalExchangeRounds,
             )?;
             validate_positive_u16(
-                self.logical_exchange_max_inputs_per_round,
+                self.max_inputs_per_round,
                 ProtocolLimit::LogicalExchangeInputsPerRound,
             )?;
             validate_u16_ceiling(
-                self.logical_exchange_max_inputs_per_round,
+                self.max_inputs_per_round,
                 HARD_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND,
                 ProtocolLimit::LogicalExchangeInputsPerRound,
             )?;
-            validate_positive_u16(
-                self.logical_exchange_max_inputs,
-                ProtocolLimit::LogicalExchangeInputs,
-            )?;
+            validate_positive_u16(self.max_inputs, ProtocolLimit::LogicalExchangeInputs)?;
             validate_u16_ceiling(
-                self.logical_exchange_max_inputs,
+                self.max_inputs,
                 HARD_LOGICAL_EXCHANGE_MAX_INPUTS,
                 ProtocolLimit::LogicalExchangeInputs,
             )?;
-            if self.logical_exchange_max_inputs_per_round > self.logical_exchange_max_inputs {
+            if self.max_inputs_per_round > self.max_inputs {
                 return Err(ProtocolLimitsError::InputsPerRoundExceedExchangeTotal {
-                    per_round: self.logical_exchange_max_inputs_per_round,
-                    total: self.logical_exchange_max_inputs,
+                    per_round: self.max_inputs_per_round,
+                    total: self.max_inputs,
                 });
             }
-            if self.logical_exchange_max_state_bytes == 0 {
+            if self.max_state_bytes == 0 {
                 return Err(ProtocolLimitsError::Zero {
                     limit: ProtocolLimit::LogicalExchangeStateBytes,
                 });
             }
-            if self.logical_exchange_max_state_bytes > HARD_LOGICAL_EXCHANGE_MAX_STATE_BYTES {
+            if self.max_state_bytes > HARD_LOGICAL_EXCHANGE_MAX_STATE_BYTES {
                 return Err(ProtocolLimitsError::ExceedsHardCeiling {
                     limit: ProtocolLimit::LogicalExchangeStateBytes,
                 });
             }
-            if self.logical_exchange_max_wall_clock.is_zero() {
+            if self.max_wall_clock.is_zero() {
                 return Err(ProtocolLimitsError::Zero {
                     limit: ProtocolLimit::LogicalExchangeWallClock,
                 });
             }
-            if self.logical_exchange_max_wall_clock > HARD_LOGICAL_EXCHANGE_MAX_WALL_CLOCK {
+            if self.max_wall_clock > HARD_LOGICAL_EXCHANGE_MAX_WALL_CLOCK {
                 return Err(ProtocolLimitsError::ExceedsHardCeiling {
                     limit: ProtocolLimit::LogicalExchangeWallClock,
                 });
             }
 
             Ok(ProtocolLimits {
-                logical_exchange_max_rounds: self.logical_exchange_max_rounds,
-                logical_exchange_max_inputs_per_round: self.logical_exchange_max_inputs_per_round,
-                logical_exchange_max_inputs: self.logical_exchange_max_inputs,
-                logical_exchange_max_state_bytes: self.logical_exchange_max_state_bytes,
-                logical_exchange_max_wall_clock: self.logical_exchange_max_wall_clock,
+                max_rounds: self.max_rounds,
+                max_inputs_per_round: self.max_inputs_per_round,
+                max_inputs: self.max_inputs,
+                max_state_bytes: self.max_state_bytes,
+                max_wall_clock: self.max_wall_clock,
             })
         }
     }
@@ -572,9 +554,10 @@ pub mod limits {
             started_at: Time,
             external_deadline: Option<Time>,
         ) -> Result<Time, LogicalExchangeBudgetError> {
-            let duration_nanos = u64::try_from(limits.logical_exchange_max_wall_clock.as_nanos())
-                .map_err(|_| LogicalExchangeBudgetError::ArithmeticOverflow {
-                resource: LogicalExchangeBudgetResource::WallClockNanos,
+            let duration_nanos = u64::try_from(limits.max_wall_clock.as_nanos()).map_err(|_| {
+                LogicalExchangeBudgetError::ArithmeticOverflow {
+                    resource: LogicalExchangeBudgetResource::WallClockNanos,
+                }
             })?;
             let deadline_nanos = started_at.as_nanos().checked_add(duration_nanos).ok_or(
                 LogicalExchangeBudgetError::ArithmeticOverflow {
@@ -676,9 +659,9 @@ pub mod limits {
                     resource: LogicalExchangeBudgetResource::Rounds,
                 },
             )?;
-            if next_rounds > self.limits.logical_exchange_max_rounds {
+            if next_rounds > self.limits.max_rounds {
                 return Err(LogicalExchangeBudgetError::RoundLimitExceeded {
-                    limit: self.limits.logical_exchange_max_rounds,
+                    limit: self.limits.max_rounds,
                 });
             }
 
@@ -709,9 +692,9 @@ pub mod limits {
                     resource: LogicalExchangeBudgetResource::InputsInRound,
                 },
             )?;
-            if next_round_inputs > self.limits.logical_exchange_max_inputs_per_round {
+            if next_round_inputs > self.limits.max_inputs_per_round {
                 return Err(LogicalExchangeBudgetError::InputsPerRoundLimitExceeded {
-                    limit: self.limits.logical_exchange_max_inputs_per_round,
+                    limit: self.limits.max_inputs_per_round,
                 });
             }
             let next_total_inputs = counters.inputs_admitted.checked_add(1).ok_or(
@@ -719,9 +702,9 @@ pub mod limits {
                     resource: LogicalExchangeBudgetResource::TotalInputs,
                 },
             )?;
-            if next_total_inputs > self.limits.logical_exchange_max_inputs {
+            if next_total_inputs > self.limits.max_inputs {
                 return Err(LogicalExchangeBudgetError::InputsLimitExceeded {
-                    limit: self.limits.logical_exchange_max_inputs,
+                    limit: self.limits.max_inputs,
                 });
             }
             let next_state_bytes = counters
@@ -730,9 +713,9 @@ pub mod limits {
                 .ok_or(LogicalExchangeBudgetError::ArithmeticOverflow {
                     resource: LogicalExchangeBudgetResource::StateBytes,
                 })?;
-            if next_state_bytes > self.limits.logical_exchange_max_state_bytes {
+            if next_state_bytes > self.limits.max_state_bytes {
                 return Err(LogicalExchangeBudgetError::StateByteLimitExceeded {
-                    limit: self.limits.logical_exchange_max_state_bytes,
+                    limit: self.limits.max_state_bytes,
                 });
             }
 
@@ -760,9 +743,9 @@ pub mod limits {
                 .ok_or(LogicalExchangeBudgetError::ArithmeticOverflow {
                     resource: LogicalExchangeBudgetResource::StateBytes,
                 })?;
-            if next_state_bytes > self.limits.logical_exchange_max_state_bytes {
+            if next_state_bytes > self.limits.max_state_bytes {
                 return Err(LogicalExchangeBudgetError::StateByteLimitExceeded {
-                    limit: self.limits.logical_exchange_max_state_bytes,
+                    limit: self.limits.max_state_bytes,
                 });
             }
 
