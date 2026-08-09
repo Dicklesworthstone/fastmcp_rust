@@ -2927,8 +2927,9 @@ mod tests {
         );
         let notification = ServerNotification::Progress(params.clone());
         assert_eq!(
-            serde_json::to_string(&notification.encode().expect("notification re-encodes"))
-                .expect("notification serializes"),
+            notification
+                .encode_wire()
+                .expect("notification re-encodes byte-exactly"),
             wire,
             "modern proxy notification handling preserves exact progress lexemes"
         );
@@ -2967,12 +2968,9 @@ mod tests {
             "a rejected modern progress frame must not reach the exact callback"
         );
         assert_eq!(
-            serde_json::to_string(
-                &baseline_notification
-                    .encode()
-                    .expect("baseline notification re-encodes"),
-            )
-            .expect("baseline notification serializes"),
+            baseline_notification
+                .encode_wire()
+                .expect("baseline notification re-encodes byte-exactly"),
             baseline,
             "the rejected frame cannot alter the admitted raw-parameter baseline"
         );
