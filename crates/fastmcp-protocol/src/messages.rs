@@ -607,9 +607,9 @@ pub struct FinalLogMessageParams {
 ///
 /// This is deliberately separate from legacy [`CancelledParams`], while
 /// retaining schema-open extension members without assigning them semantics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FinalCancelledNotificationParams {
-    /// The client request ID whose result is no longer needed.
+    /// The request ID whose result or subscription stream is no longer needed.
     #[serde(rename = "requestId")]
     pub request_id: RequestId,
     /// Optional open cancellation reason.
@@ -621,6 +621,58 @@ pub struct FinalCancelledNotificationParams {
     /// Schema-open extension members retained without activating behavior.
     #[serde(flatten, default)]
     pub additional: BTreeMap<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for FinalCancelledNotificationParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let object = value.as_object().ok_or_else(|| {
+            serde::de::Error::custom("final cancellation parameters must be an object")
+        })?;
+        let request_id = object
+            .get("requestId")
+            .ok_or_else(|| serde::de::Error::custom("final cancellation requestId is required"))
+            .and_then(|value| {
+                serde_json::from_value::<RequestId>(value.clone()).map_err(serde::de::Error::custom)
+            })?;
+        let reason = match object.get("reason") {
+            None => None,
+            Some(Value::String(reason)) => Some(reason.clone()),
+            Some(_) => {
+                return Err(serde::de::Error::custom(
+                    "final cancellation reason must be a non-null string",
+                ));
+            }
+        };
+        let meta = match object.get("_meta") {
+            None => None,
+            Some(Value::Object(entries)) => Some(
+                OpenMetadata::try_from_notification_entries(
+                    entries.clone().into_iter().collect::<BTreeMap<_, _>>(),
+                )
+                .map_err(serde::de::Error::custom)?,
+            ),
+            Some(_) => {
+                return Err(serde::de::Error::custom(
+                    "final cancellation _meta must be a non-null object",
+                ));
+            }
+        };
+        let additional = object
+            .iter()
+            .filter(|(name, _)| !matches!(name.as_str(), "requestId" | "reason" | "_meta"))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        Ok(Self {
+            request_id,
+            reason,
+            meta,
+            additional,
+        })
+    }
 }
 
 /// Exact final `notifications/progress` parameters.
@@ -1233,9 +1285,17 @@ pub struct FinalCallToolResult {
     #[serde(
         rename = "structuredContent",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_json_value"
     )]
     pub structured_content: Option<Value>,
+}
+
+fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// Final `resources/list` result payload.
@@ -3399,7 +3459,10 @@ pub struct SetLogLevelParams {
 // Notifications
 // ============================================================================
 
-/// Maximum admitted UTF-8 bytes in a cancellation-notification reason.
+/// Historical cancellation-reason size used by earlier bounded profiles.
+///
+/// Neither supported MCP era imposes this wire limit, so exact cancellation
+/// encoding and decoding do not enforce it.
 pub const MAX_CANCELLATION_REASON_BYTES: usize = 4 * 1024;
 
 /// Cancelled notification params.
@@ -3419,21 +3482,237 @@ pub struct CancelledParams {
         deserialize_with = "deserialize_cancellation_reason"
     )]
     pub reason: Option<String>,
-    /// Whether the sender wants to await cleanup completion.
-    #[serde(
-        rename = "awaitCleanup",
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_await_cleanup"
-    )]
-    pub await_cleanup: Option<bool>,
 }
 
-fn deserialize_await_cleanup<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    bool::deserialize(deserializer).map(Some)
+/// Peer that originates a cancellation notification.
+///
+/// Legacy MCP permits cancellation in either direction. Final MCP permits a
+/// client to cancel its own live request and, on stdio only, a server to end
+/// only its live `subscriptions/listen` stream. The sender remains part of the
+/// typed value so consumers can enforce the selected-era ownership rule;
+/// transport and live-registry binding remain outside this protocol codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationSender {
+    /// A client is cancelling one of its in-flight requests.
+    Client,
+    /// A server is cancelling a request-owned stream, such as a subscription.
+    Server,
+}
+
+/// An era-selected `notifications/cancelled` JSON-RPC notification.
+///
+/// This is intentionally separate from the broad [`ClientNotification`] and
+/// [`ServerNotification`] unions. Those unions preserve schema-open final
+/// extension members for generic routing. This codec is the boundary at which
+/// FastMCP assigns cancellation semantics without inferring meaning from
+/// schema-open extension members.
+///
+/// The codec is for JSON-RPC transports such as stdio. Modern Streamable HTTP
+/// cancellation is a response-stream close and must not be translated into a
+/// second `notifications/cancelled` POST by a transport integration.
+#[derive(Debug, Clone)]
+pub enum CancellationWireMessage {
+    /// Exact MCP 2024-11-05 cancellation parameters.
+    Legacy2024 {
+        /// Peer that originated the notification.
+        sender: CancellationSender,
+        /// Closed legacy cancellation payload.
+        params: CancelledParams,
+    },
+    /// MCP 2026-07-28 cancellation parameters.
+    ///
+    /// Notification metadata is optional for either sender and is never
+    /// synthesized by this codec.
+    Modern2026 {
+        /// Peer that originated the notification.
+        sender: CancellationSender,
+        /// Final cancellation payload.
+        params: FinalCancelledNotificationParams,
+    },
+}
+
+impl CancellationWireMessage {
+    /// Decodes one cancellation notification using the already-negotiated era
+    /// and the peer that supplied the frame.
+    ///
+    /// This method deliberately does not infer an era from optional fields.
+    /// The caller must negotiate once before decoding control traffic.
+    pub fn decode(
+        era: ProtocolEra,
+        sender: CancellationSender,
+        request: &JsonRpcRequest,
+    ) -> Result<Self, CancellationWireCodecError> {
+        validate_cancellation_notification_envelope(era, request)?;
+        let params = request
+            .params
+            .as_ref()
+            .ok_or(CancellationWireCodecError::MissingParameters { era })?;
+
+        match era {
+            ProtocolEra::Legacy2024 => {
+                let params =
+                    serde_json::from_value::<CancelledParams>(params.clone()).map_err(|_| {
+                        CancellationWireCodecError::InvalidParameters {
+                            era: ProtocolEra::Legacy2024,
+                        }
+                    })?;
+                validate_legacy_cancellation_params(&params)?;
+                Ok(Self::Legacy2024 { sender, params })
+            }
+            ProtocolEra::Modern2026 => {
+                let params =
+                    serde_json::from_value::<FinalCancelledNotificationParams>(params.clone())
+                        .map_err(|_| CancellationWireCodecError::InvalidParameters {
+                            era: ProtocolEra::Modern2026,
+                        })?;
+                validate_modern_cancellation_params(sender, &params)?;
+                Ok(Self::Modern2026 { sender, params })
+            }
+        }
+    }
+
+    /// Returns the exact selected protocol era.
+    #[must_use]
+    pub const fn era(&self) -> ProtocolEra {
+        match self {
+            Self::Legacy2024 { .. } => ProtocolEra::Legacy2024,
+            Self::Modern2026 { .. } => ProtocolEra::Modern2026,
+        }
+    }
+
+    /// Returns the peer that originated this cancellation notification.
+    #[must_use]
+    pub const fn sender(&self) -> CancellationSender {
+        match self {
+            Self::Legacy2024 { sender, .. } | Self::Modern2026 { sender, .. } => *sender,
+        }
+    }
+
+    /// Encodes this typed cancellation as an ID-free JSON-RPC notification.
+    ///
+    /// Local construction receives the same era-specific validation as peer
+    /// ingress. A schema-open extension never acquires cancellation semantics
+    /// through this codec.
+    pub fn encode(&self) -> Result<JsonRpcRequest, CancellationWireCodecError> {
+        let era = self.era();
+        let params = match self {
+            Self::Legacy2024 { params, .. } => {
+                validate_legacy_cancellation_params(params)?;
+                serde_json::to_value(params)
+            }
+            Self::Modern2026 { sender, params } => {
+                validate_modern_cancellation_params(*sender, params)?;
+                serde_json::to_value(params)
+            }
+        }
+        .map_err(|_| CancellationWireCodecError::EncodeFailure { era })?;
+        Ok(JsonRpcRequest::notification(
+            NOTIFICATIONS_CANCELLED,
+            Some(params),
+        ))
+    }
+}
+
+/// Stable refusal classes for [`CancellationWireMessage`] codec operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancellationWireCodecError {
+    /// The JSON-RPC envelope has an invalid version or request ID.
+    InvalidEnvelope {
+        /// Era selected before the frame was decoded.
+        era: ProtocolEra,
+    },
+    /// The wire frame is a JSON-RPC request instead of a notification.
+    RequestIdPresent {
+        /// Era selected before the frame was decoded.
+        era: ProtocolEra,
+    },
+    /// The selected cancellation codec received another method.
+    UnexpectedMethod {
+        /// Era selected before the frame was decoded.
+        era: ProtocolEra,
+        /// Method literal received from the peer.
+        method: String,
+    },
+    /// The cancellation notification omitted its required parameters object.
+    MissingParameters {
+        /// Era selected before the frame was decoded.
+        era: ProtocolEra,
+    },
+    /// Parameters do not have the exact selected-era shape.
+    InvalidParameters {
+        /// Era selected before the frame was decoded.
+        era: ProtocolEra,
+    },
+    /// A locally constructed typed payload could not be serialized.
+    EncodeFailure {
+        /// Era selected by the typed value.
+        era: ProtocolEra,
+    },
+}
+
+impl std::fmt::Display for CancellationWireCodecError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidEnvelope { era } => {
+                write!(formatter, "invalid {era:?} cancellation JSON-RPC envelope")
+            }
+            Self::RequestIdPresent { era } => {
+                write!(formatter, "{era:?} cancellation must be a notification")
+            }
+            Self::UnexpectedMethod { era, method } => {
+                write!(
+                    formatter,
+                    "{method} is not a {era:?} cancellation notification"
+                )
+            }
+            Self::MissingParameters { era } => {
+                write!(formatter, "{era:?} cancellation requires parameters")
+            }
+            Self::InvalidParameters { era } => {
+                write!(formatter, "invalid {era:?} cancellation parameters")
+            }
+            Self::EncodeFailure { era } => {
+                write!(
+                    formatter,
+                    "unable to encode {era:?} cancellation parameters"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CancellationWireCodecError {}
+
+fn validate_cancellation_notification_envelope(
+    era: ProtocolEra,
+    request: &JsonRpcRequest,
+) -> Result<(), CancellationWireCodecError> {
+    if request.validate().is_err() {
+        return Err(CancellationWireCodecError::InvalidEnvelope { era });
+    }
+    if !request.is_notification() {
+        return Err(CancellationWireCodecError::RequestIdPresent { era });
+    }
+    if request.method != NOTIFICATIONS_CANCELLED {
+        return Err(CancellationWireCodecError::UnexpectedMethod {
+            era,
+            method: request.method.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_legacy_cancellation_params(
+    _params: &CancelledParams,
+) -> Result<(), CancellationWireCodecError> {
+    Ok(())
+}
+
+fn validate_modern_cancellation_params(
+    _sender: CancellationSender,
+    _params: &FinalCancelledNotificationParams,
+) -> Result<(), CancellationWireCodecError> {
+    Ok(())
 }
 
 fn serialize_cancellation_reason<S>(
@@ -3444,12 +3723,7 @@ where
     S: Serializer,
 {
     match reason {
-        Some(reason) if reason.len() <= MAX_CANCELLATION_REASON_BYTES => {
-            serializer.serialize_str(reason)
-        }
-        Some(_) => Err(serde::ser::Error::custom(
-            "cancellation reason exceeds byte limit",
-        )),
+        Some(reason) => serializer.serialize_str(reason),
         None => serializer.serialize_none(),
     }
 }
@@ -3464,7 +3738,7 @@ where
         type Value = String;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a bounded, non-null cancellation reason string")
+            formatter.write_str("a non-null cancellation reason string")
         }
 
         fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
@@ -3478,9 +3752,6 @@ where
         where
             E: serde::de::Error,
         {
-            if value.len() > MAX_CANCELLATION_REASON_BYTES {
-                return Err(E::custom("cancellation reason exceeds byte limit"));
-            }
             Ok(value.to_owned())
         }
 
@@ -3488,9 +3759,6 @@ where
         where
             E: serde::de::Error,
         {
-            if value.len() > MAX_CANCELLATION_REASON_BYTES {
-                return Err(E::custom("cancellation reason exceeds byte limit"));
-            }
             Ok(value)
         }
     }
@@ -5245,6 +5513,49 @@ mod tests {
     }
 
     #[test]
+    fn final_tools_call_result_preserves_absent_and_explicit_null_structured_content() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "name": "nullable"
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&params))
+            .expect("final tools/call request decodes");
+
+        let absent_wire = r#"{"resultType":"complete","content":[]}"#;
+        let absent = request
+            .decode_result(absent_wire)
+            .expect("absent structuredContent is valid");
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = &absent else {
+            panic!("final tools/call complete result");
+        };
+        assert!(result.payload.structured_content.is_none());
+        assert_eq!(
+            absent
+                .encode()
+                .expect("absent structuredContent re-encodes"),
+            absent_wire
+        );
+
+        let null_wire = r#"{"resultType":"complete","content":[],"structuredContent":null}"#;
+        let explicit_null = request
+            .decode_result(null_wire)
+            .expect("explicit-null structuredContent is a present JSON value");
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = &explicit_null else {
+            panic!("final tools/call complete result");
+        };
+        assert_eq!(result.payload.structured_content, Some(Value::Null));
+        assert_eq!(
+            explicit_null
+                .encode()
+                .expect("explicit-null structuredContent re-encodes"),
+            null_wire
+        );
+    }
+
+    #[test]
     fn final_tools_call_task_result_selects_a_disjoint_typed_branch() {
         let params = serde_json::json!({
             "_meta": {
@@ -6571,11 +6882,177 @@ mod tests {
     // ========================================================================
 
     #[test]
+    fn cancellation_wire_codec_round_trips_selected_era_payloads() {
+        let legacy_wire = serde_json::from_str::<JsonRpcRequest>(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":900719925474099312345,"reason":"legacy client stopped waiting"}}"#,
+        )
+        .expect("arbitrary-precision legacy cancellation is valid JSON-RPC");
+        let legacy = CancellationWireMessage::decode(
+            ProtocolEra::Legacy2024,
+            CancellationSender::Client,
+            &legacy_wire,
+        )
+        .expect("the legacy codec admits its exact cancellation payload");
+        assert_eq!(legacy.era(), ProtocolEra::Legacy2024);
+        assert_eq!(legacy.sender(), CancellationSender::Client);
+        let CancellationWireMessage::Legacy2024 { params, .. } = &legacy else {
+            panic!("the selected legacy era must construct the legacy variant");
+        };
+        assert_eq!(
+            params.request_id,
+            RequestId::Integer("900719925474099312345".to_owned())
+        );
+        assert_eq!(
+            serde_json::to_value(legacy.encode().expect("legacy cancellation re-encodes"))
+                .expect("legacy cancellation remains JSON"),
+            serde_json::to_value(&legacy_wire).expect("legacy baseline remains JSON"),
+            "the legacy wire preserves arbitrary-precision request IDs without awaitCleanup"
+        );
+
+        let modern_wire = JsonRpcRequest::notification(
+            NOTIFICATIONS_CANCELLED,
+            Some(serde_json::json!({
+                "requestId": "final-request-7",
+                "reason": "final client stopped waiting",
+            })),
+        );
+        let modern = CancellationWireMessage::decode(
+            ProtocolEra::Modern2026,
+            CancellationSender::Client,
+            &modern_wire,
+        )
+        .expect("the final client codec admits cancellation without metadata");
+        assert_eq!(modern.era(), ProtocolEra::Modern2026);
+        assert_eq!(modern.sender(), CancellationSender::Client);
+        let CancellationWireMessage::Modern2026 { params, .. } = &modern else {
+            panic!("the selected final era must construct the final variant");
+        };
+        assert!(params.meta.is_none());
+        assert!(
+            params.additional.get("awaitCleanup").is_none(),
+            "a final client codec emission does not synthesize the legacy-only semantic"
+        );
+        assert_eq!(
+            serde_json::to_value(modern.encode().expect("final cancellation re-encodes"))
+                .expect("final cancellation remains JSON"),
+            serde_json::to_value(&modern_wire).expect("final baseline remains JSON"),
+            "the final wire preserves metadata absence without adding legacy members"
+        );
+    }
+
+    #[test]
+    fn cancellation_wire_codec_keeps_modern_metadata_optional_and_inert() {
+        let accepted_wire = JsonRpcRequest::notification(
+            NOTIFICATIONS_CANCELLED,
+            Some(serde_json::json!({
+                "requestId": "final-request-8",
+                "reason": "final client stopped waiting",
+            })),
+        );
+        let admitted = CancellationWireMessage::decode(
+            ProtocolEra::Modern2026,
+            CancellationSender::Client,
+            &accepted_wire,
+        )
+        .expect("the metadata-free final baseline is admitted");
+        let baseline_wire = serde_json::to_value(&accepted_wire).expect("baseline serializes");
+
+        let mut planted = accepted_wire.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("baseline owns final cancellation parameters")
+            .insert(
+                "_meta".to_owned(),
+                serde_json::json!({
+                    "io.modelcontextprotocol/protocolVersion": ProtocolEra::Legacy2024
+                        .version()
+                        .as_str(),
+                    "io.modelcontextprotocol/futureCancellationHint": {
+                        "preserved": true,
+                    },
+                }),
+            );
+        let with_metadata = CancellationWireMessage::decode(
+            ProtocolEra::Modern2026,
+            CancellationSender::Client,
+            &planted,
+        )
+        .expect("changing only optional metadata never changes cancellation admission");
+        assert_eq!(
+            serde_json::to_value(with_metadata.encode().expect("metadata remains opaque"))
+                .expect("metadata-bearing cancellation remains JSON"),
+            serde_json::to_value(&planted).expect("planted wire remains JSON"),
+            "optional metadata is preserved but never validated or synthesized"
+        );
+        assert_eq!(
+            serde_json::to_value(admitted.encode().expect("admitted cancellation re-encodes"))
+                .expect("admitted cancellation remains JSON"),
+            baseline_wire,
+            "the metadata-free baseline remains unchanged"
+        );
+    }
+
+    #[test]
+    fn cancellation_wire_codec_rejects_present_null_modern_optional_fields() {
+        for planted in [
+            serde_json::json!({"requestId": 7, "reason": null}),
+            serde_json::json!({"requestId": 7, "_meta": null}),
+        ] {
+            let wire = JsonRpcRequest::notification(NOTIFICATIONS_CANCELLED, Some(planted));
+            assert!(matches!(
+                CancellationWireMessage::decode(
+                    ProtocolEra::Modern2026,
+                    CancellationSender::Client,
+                    &wire,
+                ),
+                Err(CancellationWireCodecError::InvalidParameters {
+                    era: ProtocolEra::Modern2026,
+                })
+            ));
+        }
+
+        let valid_subscription_metadata = JsonRpcRequest::notification(
+            NOTIFICATIONS_CANCELLED,
+            Some(serde_json::json!({
+                "requestId": 7,
+                "_meta": {(FINAL_SUBSCRIPTION_ID_META_KEY): 7e0},
+            })),
+        );
+        assert!(
+            CancellationWireMessage::decode(
+                ProtocolEra::Modern2026,
+                CancellationSender::Server,
+                &valid_subscription_metadata,
+            )
+            .is_ok()
+        );
+
+        let invalid_subscription_metadata = JsonRpcRequest::notification(
+            NOTIFICATIONS_CANCELLED,
+            Some(serde_json::json!({
+                "requestId": 7,
+                "_meta": {(FINAL_SUBSCRIPTION_ID_META_KEY): null},
+            })),
+        );
+        assert!(matches!(
+            CancellationWireMessage::decode(
+                ProtocolEra::Modern2026,
+                CancellationSender::Server,
+                &invalid_subscription_metadata,
+            ),
+            Err(CancellationWireCodecError::InvalidParameters {
+                era: ProtocolEra::Modern2026,
+            })
+        ));
+    }
+
+    #[test]
     fn cancelled_params_minimal() {
         let params = CancelledParams {
             request_id: RequestId::Number(5),
             reason: None,
-            await_cleanup: None,
         };
         let value = serde_json::to_value(&params).expect("serialize");
         assert_eq!(value["requestId"], 5);
@@ -6588,34 +7065,26 @@ mod tests {
         let params = CancelledParams {
             request_id: RequestId::String("req-7".to_string()),
             reason: Some("User cancelled".to_string()),
-            await_cleanup: Some(true),
         };
         let value = serde_json::to_value(&params).expect("serialize");
         assert_eq!(value["requestId"], "req-7");
         assert_eq!(value["reason"], "User cancelled");
-        assert_eq!(value["awaitCleanup"], true);
+        assert!(value.get("awaitCleanup").is_none());
         assert_eq!(
             serde_json::to_string(&params).expect("legacy cancellation serializes"),
-            r#"{"requestId":"req-7","reason":"User cancelled","awaitCleanup":true}"#,
-            "the exact legacy cancellation wire retains its legacy-only field"
+            r#"{"requestId":"req-7","reason":"User cancelled"}"#,
+            "the exact legacy cancellation wire has only requestId and optional reason"
         );
     }
 
     #[test]
-    fn cancelled_params_reason_is_bounded_and_shape_is_closed() {
-        let exact = "x".repeat(MAX_CANCELLATION_REASON_BYTES);
-        let too_long = "x".repeat(MAX_CANCELLATION_REASON_BYTES + 1);
-        let exact_json = serde_json::json!({
+    fn cancelled_params_reason_is_unbounded_by_the_spec_and_shape_is_closed() {
+        let beyond_historical_bound = "x".repeat(MAX_CANCELLATION_REASON_BYTES + 1);
+        let admitted_json = serde_json::json!({
             "requestId": 1,
-            "reason": exact,
+            "reason": beyond_historical_bound,
         });
-        assert!(serde_json::from_value::<CancelledParams>(exact_json).is_ok());
-
-        let too_long_json = serde_json::json!({
-            "requestId": 1,
-            "reason": too_long,
-        });
-        assert!(serde_json::from_value::<CancelledParams>(too_long_json).is_err());
+        assert!(serde_json::from_value::<CancelledParams>(admitted_json).is_ok());
         assert!(
             serde_json::from_value::<CancelledParams>(serde_json::json!({
                 "requestId": 1,
@@ -6626,7 +7095,7 @@ mod tests {
         assert!(
             serde_json::from_value::<CancelledParams>(serde_json::json!({
                 "requestId": 1,
-                "awaitCleanup": null,
+                "awaitCleanup": true,
             }))
             .is_err()
         );
@@ -6642,9 +7111,8 @@ mod tests {
         let outbound = CancelledParams {
             request_id: RequestId::Number(1),
             reason: Some("x".repeat(MAX_CANCELLATION_REASON_BYTES + 1)),
-            await_cleanup: None,
         };
-        assert!(serde_json::to_value(outbound).is_err());
+        assert!(serde_json::to_value(outbound).is_ok());
     }
 
     // ========================================================================

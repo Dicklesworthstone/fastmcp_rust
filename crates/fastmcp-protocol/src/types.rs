@@ -704,13 +704,13 @@ fn deserialize_optional_final_json_object<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    if value.as_ref().is_some_and(|value| !value.is_object()) {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if !value.is_object() {
         return Err(D::Error::custom(
             "final tool outputSchema must be an object",
         ));
     }
-    Ok(value)
+    Ok(Some(value))
 }
 
 /// Legacy 2024 metadata, retained exactly as an open JSON object.
@@ -2700,6 +2700,41 @@ mod tests {
             serde_json::to_value(baseline).expect("baseline re-encodes"),
             accepted,
             "legacy-field rejection does not mutate final model state"
+        );
+    }
+
+    #[test]
+    fn final_tool_output_schema_distinguishes_absence_from_explicit_null() {
+        let absent_wire = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"}
+        });
+        let absent: FinalTool =
+            serde_json::from_value(absent_wire.clone()).expect("absent outputSchema is valid");
+        assert!(absent.output_schema.is_none());
+        assert_eq!(
+            serde_json::to_value(absent).expect("absent outputSchema re-encodes"),
+            absent_wire
+        );
+
+        let accepted_wire = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"},
+            "outputSchema": {"type": "null"}
+        });
+        let accepted: FinalTool = serde_json::from_value(accepted_wire.clone())
+            .expect("an object schema whose admitted instances are null is valid");
+
+        let mut planted = accepted_wire.clone();
+        planted["outputSchema"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<FinalTool>(planted).is_err(),
+            "a present outputSchema must itself be an object, not JSON null"
+        );
+        assert_eq!(
+            serde_json::to_value(accepted).expect("accepted outputSchema re-encodes"),
+            accepted_wire,
+            "rejecting the one-field null plant cannot mutate the accepted model"
         );
     }
 }

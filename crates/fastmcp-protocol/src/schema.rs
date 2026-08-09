@@ -1849,101 +1849,7 @@ fn is_valid_uri(value: &str) -> bool {
 }
 
 fn is_valid_uri_template(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    let mut literal_start = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'{' => {
-                if !is_valid_uri_reference_segment(&value[literal_start..index]) {
-                    return false;
-                }
-                let expression_start = index + 1;
-                let Some(relative_end) = bytes[expression_start..]
-                    .iter()
-                    .position(|byte| *byte == b'}')
-                else {
-                    return false;
-                };
-                let expression_end = expression_start + relative_end;
-                if !is_valid_uri_template_expression(&bytes[expression_start..expression_end]) {
-                    return false;
-                }
-                index = expression_end + 1;
-                literal_start = index;
-            }
-            b'}' => return false,
-            _ => index += 1,
-        }
-    }
-
-    is_valid_uri_reference_segment(&value[literal_start..])
-}
-
-fn is_valid_uri_template_expression(expression: &[u8]) -> bool {
-    let Some((&first, variables)) = expression.split_first() else {
-        return false;
-    };
-    let variables = if matches!(first, b'+' | b'#' | b'.' | b'/' | b';' | b'?' | b'&') {
-        variables
-    } else {
-        expression
-    };
-
-    !variables.is_empty()
-        && variables
-            .split(|byte| *byte == b',')
-            .all(is_valid_uri_template_variable)
-}
-
-fn is_valid_uri_template_variable(variable: &[u8]) -> bool {
-    if let Some(name) = variable.strip_suffix(b"*") {
-        return !name.contains(&b':') && is_valid_uri_template_variable_name(name);
-    }
-    if let Some((name, prefix)) = split_once_byte(variable, b':') {
-        return !prefix.is_empty()
-            && prefix.iter().all(u8::is_ascii_digit)
-            && prefix != b"0"
-            && is_valid_uri_template_variable_name(name);
-    }
-    is_valid_uri_template_variable_name(variable)
-}
-
-fn is_valid_uri_template_variable_name(name: &[u8]) -> bool {
-    !name.is_empty()
-        && name
-            .split(|byte| *byte == b'.')
-            .all(is_valid_uri_template_variable_name_segment)
-}
-
-fn is_valid_uri_template_variable_name_segment(segment: &[u8]) -> bool {
-    if segment.is_empty() {
-        return false;
-    }
-
-    let mut index = 0;
-    while index < segment.len() {
-        if segment[index] == b'%' {
-            if index + 2 >= segment.len()
-                || !segment[index + 1].is_ascii_hexdigit()
-                || !segment[index + 2].is_ascii_hexdigit()
-            {
-                return false;
-            }
-            index += 3;
-        } else if segment[index].is_ascii_alphanumeric() || segment[index] == b'_' {
-            index += 1;
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
-fn split_once_byte(bytes: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
-    let index = bytes.iter().position(|byte| *byte == delimiter)?;
-    Some((&bytes[..index], &bytes[index + 1..]))
+    crate::UriTemplate::parse(value).is_ok()
 }
 
 fn is_valid_uri_scheme(scheme: &str) -> bool {
@@ -2748,6 +2654,33 @@ mod tests {
         assert_eq!(errors[0].path, "root.uri");
         assert_eq!(errors[0].message, "string does not match format \"uri\"");
         assert_eq!(accepted, final_schema_format_instance());
+    }
+
+    #[test]
+    fn final_schema_uri_template_format_uses_level_four_parser() {
+        let schema = final_schema_format_schema();
+        let mut accepted = final_schema_format_instance();
+        accepted["template"] = json!("mcp://resources/{item:3}{?cursor,labels*}");
+        schema
+            .validate(&accepted)
+            .expect("a valid RFC 6570 Level 4 resource template is admitted");
+
+        let mut planted = accepted.clone();
+        planted["template"] = json!("mcp://resources/{item:0}{?cursor,labels*}");
+        let errors = schema
+            .validate(&planted)
+            .expect_err("changing only the positive prefix length to zero must reject");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "root.template");
+        assert_eq!(
+            errors[0].message,
+            "string does not match format \"uri-template\""
+        );
+        assert_eq!(
+            accepted["template"],
+            json!("mcp://resources/{item:3}{?cursor,labels*}"),
+            "a rejected format value cannot mutate the accepted instance"
+        );
     }
 
     #[test]

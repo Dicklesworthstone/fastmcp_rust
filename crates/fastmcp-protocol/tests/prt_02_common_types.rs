@@ -6,11 +6,10 @@
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, CancellationNotification, CancellationRequestId, CommonTypeError,
     CommonWireDirection, ContentBlock, EmbeddedResourceContents, FinalCommonTypesSchema,
-    Implementation, MAX_ABSOLUTE_URI_BYTES, MAX_CANCELLATION_REASON_BYTES,
-    MAX_CONTENT_ENCODED_BYTES, MAX_CURSOR_BYTES, MAX_ICON_DATA_URI_DECODED_BYTES,
-    MAX_ICON_DATA_URI_ENCODED_BYTES, MAX_ICON_DATA_URI_PREFIX_BYTES, MAX_ICON_SIZE_BYTES,
-    MAX_ICON_SIZE_ENTRIES, MAX_METADATA_ENTRIES, MAX_TRACE_FIELD_BYTES, OpaqueCursor, OpenMetadata,
-    RawIcon, TraceContext,
+    Implementation, MAX_ABSOLUTE_URI_BYTES, MAX_CONTENT_ENCODED_BYTES, MAX_CURSOR_BYTES,
+    MAX_ICON_DATA_URI_DECODED_BYTES, MAX_ICON_DATA_URI_ENCODED_BYTES,
+    MAX_ICON_DATA_URI_PREFIX_BYTES, MAX_ICON_SIZE_BYTES, MAX_ICON_SIZE_ENTRIES,
+    MAX_METADATA_ENTRIES, MAX_TRACE_FIELD_BYTES, OpaqueCursor, OpenMetadata, RawIcon, TraceContext,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -345,16 +344,13 @@ fn prt_02_b_positive() {
             Some(length)
         );
     }
-    for length in [
-        MAX_CANCELLATION_REASON_BYTES - 1,
-        MAX_CANCELLATION_REASON_BYTES,
-    ] {
+    for length in [4 * 1024, 4 * 1024 + 1] {
         assert!(
             CancellationNotification::try_new(
                 CancellationRequestId::Integer(1),
                 Some("x".repeat(length))
             )
-            .expect("cancellation reason at bound")
+            .expect("the MCP schema imposes no cancellation-reason byte bound")
             .has_untrusted_reason()
         );
     }
@@ -411,13 +407,14 @@ fn prt_02_b_positive() {
         AbsoluteUri::parse(format!("x:{}", "a".repeat(MAX_ABSOLUTE_URI_BYTES - 1))),
         Err(CommonTypeError::TooLong("URI"))
     );
-    assert!(matches!(
+    assert!(
         CancellationNotification::try_new(
             CancellationRequestId::Integer(1),
-            Some("x".repeat(MAX_CANCELLATION_REASON_BYTES + 1))
-        ),
-        Err(CommonTypeError::TooLong("cancellation reason"))
-    ));
+            Some("x".repeat(4 * 1024 + 1))
+        )
+        .expect("the exact cancellation schema has no reason-size rejection")
+        .has_untrusted_reason()
+    );
     assert_eq!(
         RawIcon::try_with_details(
             "https://example.test/icon",

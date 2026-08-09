@@ -41,7 +41,10 @@ pub const MAX_ICON_DATA_URI_DECODED_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum encoded bytes in a raw icon `data:` URI, including its prefix.
 pub const MAX_ICON_DATA_URI_ENCODED_BYTES: usize =
     4 * MAX_ICON_DATA_URI_DECODED_BYTES.div_ceil(3) + MAX_ICON_DATA_URI_PREFIX_BYTES;
-/// Maximum UTF-8 bytes admitted for a peer cancellation reason.
+/// Historical cancellation-reason size used by earlier bounded profiles.
+///
+/// MCP 2024-11-05 and MCP 2026-07-28 do not impose this wire limit. Exact
+/// cancellation decoding therefore does not enforce this value.
 pub const MAX_CANCELLATION_REASON_BYTES: usize = 4 * 1024;
 /// Maximum number of retained open metadata entries.
 pub const MAX_METADATA_ENTRIES: usize = 128;
@@ -667,6 +670,29 @@ impl OpenMetadata {
     pub fn try_from_entries(
         entries: impl IntoIterator<Item = (String, Value)>,
     ) -> Result<Self, CommonTypeError> {
+        let metadata = Self::try_from_open_entries(entries, valid_metadata_key)?;
+        metadata.validate_reserved_values()?;
+        Ok(metadata)
+    }
+
+    /// Validates notification-role metadata without assigning request/result
+    /// semantics to otherwise schema-open reserved keys.
+    ///
+    /// The final schema gives only `subscriptionId` a typed meaning in
+    /// notification metadata. Every other syntactically valid key/value is
+    /// retained exactly and remains inert.
+    pub fn try_from_notification_entries(
+        entries: impl IntoIterator<Item = (String, Value)>,
+    ) -> Result<Self, CommonTypeError> {
+        let metadata = Self::try_from_open_entries(entries, valid_open_metadata_key)?;
+        metadata.validate_notification_values()?;
+        Ok(metadata)
+    }
+
+    fn try_from_open_entries(
+        entries: impl IntoIterator<Item = (String, Value)>,
+        valid_key: fn(&str) -> bool,
+    ) -> Result<Self, CommonTypeError> {
         let mut values = BTreeMap::new();
         for (key, value) in entries {
             let value_bytes = serde_json::to_vec(&value)
@@ -675,15 +701,13 @@ impl OpenMetadata {
             if values.len() == MAX_METADATA_ENTRIES
                 || key.len() > MAX_METADATA_KEY_BYTES
                 || value_bytes > MAX_METADATA_VALUE_BYTES
-                || !valid_metadata_key(&key)
+                || !valid_key(&key)
                 || values.insert(key, value).is_some()
             {
                 return Err(CommonTypeError::Invalid("metadata key"));
             }
         }
-        let metadata = Self(values);
-        metadata.validate_reserved_values()?;
-        Ok(metadata)
+        Ok(Self(values))
     }
 
     /// Returns the exact retained entry for a valid unknown key.
@@ -776,6 +800,17 @@ impl OpenMetadata {
         }
         Ok(())
     }
+
+    fn validate_notification_values(&self) -> Result<(), CommonTypeError> {
+        if let Some(value) = self.0.get("io.modelcontextprotocol/subscriptionId") {
+            let valid = matches!(value, Value::String(_))
+                || matches!(value, Value::Number(number) if JsonInteger::try_from_number(number.clone()).is_ok());
+            if !valid {
+                return Err(CommonTypeError::Invalid("subscription ID metadata"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<'de> Deserialize<'de> for OpenMetadata {
@@ -789,29 +824,44 @@ impl<'de> Deserialize<'de> for OpenMetadata {
 }
 
 fn valid_metadata_key(key: &str) -> bool {
+    let Some((prefix, name)) = split_metadata_key(key) else {
+        return false;
+    };
+    if prefix == Some("io.modelcontextprotocol")
+        && !matches!(
+            name,
+            "protocolVersion"
+                | "clientCapabilities"
+                | "clientInfo"
+                | "logLevel"
+                | "serverInfo"
+                | "subscriptionId"
+        )
+    {
+        return false;
+    }
+    valid_metadata_name(name)
+}
+
+fn valid_open_metadata_key(key: &str) -> bool {
+    split_metadata_key(key).is_some_and(|(_, name)| valid_metadata_name(name))
+}
+
+fn split_metadata_key(key: &str) -> Option<(Option<&str>, &str)> {
     let (prefix, name) = match key.split_once('/') {
         Some((prefix, name)) if !name.contains('/') => (Some(prefix), name),
-        Some(_) => return false,
+        Some(_) => return None,
         None => (None, key),
     };
     if let Some(prefix) = prefix {
         if !valid_reverse_dns_prefix(prefix) {
-            return false;
-        }
-        if prefix == "io.modelcontextprotocol"
-            && !matches!(
-                name,
-                "protocolVersion"
-                    | "clientCapabilities"
-                    | "clientInfo"
-                    | "logLevel"
-                    | "serverInfo"
-                    | "subscriptionId"
-            )
-        {
-            return false;
+            return None;
         }
     }
+    Some((prefix, name))
+}
+
+fn valid_metadata_name(name: &str) -> bool {
     name.is_empty()
         || (name.as_bytes()[0].is_ascii_alphanumeric()
             && name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
@@ -835,10 +885,10 @@ fn reject_explicit_null_fields(value: &Value, fields: &[&str]) -> Result<(), Com
 
 fn valid_reverse_dns_prefix(prefix: &str) -> bool {
     let labels = prefix.split('.').collect::<Vec<_>>();
-    labels.len() >= 2
+    !labels.is_empty()
         && labels.into_iter().all(|label| {
             !label.is_empty()
-                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[0].is_ascii_alphabetic()
                 && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
                 && label
                     .bytes()
@@ -961,8 +1011,8 @@ impl<'de> Deserialize<'de> for CancellationRequestId {
     }
 }
 
-/// A bounded peer-provided cancellation reason that deliberately has no raw string accessor,
-/// formatter, or serializer.
+/// A peer-provided cancellation reason that deliberately has no raw string
+/// accessor, formatter, or serializer.
 #[derive(Clone, Eq, PartialEq)]
 pub struct UntrustedCancellationReason(String);
 
@@ -975,20 +1025,13 @@ pub struct CancellationNotification {
 }
 
 impl CancellationNotification {
-    /// Constructs a cancellation payload while bounding an untrusted reason.
+    /// Constructs an exact cancellation payload while retaining an untrusted
+    /// reason without rendering or interpreting it.
     pub fn try_new(
         request_id: CancellationRequestId,
         reason: Option<String>,
     ) -> Result<Self, CommonTypeError> {
-        let reason = reason
-            .map(|value| {
-                if value.len() > MAX_CANCELLATION_REASON_BYTES {
-                    Err(CommonTypeError::TooLong("cancellation reason"))
-                } else {
-                    Ok(UntrustedCancellationReason(value))
-                }
-            })
-            .transpose()?;
+        let reason = reason.map(UntrustedCancellationReason);
         Ok(Self { request_id, reason })
     }
 
@@ -1838,7 +1881,8 @@ pub enum SamplingContentBlock {
         #[serde(
             rename = "structuredContent",
             default,
-            skip_serializing_if = "Option::is_none"
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_present_json_value"
         )]
         structured_content: Option<Value>,
         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -1846,6 +1890,13 @@ pub enum SamplingContentBlock {
         #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
         additional: BTreeMap<String, Value>,
     },
+}
+
+fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 fn valid_binary_content(
@@ -2146,6 +2197,15 @@ impl FinalCommonTypesSchema {
             Some(Value::String(value)) => Some(value.clone()),
             Some(_) => return Err(CommonTypeError::Invalid("cancellation reason")),
         };
+        match params.get("_meta") {
+            None => {}
+            Some(Value::Object(entries)) => {
+                let _ = OpenMetadata::try_from_notification_entries(
+                    entries.clone().into_iter().collect::<BTreeMap<_, _>>(),
+                )?;
+            }
+            Some(_) => return Err(CommonTypeError::Invalid("cancellation metadata")),
+        }
         let _ = CancellationNotification::try_new(request_id, reason)?;
         Ok(())
     }
@@ -2225,6 +2285,56 @@ mod tests {
             accepted, baseline,
             "the rejected one-variable key change cannot mutate accepted state"
         );
+    }
+
+    #[test]
+    fn notification_metadata_remains_schema_open_but_bounded() {
+        let at_entry_limit =
+            (0..MAX_METADATA_ENTRIES).map(|index| (format!("com.example/key{index}"), Value::Null));
+        OpenMetadata::try_from_notification_entries(at_entry_limit)
+            .expect("notification metadata accepts N entries");
+        let over_entry_limit = (0..=MAX_METADATA_ENTRIES)
+            .map(|index| (format!("com.example/key{index}"), Value::Null));
+        assert_eq!(
+            OpenMetadata::try_from_notification_entries(over_entry_limit),
+            Err(CommonTypeError::Invalid("metadata key"))
+        );
+
+        let at_key_limit = "a".repeat(MAX_METADATA_KEY_BYTES);
+        OpenMetadata::try_from_notification_entries([(at_key_limit, Value::Null)])
+            .expect("notification metadata accepts an N-byte key");
+        let over_key_limit = "a".repeat(MAX_METADATA_KEY_BYTES + 1);
+        assert_eq!(
+            OpenMetadata::try_from_notification_entries([(over_key_limit, Value::Null)]),
+            Err(CommonTypeError::Invalid("metadata key"))
+        );
+
+        let at_value_limit = json!("x".repeat(MAX_METADATA_VALUE_BYTES - 2));
+        assert_eq!(
+            serde_json::to_vec(&at_value_limit)
+                .expect("bounded metadata value serializes")
+                .len(),
+            MAX_METADATA_VALUE_BYTES
+        );
+        OpenMetadata::try_from_notification_entries([("future".to_owned(), at_value_limit)])
+            .expect("notification metadata accepts an N-byte value");
+        let over_value_limit = json!("x".repeat(MAX_METADATA_VALUE_BYTES - 1));
+        assert_eq!(
+            serde_json::to_vec(&over_value_limit)
+                .expect("oversized metadata value serializes")
+                .len(),
+            MAX_METADATA_VALUE_BYTES + 1
+        );
+        assert_eq!(
+            OpenMetadata::try_from_notification_entries([("future".to_owned(), over_value_limit,)]),
+            Err(CommonTypeError::Invalid("metadata key"))
+        );
+
+        OpenMetadata::try_from_notification_entries([(
+            "io.modelcontextprotocol/futureCancellationHint".to_owned(),
+            json!({"schemaOpen": true}),
+        )])
+        .expect("unknown reserved notification metadata remains inert and admitted");
     }
 
     #[test]
@@ -2748,6 +2858,41 @@ mod tests {
         assert!(
             serde_json::from_value::<ContentBlock>(wire).is_err(),
             "sampling-only tool_result never widens the general content union"
+        );
+    }
+
+    #[test]
+    fn final_sampling_tool_result_preserves_absent_and_explicit_null_structured_content() {
+        let absent_wire = json!({
+            "type": "tool_result",
+            "toolUseId": "call-8",
+            "content": []
+        });
+        let absent: SamplingContentBlock =
+            serde_json::from_value(absent_wire.clone()).expect("absent structuredContent is valid");
+        assert_eq!(
+            serde_json::to_value(absent).expect("absent structuredContent re-encodes"),
+            absent_wire
+        );
+
+        let null_wire = json!({
+            "type": "tool_result",
+            "toolUseId": "call-8",
+            "content": [],
+            "structuredContent": null
+        });
+        let explicit_null: SamplingContentBlock = serde_json::from_value(null_wire.clone())
+            .expect("explicit-null structuredContent is a present JSON value");
+        assert!(matches!(
+            &explicit_null,
+            SamplingContentBlock::ToolResult {
+                structured_content: Some(Value::Null),
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(explicit_null).expect("explicit null re-encodes"),
+            null_wire
         );
     }
 }

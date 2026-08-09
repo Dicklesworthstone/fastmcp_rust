@@ -607,6 +607,18 @@ impl RequestId {
             Self::String(value) => Ok(CorrelationKey::String(value.clone())),
         }
     }
+
+    /// Returns whether two wire IDs identify the same JSON-RPC request.
+    ///
+    /// Numeric spellings compare by exact mathematical-integer value, while a
+    /// string remains distinct from every numeric ID.
+    #[must_use]
+    pub fn correlates_with(&self, other: &Self) -> bool {
+        matches!(
+            (self.correlation_key(), other.correlation_key()),
+            (Ok(left), Ok(right)) if left == right
+        )
+    }
 }
 
 impl Serialize for RequestId {
@@ -1439,6 +1451,9 @@ mod tests {
             string.correlation_key().expect("valid string ID"),
             "a string ID never aliases its numeric spelling"
         );
+        assert!(numeric.correlates_with(&RequestId::Integer("1.0".to_owned())));
+        assert!(numeric.correlates_with(&RequestId::Integer("1e0".to_owned())));
+        assert!(!numeric.correlates_with(&string));
         assert_eq!(
             JsonRpcResponse::success(numeric.clone(), Value::Null).id,
             Some(numeric),
