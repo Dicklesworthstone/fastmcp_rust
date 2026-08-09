@@ -115,6 +115,8 @@ pub enum ExtensionHandlerRegistrationError {
     MethodNameTooLong(String),
     /// The extension descriptor does not own the requested method.
     MethodNotOwned(ExtensionHandlerKey),
+    /// The extension descriptor owns the method only in the server-to-client direction.
+    MethodNotClientToServer(ExtensionHandlerKey),
     /// A handler is already registered for this exact extension request location.
     DuplicateHandler(ExtensionHandlerKey),
     /// Server discovery metadata is already registered for this extension.
@@ -142,6 +144,12 @@ impl fmt::Display for ExtensionHandlerRegistrationError {
             Self::MethodNotOwned(key) => write!(
                 formatter,
                 "extension handler method is not owned by its descriptor: {}/{}",
+                key.extension_id(),
+                key.method()
+            ),
+            Self::MethodNotClientToServer(key) => write!(
+                formatter,
+                "extension handler method is not client-to-server: {}/{}",
                 key.extension_id(),
                 key.method()
             ),
@@ -176,6 +184,7 @@ impl std::error::Error for ExtensionHandlerRegistrationError {
             | Self::EmptyMethodName
             | Self::MethodNameTooLong(_)
             | Self::MethodNotOwned(_)
+            | Self::MethodNotClientToServer(_)
             | Self::DuplicateHandler(_)
             | Self::DuplicateServerMetadata(_)
             | Self::OfficialMcpAppsAlreadyInstalled => None,
@@ -396,8 +405,8 @@ impl ExtensionHandlerRegistry {
 
     /// Registers one typed handler for an extension request method.
     ///
-    /// Descriptor existence and exact method ownership are checked
-    /// immediately. [`Self::invoke`] still checks direction and
+    /// Descriptor existence, exact method ownership, and client-to-server
+    /// direction are checked immediately. [`Self::invoke`] still checks
     /// request-specific admission against the current negotiated extension set
     /// before the handler can run.
     pub fn register<Request, Response, Handler>(
@@ -429,12 +438,16 @@ impl ExtensionHandlerRegistry {
                 key.method().to_owned(),
             ));
         }
-        if self
+        let Some(method_descriptor) = self
             .descriptor_registry
             .method_descriptor(&extension_id, key.method())
-            .is_none()
-        {
+        else {
             return Err(ExtensionHandlerRegistrationError::MethodNotOwned(key));
+        };
+        if method_descriptor.direction != ExtensionDirection::ClientToServer {
+            return Err(ExtensionHandlerRegistrationError::MethodNotClientToServer(
+                key,
+            ));
         }
         if self.handlers.contains_key(&key) {
             return Err(ExtensionHandlerRegistrationError::DuplicateHandler(key));
@@ -563,10 +576,11 @@ mod tests {
     use fastmcp_protocol::extensions::{
         ClientExtensionDiscovery, ExtensionLocalEnablement, ExtensionRegistryError,
         ExtensionSettings, ServerExtensionDiscovery, official_mcp_apps_empty_server_settings,
-        official_tasks_empty_settings, register_official_tasks_extension,
+        official_tasks_descriptor, official_tasks_empty_settings,
+        register_official_tasks_extension,
     };
     use fastmcp_protocol::protocol_policy::ProtocolEra;
-    use fastmcp_protocol::{ExtensionDescriptorRegistry, ExtensionId};
+    use fastmcp_protocol::{ExtensionDescriptorRegistry, ExtensionDirection, ExtensionId};
     use serde::{Deserialize, Serialize};
     use serde_json::json;
 
@@ -579,6 +593,26 @@ mod tests {
         let mut descriptors = ExtensionDescriptorRegistry::new();
         let id = register_official_tasks_extension(&mut descriptors)
             .expect("official Tasks descriptor registers");
+        (descriptors, id)
+    }
+
+    fn primary_tasks_descriptor_with_direction(
+        direction: ExtensionDirection,
+    ) -> (ExtensionDescriptorRegistry, ExtensionId) {
+        let id = fastmcp_protocol::official_tasks_extension_id();
+        let mut descriptor = official_tasks_descriptor();
+        let method = descriptor
+            .method
+            .as_mut()
+            .expect("official Tasks descriptor owns a primary request method");
+        method.direction = direction;
+        if direction == ExtensionDirection::ServerToClient {
+            method.http_era_disposition = None;
+        }
+        let mut descriptors = ExtensionDescriptorRegistry::new();
+        descriptors
+            .register(descriptor)
+            .expect("direction-adjusted Tasks descriptor remains structurally valid");
         (descriptors, id)
     }
 
@@ -678,6 +712,44 @@ mod tests {
     }
 
     #[test]
+    fn extension_handler_registry_requires_client_to_server_ownership_without_mutation() {
+        let (valid_descriptors, valid_id) =
+            primary_tasks_descriptor_with_direction(ExtensionDirection::ClientToServer);
+        let mut valid_handlers = ExtensionHandlerRegistry::new(valid_descriptors);
+        valid_handlers
+            .register(valid_id, "tasks/get", get_task)
+            .expect("a descriptor-owned client-to-server method registers");
+        assert_eq!(valid_handlers.len(), 1);
+
+        let (rejected_descriptors, rejected_id) =
+            primary_tasks_descriptor_with_direction(ExtensionDirection::ServerToClient);
+        let mut rejected_handlers = ExtensionHandlerRegistry::new(rejected_descriptors);
+        let key = ExtensionHandlerKey::new(rejected_id.clone(), "tasks/get");
+
+        assert_eq!(
+            rejected_handlers.register(rejected_id.clone(), "tasks/get", get_task),
+            Err(ExtensionHandlerRegistrationError::MethodNotClientToServer(
+                key
+            )),
+            "the structurally valid server-to-client direction must reject before insertion"
+        );
+        assert_eq!(
+            rejected_handlers.len(),
+            0,
+            "a server-to-client method cannot create a dead server handler entry"
+        );
+        assert_eq!(rejected_handlers.server_metadata_len(), 0);
+        assert_eq!(
+            rejected_handlers
+                .descriptor_registry()
+                .method_descriptor(&rejected_id, "tasks/get")
+                .map(|method| method.direction),
+            Some(ExtensionDirection::ServerToClient),
+            "rejection must not alter the owned descriptor"
+        );
+    }
+
+    #[test]
     fn official_apps_server_metadata_is_emitted_from_the_frozen_registry() {
         let (descriptors, tasks_id) = tasks_descriptors();
         let mut handlers = ExtensionHandlerRegistry::new(descriptors);
@@ -745,9 +817,7 @@ mod tests {
             "the rejection preserves the installed Apps discovery marker"
         );
         assert_eq!(
-            handlers
-                .descriptor_registry()
-                .descriptor(&apps_id),
+            handlers.descriptor_registry().descriptor(&apps_id),
             Some(&fastmcp_protocol::official_mcp_apps_descriptor()),
             "the rejected handler cannot alter the official Apps descriptor"
         );

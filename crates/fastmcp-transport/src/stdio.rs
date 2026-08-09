@@ -179,6 +179,20 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
         self.closed
     }
 
+    /// Returns the exact most recently decoded NDJSON frame without its line
+    /// delimiter.
+    ///
+    /// A successful receive leaves its bounded frame in the transport's reuse
+    /// buffer until the next receive attempt. Client result dispatch can copy
+    /// the exact response result during that interval while existing typed
+    /// receive APIs remain unchanged. Callers must use this only immediately
+    /// after a successful receive; any subsequent receive invalidates it.
+    #[must_use]
+    pub fn last_received_frame(&self) -> Option<&[u8]> {
+        let frame_len = self.frame_len();
+        (frame_len != 0).then(|| &self.line_buffer[..frame_len])
+    }
+
     /// Receives one blocking frame and reports its decode-completion instant.
     ///
     /// This preserves the timestamp taken immediately after successful decode
@@ -1928,6 +1942,11 @@ mod tests {
         let message = transport
             .recv_until(&Cx::for_testing(), Some(deadline))
             .expect("receive ready frame");
+        assert_eq!(
+            transport.last_received_frame(),
+            Some(br#"{"jsonrpc":"2.0","method":"ready","id":1}"#.as_slice()),
+            "the typed receive retains the exact bounded frame until the next receive"
+        );
 
         let JsonRpcMessage::Request(request) = message else {
             panic!("expected request");

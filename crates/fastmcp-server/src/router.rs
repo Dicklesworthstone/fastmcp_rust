@@ -24,20 +24,21 @@ use fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID;
 use fastmcp_protocol::methods::COMPLETION_COMPLETE;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
-    CacheScope, CallToolParams, CallToolResult, CompleteResult, Content, CoreRequest, CoreResult,
-    FinalCallToolParams, FinalCallToolResult, FinalCompletionParams, FinalCompletionResult,
-    FinalCoreRequest, FinalCoreResult, FinalGetPromptParams, FinalGetPromptResult, FinalListParams,
-    FinalListPromptsResult, FinalListResourceTemplatesResult, FinalListResourcesResult,
-    FinalListToolsResult, FinalPrompt, FinalPromptArgument, FinalReadResourceParams,
-    FinalReadResourceResult, FinalResource, FinalResourceTemplate, FinalTool, FinalToolAnnotations,
-    GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, InputRequiredResult,
-    JsonRpcRequest, LegacyCompletionParams, LegacyCompletionResult, LegacyContent,
-    LegacyCoreRequest, LegacyPromptMessage, LegacyResourceContent, ListPromptsParams,
-    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
-    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult,
-    MissingRequiredClientCapabilityError, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage,
-    ReadResourceParams, ReadResourceResult, Resource, ResourceContent, ResourceTemplate,
-    ServerBehavior, ServerBehaviorRegistry, Tool, validate, validate_strict,
+    AdmittedSchema, CacheScope, CallToolParams, CallToolResult, CompleteResult, Content,
+    CoreRequest, CoreResult, FinalCallToolParams, FinalCallToolResult, FinalCompletionParams,
+    FinalCompletionResult, FinalCoreRequest, FinalCoreResult, FinalGetPromptParams,
+    FinalGetPromptResult, FinalListParams, FinalListPromptsResult,
+    FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult, FinalPrompt,
+    FinalPromptArgument, FinalReadResourceParams, FinalReadResourceResult, FinalResource,
+    FinalResourceTemplate, FinalTool, FinalToolAnnotations, GetPromptParams, GetPromptResult,
+    InitializeParams, InitializeResult, InputRequiredResult, JsonRpcRequest,
+    LegacyCompletionParams, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
+    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
+    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
+    ListResourcesResult, ListToolsParams, ListToolsResult, MissingRequiredClientCapabilityError,
+    PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage, ReadResourceParams,
+    ReadResourceResult, Resource, ResourceContent, ResourceTemplate, ServerBehavior,
+    ServerBehaviorRegistry, Tool, admit_final_schema, validate, validate_strict,
 };
 #[cfg(test)]
 use fastmcp_protocol::{
@@ -291,6 +292,54 @@ fn require_final_tasks_capability(metadata: &OpenMetadata) -> McpResult<()> {
         "Required client capability is missing",
         missing.canonical_error_data(),
     ))
+}
+
+/// Admits the schemas a local tool declares for a final-dialect call.
+///
+/// The returned values own immutable copies of the declarations so one exact
+/// admitted pair is used for both the pre-handler input check and the
+/// post-handler output check. Legacy dispatch intentionally retains its raw
+/// compatibility validators.
+#[derive(Clone)]
+struct FinalToolSchemas {
+    input: AdmittedSchema,
+    output: Option<AdmittedSchema>,
+}
+
+fn admit_final_tool_schemas(tool: &Tool) -> McpResult<FinalToolSchemas> {
+    if !tool.input_schema.is_object() {
+        return Err(McpError::internal_error(
+            "tool declares a final input schema that is not an object",
+        ));
+    }
+    if tool
+        .input_schema
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        != Some("object")
+    {
+        return Err(McpError::internal_error(
+            "tool declares a final input schema without type object",
+        ));
+    }
+    let input = admit_final_schema(tool.input_schema.clone()).map_err(|_error| {
+        McpError::internal_error("tool declares an invalid final input schema")
+    })?;
+    let output = tool
+        .output_schema
+        .clone()
+        .map(|schema| {
+            if !schema.is_object() {
+                return Err(McpError::internal_error(
+                    "tool declares a final output schema that is not an object",
+                ));
+            }
+            admit_final_schema(schema).map_err(|_error| {
+                McpError::internal_error("tool declares an invalid final output schema")
+            })
+        })
+        .transpose()?;
+    Ok(FinalToolSchemas { input, output })
 }
 
 /// Encodes a handler-authored final resource result without reprojecting it
@@ -837,6 +886,11 @@ fn derive_handler_context(
 /// Routes MCP requests to the appropriate handlers.
 pub struct Router {
     tools: HashMap<String, BoxedToolHandler>,
+    /// Immutable final-dialect schemas admitted with each registered tool.
+    ///
+    /// This stays separate from the legacy `Tool` definition so final catalog
+    /// and invocation paths never consume a raw, handler-provided schema.
+    final_tool_schemas: HashMap<String, FinalToolSchemas>,
     tool_order: Vec<String>,
     completion_handler: Option<BoxedCompletionHandler>,
     resources: HashMap<String, BoxedResourceHandler>,
@@ -868,6 +922,7 @@ impl Router {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            final_tool_schemas: HashMap::new(),
             tool_order: Vec::new(),
             completion_handler: None,
             resources: HashMap::new(),
@@ -965,8 +1020,21 @@ impl Router {
     /// finer control over duplicate handling.
     pub fn add_tool<H: ToolHandler + 'static>(&mut self, handler: H) {
         let def = handler.definition();
+        let schemas = match admit_final_tool_schemas(&def) {
+            Ok(schemas) => schemas,
+            Err(error) => {
+                log::warn!(
+                    target: "fastmcp_rust::router",
+                    "refusing tool with an unadmitted final schema; tool_key={}; error_code={:?}",
+                    safe_log_label(&def.name),
+                    error.code
+                );
+                return;
+            }
+        };
         let is_new = !self.tools.contains_key(&def.name);
         self.tools.insert(def.name.clone(), Box::new(handler));
+        self.final_tool_schemas.insert(def.name.clone(), schemas);
         if is_new {
             self.tool_order.push(def.name);
         }
@@ -1012,7 +1080,9 @@ impl Router {
             }
         }
 
+        let schemas = admit_final_tool_schemas(&def)?;
         self.tools.insert(def.name.clone(), Box::new(handler));
+        self.final_tool_schemas.insert(def.name.clone(), schemas);
         if !existed {
             self.tool_order.push(def.name);
         }
@@ -1876,14 +1946,19 @@ impl Router {
                             }
                         })?
                     }
-                    FinalToolOutcome::CreateTask { status_message } => {
+                    FinalToolOutcome::CreateTask {
+                        work_descriptor,
+                        status_message,
+                    } => {
                         require_final_tasks_capability(&request_metadata)?;
                         let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
                             McpError::internal_error(
                                 "task-capable tool requires an installed final Tasks runtime",
                             )
                         })?;
-                        encode_final_task_result(runtime.create_task(status_message)?)?
+                        encode_final_task_result(
+                            runtime.create_task_with_work(work_descriptor, status_message)?,
+                        )?
                     }
                 }
             }
@@ -2114,13 +2189,19 @@ impl Router {
                     )
                 })
                 .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
+                let schemas = self.final_tool_schemas.get(&tool.name).ok_or_else(|| {
+                    McpError::internal_error("listed tool has no admitted final schemas")
+                })?;
 
                 Ok(FinalTool {
                     name: tool.name,
                     title,
                     description: tool.description,
-                    input_schema: tool.input_schema,
-                    output_schema: tool.output_schema,
+                    input_schema: schemas.input.schema().clone(),
+                    output_schema: schemas
+                        .output
+                        .as_ref()
+                        .map(|schema| schema.schema().clone()),
                     annotations: tool.annotations.map(project_final_tool_annotations),
                     icons,
                     meta,
@@ -2549,7 +2630,7 @@ impl Router {
             target: targets::HANDLER,
             "calling final tool; tool_key={}; arguments_present={}",
             safe_log_label(&params.name),
-            params.arguments.is_some()
+            !params.arguments.is_absent()
         );
 
         let dispatch_started_at = request_ctx.cx().now();
@@ -2569,24 +2650,38 @@ impl Router {
         let handler = self
             .tools
             .get(&params.name)
-            .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", params.name)))?;
-        let arguments = params.arguments.unwrap_or_else(|| serde_json::json!({}));
-        let tool_def = crate::catch_extension_unwind(|| handler.definition())
+            .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {}", params.name)))?;
+        if params.arguments.is_explicit_null() {
+            return Err(McpError::invalid_params(
+                "tools/call arguments must not be null",
+            ));
+        }
+        let declares_final_tasks = crate::catch_extension_unwind(|| handler.declares_final_tasks())
             .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
-        let validation_result = if self.strict_input_validation {
-            validate_strict(&tool_def.input_schema, &arguments)
-        } else {
-            validate(&tool_def.input_schema, &arguments)
-        };
-        if let Err(validation_errors) = validation_result {
-            let error_messages: Vec<String> = validation_errors
-                .iter()
-                .map(|error| format!("{}: {}", error.path, error.message))
-                .collect();
-            return Err(McpError::invalid_params(format!(
-                "Input validation failed: {}",
-                error_messages.join("; ")
-            )));
+        if declares_final_tasks {
+            require_final_tasks_capability(&params.meta)?;
+            self.final_task_runtime.as_ref().ok_or_else(|| {
+                McpError::internal_error(
+                    "task-capable tool requires an installed final Tasks runtime",
+                )
+            })?;
+        }
+        let arguments = params
+            .arguments
+            .into_value()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let (input_schema, output_schema) = self
+            .final_tool_schemas
+            .get(&params.name)
+            .cloned()
+            .ok_or_else(|| McpError::internal_error("tool has no admitted final schemas"))
+            .map(|schemas| (schemas.input, schemas.output))?;
+        if input_schema.validate(&arguments).is_err() {
+            let mut result = crate::handler::promote_legacy_tool_content(vec![Content::text(
+                "Tool arguments do not match the declared input schema.",
+            )])?;
+            result.payload.is_error = true;
+            return Ok(FinalToolOutcome::Complete(result));
         }
 
         let ctx = derive_handler_context(
@@ -2611,7 +2706,35 @@ impl Router {
             .await?;
 
         match outcome {
-            Outcome::Ok(result) => Ok(result),
+            Outcome::Ok(result) => {
+                match &result {
+                    FinalToolOutcome::Complete(result) => {
+                        if let Some(output_schema) = output_schema.as_ref() {
+                            let structured_content = result
+                                .payload
+                                .structured_content
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    McpError::internal_error(
+                                        "tool output is missing structuredContent required by the declared output schema",
+                                    )
+                                })?;
+                            if output_schema.validate(structured_content).is_err() {
+                                return Err(McpError::internal_error(
+                                    "tool output does not match the declared output schema",
+                                ));
+                            }
+                        }
+                    }
+                    FinalToolOutcome::CreateTask { .. } if !declares_final_tasks => {
+                        return Err(McpError::invalid_request(
+                            "tool returned CreateTask without declaring final Tasks capability",
+                        ));
+                    }
+                    FinalToolOutcome::InputRequired(_) | FinalToolOutcome::CreateTask { .. } => {}
+                }
+                Ok(result)
+            }
             Outcome::Err(error) => {
                 let error = sanitize_handler_error(request_ctx.cx(), "tool", error);
                 if is_framework_terminal_tool_error(error.code) {
@@ -2920,9 +3043,13 @@ impl Router {
             ));
         }
 
-        let resolved = self
-            .resolve_resource(uri)
-            .ok_or_else(|| McpError::resource_not_found(uri))?;
+        let resolved = self.resolve_resource(uri).ok_or_else(|| {
+            McpError::with_data(
+                McpErrorCode::InvalidParams,
+                "Resource not found",
+                serde_json::json!({"uri": uri}),
+            )
+        })?;
         let ctx = derive_handler_context(
             request_ctx,
             None,
@@ -3203,7 +3330,7 @@ impl Router {
             target: targets::HANDLER,
             "getting final prompt; prompt_key={}; arguments_present={}",
             safe_log_label(&params.name),
-            params.arguments.is_some()
+            !params.arguments.is_absent()
         );
 
         let dispatch_started_at = request_ctx.cx().now();
@@ -3220,12 +3347,33 @@ impl Router {
             ));
         }
 
-        let handler = self.prompts.get(&params.name).ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::PromptNotFound,
-                format!("Prompt not found: {}", params.name),
-            )
-        })?;
+        let handler = self
+            .prompts
+            .get(&params.name)
+            .ok_or_else(|| McpError::invalid_params(format!("Unknown prompt: {}", params.name)))?;
+        if params.arguments.is_explicit_null() {
+            return Err(McpError::invalid_params(
+                "prompts/get arguments must not be null",
+            ));
+        }
+        let definition = crate::catch_extension_unwind(|| handler.definition())
+            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "prompt_definition"))?;
+        let arguments = params.arguments.into_value().unwrap_or_default();
+        if definition
+            .arguments
+            .iter()
+            .any(|argument| argument.required && !arguments.contains_key(&argument.name))
+        {
+            return Err(McpError::invalid_params("Missing required prompt argument"));
+        }
+        if arguments.keys().any(|name| {
+            !definition
+                .arguments
+                .iter()
+                .any(|argument| &argument.name == name)
+        }) {
+            return Err(McpError::invalid_params("Unknown prompt argument"));
+        }
         let ctx = derive_handler_context(
             request_ctx,
             None,
@@ -3241,7 +3389,7 @@ impl Router {
             dispatch_started_at,
         );
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
-        let arguments = params.arguments.unwrap_or_default().into_iter().collect();
+        let arguments = arguments.into_iter().collect();
         let outcome =
             run_handler_in_request(&ctx, request_cx, effective_budget, "prompt", |child_cx| {
                 handler.get_final_outcome_async_in_request(&ctx, child_cx, arguments)
@@ -3662,6 +3810,7 @@ impl Router {
 
         let Router {
             tools,
+            final_tool_schemas,
             tool_order,
             resources,
             resource_order,
@@ -3673,7 +3822,13 @@ impl Router {
         } = other;
 
         // Mount tools
-        result.merge(self.mount_tools_from(tools, tool_order, prefix, behavior));
+        result.merge(self.mount_tools_from(
+            tools,
+            final_tool_schemas,
+            tool_order,
+            prefix,
+            behavior,
+        ));
 
         // Mount resources
         result.merge(self.mount_resources_from(resources, resource_order, prefix, behavior));
@@ -3722,13 +3877,20 @@ impl Router {
         if !preflight.is_success() {
             return preflight;
         }
-        self.mount_tools_from(other.tools, other.tool_order, prefix, behavior)
+        self.mount_tools_from(
+            other.tools,
+            other.final_tool_schemas,
+            other.tool_order,
+            prefix,
+            behavior,
+        )
     }
 
     /// Internal: mount tools from a HashMap.
     fn mount_tools_from(
         &mut self,
         mut tools: HashMap<String, BoxedToolHandler>,
+        mut final_tool_schemas: HashMap<String, FinalToolSchemas>,
         tool_order: Vec<String>,
         prefix: Option<&str>,
         behavior: crate::DuplicateBehavior,
@@ -3739,6 +3901,13 @@ impl Router {
 
         for name in tool_order {
             let Some(handler) = tools.remove(&name) else {
+                continue;
+            };
+            let Some(schemas) = final_tool_schemas.remove(&name) else {
+                result.warnings.push(format!(
+                    "Tool '{}' has no admitted final schemas and was not mounted",
+                    name
+                ));
                 continue;
             };
             let mounted_name = Self::apply_prefix(&name, prefix);
@@ -3761,6 +3930,8 @@ impl Router {
             let mounted = MountedToolHandler::new(handler, mounted_name.clone());
             let needs_order_push = !existed && !self.tool_order.iter().any(|n| n == &mounted_name);
             self.tools.insert(mounted_name.clone(), Box::new(mounted));
+            self.final_tool_schemas
+                .insert(mounted_name.clone(), schemas);
             if needs_order_push {
                 self.tool_order.push(mounted_name);
             }
@@ -3773,6 +3944,13 @@ impl Router {
             let mut remaining: Vec<(String, BoxedToolHandler)> = tools.into_iter().collect();
             remaining.sort_by(|a, b| a.0.cmp(&b.0));
             for (name, handler) in remaining {
+                let Some(schemas) = final_tool_schemas.remove(&name) else {
+                    result.warnings.push(format!(
+                        "Tool '{}' has no admitted final schemas and was not mounted",
+                        name
+                    ));
+                    continue;
+                };
                 let mounted_name = Self::apply_prefix(&name, prefix);
 
                 let existed = self.tools.contains_key(&mounted_name);
@@ -3784,6 +3962,8 @@ impl Router {
 
                 let mounted = MountedToolHandler::new(handler, mounted_name.clone());
                 self.tools.insert(mounted_name.clone(), Box::new(mounted));
+                self.final_tool_schemas
+                    .insert(mounted_name.clone(), schemas);
                 if !existed && !self.tool_order.iter().any(|n| n == &mounted_name) {
                     self.tool_order.push(mounted_name);
                 }
@@ -5575,6 +5755,11 @@ mod tag_filter_tests {
 mod router_tests {
     use super::*;
     use crate::handler::{CompletionHandler, PromptHandler, ResourceHandler, ToolHandler};
+    use crate::tasks::{
+        ApplicationTaskSupervisor, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
+        FinalTaskWorkDescriptor,
+    };
+    use crate::{FinalTaskRuntimeConfig, FinalTaskStore, InMemoryFinalTaskStore};
     use asupersync::channel::oneshot;
     use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
     use asupersync::types::CancelKind;
@@ -5589,6 +5774,7 @@ mod router_tests {
     };
     use std::collections::BTreeMap;
     use std::fmt;
+    use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
@@ -5885,6 +6071,237 @@ mod router_tests {
         })
     }
 
+    struct SchemaBoundaryTool {
+        final_calls: Arc<AtomicUsize>,
+        legacy_calls: Arc<AtomicUsize>,
+        output_matches_schema: bool,
+        output_is_error: bool,
+        output_has_unevaluated_property: bool,
+        invalid_final_input_schema: bool,
+        missing_final_input_object_type: bool,
+        invalid_final_output_schema: bool,
+    }
+
+    impl ToolHandler for SchemaBoundaryTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "schema-boundary-tool".to_owned(),
+                description: None,
+                input_schema: if self.invalid_final_input_schema {
+                    serde_json::json!(42)
+                } else if self.missing_final_input_object_type {
+                    serde_json::json!({"properties": {"value": {"type": "string"}}})
+                } else {
+                    serde_json::json!({
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": {"value": {"type": "string"}},
+                        "unevaluatedProperties": false,
+                    })
+                },
+                output_schema: Some(if self.invalid_final_output_schema {
+                    serde_json::json!(42)
+                } else {
+                    serde_json::json!({
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "required": ["accepted"],
+                        "properties": {"accepted": {"type": "boolean"}},
+                        "unevaluatedProperties": false,
+                    })
+                }),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Content::text("legacy schema-boundary result")])
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            let structured_content = if !self.output_matches_schema {
+                serde_json::json!({"accepted": "not-a-boolean"})
+            } else if self.output_has_unevaluated_property {
+                serde_json::json!({"accepted": true, "unexpected": true})
+            } else {
+                serde_json::json!({"accepted": true})
+            };
+            Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                FinalCallToolResult {
+                    content: vec![ContentBlock::text("final schema-boundary result")],
+                    is_error: self.output_is_error,
+                    structured_content: Some(structured_content),
+                },
+            )))
+        }
+    }
+
+    fn final_tools_call_request(
+        name: &str,
+        arguments: serde_json::Value,
+        id: i64,
+    ) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": name,
+                "arguments": arguments,
+            })),
+            id,
+        )
+    }
+
+    struct TaskCapableRouterTool {
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for TaskCapableRouterTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "task-capable-router-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "unevaluatedProperties": false,
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn declares_final_tasks(&self) -> bool {
+            true
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("legacy task-capable router result")])
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalToolOutcome::CreateTask {
+                work_descriptor: FinalTaskWorkDescriptor::new(serde_json::json!({
+                    "operation": "task-capable-router-tool"
+                }))?,
+                status_message: Some("router task created".to_owned()),
+            })
+        }
+    }
+
+    /// Simulates a handler that overrides the request-owned hook and bypasses
+    /// the trait's ordinary declaration guard. The router must still prevent
+    /// its undeclared task outcome from reaching task creation.
+    struct UndeclaredTaskOutcomeRouterTool {
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for UndeclaredTaskOutcomeRouterTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "undeclared-task-outcome-router-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "unevaluatedProperties": false,
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("legacy undeclared-task outcome")])
+        }
+
+        fn call_final_outcome_async_in_request<'a>(
+            &'a self,
+            _ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            _args: serde_json::Value,
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            let work_descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({
+                "operation": "undeclared-task-outcome-router-tool"
+            }));
+            Box::pin(async move {
+                match work_descriptor {
+                    Ok(work_descriptor) => Outcome::Ok(FinalToolOutcome::CreateTask {
+                        work_descriptor,
+                        status_message: None,
+                    }),
+                    Err(error) => Outcome::Err(error),
+                }
+            })
+        }
+    }
+
+    struct NoopFinalTaskSupervisor;
+
+    impl ApplicationTaskSupervisor for NoopFinalTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn task_runtime_for_router(store: Arc<InMemoryFinalTaskStore>) -> FinalTaskRuntime {
+        let store: Arc<dyn FinalTaskStore> = store;
+        FinalTaskRuntime::new(
+            store,
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000))
+                .expect("a finite final Task policy is valid"),
+            Arc::new(|_notification| {}),
+        )
+    }
+
+    fn final_task_capable_tool_request(id: i64) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {
+                            "io.modelcontextprotocol/tasks": {}
+                        }
+                    },
+                },
+                "name": "task-capable-router-tool",
+                "arguments": {},
+            })),
+            id,
+        )
+    }
+
     struct FinalCatalogTool {
         metadata: OpenMetadata,
         icons: Vec<RawIcon>,
@@ -6114,6 +6531,58 @@ mod router_tests {
         }
     }
 
+    struct PromptArgumentBoundary {
+        final_calls: Arc<AtomicUsize>,
+        legacy_calls: Arc<AtomicUsize>,
+    }
+
+    impl PromptHandler for PromptArgumentBoundary {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "prompt-argument-boundary".to_owned(),
+                description: None,
+                arguments: vec![PromptArgument {
+                    name: "topic".to_owned(),
+                    description: Some("required modern prompt topic".to_owned()),
+                    required: true,
+                }],
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![PromptMessage {
+                role: fastmcp_protocol::Role::Assistant,
+                content: Content::text("legacy prompt-argument-boundary result"),
+            }])
+        }
+
+        fn get_final(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CompleteResult::new(
+                FinalGetPromptResult {
+                    description: None,
+                    messages: vec![FinalPromptMessage {
+                        role: fastmcp_protocol::Role::Assistant,
+                        content: ContentBlock::text("final prompt-argument-boundary result"),
+                    }],
+                },
+                empty_final_result_meta()?,
+            ))
+        }
+    }
+
     fn input_required_result(request_state: &str) -> InputRequiredResult {
         InputRequiredResult::new(
             None,
@@ -6245,6 +6714,25 @@ mod router_tests {
                     "io.modelcontextprotocol/clientCapabilities": {},
                 },
                 "name": "direct-final-prompt",
+            })),
+            id,
+        )
+    }
+
+    fn final_prompt_get_request(
+        name: &str,
+        arguments: serde_json::Value,
+        id: i64,
+    ) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "prompts/get",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": name,
+                "arguments": arguments,
             })),
             id,
         )
@@ -10555,6 +11043,706 @@ mod router_tests {
     }
 
     #[test]
+    fn final_tools_call_input_schema_failure_is_bounded_tool_error_without_handler_call() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_tool(SchemaBoundaryTool {
+            final_calls: Arc::clone(&final_calls),
+            legacy_calls: Arc::clone(&legacy_calls),
+            output_matches_schema: true,
+            output_is_error: false,
+            output_has_unevaluated_property: false,
+            invalid_final_input_schema: false,
+            missing_final_input_object_type: false,
+            invalid_final_output_schema: false,
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 150, Budget::INFINITE, &state);
+
+        let rejected = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "schema-boundary-tool",
+                    serde_json::json!({"value": 7}),
+                    150_i64,
+                ),
+            )
+            .expect("registered final tool input failures are tool results");
+        assert_eq!(rejected["resultType"], "complete");
+        assert_eq!(rejected["isError"], true);
+        assert_eq!(
+            rejected["content"][0]["text"],
+            "Tool arguments do not match the declared input schema."
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+        let accepted = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "schema-boundary-tool",
+                    serde_json::json!({"value": "accepted"}),
+                    151_i64,
+                ),
+            )
+            .expect("changing only the input value to match the schema is accepted");
+        assert_eq!(accepted["resultType"], "complete");
+        assert!(accepted.get("isError").is_none());
+        assert_eq!(
+            accepted["structuredContent"],
+            serde_json::json!({"accepted": true})
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn final_unknown_tool_is_invalid_params_while_legacy_unknown_tool_is_unchanged() {
+        let router = Router::new();
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 152, Budget::INFINITE, &state);
+
+        let modern_error = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request("unknown-tool", serde_json::json!({}), 152_i64),
+            )
+            .expect_err("an unknown final tool is an invalid-params protocol error");
+        assert_eq!(modern_error.code, McpErrorCode::InvalidParams);
+
+        let legacy_error = router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "unknown-tool".to_owned(),
+                    arguments: Some(serde_json::json!({})),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect_err("the exact legacy unknown-tool result remains method-not-found");
+        assert_eq!(legacy_error.code, McpErrorCode::MethodNotFound);
+    }
+
+    #[test]
+    fn final_tool_output_schema_is_checked_before_success_and_legacy_is_unchanged() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_tool(SchemaBoundaryTool {
+            final_calls: Arc::clone(&final_calls),
+            legacy_calls: Arc::clone(&legacy_calls),
+            output_matches_schema: true,
+            output_is_error: false,
+            output_has_unevaluated_property: false,
+            invalid_final_input_schema: false,
+            missing_final_input_object_type: false,
+            invalid_final_output_schema: false,
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 153, Budget::INFINITE, &state);
+
+        let accepted = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "schema-boundary-tool",
+                    serde_json::json!({"value": "accepted"}),
+                    153_i64,
+                ),
+            )
+            .expect("a complete result matching the declared output schema is emitted");
+        assert_eq!(
+            accepted["structuredContent"],
+            serde_json::json!({"accepted": true})
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+
+        let legacy = router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "schema-boundary-tool".to_owned(),
+                    arguments: Some(serde_json::json!({"value": "accepted"})),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("the legacy tool path does not apply final output-schema validation");
+        assert!(!legacy.is_error);
+        let legacy_wire = serde_json::to_value(&legacy).expect("legacy result serializes");
+        assert_eq!(
+            legacy_wire["content"][0]["text"],
+            "legacy schema-boundary result"
+        );
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+
+        let rejected_final_calls = Arc::new(AtomicUsize::new(0));
+        let rejected_legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut rejected_router = Router::new();
+        rejected_router.add_tool(SchemaBoundaryTool {
+            final_calls: Arc::clone(&rejected_final_calls),
+            legacy_calls: Arc::clone(&rejected_legacy_calls),
+            output_matches_schema: false,
+            output_is_error: false,
+            output_has_unevaluated_property: false,
+            invalid_final_input_schema: false,
+            missing_final_input_object_type: false,
+            invalid_final_output_schema: false,
+        });
+        let rejected = rejected_router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "schema-boundary-tool",
+                    serde_json::json!({"value": "accepted"}),
+                    154_i64,
+                ),
+            )
+            .expect_err("a complete result failing the declared output schema is not emitted");
+        assert_eq!(rejected.code, McpErrorCode::InternalError);
+        assert_eq!(
+            rejected.message,
+            "tool output does not match the declared output schema"
+        );
+        assert_eq!(rejected_final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rejected_legacy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn final_tool_output_schema_applies_to_complete_error_payloads() {
+        let accepted_calls = Arc::new(AtomicUsize::new(0));
+        let mut accepted_router = Router::new();
+        accepted_router.add_tool(SchemaBoundaryTool {
+            final_calls: Arc::clone(&accepted_calls),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            output_matches_schema: true,
+            output_is_error: true,
+            output_has_unevaluated_property: false,
+            invalid_final_input_schema: false,
+            missing_final_input_object_type: false,
+            invalid_final_output_schema: false,
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 154, Budget::INFINITE, &state);
+
+        let accepted = accepted_router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "schema-boundary-tool",
+                    serde_json::json!({"value": "accepted"}),
+                    154_i64,
+                ),
+            )
+            .expect("a schema-conforming complete error payload is emitted");
+        assert_eq!(accepted["resultType"], "complete");
+        assert_eq!(accepted["isError"], true);
+        assert_eq!(
+            accepted["structuredContent"],
+            serde_json::json!({"accepted": true})
+        );
+        assert_eq!(accepted_calls.load(Ordering::SeqCst), 1);
+
+        let rejected_calls = Arc::new(AtomicUsize::new(0));
+        let mut rejected_router = Router::new();
+        rejected_router.add_tool(SchemaBoundaryTool {
+            final_calls: Arc::clone(&rejected_calls),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            output_matches_schema: false,
+            output_is_error: true,
+            output_has_unevaluated_property: false,
+            invalid_final_input_schema: false,
+            missing_final_input_object_type: false,
+            invalid_final_output_schema: false,
+        });
+
+        let rejected = rejected_router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "schema-boundary-tool",
+                    serde_json::json!({"value": "accepted"}),
+                    155_i64,
+                ),
+            )
+            .expect_err("a nonconforming complete error payload is not emitted");
+        assert_eq!(rejected.code, McpErrorCode::InternalError);
+        assert_eq!(
+            rejected.message,
+            "tool output does not match the declared output schema"
+        );
+        assert_eq!(rejected_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn final_tool_admitted_schemas_enforce_unevaluated_properties_on_shipped_path() {
+        let input_final_calls = Arc::new(AtomicUsize::new(0));
+        let input_legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut input_router = Router::new();
+        input_router.add_tool(SchemaBoundaryTool {
+            final_calls: Arc::clone(&input_final_calls),
+            legacy_calls: Arc::clone(&input_legacy_calls),
+            output_matches_schema: true,
+            output_is_error: false,
+            output_has_unevaluated_property: false,
+            invalid_final_input_schema: false,
+            missing_final_input_object_type: false,
+            invalid_final_output_schema: false,
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 155, Budget::INFINITE, &state);
+
+        let rejected_input = input_router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "schema-boundary-tool",
+                    serde_json::json!({"value": "accepted", "unexpected": true}),
+                    155_i64,
+                ),
+            )
+            .expect("unevaluated final input properties return the bounded tool error result");
+        assert_eq!(rejected_input["resultType"], "complete");
+        assert_eq!(rejected_input["isError"], true);
+        assert_eq!(input_final_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(input_legacy_calls.load(Ordering::SeqCst), 0);
+
+        let accepted_input = input_router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "schema-boundary-tool",
+                    serde_json::json!({"value": "accepted"}),
+                    156_i64,
+                ),
+            )
+            .expect("removing only the unevaluated input property reaches the handler");
+        assert_eq!(accepted_input["resultType"], "complete");
+        assert_eq!(input_final_calls.load(Ordering::SeqCst), 1);
+
+        let output_final_calls = Arc::new(AtomicUsize::new(0));
+        let output_legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut output_router = Router::new();
+        output_router.add_tool(SchemaBoundaryTool {
+            final_calls: Arc::clone(&output_final_calls),
+            legacy_calls: Arc::clone(&output_legacy_calls),
+            output_matches_schema: true,
+            output_is_error: false,
+            output_has_unevaluated_property: true,
+            invalid_final_input_schema: false,
+            missing_final_input_object_type: false,
+            invalid_final_output_schema: false,
+        });
+
+        let rejected_output = output_router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "schema-boundary-tool",
+                    serde_json::json!({"value": "accepted"}),
+                    157_i64,
+                ),
+            )
+            .expect_err("an unevaluated final output property is not emitted as success");
+        assert_eq!(rejected_output.code, McpErrorCode::InternalError);
+        assert_eq!(
+            rejected_output.message,
+            "tool output does not match the declared output schema"
+        );
+        assert_eq!(output_final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(output_legacy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn final_tool_registration_rejects_unadmitted_schemas_without_catalog_mutation() {
+        for (
+            invalid_final_input_schema,
+            missing_final_input_object_type,
+            invalid_final_output_schema,
+            expected_message,
+        ) in [
+            (
+                true,
+                false,
+                false,
+                "tool declares a final input schema that is not an object",
+            ),
+            (
+                false,
+                true,
+                false,
+                "tool declares a final input schema without type object",
+            ),
+            (
+                false,
+                false,
+                true,
+                "tool declares a final output schema that is not an object",
+            ),
+        ] {
+            let final_calls = Arc::new(AtomicUsize::new(0));
+            let legacy_calls = Arc::new(AtomicUsize::new(0));
+            let mut router = Router::new();
+            router.add_tool(SchemaBoundaryTool {
+                final_calls: Arc::new(AtomicUsize::new(0)),
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                output_matches_schema: true,
+                output_is_error: false,
+                output_has_unevaluated_property: false,
+                invalid_final_input_schema: false,
+                missing_final_input_object_type: false,
+                invalid_final_output_schema: false,
+            });
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let request_ctx = request_context(&cx, 158, Budget::INFINITE, &state);
+            let baseline_catalog = router
+                .dispatch_stateless(
+                    &request_ctx,
+                    &JsonRpcRequest::new(
+                        "tools/list",
+                        Some(serde_json::json!({
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientCapabilities": {},
+                            }
+                        })),
+                        158_i64,
+                    ),
+                )
+                .expect("the admitted baseline tool appears in the final catalog");
+
+            let error = router
+                .add_tool_with_behavior(
+                    SchemaBoundaryTool {
+                        final_calls: Arc::clone(&final_calls),
+                        legacy_calls: Arc::clone(&legacy_calls),
+                        output_matches_schema: true,
+                        output_is_error: false,
+                        output_has_unevaluated_property: false,
+                        invalid_final_input_schema,
+                        missing_final_input_object_type,
+                        invalid_final_output_schema,
+                    },
+                    crate::DuplicateBehavior::Replace,
+                )
+                .expect_err("invalid final schemas fail before replacing a registered tool");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(error.message, expected_message);
+            assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+            let catalog_after = router
+                .dispatch_stateless(
+                    &request_ctx,
+                    &JsonRpcRequest::new(
+                        "tools/list",
+                        Some(serde_json::json!({
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientCapabilities": {},
+                            }
+                        })),
+                        159_i64,
+                    ),
+                )
+                .expect("a rejected registration cannot corrupt the admitted catalog");
+            assert_eq!(catalog_after, baseline_catalog);
+
+            let preserved = router
+                .dispatch_stateless(
+                    &request_ctx,
+                    &final_tools_call_request(
+                        "schema-boundary-tool",
+                        serde_json::json!({"value": "accepted"}),
+                        160_i64,
+                    ),
+                )
+                .expect("the pre-existing admitted handler remains callable");
+            assert_eq!(preserved["resultType"], "complete");
+            assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn final_tool_and_prompt_argument_nulls_are_rejected_without_erasing_absence() {
+        let tool_final_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_tool(InputRequiredTool {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&tool_final_calls),
+        });
+        router.add_prompt(DirectFinalPrompt {
+            final_calls: Arc::clone(&prompt_final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 160, Budget::INFINITE, &state);
+
+        let absent_tool_arguments = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "input-required-tool",
+            })),
+            160_i64,
+        );
+        let mut null_tool_arguments = absent_tool_arguments.clone();
+        null_tool_arguments
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("final tool parameters are an object")
+            .insert("arguments".to_owned(), serde_json::Value::Null);
+
+        let CoreRequest::Final(FinalCoreRequest::ToolsCall(absent_tool_params)) =
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                "tools/call",
+                absent_tool_arguments.params.as_ref(),
+            )
+            .expect("absent final tool arguments decode")
+        else {
+            panic!("the final tool parameter shape is selected");
+        };
+        assert!(absent_tool_params.arguments.is_absent());
+        let CoreRequest::Final(FinalCoreRequest::ToolsCall(null_tool_params)) =
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                "tools/call",
+                null_tool_arguments.params.as_ref(),
+            )
+            .expect("explicit-null final tool arguments decode")
+        else {
+            panic!("the final tool parameter shape is selected");
+        };
+        assert!(null_tool_params.arguments.is_explicit_null());
+
+        let absent_tool_result = router
+            .dispatch_stateless(&request_ctx, &absent_tool_arguments)
+            .expect("absent final tool arguments default to an empty object");
+        assert_eq!(absent_tool_result["resultType"], "input_required");
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+        let null_tool_error = router
+            .dispatch_stateless(&request_ctx, &null_tool_arguments)
+            .expect_err("explicit-null final tool arguments are not defaulted");
+        assert_eq!(null_tool_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            null_tool_error.message,
+            "tools/call arguments must not be null"
+        );
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+
+        let absent_prompt_arguments = direct_final_prompt_request(161_i64);
+        let mut null_prompt_arguments = absent_prompt_arguments.clone();
+        null_prompt_arguments
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("final prompt parameters are an object")
+            .insert("arguments".to_owned(), serde_json::Value::Null);
+
+        let CoreRequest::Final(FinalCoreRequest::PromptsGet(absent_prompt_params)) =
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                "prompts/get",
+                absent_prompt_arguments.params.as_ref(),
+            )
+            .expect("absent final prompt arguments decode")
+        else {
+            panic!("the final prompt parameter shape is selected");
+        };
+        assert!(absent_prompt_params.arguments.is_absent());
+        let CoreRequest::Final(FinalCoreRequest::PromptsGet(null_prompt_params)) =
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                "prompts/get",
+                null_prompt_arguments.params.as_ref(),
+            )
+            .expect("explicit-null final prompt arguments decode")
+        else {
+            panic!("the final prompt parameter shape is selected");
+        };
+        assert!(null_prompt_params.arguments.is_explicit_null());
+
+        let absent_prompt_result = router
+            .dispatch_stateless(&request_ctx, &absent_prompt_arguments)
+            .expect("absent final prompt arguments default to an empty map");
+        assert_eq!(absent_prompt_result["resultType"], "complete");
+        assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
+        let null_prompt_error = router
+            .dispatch_stateless(&request_ctx, &null_prompt_arguments)
+            .expect_err("explicit-null final prompt arguments are not defaulted");
+        assert_eq!(null_prompt_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            null_prompt_error.message,
+            "prompts/get arguments must not be null"
+        );
+        assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn final_task_capable_tool_creates_work_bound_task_after_capability_and_service_admission() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = task_runtime_for_router(Arc::clone(&store));
+        let service_runner = runtime
+            .install_task_service(1, Arc::new(NoopFinalTaskSupervisor))
+            .expect("a bounded application-owned task service is installed");
+        let service_cx = Cx::for_testing();
+        let mut running_service = Box::pin(service_runner.run(&service_cx));
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(running_service.as_mut(), &mut task_cx),
+            Poll::Pending
+        ));
+        let mut router = Router::new();
+        router.set_final_task_runtime(Some(runtime));
+        router.add_tool(TaskCapableRouterTool {
+            final_calls: Arc::clone(&final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 160, Budget::INFINITE, &state);
+
+        let result = router
+            .dispatch_stateless(&request_ctx, &final_task_capable_tool_request(160_i64))
+            .expect("the admitted task-capable outcome creates a work-bound task");
+        assert_eq!(result["resultType"], "task");
+        assert_eq!(result["status"], "working");
+        assert_eq!(result["statusMessage"], "router task created");
+        assert!(
+            result["taskId"].as_str().is_some(),
+            "the created task has a final task identifier"
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.task_count(), 1);
+    }
+
+    #[test]
+    fn final_task_capable_tool_without_runtime_rejects_before_handler_without_store_mutation() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let mut router = Router::new();
+        router.add_tool(TaskCapableRouterTool {
+            final_calls: Arc::clone(&final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 161, Budget::INFINITE, &state);
+
+        let error = router
+            .dispatch_stateless(&request_ctx, &final_task_capable_tool_request(161_i64))
+            .expect_err("a task-capable tool cannot run without a final Tasks runtime");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            error.message,
+            "task-capable tool requires an installed final Tasks runtime"
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.task_count(),
+            0,
+            "pre-handler admission does not persist a task"
+        );
+    }
+
+    #[test]
+    fn final_task_capable_tool_requires_peer_capability_before_handler() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = task_runtime_for_router(Arc::clone(&store));
+        let service_runner = runtime
+            .install_task_service(1, Arc::new(NoopFinalTaskSupervisor))
+            .expect("a bounded application-owned task service is installed");
+        let service_cx = Cx::for_testing();
+        let mut running_service = Box::pin(service_runner.run(&service_cx));
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(running_service.as_mut(), &mut task_cx),
+            Poll::Pending
+        ));
+        let mut router = Router::new();
+        router.set_final_task_runtime(Some(runtime));
+        router.add_tool(TaskCapableRouterTool {
+            final_calls: Arc::clone(&final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 162, Budget::INFINITE, &state);
+
+        let error = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "task-capable-router-tool",
+                    serde_json::json!({}),
+                    162_i64,
+                ),
+            )
+            .expect_err("a missing peer Tasks capability is refused before the handler runs");
+        assert!(matches!(error.code, McpErrorCode::Custom(_)));
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.task_count(), 0);
+    }
+
+    #[test]
+    fn final_router_defensively_rejects_an_undeclared_task_outcome() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_tool(UndeclaredTaskOutcomeRouterTool {
+            final_calls: Arc::clone(&final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 163, Budget::INFINITE, &state);
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {
+                            "io.modelcontextprotocol/tasks": {}
+                        }
+                    },
+                },
+                "name": "undeclared-task-outcome-router-tool",
+                "arguments": {},
+            })),
+            163_i64,
+        );
+
+        let error = router
+            .dispatch_stateless(&request_ctx, &request)
+            .expect_err("the router refuses a task outcome without a preflight declaration");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "tool returned CreateTask without declaring final Tasks capability"
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn macro_tool_final_metadata_negative_is_non_mutating() {
         let mut router = Router::new();
         MACRO_DUAL_ERA_TOOL_CALLS.store(0, Ordering::SeqCst);
@@ -10899,6 +12087,103 @@ mod router_tests {
     }
 
     #[test]
+    fn final_prompt_arguments_are_validated_before_handler_and_legacy_is_unchanged() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_prompt(PromptArgumentBoundary {
+            final_calls: Arc::clone(&final_calls),
+            legacy_calls: Arc::clone(&legacy_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 155, Budget::INFINITE, &state);
+        let baseline = final_prompt_get_request(
+            "prompt-argument-boundary",
+            serde_json::json!({"topic": "release"}),
+            155_i64,
+        );
+        let mut missing_required = baseline.clone();
+        let removed_topic = missing_required
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("arguments"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("prompt arguments are an object")
+            .remove("topic");
+        assert_eq!(removed_topic, Some(serde_json::json!("release")));
+
+        assert_eq!(baseline.method, missing_required.method);
+        assert_eq!(baseline.id, missing_required.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("_meta")),
+            missing_required
+                .params
+                .as_ref()
+                .and_then(|params| params.get("_meta")),
+            "the required argument is the sole planted dimension"
+        );
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name")),
+            missing_required
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name")),
+            "the required argument is the sole planted dimension"
+        );
+
+        let accepted = router
+            .dispatch_stateless(&request_ctx, &baseline)
+            .expect("the complete required-argument request is accepted");
+        assert_eq!(accepted["resultType"], "complete");
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+        let missing_error = router
+            .dispatch_stateless(&request_ctx, &missing_required)
+            .expect_err("removing only a required prompt argument is rejected");
+        assert_eq!(missing_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+        let unknown_error = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_prompt_get_request("unknown-prompt", serde_json::json!({}), 156_i64),
+            )
+            .expect_err("an unknown final prompt is an invalid-params protocol error");
+        assert_eq!(unknown_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+
+        let legacy = router
+            .handle_prompts_get(
+                &request_ctx,
+                GetPromptParams {
+                    name: "prompt-argument-boundary".to_owned(),
+                    arguments: None,
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("the exact legacy prompt path retains its existing argument behavior");
+        let legacy_wire = serde_json::to_value(&legacy).expect("legacy prompt result serializes");
+        assert_eq!(
+            legacy_wire["messages"][0]["content"]["text"],
+            "legacy prompt-argument-boundary result"
+        );
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn final_prompts_get_rejects_one_field_incompatible_result_type() {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::new();
@@ -11040,6 +12325,86 @@ mod router_tests {
                 if text == "direct final resource result"
                     && mime_type.as_deref() == Some("text/markdown")
         ));
+    }
+
+    #[test]
+    fn final_unknown_resource_is_invalid_params_with_exact_uri_and_legacy_is_unchanged() {
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_resource(DirectFinalResource {
+            legacy_calls: Arc::clone(&legacy_calls),
+            final_calls: Arc::clone(&final_calls),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 157, Budget::INFINITE, &state);
+        let baseline = direct_final_resource_request(157);
+        let mut unknown = baseline.clone();
+        let replaced_uri = unknown
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("resource parameters are an object")
+            .insert(
+                "uri".to_owned(),
+                serde_json::json!("file:///unknown-final-resource"),
+            );
+        assert_eq!(
+            replaced_uri,
+            Some(serde_json::json!("file:///direct-final-resource"))
+        );
+
+        assert_eq!(baseline.method, unknown.method);
+        assert_eq!(baseline.id, unknown.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("_meta")),
+            unknown
+                .params
+                .as_ref()
+                .and_then(|params| params.get("_meta")),
+            "the resource URI is the sole planted dimension"
+        );
+
+        let accepted = router
+            .dispatch_stateless(&request_ctx, &baseline)
+            .expect("the registered final resource is accepted");
+        assert_eq!(accepted["resultType"], "complete");
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+        let error = router
+            .dispatch_stateless(&request_ctx, &unknown)
+            .expect_err("changing only the URI to an unknown resource is rejected");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(error.message, "Resource not found");
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"uri": "file:///unknown-final-resource"}))
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+        let legacy_error = router
+            .handle_resources_read(
+                &request_ctx,
+                &ReadResourceParams {
+                    uri: "file:///unknown-final-resource".to_owned(),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect_err("the exact legacy missing-resource error remains unchanged");
+        assert_eq!(legacy_error.code, McpErrorCode::ResourceNotFound);
+        assert_eq!(
+            legacy_error.message,
+            "Resource not found: file:///unknown-final-resource"
+        );
     }
 
     #[test]

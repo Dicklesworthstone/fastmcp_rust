@@ -32,6 +32,8 @@ use fastmcp_protocol::{
     decode_peer_result, encode_result,
 };
 
+use crate::tasks::FinalTaskWorkDescriptor;
+
 // ============================================================================
 // Progress Notification Sender
 // ============================================================================
@@ -270,6 +272,12 @@ pub enum FinalToolOutcome {
     InputRequired(InputRequiredResult),
     /// Create one durable working task after negotiated capability admission.
     CreateTask {
+        /// Non-null opaque application work persisted with the new task.
+        ///
+        /// [`FinalTaskWorkDescriptor::new`] is the only public constructor for
+        /// this type and rejects a null descriptor, so a task-capable handler
+        /// cannot request creation of inert work.
+        work_descriptor: FinalTaskWorkDescriptor,
         /// Optional initial status message retained by the task state machine.
         status_message: Option<String>,
     },
@@ -285,6 +293,21 @@ impl From<InputRequiredResult> for FinalToolOutcome {
     fn from(result: InputRequiredResult) -> Self {
         Self::InputRequired(result)
     }
+}
+
+const UNDECLARED_FINAL_TASK_OUTCOME_ERROR: &str =
+    "tool returned CreateTask without declaring final Tasks capability";
+
+fn admit_declared_final_tool_outcome(
+    declares_final_tasks: bool,
+    outcome: FinalToolOutcome,
+) -> McpResult<FinalToolOutcome> {
+    if matches!(&outcome, FinalToolOutcome::CreateTask { .. }) && !declares_final_tasks {
+        return Err(McpError::invalid_request(
+            UNDECLARED_FINAL_TASK_OUTCOME_ERROR,
+        ));
+    }
+    Ok(outcome)
 }
 
 /// URI template parameters extracted from a matched resource URI.
@@ -696,7 +719,17 @@ pub trait ToolHandler: Send + Sync {
         self.call_final_async(ctx, arguments)
     }
 
-    /// Calls the tool through the disjoint complete-or-task final surface.
+    /// Declares whether this handler can return a final Tasks `CreateTask` outcome.
+    ///
+    /// The router reads this declaration before invoking a final handler so it
+    /// can reject an unavailable or unnegotiated Tasks surface without letting
+    /// application code create or reserve work. Handlers that return
+    /// [`FinalToolOutcome::CreateTask`] must override this to return `true`.
+    fn declares_final_tasks(&self) -> bool {
+        false
+    }
+
+    /// Calls the tool through the final complete, input-required, or task-creation surface.
     ///
     /// Existing handlers remain complete-only. A task-capable handler
     /// overrides this method, or its async/request-owned counterpart, and
@@ -710,7 +743,7 @@ pub trait ToolHandler: Send + Sync {
             .map(FinalToolOutcome::Complete)
     }
 
-    /// Asynchronously calls the disjoint complete-or-task final surface.
+    /// Asynchronously calls the final complete, input-required, or task-creation surface.
     fn call_final_outcome_async<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -718,7 +751,12 @@ pub trait ToolHandler: Send + Sync {
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
         Box::pin(async move {
             match self.call_final_outcome(ctx, arguments) {
-                Ok(value) => Outcome::Ok(value),
+                Ok(value) => {
+                    match admit_declared_final_tool_outcome(self.declares_final_tasks(), value) {
+                        Ok(value) => Outcome::Ok(value),
+                        Err(error) => Outcome::Err(error),
+                    }
+                }
                 Err(error) => Outcome::Err(error),
             }
         })
@@ -731,7 +769,19 @@ pub trait ToolHandler: Send + Sync {
         _request_cx: &'a Cx,
         arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
-        self.call_final_outcome_async(ctx, arguments)
+        Box::pin(async move {
+            match self.call_final_outcome_async(ctx, arguments).await {
+                Outcome::Ok(value) => {
+                    match admit_declared_final_tool_outcome(self.declares_final_tasks(), value) {
+                        Ok(value) => Outcome::Ok(value),
+                        Err(error) => Outcome::Err(error),
+                    }
+                }
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(cancelled) => Outcome::Cancelled(cancelled),
+                Outcome::Panicked(panic) => Outcome::Panicked(panic),
+            }
+        })
     }
 }
 
@@ -1395,6 +1445,10 @@ impl ToolHandler for MountedToolHandler {
 
     fn final_metadata(&self) -> Option<&OpenMetadata> {
         self.inner.final_metadata()
+    }
+
+    fn declares_final_tasks(&self) -> bool {
+        self.inner.declares_final_tasks()
     }
 
     fn timeout(&self) -> Option<Duration> {
@@ -2385,6 +2439,182 @@ mod tests {
             [ContentBlock::Text { .. }]
         ));
         assert!(final_result.meta.server_info.is_none());
+    }
+
+    #[test]
+    fn tool_handler_default_final_outcome_is_complete_and_preserves_legacy_adapter() {
+        let tool = StubTool;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+
+        let final_outcome = tool
+            .call_final_outcome(&ctx, serde_json::json!({"x": 1}))
+            .expect("default final outcome promotes the legacy result");
+        let FinalToolOutcome::Complete(final_result) = final_outcome else {
+            panic!("a default tool handler must select the final complete branch");
+        };
+        assert!(matches!(
+            final_result.payload.content.as_slice(),
+            [ContentBlock::Text { text, .. }] if text == "echo: {\"x\":1}"
+        ));
+
+        let legacy = tool
+            .call(&ctx, serde_json::json!({"x": 1}))
+            .expect("legacy adapter remains callable after the final outcome");
+        assert!(matches!(
+            legacy.as_slice(),
+            [Content::Text { text }] if text == "echo: {\"x\":1}"
+        ));
+    }
+
+    #[test]
+    fn tool_handler_task_creation_outcome_preserves_legacy_adapter() {
+        struct TaskCreatingTool {
+            legacy_calls: AtomicUsize,
+        }
+
+        impl ToolHandler for TaskCreatingTool {
+            fn definition(&self) -> Tool {
+                StubTool.definition()
+            }
+
+            fn declares_final_tasks(&self) -> bool {
+                true
+            }
+
+            fn call(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
+                self.legacy_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![Content::text("exact legacy completion")])
+            }
+
+            fn call_final_outcome(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<FinalToolOutcome> {
+                Ok(FinalToolOutcome::CreateTask {
+                    work_descriptor: FinalTaskWorkDescriptor::new(serde_json::json!({
+                        "operation": "durable-tool-work",
+                    }))?,
+                    status_message: Some("awaiting durable work".to_owned()),
+                })
+            }
+        }
+
+        let tool = TaskCreatingTool {
+            legacy_calls: AtomicUsize::new(0),
+        };
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let request_cx = Cx::for_testing();
+
+        let Outcome::Ok(final_outcome) = fastmcp_core::block_on(
+            tool.call_final_outcome_async_in_request(&ctx, &request_cx, serde_json::json!({})),
+        ) else {
+            panic!("declared task-capable handler selects a router-owned task creation");
+        };
+        let FinalToolOutcome::CreateTask {
+            work_descriptor,
+            status_message: Some(status_message),
+        } = final_outcome
+        else {
+            panic!("task-capable handler must retain non-null initial work and its status");
+        };
+        assert_eq!(
+            work_descriptor.as_value(),
+            &serde_json::json!({"operation": "durable-tool-work"})
+        );
+        assert_eq!(status_message, "awaiting durable work");
+        assert_eq!(tool.legacy_calls.load(Ordering::Relaxed), 0);
+
+        let legacy = tool
+            .call(&ctx, serde_json::json!({}))
+            .expect("legacy adapter remains exact for a task-capable handler");
+        assert!(
+            matches!(legacy.as_slice(), [Content::Text { text }] if text == "exact legacy completion")
+        );
+        assert_eq!(tool.legacy_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn tool_handler_undeclared_task_creation_fails_closed_and_preserves_legacy_adapter() {
+        struct UndeclaredTaskCreatingTool {
+            legacy_calls: AtomicUsize,
+        }
+
+        impl ToolHandler for UndeclaredTaskCreatingTool {
+            fn definition(&self) -> Tool {
+                StubTool.definition()
+            }
+
+            fn call(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
+                self.legacy_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![Content::text("exact legacy completion")])
+            }
+
+            fn call_final_outcome(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<FinalToolOutcome> {
+                Ok(FinalToolOutcome::CreateTask {
+                    work_descriptor: FinalTaskWorkDescriptor::new(serde_json::json!({
+                        "operation": "must-not-run-without-declaration",
+                    }))?,
+                    status_message: None,
+                })
+            }
+        }
+
+        let tool = UndeclaredTaskCreatingTool {
+            legacy_calls: AtomicUsize::new(0),
+        };
+        assert!(
+            !tool.declares_final_tasks(),
+            "the declaration is opt-in and defaults to false"
+        );
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let request_cx = Cx::for_testing();
+
+        let outcome = fastmcp_core::block_on(tool.call_final_outcome_async_in_request(
+            &ctx,
+            &request_cx,
+            serde_json::json!({}),
+        ));
+        let Outcome::Err(error) = outcome else {
+            panic!("an undeclared task outcome must fail closed");
+        };
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
+        assert_eq!(error.message, UNDECLARED_FINAL_TASK_OUTCOME_ERROR);
+
+        let legacy = tool
+            .call(&ctx, serde_json::json!({}))
+            .expect("legacy adapter remains exact when final task outcome is rejected");
+        assert!(
+            matches!(legacy.as_slice(), [Content::Text { text }] if text == "exact legacy completion")
+        );
+        assert_eq!(tool.legacy_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn task_creation_work_descriptor_rejects_null_before_an_outcome_can_be_constructed() {
+        let error = FinalTaskWorkDescriptor::new(serde_json::Value::Null)
+            .expect_err("a task-capable handler must not request inert null work");
+
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        assert_eq!(
+            error.message,
+            "Final task work descriptor must identify an application operation"
+        );
     }
 
     #[test]

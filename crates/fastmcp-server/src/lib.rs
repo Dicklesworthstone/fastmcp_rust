@@ -114,8 +114,10 @@ use session::{
     SubscriptionRemovalError,
 };
 pub use tasks::{
-    DEFAULT_IN_MEMORY_FINAL_TASKS, FinalTaskAcceptedInput, FinalTaskNotificationEmitter,
-    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
+    ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
+    FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
+    FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
+    FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
     InMemoryFinalTaskStore,
 };
 #[cfg(test)]
@@ -132,7 +134,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -140,8 +142,10 @@ use fastmcp_transport::http::{
     DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
     DualEraHttpEndpointResponse, DualEraHttpLegacySseResponse, DualEraHttpSession,
     DualEraHttpSseResponse, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
-    HttpResponse, HttpStatus, HttpTransport, StreamableHttpRequestResponseSender,
+    HttpResponse, HttpStatus, HttpTransport, StreamableHttpRequestCancellation,
+    StreamableHttpRequestResponseSender,
 };
+use fastmcp_transport::sse::SseEvent;
 
 use asupersync::codec::Framed;
 use asupersync::http::h1::{Http1Codec, Method as Http1Method, Response as Http1Response};
@@ -216,6 +220,7 @@ const DISCOVERY_CACHE_MAX_AGE_SECONDS: u32 = 60;
 const MODERN_ONLY_INITIALIZE_MESSAGE: &str = "Initialization-based MCP is not enabled";
 const STDIO_OUTPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 static INSTALL_EXTENSION_PANIC_HOOK: Once = Once::new();
 #[cfg(test)]
 static REDACTED_EXTENSION_PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -2138,6 +2143,12 @@ pub struct ServerHttpEndpoint {
 }
 
 /// A server-owned session opened through [`ServerHttpEndpoint`].
+///
+/// Call [`ServerHttpSession::close`] before dropping a session that admitted
+/// modern request work. Async close is the only API that joins those tasks;
+/// `Drop` can cancel their exact authorities but cannot synchronously drive an
+/// asupersync runtime to quiescence.
+#[must_use = "a ServerHttpSession with admitted work must be closed asynchronously"]
 pub struct ServerHttpSession {
     server: Arc<Server>,
     endpoint_session: DualEraHttpSession,
@@ -2150,6 +2161,7 @@ pub struct ServerHttpSession {
     /// embedding caller. Handles are retained because dropping an asupersync
     /// task handle detaches it from the session lifecycle.
     modern_dispatches: Vec<OwnedModernHttpDispatch>,
+    closed: bool,
 }
 
 struct OwnedModernHttpDispatch {
@@ -2158,12 +2170,252 @@ struct OwnedModernHttpDispatch {
     task: asupersync::runtime::TaskHandle<()>,
 }
 
+/// A server-bound modern SSE response body.
+///
+/// The transport body owns peer-drop cancellation. This wrapper also observes
+/// the server request's MCP cancellation election so a cancellation-only
+/// `subscriptions/listen` terminal becomes a closed public body immediately
+/// after its final control notification has been consumed.
+pub struct ServerHttpSseResponse {
+    inner: DualEraHttpSseResponse,
+    request_cancellation: McpRequestCancellation,
+    terminal_delivery: Arc<FinalSubscriptionTerminalDelivery>,
+}
+
+const FINAL_TERMINAL_OPEN: u8 = 0;
+const FINAL_TERMINAL_ENQUEUED: u8 = 1;
+const FINAL_TERMINAL_DRAINED: u8 = 2;
+const FINAL_TERMINAL_FAILED: u8 = 3;
+
+#[derive(Default)]
+struct FinalSubscriptionTerminalDelivery {
+    state: AtomicU8,
+}
+
+impl FinalSubscriptionTerminalDelivery {
+    fn mark_enqueued(&self) {
+        let _ = self.state.compare_exchange(
+            FINAL_TERMINAL_OPEN,
+            FINAL_TERMINAL_ENQUEUED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn mark_drained(&self) {
+        let mut state = self.state.load(Ordering::Acquire);
+        while matches!(state, FINAL_TERMINAL_OPEN | FINAL_TERMINAL_ENQUEUED) {
+            match self.state.compare_exchange_weak(
+                state,
+                FINAL_TERMINAL_DRAINED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => state = observed,
+            }
+        }
+    }
+
+    fn mark_failed(&self) {
+        let _ = self.state.compare_exchange(
+            FINAL_TERMINAL_OPEN,
+            FINAL_TERMINAL_FAILED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = self.state.compare_exchange(
+            FINAL_TERMINAL_ENQUEUED,
+            FINAL_TERMINAL_FAILED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn is_enqueued(&self) -> bool {
+        self.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED
+    }
+
+    fn is_committed(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            FINAL_TERMINAL_ENQUEUED | FINAL_TERMINAL_DRAINED
+        )
+    }
+
+    #[cfg(test)]
+    fn is_drained(&self) -> bool {
+        self.state.load(Ordering::Acquire) == FINAL_TERMINAL_DRAINED
+    }
+
+    fn is_settled(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            FINAL_TERMINAL_DRAINED | FINAL_TERMINAL_FAILED
+        )
+    }
+}
+
+/// Cancellation view shared by one public HTTP response body and its MCP
+/// request authority.
+#[derive(Clone)]
+pub struct ServerHttpRequestCancellation {
+    transport: StreamableHttpRequestCancellation,
+    request: McpRequestCancellation,
+    terminal_delivery: Arc<FinalSubscriptionTerminalDelivery>,
+}
+
+impl ServerHttpRequestCancellation {
+    /// Returns whether peer body closure or MCP request cancellation won.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.transport.is_cancelled()
+            || self.request.is_cancel_requested() && !self.terminal_delivery.is_enqueued()
+    }
+
+    /// Returns the exact JSON-RPC request ID owned by this response body.
+    #[must_use]
+    pub fn request_id(&self) -> &RequestId {
+        self.transport.request_id()
+    }
+
+    /// Checks caller, transport-body, and MCP request cancellation together.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport's cancellation error, or [`TransportError::Cancelled`]
+    /// when MCP cancellation has closed the response body.
+    pub fn checkpoint(&self, cx: &Cx) -> Result<(), TransportError> {
+        self.transport.checkpoint(cx)?;
+        if self.request.is_cancel_requested() && !self.terminal_delivery.is_enqueued() {
+            return Err(TransportError::Cancelled);
+        }
+        Ok(())
+    }
+}
+
+impl ServerHttpSseResponse {
+    fn new(
+        inner: DualEraHttpSseResponse,
+        request_cancellation: McpRequestCancellation,
+        terminal_delivery: Arc<FinalSubscriptionTerminalDelivery>,
+    ) -> Self {
+        Self {
+            inner,
+            request_cancellation,
+            terminal_delivery,
+        }
+    }
+
+    /// Returns the HTTP response head for this SSE body.
+    #[must_use]
+    pub fn response(&self) -> &HttpResponse {
+        self.inner.response()
+    }
+
+    /// Returns the cancellation view shared by the transport body and MCP request.
+    #[must_use]
+    pub fn cancellation(&self) -> ServerHttpRequestCancellation {
+        ServerHttpRequestCancellation {
+            transport: self.inner.cancellation(),
+            request: self.request_cancellation.clone(),
+            terminal_delivery: Arc::clone(&self.terminal_delivery),
+        }
+    }
+
+    /// Returns the producer bound to this exact response body.
+    #[must_use]
+    pub fn sender(&self) -> StreamableHttpRequestResponseSender {
+        self.inner.sender()
+    }
+
+    /// Returns whether either the transport body or the MCP request reached a
+    /// cancellation-only terminal state.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+            || self.terminal_delivery.is_settled()
+            || self.request_cancellation.is_cancel_requested()
+                && !self.terminal_delivery.is_enqueued()
+    }
+
+    /// Pops the next queued event, then reports terminal MCP cancellation as a
+    /// closed body rather than an indefinitely pending empty queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying transport failure, or [`DualEraHttpEndpointError::Closed`]
+    /// after a cancellation-only MCP terminal has drained.
+    pub fn pop_event(&self) -> Result<Option<SseEvent>, DualEraHttpEndpointError> {
+        if self.terminal_delivery.is_settled() {
+            return Err(DualEraHttpEndpointError::Closed);
+        }
+        match self.inner.pop_event()? {
+            Some(event) => {
+                if final_subscription_terminal_event(&event) {
+                    self.terminal_delivery.mark_drained();
+                }
+                Ok(Some(event))
+            }
+            None if self.request_cancellation.is_cancel_requested() => {
+                if self.terminal_delivery.is_enqueued() {
+                    Ok(None)
+                } else {
+                    self.terminal_delivery.mark_failed();
+                    Err(DualEraHttpEndpointError::Closed)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Receives the next event while observing both transport and MCP terminal
+    /// cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying transport failure, or [`DualEraHttpEndpointError::Closed`]
+    /// when the response body, MCP request, or caller context is terminal.
+    pub fn recv_event(&self, cx: &Cx) -> Result<SseEvent, DualEraHttpEndpointError> {
+        loop {
+            match self.pop_event()? {
+                Some(event) => return Ok(event),
+                None if cx.checkpoint().is_err() => {
+                    return Err(DualEraHttpEndpointError::Closed);
+                }
+                None => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    }
+}
+
+fn final_subscription_terminal_event(event: &SseEvent) -> bool {
+    let Ok(notification) = serde_json::from_str::<JsonRpcRequest>(&event.data) else {
+        return false;
+    };
+    final_subscription_terminal_notification(&notification)
+}
+
+fn final_subscription_terminal_notification(notification: &JsonRpcRequest) -> bool {
+    let Ok(ServerNotification::Cancelled(params)) = ServerNotification::decode(&notification)
+    else {
+        return false;
+    };
+    params
+        .meta
+        .as_ref()
+        .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+        .cloned()
+        .and_then(|subscription_id| serde_json::from_value::<RequestId>(subscription_id).ok())
+        .is_some_and(|subscription_id| subscription_id == params.request_id)
+}
+
 /// A response emitted by [`ServerHttpSession::handle`].
 pub enum ServerHttpEndpointResponse {
     /// A complete response, including modern JSON and legacy POST acknowledgement.
     Immediate(HttpResponse),
     /// A finite modern request-scoped SSE response body.
-    ModernSse(DualEraHttpSseResponse),
+    ModernSse(ServerHttpSseResponse),
     /// A live exact MCP 2024-11-05 SSE stream.
     LegacySse(DualEraHttpLegacySseResponse),
 }
@@ -2212,7 +2464,30 @@ struct FinalSubscriptionEntry {
     accepted_filter: SubscriptionFilter,
     notification_sender: NotificationSender,
     request_cancellation: McpRequestCancellation,
+    terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
     election: Arc<FinalSubscriptionElection>,
+}
+
+#[derive(Default)]
+struct FinalSubscriptionTerminationReceipt {
+    terminated: usize,
+    terminal_deliveries: Vec<Arc<FinalSubscriptionTerminalDelivery>>,
+}
+
+impl FinalSubscriptionTerminationReceipt {
+    fn is_settled(&self) -> bool {
+        self.terminal_deliveries
+            .iter()
+            .all(|delivery| delivery.is_settled())
+    }
+
+    fn fail_pending(&self) {
+        for delivery in &self.terminal_deliveries {
+            if !delivery.is_settled() {
+                delivery.mark_failed();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2276,6 +2551,7 @@ impl FinalSubscriptionRegistry {
         accept_tasks: bool,
         modern_http_owner: Option<u64>,
         request_cancellation: McpRequestCancellation,
+        terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
         notification_sender: NotificationSender,
     ) -> McpResult<FinalSubscriptionLease> {
         if subscription_id.validate().is_err() {
@@ -2330,6 +2606,7 @@ impl FinalSubscriptionRegistry {
                 accepted_filter,
                 notification_sender: notification_sender.clone(),
                 request_cancellation: request_cancellation.clone(),
+                terminal_delivery,
                 election: Arc::clone(&election),
             },
         );
@@ -2381,8 +2658,24 @@ impl FinalSubscriptionRegistry {
             .phase
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !registered || *phase != FinalSubscriptionPhase::Opening {
+        if !registered
+            || *phase != FinalSubscriptionPhase::Opening
+            || request_cancellation.is_cancel_requested()
+        {
+            if *phase == FinalSubscriptionPhase::Opening {
+                *phase = FinalSubscriptionPhase::PeerTerminated;
+            }
             drop(phase);
+            let mut state = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = state.entries.remove(&key)
+                && let Some(owner) = entry.modern_http_owner
+            {
+                state.modern_http_owners.remove(&owner);
+            }
+            drop(state);
             request_cancellation.cancel();
             return Err(McpError::request_cancelled());
         }
@@ -2435,10 +2728,18 @@ impl FinalSubscriptionRegistry {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if *phase == FinalSubscriptionPhase::Active {
-                if catch_extension_unwind(|| (entry.notification_sender)(notification)).is_ok() {
+                if entry.request_cancellation.is_cancel_requested() {
+                    *phase = FinalSubscriptionPhase::PeerTerminated;
+                    continue;
+                }
+                let sent =
+                    catch_extension_unwind(|| (entry.notification_sender)(notification)).is_ok();
+                if sent && !entry.request_cancellation.is_cancel_requested() {
                     count += 1;
                 } else {
-                    let _ = extension_panic_error("final_subscription_event_sender");
+                    if !sent {
+                        let _ = extension_panic_error("final_subscription_event_sender");
+                    }
                     *phase = FinalSubscriptionPhase::PeerTerminated;
                     entry.request_cancellation.cancel();
                 }
@@ -2484,10 +2785,18 @@ impl FinalSubscriptionRegistry {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if *phase == FinalSubscriptionPhase::Active {
-                if catch_extension_unwind(|| (entry.notification_sender)(notification)).is_ok() {
+                if entry.request_cancellation.is_cancel_requested() {
+                    *phase = FinalSubscriptionPhase::PeerTerminated;
+                    continue;
+                }
+                let sent =
+                    catch_extension_unwind(|| (entry.notification_sender)(notification)).is_ok();
+                if sent && !entry.request_cancellation.is_cancel_requested() {
                     count += 1;
                 } else {
-                    let _ = extension_panic_error("final_task_subscription_sender");
+                    if !sent {
+                        let _ = extension_panic_error("final_task_subscription_sender");
+                    }
                     *phase = FinalSubscriptionPhase::PeerTerminated;
                     entry.request_cancellation.cancel();
                 }
@@ -2497,6 +2806,10 @@ impl FinalSubscriptionRegistry {
     }
 
     fn terminate(&self) -> usize {
+        self.terminate_with_receipt().terminated
+    }
+
+    fn terminate_with_receipt(&self) -> FinalSubscriptionTerminationReceipt {
         self.terminating.store(true, Ordering::Release);
         let entries = {
             let mut state = self
@@ -2507,39 +2820,78 @@ impl FinalSubscriptionRegistry {
             state.modern_http_owners.clear();
             entries.into_values().collect::<Vec<_>>()
         };
-        let mut terminated = 0;
+        let mut receipt = FinalSubscriptionTerminationReceipt::default();
         for entry in entries {
-            let mut phase = entry
-                .election
-                .phase
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match *phase {
-                FinalSubscriptionPhase::Opening => {
-                    *phase = FinalSubscriptionPhase::ServerTerminated;
-                    entry.request_cancellation.cancel();
-                }
-                FinalSubscriptionPhase::Active => {
-                    *phase = FinalSubscriptionPhase::ServerTerminated;
-                    // This per-entry election serializes the last ordinary
-                    // publication with the server-owned terminal control.
-                    if let Ok(notification) =
-                        subscription_cancellation_notification(&entry.subscription_id)
-                        && catch_extension_unwind(|| {
-                            (entry.notification_sender)(notification);
-                        })
-                        .is_err()
-                    {
-                        let _ = extension_panic_error("final_subscription_termination_sender");
-                    }
-                    entry.request_cancellation.cancel();
-                    terminated += 1;
-                }
-                FinalSubscriptionPhase::PeerTerminated
-                | FinalSubscriptionPhase::ServerTerminated => {}
+            let (terminated, terminal_delivery) = Self::terminate_removed_entry(entry);
+            if terminated {
+                receipt.terminated += 1;
+            }
+            if let Some(terminal_delivery) = terminal_delivery {
+                receipt.terminal_deliveries.push(terminal_delivery);
             }
         }
-        terminated
+        receipt
+    }
+
+    fn terminate_removed_entry(
+        entry: FinalSubscriptionEntry,
+    ) -> (bool, Option<Arc<FinalSubscriptionTerminalDelivery>>) {
+        let mut phase = entry
+            .election
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *phase {
+            FinalSubscriptionPhase::Opening => {
+                *phase = if entry.request_cancellation.is_cancel_requested() {
+                    FinalSubscriptionPhase::PeerTerminated
+                } else {
+                    FinalSubscriptionPhase::ServerTerminated
+                };
+                entry.request_cancellation.cancel();
+                (false, None)
+            }
+            FinalSubscriptionPhase::Active => {
+                if entry.request_cancellation.is_cancel_requested() {
+                    *phase = FinalSubscriptionPhase::PeerTerminated;
+                    return (false, None);
+                }
+                *phase = FinalSubscriptionPhase::ServerTerminated;
+                // This per-entry election serializes the last ordinary
+                // publication with the server-owned terminal control.
+                let sent = match subscription_cancellation_notification(&entry.subscription_id) {
+                    Ok(notification) => {
+                        let sent = catch_extension_unwind(|| {
+                            (entry.notification_sender)(notification);
+                        })
+                        .is_ok();
+                        if !sent {
+                            let _ = extension_panic_error("final_subscription_termination_sender");
+                        }
+                        sent
+                    }
+                    Err(_) => false,
+                };
+                let terminal_committed = entry
+                    .terminal_delivery
+                    .as_ref()
+                    .is_some_and(|delivery| delivery.is_committed());
+                if !sent || entry.request_cancellation.is_cancel_requested() && !terminal_committed
+                {
+                    *phase = FinalSubscriptionPhase::PeerTerminated;
+                    if let Some(delivery) = &entry.terminal_delivery {
+                        delivery.mark_failed();
+                    }
+                    entry.request_cancellation.cancel();
+                    return (false, None);
+                }
+                entry.request_cancellation.cancel();
+                (true, entry.terminal_delivery)
+            }
+            FinalSubscriptionPhase::PeerTerminated | FinalSubscriptionPhase::ServerTerminated => {
+                (false, None)
+            }
+        }
     }
 
     /// Cancels the exact live modern HTTP listen owned by one response body.
@@ -2886,6 +3238,23 @@ impl HttpConnectionChildren {
             let _ = task.join(cx).await;
         }
     }
+
+    async fn drain_terminal_controls_then_cancel_and_join(
+        &mut self,
+        cx: &Cx,
+        receipt: &FinalSubscriptionTerminationReceipt,
+    ) {
+        let deadline = Instant::now() + HTTP_TERMINAL_DRAIN_TIMEOUT;
+        while !receipt.is_settled() && Instant::now() < deadline {
+            self.reap_finished();
+            if self.tasks.is_empty() {
+                break;
+            }
+            asupersync::runtime::yield_now().await;
+        }
+        receipt.fail_pending();
+        self.cancel_and_join(cx).await;
+    }
 }
 
 /// A bound, caller-owned HTTP server lifecycle.
@@ -2964,7 +3333,14 @@ impl BoundHttpServer {
                 Err(error) => break Err(error),
             }
         };
-        connection_children.cancel_and_join(cx).await;
+        // Final subscription teardown must commit its correlated cancellation
+        // controls while the response writers are still owned. Give those
+        // children a bounded scheduling window to flush and close before
+        // aborting any unrelated or uncooperative connection.
+        let terminal_receipt = server.final_subscriptions.terminate_with_receipt();
+        connection_children
+            .drain_terminal_controls_then_cancel_and_join(cx, &terminal_receipt)
+            .await;
         server.graceful_shutdown_returning();
         result
     }
@@ -3068,6 +3444,7 @@ impl ServerHttpEndpoint {
             legacy_active_request: Arc::new(Mutex::new(None)),
             legacy_request_cx: Arc::new(Mutex::new(cx.clone())),
             modern_dispatches: Vec::new(),
+            closed: false,
         })
     }
 
@@ -3129,6 +3506,15 @@ impl ServerHttpSession {
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         let request = self.endpoint_session.recv_modern_request(cx)?;
 
+        // Final Streamable HTTP cancellation is response-body closure. A
+        // separate notifications/cancelled POST has no request-body authority
+        // and is rejected instead of being correlated by JSON-RPC ID.
+        if request.method == "notifications/cancelled" {
+            return Ok(ServerHttpEndpointResponse::Immediate(
+                HttpResponse::bad_request(),
+            ));
+        }
+
         if request.method == SUBSCRIPTIONS_LISTEN {
             let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
                 return Ok(ServerHttpEndpointResponse::Immediate(
@@ -3138,19 +3524,23 @@ impl ServerHttpSession {
             let sender = sse.sender();
             let request_cancellation = sender.request_cancellation();
             let owner_generation = next_modern_http_stream_generation();
+            let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
             let dispatch = spawn_modern_sse_dispatch(
                 cx,
                 Arc::clone(&self.server),
                 owner_generation,
                 request,
                 sender,
+                Arc::clone(&terminal_delivery),
             )?;
             self.modern_dispatches.push(OwnedModernHttpDispatch {
                 owner_generation,
-                request_cancellation,
+                request_cancellation: request_cancellation.clone(),
                 task: dispatch,
             });
-            return Ok(ServerHttpEndpointResponse::ModernSse(sse));
+            return Ok(ServerHttpEndpointResponse::ModernSse(
+                ServerHttpSseResponse::new(sse, request_cancellation, terminal_delivery),
+            ));
         }
 
         let inbound = InboundRequestContext::new(
@@ -3180,6 +3570,7 @@ impl ServerHttpSession {
                 }
             }
             DualEraHttpEndpointResponse::ModernSse(sse) => {
+                let request_cancellation = sse.sender().request_cancellation();
                 if let Some(response) = response {
                     self.endpoint_session.send_modern_sse_response(
                         cx,
@@ -3187,7 +3578,13 @@ impl ServerHttpSession {
                         response,
                     )?;
                 }
-                Ok(ServerHttpEndpointResponse::ModernSse(sse))
+                Ok(ServerHttpEndpointResponse::ModernSse(
+                    ServerHttpSseResponse::new(
+                        sse,
+                        request_cancellation,
+                        Arc::new(FinalSubscriptionTerminalDelivery::default()),
+                    ),
+                ))
             }
             DualEraHttpEndpointResponse::Immediate(response) => {
                 debug_assert!(request.id.is_none());
@@ -3299,9 +3696,25 @@ impl ServerHttpSession {
         Ok(ServerHttpEndpointResponse::Immediate(response))
     }
 
-    /// Closes this session and releases its exact legacy lifecycle state.
-    pub fn close(&mut self) {
-        for dispatch in &self.modern_dispatches {
+    /// Closes this session, joins every owned modern dispatch, and releases its
+    /// exact legacy lifecycle state.
+    ///
+    /// This is the structured settlement boundary. Callers that admitted a
+    /// modern SSE dispatch must await it before dropping the session.
+    pub async fn close(&mut self, cx: &Cx) {
+        let dispatches = self.begin_close();
+        for mut task in dispatches {
+            let _ = task.join(cx).await;
+        }
+    }
+
+    fn begin_close(&mut self) -> Vec<asupersync::runtime::TaskHandle<()>> {
+        if self.closed {
+            return Vec::new();
+        }
+        self.closed = true;
+        let dispatches = std::mem::take(&mut self.modern_dispatches);
+        for dispatch in &dispatches {
             self.server
                 .final_subscriptions
                 .cancel_modern_http_owner(dispatch.owner_generation);
@@ -3312,6 +3725,10 @@ impl ServerHttpSession {
             let _ = adapter.close(self.legacy_binding);
         }
         self.endpoint_session.close();
+        dispatches
+            .into_iter()
+            .map(|dispatch| dispatch.task)
+            .collect()
     }
 
     fn reap_modern_dispatches(&mut self) {
@@ -3337,12 +3754,15 @@ impl ServerHttpSession {
 
 impl Drop for ServerHttpSession {
     fn drop(&mut self) {
-        for dispatch in &self.modern_dispatches {
-            self.server
-                .final_subscriptions
-                .cancel_modern_http_owner(dispatch.owner_generation);
-            dispatch.request_cancellation.cancel();
-            dispatch.task.abort();
+        // A synchronous destructor cannot drive the caller-owned asupersync
+        // runtime. Fail closed by revoking every exact transport/MCP authority
+        // in `begin_close`, aborting its task, and consuming any terminal
+        // result already available. Pending cancelled tasks remain owned by
+        // their structured runtime region; unlike the former process-global
+        // queue, this path retains no cross-session work and claims no join
+        // guarantee. `close(&Cx).await` is the required joined boundary.
+        for mut task in self.begin_close() {
+            let _ = task.try_join();
         }
     }
 }
@@ -3490,10 +3910,12 @@ fn spawn_modern_sse_dispatch(
     http_stream_generation: u64,
     request: JsonRpcRequest,
     response_sender: StreamableHttpRequestResponseSender,
+    terminal_delivery: Arc<FinalSubscriptionTerminalDelivery>,
 ) -> Result<asupersync::runtime::TaskHandle<()>, DualEraHttpEndpointError> {
     let request_id = request_id_to_u64(request.id.as_ref());
     let policy = server.protocol_policy;
     let notification_response_sender = response_sender.clone();
+    let notification_terminal_delivery = Arc::clone(&terminal_delivery);
     cx.spawn(move |request_cx| async move {
         let inbound = InboundRequestContext::new(
             request_cx.clone(),
@@ -3530,11 +3952,25 @@ fn spawn_modern_sse_dispatch(
         let notification_cx = request_cx.clone();
         let notification_cancellation = response_sender.request_cancellation();
         let notification_sender: NotificationSender = Arc::new(move |notification| {
-            if notification_response_sender
-                .send_notification(&notification_cx, notification)
-                .is_err()
-            {
+            let terminal_control = final_subscription_terminal_notification(&notification);
+            let sent = if terminal_control {
+                // The caller's root cancellation initiates normal HTTP server
+                // shutdown. Mask only the already-elected terminal control so
+                // it can drain before connection children are aborted; all
+                // ordinary publications retain normal cancellation checks.
+                notification_cx.masked(|| {
+                    notification_response_sender.send_notification(&notification_cx, notification)
+                })
+            } else {
+                notification_response_sender.send_notification(&notification_cx, notification)
+            };
+            if sent.is_err() {
+                if terminal_control {
+                    notification_terminal_delivery.mark_failed();
+                }
                 notification_cancellation.cancel();
+            } else if terminal_control {
+                notification_terminal_delivery.mark_enqueued();
             }
         });
         let response = Arc::clone(&server)
@@ -3544,6 +3980,7 @@ fn spawn_modern_sse_dispatch(
                 request,
                 Some(http_stream_generation),
                 cancellation.clone(),
+                Some(terminal_delivery),
                 notification_sender,
             )
             .await;
@@ -3571,12 +4008,19 @@ async fn send_modern_sse_stream(
     let response_head = legacy_sse_response_head(response.response())?;
     let sender = response.sender();
     let request_cancellation = sender.request_cancellation();
+    let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
     let (_reader, mut writer) = stream.into_split();
     let cancellation_server = Arc::clone(&server);
 
-    let mut dispatch =
-        spawn_modern_sse_dispatch(cx, server, http_stream_generation, request, sender)
-            .map_err(|_| ())?;
+    let mut dispatch = spawn_modern_sse_dispatch(
+        cx,
+        server,
+        http_stream_generation,
+        request,
+        sender,
+        Arc::clone(&terminal_delivery),
+    )
+    .map_err(|_| ())?;
 
     let result = async {
         writer.write_all(&response_head).await.map_err(|_| ())?;
@@ -3584,15 +4028,24 @@ async fn send_modern_sse_stream(
         loop {
             match response.pop_event() {
                 Ok(Some(event)) => {
+                    let terminal_control = final_subscription_terminal_event(&event);
                     let bytes = event.to_bytes().map_err(|_| ())?;
                     let prefix = format!("{:X}\r\n", bytes.len());
                     writer.write_all(prefix.as_bytes()).await.map_err(|_| ())?;
                     writer.write_all(&bytes).await.map_err(|_| ())?;
                     writer.write_all(b"\r\n").await.map_err(|_| ())?;
                     writer.flush().await.map_err(|_| ())?;
+                    if terminal_control {
+                        terminal_delivery.mark_drained();
+                    }
                 }
                 Ok(None) if response.is_finished() => break,
-                Ok(None) if request_cancellation.is_cancel_requested() => break,
+                Ok(None)
+                    if request_cancellation.is_cancel_requested()
+                        && !terminal_delivery.is_enqueued() =>
+                {
+                    break;
+                }
                 Ok(None) => {
                     asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
@@ -3605,6 +4058,7 @@ async fn send_modern_sse_stream(
     .await;
 
     if result.is_err() {
+        terminal_delivery.mark_failed();
         cancellation_server
             .final_subscriptions
             .cancel_modern_http_owner(http_stream_generation);
@@ -3752,7 +4206,7 @@ async fn serve_http_connection(
                     response,
                 )
                 .await;
-                session.close();
+                session.close(cx).await;
                 return;
             }
             Ok(Err(response)) => {
@@ -3827,11 +4281,14 @@ async fn serve_http_connection(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&session_id);
     if let Some(session) = removed {
-        let mut session_guard = session
+        let dispatches = session
             .session
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        session_guard.close();
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .begin_close();
+        for mut task in dispatches {
+            let _ = task.join(cx).await;
+        }
     }
 }
 
@@ -4510,7 +4967,10 @@ impl Server {
                     .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 serde_json::to_value(self.server_discovery()?).map_err(McpError::from)
             } else {
-                match self.router.dispatch_stateless(&request_ctx, &request) {
+                match self
+                    .router
+                    .dispatch_stateless(&request_ctx, &admission_request)
+                {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
                         self.dispatch_extension_fallback(&request_ctx, &admission_request)
                     }
@@ -4590,6 +5050,7 @@ impl Server {
         request: JsonRpcRequest,
         modern_http_owner: Option<u64>,
         request_cancellation: McpRequestCancellation,
+        terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
         notification_sender: NotificationSender,
     ) -> Option<JsonRpcResponse> {
         let method = request.method.clone();
@@ -4710,6 +5171,7 @@ impl Server {
                     &request,
                     modern_http_owner,
                     request_cancellation.clone(),
+                    terminal_delivery,
                     notification_sender,
                 )
                 .await
@@ -4787,6 +5249,7 @@ impl Server {
         request: &JsonRpcRequest,
         modern_http_owner: Option<u64>,
         request_cancellation: McpRequestCancellation,
+        terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
         notification_sender: NotificationSender,
     ) -> McpResult<serde_json::Value> {
         let subscription_id = request.id.clone().ok_or_else(|| {
@@ -4861,12 +5324,32 @@ impl Server {
             tasks_requested,
             modern_http_owner,
             request_cancellation.clone(),
+            terminal_delivery,
             notification_sender,
         )?;
 
         while !self.final_subscriptions.is_terminating() {
-            if request_cancellation.is_cancel_requested() || request_ctx.ensure_live().is_err() {
+            if request_cancellation.is_cancel_requested() {
                 return Err(McpError::request_cancelled());
+            }
+            if request_ctx.ensure_live().is_err() {
+                // Keep the lease registered until the owning server lifecycle
+                // performs its global terminal election. Exiting here would
+                // let `Drop` remove the entry before `BoundHttpServer::serve`
+                // can obtain the delivery receipt it must await. An embedding
+                // session without that lifecycle still releases this wait by
+                // cancelling the exact response-body request in `close`.
+                while !self.final_subscriptions.is_terminating()
+                    && !request_cancellation.is_cancel_requested()
+                {
+                    asupersync::runtime::yield_now().await;
+                }
+                if request_cancellation.is_cancel_requested()
+                    && !self.final_subscriptions.is_terminating()
+                {
+                    return Err(McpError::request_cancelled());
+                }
+                break;
             }
             // The registry is intentionally transport-neutral. Polling uses
             // the caller-owned clock and never creates a detached wake task;
@@ -4924,6 +5407,7 @@ impl Server {
         request: JsonRpcRequest,
         modern_http_owner: Option<u64>,
         request_cancellation: McpRequestCancellation,
+        terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
         notification_sender: NotificationSender,
     ) -> Option<JsonRpcResponse> {
         if matches!(policy, ProtocolPolicy::ModernOnly)
@@ -4947,6 +5431,7 @@ impl Server {
             request,
             modern_http_owner,
             request_cancellation,
+            terminal_delivery,
             notification_sender,
         )
         .await
@@ -7167,6 +7652,7 @@ impl Server {
                                                             request.clone(),
                                                             None,
                                                             request_cancellation.clone(),
+                                                            None,
                                                             notification_sender,
                                                         ),
                                                 )
@@ -12105,7 +12591,7 @@ mod lib_unit_tests {
         settings: serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
-            "id": task_id.as_str(),
+            "taskId": task_id.as_str(),
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
                 "io.modelcontextprotocol/clientCapabilities": {
@@ -16536,6 +17022,7 @@ mod lib_unit_tests {
                         );
                     }
                 }
+                let shutdown_cx = caller_cx.clone();
                 let _server_cancellation = CancelServerOnDrop(caller_cx);
                 let listen = JsonRpcRequest::new(
                     SUBSCRIPTIONS_LISTEN,
@@ -16598,9 +17085,10 @@ mod lib_unit_tests {
                             .to_owned(),
                     );
                 }
-                if server.terminate_subscription_streams() != 1 {
-                    return Err("server teardown did not own the live listen".to_owned());
-                }
+                shutdown_cx.cancel_with(
+                    CancelKind::User,
+                    Some("subscription graceful shutdown requested"),
+                );
                 let mut trailing = Vec::new();
                 std::io::Read::read_to_end(&mut stream, &mut trailing)
                     .map_err(|error| format!("terminated listen stream did not close: {error}"))?;
@@ -19721,6 +20209,7 @@ mod lib_unit_tests {
                 false,
                 None,
                 McpRequestCancellation::new(),
+                None,
                 sender,
             )
             .expect("final subscription should admit a bounded stream");
@@ -19811,6 +20300,7 @@ mod lib_unit_tests {
                 false,
                 Some(873),
                 first_cancellation.clone(),
+                None,
                 Arc::clone(&sender),
             )
             .expect("the first modern HTTP response body must admit");
@@ -19821,6 +20311,7 @@ mod lib_unit_tests {
                 false,
                 Some(874),
                 second_cancellation.clone(),
+                None,
                 sender,
             )
             .expect("a distinct response body may reuse the same JSON-RPC id");
@@ -19890,6 +20381,7 @@ mod lib_unit_tests {
                 .push(notification);
         });
         let subscription_id = RequestId::String("task-subscription-73".to_owned());
+        let subscription_cancellation = McpRequestCancellation::new();
         let _lease = server
             .final_subscriptions
             .open(
@@ -19897,7 +20389,8 @@ mod lib_unit_tests {
                 requested,
                 true,
                 None,
-                McpRequestCancellation::new(),
+                subscription_cancellation.clone(),
+                None,
                 sender,
             )
             .expect("negotiated Tasks filter must open");
@@ -19952,6 +20445,22 @@ mod lib_unit_tests {
             2,
             "one acknowledged stream receives exactly one matching task event"
         );
+        subscription_cancellation.cancel();
+        assert_eq!(
+            server
+                .final_subscriptions
+                .publish_task(delivered)
+                .expect("peer-cancelled task publication remains well-formed"),
+            0,
+            "a peer-cancelled token must prevent a Tasks callback before lease cleanup",
+        );
+        assert_eq!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2,
+            "peer-cancelled Tasks publication must leave delivery state unchanged",
+        );
     }
 
     #[test]
@@ -19978,6 +20487,7 @@ mod lib_unit_tests {
                 false,
                 None,
                 McpRequestCancellation::new(),
+                None,
                 sender,
             )
             .expect("selected catalog subscription should admit");
@@ -20125,6 +20635,7 @@ mod lib_unit_tests {
             request,
             Some(73),
             McpRequestCancellation::new(),
+            None,
             notification_sender,
         ));
 
@@ -20240,6 +20751,7 @@ mod lib_unit_tests {
             request,
             Some(74),
             request_cancellation,
+            None,
             notification_sender,
         ));
 
@@ -20291,6 +20803,7 @@ mod lib_unit_tests {
                 false,
                 Some(881),
                 cancellation.clone(),
+                None,
                 sender,
             )
             .expect("a final listen must register before termination");
@@ -20306,6 +20819,72 @@ mod lib_unit_tests {
             ServerNotification::decode(&sent[1]),
             Ok(ServerNotification::Cancelled(_))
         ));
+    }
+
+    #[test]
+    fn final_subscription_shutdown_receipt_waits_for_terminal_consumption() {
+        let registry = Arc::new(FinalSubscriptionRegistry::default());
+        let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+        let sender_delivery = Arc::clone(&terminal_delivery);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            if notification.method == "notifications/cancelled" {
+                sender_delivery.mark_enqueued();
+            }
+        });
+        let _lease = registry
+            .open(
+                RequestId::Number(887),
+                SubscriptionFilter::default(),
+                false,
+                Some(887),
+                McpRequestCancellation::new(),
+                Some(Arc::clone(&terminal_delivery)),
+                sender,
+            )
+            .expect("a final listen must register before termination");
+
+        let receipt = registry.terminate_with_receipt();
+        assert_eq!(receipt.terminated, 1);
+        assert!(terminal_delivery.is_enqueued());
+        assert!(
+            !receipt.is_settled(),
+            "queue admission alone must not masquerade as body consumption"
+        );
+
+        terminal_delivery.mark_drained();
+        assert!(receipt.is_settled());
+    }
+
+    #[test]
+    fn final_subscription_shutdown_receipt_fails_closed_after_backpressure_bound() {
+        let registry = Arc::new(FinalSubscriptionRegistry::default());
+        let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+        let sender_delivery = Arc::clone(&terminal_delivery);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            if notification.method == "notifications/cancelled" {
+                sender_delivery.mark_enqueued();
+            }
+        });
+        let _lease = registry
+            .open(
+                RequestId::Number(888),
+                SubscriptionFilter::default(),
+                false,
+                Some(888),
+                McpRequestCancellation::new(),
+                Some(Arc::clone(&terminal_delivery)),
+                sender,
+            )
+            .expect("a final listen must register before termination");
+
+        let receipt = registry.terminate_with_receipt();
+        assert!(!receipt.is_settled());
+        receipt.fail_pending();
+        assert!(
+            receipt.is_settled(),
+            "bounded shutdown must turn an unconsumed terminal into an explicit failure"
+        );
+        assert!(!terminal_delivery.is_drained());
     }
 
     #[test]
@@ -20330,6 +20909,7 @@ mod lib_unit_tests {
                 false,
                 Some(882),
                 cancellation.clone(),
+                None,
                 sender,
             )
             .expect("a modern HTTP listen must register");
@@ -20353,6 +20933,99 @@ mod lib_unit_tests {
             "peer winner leaves only the mandatory acknowledgement"
         );
         drop(lease);
+    }
+
+    #[test]
+    fn final_subscription_peer_token_prevents_immediate_publication_and_shutdown_callbacks() {
+        let registry = Arc::new(FinalSubscriptionRegistry::default());
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let cancellation = McpRequestCancellation::new();
+        let _lease = registry
+            .open(
+                RequestId::Number(885),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                false,
+                Some(885),
+                cancellation.clone(),
+                None,
+                sender,
+            )
+            .expect("a final listen must acknowledge before peer cancellation");
+
+        cancellation.cancel();
+        assert_eq!(
+            registry
+                .publish(ServerNotification::ToolsListChanged(None))
+                .expect("peer-cancelled publication remains well-formed"),
+            0,
+            "a peer-cancelled token must stop the callback before lease cleanup",
+        );
+        assert_eq!(registry.terminate(), 0);
+        assert_eq!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "peer cancellation leaves only the acknowledgement",
+        );
+    }
+
+    #[test]
+    fn final_subscription_callback_cancellation_is_not_counted_as_delivery() {
+        let registry = Arc::new(FinalSubscriptionRegistry::default());
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let cancellation = McpRequestCancellation::new();
+        let sent_for_sender = Arc::clone(&sent);
+        let cancellation_for_sender = cancellation.clone();
+        let sender: NotificationSender = Arc::new(move |notification| {
+            let mut sent = sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !sent.is_empty() {
+                cancellation_for_sender.cancel();
+            }
+            sent.push(notification);
+        });
+        let _lease = registry
+            .open(
+                RequestId::Number(886),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                false,
+                Some(886),
+                cancellation,
+                None,
+                sender,
+            )
+            .expect("a final listen must acknowledge before callback cancellation");
+
+        assert_eq!(
+            registry
+                .publish(ServerNotification::ToolsListChanged(None))
+                .expect("callback cancellation remains a well-formed publication"),
+            0,
+            "a callback that observes peer closure must not report a delivery",
+        );
+        assert_eq!(registry.terminate(), 0);
+        assert_eq!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2,
+            "the attempted event is retained by this planted sender, but no terminal control follows",
+        );
     }
 
     #[test]
@@ -20392,6 +21065,7 @@ mod lib_unit_tests {
                 false,
                 Some(883),
                 opener_cancellation,
+                None,
                 sender,
             )
         });
@@ -20532,10 +21206,49 @@ mod lib_unit_tests {
                 return Err("an acknowledged response body was not pending".to_owned());
             }
 
+            let mut rejected_session = endpoint
+                .open_session(&cx)
+                .map_err(|error| format!("rejected cancellation session failed: {error}"))?;
+            let cancellation = JsonRpcRequest::notification(
+                "notifications/cancelled",
+                Some(serde_json::json!({
+                    "requestId": 884,
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    },
+                })),
+            );
+            let rejected = rejected_session
+                .handle(
+                    &cx,
+                    HttpRequest::new(HttpMethod::Post, "/mcp")
+                        .with_header("content-type", "application/json")
+                        .with_header("accept", "application/json")
+                        .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                        .with_header("mcp-method", "notifications/cancelled")
+                        .with_body(
+                            serde_json::to_vec(&cancellation)
+                                .expect("typed cancellation notification must serialize"),
+                        ),
+                )
+                .map_err(|error| format!("cancellation rejection failed: {error}"))?;
+            let ServerHttpEndpointResponse::Immediate(rejected) = rejected else {
+                return Err(
+                    "HTTP cancellation notification was not rejected immediately".to_owned(),
+                );
+            };
+            if rejected.status != HttpStatus::BAD_REQUEST
+                || first_guard.checkpoint(&cx).is_err()
+                || second_guard.checkpoint(&cx).is_err()
+            {
+                return Err("HTTP cancellation POST affected a response body".to_owned());
+            }
+
             drop(first_sse);
             if first_guard.checkpoint(&cx).is_ok() || second_guard.checkpoint(&cx).is_err() {
                 return Err("response-body drop did not isolate cancellation".to_owned());
             }
+            drop(first_session);
             let removal_deadline = Instant::now() + Duration::from_secs(2);
             while endpoint
                 .server
@@ -20562,7 +21275,36 @@ mod lib_unit_tests {
                 return Err("dropped body affected the surviving listen".to_owned());
             }
 
-            second_session.close();
+            if endpoint.server.terminate_subscription_streams() != 1 {
+                return Err("server teardown did not elect the surviving listen".to_owned());
+            }
+            if second_guard.checkpoint(&cx).is_err() || second_sse.is_finished() {
+                return Err(
+                    "queued terminal control was confused with a closed public body".to_owned(),
+                );
+            }
+            let terminal = second_sse
+                .pop_event()
+                .map_err(|error| format!("terminal control was not readable: {error}"))?
+                .ok_or_else(|| "terminal control remained pending".to_owned())?;
+            let terminal: JsonRpcRequest = serde_json::from_str(&terminal.data)
+                .map_err(|error| format!("terminal control was invalid JSON-RPC: {error}"))?;
+            if terminal.method != "notifications/cancelled" {
+                return Err("server teardown emitted the wrong terminal control".to_owned());
+            }
+            if !second_sse.is_finished() || second_guard.checkpoint(&cx).is_ok() {
+                return Err("terminal control did not finish the public SSE body".to_owned());
+            }
+            if !matches!(
+                second_sse.pop_event(),
+                Err(DualEraHttpEndpointError::Closed)
+            ) {
+                return Err(
+                    "terminal control did not close the public SSE response body".to_owned(),
+                );
+            }
+
+            second_session.close(&cx).await;
             if second_guard.checkpoint(&cx).is_ok()
                 || !endpoint
                     .server
@@ -20573,10 +21315,85 @@ mod lib_unit_tests {
                     .entries
                     .is_empty()
                 || second_sse.pop_event().is_ok()
+                || !second_session.modern_dispatches.is_empty()
             {
                 return Err("session close remained indistinguishable from pending".to_owned());
             }
-            first_session.close();
+            second_session.close(&cx).await;
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn public_http_last_session_drop_revokes_work_without_terminal_claim() {
+        run_live_http_test(|cx| async move {
+            let endpoint = Server::new("public-http-last-session-drop", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .build_http_endpoint("http://legacy.test")
+                .map_err(|error| format!("public endpoint setup failed: {error}"))?;
+            let mut session = endpoint
+                .open_session(&cx)
+                .map_err(|error| format!("public listen session failed: {error}"))?;
+            let listen = JsonRpcRequest::new(
+                SUBSCRIPTIONS_LISTEN,
+                Some(serde_json::json!({
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                    "notifications": {"toolsListChanged": true},
+                })),
+                RequestId::Number(889),
+            );
+            let response = session
+                .handle(
+                    &cx,
+                    HttpRequest::new(HttpMethod::Post, "/mcp")
+                        .with_header("content-type", "application/json")
+                        .with_header("accept", "text/event-stream")
+                        .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                        .with_header("mcp-method", SUBSCRIPTIONS_LISTEN)
+                        .with_body(
+                            serde_json::to_vec(&listen)
+                                .expect("typed listen request must serialize"),
+                        ),
+                )
+                .map_err(|error| format!("public listen failed: {error}"))?;
+            let ServerHttpEndpointResponse::ModernSse(sse) = response else {
+                return Err("public listen did not return SSE".to_owned());
+            };
+            let guard = sse.cancellation();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match sse.pop_event() {
+                    Ok(Some(_acknowledgement)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                    Ok(None) => return Err("public listen acknowledgement timed out".to_owned()),
+                    Err(error) => return Err(format!("public listen closed early: {error}")),
+                }
+            }
+            if guard.checkpoint(&cx).is_err() {
+                return Err("acknowledged listen was not pending before session drop".to_owned());
+            }
+
+            drop(session);
+            if guard.checkpoint(&cx).is_ok()
+                || !endpoint
+                    .server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entries
+                    .is_empty()
+            {
+                return Err("last-session Drop did not revoke its exact request".to_owned());
+            }
+            if !matches!(sse.pop_event(), Err(DualEraHttpEndpointError::Closed)) {
+                return Err("cancelled Drop path was confused with a pending body".to_owned());
+            }
             Ok(())
         });
     }
