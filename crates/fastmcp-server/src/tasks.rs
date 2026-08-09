@@ -2980,7 +2980,7 @@ impl FinalTaskRuntime {
         }
         let service_id = self
             .next_task_service_id
-            .fetch_update(
+            .try_update(
                 TaskServiceOrdering::Relaxed,
                 TaskServiceOrdering::Relaxed,
                 |current| current.checked_add(1),
@@ -3753,9 +3753,9 @@ impl AuthorizedTaskServiceRunner {
         let mut lease = FinalTaskHandoffLease::new(&self.runtime, &handoff);
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
-        let task_id = final_task_handoff_task_id(&handoff);
+        let task_id = final_task_handoff_task_id(&handoff).clone();
         let generation = final_task_handoff_generation(&handoff);
-        if !self.runtime.begin_handoff_dispatch(task_id, generation)? {
+        if !self.runtime.begin_handoff_dispatch(&task_id, generation)? {
             // Cancellation or another service won the atomic election before
             // this handoff could begin. That winner owns the handoff outcome;
             // do not let this losing caller restore over its durable state.
@@ -3764,7 +3764,7 @@ impl AuthorizedTaskServiceRunner {
         }
         match self.supervisor.resume(cx, handoff).await {
             Ok(()) => {
-                let _ = self.runtime.finish_handoff_dispatch(task_id, generation)?;
+                let _ = self.runtime.finish_handoff_dispatch(&task_id, generation)?;
                 lease.disarm();
                 Ok(())
             }
@@ -4710,7 +4710,7 @@ mod tests {
         const ELAPSED_MS: u64 = 60_000;
         let (store, now) = in_memory_store_with_test_clock(1);
         let runtime = FinalTaskRuntime::new(
-            Arc::clone(&store),
+            store.clone(),
             FinalTaskRuntimeConfig::with_unlimited_ttl(&AllowUnlimitedFinalTaskRetention, None)
                 .expect("explicit authority admits null TTL retention"),
             Arc::new(|_| {}),
@@ -4756,7 +4756,7 @@ mod tests {
         const TTL_MS: u64 = 60_000;
         let (store, now) = in_memory_store_with_test_clock(1);
         let runtime = FinalTaskRuntime::new(
-            Arc::clone(&store),
+            store.clone(),
             FinalTaskRuntimeConfig::with_ttl(Some(TTL_MS), None)
                 .expect("positive TTL is a valid Task retention value"),
             Arc::new(|_| {}),
@@ -5180,7 +5180,7 @@ mod tests {
         let delivered = Arc::new(AtomicBool::new(false));
         let delivered_by_emitter = Arc::clone(&delivered);
         let runtime = FinalTaskRuntime::new(
-            Arc::clone(&store),
+            store.clone(),
             FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
             Arc::new(move |_| {
                 delivered_by_emitter.store(true, AtomicOrdering::SeqCst);
@@ -5210,7 +5210,7 @@ mod tests {
         let store = Arc::new(InMemoryFinalTaskStore::default());
         let continued = Arc::new(AtomicBool::new(false));
         let runtime = FinalTaskRuntime::new(
-            Arc::clone(&store),
+            store.clone(),
             FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
             Arc::new(|_| panic!("planted final task notification emitter panic")),
         );

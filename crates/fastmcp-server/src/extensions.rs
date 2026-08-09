@@ -440,7 +440,7 @@ impl ExtensionHandlerRegistry {
         }
         let Some(method_descriptor) = self
             .descriptor_registry
-            .method_descriptor(&extension_id, key.method())
+            .method_descriptor(key.extension_id(), key.method())
         else {
             return Err(ExtensionHandlerRegistrationError::MethodNotOwned(key));
         };

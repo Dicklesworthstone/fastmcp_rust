@@ -149,7 +149,7 @@ use fastmcp_transport::sse::SseEvent;
 
 use asupersync::codec::Framed;
 use asupersync::http::h1::{Http1Codec, Method as Http1Method, Response as Http1Response};
-use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+use asupersync::io::AsyncWriteExt;
 use asupersync::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use asupersync::stream::StreamExt;
 use asupersync::{Budget, CancelKind, Cx, RegionId, channel::mpsc as asupersync_mpsc};
@@ -164,7 +164,6 @@ use fastmcp_core::{
     McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
-#[cfg(test)]
 use fastmcp_protocol::common_types::Implementation;
 use fastmcp_protocol::common_types::OpenMetadata;
 use fastmcp_protocol::extensions::{
@@ -173,7 +172,7 @@ use fastmcp_protocol::extensions::{
 };
 use fastmcp_protocol::methods::{
     Legacy2024ListChangedCapability, Legacy2024ResourcesCapability, Legacy2024ServerCapabilities,
-    SUBSCRIPTIONS_LISTEN, final_2026_07_28_method,
+    SUBSCRIPTIONS_LISTEN, decode_legacy_2024_11_05_client_capabilities, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
     LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION, ModernVersionSupport, ProtocolEra,
@@ -199,11 +198,10 @@ use fastmcp_protocol::{
     ServerNotification, SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
     UnsubscribeResourceParams, task_subscription_ids,
 };
-#[cfg(test)]
 use fastmcp_protocol::{CompleteResult, FinalSubscriptionsListenResult, ResultMeta};
 use legacy_2024::{
     Legacy2024AdapterError, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Outbound,
-    Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo,
+    Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo, Legacy2024StateSnapshot,
     LegacyAuthenticatedPeerPartition, LegacyPeerBinding,
 };
 
@@ -663,6 +661,108 @@ struct LiveLegacy2024Dispatch {
     active_request: LiveLegacy2024ActiveRequest,
 }
 
+/// Shared handler-facing state for one live exact-2024 stdio connection.
+///
+/// The lifecycle adapter owns exact wire admission, while this runtime owns
+/// the server facilities a dispatched handler can use. Keeping these values
+/// together prevents an admitted legacy request from receiving a fresh state
+/// bag or a disconnected outbound request registry.
+#[derive(Clone)]
+struct LiveLegacy2024ConnectionRuntime {
+    session_state: SessionState,
+    notification_sender: NotificationSender,
+    request_sender: Option<RequestSender>,
+    supports_sampling: Arc<AtomicBool>,
+    log_level: Arc<Mutex<Option<LogLevel>>>,
+    logging_ceiling: LevelFilter,
+}
+
+fn map_legacy_log_level(level: &str, ceiling: LevelFilter) -> Option<LogLevel> {
+    let mapped = match level {
+        "debug" => LogLevel::Debug,
+        "info" | "notice" => LogLevel::Info,
+        "warning" => LogLevel::Warning,
+        "error" | "alert" | "critical" | "emergency" => LogLevel::Error,
+        _ => return None,
+    };
+    let requested = match mapped {
+        LogLevel::Debug => LevelFilter::Debug,
+        LogLevel::Info => LevelFilter::Info,
+        LogLevel::Warning => LevelFilter::Warn,
+        LogLevel::Error => LevelFilter::Error,
+    };
+    if ceiling == LevelFilter::Off {
+        return None;
+    }
+    Some(match requested.min(ceiling) {
+        LevelFilter::Debug => LogLevel::Debug,
+        LevelFilter::Info => LogLevel::Info,
+        LevelFilter::Warn => LogLevel::Warning,
+        LevelFilter::Error | LevelFilter::Trace => LogLevel::Error,
+        LevelFilter::Off => return None,
+    })
+}
+
+impl LiveLegacy2024ConnectionRuntime {
+    fn new(
+        session_state: SessionState,
+        notification_sender: NotificationSender,
+        request_sender: Option<RequestSender>,
+        logging_ceiling: LevelFilter,
+    ) -> Self {
+        Self {
+            session_state,
+            notification_sender,
+            request_sender,
+            supports_sampling: Arc::new(AtomicBool::new(false)),
+            log_level: Arc::new(Mutex::new(None)),
+            logging_ceiling,
+        }
+    }
+
+    fn bidirectional_senders(
+        &self,
+        server: &Server,
+        request_cancellation: &McpRequestCancellation,
+    ) -> Option<BidirectionalSenders> {
+        let request_sender = self.request_sender.as_ref()?;
+        server.create_bidirectional_senders_from_capabilities(
+            self.supports_sampling.load(Ordering::Acquire),
+            false,
+            request_sender,
+            request_cancellation,
+        )
+    }
+
+    fn log_level(&self) -> Option<LogLevel> {
+        *self
+            .log_level
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn sync_from_adapter_snapshot(&self, snapshot: &Legacy2024StateSnapshot) {
+        let supports_sampling =
+            serde_json::from_slice::<serde_json::Value>(&snapshot.client_capabilities_bytes)
+                .ok()
+                .and_then(|capabilities| {
+                    decode_legacy_2024_11_05_client_capabilities(capabilities).ok()
+                })
+                .is_some_and(|capabilities| capabilities.sampling.is_some());
+        self.supports_sampling
+            .store(supports_sampling, Ordering::Release);
+
+        let log_level = snapshot
+            .logging_level
+            .as_deref()
+            .and_then(|level| map_legacy_log_level(level, self.logging_ceiling));
+        *self
+            .log_level
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = log_level;
+    }
+}
+
 /// Bridges an admitted exact-2024 operation to the server's legacy result
 /// surface while retaining the peer's original request identity.
 struct LiveLegacy2024RuntimeHandler<'a> {
@@ -670,6 +770,7 @@ struct LiveLegacy2024RuntimeHandler<'a> {
     cx: Cx,
     session_id: u64,
     session_principal: SessionPrincipalBinding,
+    runtime: LiveLegacy2024ConnectionRuntime,
     active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
 }
 
@@ -694,7 +795,13 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
         let request = JsonRpcRequest::new(method, params.cloned(), request_id);
         let dispatch = self
             .server
-            .dispatch_legacy_2024(&self.cx, self.session_id, &self.session_principal, &request)
+            .dispatch_legacy_2024(
+                &self.cx,
+                self.session_id,
+                &self.session_principal,
+                Some(&self.runtime),
+                &request,
+            )
             .map_err(|error| {
                 Legacy2024HandlerError::with_code(
                     i64::from(i32::from(error.code)),
@@ -766,6 +873,7 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
                 &request_cx,
                 self.session_id,
                 &self.session_principal,
+                None,
                 &request,
             )
             .map_err(|error| {
@@ -1076,6 +1184,13 @@ fn legacy_adapter_response<H: Legacy2024Handler>(
             unreachable!("receiving a client frame cannot create a legacy reverse frame")
         }
     }
+}
+
+fn sync_live_legacy_runtime_from_adapter<H: Legacy2024Handler>(
+    runtime: &LiveLegacy2024ConnectionRuntime,
+    adapter: &Legacy2024ServerAdapter<H>,
+) {
+    runtime.sync_from_adapter_snapshot(&adapter.snapshot());
 }
 
 /// Applies an exact legacy client response to the adapter that allocated its
@@ -1392,6 +1507,17 @@ impl DispatchQueueState {
             .wait_timeout_while(inner, timeout, |inner| inner.modern_in_flight != 0)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.modern_in_flight == 0
+    }
+
+    fn wait_for_modern_drain_unbounded(&self) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _quiesced_guard = self
+            .drained
+            .wait_while(inner, |inner| inner.modern_in_flight != 0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 
     fn cancel_if_queued(&self, id: &RequestId) -> bool {
@@ -5458,6 +5584,7 @@ impl Server {
         cx: &Cx,
         session_id: u64,
         session_principal: &SessionPrincipalBinding,
+        runtime: Option<&LiveLegacy2024ConnectionRuntime>,
         request: &JsonRpcRequest,
     ) -> McpResult<LiveLegacy2024Dispatch> {
         let request_id = request
@@ -5483,10 +5610,14 @@ impl Server {
         })?;
         let request_cancellation = active_guard.cancellation();
         let result = (|| {
+            let session_state =
+                runtime.map_or_else(SessionState::new, |runtime| runtime.session_state.clone());
+            let bidirectional_senders = runtime
+                .and_then(|runtime| runtime.bidirectional_senders(self, &request_cancellation));
             let (request_ctx, _request_lease_guard) = self.request_context(
                 cx,
                 request_id_to_u64(request.id.as_ref()),
-                SessionState::new(),
+                session_state.clone(),
                 request_cancellation.clone(),
                 budget,
             )?;
@@ -5529,7 +5660,7 @@ impl Server {
                         serde_json::to_value(self.router.handle_tools_list(
                             &request_ctx,
                             params,
-                            None,
+                            Some(&session_state),
                         ))
                         .map_err(McpError::from)
                     }
@@ -5538,9 +5669,9 @@ impl Server {
                         serde_json::to_value(self.router.handle_tools_call(
                             &request_ctx,
                             params,
-                            SessionState::new(),
-                            None,
-                            None,
+                            session_state.clone(),
+                            runtime.map(|runtime| &runtime.notification_sender),
+                            bidirectional_senders.as_ref(),
                         )?)
                         .map_err(McpError::from)
                     }
@@ -5549,7 +5680,7 @@ impl Server {
                         serde_json::to_value(self.router.handle_resources_list(
                             &request_ctx,
                             params,
-                            None,
+                            Some(&session_state),
                         ))
                         .map_err(McpError::from)
                     }
@@ -5558,7 +5689,7 @@ impl Server {
                         serde_json::to_value(self.router.handle_resource_templates_list(
                             &request_ctx,
                             params,
-                            None,
+                            Some(&session_state),
                         ))
                         .map_err(McpError::from)
                     }
@@ -5567,9 +5698,9 @@ impl Server {
                         serde_json::to_value(self.router.handle_resources_read(
                             &request_ctx,
                             &params,
-                            SessionState::new(),
-                            None,
-                            None,
+                            session_state.clone(),
+                            runtime.map(|runtime| &runtime.notification_sender),
+                            bidirectional_senders.as_ref(),
                         )?)
                         .map_err(McpError::from)
                     }
@@ -5578,7 +5709,7 @@ impl Server {
                         serde_json::to_value(self.router.handle_prompts_list(
                             &request_ctx,
                             params,
-                            None,
+                            Some(&session_state),
                         ))
                         .map_err(McpError::from)
                     }
@@ -5587,9 +5718,9 @@ impl Server {
                         serde_json::to_value(self.router.handle_prompts_get(
                             &request_ctx,
                             params,
-                            SessionState::new(),
-                            None,
-                            None,
+                            session_state,
+                            runtime.map(|runtime| &runtime.notification_sender),
+                            bidirectional_senders.as_ref(),
                         )?)
                         .map_err(McpError::from)
                     }
@@ -5604,6 +5735,15 @@ impl Server {
                 request,
                 result,
             );
+
+            if let Some(runtime) = runtime {
+                self.maybe_emit_log_notification_for_level(
+                    runtime.log_level(),
+                    &runtime.notification_sender,
+                    &request.method,
+                    &result,
+                );
+            }
 
             match result {
                 Ok(value) if value.get("resultType").is_some() => Err(McpError::internal_error(
@@ -6101,6 +6241,12 @@ impl Server {
     /// MCP 2024-11-05 traffic remains serialized through its lifecycle adapter.
     /// Use this entry point for genuinely full-duplex transports; an unsplit
     /// [`Transport`] cannot safely promise concurrent receive and response I/O.
+    ///
+    /// Shutdown retains ownership of the dispatch worker. If an arbitrary
+    /// handler ignores cancellation past the bounded shutdown deadline, this
+    /// returning API continues waiting for that worker to quiesce instead of
+    /// orphaning it merely to return. Once it does quiesce, the call reports
+    /// the timeout failure and then performs the normal owned cleanup.
     pub fn run_split_transport_returning_with_cx<R, S>(
         self,
         cx: &Cx,
@@ -6834,7 +6980,8 @@ impl Server {
     /// request scope; exact legacy traffic retains its isolated session path.
     /// Unlike the process-exiting stdio entry point, this returning helper
     /// never detaches a non-quiescent handler: after logging the bounded
-    /// shutdown deadline it continues waiting before running lifecycle hooks.
+    /// shutdown deadline it waits without a second deadline for the owned
+    /// worker before running lifecycle hooks or returning to the caller.
     fn run_loop_returning<R, S>(
         self,
         cx: &Cx,
@@ -6926,7 +7073,7 @@ impl Server {
         dispatch_cx: &Cx,
         mut recv: R,
         send: S,
-        _notification_sender: NotificationSender,
+        notification_sender: NotificationSender,
         transport_label: &'static str,
         detach_on_worker_timeout: bool,
         connection_failure: Option<Arc<AtomicBool>>,
@@ -6957,7 +7104,28 @@ impl Server {
         let send = Arc::new(Mutex::new(send));
         let queue_state = Arc::new(DispatchQueueState::default());
         let worker_failed = Arc::new(AtomicBool::new(false));
-        let pending_requests = server.new_pending_requests_for_connection();
+        let pending_requests = Arc::new(
+            PendingRequests::with_max_in_flight_for_exact_legacy(
+                server.max_bidirectional_requests_per_connection,
+            )
+            .expect("ServerBuilder validates the bidirectional request limit"),
+        );
+        let legacy_request_sender = RequestSender::new(Arc::clone(&pending_requests), {
+            let send = Arc::clone(&send);
+            let request_cx = dispatch_cx.clone();
+            Arc::new(move |message| {
+                let mut send_guard = send
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                send_guard(&request_cx, message).map_err(|error| error.to_string())
+            })
+        });
+        let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
+            SessionState::new(),
+            notification_sender,
+            Some(legacy_request_sender),
+            server.logging.level,
+        );
         let (dispatch_sender, mut dispatch_receiver) =
             asupersync_mpsc::channel::<QueuedDispatchMessage>(MAX_DISPATCH_QUEUE_DEPTH);
 
@@ -6968,6 +7136,7 @@ impl Server {
         let worker_cx = cx.clone();
         let worker_renderer = traffic_renderer.clone();
         let worker_session_principal = session_principal.clone();
+        let worker_legacy_runtime = legacy_runtime.clone();
         let (worker_completion_sender, worker_completion_receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let _completion = DispatchWorkerCompletionSignal(Some(worker_completion_sender));
@@ -7112,6 +7281,7 @@ impl Server {
                                 cx: worker_cx.clone(),
                                 session_id: legacy_binding.generation(),
                                 session_principal: worker_session_principal.clone(),
+                                runtime: worker_legacy_runtime.clone(),
                                 active_request: Arc::clone(&legacy_active_request),
                             },
                         );
@@ -7125,6 +7295,7 @@ impl Server {
                     }
                 };
                 let legacy_response = legacy_adapter_response(adapter, legacy_binding, &request);
+                sync_live_legacy_runtime_from_adapter(&worker_legacy_runtime, adapter);
                 let active_request = take_live_legacy_active_request(&legacy_active_request);
                 let handled = match legacy_response {
                     Ok(response) => response.map(|response| {
@@ -7313,9 +7484,17 @@ impl Server {
                         exit_code = 1;
                         break;
                     }
-                    if pending_requests.route_response(&response) {
+                    let disposition = pending_requests.route_response_with_disposition(&response);
+                    if matches!(
+                        disposition,
+                        bidirectional::PendingResponseDisposition::Delivered
+                    ) {
                         debug!(target: targets::SERVER, "Routed response to pending request");
-                    } else if matches!(negotiated_era, Some(ProtocolEra::Legacy2024)) {
+                    } else if matches!(
+                        disposition,
+                        bidirectional::PendingResponseDisposition::Unmatched
+                    ) && matches!(negotiated_era, Some(ProtocolEra::Legacy2024))
+                    {
                         match dispatch_sender
                             .try_send(QueuedDispatchMessage::LegacyResponse(response))
                         {
@@ -7329,7 +7508,10 @@ impl Server {
                                 break;
                             }
                         }
-                    } else {
+                    } else if matches!(
+                        disposition,
+                        bidirectional::PendingResponseDisposition::Unmatched
+                    ) {
                         debug!(target: targets::SERVER, "Received unmatched JSON-RPC response");
                     }
                 }
@@ -7826,21 +8008,27 @@ impl Server {
         drop(dispatch_sender);
         server.cancel_active_requests(CancelKind::Shutdown, false);
         pending_requests.cancel_all();
-        let modern_children_quiesced =
-            if queue_state.wait_for_modern_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT) {
-                true
+        let modern_children_quiesced = if queue_state
+            .wait_for_modern_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
+        {
+            true
+        } else {
+            error!(
+                target: targets::SERVER,
+                "Modern request children did not drain within the bounded shutdown deadline"
+            );
+            exit_code = 1;
+            if detach_on_worker_timeout {
+                false
             } else {
                 error!(
                     target: targets::SERVER,
-                    "Modern request children did not drain within the bounded shutdown deadline"
+                    "Returning server pump is waiting for modern-child quiescence before cleanup"
                 );
-                exit_code = 1;
-                // Modern requests are caller-owned children, not detached work.
-                // Once shutdown has cancelled their individual contexts, keep
-                // draining before lifecycle hooks can observe connection teardown.
-                while !queue_state.wait_for_modern_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT) {}
+                queue_state.wait_for_modern_drain_unbounded();
                 true
-            };
+            }
+        };
         let worker_quiesced = match worker_completion_receiver
             .recv_timeout(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
         {
@@ -7913,7 +8101,7 @@ impl Server {
         cx: &Cx,
         mut recv: R,
         send: S,
-        _notification_sender: NotificationSender,
+        notification_sender: NotificationSender,
         connection_failure: Option<Arc<AtomicBool>>,
         transport_label: &'static str,
     ) -> !
@@ -7929,9 +8117,15 @@ impl Server {
         let mut era_classifier = StdioEraClassifier::new(self.protocol_policy);
         let mut negotiated_era = None;
 
-        // Wrap send in Arc<Mutex> for shared access from bidirectional requests
+        // Keep response output and inbound pending-response routing connection-scoped.
         let send = Arc::new(Mutex::new(send));
         let pending_requests = self.new_pending_requests_for_connection();
+        let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
+            SessionState::new(),
+            notification_sender,
+            None,
+            self.logging.level,
+        );
 
         // Track connection opened
         if let Some(ref stats) = self.stats {
@@ -8122,6 +8316,7 @@ impl Server {
                                         cx: cx.clone(),
                                         session_id: legacy_binding.generation(),
                                         session_principal: session.principal_binding(),
+                                        runtime: legacy_runtime.clone(),
                                         active_request: Arc::clone(&legacy_active_request),
                                     },
                                 );
@@ -8133,6 +8328,7 @@ impl Server {
                         };
                         let legacy_response =
                             legacy_adapter_response(adapter, legacy_binding, &request);
+                        sync_live_legacy_runtime_from_adapter(&legacy_runtime, adapter);
                         let active_request =
                             take_live_legacy_active_request(&legacy_active_request);
                         match legacy_response {
@@ -8151,16 +8347,27 @@ impl Server {
                     // pending-request ownership. Only an unmatched response
                     // on an exact-2024 connection belongs to the legacy
                     // adapter's reverse-request lifecycle.
-                    if pending_requests.route_response(&response) {
+                    let disposition = pending_requests.route_response_with_disposition(&response);
+                    if matches!(
+                        disposition,
+                        bidirectional::PendingResponseDisposition::Delivered
+                    ) {
                         debug!(target: targets::SERVER, "Routed response to pending request");
-                    } else if matches!(negotiated_era, Some(ProtocolEra::Legacy2024)) {
+                    } else if matches!(
+                        disposition,
+                        bidirectional::PendingResponseDisposition::Unmatched
+                    ) && matches!(negotiated_era, Some(ProtocolEra::Legacy2024))
+                    {
                         let Some(adapter) = legacy_adapter.as_mut() else {
                             self.graceful_shutdown(1);
                         };
                         if !legacy_adapter_accept_response(adapter, legacy_binding, &response) {
                             self.graceful_shutdown(1);
                         }
-                    } else {
+                    } else if matches!(
+                        disposition,
+                        bidirectional::PendingResponseDisposition::Unmatched
+                    ) {
                         let request_key = response.id.as_ref().map(request_id_log_key);
                         debug!(
                             target: targets::SERVER,
@@ -8227,7 +8434,7 @@ impl Server {
         cx: &Cx,
         mut recv: R,
         send: S,
-        _notification_sender: NotificationSender,
+        notification_sender: NotificationSender,
         connection_failure: Option<Arc<AtomicBool>>,
         transport_label: &'static str,
     ) -> McpResult<()>
@@ -8243,9 +8450,15 @@ impl Server {
         let mut era_classifier = StdioEraClassifier::new(self.protocol_policy);
         let mut negotiated_era = None;
 
-        // Wrap send in Arc<Mutex> for shared access from bidirectional requests
+        // Keep response output and inbound pending-response routing connection-scoped.
         let send = Arc::new(Mutex::new(send));
         let pending_requests = self.new_pending_requests_for_connection();
+        let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
+            SessionState::new(),
+            notification_sender,
+            None,
+            self.logging.level,
+        );
 
         // Track connection opened
         if let Some(ref stats) = self.stats {
@@ -8476,6 +8689,7 @@ impl Server {
                                         cx: cx.clone(),
                                         session_id: legacy_binding.generation(),
                                         session_principal: session.principal_binding(),
+                                        runtime: legacy_runtime.clone(),
                                         active_request: Arc::clone(&legacy_active_request),
                                     },
                                 );
@@ -8492,6 +8706,7 @@ impl Server {
                         };
                         let legacy_response =
                             legacy_adapter_response(adapter, legacy_binding, &request);
+                        sync_live_legacy_runtime_from_adapter(&legacy_runtime, adapter);
                         let active_request =
                             take_live_legacy_active_request(&legacy_active_request);
                         match legacy_response {
@@ -8521,9 +8736,17 @@ impl Server {
                     // Preserve generic pending responses first; otherwise an
                     // exact-2024 response completes the adapter-owned reverse
                     // request for this one selected legacy connection.
-                    if pending_requests.route_response(&response) {
+                    let disposition = pending_requests.route_response_with_disposition(&response);
+                    if matches!(
+                        disposition,
+                        bidirectional::PendingResponseDisposition::Delivered
+                    ) {
                         debug!(target: targets::SERVER, "Routed response to pending request");
-                    } else if matches!(negotiated_era, Some(ProtocolEra::Legacy2024)) {
+                    } else if matches!(
+                        disposition,
+                        bidirectional::PendingResponseDisposition::Unmatched
+                    ) && matches!(negotiated_era, Some(ProtocolEra::Legacy2024))
+                    {
                         let Some(adapter) = legacy_adapter.as_mut() else {
                             self.graceful_shutdown_returning();
                             return Err(server_run_error(
@@ -8540,7 +8763,10 @@ impl Server {
                                 "Legacy MCP 2024-11-05 adapter rejected a client response",
                             ));
                         }
-                    } else {
+                    } else if matches!(
+                        disposition,
+                        bidirectional::PendingResponseDisposition::Unmatched
+                    ) {
                         let request_key = response.id.as_ref().map(request_id_log_key);
                         debug!(
                             target: targets::SERVER,
@@ -10076,10 +10302,13 @@ impl Server {
     }
 
     fn request_id_is_active(&self, session_id: u64, request_id: &RequestId) -> bool {
+        let Ok(key) = ActiveRequestKey::new(session_id, request_id) else {
+            return false;
+        };
         self.active_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&ActiveRequestKey::new(session_id, request_id.clone()))
+            .contains_key(&key)
     }
 
     fn handle_cancelled_notification(&self, session_id: u64, params: CancelledParams) {
@@ -10093,24 +10322,20 @@ impl Server {
             reason.len(),
             await_cleanup
         );
-        let active = {
+        let active_key = ActiveRequestKey::new(session_id, &params.request_id).ok();
+        let active = active_key.and_then(|key| {
             let guard = self.active_requests.lock().unwrap_or_else(|poisoned| {
                 error!(target: targets::SERVER, "active_requests lock poisoned, recovering");
                 poisoned.into_inner()
             });
-            guard
-                .get(&ActiveRequestKey::new(
-                    session_id,
-                    params.request_id.clone(),
-                ))
-                .map(|entry| {
-                    (
-                        entry.cancellation.clone(),
-                        entry.region_id,
-                        entry.completion.clone(),
-                    )
-                })
-        };
+            guard.get(&key).map(|entry| {
+                (
+                    entry.cancellation.clone(),
+                    entry.region_id,
+                    entry.completion.clone(),
+                )
+            })
+        });
         if let Some((cancellation, region_id, completion)) = active {
             let accepted = cancellation.cancel();
             if await_cleanup && accepted {
@@ -10198,7 +10423,7 @@ impl Server {
                         target: targets::SESSION,
                         "Shutdown cancel timed out for session={} request_key={:016x} (ambient_region={:?})",
                         key.session_id,
-                        request_id_log_key(&key.request_id),
+                        key.log_key(),
                         region_id
                     );
                 }
@@ -10445,15 +10670,23 @@ struct ActiveRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ActiveRequestKey {
     session_id: u64,
-    request_id: RequestId,
+    correlation_key: CorrelationKey,
 }
 
 impl ActiveRequestKey {
-    fn new(session_id: u64, request_id: RequestId) -> Self {
-        Self {
+    fn new(session_id: u64, request_id: &RequestId) -> Result<Self, &'static str> {
+        Ok(Self {
             session_id,
-            request_id,
-        }
+            correlation_key: request_id.correlation_key()?,
+        })
+    }
+
+    fn log_key(&self) -> u64 {
+        let (domain, value) = match &self.correlation_key {
+            CorrelationKey::String(value) => ("string:", value),
+            CorrelationKey::Integer(value) => ("integer:", value),
+        };
+        stable_hash_request_id(domain) ^ stable_hash_request_id(value)
     }
 }
 
@@ -10501,12 +10734,12 @@ impl ActiveRequestGuard {
         cx: Cx,
         cancellation: McpRequestCancellation,
     ) -> Result<Self, RequestId> {
+        let key = ActiveRequestKey::new(session_id, &id).map_err(|_| id.clone())?;
         let completion = Arc::new(RequestCompletion::new());
         let entry = ActiveRequest::with_cancellation(cx, completion.clone(), cancellation.clone());
         let mut guard = map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let key = ActiveRequestKey::new(session_id, id.clone());
         if guard.contains_key(&key) {
             fastmcp_core::logging::warn!(
                 target: targets::SESSION,
@@ -10546,7 +10779,7 @@ impl Drop for ActiveRequestGuard {
                         target: targets::SESSION,
                         "Active request replaced before drop for session={} request_key={:016x}",
                         self.key.session_id,
-                        request_id_log_key(&self.key.request_id)
+                        self.key.log_key()
                     );
                 }
                 None => {
@@ -10554,7 +10787,7 @@ impl Drop for ActiveRequestGuard {
                         target: targets::SESSION,
                         "Active request missing on drop for session={} request_key={:016x}",
                         self.key.session_id,
-                        request_id_log_key(&self.key.request_id)
+                        self.key.log_key()
                     );
                 }
             }
@@ -12491,6 +12724,9 @@ mod lib_unit_tests {
             _arguments: serde_json::Value,
         ) -> McpResult<FinalToolOutcome> {
             Ok(FinalToolOutcome::CreateTask {
+                work_descriptor: FinalTaskWorkDescriptor::new(serde_json::json!({
+                    "operation": "durable-final-task-tool",
+                }))?,
                 status_message: Some("accepted by negotiated tool".to_owned()),
             })
         }
@@ -14288,6 +14524,43 @@ mod lib_unit_tests {
         assert!(!config.file_line);
     }
 
+    #[test]
+    fn legacy_logging_maps_notice_and_high_severity_levels() {
+        assert_eq!(
+            map_legacy_log_level("notice", LevelFilter::Info),
+            Some(LogLevel::Info)
+        );
+        assert_eq!(
+            map_legacy_log_level("critical", LevelFilter::Error),
+            Some(LogLevel::Error)
+        );
+        assert_eq!(
+            map_legacy_log_level("alert", LevelFilter::Error),
+            Some(LogLevel::Error)
+        );
+        assert_eq!(
+            map_legacy_log_level("emergency", LevelFilter::Error),
+            Some(LogLevel::Error)
+        );
+    }
+
+    #[test]
+    fn legacy_logging_clamps_to_server_ceiling_and_off() {
+        assert_eq!(
+            map_legacy_log_level("notice", LevelFilter::Warn),
+            Some(LogLevel::Warning)
+        );
+        assert_eq!(
+            map_legacy_log_level("error", LevelFilter::Warn),
+            Some(LogLevel::Error)
+        );
+        assert_eq!(map_legacy_log_level("emergency", LevelFilter::Off), None);
+        assert_eq!(
+            map_legacy_log_level("not-a-level", LevelFilter::Error),
+            None
+        );
+    }
+
     // ── LifespanHooks ───────────────────────────────────────────────
 
     #[test]
@@ -14337,12 +14610,12 @@ mod lib_unit_tests {
         let duplicate = ActiveRequestGuard::try_new(
             Arc::clone(&map),
             11,
-            RequestId::Number(7),
+            RequestId::Integer("7e0".to_owned()),
             Cx::for_testing(),
         );
         assert!(
             duplicate.is_err(),
-            "duplicate active request id must be rejected"
+            "equivalent numeric active request IDs must be rejected"
         );
         drop(first);
         assert!(map.lock().unwrap().is_empty());
@@ -15017,79 +15290,191 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn reality_check_regression_dispatch_worker_shutdown_is_bounded() {
-        let emitted = Arc::new(AtomicBool::new(false));
-        let emitted_for_receive = Arc::clone(&emitted);
-        let send_entered = Arc::new(AtomicBool::new(false));
-        let send_entered_for_receive = Arc::clone(&send_entered);
-        let send_entered_by_worker = Arc::clone(&send_entered);
-        let send_finished = Arc::new(AtomicBool::new(false));
-        let send_finished_by_worker = Arc::clone(&send_finished);
-        let release_send = Arc::new((Mutex::new(false), Condvar::new()));
-        let release_send_for_worker = Arc::clone(&release_send);
+    fn stdio_pump_returns_failure_and_skips_hooks_for_non_quiescent_legacy_handler() {
+        let control = Arc::new(NonQuiescentLegacyControl::default());
+        let control_for_receive = Arc::clone(&control);
+        let phase = Arc::new(AtomicUsize::new(0));
+        let phase_for_receive = Arc::clone(&phase);
         let shutdown_called = Arc::new(AtomicBool::new(false));
         let shutdown_observer = Arc::clone(&shutdown_called);
 
-        let exit_code = Server::new("bounded-worker-shutdown-test", "1.0.0")
+        let exit_code = Server::new("bounded-legacy-worker-shutdown-test", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .tool(NonQuiescentLegacyTool {
+                control: Arc::clone(&control),
+            })
             .on_shutdown(move || shutdown_observer.store(true, Ordering::Release))
             .build()
             .run_loop_pump(
                 &Cx::for_testing(),
-                move |_receive_cx, _worker_failed| {
-                    if !emitted_for_receive.swap(true, Ordering::AcqRel) {
-                        return Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
-                            "ping", None, 705_i64,
-                        )));
+                move |_receive_cx, _worker_failed| match phase_for_receive
+                    .fetch_add(1, Ordering::AcqRel)
+                {
+                    0 => Ok(exact_legacy_initialize_request(
+                        705,
+                        serde_json::json!("1.0.0"),
+                    )),
+                    1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/initialized",
+                        None,
+                    ))),
+                    2 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "non_quiescent_legacy_tool",
+                            "arguments": {},
+                        })),
+                        706_i64,
+                    ))),
+                    3 if control_for_receive.wait_for_started(Duration::from_secs(2)) => {
+                        Err(TransportError::Closed)
                     }
-                    let deadline = Instant::now() + Duration::from_secs(2);
-                    while !send_entered_for_receive.load(Ordering::Acquire)
-                        && Instant::now() < deadline
-                    {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(TransportError::Closed)
+                    3 => Err(TransportError::Timeout),
+                    _ => Err(TransportError::Closed),
                 },
-                move |_send_cx, _message| {
-                    send_entered_by_worker.store(true, Ordering::Release);
-                    let (release_lock, release_cv) = &*release_send_for_worker;
-                    let release = release_lock
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let _ = release_cv
-                        .wait_timeout_while(release, Duration::from_secs(5), |release| !*release)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    send_finished_by_worker.store(true, Ordering::Release);
-                    Ok(())
-                },
+                move |_send_cx, _message| Ok(()),
                 Arc::new(|_| {}),
-                "test",
+                "stdio-test",
             );
 
-        let returned_before_send_finished = !send_finished.load(Ordering::Acquire);
-        {
-            let (release_lock, release_cv) = &*release_send;
-            let mut release = release_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *release = true;
-            release_cv.notify_all();
-        }
-        let send_finish_deadline = Instant::now() + Duration::from_secs(2);
-        while !send_finished.load(Ordering::Acquire) && Instant::now() < send_finish_deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        assert_eq!(exit_code, 1);
+        assert!(control.has_started());
+        assert!(
+            !control.has_finished(),
+            "the process-style pump must return before a non-cooperative legacy handler releases"
+        );
+        assert!(!shutdown_called.load(Ordering::Acquire));
+        control.release();
+        assert!(
+            control.wait_for_finished(Duration::from_secs(2)),
+            "the detached process-style worker must finish after the test releases it"
+        );
+    }
+
+    #[test]
+    fn returning_split_waits_for_non_quiescent_legacy_handler_before_owned_cleanup() {
+        let control = Arc::new(NonQuiescentLegacyControl::default());
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let shutdown_observer = Arc::clone(&shutdown_called);
+        let release_control = Arc::clone(&control);
+        let release_thread = std::thread::spawn(move || {
+            std::thread::sleep(DISPATCH_WORKER_SHUTDOWN_TIMEOUT + Duration::from_millis(200));
+            release_control.release();
+        });
+        let started = Instant::now();
+        let run_result = run_live_split_transport(
+            Server::new("returning-legacy-worker-shutdown-test", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(NonQuiescentLegacyTool {
+                    control: Arc::clone(&control),
+                })
+                .on_shutdown(move || shutdown_observer.store(true, Ordering::Release))
+                .build(),
+            NonQuiescentLegacySplitRecv {
+                phase: 0,
+                control: Arc::clone(&control),
+            },
+            NonQuiescentLegacySplitSend,
+        );
+        let elapsed = started.elapsed();
+        release_thread.join().expect("release thread must finish");
+
+        assert!(control.has_started());
+        assert!(control.has_finished());
+        assert!(elapsed >= DISPATCH_WORKER_SHUTDOWN_TIMEOUT);
+        assert!(shutdown_called.load(Ordering::Acquire));
+        assert!(run_result.is_err(), "worker timeout must remain a failure");
+    }
+
+    #[test]
+    fn returning_split_waits_for_non_quiescent_modern_child_before_cleanup() {
+        let control = Arc::new(NonQuiescentLegacyControl::default());
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let shutdown_observer = Arc::clone(&shutdown_called);
+        let release_control = Arc::clone(&control);
+        let release_thread = std::thread::spawn(move || {
+            std::thread::sleep(DISPATCH_WORKER_SHUTDOWN_TIMEOUT * 2 + Duration::from_millis(200));
+            release_control.release();
+        });
+        let started = Instant::now();
+        let run_result = run_live_split_transport(
+            Server::new("returning-modern-worker-shutdown-test", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(NonQuiescentModernTool {
+                    control: Arc::clone(&control),
+                })
+                .on_shutdown(move || shutdown_observer.store(true, Ordering::Release))
+                .build(),
+            NonQuiescentModernSplitRecv { phase: 0 },
+            NonQuiescentLegacySplitSend,
+        );
+        let elapsed = started.elapsed();
+        release_thread.join().expect("release thread must finish");
+
+        assert!(control.has_started());
+        assert!(control.has_finished());
+        assert!(elapsed >= DISPATCH_WORKER_SHUTDOWN_TIMEOUT);
+        assert!(shutdown_called.load(Ordering::Acquire));
+        assert!(
+            run_result.is_err(),
+            "modern worker timeout must remain a failure"
+        );
+    }
+
+    #[test]
+    fn stdio_pump_returns_failure_and_skips_hooks_for_non_quiescent_modern_child() {
+        let control = Arc::new(NonQuiescentLegacyControl::default());
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let shutdown_observer = Arc::clone(&shutdown_called);
+        let phase = Arc::new(AtomicUsize::new(0));
+        let phase_for_receive = Arc::clone(&phase);
+        let control_for_receive = Arc::clone(&control);
+        let cx = Cx::for_testing();
+        let exit_code = Server::new("stdio-modern-worker-shutdown-test", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .tool(NonQuiescentModernTool {
+                control: Arc::clone(&control),
+            })
+            .on_shutdown(move || shutdown_observer.store(true, Ordering::Release))
+            .build()
+            .run_loop_pump_with_policy(
+                &cx,
+                &cx,
+                move |_receive_cx, _worker_failed| match phase_for_receive
+                    .fetch_add(1, Ordering::AcqRel)
+                {
+                    0 => Ok(modern_discovery_opening_request()),
+                    1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "non_quiescent_modern_tool",
+                            "arguments": {},
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            },
+                        })),
+                        710_i64,
+                    ))),
+                    2 if control_for_receive.wait_for_started(Duration::from_secs(2)) => {
+                        Err(TransportError::Closed)
+                    }
+                    2 => Err(TransportError::Timeout),
+                    _ => Err(TransportError::Closed),
+                },
+                move |_send_cx, _message| Ok(()),
+                Arc::new(|_| {}),
+                "stdio-modern-test",
+                true,
+                None,
+                true,
+            );
 
         assert_eq!(exit_code, 1);
-        assert!(send_entered.load(Ordering::Acquire));
+        assert!(control.has_started());
+        assert!(!control.has_finished());
         assert!(!shutdown_called.load(Ordering::Acquire));
-        assert!(
-            returned_before_send_finished,
-            "process-exiting pump must detach instead of awaiting the blocked worker"
-        );
-        assert!(
-            send_finished.load(Ordering::Acquire),
-            "released dispatch worker must finish before the regression test exits"
-        );
+        control.release();
+        assert!(control.wait_for_finished(Duration::from_secs(2)));
     }
 
     #[test]
@@ -15219,6 +15604,51 @@ mod lib_unit_tests {
         }
     }
 
+    struct LiveLegacyRuntimeConnectionTool;
+
+    impl ToolHandler for LiveLegacyRuntimeConnectionTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "live_legacy_runtime_connection_tool".to_owned(),
+                description: Some(
+                    "Proves legacy stdio handlers retain their connection runtime".to_owned(),
+                ),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["sample"],
+                    "properties": {"sample": {"type": "boolean"}},
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            let counter = ctx.get_state::<u64>("legacy-runtime-counter").unwrap_or(0) + 1;
+            if !ctx.set_state("legacy-runtime-counter", counter) {
+                return Err(McpError::internal_error(
+                    "legacy connection state could not retain a counter",
+                ));
+            }
+            ctx.report_progress(counter as f64, Some("legacy connection progress"));
+
+            let sample = arguments
+                .get("sample")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| McpError::invalid_params("sample must be a boolean"))?;
+            let text = if sample {
+                let response = block_on(ctx.sample("legacy runtime sample", 16))?;
+                format!("legacy-runtime-{counter}-{}", response.text)
+            } else {
+                format!("legacy-runtime-{counter}-without-sampling")
+            };
+            Ok(vec![Content::text(text)])
+        }
+    }
+
     struct LiveLegacyCompletionHandler;
 
     impl CompletionHandler for LiveLegacyCompletionHandler {
@@ -15304,6 +15734,223 @@ mod lib_unit_tests {
             Err(McpError::internal_error(
                 "exact legacy cancellation did not reach the live handler",
             ))
+        }
+    }
+
+    #[derive(Default)]
+    struct NonQuiescentLegacyState {
+        started: bool,
+        released: bool,
+        finished: bool,
+    }
+
+    #[derive(Default)]
+    struct NonQuiescentLegacyControl {
+        state: Mutex<NonQuiescentLegacyState>,
+        changed: Condvar,
+    }
+
+    impl NonQuiescentLegacyControl {
+        fn wait_until_released(&self) {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = state;
+            state.started = true;
+            self.changed.notify_all();
+            let mut state = self
+                .changed
+                .wait_while(state, |state| !state.released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.finished = true;
+            self.changed.notify_all();
+        }
+
+        fn wait_for_started(&self, timeout: Duration) -> bool {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, timeout, |state| !state.started)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.started
+        }
+
+        fn has_started(&self) -> bool {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .started
+        }
+
+        fn has_finished(&self) -> bool {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .finished
+        }
+
+        fn release(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.released = true;
+            self.changed.notify_all();
+        }
+
+        fn wait_for_finished(&self, timeout: Duration) -> bool {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, timeout, |state| !state.finished)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.finished
+        }
+    }
+
+    struct NonQuiescentLegacyTool {
+        control: Arc<NonQuiescentLegacyControl>,
+    }
+
+    impl ToolHandler for NonQuiescentLegacyTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "non_quiescent_legacy_tool".to_owned(),
+                description: Some(
+                    "Test-only legacy handler that deliberately ignores cancellation".to_owned(),
+                ),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            self.control.wait_until_released();
+            Ok(vec![Content::text("non-quiescent legacy handler released")])
+        }
+    }
+
+    struct NonQuiescentModernTool {
+        control: Arc<NonQuiescentLegacyControl>,
+    }
+
+    impl ToolHandler for NonQuiescentModernTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "non_quiescent_modern_tool".to_owned(),
+                description: Some("Test-only non-cooperative modern handler".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            self.control.wait_until_released();
+            Ok(vec![Content::text("non-quiescent modern child released")])
+        }
+    }
+
+    struct NonQuiescentLegacySplitRecv {
+        phase: usize,
+        control: Arc<NonQuiescentLegacyControl>,
+    }
+
+    impl TransportRecvHalf for NonQuiescentLegacySplitRecv {
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            let phase = self.phase;
+            self.phase = self.phase.saturating_add(1);
+            match phase {
+                0 => Ok(exact_legacy_initialize_request(
+                    707,
+                    serde_json::json!("1.0.0"),
+                )),
+                1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/initialized",
+                    None,
+                ))),
+                2 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "non_quiescent_legacy_tool",
+                        "arguments": {},
+                    })),
+                    708_i64,
+                ))),
+                3 if self.control.wait_for_started(Duration::from_secs(2)) => {
+                    Err(TransportError::Closed)
+                }
+                3 => Err(TransportError::Timeout),
+                _ => Err(TransportError::Closed),
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct NonQuiescentLegacySplitSend;
+
+    impl TransportSendHalf for NonQuiescentLegacySplitSend {
+        fn send(&mut self, _cx: &Cx, _message: &JsonRpcMessage) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct NonQuiescentModernSplitRecv {
+        phase: usize,
+    }
+
+    impl TransportRecvHalf for NonQuiescentModernSplitRecv {
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            let phase = self.phase;
+            self.phase = self.phase.saturating_add(1);
+            match phase {
+                0 => Ok(modern_discovery_opening_request()),
+                1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "non_quiescent_modern_tool",
+                        "arguments": {},
+                        "_meta": {
+                            MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        },
+                    })),
+                    709_i64,
+                ))),
+                _ => Err(TransportError::Closed),
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
         }
     }
 
@@ -15619,6 +16266,259 @@ mod lib_unit_tests {
         fn close(&mut self) -> Result<(), TransportError> {
             Ok(())
         }
+    }
+
+    struct LiveLegacyRuntimeSplitRecv {
+        phase: u8,
+        supports_sampling: bool,
+        outbound: Receiver<JsonRpcMessage>,
+    }
+
+    impl LiveLegacyRuntimeSplitRecv {
+        fn wait_for_response(&self, id: i64) -> Result<(), TransportError> {
+            loop {
+                match self.outbound.recv_timeout(Duration::from_secs(2)) {
+                    Ok(JsonRpcMessage::Response(response)) if response.id == Some(id.into()) => {
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(_) => return Err(TransportError::Timeout),
+                }
+            }
+        }
+
+        fn sampling_response(&self) -> Result<JsonRpcMessage, TransportError> {
+            loop {
+                match self.outbound.recv_timeout(Duration::from_secs(2)) {
+                    Ok(JsonRpcMessage::Request(request))
+                        if request.method == "sampling/createMessage" =>
+                    {
+                        let id = request.id.expect("sampling request must carry an id");
+                        let result =
+                            serde_json::to_value(fastmcp_protocol::CreateMessageResult::text(
+                                "sampled-value",
+                                "legacy-test-model",
+                            ))
+                            .expect("sampling result must serialize");
+                        return Ok(JsonRpcMessage::Response(JsonRpcResponse::success(
+                            id, result,
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(_) => return Err(TransportError::Timeout),
+                }
+            }
+        }
+    }
+
+    impl TransportRecvHalf for LiveLegacyRuntimeSplitRecv {
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            let phase = self.phase;
+            self.phase = self.phase.saturating_add(1);
+            match phase {
+                0 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "initialize",
+                    Some(serde_json::json!({
+                        "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                        "capabilities": if self.supports_sampling {
+                            serde_json::json!({"sampling": {}})
+                        } else {
+                            serde_json::json!({})
+                        },
+                        "clientInfo": {"name": "legacy-runtime-client", "version": "1.0.0"},
+                    })),
+                    701_i64,
+                ))),
+                1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/initialized",
+                    None,
+                ))),
+                2 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "logging/setLevel",
+                    Some(serde_json::json!({"level": "debug"})),
+                    702_i64,
+                ))),
+                3 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "live_legacy_runtime_connection_tool",
+                        "arguments": {"sample": true},
+                        "_meta": {"progressToken": "legacy-runtime-progress"},
+                    })),
+                    703_i64,
+                ))),
+                4 if self.supports_sampling => self.sampling_response(),
+                4 => {
+                    self.wait_for_response(703)?;
+                    Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_legacy_runtime_connection_tool",
+                            "arguments": {"sample": false},
+                            "_meta": {"progressToken": "legacy-runtime-progress"},
+                        })),
+                        704_i64,
+                    )))
+                }
+                5 if self.supports_sampling => {
+                    self.wait_for_response(703)?;
+                    Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_legacy_runtime_connection_tool",
+                            "arguments": {"sample": false},
+                            "_meta": {"progressToken": "legacy-runtime-progress"},
+                        })),
+                        704_i64,
+                    )))
+                }
+                5 | 6 => {
+                    self.wait_for_response(704)?;
+                    Err(TransportError::Closed)
+                }
+                _ => Err(TransportError::Closed),
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct LegacyCancelLateRecv {
+        phase: u8,
+        outbound: Receiver<JsonRpcMessage>,
+        reverse_id: Option<RequestId>,
+        stale_offset: i64,
+        cancellation_request_id: RequestId,
+    }
+
+    impl TransportRecvHalf for LegacyCancelLateRecv {
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            let phase = self.phase;
+            self.phase = self.phase.saturating_add(1);
+            match phase {
+                0 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "initialize",
+                    Some(serde_json::json!({
+                        "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                        "capabilities": {"sampling": {}},
+                        "clientInfo": {"name": "cancel-late", "version": "1.0.0"},
+                    })),
+                    801_i64,
+                ))),
+                1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/initialized",
+                    None,
+                ))),
+                2 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "tools/call",
+                    Some(
+                        serde_json::json!({"name": "live_legacy_runtime_connection_tool", "arguments": {"sample": true}}),
+                    ),
+                    802_i64,
+                ))),
+                3 => loop {
+                    match self.outbound.recv_timeout(Duration::from_secs(2)) {
+                        Ok(JsonRpcMessage::Request(request))
+                            if request.method == "sampling/createMessage" =>
+                        {
+                            let id = request.id.expect("sampling request id");
+                            assert_eq!(id, RequestId::Number(-1));
+                            self.reverse_id = Some(id.clone());
+                            return Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                                "notifications/cancelled",
+                                Some(serde_json::json!({
+                                    "requestId": self.cancellation_request_id.clone(),
+                                    "reason": "test cancellation",
+                                })),
+                            )));
+                        }
+                        Ok(_) => {}
+                        Err(_) => return Err(TransportError::Timeout),
+                    }
+                },
+                4 => {
+                    let id = self.reverse_id.clone().expect("captured reverse id");
+                    let id = match id {
+                        RequestId::Number(value) => RequestId::Number(value + self.stale_offset),
+                        other => other,
+                    };
+                    Ok(JsonRpcMessage::Response(JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({"text": "late"}),
+                    )))
+                }
+                5 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "tools/call",
+                    Some(
+                        serde_json::json!({"name": "live_legacy_runtime_connection_tool", "arguments": {"sample": false}}),
+                    ),
+                    803_i64,
+                ))),
+                6 => loop {
+                    match self.outbound.recv_timeout(Duration::from_secs(2)) {
+                        Ok(JsonRpcMessage::Response(response))
+                            if response.id == Some(803_i64.into()) =>
+                        {
+                            return Err(TransportError::Closed);
+                        }
+                        Ok(_) => {}
+                        Err(_) => return Err(TransportError::Timeout),
+                    }
+                },
+                _ => Err(TransportError::Closed),
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct LiveLegacyRuntimeSplitSend {
+        sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
+        outbound: std::sync::mpsc::SyncSender<JsonRpcMessage>,
+    }
+
+    impl TransportSendHalf for LiveLegacyRuntimeSplitSend {
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.sent
+                .lock()
+                .expect("legacy runtime sent-message mutex must not be poisoned")
+                .push(message.clone());
+            self.outbound
+                .send(message.clone())
+                .map_err(|_| TransportError::Closed)
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn live_legacy_runtime_connection_transcript(supports_sampling: bool) -> Vec<JsonRpcMessage> {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (outbound, inbound) = sync_channel(32);
+        run_live_split_transport(
+            Server::new("live-legacy-runtime-connection", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LiveLegacyRuntimeConnectionTool)
+                .build(),
+            LiveLegacyRuntimeSplitRecv {
+                phase: 0,
+                supports_sampling,
+                outbound: inbound,
+            },
+            LiveLegacyRuntimeSplitSend {
+                sent: Arc::clone(&sent),
+                outbound,
+            },
+        )
+        .expect("public split transport must complete the legacy runtime script");
+        sent.lock()
+            .expect("legacy runtime sent-message mutex must not be poisoned")
+            .clone()
     }
 
     fn run_live_websocket_split<R, W>(server: Server, reader: R, writer: W) -> Result<(), String>
@@ -16486,6 +17386,235 @@ mod lib_unit_tests {
             call.result
                 .as_ref()
                 .is_some_and(|result| result.get("resultType").is_none())
+        );
+    }
+
+    #[test]
+    fn public_split_transport_legacy_runtime_retains_state_notifications_and_sampling() {
+        let sent = live_legacy_runtime_connection_transcript(true);
+
+        assert!(
+            sent.iter().any(|message| {
+                matches!(message, JsonRpcMessage::Request(request) if request.method == "sampling/createMessage")
+            }),
+            "an advertised legacy sampling capability must install the connection request sender"
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|message| {
+                    matches!(message, JsonRpcMessage::Request(request) if request.method == "notifications/progress")
+                })
+                .count(),
+            2,
+            "both handler calls must use the connection notification sender for progress"
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|message| {
+                    matches!(message, JsonRpcMessage::Request(request) if request.method == "notifications/message")
+                })
+                .count(),
+            2,
+            "the negotiated legacy log level must use the same notification sender"
+        );
+
+        let first = sent.iter().find_map(|message| match message {
+            JsonRpcMessage::Response(response) if response.id == Some(703_i64.into()) => {
+                response.result.as_ref()
+            }
+            _ => None,
+        });
+        assert_eq!(
+            first
+                .and_then(|result| result["content"].as_array())
+                .and_then(|content| content.first())
+                .and_then(|content| content["text"].as_str()),
+            Some("legacy-runtime-1-sampled-value")
+        );
+
+        let second = sent.iter().find_map(|message| match message {
+            JsonRpcMessage::Response(response) if response.id == Some(704_i64.into()) => {
+                response.result.as_ref()
+            }
+            _ => None,
+        });
+        assert_eq!(
+            second
+                .and_then(|result| result["content"].as_array())
+                .and_then(|content| content.first())
+                .and_then(|content| content["text"].as_str()),
+            Some("legacy-runtime-2-without-sampling"),
+            "the second public-path call must observe the first call's SessionState mutation"
+        );
+    }
+
+    #[test]
+    fn public_split_legacy_sampling_cancel_late_reply_preserves_connection() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (outbound, inbound) = sync_channel(32);
+        let result = run_live_split_transport(
+            Server::new("legacy-cancel-late", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LiveLegacyRuntimeConnectionTool)
+                .build(),
+            LegacyCancelLateRecv {
+                phase: 0,
+                outbound: inbound,
+                reverse_id: None,
+                stale_offset: 0,
+                cancellation_request_id: RequestId::Number(802),
+            },
+            LiveLegacyRuntimeSplitSend {
+                sent: Arc::clone(&sent),
+                outbound,
+            },
+        );
+        result.expect("retired late response must preserve the connection");
+        assert!(
+            sent.lock()
+                .expect("sent messages mutex")
+                .iter()
+                .any(|message| matches!(
+                    message,
+            JsonRpcMessage::Response(response)
+                if response.id == Some(803_i64.into())
+                    && response
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("content"))
+                        .is_some_and(|content| content.to_string().contains("legacy-runtime-2-without-sampling"))
+                ))
+        );
+    }
+
+    #[test]
+    fn public_split_legacy_sampling_numeric_cancellation_alias_retires_late_reply() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (outbound, inbound) = sync_channel(32);
+        let result = run_live_split_transport(
+            Server::new("legacy-cancel-numeric-alias", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LiveLegacyRuntimeConnectionTool)
+                .build(),
+            LegacyCancelLateRecv {
+                phase: 0,
+                outbound: inbound,
+                reverse_id: None,
+                stale_offset: 0,
+                cancellation_request_id: RequestId::Integer("802e0".to_owned()),
+            },
+            LiveLegacyRuntimeSplitSend {
+                sent: Arc::clone(&sent),
+                outbound,
+            },
+        );
+        result.expect(
+            "numeric cancellation aliases must retire the late reply and preserve the connection",
+        );
+        assert!(
+            sent.lock()
+                .expect("sent messages mutex")
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    JsonRpcMessage::Response(response)
+                        if response.id == Some(803_i64.into())
+                            && response
+                                .result
+                                .as_ref()
+                                .and_then(|result| result.get("content"))
+                                .is_some_and(|content| content.to_string().contains("legacy-runtime-2-without-sampling"))
+                )),
+            "changing only the cancellation ID spelling must retain the successful follow-up request"
+        );
+    }
+
+    #[test]
+    fn public_split_legacy_sampling_next_negative_reply_remains_invalid() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (outbound, inbound) = sync_channel(32);
+        let result = run_live_split_transport(
+            Server::new("legacy-cancel-next-negative", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LiveLegacyRuntimeConnectionTool)
+                .build(),
+            LegacyCancelLateRecv {
+                phase: 0,
+                outbound: inbound,
+                reverse_id: None,
+                stale_offset: -1,
+                cancellation_request_id: RequestId::Number(802),
+            },
+            LiveLegacyRuntimeSplitSend {
+                sent: Arc::clone(&sent),
+                outbound,
+            },
+        );
+        result.expect_err("next unissued negative response must remain invalid");
+        assert!(
+            !sent
+                .lock()
+                .expect("sent messages mutex")
+                .iter()
+                .any(|message| matches!(
+                        message,
+                JsonRpcMessage::Response(response) if response.id == Some(803_i64.into())
+                    ))
+        );
+    }
+
+    #[test]
+    fn public_split_transport_legacy_runtime_rejects_sampling_when_only_capability_is_removed() {
+        let sent = live_legacy_runtime_connection_transcript(false);
+
+        assert!(
+            !sent.iter().any(|message| {
+                matches!(message, JsonRpcMessage::Request(request) if request.method == "sampling/createMessage")
+            }),
+            "removing only the advertised sampling capability must prevent a reverse request"
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|message| {
+                    matches!(message, JsonRpcMessage::Request(request) if request.method == "notifications/progress")
+                })
+                .count(),
+            2,
+            "the negative must retain the same connection state and notification path"
+        );
+
+        let rejected = sent.iter().find_map(|message| match message {
+            JsonRpcMessage::Response(response) if response.id == Some(703_i64.into()) => {
+                response.result.as_ref()
+            }
+            _ => None,
+        });
+        assert_eq!(
+            rejected.and_then(|result| result["isError"].as_bool()),
+            Some(true)
+        );
+        assert!(
+            rejected
+                .and_then(|result| result["content"].as_array())
+                .and_then(|content| content.first())
+                .and_then(|content| content["text"].as_str())
+                .is_some_and(|text| text.contains("Sampling not available")),
+            "the otherwise identical handler call must fail at the advertised-capability gate"
+        );
+
+        let second = sent.iter().find_map(|message| match message {
+            JsonRpcMessage::Response(response) if response.id == Some(704_i64.into()) => {
+                response.result.as_ref()
+            }
+            _ => None,
+        });
+        assert_eq!(
+            second
+                .and_then(|result| result["content"].as_array())
+                .and_then(|content| content.first())
+                .and_then(|content| content["text"].as_str()),
+            Some("legacy-runtime-2-without-sampling"),
+            "removing only sampling capability must not replace the retained SessionState"
         );
     }
 

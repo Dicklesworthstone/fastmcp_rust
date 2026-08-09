@@ -793,7 +793,7 @@ impl ProxyHttpClient {
             request_id.clone(),
         ));
         let response = match &mut self.connection {
-            ClientHttpConnection::LegacySse(client) => {
+            ClientHttpConnection::LegacySse { client, .. } => {
                 block_on(client.send(&self.cx, &message)).map_err(legacy_http_error)?;
                 receive_legacy_response(client, &self.cx, &request_id)?
             }
@@ -825,7 +825,7 @@ impl ProxyHttpClient {
 
         let notification = JsonRpcMessage::Request(JsonRpcRequest::initialized_notification());
         match &mut self.connection {
-            ClientHttpConnection::LegacySse(client) => {
+            ClientHttpConnection::LegacySse { client, .. } => {
                 block_on(client.send(&self.cx, &notification)).map_err(legacy_http_error)?;
             }
             ClientHttpConnection::Modern(_) => {
@@ -859,7 +859,7 @@ impl ProxyHttpClient {
             ClientHttpConnection::Modern(client) => {
                 receive_modern_response(client, &self.cx, method, parameters, &request_id)?
             }
-            ClientHttpConnection::LegacySse(client) => {
+            ClientHttpConnection::LegacySse { client, .. } => {
                 let message = JsonRpcMessage::Request(JsonRpcRequest::new(
                     method,
                     Some(parameters),
