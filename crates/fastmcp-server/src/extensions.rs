@@ -113,6 +113,8 @@ pub enum ExtensionHandlerRegistrationError {
     EmptyMethodName,
     /// The handler method exceeds the protocol's bounded member-name limit.
     MethodNameTooLong(String),
+    /// The extension descriptor does not own the requested method.
+    MethodNotOwned(ExtensionHandlerKey),
     /// A handler is already registered for this exact extension request location.
     DuplicateHandler(ExtensionHandlerKey),
     /// Server discovery metadata is already registered for this extension.
@@ -137,6 +139,12 @@ impl fmt::Display for ExtensionHandlerRegistrationError {
                     "extension handler method exceeds its byte limit: {method}"
                 )
             }
+            Self::MethodNotOwned(key) => write!(
+                formatter,
+                "extension handler method is not owned by its descriptor: {}/{}",
+                key.extension_id(),
+                key.method()
+            ),
             Self::DuplicateHandler(key) => write!(
                 formatter,
                 "extension handler is already registered: {}/{}",
@@ -167,6 +175,7 @@ impl std::error::Error for ExtensionHandlerRegistrationError {
             | Self::UnregisteredExtension(_)
             | Self::EmptyMethodName
             | Self::MethodNameTooLong(_)
+            | Self::MethodNotOwned(_)
             | Self::DuplicateHandler(_)
             | Self::DuplicateServerMetadata(_)
             | Self::OfficialMcpAppsAlreadyInstalled => None,
@@ -387,10 +396,10 @@ impl ExtensionHandlerRegistry {
 
     /// Registers one typed handler for an extension request method.
     ///
-    /// Descriptor existence is checked immediately. Exact method ownership and
-    /// client-to-server direction remain request-specific protocol checks, so
-    /// [`Self::invoke`] performs them against the current negotiated extension
-    /// set before this handler can run.
+    /// Descriptor existence and exact method ownership are checked
+    /// immediately. [`Self::invoke`] still checks direction and
+    /// request-specific admission against the current negotiated extension set
+    /// before the handler can run.
     pub fn register<Request, Response, Handler>(
         &mut self,
         extension_id: ExtensionId,
@@ -419,6 +428,13 @@ impl ExtensionHandlerRegistry {
             return Err(ExtensionHandlerRegistrationError::MethodNameTooLong(
                 key.method().to_owned(),
             ));
+        }
+        if self
+            .descriptor_registry
+            .method_descriptor(&extension_id, key.method())
+            .is_none()
+        {
+            return Err(ExtensionHandlerRegistrationError::MethodNotOwned(key));
         }
         if self.handlers.contains_key(&key) {
             return Err(ExtensionHandlerRegistrationError::DuplicateHandler(key));
@@ -693,6 +709,47 @@ mod tests {
                 .map(|settings| serde_json::Value::Object(settings.as_object().clone())),
             Some(json!({})),
             "the official Apps server marker is emitted only through the frozen descriptor registry"
+        );
+    }
+
+    #[test]
+    fn official_apps_rejects_unowned_client_to_server_handler_without_mutation() {
+        let mut handlers = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
+        let apps_id = handlers
+            .install_official_mcp_apps()
+            .expect("the official Apps descriptor and marker install");
+        let key = ExtensionHandlerKey::new(
+            apps_id.clone(),
+            fastmcp_protocol::extensions::MCP_APPS_INITIALIZE_METHOD,
+        );
+
+        assert_eq!(
+            handlers.register(
+                apps_id.clone(),
+                fastmcp_protocol::extensions::MCP_APPS_INITIALIZE_METHOD,
+                |_context: &McpContext,
+                 _params: serde_json::Value|
+                 -> McpResult<serde_json::Value> { Ok(json!({})) },
+            ),
+            Err(ExtensionHandlerRegistrationError::MethodNotOwned(key)),
+            "MCP Apps owns no client-to-server extension method on this server registry"
+        );
+        assert_eq!(
+            handlers.len(),
+            0,
+            "the rejected Apps handler cannot create a dead dispatch entry"
+        );
+        assert_eq!(
+            handlers.server_metadata_len(),
+            1,
+            "the rejection preserves the installed Apps discovery marker"
+        );
+        assert_eq!(
+            handlers
+                .descriptor_registry()
+                .descriptor(&apps_id),
+            Some(&fastmcp_protocol::official_mcp_apps_descriptor()),
+            "the rejected handler cannot alter the official Apps descriptor"
         );
     }
 

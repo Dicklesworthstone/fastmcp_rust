@@ -43,12 +43,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
+use std::future::Future;
+use std::pin::Pin;
+
+use asupersync::channel::mpsc::{self, Receiver, Sender};
+use asupersync::Cx;
 #[cfg(test)]
 use asupersync::Budget;
 #[cfg(test)]
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 #[cfg(test)]
-use asupersync::{CancelKind, Cx};
+use asupersync::CancelKind;
 use base64::Engine as _;
 #[cfg(test)]
 use fastmcp_core::logging::{debug, info, targets, warn};
@@ -1580,6 +1585,89 @@ pub trait FinalTaskStore: Send + Sync {
         notification: FinalTaskStatusNotification,
     ) -> McpResult<bool>;
 
+    /// Atomically compares the current generation, replaces the task and its
+    /// notification, and appends validated input to the private worker
+    /// handoff. No task, notification, generation, or handoff state may change
+    /// when the comparison fails.
+    ///
+    /// Stores written before this operation was added fail closed by default;
+    /// accepting an update while discarding its input is never a valid
+    /// compatibility fallback.
+    fn replace_task_and_append_input_if_current(
+        &self,
+        _expected: &FinalTaskSnapshot,
+        _task: FinalTask,
+        _notification: FinalTaskStatusNotification,
+        _input_responses: FinalTaskInputResponses,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Final task store does not implement atomic task-input append",
+        ))
+    }
+
+    /// Atomically compares the current generation, replaces the task and its
+    /// notification, and clears every unconsumed input from an earlier input
+    /// cycle. This operation is required when entering `input_required` and
+    /// when committing a terminal state.
+    fn replace_task_and_clear_input_if_current(
+        &self,
+        _expected: &FinalTaskSnapshot,
+        _task: FinalTask,
+        _notification: FinalTaskStatusNotification,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Final task store does not implement atomic task-input clearing",
+        ))
+    }
+
+    /// Atomically consumes the private accepted-input handoff only when the
+    /// store still contains the exact supplied generation in `working` state.
+    /// A stale generation, a non-working state, or an already-consumed handoff
+    /// returns `None` without mutation.
+    fn take_input_if_current(
+        &self,
+        _expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskInputResponses>> {
+        Err(McpError::internal_error(
+            "Final task store does not implement atomic task-input consumption",
+        ))
+    }
+
+    /// Returns one current `working` task with an unconsumed accepted-input
+    /// handoff without consuming that handoff.
+    ///
+    /// The returned snapshot is only a compare-and-swap candidate. A service
+    /// must still call [`Self::take_input_if_current`] before delivering any
+    /// input to application code, so a concurrent terminal transition or
+    /// another service generation wins without replaying the handoff.
+    ///
+    /// Stores that cannot enumerate their durable accepted-input handoffs fail
+    /// closed. A service runner must never claim restart recovery merely
+    /// because ordinary `get_task` is available.
+    fn next_accepted_input_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+        Err(McpError::internal_error(
+            "Final task store does not implement accepted-input recovery",
+        ))
+    }
+
+    /// Restores a consumed accepted-input handoff after a supervisor returns
+    /// an error, but only when the exact working generation is still current.
+    ///
+    /// This preserves at-least-once recovery semantics for the handoff rather
+    /// than silently dropping it when a caller-owned service generation exits.
+    /// A `false` result means a newer durable transition won and the input must
+    /// not be reintroduced into that state.
+    fn restore_input_if_current(
+        &self,
+        _task_id: &FinalTaskId,
+        _generation: u64,
+        _input_responses: FinalTaskInputResponses,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Final task store does not implement accepted-input restoration",
+        ))
+    }
+
     /// Durably records cooperative cancellation intent for a known task.
     fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()>;
 
@@ -1660,6 +1748,7 @@ struct InMemoryFinalTaskState {
     tasks: BTreeMap<FinalTaskId, FinalTask>,
     generations: BTreeMap<FinalTaskId, u64>,
     next_generation: u64,
+    accepted_inputs: BTreeMap<FinalTaskId, FinalTaskInputResponses>,
     cancellation_requests: BTreeSet<FinalTaskId>,
     latest_notifications: BTreeMap<FinalTaskId, FinalTaskStatusNotification>,
     expires_at: BTreeMap<FinalTaskId, Instant>,
@@ -1806,7 +1895,13 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         if !state.tasks.contains_key(&task_id) {
             return Err(McpError::invalid_params("Task not found"));
         }
-        replace_in_memory_final_task(&mut state, task, notification, now)?;
+        replace_in_memory_final_task(
+            &mut state,
+            task,
+            notification,
+            now,
+            InMemoryFinalTaskInputMutation::Clear,
+        )?;
         Ok(())
     }
 
@@ -1832,7 +1927,164 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(false);
         }
-        replace_in_memory_final_task(&mut state, task, notification, now)?;
+        replace_in_memory_final_task(
+            &mut state,
+            task,
+            notification,
+            now,
+            InMemoryFinalTaskInputMutation::Clear,
+        )?;
+        Ok(true)
+    }
+
+    fn replace_task_and_append_input_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+        input_responses: FinalTaskInputResponses,
+    ) -> McpResult<bool> {
+        let task_id = task.base().task_id.clone();
+        if expected.task().base().task_id != task_id {
+            return Err(McpError::invalid_params(
+                "Expected and replacement final task IDs must match",
+            ));
+        }
+        ensure_final_task_notification_matches_task(&task, &notification)?;
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        if state.generations.get(&task_id) != Some(&expected.generation()) {
+            return Ok(false);
+        }
+        replace_in_memory_final_task(
+            &mut state,
+            task,
+            notification,
+            now,
+            InMemoryFinalTaskInputMutation::Append(input_responses),
+        )?;
+        Ok(true)
+    }
+
+    fn replace_task_and_clear_input_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+    ) -> McpResult<bool> {
+        let task_id = task.base().task_id.clone();
+        if expected.task().base().task_id != task_id {
+            return Err(McpError::invalid_params(
+                "Expected and replacement final task IDs must match",
+            ));
+        }
+        ensure_final_task_notification_matches_task(&task, &notification)?;
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        if state.generations.get(&task_id) != Some(&expected.generation()) {
+            return Ok(false);
+        }
+        replace_in_memory_final_task(
+            &mut state,
+            task,
+            notification,
+            now,
+            InMemoryFinalTaskInputMutation::Clear,
+        )?;
+        Ok(true)
+    }
+
+    fn take_input_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskInputResponses>> {
+        let task_id = &expected.task().base().task_id;
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        if state.generations.get(task_id) != Some(&expected.generation())
+            || !state
+                .tasks
+                .get(task_id)
+                .is_some_and(|task| matches!(task, FinalTask::Working(_)))
+        {
+            return Ok(None);
+        }
+        Ok(state.accepted_inputs.remove(task_id))
+    }
+
+    fn next_accepted_input_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+
+        let Some(task_id) = state
+            .accepted_inputs
+            .keys()
+            .find(|task_id| {
+                matches!(state.tasks.get(*task_id), Some(FinalTask::Working(_)))
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let task = state.tasks.get(&task_id).cloned().ok_or_else(|| {
+            McpError::internal_error(
+                "In-memory final task store retained input for a missing task",
+            )
+        })?;
+        let generation = state.generations.get(&task_id).copied().ok_or_else(|| {
+            McpError::internal_error(
+                "In-memory final task store retained input without a task generation",
+            )
+        })?;
+        Ok(Some(FinalTaskSnapshot::new(task, generation)))
+    }
+
+    fn restore_input_if_current(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+        input_responses: FinalTaskInputResponses,
+    ) -> McpResult<bool> {
+        if input_responses.is_empty() {
+            return Err(McpError::internal_error(
+                "Cannot restore an empty accepted-input handoff",
+            ));
+        }
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        if state.generations.get(task_id) != Some(&generation)
+            || !state
+                .tasks
+                .get(task_id)
+                .is_some_and(|task| matches!(task, FinalTask::Working(_)))
+        {
+            return Ok(false);
+        }
+        state
+            .accepted_inputs
+            .entry(task_id.clone())
+            .or_default()
+            .extend(input_responses);
         Ok(true)
     }
 
@@ -1932,11 +2184,17 @@ fn next_in_memory_final_task_generation(state: &mut InMemoryFinalTaskState) -> M
     Ok(generation)
 }
 
+enum InMemoryFinalTaskInputMutation {
+    Clear,
+    Append(FinalTaskInputResponses),
+}
+
 fn replace_in_memory_final_task(
     state: &mut InMemoryFinalTaskState,
     task: FinalTask,
     notification: FinalTaskStatusNotification,
     now: Instant,
+    input_mutation: InMemoryFinalTaskInputMutation,
 ) -> McpResult<()> {
     let task_id = task.base().task_id.clone();
     let expires_at = in_memory_final_task_expiry(&task, now)?;
@@ -1950,6 +2208,20 @@ fn replace_in_memory_final_task(
         .insert(task_id.clone(), notification);
     state.tasks.insert(task_id.clone(), task);
     state.generations.insert(task_id.clone(), generation);
+    match input_mutation {
+        InMemoryFinalTaskInputMutation::Clear => {
+            state.accepted_inputs.remove(&task_id);
+        }
+        InMemoryFinalTaskInputMutation::Append(input_responses) => {
+            if !input_responses.is_empty() {
+                state
+                    .accepted_inputs
+                    .entry(task_id.clone())
+                    .or_default()
+                    .extend(input_responses);
+            }
+        }
+    }
     match expires_at {
         Some(expires_at) => {
             state.expires_at.insert(task_id.clone(), expires_at);
@@ -1974,6 +2246,7 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
         state.expires_at.remove(&task_id);
         state.tasks.remove(&task_id);
         state.generations.remove(&task_id);
+        state.accepted_inputs.remove(&task_id);
         state.cancellation_requests.remove(&task_id);
         state.latest_notifications.remove(&task_id);
     }
@@ -1991,9 +2264,11 @@ pub type FinalTaskNotificationEmitter = Arc<dyn Fn(FinalTaskStatusNotification) 
 /// task input belongs to the task's private execution state. The caller-owned
 /// supervisor takes this value after a task returns to `working` and uses it to
 /// resume the associated operation.
-#[derive(Clone, Debug, PartialEq)]
+#[must_use = "accepted task input must be handed to the resumed worker"]
+#[derive(PartialEq)]
 pub struct FinalTaskAcceptedInput {
     task_id: FinalTaskId,
+    generation: u64,
     input_responses: FinalTaskInputResponses,
 }
 
@@ -2004,6 +2279,13 @@ impl FinalTaskAcceptedInput {
         &self.task_id
     }
 
+    /// Returns the exact store generation whose `working` state authorized
+    /// this one-shot handoff.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Returns every validated input response accumulated for this resumption.
     #[must_use]
     pub const fn input_responses(&self) -> &FinalTaskInputResponses {
@@ -2012,22 +2294,40 @@ impl FinalTaskAcceptedInput {
 
     /// Splits this one-shot supervisor handoff into its task ID and input map.
     #[must_use]
-    pub fn into_parts(self) -> (FinalTaskId, FinalTaskInputResponses) {
-        (self.task_id, self.input_responses)
+    pub fn into_parts(self) -> (FinalTaskId, u64, FinalTaskInputResponses) {
+        (self.task_id, self.generation, self.input_responses)
+    }
+
+    fn restore_copy(&self) -> FinalTaskInputResponses {
+        self.input_responses.clone()
     }
 }
 
 /// Immutable final Tasks timing policy supplied with the durable store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FinalTaskRuntimeConfig {
-    ttl_ms: u64,
+    ttl_ms: Option<u64>,
     poll_interval_ms: Option<u64>,
 }
 
 impl FinalTaskRuntimeConfig {
     /// Creates a final Tasks policy with a required finite retention duration.
     pub fn new(ttl_ms: u64, poll_interval_ms: Option<u64>) -> McpResult<Self> {
-        final_task_duration(ttl_ms)?;
+        Self::with_ttl(Some(ttl_ms), poll_interval_ms)
+    }
+
+    /// Creates a final Tasks policy whose required wire `ttlMs` field is
+    /// either a positive duration or explicit `null`.
+    ///
+    /// `None` means unlimited retention: the task is never reclaimed by TTL
+    /// and remains charged to the configured store until that store performs
+    /// an explicit retention action. The process-local store implements the
+    /// no-automatic-expiry half of that contract only; it is not a durable
+    /// retention-administration or production recovery profile.
+    pub fn with_ttl(ttl_ms: Option<u64>, poll_interval_ms: Option<u64>) -> McpResult<Self> {
+        if let Some(ttl_ms) = ttl_ms {
+            final_task_duration(ttl_ms)?;
+        }
         if let Some(interval) = poll_interval_ms {
             final_task_duration(interval)?;
         }
@@ -2036,6 +2336,51 @@ impl FinalTaskRuntimeConfig {
             poll_interval_ms,
         })
     }
+
+    /// Returns the configured presence-aware TTL for locally created Tasks.
+    #[must_use]
+    pub const fn ttl_ms(&self) -> Option<u64> {
+        self.ttl_ms
+    }
+}
+
+/// Application callback invoked for one durably accepted input handoff.
+///
+/// The callback receives only the opaque task identity, the store generation,
+/// and validated input responses. It never receives a store record, queue
+/// handle, or task-service control surface. The enclosing
+/// [`AuthorizedTaskServiceRunner`] must be run by the embedding application in
+/// its own structured `Cx` region; FastMCP never creates a runtime or detaches
+/// a worker for it.
+pub type FinalTaskSupervisorFuture<'a> =
+    Pin<Box<dyn Future<Output = McpResult<()>> + Send + 'a>>;
+
+/// Caller-owned execution hook for accepted final-Tasks input.
+///
+/// Implementations run under the `Cx` supplied to
+/// [`AuthorizedTaskServiceRunner::run`]. They should treat a repeated call
+/// after a service restart as at-least-once recovery and make external effects
+/// idempotent. They cannot construct or clone the runner, inspect its queue,
+/// or bypass the durable handoff.
+pub trait ApplicationTaskSupervisor: Send + Sync {
+    /// Resumes one task after all outstanding input has been durably accepted.
+    fn resume<'a>(
+        &'a self,
+        cx: &'a Cx,
+        accepted: FinalTaskAcceptedInput,
+    ) -> FinalTaskSupervisorFuture<'a>;
+}
+
+/// One-shot framework runner for a caller-owned application Task service.
+///
+/// Only [`FinalTaskRuntime::install_task_service`] can construct this type.
+/// It is intentionally not cloneable: one runner owns one bounded wakeup
+/// receiver, while the durable store remains the recovery authority when a
+/// wakeup is missed, coalesced, or its service generation exits.
+pub struct AuthorizedTaskServiceRunner {
+    runtime: FinalTaskRuntime,
+    receiver: Receiver<FinalTaskId>,
+    supervisor: Arc<dyn ApplicationTaskSupervisor>,
 }
 
 /// Final Tasks state machine backed by an application-supplied durable store.
@@ -2048,10 +2393,7 @@ pub struct FinalTaskRuntime {
     store: Arc<dyn FinalTaskStore>,
     config: FinalTaskRuntimeConfig,
     notification_emitters: Arc<Mutex<Vec<FinalTaskNotificationEmitter>>>,
-    /// Validated task inputs retained until the caller-owned supervisor takes
-    /// one complete resumption handoff. Partial updates accumulate here but
-    /// cannot be observed until every outstanding input request is satisfied.
-    accepted_inputs: Arc<Mutex<BTreeMap<FinalTaskId, FinalTaskInputResponses>>>,
+    service_signal: Arc<Mutex<Option<Sender<FinalTaskId>>>>,
 }
 
 impl FinalTaskRuntime {
@@ -2066,7 +2408,7 @@ impl FinalTaskRuntime {
             store,
             config,
             notification_emitters: Arc::new(Mutex::new(vec![notification_emitter])),
-            accepted_inputs: Arc::new(Mutex::new(BTreeMap::new())),
+            service_signal: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2113,29 +2455,87 @@ impl FinalTaskRuntime {
             .push(emitter);
     }
 
+    /// Installs one bounded wakeup channel for a caller-owned structured Task
+    /// service and returns its non-cloneable runner.
+    ///
+    /// The caller must run the returned runner in an application-lifetime
+    /// asupersync region with [`AuthorizedTaskServiceRunner::run`]. A full
+    /// wakeup queue deliberately does not reject a durable transition: the
+    /// runner rescans the store's accepted-input handoffs after every wakeup
+    /// and when it starts, so the store rather than this process-local signal
+    /// remains authoritative for recovery.
+    pub fn install_task_service(
+        &self,
+        queue_capacity: usize,
+        supervisor: Arc<dyn ApplicationTaskSupervisor>,
+    ) -> McpResult<AuthorizedTaskServiceRunner> {
+        if queue_capacity == 0 {
+            return Err(McpError::invalid_params(
+                "Task service queue capacity must be positive",
+            ));
+        }
+        let (sender, receiver) = mpsc::channel(queue_capacity);
+        let mut signal = self
+            .service_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if signal.is_some() {
+            return Err(McpError::invalid_params(
+                "A task service is already installed for this runtime",
+            ));
+        }
+        *signal = Some(sender);
+        Ok(AuthorizedTaskServiceRunner {
+            runtime: self.clone(),
+            receiver,
+            supervisor,
+        })
+    }
+
     /// Takes the validated inputs for a task that has returned to `working`.
     ///
     /// A task supervisor calls this after observing the task's resumed state.
-    /// Input values remain private runtime state rather than leaking through a
-    /// task snapshot or `notifications/tasks`; the returned value is removed
-    /// atomically so one worker cannot replay another worker's inputs. While a
-    /// task remains `input_required`, or if it has no accepted inputs, this
-    /// returns `None` without changing runtime state.
+    /// Input values remain private durable-store state rather than leaking
+    /// through a task snapshot or `notifications/tasks`. The store atomically
+    /// verifies the exact current `working` generation and removes the handoff,
+    /// so a stale or second worker cannot replay another worker's inputs.
     pub fn take_accepted_input(
         &self,
         task_id: &FinalTaskId,
     ) -> McpResult<Option<FinalTaskAcceptedInput>> {
         let current = self.load_task_snapshot(task_id)?;
-        if !matches!(current.task(), FinalTask::Working(_)) {
+        let input_responses = self.store.take_input_if_current(&current)?;
+        Ok(
+            input_responses.map(|input_responses| FinalTaskAcceptedInput {
+                task_id: task_id.clone(),
+                generation: current.generation(),
+                input_responses,
+            }),
+        )
+    }
+
+    /// Atomically recovers one durably accepted input handoff for a newly
+    /// installed service generation.
+    ///
+    /// This intentionally does not infer recoverability from ordinary task
+    /// reads. The store returns a compare-and-swap candidate and the runtime
+    /// consumes it only if that exact `working` generation is still current.
+    /// A stale candidate therefore has no side effect and can never replay a
+    /// terminal transition.
+    pub fn recover_accepted_input(&self) -> McpResult<Option<FinalTaskAcceptedInput>> {
+        let Some(candidate) = self.store.next_accepted_input_snapshot()? else {
             return Ok(None);
+        };
+        let task_id = candidate.task().base().task_id.clone();
+        if !matches!(candidate.task(), FinalTask::Working(_)) {
+            return Err(McpError::internal_error(
+                "Final task store returned a non-working accepted-input recovery candidate",
+            ));
         }
-        let input_responses = self
-            .accepted_inputs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(task_id);
+        let input_responses = self.store.take_input_if_current(&candidate)?;
         Ok(input_responses.map(|input_responses| FinalTaskAcceptedInput {
-            task_id: task_id.clone(),
+            task_id,
+            generation: candidate.generation(),
             input_responses,
         }))
     }
@@ -2150,7 +2550,7 @@ impl FinalTaskRuntime {
             status_message,
             created_at: now.clone(),
             last_updated_at: now,
-            ttl_ms: Some(final_task_duration(self.config.ttl_ms)?),
+            ttl_ms: self.config.ttl_ms.map(final_task_duration).transpose()?,
             poll_interval_ms: self
                 .config
                 .poll_interval_ms
@@ -2202,7 +2602,7 @@ impl FinalTaskRuntime {
             )?,
             input_requests,
         };
-        self.persist_transition(&current, task.clone())?;
+        self.persist_transition_clearing_input(&current, task.clone())?;
         Ok(task)
     }
 
@@ -2245,20 +2645,7 @@ impl FinalTaskRuntime {
                 input_requests,
             }
         };
-        // Hold the handoff lock across the durable transition. A polling
-        // supervisor can therefore never observe `working` and consume an
-        // empty handoff in the interval before this accepted input is stored.
-        let mut accepted_inputs = self
-            .accepted_inputs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let notification = self.persist_transition_without_emit(&current, task)?;
-        if !input_responses.is_empty() {
-            let accumulated = accepted_inputs.entry(task_id.clone()).or_default();
-            accumulated.extend(input_responses.clone());
-        }
-        drop(accepted_inputs);
-        self.emit(notification);
+        self.persist_transition_appending_input(&current, task, input_responses.clone())?;
         Ok(UpdateTaskResult::default())
     }
 
@@ -2311,8 +2698,7 @@ impl FinalTaskRuntime {
             FinalTaskStatus::Cancelled,
             status_message,
         )?);
-        self.persist_transition(&current, task.clone())?;
-        self.discard_accepted_input(task_id);
+        self.persist_transition_clearing_input(&current, task.clone())?;
         Ok(task)
     }
 
@@ -2335,8 +2721,7 @@ impl FinalTaskRuntime {
             )?,
             result,
         };
-        self.persist_transition(&current, task.clone())?;
-        self.discard_accepted_input(task_id);
+        self.persist_transition_clearing_input(&current, task.clone())?;
         Ok(task)
     }
 
@@ -2362,8 +2747,7 @@ impl FinalTaskRuntime {
             )?,
             error,
         };
-        self.persist_transition(&current, task.clone())?;
-        self.discard_accepted_input(task_id);
+        self.persist_transition_clearing_input(&current, task.clone())?;
         Ok(task)
     }
 
@@ -2387,34 +2771,51 @@ impl FinalTaskRuntime {
         Ok(())
     }
 
-    fn persist_transition(&self, expected: &FinalTaskSnapshot, task: FinalTask) -> McpResult<()> {
-        let notification = self.persist_transition_without_emit(expected, task)?;
-        self.emit(notification);
-        Ok(())
-    }
-
-    fn persist_transition_without_emit(
+    fn persist_transition_appending_input(
         &self,
         expected: &FinalTaskSnapshot,
         task: FinalTask,
-    ) -> McpResult<FinalTaskStatusNotification> {
+        input_responses: FinalTaskInputResponses,
+    ) -> McpResult<()> {
+        let wakeup_task_id = match &task {
+            FinalTask::Working(base) => Some(base.task_id.clone()),
+            _ => None,
+        };
         let notification = final_task_notification(&task);
-        if !self
-            .store
-            .replace_task_if_current(expected, task, notification.clone())?
-        {
+        if !self.store.replace_task_and_append_input_if_current(
+            expected,
+            task,
+            notification.clone(),
+            input_responses,
+        )? {
             return Err(McpError::invalid_params(
                 "Task state changed before the transition could be recorded",
             ));
         }
-        Ok(notification)
+        self.emit(notification);
+        if let Some(task_id) = wakeup_task_id {
+            self.signal_task_service(task_id);
+        }
+        Ok(())
     }
 
-    fn discard_accepted_input(&self, task_id: &FinalTaskId) {
-        self.accepted_inputs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(task_id);
+    fn persist_transition_clearing_input(
+        &self,
+        expected: &FinalTaskSnapshot,
+        task: FinalTask,
+    ) -> McpResult<()> {
+        let notification = final_task_notification(&task);
+        if !self.store.replace_task_and_clear_input_if_current(
+            expected,
+            task,
+            notification.clone(),
+        )? {
+            return Err(McpError::invalid_params(
+                "Task state changed before the transition could be recorded",
+            ));
+        }
+        self.emit(notification);
+        Ok(())
     }
 
     fn emit(&self, notification: FinalTaskStatusNotification) {
@@ -2425,6 +2826,105 @@ impl FinalTaskRuntime {
             .clone();
         for emitter in emitters {
             emitter(notification.clone());
+        }
+    }
+
+    fn restore_accepted_input(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+        input_responses: FinalTaskInputResponses,
+    ) -> McpResult<bool> {
+        self.store
+            .restore_input_if_current(task_id, generation, input_responses)
+    }
+
+    fn signal_task_service(&self, task_id: FinalTaskId) {
+        let mut signal = self
+            .service_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(sender) = signal.as_ref() else {
+            return;
+        };
+        if sender.try_send(task_id).is_err() && sender.is_closed() {
+            // A completed or cancelled runner releases this process-local
+            // signal. The durable accepted-input record stays untouched for a
+            // later service generation to recover.
+            *signal = None;
+        }
+    }
+}
+
+impl AuthorizedTaskServiceRunner {
+    /// Runs recovery and bounded wakeup handling inside the caller's
+    /// structured application region.
+    ///
+    /// The durable store is scanned before the first wait and after every
+    /// wakeup. A queue-full or missed synchronous signal therefore delays
+    /// recovery but cannot erase a committed handoff. If the application
+    /// supervisor returns an error, the exact current handoff is restored
+    /// before that error leaves the region; a subsequent installed service may
+    /// recover it. This is at-least-once handoff semantics, not an exactly-once
+    /// side-effect claim.
+    pub async fn run(mut self, cx: &Cx) -> McpResult<()> {
+        self.recover_pending(cx).await?;
+        loop {
+            let task_id = match self.receiver.recv(cx).await {
+                Ok(task_id) => task_id,
+                Err(_) if cx.checkpoint().is_err() => return Ok(()),
+                Err(error) => {
+                    return Err(McpError::internal_error(format!(
+                        "Task service wakeup receive failed: {error}"
+                    )));
+                }
+            };
+            self.resume_task(cx, &task_id).await?;
+            self.recover_pending(cx).await?;
+        }
+    }
+
+    async fn recover_pending(&self, cx: &Cx) -> McpResult<()> {
+        while let Some(accepted) = self.runtime.recover_accepted_input()? {
+            self.resume_accepted(cx, accepted).await?;
+        }
+        Ok(())
+    }
+
+    async fn resume_task(&self, cx: &Cx, task_id: &FinalTaskId) -> McpResult<()> {
+        if let Some(accepted) = self.runtime.take_accepted_input(task_id)? {
+            self.resume_accepted(cx, accepted).await?;
+        }
+        Ok(())
+    }
+
+    async fn resume_accepted(&self, cx: &Cx, accepted: FinalTaskAcceptedInput) -> McpResult<()> {
+        let task_id = accepted.task_id().clone();
+        let generation = accepted.generation();
+        let input_responses = accepted.restore_copy();
+        if let Err(error) = self.supervisor.resume(cx, accepted).await {
+            // The application callback receives ownership of the handoff, so
+            // preserve a copy before entering it. If a newer task transition
+            // won, restoration is fenced out and must not resurrect that task.
+            let _ = self
+                .runtime
+                .restore_accepted_input(&task_id, generation, input_responses)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AuthorizedTaskServiceRunner {
+    fn drop(&mut self) {
+        self.receiver.close();
+        let mut signal = self
+            .runtime
+            .service_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if signal.as_ref().is_some_and(Sender::is_closed) {
+            *signal = None;
         }
     }
 }
@@ -2586,6 +3086,47 @@ mod tests {
                 }
             }),
         )
+    }
+
+    struct RecordingFinalTaskSupervisor {
+        accepted: Arc<Mutex<Vec<(FinalTaskId, FinalTaskInputResponses)>>>,
+    }
+
+    impl ApplicationTaskSupervisor for RecordingFinalTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            cx: &'a Cx,
+            accepted: FinalTaskAcceptedInput,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let recorded = Arc::clone(&self.accepted);
+            Box::pin(async move {
+                recorded
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((accepted.task_id().clone(), accepted.input_responses().clone()));
+                // The caller controls the structured service region. Ending it
+                // after one observed recovery makes this test prove that the
+                // runner neither creates a runtime nor detaches a worker.
+                cx.cancel_with(CancelKind::User, None);
+                Ok(())
+            })
+        }
+    }
+
+    struct FailingFinalTaskSupervisor;
+
+    impl ApplicationTaskSupervisor for FailingFinalTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _accepted: FinalTaskAcceptedInput,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async {
+                Err(McpError::internal_error(
+                    "planted caller-owned supervisor failure",
+                ))
+            })
+        }
     }
 
     fn final_roots_request() -> FinalTaskInputRequests {
@@ -2799,6 +3340,71 @@ mod tests {
                 .expect("task without a TTL remains readable")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn task_03_final_runtime_emits_null_ttl_and_retains_without_automatic_expiry() {
+        const ELAPSED_MS: u64 = 60_000;
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let runtime = FinalTaskRuntime::new(
+            Arc::clone(&store),
+            FinalTaskRuntimeConfig::with_ttl(None, None)
+                .expect("null TTL is an explicit valid Task retention value"),
+            Arc::new(|_| {}),
+        );
+
+        let created = runtime
+            .create_task(None)
+            .expect("null-TTL task is durably created");
+        let task_id = created.task.base().task_id.clone();
+        assert!(created.task.base().ttl_ms.is_none());
+        assert_eq!(runtime.config.ttl_ms(), None);
+
+        let mut clock = now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *clock = clock
+            .checked_add(StdDuration::from_millis(ELAPSED_MS))
+            .expect("test clock can advance past an unlimited task lifetime");
+        drop(clock);
+
+        assert!(
+            runtime.get_task(&task_id).is_ok(),
+            "only null TTL differs from the finite deadline case, so it remains retained"
+        );
+        assert_eq!(store.task_count(), 1);
+    }
+
+    #[test]
+    fn task_03_final_runtime_finite_ttl_reclaims_at_the_same_deadline() {
+        const TTL_MS: u64 = 60_000;
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let runtime = FinalTaskRuntime::new(
+            Arc::clone(&store),
+            FinalTaskRuntimeConfig::with_ttl(Some(TTL_MS), None)
+                .expect("positive TTL is a valid Task retention value"),
+            Arc::new(|_| {}),
+        );
+
+        let created = runtime
+            .create_task(None)
+            .expect("finite-TTL task is durably created");
+        let task_id = created.task.base().task_id.clone();
+        assert!(created.task.base().ttl_ms.is_some());
+
+        let mut clock = now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *clock = clock
+            .checked_add(StdDuration::from_millis(TTL_MS))
+            .expect("test clock reaches the finite task deadline");
+        drop(clock);
+
+        assert!(
+            runtime.get_task(&task_id).is_err(),
+            "changing only null TTL to a positive TTL permits reclamation at its deadline"
+        );
+        assert_eq!(store.task_count(), 0);
     }
 
     #[test]
@@ -3217,7 +3823,11 @@ mod tests {
                 .expect("typed second roots input request"),
         );
         runtime
-            .require_input(&task_id, requests, Some("awaiting both roots responses".to_owned()))
+            .require_input(
+                &task_id,
+                requests,
+                Some("awaiting both roots responses".to_owned()),
+            )
             .expect("working task requests two typed inputs");
 
         let first: FinalTaskInputResponses = serde_json::from_value(serde_json::json!({
@@ -3242,12 +3852,18 @@ mod tests {
         runtime
             .update_task(&task_id, &second)
             .expect("accept final matching input response");
+        let resumed_generation = store
+            .get_task_snapshot(&task_id)
+            .expect("read resumed task generation")
+            .expect("resumed task remains retained")
+            .generation();
 
         let accepted = runtime
             .take_accepted_input(&task_id)
             .expect("resumed task exposes one supervisor handoff")
             .expect("all accepted input values are retained for the resumed worker");
         assert_eq!(accepted.task_id(), &task_id);
+        assert_eq!(accepted.generation(), resumed_generation);
         assert_eq!(accepted.input_responses().get("roots"), first.get("roots"));
         assert_eq!(
             accepted.input_responses().get("workspace-roots"),
@@ -3266,6 +3882,156 @@ mod tests {
                 .expect("second handoff read is valid")
                 .is_none(),
             "the supervisor handoff is one-shot and cannot replay accepted input"
+        );
+    }
+
+    #[test]
+    fn task_03_final_new_input_cycle_clears_unconsumed_prior_handoff() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = runtime
+            .create_task(None)
+            .expect("create task for two input cycles")
+            .task
+            .base()
+            .task_id
+            .clone();
+
+        let mut first_requests = FinalTaskInputRequests::new();
+        first_requests.insert(
+            "first-roots".to_owned(),
+            serde_json::from_value(serde_json::json!({"method": "roots/list"}))
+                .expect("typed first-cycle roots request"),
+        );
+        runtime
+            .require_input(&task_id, first_requests, None)
+            .expect("enter first input cycle");
+        let first_responses: FinalTaskInputResponses = serde_json::from_value(serde_json::json!({
+            "first-roots": {"roots": [{"uri": "file:///first-cycle"}]}
+        }))
+        .expect("typed first-cycle response");
+        runtime
+            .update_task(&task_id, &first_responses)
+            .expect("complete first input cycle without consuming its handoff");
+
+        let mut second_requests = FinalTaskInputRequests::new();
+        second_requests.insert(
+            "second-roots".to_owned(),
+            serde_json::from_value(serde_json::json!({"method": "roots/list"}))
+                .expect("typed second-cycle roots request"),
+        );
+        runtime
+            .require_input(&task_id, second_requests, None)
+            .expect("enter second input cycle and clear the first handoff");
+        let second_responses: FinalTaskInputResponses = serde_json::from_value(serde_json::json!({
+            "second-roots": {"roots": [{"uri": "file:///second-cycle"}]}
+        }))
+        .expect("typed second-cycle response");
+        runtime
+            .update_task(&task_id, &second_responses)
+            .expect("complete second input cycle");
+
+        let accepted = runtime
+            .take_accepted_input(&task_id)
+            .expect("read second-cycle supervisor handoff")
+            .expect("second cycle retains its accepted response");
+        assert_eq!(accepted.input_responses(), &second_responses);
+        assert!(
+            !accepted.input_responses().contains_key("first-roots"),
+            "starting a new cycle atomically removes unconsumed prior-cycle input"
+        );
+    }
+
+    #[test]
+    fn task_03_final_terminal_transition_fences_stale_input_take() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = runtime
+            .create_task(None)
+            .expect("create task for terminal input race")
+            .task
+            .base()
+            .task_id
+            .clone();
+        runtime
+            .require_input(&task_id, final_roots_request(), None)
+            .expect("task requests roots before terminal race");
+        let input_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed roots response");
+        runtime
+            .update_task(&task_id, &input_responses)
+            .expect("accepted input returns task to working");
+        let stale_working = store
+            .get_task_snapshot(&task_id)
+            .expect("read pre-terminal generation")
+            .expect("working task remains retained");
+        let result: FinalTaskCallToolResult =
+            serde_json::from_value(serde_json::json!({"content": []}))
+                .expect("typed terminal tool result");
+        runtime
+            .complete_task(&task_id, result, None)
+            .expect("terminal transition wins before stale supervisor take");
+        let terminal = store
+            .get_task_snapshot(&task_id)
+            .expect("read terminal generation")
+            .expect("terminal task remains retained");
+
+        assert_ne!(terminal.generation(), stale_working.generation());
+        assert!(matches!(terminal.task(), FinalTask::Completed { .. }));
+        assert!(
+            store
+                .take_input_if_current(&stale_working)
+                .expect("stale generation take fails closed")
+                .is_none(),
+            "a stale working generation cannot consume after a terminal winner"
+        );
+        assert!(
+            runtime
+                .take_accepted_input(&task_id)
+                .expect("terminal task has no supervisor handoff")
+                .is_none(),
+            "the terminal transition atomically clears previously accepted input"
+        );
+    }
+
+    #[test]
+    fn task_03_final_new_runtime_recovers_unconsumed_input_handoff() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let first_runtime =
+            final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = first_runtime
+            .create_task(None)
+            .expect("create task before runtime replacement")
+            .task
+            .base()
+            .task_id
+            .clone();
+        first_runtime
+            .require_input(&task_id, final_roots_request(), None)
+            .expect("task requests input before runtime replacement");
+        let input_responses: FinalTaskInputResponses = serde_json::from_value(
+            serde_json::json!({"roots": {"roots": [{"uri": "file:///recovered"}]}}),
+        )
+        .expect("typed retained roots response");
+        first_runtime
+            .update_task(&task_id, &input_responses)
+            .expect("store commits task state and input together");
+        drop(first_runtime);
+
+        let recovered_runtime =
+            final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let accepted = recovered_runtime
+            .take_accepted_input(&task_id)
+            .expect("new runtime reads the store-owned handoff")
+            .expect("unconsumed accepted input survives runtime replacement");
+        assert_eq!(accepted.input_responses(), &input_responses);
+        assert!(
+            recovered_runtime
+                .take_accepted_input(&task_id)
+                .expect("second recovered take is valid")
+                .is_none(),
+            "the recovered handoff remains one-shot"
         );
     }
 
@@ -3316,7 +4082,10 @@ mod tests {
                 .task,
         )
         .expect("serialize task after rejected response");
-        assert_eq!(after, before, "rejected input leaves durable task state unchanged");
+        assert_eq!(
+            after, before,
+            "rejected input leaves durable task state unchanged"
+        );
         assert_eq!(
             serde_json::to_vec(&store.latest_notification(&task_id))
                 .expect("serialize retained notification after rejection"),
