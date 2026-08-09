@@ -4747,9 +4747,20 @@ fn validate_final_task_request_meta(
     request: &FinalTaskRequestMeta,
     method: &'static str,
 ) -> McpResult<()> {
-    let protocol_version = request.meta.protocol_version().ok().flatten();
+    // Typed modern admission consumes the protocol-version marker upstream
+    // and deliberately strips it before handler parameter decoding, so its
+    // absence here is the normal dispatched shape; when a direct caller does
+    // supply it, it must still be the exact final version. Client
+    // capabilities survive stripping and remain required.
+    let Ok(protocol_version) = request.meta.protocol_version() else {
+        return Err(McpError::invalid_params(format!(
+            "Invalid final {method} parameters"
+        )));
+    };
     let client_capabilities = request.meta.client_capabilities().ok().flatten();
-    if protocol_version != Some(FINAL_PROTOCOL_VERSION) || client_capabilities.is_none() {
+    if protocol_version.is_some_and(|version| version != FINAL_PROTOCOL_VERSION)
+        || client_capabilities.is_none()
+    {
         return Err(McpError::invalid_params(format!(
             "Invalid final {method} parameters"
         )));

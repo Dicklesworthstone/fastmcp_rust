@@ -15392,14 +15392,19 @@ mod lib_unit_tests {
             .base()
             .task_id
             .clone();
+        // The caller extension registered with RejectOneSided, so the client
+        // must declare it alongside the official Tasks extension or the whole
+        // per-request negotiation (correctly) rejects.
+        let mut get_params = final_tasks_get_params(&task_id, serde_json::json!({}));
+        get_params
+            .pointer_mut("/_meta/io.modelcontextprotocol~1clientCapabilities/extensions")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("baseline request declares client extensions")
+            .insert("com.example/echo".to_owned(), serde_json::json!({}));
         let response = server
             .dispatch_stateless(
                 &InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory),
-                &JsonRpcRequest::new(
-                    fastmcp_protocol::TASK_GET,
-                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
-                    71_i64,
-                ),
+                &JsonRpcRequest::new(fastmcp_protocol::TASK_GET, Some(get_params), 71_i64),
             )
             .expect("merged final Tasks handler must route requests");
         assert!(response.error.is_none());
@@ -16108,62 +16113,88 @@ mod lib_unit_tests {
         let mut session = initialized_test_session(&server);
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let request = JsonRpcRequest::new(
-            "tools/list",
-            Some(serde_json::json!({
-                "authorization": "Bearer top-level-secret",
-                "_meta": {
-                    "accessToken": "Bearer metadata-secret",
-                    "trace": "preserved-metadata"
-                },
-                "headers": {
-                    "Authorization": "Bearer header-secret",
-                    "x-preserved": "yes"
-                },
-                "arguments": {
-                    "token": "domain-value",
-                    "nested": {"authorization": "domain-authorization"}
+
+        // The fail-closed credential grammar rejects a request carrying more
+        // than one recognized credential source, so each recognized location
+        // proves its visible-to-auth-then-stripped custody in its own
+        // single-source dispatch.
+        let cases = [
+            (
+                91_i64,
+                serde_json::json!({
+                    "authorization": "Bearer top-level-secret",
+                    "arguments": {
+                        "token": "domain-value",
+                        "nested": {"authorization": "domain-authorization"}
+                    }
+                }),
+            ),
+            (
+                92_i64,
+                serde_json::json!({
+                    "_meta": {
+                        "accessToken": "Bearer metadata-secret",
+                        "trace": "preserved-metadata"
+                    }
+                }),
+            ),
+            (
+                93_i64,
+                serde_json::json!({
+                    "headers": {
+                        "Authorization": "Bearer header-secret",
+                        "x-preserved": "yes"
+                    }
+                }),
+            ),
+        ];
+        for (id, params) in cases {
+            let request = JsonRpcRequest::new("tools/list", Some(params.clone()), id);
+            let response = server
+                .dispatch_request(
+                    &Cx::for_testing(),
+                    &mut session,
+                    request,
+                    &notification_sender,
+                    &request_sender,
+                )
+                .expect("authenticated tools/list must respond");
+            assert!(
+                response.error.is_none(),
+                "unexpected response for id {id}: {response:?}"
+            );
+
+            let raw = raw
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("auth provider must receive raw params");
+            assert_eq!(raw, params, "auth must see the unstripped params");
+
+            let sanitized = sanitized
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("middleware must receive sanitized params");
+            match id {
+                91 => {
+                    assert!(sanitized.get("authorization").is_none());
+                    assert_eq!(sanitized["arguments"]["token"], "domain-value");
+                    assert_eq!(
+                        sanitized["arguments"]["nested"]["authorization"],
+                        "domain-authorization"
+                    );
                 }
-            })),
-            91_i64,
-        );
-
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                request,
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("authenticated tools/list must respond");
-        assert!(
-            response.error.is_none(),
-            "unexpected response: {response:?}"
-        );
-
-        let raw = raw
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .expect("auth provider must receive raw params");
-        assert_eq!(raw["authorization"], "Bearer top-level-secret");
-
-        let sanitized = sanitized
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .expect("middleware must receive sanitized params");
-        assert!(sanitized.get("authorization").is_none());
-        assert!(sanitized["_meta"].get("accessToken").is_none());
-        assert_eq!(sanitized["_meta"]["trace"], "preserved-metadata");
-        assert!(sanitized["headers"].get("Authorization").is_none());
-        assert_eq!(sanitized["headers"]["x-preserved"], "yes");
-        assert_eq!(sanitized["arguments"]["token"], "domain-value");
-        assert_eq!(
-            sanitized["arguments"]["nested"]["authorization"],
-            "domain-authorization"
-        );
+                92 => {
+                    assert!(sanitized["_meta"].get("accessToken").is_none());
+                    assert_eq!(sanitized["_meta"]["trace"], "preserved-metadata");
+                }
+                _ => {
+                    assert!(sanitized["headers"].get("Authorization").is_none());
+                    assert_eq!(sanitized["headers"]["x-preserved"], "yes");
+                }
+            }
+        }
     }
 
     #[test]
