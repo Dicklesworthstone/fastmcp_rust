@@ -1614,7 +1614,11 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"notifications/initialized","id":null}"#,
         )
         .expect_err("an explicit null id must not become a notification");
-        assert!(error.to_string().contains("invalid type"));
+        assert!(
+            error
+                .to_string()
+                .contains("JSON-RPC id must be a string or mathematical integer")
+        );
 
         let notification = serde_json::from_str::<JsonRpcRequest>(
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,

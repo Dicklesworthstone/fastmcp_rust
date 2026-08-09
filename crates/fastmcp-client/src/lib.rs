@@ -9772,8 +9772,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn complete_late_message_routes_unrelated_response_and_retires_tombstone() {
-        let mut client =
-            make_shell_scripted_initialized_client("exec sleep 2", Duration::from_secs(1));
+        // The unrelated response must arrive through the real transport:
+        // routing now retains each response's raw admitted source frame, so a
+        // fabricated in-memory response (which no frame ever carried) is
+        // correctly refused by production code.
+        let mut client = make_shell_scripted_initialized_client(
+            r#"printf '%s
+' '{"jsonrpc":"2.0","id":21,"result":{"owner":"unrelated"}}'; exec sleep 2"#,
+            Duration::from_secs(1),
+        );
         let timed_out_id = RequestId::Number(20);
         let unrelated_id = RequestId::Number(21);
         let mut timed_out_waiter = client
@@ -9785,12 +9792,15 @@ mod tests {
             .register(unrelated_id.clone())
             .expect("register unrelated owner");
 
+        let recv_cx = Cx::for_request();
+        let unrelated_message = client
+            .transport
+            .recv(&recv_cx)
+            .expect("scripted unrelated response arrives with its source frame");
+
         let timeout = client.finish_timeout_after_complete_message(
             &timed_out_id,
-            JsonRpcMessage::Response(JsonRpcResponse::success(
-                unrelated_id.clone(),
-                serde_json::json!({"owner": "unrelated"}),
-            )),
+            unrelated_message,
             RequestTimeoutSource::Idle,
         );
 
