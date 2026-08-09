@@ -21,9 +21,9 @@ use asupersync::CancelKind;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::reactor::create_reactor;
 use fastmcp_rust::{
-    auto, CanonicalHttpUrl, ClientHttpConnection, ClientHttpResponse, ClientProtocolPlan, Cx,
-    JsonRpcMessage, ModernHttpResponseKind, ModernHttpResponseStream, ProtocolEra,
-    ProtocolPolicy, RequestId, Server, SseLimits,
+    CanonicalHttpUrl, ClientHttpResponse, ClientProtocolPlan, Cx, JsonRpcMessage,
+    ModernHttpResponseKind, ModernHttpResponseStream, ProtocolEra, ProtocolPolicy, Server,
+    SseLimits, auto,
 };
 use serde_json::json;
 
@@ -36,6 +36,9 @@ fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
 
 const HTTP_SERVER_STARTUP_BOUND: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(2);
+/// Hard ceiling for the server task itself. This bounds the owned thread even
+/// if cancellation is not observed by a future regression in server teardown.
+const HTTP_SERVER_THREAD_BOUND: Duration = Duration::from_secs(4);
 
 /// Owns one real public HTTP server composition and proves its teardown.
 ///
@@ -45,62 +48,89 @@ const HTTP_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(2);
 /// implements without a bespoke test tool.
 struct HttpServerFixture {
     address: SocketAddr,
-    shutdown: Cx,
+    shutdown: mpsc::SyncSender<()>,
     finished: mpsc::Receiver<Result<(), String>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl HttpServerFixture {
     fn spawn() -> Self {
-        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(SocketAddr, Cx), String>>(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
-        let join = thread::spawn(move || {
+        let mut join = Some(thread::spawn(move || {
             let ready_for_spawn_failure = ready_tx.clone();
             let finished_for_spawn_failure = finished_tx.clone();
             let (task_done_tx, task_done_rx) = mpsc::channel::<()>();
+            let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
             let runtime = RuntimeBuilder::current_thread()
                 .with_reactor(create_reactor().expect("server reactor initializes"))
                 .blocking_threads(4, 64)
                 .build()
                 .expect("server runtime builds");
-            let server_task = runtime.handle().try_spawn_with_cx(move |cx| async move {
-                let outcome = async {
-                    let bound = match Server::new("facade-http-example", "1.0.0")
-                        .protocol_policy(ProtocolPolicy::Auto)
-                        .build()
-                        .bind_http(&cx, "127.0.0.1:0")
-                        .await
-                    {
-                        Ok(bound) => bound,
-                        Err(error) => {
-                            let message = format!("facade HTTP server bind failed: {error}");
-                            let _ = ready_tx.send(Err(message.clone()));
-                            return Err(message);
-                        }
-                    };
-                    let address = match bound.local_addr() {
-                        Ok(address) => address,
-                        Err(error) => {
-                            let message = format!("facade HTTP server address failed: {error}");
-                            let _ = ready_tx.send(Err(message.clone()));
-                            return Err(message);
-                        }
-                    };
-                    if ready_tx.send(Ok((address, cx.clone()))).is_err() {
+            let server_task = runtime.handle().try_spawn_with_cx(move |cx| {
+                let server_cx_tx = server_cx_tx;
+                async move {
+                    if server_cx_tx.send(cx.clone()).is_err() {
                         cx.cancel_with(
                             CancelKind::User,
-                            Some("HTTP E2E startup receiver went away"),
+                            Some("HTTP E2E server control receiver went away"),
                         );
-                        return Err("HTTP E2E startup receiver went away".to_owned());
+                        let _ = finished_tx
+                            .send(Err("HTTP E2E server control receiver went away".to_owned()));
+                        let _ = task_done_tx.send(());
+                        return;
                     }
-                    bound
-                        .serve(&cx)
+                    let outcome =
+                        match asupersync::time::timeout(cx.now(), HTTP_SERVER_THREAD_BOUND, async {
+                            let bound = match Server::new("facade-http-example", "1.0.0")
+                                .protocol_policy(ProtocolPolicy::Auto)
+                                .build()
+                                .bind_http(&cx, "127.0.0.1:0")
+                                .await
+                            {
+                                Ok(bound) => bound,
+                                Err(error) => {
+                                    let message =
+                                        format!("facade HTTP server bind failed: {error}");
+                                    let _ = ready_tx.send(Err(message.clone()));
+                                    return Err(message);
+                                }
+                            };
+                            let address = match bound.local_addr() {
+                                Ok(address) => address,
+                                Err(error) => {
+                                    let message =
+                                        format!("facade HTTP server address failed: {error}");
+                                    let _ = ready_tx.send(Err(message.clone()));
+                                    return Err(message);
+                                }
+                            };
+                            if ready_tx.send(Ok(address)).is_err() {
+                                cx.cancel_with(
+                                    CancelKind::User,
+                                    Some("HTTP E2E startup receiver went away"),
+                                );
+                                return Err("HTTP E2E startup receiver went away".to_owned());
+                            }
+                            bound.serve(&cx).await.map_err(|error| {
+                                format!("facade HTTP server stopped unexpectedly: {error}")
+                            })
+                        })
                         .await
-                        .map_err(|error| format!("facade HTTP server stopped unexpectedly: {error}"))
+                        {
+                            Ok(outcome) => outcome,
+                            Err(_) => {
+                                cx.cancel_with(
+                                    CancelKind::User,
+                                    Some("HTTP E2E server task hard deadline exceeded"),
+                                );
+                                Err("facade HTTP server exceeded its hard task deadline".to_owned())
+                            }
+                        };
+                    let _ = finished_tx.send(outcome);
+                    let _ = task_done_tx.send(());
                 }
-                .await;
-                let _ = finished_tx.send(outcome);
-                let _ = task_done_tx.send(());
             });
             if let Err(error) = server_task {
                 let message = format!("facade HTTP server task was not admitted: {error}");
@@ -109,7 +139,28 @@ impl HttpServerFixture {
                 return;
             }
             runtime.block_on(async move {
+                let mut server_cx = None;
+                let mut shutdown_requested = false;
                 loop {
+                    match shutdown_rx.try_recv() {
+                        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                            shutdown_requested = true;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
+                    }
+                    if server_cx.is_none() {
+                        if let Ok(cx) = server_cx_rx.try_recv() {
+                            server_cx = Some(cx);
+                        }
+                    }
+                    if shutdown_requested {
+                        if let Some(cx) = server_cx.as_ref() {
+                            cx.cancel_with(
+                                CancelKind::User,
+                                Some("HTTP E2E fixture shutdown requested"),
+                            );
+                        }
+                    }
                     match task_done_rx.try_recv() {
                         Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
                         Err(mpsc::TryRecvError::Empty) => {
@@ -119,31 +170,40 @@ impl HttpServerFixture {
                     }
                 }
             });
-        });
+        }));
 
-        let (address, shutdown) = match ready_rx.recv_timeout(HTTP_SERVER_STARTUP_BOUND) {
-            Ok(Ok(ready)) => ready,
+        let address = match ready_rx.recv_timeout(HTTP_SERVER_STARTUP_BOUND) {
+            Ok(Ok(address)) => address,
             Ok(Err(error)) => {
-                let _ = finished_rx.recv_timeout(HTTP_SERVER_TEARDOWN_BOUND);
-                let _ = join.join();
-                panic!("public HTTP server failed to start: {error}");
+                let settlement = settle_http_server(
+                    &shutdown_tx,
+                    &finished_rx,
+                    join.take()
+                        .expect("HTTP server fixture retains its join handle"),
+                );
+                panic!(
+                    "public HTTP server failed to start: {error}; {settlement:?} after thread settlement"
+                );
             }
             Err(error) => {
-                let completed = finished_rx
-                    .recv_timeout(HTTP_SERVER_TEARDOWN_BOUND)
-                    .is_ok();
-                if completed {
-                    let _ = join.join();
-                }
-                panic!("public HTTP server startup exceeded its bound: {error}");
+                drop(ready_rx);
+                let settlement = settle_http_server(
+                    &shutdown_tx,
+                    &finished_rx,
+                    join.take()
+                        .expect("HTTP server fixture retains its join handle"),
+                );
+                panic!(
+                    "public HTTP server startup exceeded its bound: {error}; {settlement:?} after thread settlement"
+                );
             }
         };
 
         Self {
             address,
-            shutdown,
+            shutdown: shutdown_tx,
             finished: finished_rx,
-            join: Some(join),
+            join,
         }
     }
 
@@ -151,46 +211,92 @@ impl HttpServerFixture {
         self.address
     }
 
+    fn settle(&mut self) -> Result<(), String> {
+        settle_http_server(
+            &self.shutdown,
+            &self.finished,
+            self.join
+                .take()
+                .expect("HTTP server fixture retains its join handle"),
+        )
+    }
+
     fn shutdown(mut self) {
-        self.shutdown.cancel_with(
-            CancelKind::User,
-            Some("HTTP E2E fixture teardown requested"),
-        );
-        let outcome = self
-            .finished
-            .recv_timeout(HTTP_SERVER_TEARDOWN_BOUND)
-            .unwrap_or_else(|error| panic!("public HTTP server teardown exceeded its bound: {error}"));
-        self.join
-            .take()
-            .expect("HTTP server fixture retains its join handle")
-            .join()
-            .expect("HTTP server thread must not panic during teardown");
-        outcome.unwrap_or_else(|error| panic!("public HTTP server teardown failed: {error}"));
+        self.settle()
+            .unwrap_or_else(|error| panic!("public HTTP server teardown failed: {error}"));
     }
 }
 
 impl Drop for HttpServerFixture {
     fn drop(&mut self) {
-        let Some(join) = self.join.take() else {
+        if self.join.is_none() {
             return;
-        };
-        self.shutdown.cancel_with(
-            CancelKind::User,
-            Some("HTTP E2E fixture drop requested"),
-        );
-        match self.finished.recv_timeout(HTTP_SERVER_TEARDOWN_BOUND) {
-            Ok(_) => {
-                let join_result = join.join();
-                if !std::thread::panicking() {
-                    join_result.expect("HTTP server thread must not panic during fixture drop");
-                }
-            }
-            Err(error) if !std::thread::panicking() => {
-                panic!("public HTTP server fixture drop exceeded its teardown bound: {error}");
-            }
-            Err(_) => {}
+        }
+        let settlement = self.settle();
+        if !std::thread::panicking() {
+            settlement
+                .unwrap_or_else(|error| panic!("public HTTP server fixture drop failed: {error}"));
         }
     }
+}
+
+/// Signals shutdown without blocking and joins the owned server thread before
+/// returning any startup or teardown failure to the test.
+fn settle_http_server(
+    shutdown: &mpsc::SyncSender<()>,
+    finished: &mpsc::Receiver<Result<(), String>>,
+    join: JoinHandle<()>,
+) -> Result<(), String> {
+    settle_http_server_with_bound(shutdown, finished, join, HTTP_SERVER_TEARDOWN_BOUND)
+}
+
+/// This helper is separately bounded so the planted timeout test can prove
+/// that a reported timeout follows, rather than replaces, joining the owner.
+fn settle_http_server_with_bound(
+    shutdown: &mpsc::SyncSender<()>,
+    finished: &mpsc::Receiver<Result<(), String>>,
+    join: JoinHandle<()>,
+    completion_bound: Duration,
+) -> Result<(), String> {
+    match shutdown.try_send(()) {
+        Ok(()) | Err(mpsc::TrySendError::Full(())) | Err(mpsc::TrySendError::Disconnected(())) => {}
+    }
+    let completion = finished
+        .recv_timeout(completion_bound)
+        .map_err(|error| format!("public HTTP server teardown exceeded its bound: {error}"));
+    let joined = join
+        .join()
+        .map_err(|_| "HTTP server thread panicked during settlement".to_owned());
+
+    joined?;
+    completion?.map_err(|error| format!("public HTTP server teardown failed: {error}"))
+}
+
+#[test]
+fn e2e_http_fixture_planted_teardown_timeout_joins_before_failure() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let joined = Arc::new(AtomicBool::new(false));
+    let joined_by_server = Arc::clone(&joined);
+    let server = thread::spawn(move || {
+        shutdown_rx
+            .recv()
+            .expect("the bounded settlement path sends one shutdown signal");
+        joined_by_server.store(true, Ordering::SeqCst);
+    });
+
+    let settlement =
+        settle_http_server_with_bound(&shutdown_tx, &finished_rx, server, Duration::ZERO);
+
+    assert!(
+        joined.load(Ordering::SeqCst),
+        "the planted timeout is reported only after the owned server thread joined"
+    );
+    assert!(matches!(settlement, Err(error) if error.contains("exceeded its bound")));
+    drop(finished_tx);
 }
 
 fn plan(addr: SocketAddr, policy: ProtocolPolicy) -> ClientProtocolPlan {
@@ -225,34 +331,6 @@ fn plan_with_modern_post_path(
         0,
     )
     .expect("the complete HTTP plan must be accepted")
-}
-
-/// Performs the exact public 2024-11-05 initialization lifecycle over the
-/// Auto-selected legacy connection and returns its correlated response.
-fn initialize_exact_legacy_http(
-    cx: &Cx,
-    connection: &mut ClientHttpConnection,
-    request_id: i64,
-) -> serde_json::Value {
-    let response = runtime_block_on(connection.request(
-        cx,
-        "initialize",
-        json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "e2e-legacy-http-client", "version": "1.0.0"}
-        }),
-        RequestId::Number(request_id),
-    ))
-    .expect("legacy initialize POSTs to the live Auto-selected message endpoint");
-    let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) = response else {
-        panic!("the Auto-selected legacy connection must return a legacy JSON-RPC response");
-    };
-    let document = serde_json::to_value(response).expect("legacy initialize response reserializes");
-
-    runtime_block_on(connection.notify(cx, "notifications/initialized", None))
-        .expect("the exact legacy lifecycle acknowledgement uses the selected live endpoint");
-    document
 }
 
 /// Consumes whichever response lane the real server selected and returns the
@@ -297,7 +375,10 @@ fn e2e_public_http_auto_selects_modern_on_the_shipped_facade_server() {
     let builder = auto::client_builder()
         .client_info("e2e-modern-http-client", "1.0.0")
         .protocol_plan(plan(server.address(), ProtocolPolicy::Auto));
-    assert_eq!(builder.selected_protocol_plan().policy(), ProtocolPolicy::Auto);
+    assert_eq!(
+        builder.selected_protocol_plan().policy(),
+        ProtocolPolicy::Auto
+    );
 
     let mut client = runtime_block_on(builder.connect_http_client_with_cx(&cx))
         .expect("the public Auto facade client completes live modern discovery");
@@ -313,16 +394,12 @@ fn e2e_public_http_auto_selects_modern_on_the_shipped_facade_server() {
     );
     assert_eq!(
         client.connection().protocol_version(),
-        fastmcp_rust::modern::PROTOCOL_VERSION,
+        Some(fastmcp_rust::modern::PROTOCOL_VERSION),
         "the public HTTP connection reports the exact modern negotiated version"
     );
 
-    let response = runtime_block_on(client.request(
-        &cx,
-        "ping",
-        json!({}),
-    ))
-    .expect("the Auto-selected modern connection serves requests");
+    let response = runtime_block_on(client.request(&cx, "ping", json!({})))
+        .expect("the Auto-selected modern connection serves requests");
     let ClientHttpResponse::Modern(response) = response else {
         panic!("the selected modern HTTP client must retain the modern response lane");
     };
@@ -351,46 +428,38 @@ fn e2e_public_http_auto_falls_back_to_exact_legacy_on_live_eligible_refusal() {
             ProtocolPolicy::Auto,
             "/modern-unavailable",
         ));
-    assert_eq!(builder.selected_protocol_plan().policy(), ProtocolPolicy::Auto);
-    let mut connection = runtime_block_on(builder.connect_http_with_cx(&cx))
-        .expect("an eligible live modern-route refusal opens the exact legacy lane");
     assert_eq!(
-        connection.selected_protocol_era(),
+        builder.selected_protocol_plan().policy(),
+        ProtocolPolicy::Auto
+    );
+    let mut client = runtime_block_on(builder.connect_http_client_with_cx(&cx))
+        .expect("an eligible live modern-route refusal completes the exact legacy lifecycle");
+    assert_eq!(
+        client.selected_protocol_era(),
         ProtocolEra::Legacy2024,
         "Auto must expose exact legacy selection only after its eligible live refusal"
     );
-    assert_eq!(connection.protocol_plan().policy(), ProtocolPolicy::Auto);
+    assert_eq!(client.protocol_plan().policy(), ProtocolPolicy::Auto);
     assert!(
-        connection.server_discovery().is_none(),
+        client.server_discovery().is_none(),
         "exact legacy fallback cannot expose modern discovery state"
     );
     assert_eq!(
-        connection.protocol_version(),
-        fastmcp_rust::legacy_2024::PROTOCOL_VERSION,
-        "the public HTTP connection reports the exact legacy negotiated version"
-    );
-
-    let document = initialize_exact_legacy_http(&cx, &mut connection, 17);
-    assert!(
-        document.get("error").is_none(),
-        "exact legacy initialize after Auto fallback must not fail: {document}"
+        client.connection().protocol_version(),
+        Some(fastmcp_rust::legacy_2024::PROTOCOL_VERSION),
+        "the public HTTP connection retains the exact validated legacy initialize wire version"
     );
     assert_eq!(
-        document["result"]["serverInfo"]["name"],
-        json!("facade-http-example"),
+        client.server_info().name,
+        "facade-http-example",
         "the legacy initialization result comes from the shipped facade server composition"
     );
-    let ping = runtime_block_on(connection.request(
-        &cx,
-        "ping",
-        json!({}),
-        RequestId::Number(18),
-    ))
-    .expect("the initialized exact-legacy fallback remains usable");
+    let ping = runtime_block_on(client.request(&cx, "ping", json!({})))
+        .expect("the initialized exact-legacy fallback remains usable");
     let ClientHttpResponse::Legacy(JsonRpcMessage::Response(ping)) = ping else {
         panic!("the exact-legacy fallback must answer ping through its legacy response lane");
     };
     assert!(ping.error.is_none(), "legacy ping must not fail: {ping:?}");
-    drop(connection);
+    drop(client);
     server.shutdown();
 }

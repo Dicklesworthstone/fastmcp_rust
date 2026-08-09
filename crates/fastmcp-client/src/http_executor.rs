@@ -3267,11 +3267,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
+    use asupersync::{CancelKind, Cx};
     use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
     use fastmcp_protocol::protocol_policy::{LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION};
     use fastmcp_protocol::{
@@ -3297,11 +3298,57 @@ mod tests {
         body: Vec<u8>,
     }
 
+    const LEGACY_TEST_PEER_BOUND: Duration = Duration::from_secs(2);
+    const LEGACY_TEST_PEER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
     fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
         RuntimeBuilder::current_thread()
             .build()
             .expect("native HTTP test runtime must build")
             .block_on(future)
+    }
+
+    /// Accepts one local peer connection without allowing a pre-connect
+    /// client failure to strand the peer thread. The caller's deadline bounds
+    /// every accept in the scripted wire exchange, while the stop signal
+    /// closes the no-connection path before its owner joins the thread.
+    fn accept_legacy_test_peer(
+        listener: &TcpListener,
+        stop: &mpsc::Receiver<()>,
+        deadline: Instant,
+    ) -> Result<Option<TcpStream>, String> {
+        loop {
+            match stop.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return Ok(None),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(LEGACY_TEST_PEER_BOUND))
+                        .map_err(|error| format!("set legacy peer read timeout: {error}"))?;
+                    stream
+                        .set_write_timeout(Some(LEGACY_TEST_PEER_BOUND))
+                        .map_err(|error| format!("set legacy peer write timeout: {error}"))?;
+                    return Ok(Some(stream));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    thread::sleep(LEGACY_TEST_PEER_POLL_INTERVAL);
+                }
+                Err(error) => return Err(format!("accept legacy test peer: {error}")),
+            }
+        }
+    }
+
+    fn signal_legacy_test_peer_stop(stop: &mpsc::SyncSender<()>) {
+        match stop.try_send(()) {
+            Ok(())
+            | Err(mpsc::TrySendError::Full(()))
+            | Err(mpsc::TrySendError::Disconnected(())) => {}
+        }
     }
 
     #[test]
@@ -4729,8 +4776,15 @@ mod tests {
         let sse_target = format!("http://{address}/legacy-sse");
         let message_target = format!("http://{address}/legacy-message");
         let advertised_message_target = message_target.clone();
-        let server = thread::spawn(move || {
-            let (mut sse, _) = listener.accept().expect("accept legacy SSE GET");
+        let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
+        let server = thread::spawn(move || -> Result<bool, String> {
+            listener
+                .set_nonblocking(true)
+                .map_err(|error| format!("make legacy-version listener nonblocking: {error}"))?;
+            let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+            let Some(mut sse) = accept_legacy_test_peer(&listener, &stop_rx, deadline)? else {
+                return Ok(false);
+            };
             let sse_request = read_request(&mut sse);
             assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
             begin_chunked_sse(&mut sse);
@@ -4739,9 +4793,10 @@ mod tests {
                 &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
             );
 
-            let (mut initialize_post, _) = listener
-                .accept()
-                .expect("accept exact legacy initialize POST");
+            let Some(mut initialize_post) = accept_legacy_test_peer(&listener, &stop_rx, deadline)?
+            else {
+                return Ok(false);
+            };
             let initialize_request = read_request(&mut initialize_post);
             let initialize = serde_json::from_slice::<serde_json::Value>(&initialize_request.body)
                 .expect("legacy initialize POST must be JSON-RPC");
@@ -4753,10 +4808,11 @@ mod tests {
                 "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}\n\n",
             );
             finish_chunked_sse(&mut sse);
+            Ok(true)
         });
 
         let cx = Cx::for_request();
-        let error = runtime_block_on(
+        let connection_result = runtime_block_on(
             ClientBuilder::new()
                 .protocol_plan(plan(
                     "http://127.0.0.1:9/mcp",
@@ -4765,15 +4821,73 @@ mod tests {
                     ProtocolPolicy::LegacyOnly,
                 ))
                 .connect_http_client_with_cx(&cx),
-        )
-        .err()
-        .expect("only the selected legacy initialize version is incompatible");
+        );
+        signal_legacy_test_peer_stop(&stop_tx);
+        let served = server
+            .join()
+            .expect("legacy-version server thread must join")
+            .expect("legacy-version server must settle without an accept-loop failure");
+        let error = connection_result
+            .err()
+            .expect("only the selected legacy initialize version is incompatible");
+        assert!(
+            served,
+            "the wrong-version wire peer must receive its two requests"
+        );
         assert!(matches!(
             error,
             crate::HttpClientError::LegacyInitializationUnsupportedProtocolVersion { actual }
                 if actual == "2026-07-28"
         ));
-        server.join().expect("legacy-version server must join");
+    }
+
+    #[test]
+    fn wrong_version_peer_settles_after_a_planted_pre_connect_client_cancellation() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind local pre-connect settlement listener");
+        let address = listener
+            .local_addr()
+            .expect("read local pre-connect settlement address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
+        let server = thread::spawn(move || -> Result<bool, String> {
+            listener
+                .set_nonblocking(true)
+                .map_err(|error| format!("make pre-connect listener nonblocking: {error}"))?;
+            let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+            Ok(accept_legacy_test_peer(&listener, &stop_rx, deadline)?.is_some())
+        });
+
+        let cx = Cx::for_request();
+        cx.cancel_with(
+            CancelKind::User,
+            Some("plant a client failure before the legacy SSE connect"),
+        );
+        let connection_result = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    "http://127.0.0.1:9/mcp",
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::LegacyOnly,
+                ))
+                .connect_http_client_with_cx(&cx),
+        );
+        signal_legacy_test_peer_stop(&stop_tx);
+        let accepted = server
+            .join()
+            .expect("pre-connect server thread must join")
+            .expect("pre-connect server must settle without an accept-loop failure");
+
+        assert!(
+            connection_result.is_err(),
+            "the planted cancelled context fails before the legacy peer can connect"
+        );
+        assert!(
+            !accepted,
+            "the stopped peer must not accept a connection after the pre-connect failure"
+        );
     }
 
     #[test]
