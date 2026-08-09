@@ -4971,7 +4971,10 @@ impl Server {
                     .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 serde_json::to_value(self.server_discovery()?).map_err(McpError::from)
             } else {
-                match self.router.dispatch_stateless(&request_ctx, &admission_request) {
+                match self
+                    .router
+                    .dispatch_stateless(&request_ctx, &admission_request)
+                {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
                         self.dispatch_extension_fallback(&request_ctx, &admission_request)
                     }
