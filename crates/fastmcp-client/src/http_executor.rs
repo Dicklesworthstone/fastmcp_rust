@@ -77,12 +77,12 @@ fn raw_final_notification_params(
 
     serde_json::from_slice::<RawNotificationEnvelope>(frame)
         .map_err(|_| FinalNotificationError::InvalidParams {
-            method: NOTIFICATIONS_PROGRESS.to_owned(),
+            method: NOTIFICATIONS_PROGRESS,
         })?
         .params
         .map(|params| params.get().to_owned())
         .ok_or(FinalNotificationError::InvalidParams {
-            method: NOTIFICATIONS_PROGRESS.to_owned(),
+            method: NOTIFICATIONS_PROGRESS,
         })
         .map(Some)
 }
@@ -4931,9 +4931,9 @@ mod tests {
 
     fn run_public_http_tasks_lifecycle() -> Result<
         (
-            fastmcp_protocol::FinalGetTaskResult,
-            fastmcp_protocol::FinalUpdateTaskResult,
-            fastmcp_protocol::FinalCancelTaskResult,
+            fastmcp_protocol::tasks_extension::GetTaskResult,
+            fastmcp_protocol::tasks_extension::UpdateTaskResult,
+            fastmcp_protocol::tasks_extension::CancelTaskResult,
         ),
         ClientHttpConnectionError,
     > {
@@ -4959,9 +4959,9 @@ mod tests {
             );
 
             let (mut get, _) = listener.accept().expect("accept tasks/get request");
-            let get =
+            let get_request =
                 assert_public_http_tasks_lifecycle_request(read_request(&mut get), "tasks/get", 2);
-            assert_eq!(get["params"]["taskId"], "task-73");
+            assert_eq!(get_request["params"]["taskId"], "task-73");
             write_response(
                 &mut get,
                 200,
@@ -4970,13 +4970,13 @@ mod tests {
             );
 
             let (mut update, _) = listener.accept().expect("accept tasks/update request");
-            let update = assert_public_http_tasks_lifecycle_request(
+            let update_request = assert_public_http_tasks_lifecycle_request(
                 read_request(&mut update),
                 "tasks/update",
                 3,
             );
-            assert_eq!(update["params"]["taskId"], "task-73");
-            assert_eq!(update["params"]["inputResponses"], serde_json::json!({}));
+            assert_eq!(update_request["params"]["taskId"], "task-73");
+            assert_eq!(update_request["params"]["inputResponses"], serde_json::json!({}));
             write_response(
                 &mut update,
                 200,
@@ -4985,12 +4985,12 @@ mod tests {
             );
 
             let (mut cancel, _) = listener.accept().expect("accept tasks/cancel request");
-            let cancel = assert_public_http_tasks_lifecycle_request(
+            let cancel_request = assert_public_http_tasks_lifecycle_request(
                 read_request(&mut cancel),
                 "tasks/cancel",
                 4,
             );
-            assert_eq!(cancel["params"]["taskId"], "task-73");
+            assert_eq!(cancel_request["params"]["taskId"], "task-73");
             write_response(
                 &mut cancel,
                 200,
@@ -5218,11 +5218,11 @@ mod tests {
             write_response(&mut probe, 200, "application/json", modern_discovery_body());
 
             let (mut request, _) = listener.accept().expect("accept positive modern request");
-            let request = read_request(&mut request);
-            let request = serde_json::from_slice::<serde_json::Value>(&request.body)
+            let request_wire = read_request(&mut request);
+            let request_body = serde_json::from_slice::<serde_json::Value>(&request_wire.body)
                 .expect("positive modern request must be JSON-RPC");
-            assert_eq!(request["id"], 2);
-            assert_eq!(request["method"], "tools/list");
+            assert_eq!(request_body["id"], 2);
+            assert_eq!(request_body["method"], "tools/list");
             write_response(
                 &mut request,
                 200,
@@ -5979,7 +5979,7 @@ mod tests {
         assert_eq!(get.task.base().task_id.as_str(), "task-73");
         assert!(matches!(
             get.task,
-            fastmcp_protocol::FinalTask::InputRequired { .. }
+            fastmcp_protocol::tasks_extension::Task::InputRequired { .. }
         ));
         assert!(update.meta.is_none());
         assert!(update.additional.is_empty());

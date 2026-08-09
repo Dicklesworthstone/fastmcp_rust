@@ -4140,6 +4140,12 @@ pub enum HttpClientError {
     CoreResult(McpError),
 }
 
+impl From<McpError> for HttpClientError {
+    fn from(error: McpError) -> Self {
+        Self::CoreResult(error)
+    }
+}
+
 impl std::fmt::Display for HttpClientError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -6484,6 +6490,14 @@ impl Client {
     /// served, so an already-delivered list/resource invalidation wins over a
     /// fresh entry. Targets without a nonblocking child-pipe primitive discard
     /// retained entries instead of serving an unread notification stale.
+    /// Observes caller cancellation between cached task-poll steps.
+    fn checkpoint_task_poll(&mut self) -> McpResult<()> {
+        if self.cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        Ok(())
+    }
+
     fn drain_final_cache_invalidations(&mut self) -> McpResult<()> {
         self.checkpoint_task_poll()?;
 
