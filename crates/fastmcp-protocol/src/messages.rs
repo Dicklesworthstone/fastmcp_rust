@@ -7083,7 +7083,10 @@ mod tests {
         let entries = (0..15)
             .map(|index| format!(r#""key-{index}":"{escaped_maximum_value}""#))
             .collect::<Vec<_>>();
-        let prefix = format!(r#"{{{},"tail":"#, entries.join(","));
+        // The tail value's OPENING quote belongs to the prefix; the suffix
+        // carries only the closing quote and brace. Omitting it made the
+        // fixture invalid JSON and turned both assertions vacuous.
+        let prefix = format!(r#"{{{},"tail":""#, entries.join(","));
         let suffix = r#""}"#;
         let tail_bytes = MAX_COMPLETION_CONTEXT_ARGUMENT_BYTES - prefix.len() - suffix.len();
         assert!(tail_bytes <= MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES);
