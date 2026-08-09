@@ -113,10 +113,26 @@ pub mod __private {
     pub use serde_json;
 }
 
+/// Re-export the runtime package used by the facade's public `Cx` and lab
+/// types. This keeps deterministic macro and handler tests on a facade-only
+/// dependency path.
+pub use asupersync;
+
+/// Complete component namespaces for advanced consumers.
+///
+/// The root, [`modern`], and [`legacy_2024`] exports are the ergonomic API.
+/// These namespaces retain every implemented public item without requiring an
+/// application to name a FastMCP component crate directly.
+pub use fastmcp_client as client;
+pub use fastmcp_core as core;
+pub use fastmcp_derive as derive;
+pub use fastmcp_protocol as protocol;
+pub use fastmcp_server as server;
+
 /// JSON values and objects used by the protocol's schema-open and exact legacy
 /// adapter surfaces. Re-exporting these keeps one-crate consumers from having
 /// to name FastMCP's transitive serialization crate to implement an adapter.
-pub use serde_json::{Map as JsonMap, Value as JsonValue};
+pub use serde_json::{self, Map as JsonMap, Value as JsonValue, json};
 
 // Re-export core types
 pub use fastmcp_core::{
@@ -129,6 +145,18 @@ pub use fastmcp_core::{
     SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender,
     SamplingStopReason, Scope, ServerCapabilityInfo, TaskId, ToolCallResult, ToolCaller,
     ToolContentItem, cancelled, err, ok,
+};
+pub use fastmcp_core::{
+    DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS, DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND,
+    DEFAULT_LOGICAL_EXCHANGE_MAX_ROUNDS, DEFAULT_LOGICAL_EXCHANGE_MAX_STATE_BYTES,
+    DEFAULT_LOGICAL_EXCHANGE_MAX_WALL_CLOCK, DISABLED_PROMPTS_KEY, DISABLED_RESOURCES_KEY,
+    DISABLED_TOOLS_KEY, HARD_LOGICAL_EXCHANGE_MAX_INPUTS,
+    HARD_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND, HARD_LOGICAL_EXCHANGE_MAX_ROUNDS,
+    HARD_LOGICAL_EXCHANGE_MAX_STATE_BYTES, HARD_LOGICAL_EXCHANGE_MAX_WALL_CLOCK,
+    LogicalExchangeBudget, LogicalExchangeBudgetError, LogicalExchangeBudgetResource,
+    MAX_ACCESS_SCHEME_BYTES, MAX_ACCESS_TOKEN_BYTES, ParseDurationError, ProtocolLimit,
+    ProtocolLimits, ProtocolLimitsBuilder, ProtocolLimitsError, SessionState, block_on,
+    parse_duration,
 };
 // The established root `NotificationSender` is the server router callback;
 // expose the McpContext progress capability without changing that legacy name.
@@ -160,14 +188,21 @@ pub use fastmcp_core::logging;
 // Re-export protocol types shared by both eras. Exact legacy initialization
 // types live in `legacy_2024`; modern discovery types live in `modern`.
 pub use fastmcp_protocol::{
-    CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, Content, GetPromptParams,
-    GetPromptResult, JsonRpcAdmissionError, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
-    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
-    ListToolsResult, LogLevel, ProgressMarker, Prompt, PromptArgument, PromptMessage,
-    ReadResourceParams, ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate,
-    ResourcesCapability, Role, ServerCapabilities, ServerInfo, SubscribeResourceParams, Tool,
-    ToolAnnotations, ToolsCapability, UnsubscribeResourceParams, decode_strict_jsonrpc_message,
+    CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, ClientIngressFailureScope,
+    Content, CorrelationKey, GetPromptParams, GetPromptResult, JSONRPC_VERSION,
+    JsonRpcAdmissionError, JsonRpcEndpointRole, JsonRpcError, JsonRpcMessage,
+    JsonRpcMessageDirection, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseAdmission,
+    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel,
+    MAX_JSONRPC_STRING_ID_ENCODED_BYTES, MAX_RAW_JSON_AGGREGATE_NUMBER_BYTES,
+    MAX_RAW_JSON_CONTAINER_ENTRIES, MAX_RAW_JSON_EXPONENT, MAX_RAW_JSON_NESTING_DEPTH,
+    MAX_RAW_JSON_NUMBER_BYTES, ProgressMarker, Prompt, PromptArgument, PromptMessage,
+    RawJsonAdmissionError, RawJsonRpcDisposition, ReadResourceParams, ReadResourceResult,
+    RequestId, Resource, ResourceContent, ResourceTemplate, ResourcesCapability, Role,
+    ServerCapabilities, ServerInfo, SubscribeResourceParams, Tool, ToolAnnotations,
+    ToolsCapability, UncorrelatedJsonRpcErrorResponse, UnsubscribeResourceParams,
+    admit_raw_jsonrpc_document, decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
+    dispose_raw_jsonrpc_failure,
 };
 
 pub use fastmcp_protocol::{
@@ -204,7 +239,8 @@ pub use fastmcp_protocol::{
     FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY,
     FinalArguments, FinalCallToolParams, FinalCallToolResult, FinalCancelledNotificationParams,
     FinalCompletionArgument, FinalCompletionContext, FinalCompletionParams,
-    FinalCompletionReference, FinalCompletionResult, FinalCoreRequest, FinalCoreResult,
+    FinalCompletionReference, FinalCompletionResult, FinalCompletionValues, FinalCoreRequest,
+    FinalCoreResult,
     FinalCreateMessageInputRequiredResult, FinalCreateMessageParams, FinalCreateMessageResult,
     FinalEmbeddedCreateMessageParams, FinalEmbeddedElicitationParams,
     FinalEmbeddedElicitationResult, FinalEmbeddedFormElicitationParams, FinalEmbeddedInputKind,
@@ -279,7 +315,7 @@ pub use fastmcp_protocol::tasks_extension;
 pub use fastmcp_protocol::tasks_extension::TASK_UPDATE;
 pub use fastmcp_protocol::{
     AdmittedSchema, FinalCoreResultType, SchemaAdmissionError, ValidationError, ValidationResult,
-    admit_final_schema, validate_final_core_result,
+    admit_final_schema, validate, validate_final_core_result, validate_strict,
 };
 pub use fastmcp_protocol::{
     CompleteTaskResult, CreateTaskResult, EmptyTaskResult, FinalCancelTaskParams,
@@ -337,11 +373,13 @@ pub use fastmcp_transport::http::{
     DualEraHttpSession, DualEraHttpSseResponse,
 };
 pub use fastmcp_transport::{
-    AsyncStdioTransport, Codec, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest,
-    HttpRequestHandler, HttpResponse, HttpResponseRepresentation, HttpStatus,
-    ModernHttpRequestAdmission, SendPermit, StdioTransport, StreamableHttpRequestCancellation,
-    StreamableHttpRequestResponseStream, StreamableHttpResponseStream, StreamableHttpTransport,
-    Transport, TransportError, TransportRecvHalf, TransportSendHalf, TwoPhaseTransport,
+    AsyncLineReader, AsyncStdin, AsyncStdioTransport, AsyncStdout, Codec, CodecError, HttpError,
+    HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
+    HttpResponseRepresentation, HttpStatus, InvalidMessageKind, ModernHttpRequestAdmission,
+    ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits, ModernSseParseError, SendPermit,
+    StdioTransport, StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
+    StreamableHttpResponseStream, StreamableHttpTransport, Transport, TransportError,
+    TransportRecvHalf, TransportSendHalf, TwoPhaseTransport,
 };
 
 // Re-export transport modules
@@ -367,7 +405,8 @@ pub use fastmcp_server::{
     create_context_with_progress, create_context_with_progress_and_senders,
 };
 pub use fastmcp_server::{
-    DuplicateBehavior, LifespanHooks, LoggingConfig, ShutdownHook, StartupHook,
+    DuplicateBehavior, LifespanHooks, LoggingConfig, ServerLaunchPolicyError, ShutdownHook,
+    StartupHook,
 };
 pub use fastmcp_server::{
     ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
@@ -392,13 +431,17 @@ pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
 pub use fastmcp_client::{
-    BoundedListPage, CancellationRequested, Client, ClientBuilder, ClientHttpConnection,
-    ClientHttpConnectionError, ClientHttpNegotiation, ClientHttpNegotiationDecision,
-    ClientHttpNegotiationError, ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
-    ClientProtocolPlanError, ClientSession, CompletionContext, CompletionParams,
-    CompletionReference, ExecutionTerminalReason, ExecutionTerminalRecord, ExecutionTerminalState,
-    FinalCacheStats, FinalTask, FinalTaskInputResponses, FinalTaskStatusNotification,
-    FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient, HttpClientError, ListPageLimits,
+    BoundedListPage, CachePartitionKey, CancellationRequested, Client, ClientBuilder,
+    ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
+    ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
+    ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
+    CompletionContext, CompletionParams, CompletionReference, DEFAULT_FINAL_CACHE_CAPACITY,
+    DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason, ExecutionTerminalRecord,
+    ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey,
+    FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
+    FinalCacheTtlDiagnostic, FinalResultCache, FinalTask, FinalTaskInputResponses,
+    FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient,
+    HttpClientError, ListPageLimits, MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES,
     OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback, Request,
     RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
     SubscriptionFilter, SubscriptionListenCollector,
@@ -497,16 +540,20 @@ pub mod modern {
     pub use fastmcp_client::sse;
     pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
     pub use fastmcp_client::{
-        BoundedListPage, CancellationRequested, Client, ClientBuilder, ClientHttpConnection,
-        ClientHttpConnectionError, ClientHttpNegotiation, ClientHttpNegotiationDecision,
-        ClientHttpNegotiationError, ClientHttpNegotiationState, ClientHttpResponse,
-        ClientProtocolPlan, ClientProtocolPlanError, ClientSession, CompletionContext,
-        CompletionParams, CompletionReference, ExecutionTerminalReason, ExecutionTerminalRecord,
-        ExecutionTerminalState, FinalCacheStats, FinalTask, FinalTaskInputResponses,
+        BoundedListPage, CachePartitionKey, CancellationRequested, Client, ClientBuilder,
+        ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
+        ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
+        ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
+        CompletionContext, CompletionParams, CompletionReference, DEFAULT_FINAL_CACHE_CAPACITY,
+        DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason, ExecutionTerminalRecord,
+        ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey,
+        FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
+        FinalCacheTtlDiagnostic, FinalResultCache, FinalTask, FinalTaskInputResponses,
         FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient,
-        HttpClientError, ListPageLimits, OpaquePagination, PaginationBounds, PendingRequestRecord,
-        ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
-        RequestTimeoutSource, SubscriptionFilter, SubscriptionListenCollector,
+        HttpClientError, ListPageLimits, MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES,
+        OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback, Request,
+        RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
+        SubscriptionFilter, SubscriptionListenCollector,
     };
     pub use fastmcp_client::{http_executor, mcp_config};
     pub use fastmcp_core::{
@@ -578,7 +625,7 @@ pub mod modern {
         AdmittedSchema, CacheScope, CacheTtl, CacheableResult, CancellationSender,
         CancellationWireCodecError, CancellationWireMessage, ClientCapabilities, ClientInfo,
         ClientNotification, CompleteResult, CompleteResultPayload, CompleteTaskResult,
-        CompletionValues, CoreDispatchError, CoreRequest, CoreResult,
+        CoreDispatchError, CoreRequest, CoreResult,
         CoreResultDiscriminatorPolicy, CreateTaskResult, DecodedResult, DiscoveryCacheHints,
         EmptyTaskResult, ExactJsonMember, ExactJsonObject, ExactJsonValue,
         FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
@@ -586,8 +633,9 @@ pub mod modern {
         FINAL_SERVER_INFO_META_KEY, FinalArguments, FinalBaseMetadata, FinalCallToolParams,
         FinalCallToolResult, FinalCancelTaskParams, FinalCancelTaskResult,
         FinalCancelledNotificationParams, FinalCompletionArgument, FinalCompletionContext,
-        FinalCompletionParams, FinalCompletionReference, FinalCompletionResult, FinalCoreRequest,
-        FinalCoreResult, FinalCoreResultType, FinalCreateMessageInputRequiredResult,
+        FinalCompletionParams, FinalCompletionReference, FinalCompletionResult,
+        FinalCompletionValues, FinalCoreRequest, FinalCoreResult, FinalCoreResultType,
+        FinalCreateMessageInputRequiredResult,
         FinalCreateMessageParams, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams,
         FinalEmbeddedElicitationParams, FinalEmbeddedElicitationResult,
         FinalEmbeddedFormElicitationParams, FinalEmbeddedInputKind, FinalEmbeddedInputRequest,
@@ -711,7 +759,8 @@ pub mod legacy_2024 {
         RootsRequestHandler as LegacyRootsRequestHandler,
         SamplingRequestHandler as LegacySamplingRequestHandler,
     };
-    pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
+    pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpContext, McpError, McpOutcome, McpResult};
+    pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::methods;
     pub use fastmcp_protocol::protocol_policy::{
         LEGACY_PROTOCOL_VERSION, LegacyAdapterReceiptIssuer, LegacyClientAdapterInstalledReceipt,
@@ -720,19 +769,28 @@ pub mod legacy_2024 {
         ProtocolPolicy, ProtocolVersion,
     };
     pub use fastmcp_protocol::{
-        CallToolParams, CallToolResult, CancellationSender, CancellationWireCodecError,
-        CancellationWireMessage, CancelledParams, ClientCapabilities, ClientInfo, CompletionValues,
-        GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage,
-        JsonRpcRequest, LegacyCompletionArgument, LegacyCompletionParams,
-        LegacyCompletionReference, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
-        LegacyCoreResult, LegacyEmptyResult, LegacyMetadata, LegacyOpaqueMetadata,
-        LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
-        ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-        ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel, LogMessageParams,
-        PROTOCOL_VERSION, ProgressMarker, ProgressParams, Prompt, PromptArgument,
-        ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource, ResourceTemplate,
-        ResourceUpdatedNotificationParams, ServerCapabilities, ServerInfo, SetLogLevelParams,
-        SubscribeResourceParams, Tool, ToolAnnotations, UnsubscribeResourceParams,
+        CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancellationSender,
+        CancellationWireCodecError, CancellationWireMessage, CancelledParams, ClientCapabilities,
+        ClientInfo, CompletionValues, CreateMessageParams, CreateMessageResult, ElicitAction,
+        ElicitCompleteNotificationParams, ElicitContentValue, ElicitMode, ElicitRequestFormParams,
+        ElicitRequestParams, ElicitRequestUrlParams, ElicitRequestedSchema, ElicitResult,
+        ElicitationCapability, ElicitationRequiredErrorData, FormElicitationCapability,
+        GetPromptParams, GetPromptResult, GetTaskParams, GetTaskResult, Icon, IncludeContext,
+        InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+        LegacyCompletionArgument, LegacyCompletionParams, LegacyCompletionReference,
+        LegacyCompletionResult, LegacyContent, LegacyCoreRequest, LegacyCoreResult,
+        LegacyEmptyResult, LegacyMetadata, LegacyOpaqueMetadata, LegacyPromptMessage,
+        LegacyResourceContent, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
+        ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListRootsParams,
+        ListRootsResult, ListTasksParams, ListTasksResult, ListToolsParams, ListToolsResult,
+        LogLevel, LogMessageParams, LoggingCapability, PROTOCOL_VERSION, ProgressMarker,
+        ProgressParams, Prompt, PromptArgument, PromptsCapability, ReadResourceParams,
+        ReadResourceResult, RequestId, RequestMeta, Resource, ResourceContent, ResourceTemplate,
+        ResourceUpdatedNotificationParams, ResourcesCapability, Root, RootsCapability,
+        SamplingCapability, SamplingContent, SamplingMessage, ServerCapabilities, ServerInfo,
+        SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, SubscribeResourceParams, TaskId,
+        TaskInfo, TaskResult, TaskStatus, TaskStatusNotificationParams, TasksCapability, Tool,
+        ToolAnnotations, ToolsCapability, UnsubscribeResourceParams, UrlElicitationCapability,
     };
     pub use fastmcp_server::legacy_2024::{
         LEGACY_2024_MAX_ADAPTER_RESERVATIONS, Legacy2024AdapterError, Legacy2024Handler,
@@ -743,10 +801,13 @@ pub mod legacy_2024 {
         LegacyServerAdapterInstalledReceipt as ServerAdapterInstalledReceipt,
         legacy_2024_a_digest_preimage, legacy_2024_b_digest_preimage,
     };
+    pub use fastmcp_server::{
+        CompletionHandler, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
+    };
     pub use fastmcp_transport::sse::{
         LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink, LegacySseServerTransport,
     };
-    pub use serde_json::{Map as JsonMap, Value as JsonValue};
+    pub use serde_json::{self, Map as JsonMap, Value as JsonValue, json};
 
     /// Creates a client builder pinned to the exact MCP 2024-11-05 stdio plan.
     ///
@@ -969,19 +1030,23 @@ pub mod prelude {
         validate_final_core_result,
     };
     pub use crate::{
-        ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, ClientCapabilityInfo,
-        ContextNotificationSender, DEFAULT_IN_MEMORY_FINAL_TASKS, ElicitationAction,
+        ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, CachePartitionKey,
+        ClientCapabilityInfo, ContextNotificationSender, DEFAULT_FINAL_CACHE_CAPACITY,
+        DEFAULT_FINAL_CACHE_MAX_BYTES, DEFAULT_IN_MEMORY_FINAL_TASKS, ElicitationAction,
         ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender,
-        FinalCacheStats, FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskRetentionAuthority,
+        FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup, FinalCacheMiss,
+        FinalCacheResultSet, FinalCacheStats, FinalCacheTtlDiagnostic, FinalResultCache,
+        FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskRetentionAuthority,
         FinalTaskSnapshot, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
         FinalTaskWorkDescriptor, InMemoryFinalTaskStore, JsonRpcAdmissionError, JsonRpcMessage,
-        MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpContextLeaseGuard, McpRequestCancellation,
-        NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, PendingRequests,
-        ProgressReporter, RequestSender, ResourceContentItem, ResourceReadResult, ResourceReader,
-        SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender,
-        SamplingStopReason, ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
-        TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
-        decode_strict_jsonrpc_message,
+        MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES, MAX_RESOURCE_READ_DEPTH,
+        MAX_TOOL_CALL_DEPTH, McpContextLeaseGuard, McpRequestCancellation, NoOpElicitationSender,
+        NoOpNotificationSender, NoOpSamplingSender, PendingRequests, ProgressReporter,
+        PromptHandler, RequestSender, ResourceContentItem, ResourceHandler, ResourceReadResult,
+        ResourceReader, SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole,
+        SamplingSender, SamplingStopReason, ServerCapabilityInfo, ToolCallResult, ToolCaller,
+        ToolContentItem, ToolHandler, TransportElicitationSender, TransportRootsProvider,
+        TransportSamplingSender, block_on, decode_strict_jsonrpc_message,
     };
 }
 
@@ -999,6 +1064,76 @@ mod tests {
         assert_eq!(policy.idle_timeout(), Duration::from_secs(2));
         assert_eq!(policy.absolute_timeout(), Duration::from_secs(5));
         assert_ne!(RequestTimeoutSource::Idle, RequestTimeoutSource::Absolute);
+    }
+
+    #[test]
+    fn facade_component_namespaces_and_era_modules_cover_the_complete_surface() {
+        let _: Option<super::client::FinalResultCache> = None;
+        let _: Option<super::core::ProtocolLimits> = None;
+        let _: Option<super::protocol::uri_template::UriTemplate> = None;
+        let _: Option<super::server::ServerLaunchPolicyError> = None;
+        let _: Option<super::transport::ModernSseDecoder> = None;
+        let _: Option<super::asupersync::Cx> = None;
+        let _: Option<super::serde_json::Value> = None;
+
+        let _: Option<super::legacy_2024::InitializeParams> = None;
+        let _: Option<super::legacy_2024::TaskInfo> = None;
+        let _: Option<super::modern::FinalCallToolParams> = None;
+    }
+
+    #[test]
+    fn final_cache_api_is_reexported_from_root_modern_and_prelude() {
+        use super::{
+            CachePartitionKey, DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES,
+            FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup,
+            FinalCacheMiss, FinalCacheResultSet, FinalCacheStats, FinalCacheTtlDiagnostic,
+            FinalResultCache, MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES, modern, prelude,
+        };
+
+        let _: Option<CachePartitionKey> = None;
+        let _: Option<FinalCacheGeneration> = None;
+        let _: Option<FinalCacheInsert> = None;
+        let _: Option<FinalCacheKey> = None;
+        let _: Option<FinalCacheLookup> = None;
+        let _: Option<FinalCacheMiss> = None;
+        let _: Option<FinalCacheResultSet> = None;
+        let _: Option<FinalCacheStats> = None;
+        let _: Option<FinalCacheTtlDiagnostic> = None;
+        let _: Option<FinalResultCache> = None;
+        let _: usize = DEFAULT_FINAL_CACHE_CAPACITY;
+        let _: usize = DEFAULT_FINAL_CACHE_MAX_BYTES;
+        let _: usize = MAX_FINAL_CACHE_CAPACITY;
+        let _: usize = MAX_FINAL_CACHE_MAX_BYTES;
+
+        let _: Option<modern::CachePartitionKey> = None;
+        let _: Option<modern::FinalCacheGeneration> = None;
+        let _: Option<modern::FinalCacheInsert> = None;
+        let _: Option<modern::FinalCacheKey> = None;
+        let _: Option<modern::FinalCacheLookup> = None;
+        let _: Option<modern::FinalCacheMiss> = None;
+        let _: Option<modern::FinalCacheResultSet> = None;
+        let _: Option<modern::FinalCacheStats> = None;
+        let _: Option<modern::FinalCacheTtlDiagnostic> = None;
+        let _: Option<modern::FinalResultCache> = None;
+        let _: usize = modern::DEFAULT_FINAL_CACHE_CAPACITY;
+        let _: usize = modern::DEFAULT_FINAL_CACHE_MAX_BYTES;
+        let _: usize = modern::MAX_FINAL_CACHE_CAPACITY;
+        let _: usize = modern::MAX_FINAL_CACHE_MAX_BYTES;
+
+        let _: Option<prelude::CachePartitionKey> = None;
+        let _: Option<prelude::FinalCacheGeneration> = None;
+        let _: Option<prelude::FinalCacheInsert> = None;
+        let _: Option<prelude::FinalCacheKey> = None;
+        let _: Option<prelude::FinalCacheLookup> = None;
+        let _: Option<prelude::FinalCacheMiss> = None;
+        let _: Option<prelude::FinalCacheResultSet> = None;
+        let _: Option<prelude::FinalCacheStats> = None;
+        let _: Option<prelude::FinalCacheTtlDiagnostic> = None;
+        let _: Option<prelude::FinalResultCache> = None;
+        let _: usize = prelude::DEFAULT_FINAL_CACHE_CAPACITY;
+        let _: usize = prelude::DEFAULT_FINAL_CACHE_MAX_BYTES;
+        let _: usize = prelude::MAX_FINAL_CACHE_CAPACITY;
+        let _: usize = prelude::MAX_FINAL_CACHE_MAX_BYTES;
     }
 
     #[test]

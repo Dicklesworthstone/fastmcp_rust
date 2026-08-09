@@ -673,9 +673,9 @@ fn assert_dual_era_facade_surface() {
         context: Some(modern::FinalCompletionContext::default()),
     };
     let final_completion_result = modern::FinalCompletionResult {
-        completion: modern::CompletionValues {
+        completion: modern::FinalCompletionValues {
             values: vec!["boston".to_owned()],
-            total: Some(1),
+            total: Some(modern::JsonInteger::from(1_i64)),
             has_more: Some(false),
         },
     };

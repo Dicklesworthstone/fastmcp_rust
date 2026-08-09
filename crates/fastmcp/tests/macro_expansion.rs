@@ -21,7 +21,8 @@
 #![allow(clippy::enum_variant_names)]
 #![allow(dead_code)]
 
-use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
+use fastmcp_rust::asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
+use fastmcp_rust::serde_json::{self, json};
 use fastmcp_rust::{
     ApplicationTaskSupervisor, CacheScope, CompleteResult, Content, ContentBlock, Cx,
     EmbeddedResourceContents, FinalAbsoluteUri, FinalCallToolResult, FinalGetPromptResult,
@@ -33,7 +34,6 @@ use fastmcp_rust::{
     McpOutcome, McpResult, Outcome, PromptHandler, PromptMessage, ResourceContent, ResourceHandler,
     ResultMeta, Role, Server, ToolHandler, prompt, resource, tool,
 };
-use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::task::Poll;
@@ -69,6 +69,75 @@ fn expect_text(content: &Content) -> &str {
             "Expected Text content"
         );
         ""
+    }
+}
+
+// This module intentionally imports every macro dependency through the facade
+// only. It is a focused packaging proof: a downstream user needs neither a
+// component crate nor serde_json/asupersync as a direct dependency.
+mod facade_only_macro_compile_proofs {
+    use fastmcp_rust::{
+        CompleteResult, Content, FinalCallToolResult, JsonSchema, McpContext, PromptHandler,
+        PromptMessage, ResourceContent, ResourceHandler, Role, ToolHandler, prompt, resource, tool,
+    };
+
+    #[derive(JsonSchema)]
+    struct FacadeOnlySchema {
+        title: String,
+    }
+
+    #[tool]
+    fn facade_only_legacy_tool(name: String) -> String {
+        format!("hello, {name}")
+    }
+
+    #[tool(tasks)]
+    fn facade_only_final_task_tool() -> fastmcp_rust::FinalToolOutcome {
+        fastmcp_rust::FinalToolOutcome::Complete(CompleteResult::new(
+            FinalCallToolResult {
+                content: Vec::new(),
+                is_error: false,
+                structured_content: None,
+            },
+            super::final_result_meta(),
+        ))
+    }
+
+    #[resource(uri = "facade://macro-proof")]
+    fn facade_only_resource(_ctx: &McpContext) -> String {
+        "facade resource".to_string()
+    }
+
+    #[prompt]
+    fn facade_only_prompt(name: String) -> Vec<PromptMessage> {
+        vec![PromptMessage {
+            role: Role::User,
+            content: Content::text(name),
+        }]
+    }
+
+    #[test]
+    fn facade_only_paths_compile_every_macro_family_and_keep_legacy_names() {
+        assert_eq!(FacadeOnlySchema::json_schema()["type"], "object");
+        assert_eq!(
+            FacadeOnlyLegacyTool.definition().name,
+            "facade_only_legacy_tool"
+        );
+        assert!(FacadeOnlyFinalTaskTool.declares_final_tasks());
+        assert_eq!(
+            FacadeOnlyResourceResource.definition().uri,
+            "facade://macro-proof"
+        );
+        assert_eq!(
+            FacadeOnlyPromptPrompt.definition().name,
+            "facade_only_prompt"
+        );
+
+        let _: Option<fastmcp_rust::legacy_2024::CancelledParams> = None;
+        let _: Option<fastmcp_rust::legacy_2024::InitializeParams> = None;
+        let _: Option<fastmcp_rust::legacy_2024::Tool> = None;
+        let _: Option<fastmcp_rust::modern::FinalCallToolParams> = None;
+        let _: Option<ResourceContent> = None;
     }
 }
 

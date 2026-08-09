@@ -50,8 +50,8 @@ impl CompletionHandler for DownstreamCompletionHandler {
         &self,
         _ctx: &fastmcp_rust::McpContext,
         _params: modern::FinalCompletionParams,
-    ) -> fastmcp_rust::McpResult<modern::CompletionValues> {
-        Ok(modern::CompletionValues {
+    ) -> fastmcp_rust::McpResult<modern::FinalCompletionValues> {
+        Ok(modern::FinalCompletionValues {
             values: Vec::new(),
             total: None,
             has_more: None,
@@ -414,9 +414,9 @@ fn assert_dual_era_completion_exports() {
         context: Some(modern::FinalCompletionContext::default()),
     };
     let modern_result = modern::FinalCompletionResult {
-        completion: modern::CompletionValues {
+        completion: modern::FinalCompletionValues {
             values: vec!["boston".to_owned()],
-            total: Some(1),
+            total: Some(modern::JsonInteger::from(1_i64)),
             has_more: Some(false),
         },
     };
