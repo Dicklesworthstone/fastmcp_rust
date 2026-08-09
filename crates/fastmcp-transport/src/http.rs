@@ -4081,7 +4081,11 @@ impl DualEraHttpLegacySseResponse {
                     debug_assert!(previous > 0, "legacy SSE live-event count underflow");
                     return Ok(SseEvent::message(message.data));
                 }
-                Err(mpsc::RecvError::Empty) => {}
+                Err(mpsc::RecvError::Empty) => {
+                    // This poll loop runs on a blocking thread; without a
+                    // pause it spins one core at 100% between events.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 Err(mpsc::RecvError::Disconnected) => {
                     return Err(DualEraHttpEndpointError::Transport(TransportError::Closed));
                 }
