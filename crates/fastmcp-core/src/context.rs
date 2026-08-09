@@ -171,6 +171,21 @@ pub trait NotificationSender: Send + Sync {
     /// * `total` - Optional total for determinate progress
     /// * `message` - Optional message describing current status
     fn send_progress(&self, progress: f64, total: Option<f64>, message: Option<&str>);
+
+    /// Sends one exact-number final progress notification.
+    ///
+    /// The default deliberately does nothing. Existing and legacy senders
+    /// therefore cannot accidentally emit a final wire model merely because a
+    /// handler calls the typed progress API. Senders that explicitly support
+    /// the final protocol override this method and retain each JSON-number
+    /// lexeme through serialization.
+    fn send_progress_exact(
+        &self,
+        _progress: serde_json::Number,
+        _total: Option<serde_json::Number>,
+        _message: Option<&str>,
+    ) {
+    }
 }
 
 // ============================================================================
@@ -1042,6 +1057,21 @@ impl ProgressReporter {
     pub fn report_with_total(&self, progress: f64, total: f64, message: Option<&str>) {
         self.sender.send_progress(progress, Some(total), message);
     }
+
+    /// Reports final progress without converting JSON-number lexemes through
+    /// `f64`.
+    ///
+    /// The supplied numbers may exceed IEEE-754 range when the installed
+    /// sender supports the final protocol. A legacy sender receives the trait
+    /// default, which emits nothing.
+    pub fn report_exact(
+        &self,
+        progress: serde_json::Number,
+        total: Option<serde_json::Number>,
+        message: Option<&str>,
+    ) {
+        self.sender.send_progress_exact(progress, total, message);
+    }
 }
 
 impl std::fmt::Debug for ProgressReporter {
@@ -1682,6 +1712,24 @@ impl McpContext {
             && let Some(ref reporter) = self.progress_reporter
         {
             reporter.report_with_total(progress, total, message);
+        }
+    }
+
+    /// Reports final progress while retaining the caller's exact JSON-number
+    /// lexemes.
+    ///
+    /// This is a no-op unless the current request installed a final-capable
+    /// progress reporter. The legacy `f64` progress APIs remain unchanged.
+    pub fn report_progress_exact(
+        &self,
+        progress: serde_json::Number,
+        total: Option<serde_json::Number>,
+        message: Option<&str>,
+    ) {
+        if self.ensure_live().is_ok()
+            && let Some(ref reporter) = self.progress_reporter
+        {
+            reporter.report_exact(progress, total, message);
         }
     }
 
