@@ -5345,7 +5345,8 @@ mod tests {
             expected: &FinalTaskSnapshot,
             owner_id: &str,
         ) -> McpResult<Option<FinalTaskInputResponses>> {
-            self.inner.take_input_for_owner_if_current(expected, owner_id)
+            self.inner
+                .take_input_for_owner_if_current(expected, owner_id)
         }
 
         fn work_descriptor_if_current(
@@ -5398,7 +5399,8 @@ mod tests {
             task_id: &FinalTaskId,
             generation: u64,
         ) -> McpResult<bool> {
-            self.inner.begin_handoff_dispatch_if_current(task_id, generation)
+            self.inner
+                .begin_handoff_dispatch_if_current(task_id, generation)
         }
 
         fn begin_handoff_dispatch_for_owner_if_current(
@@ -5418,8 +5420,12 @@ mod tests {
             owner_id: &str,
             dispatch_fence: u64,
         ) -> McpResult<bool> {
-            self.inner
-                .renew_handoff_dispatch_if_current(task_id, generation, owner_id, dispatch_fence)
+            self.inner.renew_handoff_dispatch_if_current(
+                task_id,
+                generation,
+                owner_id,
+                dispatch_fence,
+            )
         }
 
         fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
@@ -5431,7 +5437,8 @@ mod tests {
             task_id: &FinalTaskId,
             generation: u64,
         ) -> McpResult<bool> {
-            self.inner.finish_handoff_dispatch_if_current(task_id, generation)
+            self.inner
+                .finish_handoff_dispatch_if_current(task_id, generation)
         }
 
         fn finish_handoff_dispatch_for_owner_if_current(

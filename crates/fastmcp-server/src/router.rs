@@ -1225,9 +1225,7 @@ fn run_handler<'a, T>(
                 // A synchronous handler cannot be preempted by timeout_at, so
                 // a late completion surfaces here; deadline expiry keeps its
                 // distinguishable timeout message.
-                if budget
-                    .is_past_deadline(ctx.cx().now())
-                {
+                if budget.is_past_deadline(ctx.cx().now()) {
                     Err(McpError::new(
                         McpErrorCode::RequestCancelled,
                         "Request timeout exceeded",
@@ -6160,11 +6158,8 @@ mod router_tests {
                 }
                 // Modern tools/call computes an MRTR exchange binding, which
                 // requires a session cache partition on the request context.
-                let request_ctx = McpContext::with_state(
-                    request_cx,
-                    request_context_id,
-                    SessionState::new(),
-                );
+                let request_ctx =
+                    McpContext::with_state(request_cx, request_context_id, SessionState::new());
                 let request = JsonRpcRequest::new(
                     "tools/call",
                     Some(serde_json::json!({
@@ -8116,7 +8111,10 @@ mod router_tests {
         }
 
         fn call(&self, ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
-            eprintln!("WM-BUDGET call entered deadline={:?}", ctx.budget().deadline);
+            eprintln!(
+                "WM-BUDGET call entered deadline={:?}",
+                ctx.budget().deadline
+            );
             *self
                 .observed_deadline
                 .lock()
