@@ -8228,6 +8228,16 @@ impl Server {
                     Ok(response) => response.map(|response| {
                         legacy_handled_response(response, active_request, &worker_cx)
                     }),
+                    // Peer-fault rejections of id-less frames are dropped
+                    // rather than terminating the dispatch worker.
+                    Err(error) if matches!(error.code(), -32600 | -32601 | -32602) => {
+                        debug!(
+                            target: targets::SESSION,
+                            "Dropped invalid exact-2024 notification; code={}",
+                            error.code()
+                        );
+                        None
+                    }
                     Err(_) => {
                         if let Some(id) = request_id.as_ref() {
                             worker_queue_state.discard(id);
@@ -9397,6 +9407,16 @@ impl Server {
                             Ok(response) => response.map(|response| {
                                 legacy_handled_response(response, active_request, cx)
                             }),
+                            // Peer-fault rejections of id-less frames are
+                            // dropped rather than terminating the connection.
+                            Err(error) if matches!(error.code(), -32600 | -32601 | -32602) => {
+                                debug!(
+                                    target: targets::SESSION,
+                                    "Dropped invalid exact-2024 notification; code={}",
+                                    error.code()
+                                );
+                                None
+                            }
                             Err(_) => self.graceful_shutdown(1),
                         }
                     }
@@ -9781,6 +9801,18 @@ impl Server {
                             Ok(response) => response.map(|response| {
                                 legacy_handled_response(response, active_request, cx)
                             }),
+                            // A peer-fault rejection of an id-less frame has no
+                            // response channel; JSON-RPC drops it without
+                            // advancing lifecycle, and one malformed peer
+                            // notification must not terminate the connection.
+                            Err(error) if matches!(error.code(), -32600 | -32601 | -32602) => {
+                                debug!(
+                                    target: targets::SESSION,
+                                    "Dropped invalid exact-2024 notification; code={}",
+                                    error.code()
+                                );
+                                None
+                            }
                             Err(_) => {
                                 self.graceful_shutdown_returning();
                                 return Err(server_run_error(
@@ -23039,8 +23071,37 @@ mod lib_unit_tests {
 
     #[test]
     fn legacy_http_delivers_resource_updates_only_to_the_subscribed_uri() {
+        // resources/subscribe admits only URIs the router can resolve, so the
+        // subscribed target must exist as a registered resource.
+        struct SubscribedFileResource;
+
+        impl crate::ResourceHandler for SubscribedFileResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "file:///subscribed.txt".to_string(),
+                    name: "subscribed".to_string(),
+                    description: None,
+                    mime_type: Some("text/plain".to_string()),
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                Ok(vec![fastmcp_protocol::ResourceContent {
+                    uri: "file:///subscribed.txt".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: Some("subscribed".to_string()),
+                    blob: None,
+                }])
+            }
+        }
+
         let cx = Cx::for_testing();
         let endpoint = Server::new("legacy-http-resource-update", "1.0.0")
+            .resource(SubscribedFileResource)
+            .resource_subscriptions()
             .build_http_endpoint("http://legacy.test")
             .expect("builder must construct the configured dual-era endpoint");
         let mut session = endpoint
