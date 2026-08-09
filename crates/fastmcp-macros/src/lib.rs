@@ -2477,8 +2477,10 @@ mod async_handler_expansion_tests {
 
             assert!(tokens.contains("fn call_final_outcome"), "{tokens}");
             assert!(tokens.contains("FinalToolOutcome"), "{tokens}");
+            // The path lives inside a string literal, which stringifies
+            // verbatim rather than with token-stream spacing.
             assert!(
-                tokens.contains("must be invoked through ToolHandler :: call_final_outcome"),
+                tokens.contains("must be invoked through ToolHandler::call_final_outcome"),
                 "{tokens}"
             );
             assert!(!tokens.contains("fn call_final ("), "{tokens}");
@@ -2589,7 +2591,9 @@ mod async_handler_expansion_tests {
         assert!(final_hook.contains("CompleteResult"), "{final_hook}");
         assert!(final_hook.contains("FinalCallToolResult"), "{final_hook}");
         assert!(final_hook.contains("Ok (result)"), "{final_hook}");
-        assert!(!final_hook.contains("payload"), "{final_hook}");
+        // Guard against payload PROJECTION (`result . payload`), not the
+        // `Outcome::Panicked(payload)` binding of the 4-valued bridge.
+        assert!(!final_hook.contains(". payload"), "{final_hook}");
         assert!(!final_hook.contains("content . into_iter"), "{final_hook}");
 
         let async_tokens = generate_tool_execution_methods(
@@ -2611,7 +2615,12 @@ mod async_handler_expansion_tests {
             final_async_hook.contains("Ok (result)"),
             "{final_async_hook}"
         );
-        assert!(!final_async_hook.contains("payload"), "{final_async_hook}");
+        // Same precision as the sync hook: forbid projection, not the
+        // Outcome::Panicked binding.
+        assert!(
+            !final_async_hook.contains(". payload"),
+            "{final_async_hook}"
+        );
     }
 
     #[test]
