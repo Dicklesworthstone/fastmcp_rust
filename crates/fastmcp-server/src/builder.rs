@@ -581,8 +581,25 @@ impl ServerBuilder {
                 e.code
             );
         } else {
-            self.capabilities.resources = Some(ResourcesCapability::default());
+            self.capabilities
+                .resources
+                .get_or_insert_with(ResourcesCapability::default);
         }
+        self
+    }
+
+    /// Advertises the `resources.subscribe` capability so clients may
+    /// subscribe to registered resource URIs.
+    ///
+    /// Subscription admission still requires each subscribed URI to resolve
+    /// to a registered resource; this only turns on the capability that the
+    /// subscribe methods are gated behind.
+    #[must_use]
+    pub fn resource_subscriptions(mut self) -> Self {
+        self.capabilities
+            .resources
+            .get_or_insert_with(ResourcesCapability::default)
+            .subscribe = true;
         self
     }
 
@@ -599,7 +616,9 @@ impl ServerBuilder {
                 error.code
             );
         } else {
-            self.capabilities.resources = Some(ResourcesCapability::default());
+            self.capabilities
+                .resources
+                .get_or_insert_with(ResourcesCapability::default);
         }
         self
     }
@@ -621,7 +640,9 @@ impl ServerBuilder {
                 error.code
             );
         } else {
-            self.capabilities.resources = Some(ResourcesCapability::default());
+            self.capabilities
+                .resources
+                .get_or_insert_with(ResourcesCapability::default);
         }
         self
     }
@@ -639,7 +660,9 @@ impl ServerBuilder {
                 error.code
             );
         } else {
-            self.capabilities.resources = Some(ResourcesCapability::default());
+            self.capabilities
+                .resources
+                .get_or_insert_with(ResourcesCapability::default);
         }
         self
     }
@@ -849,7 +872,9 @@ impl ServerBuilder {
             self.capabilities.tools = Some(ToolsCapability::default());
         }
         if has_resources {
-            self.capabilities.resources = Some(ResourcesCapability::default());
+            self.capabilities
+                .resources
+                .get_or_insert_with(ResourcesCapability::default);
         }
         if has_prompts {
             self.capabilities.prompts = Some(PromptsCapability::default());
@@ -979,7 +1004,9 @@ impl ServerBuilder {
             self.capabilities.tools = Some(ToolsCapability::default());
         }
         if has_resources {
-            self.capabilities.resources = Some(ResourcesCapability::default());
+            self.capabilities
+                .resources
+                .get_or_insert_with(ResourcesCapability::default);
         }
         if has_prompts {
             self.capabilities.prompts = Some(PromptsCapability::default());
@@ -1096,7 +1123,9 @@ impl ServerBuilder {
                     self.capabilities.tools = Some(ToolsCapability::default());
                 }
                 if has_resources {
-                    self.capabilities.resources = Some(ResourcesCapability::default());
+                    self.capabilities
+                .resources
+                .get_or_insert_with(ResourcesCapability::default);
                 }
                 if has_prompts {
                     self.capabilities.prompts = Some(PromptsCapability::default());
@@ -1203,7 +1232,9 @@ impl ServerBuilder {
             self.capabilities.tools = Some(ToolsCapability::default());
         }
         if has_resources && (result.resources > 0 || result.resource_templates > 0) {
-            self.capabilities.resources = Some(ResourcesCapability::default());
+            self.capabilities
+                .resources
+                .get_or_insert_with(ResourcesCapability::default);
         }
         if has_prompts && result.prompts > 0 {
             self.capabilities.prompts = Some(PromptsCapability::default());
@@ -1293,7 +1324,9 @@ impl ServerBuilder {
 
         // Update capabilities if resources were mounted
         if result.resources > 0 || result.resource_templates > 0 {
-            self.capabilities.resources = Some(ResourcesCapability::default());
+            self.capabilities
+                .resources
+                .get_or_insert_with(ResourcesCapability::default);
         }
 
         self
