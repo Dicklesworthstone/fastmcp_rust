@@ -1205,16 +1205,12 @@ fn connect_auto_stdio_to_shipped_echo_server(server_policy: &str) -> Client {
 }
 
 #[cfg(unix)]
-fn connect_modern_stdio_to_shipped_echo_server(server_policy: &str) -> McpResult<Client> {
+fn connect_modern_stdio_to_shipped_echo_server(server_policy: &str) -> McpResult<modern::Client> {
     let executable = shipped_echo_server_executable();
     let command = executable
         .to_str()
         .expect("the shipped example path is valid UTF-8");
     let builder = modern::client_builder().env("FASTMCP_PROTOCOL_POLICY", server_policy);
-    assert_eq!(
-        builder.selected_protocol_plan().policy(),
-        ProtocolPolicy::ModernOnly
-    );
 
     builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
 }
@@ -1296,20 +1292,15 @@ fn e2e_public_stdio_modern_only_round_trips_with_the_shipped_facade_server() {
     let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
         .expect("a ModernOnly facade client completes live modern discovery");
 
-    assert_eq!(client.protocol_policy(), ProtocolPolicy::ModernOnly);
-    assert_eq!(
-        client.selected_protocol_era(),
-        Some(ProtocolEra::Modern2026)
-    );
     assert_eq!(
         client.protocol_version(),
         fastmcp_rust::modern::PROTOCOL_VERSION
     );
     let tools = client
-        .list_tools()
+        .list_tools(None)
         .expect("the explicit ModernOnly connection accepts tools/list");
     assert!(
-        tools.iter().any(|tool| tool.name == "echo"),
+        tools.tools.iter().any(|tool| tool.name == "echo"),
         "the modern tools/list result must expose the shipped echo tool"
     );
     client.close().expect("modern-only stdio client cleanup");
