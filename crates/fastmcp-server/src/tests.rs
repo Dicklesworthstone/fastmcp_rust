@@ -8,6 +8,7 @@
 //! - Error handling
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -161,10 +162,17 @@ fn nested_state_call(ctx: &McpContext) -> McpResult<String> {
     Ok(format!("Inner tool saw: {}", text))
 }
 
-static BLOCKING_TOOL_STATE: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
+#[derive(Clone)]
+struct BlockingToolState {
+    barrier: Arc<Barrier>,
+    started: Option<Arc<AtomicBool>>,
+    completed: Option<Arc<AtomicBool>>,
+}
+
+static BLOCKING_TOOL_STATE: OnceLock<Mutex<Option<BlockingToolState>>> = OnceLock::new();
 static BLOCKING_TOOL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn blocking_tool_state() -> &'static Mutex<Option<Arc<Barrier>>> {
+fn blocking_tool_state() -> &'static Mutex<Option<BlockingToolState>> {
     BLOCKING_TOOL_STATE.get_or_init(|| Mutex::new(None))
 }
 
@@ -185,12 +193,25 @@ impl Drop for BlockingToolConfigGuard {
 }
 
 fn configure_blocking_tool(barrier: Arc<Barrier>) -> BlockingToolConfigGuard {
+    configure_blocking_tool_with_completion(barrier, None, None)
+}
+
+fn configure_blocking_tool_with_completion(
+    barrier: Arc<Barrier>,
+    started: Option<Arc<AtomicBool>>,
+    completed: Option<Arc<AtomicBool>>,
+) -> BlockingToolConfigGuard {
     let lock = blocking_tool_lock()
         .lock()
         .expect("blocking tool lock poisoned");
     *blocking_tool_state()
         .lock()
-        .expect("blocking tool state lock poisoned") = Some(barrier);
+        .expect("blocking tool state lock poisoned") =
+        Some(BlockingToolState {
+            barrier,
+            started,
+            completed,
+        });
     BlockingToolConfigGuard { _lock: lock }
 }
 
@@ -199,15 +220,21 @@ fn configure_blocking_tool(barrier: Arc<Barrier>) -> BlockingToolConfigGuard {
     description = "Blocks until cancellation is observed"
 )]
 fn block_until_cancelled(ctx: &McpContext) -> McpResult<String> {
-    let barrier = blocking_tool_state()
+    let state = blocking_tool_state()
         .lock()
         .expect("blocking tool state lock poisoned")
         .clone()
         .ok_or_else(|| McpError::internal_error("blocking tool not configured for test"))?;
 
-    barrier.wait();
+    if let Some(started) = state.started {
+        started.store(true, Ordering::Release);
+    }
+    state.barrier.wait();
     while !ctx.is_cancelled() {
         std::thread::yield_now();
+    }
+    if let Some(completed) = state.completed {
+        completed.store(true, Ordering::Release);
     }
     Err(McpError::request_cancelled())
 }
@@ -674,10 +701,16 @@ mod router_tests {
         let mut router = Router::new();
 
         // Register tools
-        router.add_tool(Greet);
-        router.add_tool(CancellationCheck);
-        router.add_tool(SlowTool);
-        router.add_tool(ErrorTool);
+        router.add_tool(Greet).expect("tool registration succeeds");
+        router
+            .add_tool(CancellationCheck)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(SlowTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(ErrorTool)
+            .expect("tool registration succeeds");
 
         // Register resources
         router.add_resource(StaticResource {
@@ -1610,7 +1643,6 @@ mod router_tests {
         let params = CancelledParams {
             request_id: RequestId::Number(1),
             reason: Some("unit test".to_string()),
-            await_cleanup: None,
         };
         let request = fastmcp_protocol::JsonRpcRequest::notification(
             "notifications/cancelled",
@@ -1652,7 +1684,6 @@ mod router_tests {
         let params = CancelledParams {
             request_id: request_id.clone(),
             reason: Some("test cancellation".to_string()),
-            await_cleanup: None,
         };
         server.handle_cancelled_notification(session_id, params);
 
@@ -1661,7 +1692,7 @@ mod router_tests {
     }
 
     #[test]
-    fn test_cancelled_notification_await_cleanup_remains_nonblocking() {
+    fn test_cancelled_notification_remains_nonblocking() {
         let server = Server::new("test-server", "1.0.0").build();
         let session_id = 1;
         let request_id = RequestId::Number(100);
@@ -1684,8 +1715,7 @@ mod router_tests {
 
         let params = CancelledParams {
             request_id: request_id.clone(),
-            reason: Some("await cleanup".to_string()),
-            await_cleanup: Some(true),
+            reason: Some("test cancellation".to_string()),
         };
         let start = Instant::now();
         server.handle_cancelled_notification(session_id, params);
@@ -1695,7 +1725,7 @@ mod router_tests {
         assert!(!cx.is_cancel_requested());
         assert!(
             start.elapsed() < Duration::from_secs(1),
-            "awaitCleanup must not block the receive path"
+            "a cancellation notification must not block the receive path"
         );
     }
 
@@ -3427,11 +3457,21 @@ mod handler_definition_tests {
     fn create_tagged_tools_router() -> Router {
         let mut router = Router::new();
         // Tools with various tag combinations
-        router.add_tool(TaggedSearchTool);
-        router.add_tool(TaggedCreateTool);
-        router.add_tool(TaggedAdminTool);
-        router.add_tool(TaggedDebugTool);
-        router.add_tool(TaggedUntaggedTool);
+        router
+            .add_tool(TaggedSearchTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(TaggedCreateTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(TaggedAdminTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(TaggedDebugTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(TaggedUntaggedTool)
+            .expect("tool registration succeeds");
         router
     }
 
@@ -3569,8 +3609,10 @@ mod multi_handler_tests {
     #[test]
     fn test_multiple_tools() {
         let mut router = Router::new();
-        router.add_tool(Greet);
-        router.add_tool(FormalGreet);
+        router.add_tool(Greet).expect("tool registration succeeds");
+        router
+            .add_tool(FormalGreet)
+            .expect("tool registration succeeds");
 
         let tools = router.tools();
         assert_eq!(tools.len(), 2);
@@ -3686,7 +3728,9 @@ mod session_state_tests {
     #[test]
     fn test_session_state_persists_across_calls() {
         let mut router = Router::new();
-        router.add_tool(Increment);
+        router
+            .add_tool(Increment)
+            .expect("tool registration succeeds");
 
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
@@ -3731,7 +3775,9 @@ mod session_state_tests {
     #[test]
     fn test_different_session_states_are_independent() {
         let mut router = Router::new();
-        router.add_tool(Increment);
+        router
+            .add_tool(Increment)
+            .expect("tool registration succeeds");
 
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
@@ -4014,7 +4060,9 @@ mod lab_runtime_tests {
 
             LabRuntimeTarget::block_on(runtime, async move {
                 let mut router = Router::new();
-                router.add_tool(CancellationCheck);
+                router
+                    .add_tool(CancellationCheck)
+                    .expect("tool registration succeeds");
 
                 let cx = Cx::for_testing();
                 cx.cancel_with(CancelKind::User, None);
@@ -4182,8 +4230,12 @@ mod mount_tests {
     fn test_mount_with_prefix_renames_tools() {
         let mut main_router = Router::new();
         let mut db_router = Router::new();
-        db_router.add_tool(MountQuery);
-        db_router.add_tool(MountInsert);
+        db_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
+        db_router
+            .add_tool(MountInsert)
+            .expect("tool registration succeeds");
 
         let result = main_router.mount(db_router, Some("db"));
 
@@ -4198,7 +4250,9 @@ mod mount_tests {
     fn test_mount_without_prefix_keeps_names() {
         let mut main_router = Router::new();
         let mut other_router = Router::new();
-        other_router.add_tool(MountQuery);
+        other_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
 
         let result = main_router.mount(other_router, None);
 
@@ -4235,10 +4289,14 @@ mod mount_tests {
     #[test]
     fn test_mount_conflict_generates_warning() {
         let mut main_router = Router::new();
-        main_router.add_tool(MountQuery);
+        main_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
 
         let mut other_router = Router::new();
-        other_router.add_tool(MountQuery);
+        other_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
 
         // Mount without prefix, causing a conflict
         let result = main_router.mount(other_router, None);
@@ -4252,7 +4310,9 @@ mod mount_tests {
     fn test_mount_preserves_tool_definition() {
         let mut main_router = Router::new();
         let mut db_router = Router::new();
-        db_router.add_tool(MountQuery);
+        db_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
 
         main_router.mount(db_router, Some("db"));
 
@@ -4265,7 +4325,9 @@ mod mount_tests {
     fn test_mount_all_components() {
         let mut main_router = Router::new();
         let mut other_router = Router::new();
-        other_router.add_tool(MountQuery);
+        other_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
         other_router.add_resource(ConfigResource);
         other_router.add_prompt(GreetingPrompt);
 
@@ -4392,7 +4454,9 @@ mod mount_tests {
     fn test_prefix_validation_rejects_slashes() {
         let mut router = Router::new();
         let mut other = Router::new();
-        other.add_tool(MountQuery);
+        other
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
 
         let result = router.mount(other, Some("bad/prefix"));
 
@@ -4454,7 +4518,9 @@ mod duplicate_behavior_tests {
     #[test]
     fn test_duplicate_behavior_error_returns_error() {
         let mut router = Router::new();
-        router.add_tool(DupTool1);
+        router
+            .add_tool(DupTool1)
+            .expect("tool registration succeeds");
 
         let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Error);
         assert!(result.is_err());
@@ -4464,7 +4530,9 @@ mod duplicate_behavior_tests {
     #[test]
     fn test_duplicate_behavior_warn_keeps_original() {
         let mut router = Router::new();
-        router.add_tool(DupTool1);
+        router
+            .add_tool(DupTool1)
+            .expect("tool registration succeeds");
 
         let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Warn);
         assert!(result.is_ok());
@@ -4477,7 +4545,9 @@ mod duplicate_behavior_tests {
     #[test]
     fn test_duplicate_behavior_replace_replaces() {
         let mut router = Router::new();
-        router.add_tool(DupTool1);
+        router
+            .add_tool(DupTool1)
+            .expect("tool registration succeeds");
 
         let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Replace);
         assert!(result.is_ok());
@@ -4490,7 +4560,9 @@ mod duplicate_behavior_tests {
     #[test]
     fn test_duplicate_behavior_ignore_keeps_original() {
         let mut router = Router::new();
-        router.add_tool(DupTool1);
+        router
+            .add_tool(DupTool1)
+            .expect("tool registration succeeds");
 
         let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Ignore);
         assert!(result.is_ok());
@@ -5082,7 +5154,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_router_tool_caller_calls_tool() {
         let mut router = Router::new();
-        router.add_tool(AddNumbersTool);
+        router
+            .add_tool(AddNumbersTool)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
@@ -5146,7 +5220,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_with_tool_caller() {
         let mut router = Router::new();
-        router.add_tool(AddNumbersTool);
+        router
+            .add_tool(AddNumbersTool)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -5169,7 +5245,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_text() {
         let mut router = Router::new();
-        router.add_tool(AddNumbersTool);
+        router
+            .add_tool(AddNumbersTool)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -5187,7 +5265,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_json() {
         let mut router = Router::new();
-        router.add_tool(ComputeJsonTool);
+        router
+            .add_tool(ComputeJsonTool)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -5210,7 +5290,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_returns_error_result() {
         let mut router = Router::new();
-        router.add_tool(FailingToolTest);
+        router
+            .add_tool(FailingToolTest)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -5229,7 +5311,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_text_propagates_error() {
         let mut router = Router::new();
-        router.add_tool(FailingToolTest);
+        router
+            .add_tool(FailingToolTest)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -5262,7 +5346,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_tool_validation_error() {
         let mut router = Router::new();
-        router.add_tool(AddNumbersTool);
+        router
+            .add_tool(AddNumbersTool)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
@@ -5287,8 +5373,12 @@ mod ctx_call_tool_tests {
         use crate::RouterResourceReader;
 
         let mut router = Router::new();
-        router.add_tool(GetStateFromCtx);
-        router.add_tool(NestedStateCall);
+        router
+            .add_tool(GetStateFromCtx)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(NestedStateCall)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let session_state = SessionState::new();
@@ -5382,8 +5472,12 @@ mod ctx_call_tool_tests {
         use crate::RouterResourceReader;
 
         let mut router = Router::new();
-        router.add_tool(CurrentAuthTool);
-        router.add_tool(NestedAuthTool);
+        router
+            .add_tool(CurrentAuthTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(NestedAuthTool)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let session_state = SessionState::new();
@@ -6051,7 +6145,7 @@ mod handler_direct_tests {
     #[test]
     fn router_registers_tool_and_lists_it() {
         let mut router = Router::new();
-        router.add_tool(Greet);
+        router.add_tool(Greet).expect("tool registration succeeds");
         let tools = router.tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "greet");
@@ -6081,8 +6175,10 @@ mod handler_direct_tests {
     #[test]
     fn router_counts_match_registrations() {
         let mut router = Router::new();
-        router.add_tool(Greet);
-        router.add_tool(ErrorTool);
+        router.add_tool(Greet).expect("tool registration succeeds");
+        router
+            .add_tool(ErrorTool)
+            .expect("tool registration succeeds");
         router.add_resource(StaticResource {
             uri: "test://a".to_string(),
             content: "".to_string(),
@@ -7096,15 +7192,21 @@ mod helper_function_tests {
 
     #[test]
     fn receive_pump_cancels_a_running_handler_in_band() {
-        let barrier = Arc::new(Barrier::new(2));
-        let _configuration = configure_blocking_tool(Arc::clone(&barrier));
+        let barrier = Arc::new(Barrier::new(1));
+        let started = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let _configuration = configure_blocking_tool_with_completion(
+            barrier,
+            Some(Arc::clone(&started)),
+            Some(Arc::clone(&completed)),
+        );
         let server = Server::new("receive-pump-cancellation", "1.0.0")
             .tool(BlockUntilCancelled)
             .build();
-        let (outbound_tx, outbound_rx) = mpsc::channel::<JsonRpcMessage>();
         let sent = Arc::new(Mutex::new(Vec::<JsonRpcMessage>::new()));
         let sent_for_transport = Arc::clone(&sent);
-        let barrier_for_receive = Arc::clone(&barrier);
+        let started_for_receive = Arc::clone(&started);
+        let completed_for_receive = Arc::clone(&completed);
         let mut step = 0_u8;
 
         server
@@ -7147,35 +7249,41 @@ mod helper_function_tests {
                             ),
                         )),
                         2 => {
-                            barrier_for_receive.wait();
-                            Ok(JsonRpcMessage::Request(
-                                fastmcp_protocol::JsonRpcRequest::notification(
-                                    "notifications/cancelled",
-                                    Some(
-                                        serde_json::to_value(CancelledParams {
-                                            request_id: RequestId::Number(2),
-                                            reason: Some("test cancellation".to_string()),
-                                            await_cleanup: Some(false),
-                                        })
-                                        .expect("serialize cancellation"),
+                            let deadline = Instant::now() + Duration::from_secs(2);
+                            while !started_for_receive.load(Ordering::Acquire)
+                                && Instant::now() < deadline
+                            {
+                                std::thread::yield_now();
+                            }
+                            if started_for_receive.load(Ordering::Acquire) {
+                                Ok(JsonRpcMessage::Request(
+                                    fastmcp_protocol::JsonRpcRequest::notification(
+                                        "notifications/cancelled",
+                                        Some(
+                                            serde_json::to_value(CancelledParams {
+                                                request_id: RequestId::Number(2),
+                                                reason: Some("test cancellation".to_string()),
+                                            })
+                                            .expect("serialize cancellation"),
+                                        ),
                                     ),
-                                ),
-                            ))
+                                ))
+                            } else {
+                                Err(fastmcp_transport::TransportError::Timeout)
+                            }
                         }
                         _ => {
                             let deadline = Instant::now() + Duration::from_secs(2);
-                            while Instant::now() < deadline {
-                                match outbound_rx.recv_timeout(Duration::from_millis(20)) {
-                                    Ok(JsonRpcMessage::Response(response))
-                                        if response.id == Some(RequestId::Number(2)) =>
-                                    {
-                                        return Err(fastmcp_transport::TransportError::Closed);
-                                    }
-                                    Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                                }
+                            while !completed_for_receive.load(Ordering::Acquire)
+                                && Instant::now() < deadline
+                            {
+                                std::thread::yield_now();
                             }
-                            Err(fastmcp_transport::TransportError::Timeout)
+                            if completed_for_receive.load(Ordering::Acquire) {
+                                Err(fastmcp_transport::TransportError::Closed)
+                            } else {
+                                Err(fastmcp_transport::TransportError::Timeout)
+                            }
                         }
                     }
                 },
@@ -7184,9 +7292,7 @@ mod helper_function_tests {
                         .lock()
                         .expect("sent messages lock")
                         .push(message.clone());
-                    outbound_tx
-                        .send(message.clone())
-                        .map_err(|_| fastmcp_transport::TransportError::Closed)
+                    Ok(())
                 },
                 Arc::new(|_| {}),
                 None,
@@ -7195,18 +7301,19 @@ mod helper_function_tests {
             .expect("scripted returning loop must close cleanly");
 
         let sent = sent.lock().expect("sent messages lock");
-        let cancellation_response = sent.iter().find_map(|message| match message {
-            JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(2)) => {
-                Some(response)
-            }
-            _ => None,
-        });
         assert_eq!(
-            cancellation_response
-                .and_then(|response| response.error.as_ref())
-                .map(|error| error.code),
-            Some(i32::from(McpErrorCode::RequestCancelled))
+            sent.iter()
+                .filter(|message| matches!(message, JsonRpcMessage::Response(_)))
+                .count(),
+            1,
+            "accepted exact legacy cancellation must suppress the cancelled request response"
         );
+        assert!(sent.iter().any(
+            |message| matches!(message, JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(1)))
+        ));
+        assert!(!sent.iter().any(
+            |message| matches!(message, JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(2)))
+        ));
     }
 
     #[test]

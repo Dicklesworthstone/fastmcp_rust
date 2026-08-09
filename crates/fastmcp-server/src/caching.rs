@@ -1802,13 +1802,13 @@ mod tests {
         middleware
             .on_response(&ctx, &request, response.clone())
             .unwrap();
-        let key = CacheKey::new("tools/list", None);
         let expires_before_hit = middleware
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries
-            .get(&key)
+            .values()
+            .next()
             .expect("cached entry")
             .expires_at;
 
@@ -1823,7 +1823,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries
-            .get(&key)
+            .values()
+            .next()
             .expect("cache hit must retain the original entry")
             .expires_at;
         assert_eq!(expires_after_hit, expires_before_hit);
@@ -2441,7 +2442,8 @@ mod tests {
             .unwrap();
 
         // Invalidate specific entry
-        middleware.invalidate("tools/list", None);
+        let semantic_page_set = serde_json::json!({});
+        middleware.invalidate("tools/list", Some(&semantic_page_set));
 
         // Should miss now
         let decision = middleware.on_request(&ctx, &request).unwrap();

@@ -26,9 +26,9 @@ use fastmcp_protocol::common_types::{
 use fastmcp_protocol::{
     CacheScope, CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy,
     DecodedResult, FinalCallToolResult, FinalCompletionParams, FinalGetPromptResult,
-    FinalPromptMessage, FinalReadResourceResult, Icon, InputRequiredResult, JsonRpcRequest,
-    LegacyCompletionParams, ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource,
-    ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations,
+    FinalPromptMessage, FinalReadResourceResult, FinalTool, Icon, InputRequiredResult,
+    JsonRpcRequest, LegacyCompletionParams, ProgressMarker, ProgressParams, Prompt, PromptMessage,
+    Resource, ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations,
     decode_peer_result, encode_result,
 };
 
@@ -527,6 +527,15 @@ fn promote_legacy_prompt_messages(
     ))
 }
 
+/// Closed framework error classes that an output-schema tool must represent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolErrorKind {
+    /// The structurally valid call arguments failed the registered input schema.
+    InputValidation,
+    /// The admitted handler returned a non-terminal tool-execution error.
+    Handler,
+}
+
 /// Handler for a tool.
 ///
 /// This trait is typically implemented via the `#[tool]` macro.
@@ -609,6 +618,33 @@ pub trait ToolHandler: Send + Sync {
 
     /// Returns final open metadata for this tool's catalog entry.
     fn final_metadata(&self) -> Option<&OpenMetadata> {
+        None
+    }
+
+    /// Returns an exact final catalog definition when this handler owns one.
+    ///
+    /// Legacy-first handlers normally leave this as `None`; the router then
+    /// freezes the ordinary [`Self::definition`] plus the individual final
+    /// metadata hooks into a final definition. A native final handler or proxy
+    /// should override this hook so title-bearing annotations, the complete
+    /// icon collection, and open metadata are never projected through the
+    /// narrower legacy [`Tool`] model.
+    fn final_definition(&self) -> Option<FinalTool> {
+        None
+    }
+
+    /// Maps a framework-authored tool error into this tool's structured output.
+    ///
+    /// A handler that declares `outputSchema` must return a truthful value for
+    /// both closed error kinds. Registration invokes this hook once for each
+    /// kind, bounds and validates the returned JSON, and stores immutable
+    /// copies beside the admitted schemas. Returning `None`, an over-limit
+    /// value, or a value rejected by `outputSchema` rejects registration
+    /// before any catalog mutation.
+    fn final_tool_error_structured_content(
+        &self,
+        _kind: ToolErrorKind,
+    ) -> Option<serde_json::Value> {
         None
     }
 
@@ -1445,6 +1481,19 @@ impl ToolHandler for MountedToolHandler {
 
     fn final_metadata(&self) -> Option<&OpenMetadata> {
         self.inner.final_metadata()
+    }
+
+    fn final_definition(&self) -> Option<FinalTool> {
+        let mut definition = self.inner.final_definition()?;
+        definition.name.clone_from(&self.mounted_name);
+        Some(definition)
+    }
+
+    fn final_tool_error_structured_content(
+        &self,
+        kind: ToolErrorKind,
+    ) -> Option<serde_json::Value> {
+        self.inner.final_tool_error_structured_content(kind)
     }
 
     fn declares_final_tasks(&self) -> bool {

@@ -534,6 +534,30 @@ impl ServerBuilder {
         self
     }
 
+    /// Registers an intentionally exact MCP 2024-11-05-only tool handler.
+    ///
+    /// This does not depend on builder call order or the connection protocol
+    /// policy. The tool is available through exact legacy list/call routes and
+    /// omitted from all MCP 2026-07-28 catalogs and dispatch. Use [`Self::tool`]
+    /// for ordinary dual-era registration; it never falls back to this path
+    /// when final schema admission fails.
+    #[must_use]
+    pub fn legacy_tool<H: ToolHandler + 'static>(mut self, handler: H) -> Self {
+        if let Err(error) = self
+            .router
+            .add_legacy_tool_with_behavior(handler, self.on_duplicate)
+        {
+            log::error!(
+                target: "fastmcp_rust::builder",
+                "Failed to register exact-2024-only tool; code={:?}",
+                error.code
+            );
+        } else {
+            self.capabilities.tools = Some(ToolsCapability::default());
+        }
+        self
+    }
+
     /// Registers a resource handler.
     ///
     /// Duplicate handling is controlled by [`on_duplicate`](Self::on_duplicate).
@@ -1484,6 +1508,26 @@ mod tests {
         }
     }
 
+    struct ExactLegacyOnlyTool;
+    impl crate::ToolHandler for ExactLegacyOnlyTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "exact_legacy_only".to_owned(),
+                description: Some("exact 2024-only test tool".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: Some(serde_json::json!(false)),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("legacy")])
+        }
+    }
+
     struct TestResource;
     impl crate::ResourceHandler for TestResource {
         fn definition(&self) -> Resource {
@@ -2207,6 +2251,22 @@ mod tests {
         let server = ServerBuilder::new("srv", "1.0").tool(TestTool).build();
         assert!(server.capabilities().tools.is_some());
         assert!(server.has_tools());
+    }
+
+    #[test]
+    fn builder_legacy_tool_is_explicit_and_does_not_claim_modern_tools() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .legacy_tool(ExactLegacyOnlyTool)
+            .build();
+        assert!(server.capabilities().tools.is_some());
+        assert!(server.has_tools());
+        let router = server.into_router();
+        assert_eq!(router.tools_count(), 1);
+        assert!(
+            !router
+                .server_discovery_behavior_registry()
+                .contains(fastmcp_protocol::ServerBehavior::ToolsList)
+        );
     }
 
     #[test]

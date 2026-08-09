@@ -26,8 +26,8 @@ use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     AdmittedSchema, CacheScope, CallToolParams, CallToolResult, CompleteResult, Content,
     CoreRequest, CoreResult, FinalCallToolParams, FinalCallToolResult, FinalCompletionParams,
-    FinalCompletionResult, FinalCoreRequest, FinalCoreResult, FinalGetPromptParams,
-    FinalGetPromptResult, FinalListParams, FinalListPromptsResult,
+    FinalCompletionReference, FinalCompletionResult, FinalCoreRequest, FinalCoreResult,
+    FinalGetPromptParams, FinalGetPromptResult, FinalListParams, FinalListPromptsResult,
     FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult, FinalPrompt,
     FinalPromptArgument, FinalReadResourceParams, FinalReadResourceResult, FinalResource,
     FinalResourceTemplate, FinalTool, FinalToolAnnotations, GetPromptParams, GetPromptResult,
@@ -57,7 +57,7 @@ use crate::FinalTaskRuntime;
 use crate::Session;
 use crate::handler::{
     BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
-    CompletionHandler, PromptHandler, ResourceHandler, ToolHandler,
+    CompletionHandler, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
 };
 
 /// Type alias for a notification sender callback.
@@ -304,30 +304,69 @@ fn require_final_tasks_capability(metadata: &OpenMetadata) -> McpResult<()> {
 struct FinalToolSchemas {
     input: AdmittedSchema,
     output: Option<AdmittedSchema>,
+    errors: Option<FinalToolErrorStructuredContent>,
 }
 
-fn admit_final_tool_schemas(tool: &Tool) -> McpResult<FinalToolSchemas> {
-    if !tool.input_schema.is_object() {
+#[derive(Clone)]
+struct FinalToolErrorStructuredContent {
+    input_validation: serde_json::Value,
+    handler: serde_json::Value,
+}
+
+const MAX_FINAL_TOOL_ERROR_STRUCTURED_CONTENT_BYTES: usize = 16 * 1024;
+
+fn admit_final_tool_error_structured_content<H: ToolHandler + ?Sized>(
+    handler: &H,
+    output: &AdmittedSchema,
+    kind: ToolErrorKind,
+) -> McpResult<serde_json::Value> {
+    let mapped = crate::catch_extension_unwind(|| {
+        handler.final_tool_error_structured_content(kind)
+    })
+    .map_err(|_payload| {
+        McpError::internal_error("tool error structured-content mapper panicked during admission")
+    })?
+    .ok_or_else(|| {
+        McpError::internal_error(
+            "tool declares outputSchema without a complete tool-error structured-content mapper",
+        )
+    })?;
+    let encoded = serde_json::to_vec(&mapped).map_err(|_error| {
+        McpError::internal_error("tool error structured-content mapper returned invalid JSON")
+    })?;
+    if encoded.len() > MAX_FINAL_TOOL_ERROR_STRUCTURED_CONTENT_BYTES {
+        return Err(McpError::internal_error(
+            "tool error structured-content mapper exceeded the registration limit",
+        ));
+    }
+    if output.validate(&mapped).is_err() {
+        return Err(McpError::internal_error(
+            "tool error structured-content mapper does not satisfy outputSchema",
+        ));
+    }
+    Ok(mapped)
+}
+
+fn admit_final_tool_schemas<H: ToolHandler + ?Sized>(
+    input_schema: &serde_json::Value,
+    output_schema: Option<&serde_json::Value>,
+    handler: &H,
+) -> McpResult<FinalToolSchemas> {
+    if !input_schema.is_object() {
         return Err(McpError::internal_error(
             "tool declares a final input schema that is not an object",
         ));
     }
-    if tool
-        .input_schema
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        != Some("object")
-    {
+    if input_schema.get("type").and_then(serde_json::Value::as_str) != Some("object") {
         return Err(McpError::internal_error(
             "tool declares a final input schema without type object",
         ));
     }
-    let input = admit_final_schema(tool.input_schema.clone()).map_err(|_error| {
+    let input = admit_final_schema(input_schema.clone()).map_err(|_error| {
         McpError::internal_error("tool declares an invalid final input schema")
     })?;
-    let output = tool
-        .output_schema
-        .clone()
+    let output = output_schema
+        .cloned()
         .map(|schema| {
             if !schema.is_object() {
                 return Err(McpError::internal_error(
@@ -339,7 +378,130 @@ fn admit_final_tool_schemas(tool: &Tool) -> McpResult<FinalToolSchemas> {
             })
         })
         .transpose()?;
-    Ok(FinalToolSchemas { input, output })
+    let errors = output
+        .as_ref()
+        .map(|output| {
+            Ok(FinalToolErrorStructuredContent {
+                input_validation: admit_final_tool_error_structured_content(
+                    handler,
+                    output,
+                    ToolErrorKind::InputValidation,
+                )?,
+                handler: admit_final_tool_error_structured_content(
+                    handler,
+                    output,
+                    ToolErrorKind::Handler,
+                )?,
+            })
+        })
+        .transpose()?;
+    Ok(FinalToolSchemas {
+        input,
+        output,
+        errors,
+    })
+}
+
+/// One immutable catalog snapshot committed together with its dispatch target.
+/// No list or validation path re-invokes the handler's definition hooks.
+struct AdmittedToolRegistration {
+    handler: BoxedToolHandler,
+    definition: Tool,
+    final_registration: Option<AdmittedFinalToolRegistration>,
+}
+
+struct AdmittedFinalToolRegistration {
+    final_definition: FinalTool,
+    schemas: FinalToolSchemas,
+    declares_final_tasks: bool,
+}
+
+impl AdmittedToolRegistration {
+    fn admit<H: ToolHandler + 'static>(handler: H, definition: Tool) -> McpResult<Self> {
+        let (exact_final_definition, declares_final_tasks) = crate::catch_extension_unwind(|| {
+            (handler.final_definition(), handler.declares_final_tasks())
+        })
+        .map_err(|_payload| {
+            McpError::internal_error("tool metadata hook panicked during admission")
+        })?;
+        let final_definition = match exact_final_definition {
+            Some(definition) => definition,
+            None => {
+                let (title, icons, metadata) = crate::catch_extension_unwind(|| {
+                    (
+                        handler.final_title().map(str::to_owned),
+                        handler.final_icons().map(|icons| icons.to_vec()),
+                        handler.final_metadata().cloned(),
+                    )
+                })
+                .map_err(|_payload| {
+                    McpError::internal_error("tool metadata hook panicked during admission")
+                })?;
+                FinalTool {
+                    name: definition.name.clone(),
+                    title,
+                    description: definition.description.clone(),
+                    input_schema: definition.input_schema.clone(),
+                    output_schema: definition.output_schema.clone(),
+                    annotations: definition
+                        .annotations
+                        .clone()
+                        .map(project_final_tool_annotations),
+                    icons,
+                    meta: metadata,
+                }
+            }
+        };
+        if final_definition.name != definition.name {
+            return Err(McpError::internal_error(
+                "tool's exact final definition name differs from its legacy definition name",
+            ));
+        }
+        let schemas = admit_final_tool_schemas(
+            &final_definition.input_schema,
+            final_definition.output_schema.as_ref(),
+            &handler,
+        )?;
+        Ok(Self {
+            handler: Box::new(handler),
+            definition,
+            final_registration: Some(AdmittedFinalToolRegistration {
+                final_definition,
+                schemas,
+                declares_final_tasks,
+            }),
+        })
+    }
+
+    fn legacy_only<H: ToolHandler + 'static>(handler: H, definition: Tool) -> Self {
+        Self {
+            handler: Box::new(handler),
+            definition,
+            final_registration: None,
+        }
+    }
+
+    fn with_mounted_name(self, mounted_name: String) -> Self {
+        use crate::handler::MountedToolHandler;
+
+        let Self {
+            handler,
+            mut definition,
+            mut final_registration,
+        } = self;
+        definition.name.clone_from(&mounted_name);
+        if let Some(final_registration) = final_registration.as_mut() {
+            final_registration
+                .final_definition
+                .name
+                .clone_from(&mounted_name);
+        }
+        Self {
+            handler: Box::new(MountedToolHandler::new(handler, mounted_name)),
+            definition,
+            final_registration,
+        }
+    }
 }
 
 /// Encodes a handler-authored final resource result without reprojecting it
@@ -877,14 +1039,7 @@ fn derive_handler_context(
 
 /// Routes MCP requests to the appropriate handlers.
 pub struct Router {
-    tools: HashMap<String, BoxedToolHandler>,
-    /// Immutable final-dialect schemas admitted with each registered tool.
-    ///
-    /// This is a final-only index: every tool remains registered in `tools`
-    /// for the exact legacy surface, while only entries present here are
-    /// visible or invokable on modern routes. This keeps final schema
-    /// admission from changing legacy registration semantics.
-    final_tool_schemas: HashMap<String, FinalToolSchemas>,
+    tools: HashMap<String, AdmittedToolRegistration>,
     tool_order: Vec<String>,
     completion_handler: Option<BoxedCompletionHandler>,
     resources: HashMap<String, BoxedResourceHandler>,
@@ -916,7 +1071,6 @@ impl Router {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
-            final_tool_schemas: HashMap::new(),
             tool_order: Vec::new(),
             completion_handler: None,
             resources: HashMap::new(),
@@ -1012,42 +1166,57 @@ impl Router {
     /// If a tool with the same name already exists, it will be replaced.
     /// Use [`add_tool_with_behavior`](Self::add_tool_with_behavior) for
     /// finer control over duplicate handling.
-    pub fn add_tool<H: ToolHandler + 'static>(&mut self, handler: H) {
-        let def = handler.definition();
-        let schemas = match admit_final_tool_schemas(&def) {
-            Ok(schemas) => Some(schemas),
-            Err(error) => {
-                log::warn!(
-                    target: "fastmcp_rust::router",
-                    "registering tool for legacy only because final schema admission failed; tool_key={}; error_code={:?}",
-                    safe_log_label(&def.name),
-                    error.code
-                );
-                None
-            }
-        };
-        let is_new = !self.tools.contains_key(&def.name);
-        self.tools.insert(def.name.clone(), Box::new(handler));
-        if let Some(schemas) = schemas {
-            self.final_tool_schemas.insert(def.name.clone(), schemas);
-        } else {
-            self.final_tool_schemas.remove(&def.name);
-        }
-        if is_new {
-            self.tool_order.push(def.name);
-        }
+    pub fn add_tool<H: ToolHandler + 'static>(&mut self, handler: H) -> McpResult<()> {
+        self.add_tool_with_behavior(handler, crate::DuplicateBehavior::Replace)
+    }
+
+    /// Adds an intentionally exact-2024-only tool handler.
+    ///
+    /// This is the explicit escape hatch for a legacy definition that cannot
+    /// satisfy final schema admission. The tool remains available to exact
+    /// MCP 2024-11-05 list and call routes, but is absent from every modern
+    /// catalog and modern dispatch lookup. Ordinary [`Self::add_tool`] never
+    /// falls back to this path.
+    pub fn add_legacy_tool<H: ToolHandler + 'static>(&mut self, handler: H) -> McpResult<()> {
+        self.add_legacy_tool_with_behavior(handler, crate::DuplicateBehavior::Replace)
     }
 
     /// Adds a tool handler with specified duplicate behavior.
     ///
-    /// Returns `Err` if behavior is [`crate::DuplicateBehavior::Error`] and the
-    /// tool name already exists.
+    /// Returns `Err` if duplicate policy rejects the name or if the candidate's
+    /// immutable definition, schemas, final metadata, or required error mapper
+    /// cannot be admitted. Every error is returned before catalog mutation.
     pub fn add_tool_with_behavior<H: ToolHandler + 'static>(
         &mut self,
         handler: H,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        let def = handler.definition();
+        self.add_tool_registration_with_behavior(handler, behavior, true)
+    }
+
+    /// Adds an intentionally exact-2024-only tool with duplicate policy.
+    ///
+    /// The definition is snapshotted before mutation, but no final definition,
+    /// schema, metadata, or error-mapper hook is read. This prevents an
+    /// explicitly legacy-only registration from accidentally claiming modern
+    /// support while retaining the same duplicate semantics as ordinary tools.
+    pub fn add_legacy_tool_with_behavior<H: ToolHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        self.add_tool_registration_with_behavior(handler, behavior, false)
+    }
+
+    fn add_tool_registration_with_behavior<H: ToolHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+        admit_final: bool,
+    ) -> Result<(), McpError> {
+        let def = crate::catch_extension_unwind(|| handler.definition()).map_err(|_payload| {
+            McpError::internal_error("tool definition hook panicked during admission")
+        })?;
         let name = &def.name;
 
         let existed = self.tools.contains_key(name);
@@ -1078,26 +1247,18 @@ impl Router {
             }
         }
 
-        let schemas = match admit_final_tool_schemas(&def) {
-            Ok(schemas) => Some(schemas),
-            Err(error) => {
-                log::warn!(
-                    target: "fastmcp_rust::router",
-                    "registering tool for legacy only because final schema admission failed; tool_key={}; error_code={:?}",
-                    safe_log_label(&def.name),
-                    error.code
-                );
-                None
-            }
-        };
-        self.tools.insert(def.name.clone(), Box::new(handler));
-        if let Some(schemas) = schemas {
-            self.final_tool_schemas.insert(def.name.clone(), schemas);
+        // Admission must finish before any map or ordering mutation. In
+        // particular, a rejected replacement must retain the prior handler
+        // and its admitted schemas for both protocol eras.
+        let name = def.name.clone();
+        let admitted = if admit_final {
+            AdmittedToolRegistration::admit(handler, def)?
         } else {
-            self.final_tool_schemas.remove(&def.name);
-        }
+            AdmittedToolRegistration::legacy_only(handler, def)
+        };
+        self.tools.insert(name.clone(), admitted);
         if !existed {
-            self.tool_order.push(def.name);
+            self.tool_order.push(name);
         }
         Ok(())
     }
@@ -1366,7 +1527,7 @@ impl Router {
         self.tool_order
             .iter()
             .filter_map(|name| self.tools.get(name))
-            .map(|h| h.definition())
+            .map(|entry| entry.definition.clone())
             .collect()
     }
 
@@ -1383,8 +1544,8 @@ impl Router {
         self.tool_order
             .iter()
             .filter_map(|name| self.tools.get(name))
-            .filter_map(|h| {
-                let def = h.definition();
+            .filter_map(|entry| {
+                let def = &entry.definition;
                 // Check session state filter
                 if let Some(state) = session_state {
                     if !state.is_tool_enabled(&def.name) {
@@ -1397,7 +1558,7 @@ impl Router {
                         return None;
                     }
                 }
-                Some(def)
+                Some(def.clone())
             })
             .collect()
     }
@@ -1566,7 +1727,12 @@ impl Router {
         if self.completion_handler.is_some() {
             behaviors.push(ServerBehavior::CompletionComplete);
         }
-        if !self.tool_order.is_empty() {
+        if self
+            .tool_order
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .any(|entry| entry.final_registration.is_some())
+        {
             behaviors.push(ServerBehavior::ToolsList);
             behaviors.push(ServerBehavior::ToolsListChangedNotification);
         }
@@ -1587,7 +1753,7 @@ impl Router {
     /// Gets a tool handler by name.
     #[must_use]
     pub fn get_tool(&self, name: &str) -> Option<&BoxedToolHandler> {
-        self.tools.get(name)
+        self.tools.get(name).map(|entry| &entry.handler)
     }
 
     /// Gets a resource handler by URI.
@@ -1768,6 +1934,27 @@ impl Router {
         }
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
+        }
+
+        match &params.reference {
+            FinalCompletionReference::Prompt { name }
+            | FinalCompletionReference::PromptWithTitle { name, .. }
+                if !self.prompts.contains_key(name) =>
+            {
+                return Err(McpError::invalid_params(
+                    "completion prompt reference is not registered",
+                ));
+            }
+            FinalCompletionReference::Resource { uri }
+                if !self.resource_templates.contains_key(uri) =>
+            {
+                return Err(McpError::invalid_params(
+                    "completion resource reference is not a registered resource template",
+                ));
+            }
+            FinalCompletionReference::Prompt { .. }
+            | FinalCompletionReference::PromptWithTitle { .. }
+            | FinalCompletionReference::Resource { .. } => {}
         }
 
         let handler = self
@@ -2174,10 +2361,9 @@ impl Router {
         })
     }
 
-    /// Handles a final tools/list request using only the final-admitted tool
-    /// index. A legacy-only tool is deliberately absent before its definition
-    /// hook is reached, so malformed final schemas cannot influence a modern
-    /// catalog page or its cursor.
+    /// Handles a final tools/list request using only final-admitted entries.
+    /// Normal registration admits schemas before committing its handler, so a
+    /// malformed candidate cannot influence a modern catalog page or cursor.
     fn handle_final_tools_list(
         &self,
         request_ctx: &McpContext,
@@ -2197,9 +2383,9 @@ impl Router {
         let tools = crate::catch_extension_unwind(|| {
             self.tool_order
                 .iter()
-                .filter(|name| self.final_tool_schemas.contains_key(name.as_str()))
                 .filter_map(|name| self.tools.get(name))
-                .map(|handler| handler.definition())
+                .filter(|entry| entry.final_registration.is_some())
+                .map(|entry| entry.definition.clone())
                 .filter(|tool| tag_filters.is_none_or(|filters| filters.matches(&tool.tags)))
                 .collect::<Vec<_>>()
         })
@@ -2223,7 +2409,7 @@ impl Router {
 
     fn project_final_tools_list(
         &self,
-        request_ctx: &McpContext,
+        _request_ctx: &McpContext,
         result: ListToolsResult,
         cache_hints: FinalCacheHintPolicy,
     ) -> McpResult<FinalListToolsResult> {
@@ -2231,34 +2417,16 @@ impl Router {
             .tools
             .into_iter()
             .map(|tool| {
-                let handler = self.tools.get(&tool.name).ok_or_else(|| {
+                let entry = self.tools.get(&tool.name).ok_or_else(|| {
                     McpError::internal_error("listed tool is absent from the router catalog")
                 })?;
-                let (title, icons, meta) = crate::catch_extension_unwind(|| {
-                    (
-                        handler.final_title().map(str::to_owned),
-                        handler.final_icons().map(|icons| icons.to_vec()),
-                        handler.final_metadata().cloned(),
+                let final_registration = entry.final_registration.as_ref().ok_or_else(|| {
+                    McpError::internal_error(
+                        "legacy-only tool reached the final catalog projection",
                     )
-                })
-                .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
-                let schemas = self.final_tool_schemas.get(&tool.name).ok_or_else(|| {
-                    McpError::internal_error("listed tool has no admitted final schemas")
                 })?;
 
-                Ok(FinalTool {
-                    name: tool.name,
-                    title,
-                    description: tool.description,
-                    input_schema: schemas.input.schema().clone(),
-                    output_schema: schemas
-                        .output
-                        .as_ref()
-                        .map(|schema| schema.schema().clone()),
-                    annotations: tool.annotations.map(project_final_tool_annotations),
-                    icons,
-                    meta,
-                })
+                Ok(final_registration.final_definition.clone())
             })
             .collect::<McpResult<Vec<_>>>()?;
         Ok(FinalListToolsResult {
@@ -2472,22 +2640,20 @@ impl Router {
         }
 
         // Find the tool handler
-        let handler = self
+        let entry = self
             .tools
             .get(&params.name)
             .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", params.name)))?;
+        let handler = &entry.handler;
 
         // Validate arguments against the tool's input schema
         // Default to empty object since MCP tool arguments are always objects
         let arguments = params.arguments.unwrap_or_else(|| serde_json::json!({}));
-        let tool_def = crate::catch_extension_unwind(|| handler.definition())
-            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
-
         // Use strict or lenient validation based on configuration
         let validation_result = if self.strict_input_validation {
-            validate_strict(&tool_def.input_schema, &arguments)
+            validate_strict(&entry.definition.input_schema, &arguments)
         } else {
-            validate(&tool_def.input_schema, &arguments)
+            validate(&entry.definition.input_schema, &arguments)
         };
 
         if let Err(validation_errors) = validation_result {
@@ -2588,17 +2754,16 @@ impl Router {
             ));
         }
 
-        let handler = self
+        let entry = self
             .tools
             .get(&params.name)
             .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", params.name)))?;
+        let handler = &entry.handler;
         let arguments = params.arguments.unwrap_or_else(|| serde_json::json!({}));
-        let tool_def = crate::catch_extension_unwind(|| handler.definition())
-            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
         let validation_result = if self.strict_input_validation {
-            validate_strict(&tool_def.input_schema, &arguments)
+            validate_strict(&entry.definition.input_schema, &arguments)
         } else {
-            validate(&tool_def.input_schema, &arguments)
+            validate(&entry.definition.input_schema, &arguments)
         };
         if let Err(validation_errors) = validation_result {
             let error_messages: Vec<String> = validation_errors
@@ -2700,23 +2865,23 @@ impl Router {
             ));
         }
 
-        let handler = self
+        let entry = self
             .tools
             .get(&params.name)
             .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {}", params.name)))?;
-        let (input_schema, output_schema) = self
-            .final_tool_schemas
-            .get(&params.name)
-            .cloned()
-            .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {}", params.name)))
-            .map(|schemas| (schemas.input, schemas.output))?;
+        let final_registration = entry
+            .final_registration
+            .as_ref()
+            .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {}", params.name)))?;
+        let handler = &entry.handler;
+        let input_schema = &final_registration.schemas.input;
+        let output_schema = final_registration.schemas.output.as_ref();
         if params.arguments.is_explicit_null() {
             return Err(McpError::invalid_params(
                 "tools/call arguments must not be null",
             ));
         }
-        let declares_final_tasks = crate::catch_extension_unwind(|| handler.declares_final_tasks())
-            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
+        let declares_final_tasks = final_registration.declares_final_tasks;
         if declares_final_tasks {
             require_final_tasks_capability(&params.meta)?;
             let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
@@ -2735,6 +2900,11 @@ impl Router {
                 "Tool arguments do not match the declared input schema.",
             )])?;
             result.payload.is_error = true;
+            result.payload.structured_content = final_registration
+                .schemas
+                .errors
+                .as_ref()
+                .map(|errors| errors.input_validation.clone());
             return Ok(FinalToolOutcome::Complete(result));
         }
 
@@ -2763,7 +2933,7 @@ impl Router {
             Outcome::Ok(result) => {
                 match &result {
                     FinalToolOutcome::Complete(result) => {
-                        if let Some(output_schema) = output_schema.as_ref() {
+                        if let Some(output_schema) = output_schema {
                             let structured_content = result
                                 .payload
                                 .structured_content
@@ -2799,6 +2969,11 @@ impl Router {
                         text: error.message,
                     }])?;
                 result.payload.is_error = true;
+                result.payload.structured_content = final_registration
+                    .schemas
+                    .errors
+                    .as_ref()
+                    .map(|errors| errors.handler.clone());
                 Ok(FinalToolOutcome::Complete(result))
             }
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
@@ -3864,7 +4039,6 @@ impl Router {
 
         let Router {
             tools,
-            final_tool_schemas,
             tool_order,
             resources,
             resource_order,
@@ -3876,13 +4050,7 @@ impl Router {
         } = other;
 
         // Mount tools
-        result.merge(self.mount_tools_from(
-            tools,
-            final_tool_schemas,
-            tool_order,
-            prefix,
-            behavior,
-        ));
+        result.merge(self.mount_tools_from(tools, tool_order, prefix, behavior));
 
         // Mount resources
         result.merge(self.mount_resources_from(resources, resource_order, prefix, behavior));
@@ -3931,33 +4099,23 @@ impl Router {
         if !preflight.is_success() {
             return preflight;
         }
-        self.mount_tools_from(
-            other.tools,
-            other.final_tool_schemas,
-            other.tool_order,
-            prefix,
-            behavior,
-        )
+        self.mount_tools_from(other.tools, other.tool_order, prefix, behavior)
     }
 
     /// Internal: mount tools from a HashMap.
     fn mount_tools_from(
         &mut self,
-        mut tools: HashMap<String, BoxedToolHandler>,
-        mut final_tool_schemas: HashMap<String, FinalToolSchemas>,
+        mut tools: HashMap<String, AdmittedToolRegistration>,
         tool_order: Vec<String>,
         prefix: Option<&str>,
         behavior: crate::DuplicateBehavior,
     ) -> MountResult {
-        use crate::handler::MountedToolHandler;
-
         let mut result = MountResult::default();
 
         for name in tool_order {
-            let Some(handler) = tools.remove(&name) else {
+            let Some(entry) = tools.remove(&name) else {
                 continue;
             };
-            let schemas = final_tool_schemas.remove(&name);
             let mounted_name = Self::apply_prefix(&name, prefix);
             trace!(
                 target: targets::HANDLER,
@@ -3974,16 +4132,12 @@ impl Router {
                 continue;
             }
 
-            // Wrap with mounted name and insert
-            let mounted = MountedToolHandler::new(handler, mounted_name.clone());
+            // Rewrite the immutable definition snapshot and wrap only the
+            // dispatch target. Admitted schemas and final metadata move as one
+            // entry and are never recomputed during mounting.
+            let mounted = entry.with_mounted_name(mounted_name.clone());
             let needs_order_push = !existed && !self.tool_order.iter().any(|n| n == &mounted_name);
-            self.tools.insert(mounted_name.clone(), Box::new(mounted));
-            if let Some(schemas) = schemas {
-                self.final_tool_schemas
-                    .insert(mounted_name.clone(), schemas);
-            } else {
-                self.final_tool_schemas.remove(&mounted_name);
-            }
+            self.tools.insert(mounted_name.clone(), mounted);
             if needs_order_push {
                 self.tool_order.push(mounted_name);
             }
@@ -3993,10 +4147,10 @@ impl Router {
         if !tools.is_empty() {
             // Defensive: older Routers or unusual construction could leave items untracked by
             // tool_order. Mount them deterministically to avoid HashMap iteration order leaks.
-            let mut remaining: Vec<(String, BoxedToolHandler)> = tools.into_iter().collect();
+            let mut remaining: Vec<(String, AdmittedToolRegistration)> =
+                tools.into_iter().collect();
             remaining.sort_by(|a, b| a.0.cmp(&b.0));
-            for (name, handler) in remaining {
-                let schemas = final_tool_schemas.remove(&name);
+            for (name, entry) in remaining {
                 let mounted_name = Self::apply_prefix(&name, prefix);
 
                 let existed = self.tools.contains_key(&mounted_name);
@@ -4006,14 +4160,8 @@ impl Router {
                     continue;
                 }
 
-                let mounted = MountedToolHandler::new(handler, mounted_name.clone());
-                self.tools.insert(mounted_name.clone(), Box::new(mounted));
-                if let Some(schemas) = schemas {
-                    self.final_tool_schemas
-                        .insert(mounted_name.clone(), schemas);
-                } else {
-                    self.final_tool_schemas.remove(&mounted_name);
-                }
+                let mounted = entry.with_mounted_name(mounted_name.clone());
+                self.tools.insert(mounted_name.clone(), mounted);
                 if !existed && !self.tool_order.iter().any(|n| n == &mounted_name) {
                     self.tool_order.push(mounted_name);
                 }
@@ -4372,12 +4520,12 @@ impl Router {
         HashMap<String, ResourceTemplateEntry>,
         HashMap<String, BoxedPromptHandler>,
     ) {
-        (
-            self.tools,
-            self.resources,
-            self.resource_templates,
-            self.prompts,
-        )
+        let tools = self
+            .tools
+            .into_iter()
+            .map(|(name, entry)| (name, entry.handler))
+            .collect();
+        (tools, self.resources, self.resource_templates, self.prompts)
     }
 }
 
@@ -5097,20 +5245,18 @@ impl ToolCaller for RouterToolCaller {
             }
 
             // Find the tool handler
-            let handler = router
+            let entry = router
                 .tools
                 .get(&name)
                 .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", name)))?;
+            let handler = &entry.handler;
 
             // Validate arguments against the tool's input schema
-            let tool_def = crate::catch_extension_unwind(|| handler.definition())
-                .map_err(|_payload| sanitized_handler_panic(parent_ctx.cx(), "tool_definition"))?;
-
             // Use strict or lenient validation based on router configuration
             let validation_result = if router.strict_input_validation {
-                validate_strict(&tool_def.input_schema, &args)
+                validate_strict(&entry.definition.input_schema, &args)
             } else {
-                validate(&tool_def.input_schema, &args)
+                validate(&entry.definition.input_schema, &args)
             };
 
             if let Err(validation_errors) = validation_result {
@@ -6083,14 +6229,62 @@ mod router_tests {
         }
     }
 
-    /// A tool that remains valid for legacy registration and dispatch but is
-    /// intentionally excluded from the final-admitted index.
-    struct LegacyOnlyNamedTool {
+    struct DuplicateInvariantTool {
+        label: &'static str,
+        schema_property: &'static str,
+        legacy_calls: Arc<AtomicUsize>,
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for DuplicateInvariantTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "duplicate-invariant-tool".to_owned(),
+                description: Some(self.label.to_owned()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        (self.schema_property): {"type": "boolean"}
+                    },
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![self.label.to_owned()],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Content::text(self.label)])
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                FinalCallToolResult {
+                    content: vec![ContentBlock::text(self.label)],
+                    is_error: false,
+                    structured_content: None,
+                },
+            )))
+        }
+    }
+
+    /// A normal-registration candidate whose final output-schema field is
+    /// invalid. It is used to prove admission rejects without catalog change.
+    struct InvalidFinalSchemaNamedTool {
         name: String,
         tags: Vec<String>,
     }
 
-    impl LegacyOnlyNamedTool {
+    impl InvalidFinalSchemaNamedTool {
         fn with_tags(name: &str, tags: Vec<String>) -> Self {
             Self {
                 name: name.to_owned(),
@@ -6099,14 +6293,15 @@ mod router_tests {
         }
     }
 
-    impl ToolHandler for LegacyOnlyNamedTool {
+    impl ToolHandler for InvalidFinalSchemaNamedTool {
         fn definition(&self) -> Tool {
             Tool {
                 name: self.name.clone(),
-                description: Some(format!("Legacy-only tool {}", self.name)),
+                description: Some(format!("Invalid-schema tool {}", self.name)),
                 input_schema: serde_json::json!({"type": "object"}),
-                // A scalar final output schema is inadmissible, but legacy
-                // dispatch does not consume it.
+                // The final field itself must be a JSON object. This scalar
+                // schema document is deliberately invalid for local normal
+                // registration.
                 output_schema: Some(serde_json::json!(false)),
                 icon: None,
                 version: None,
@@ -6146,23 +6341,27 @@ mod router_tests {
         JsonRpcRequest::new("tools/list", Some(serde_json::Value::Object(params)), id)
     }
 
-    fn mixed_era_mounted_tool_router() -> Router {
+    fn mounted_tool_router() -> Router {
         let mut source = Router::new();
-        source.add_tool(NamedTool::with_tags("first", vec!["visible".to_owned()]));
-        source.add_tool(LegacyOnlyNamedTool::with_tags(
-            "legacy-middle",
-            vec!["visible".to_owned()],
-        ));
-        source.add_tool(NamedTool::with_tags("second", vec!["visible".to_owned()]));
-        source.add_tool(NamedTool::with_tags(
-            "excluded",
-            vec!["visible".to_owned(), "excluded".to_owned()],
-        ));
-        source.add_tool(NamedTool::with_tags("other", vec!["other".to_owned()]));
+        source
+            .add_tool(NamedTool::with_tags("first", vec!["visible".to_owned()]))
+            .expect("tool registration succeeds");
+        source
+            .add_tool(NamedTool::with_tags("second", vec!["visible".to_owned()]))
+            .expect("tool registration succeeds");
+        source
+            .add_tool(NamedTool::with_tags(
+                "excluded",
+                vec!["visible".to_owned(), "excluded".to_owned()],
+            ))
+            .expect("tool registration succeeds");
+        source
+            .add_tool(NamedTool::with_tags("other", vec!["other".to_owned()]))
+            .expect("tool registration succeeds");
 
         let mut router = Router::new();
         let mounted = router.mount_tools(source, Some("peer"));
-        assert_eq!(mounted.tools, 5);
+        assert_eq!(mounted.tools, 4);
         router
     }
 
@@ -6239,8 +6438,16 @@ mod router_tests {
                     serde_json::json!({
                         "$schema": "https://json-schema.org/draft/2020-12/schema",
                         "type": "object",
-                        "required": ["accepted"],
-                        "properties": {"accepted": {"type": "boolean"}},
+                        "properties": {
+                            "accepted": {"type": "boolean"},
+                            "error": {
+                                "enum": ["input-validation", "handler"]
+                            }
+                        },
+                        "anyOf": [
+                            {"required": ["accepted"]},
+                            {"required": ["error"]}
+                        ],
                         "unevaluatedProperties": false,
                     })
                 }),
@@ -6254,6 +6461,18 @@ mod router_tests {
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
             self.legacy_calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![Content::text("legacy schema-boundary result")])
+        }
+
+        fn final_tool_error_structured_content(
+            &self,
+            kind: ToolErrorKind,
+        ) -> Option<serde_json::Value> {
+            Some(match kind {
+                ToolErrorKind::InputValidation => {
+                    serde_json::json!({"error": "input-validation"})
+                }
+                ToolErrorKind::Handler => serde_json::json!({"error": "handler"}),
+            })
         }
 
         fn call_final_outcome(
@@ -6276,6 +6495,146 @@ mod router_tests {
                     structured_content: Some(structured_content),
                 },
             )))
+        }
+    }
+
+    /// A dual-era tool whose admitted output schema and handlers deliberately
+    /// differ across registrations. It proves a successful replacement commits
+    /// both the handler and final schema together.
+    struct AdmittedSchemaReplacementTool {
+        legacy_calls: Arc<AtomicUsize>,
+        final_calls: Arc<AtomicUsize>,
+        legacy_label: &'static str,
+        output_schema: serde_json::Value,
+        structured_content: Option<serde_json::Value>,
+    }
+
+    impl ToolHandler for AdmittedSchemaReplacementTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "admitted-schema-replacement-tool".to_owned(),
+                description: Some(self.legacy_label.to_owned()),
+                input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "unevaluatedProperties": false,
+                }),
+                output_schema: Some(self.output_schema.clone()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Content::text(self.legacy_label)])
+        }
+
+        fn final_tool_error_structured_content(
+            &self,
+            kind: ToolErrorKind,
+        ) -> Option<serde_json::Value> {
+            match self
+                .output_schema
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("string") => Some(serde_json::json!(match kind {
+                    ToolErrorKind::InputValidation => "input-validation-error",
+                    ToolErrorKind::Handler => "handler-error",
+                })),
+                Some("boolean") => Some(serde_json::json!(matches!(kind, ToolErrorKind::Handler))),
+                Some("null") => Some(serde_json::Value::Null),
+                Some("object") => Some(serde_json::json!({
+                    "error": match kind {
+                        ToolErrorKind::InputValidation => "input-validation",
+                        ToolErrorKind::Handler => "handler",
+                    }
+                })),
+                _ => None,
+            }
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                FinalCallToolResult {
+                    content: vec![ContentBlock::text(self.legacy_label)],
+                    is_error: false,
+                    structured_content: self.structured_content.clone(),
+                },
+            )))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ErrorMapperMode {
+        Complete,
+        MissingHandler,
+        InvalidHandler,
+        OversizedHandler,
+    }
+
+    struct ErrorMappedTool {
+        mode: ErrorMapperMode,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for ErrorMappedTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "error-mapped-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["value"],
+                    "properties": {"value": {"type": "string"}},
+                    "additionalProperties": false
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "required": ["error"],
+                    "properties": {"error": {"type": "string"}},
+                    "additionalProperties": false
+                })),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn final_tool_error_structured_content(
+            &self,
+            kind: ToolErrorKind,
+        ) -> Option<serde_json::Value> {
+            match (self.mode, kind) {
+                (ErrorMapperMode::MissingHandler, ToolErrorKind::Handler) => None,
+                (ErrorMapperMode::InvalidHandler, ToolErrorKind::Handler) => {
+                    Some(serde_json::json!({"error": 7}))
+                }
+                (ErrorMapperMode::OversizedHandler, ToolErrorKind::Handler) => Some(
+                    serde_json::json!({"error": "x".repeat(MAX_FINAL_TOOL_ERROR_STRUCTURED_CONTENT_BYTES)}),
+                ),
+                (_, ToolErrorKind::InputValidation) => {
+                    Some(serde_json::json!({"error": "input-validation"}))
+                }
+                (_, ToolErrorKind::Handler) => Some(serde_json::json!({"error": "handler"})),
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(McpError::new(
+                McpErrorCode::ToolExecutionError,
+                "mapped handler failure",
+            ))
         }
     }
 
@@ -6464,6 +6823,37 @@ mod router_tests {
 
         fn final_metadata(&self) -> Option<&OpenMetadata> {
             Some(&self.metadata)
+        }
+
+        fn final_definition(&self) -> Option<FinalTool> {
+            Some(FinalTool {
+                name: "final-catalog-tool".to_owned(),
+                title: Some("Exact Final Catalog Tool".to_owned()),
+                description: Some("exact final catalog description".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: Some(serde_json::json!({"type": "object"})),
+                annotations: Some(FinalToolAnnotations {
+                    title: Some("Exact annotation title".to_owned()),
+                    destructive: Some(false),
+                    idempotent: Some(true),
+                    read_only: Some(true),
+                    open_world_hint: Some(false),
+                }),
+                icons: Some(self.icons.clone()),
+                meta: Some(self.metadata.clone()),
+            })
+        }
+
+        fn final_tool_error_structured_content(
+            &self,
+            kind: ToolErrorKind,
+        ) -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "error": match kind {
+                    ToolErrorKind::InputValidation => "input-validation",
+                    ToolErrorKind::Handler => "handler",
+                }
+            }))
         }
 
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
@@ -7343,10 +7733,12 @@ mod router_tests {
 
     fn marked_router(marker: &str) -> Router {
         let mut router = Router::new();
-        router.add_tool(NamedTool::with_tags(
-            "duplicate_tool",
-            vec![marker.to_string()],
-        ));
+        router
+            .add_tool(NamedTool::with_tags(
+                "duplicate_tool",
+                vec![marker.to_string()],
+            ))
+            .expect("tool registration succeeds");
         router.add_resource(NamedResource::with_tags(
             "duplicate://resource",
             vec![marker.to_string()],
@@ -7808,7 +8200,8 @@ mod router_tests {
     #[test]
     fn add_and_get_tool() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::new("my_tool"));
+        r.add_tool(NamedTool::new("my_tool"))
+            .expect("tool registration succeeds");
         assert_eq!(r.tools_count(), 1);
         assert!(r.get_tool("my_tool").is_some());
         assert!(r.get_tool("other").is_none());
@@ -7817,8 +8210,10 @@ mod router_tests {
     #[test]
     fn add_tool_replace_on_duplicate() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::new("t"));
-        r.add_tool(NamedTool::new("t"));
+        r.add_tool(NamedTool::new("t"))
+            .expect("initial registration succeeds");
+        r.add_tool(NamedTool::new("t"))
+            .expect("valid replacement succeeds");
         assert_eq!(r.tools_count(), 1);
         // Order preserved (only one entry)
         assert_eq!(r.tools().len(), 1);
@@ -7827,49 +8222,277 @@ mod router_tests {
     #[test]
     fn tools_returns_definitions_in_order() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::new("b"));
-        r.add_tool(NamedTool::new("a"));
+        r.add_tool(NamedTool::new("b"))
+            .expect("tool registration succeeds");
+        r.add_tool(NamedTool::new("a"))
+            .expect("tool registration succeeds");
         let names: Vec<_> = r.tools().iter().map(|t| t.name.clone()).collect();
         assert_eq!(names, vec!["b", "a"]); // insertion order
+    }
+
+    #[test]
+    fn explicit_legacy_tool_is_callable_only_on_exact_2024_routes() {
+        let mut router = Router::new();
+        router
+            .add_legacy_tool(InvalidFinalSchemaNamedTool::with_tags(
+                "legacy-only-tool",
+                vec!["legacy".to_owned()],
+            ))
+            .expect("explicit legacy registration does not claim final admission");
+        assert_eq!(
+            router
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            vec!["legacy-only-tool"]
+        );
+        assert!(
+            !router
+                .server_discovery_behavior_registry()
+                .contains(ServerBehavior::ToolsList),
+            "a legacy-only catalog cannot produce a modern discovery claim"
+        );
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 78, Budget::INFINITE, &state);
+        let legacy = router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "legacy-only-tool".to_owned(),
+                    arguments: Some(serde_json::json!({})),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("exact 2024 dispatch reaches the explicit legacy handler");
+        assert_eq!(
+            serde_json::to_value(legacy).expect("legacy result serializes")["content"][0]["text"],
+            "called legacy-only-tool"
+        );
+
+        let modern_catalog = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, None, None, 79_i64),
+            )
+            .expect("modern tools/list remains a valid empty catalog");
+        assert_eq!(modern_catalog["tools"], serde_json::json!([]));
+        let modern_error = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request("legacy-only-tool", serde_json::json!({}), 80_i64),
+            )
+            .expect_err("modern dispatch cannot resolve an explicit legacy-only tool");
+        assert_eq!(modern_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(router.tools_count(), 1);
     }
 
     // ── add_tool_with_behavior ─────────────────────────────────────────
 
     #[test]
-    fn add_tool_behavior_error_on_duplicate() {
-        let mut r = Router::new();
-        r.add_tool(NamedTool::new("t"));
-        let err = r
-            .add_tool_with_behavior(NamedTool::new("t"), crate::DuplicateBehavior::Error)
-            .unwrap_err();
-        assert!(err.message.contains("already exists"));
+    fn duplicate_error_warn_and_ignore_preserve_handler_schema_and_order() {
+        for behavior in [
+            crate::DuplicateBehavior::Error,
+            crate::DuplicateBehavior::Warn,
+            crate::DuplicateBehavior::Ignore,
+        ] {
+            let original_legacy_calls = Arc::new(AtomicUsize::new(0));
+            let original_final_calls = Arc::new(AtomicUsize::new(0));
+            let candidate_legacy_calls = Arc::new(AtomicUsize::new(0));
+            let candidate_final_calls = Arc::new(AtomicUsize::new(0));
+            let mut router = Router::new();
+            router
+                .add_tool(NamedTool::new("before"))
+                .expect("baseline tool admission succeeds");
+            router
+                .add_tool(DuplicateInvariantTool {
+                    label: "original",
+                    schema_property: "original_property",
+                    legacy_calls: Arc::clone(&original_legacy_calls),
+                    final_calls: Arc::clone(&original_final_calls),
+                })
+                .expect("original admission succeeds");
+            router
+                .add_tool(NamedTool::new("after"))
+                .expect("trailing tool admission succeeds");
+
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let request_ctx = request_context(&cx, 81, Budget::INFINITE, &state);
+            let legacy_before =
+                serde_json::to_value(router.tools()).expect("legacy catalog serializes");
+            let modern_before = router
+                .dispatch_stateless(
+                    &request_ctx,
+                    &final_tools_list_request(None, None, None, 81_i64),
+                )
+                .expect("modern catalog is available");
+
+            let registration = router.add_tool_with_behavior(
+                DuplicateInvariantTool {
+                    label: "candidate",
+                    schema_property: "candidate_property",
+                    legacy_calls: Arc::clone(&candidate_legacy_calls),
+                    final_calls: Arc::clone(&candidate_final_calls),
+                },
+                behavior,
+            );
+            if behavior == crate::DuplicateBehavior::Error {
+                let error = registration.expect_err("Error rejects the duplicate");
+                assert!(error.message.contains("already exists"));
+            } else {
+                registration.expect("Warn and Ignore retain the original");
+            }
+
+            assert_eq!(
+                serde_json::to_value(router.tools()).expect("legacy catalog serializes"),
+                legacy_before
+            );
+            assert_eq!(
+                router
+                    .dispatch_stateless(
+                        &request_ctx,
+                        &final_tools_list_request(None, None, None, 82_i64),
+                    )
+                    .expect("modern catalog remains available"),
+                modern_before
+            );
+            assert_eq!(
+                router
+                    .tools()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect::<Vec<_>>(),
+                vec!["before", "duplicate-invariant-tool", "after"]
+            );
+
+            let legacy = router
+                .handle_tools_call(
+                    &request_ctx,
+                    CallToolParams {
+                        name: "duplicate-invariant-tool".to_owned(),
+                        arguments: Some(serde_json::json!({})),
+                        meta: None,
+                    },
+                    state.clone(),
+                    None,
+                    None,
+                )
+                .expect("legacy dispatch retains the original");
+            assert_eq!(
+                serde_json::to_value(legacy).expect("legacy result serializes")["content"][0]["text"],
+                "original"
+            );
+            let modern = router
+                .dispatch_stateless(
+                    &request_ctx,
+                    &final_tools_call_request(
+                        "duplicate-invariant-tool",
+                        serde_json::json!({}),
+                        83_i64,
+                    ),
+                )
+                .expect("modern dispatch retains the original");
+            assert_eq!(modern["content"][0]["text"], "original");
+            assert_eq!(original_legacy_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(original_final_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(candidate_legacy_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(candidate_final_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
-    fn add_tool_behavior_warn_keeps_original() {
-        let mut r = Router::new();
-        r.add_tool(NamedTool::new("t"));
-        r.add_tool_with_behavior(NamedTool::new("t"), crate::DuplicateBehavior::Warn)
-            .unwrap();
-        assert_eq!(r.tools_count(), 1);
-    }
+    fn duplicate_replace_atomically_updates_handler_schema_and_retains_order() {
+        let replacement_legacy_calls = Arc::new(AtomicUsize::new(0));
+        let replacement_final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(NamedTool::new("before"))
+            .expect("baseline admission succeeds");
+        router
+            .add_tool(DuplicateInvariantTool {
+                label: "original",
+                schema_property: "original_property",
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .expect("original admission succeeds");
+        router
+            .add_tool(NamedTool::new("after"))
+            .expect("trailing admission succeeds");
+        router
+            .add_tool_with_behavior(
+                DuplicateInvariantTool {
+                    label: "replacement",
+                    schema_property: "replacement_property",
+                    legacy_calls: Arc::clone(&replacement_legacy_calls),
+                    final_calls: Arc::clone(&replacement_final_calls),
+                },
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("Replace admits before committing the candidate");
 
-    #[test]
-    fn add_tool_behavior_replace() {
-        let mut r = Router::new();
-        r.add_tool(NamedTool::new("t"));
-        r.add_tool_with_behavior(NamedTool::new("t"), crate::DuplicateBehavior::Replace)
-            .unwrap();
-        assert_eq!(r.tools_count(), 1);
-    }
+        assert_eq!(
+            router
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            vec!["before", "duplicate-invariant-tool", "after"]
+        );
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 84, Budget::INFINITE, &state);
+        let modern_catalog = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, None, None, 84_i64),
+            )
+            .expect("modern replacement catalog is available");
+        assert_eq!(
+            modern_catalog["tools"][1]["inputSchema"]["properties"],
+            serde_json::json!({"replacement_property": {"type": "boolean"}})
+        );
+        assert_eq!(
+            router.tools()[1].description.as_deref(),
+            Some("replacement")
+        );
 
-    #[test]
-    fn add_tool_behavior_ignore() {
-        let mut r = Router::new();
-        r.add_tool(NamedTool::new("t"));
-        r.add_tool_with_behavior(NamedTool::new("t"), crate::DuplicateBehavior::Ignore)
-            .unwrap();
-        assert_eq!(r.tools_count(), 1);
+        let legacy = router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "duplicate-invariant-tool".to_owned(),
+                    arguments: Some(serde_json::json!({})),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("legacy dispatch uses replacement");
+        assert_eq!(
+            serde_json::to_value(legacy).expect("legacy result serializes")["content"][0]["text"],
+            "replacement"
+        );
+        let modern = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "duplicate-invariant-tool",
+                    serde_json::json!({}),
+                    85_i64,
+                ),
+            )
+            .expect("modern dispatch uses replacement");
+        assert_eq!(modern["content"][0]["text"], "replacement");
+        assert_eq!(replacement_legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement_final_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -7973,7 +8596,9 @@ mod router_tests {
         let canary = "raw-peer-identifier-canary";
 
         let mut tools = Router::new();
-        tools.add_tool(NamedTool::new(canary));
+        tools
+            .add_tool(NamedTool::new(canary))
+            .expect("tool registration succeeds");
         let tool_error = tools
             .add_tool_with_behavior(NamedTool::new(canary), crate::DuplicateBehavior::Error)
             .unwrap_err();
@@ -8159,8 +8784,10 @@ mod router_tests {
     #[test]
     fn tools_filtered_no_filters_returns_all() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::new("a"));
-        r.add_tool(NamedTool::new("b"));
+        r.add_tool(NamedTool::new("a"))
+            .expect("tool registration succeeds");
+        r.add_tool(NamedTool::new("b"))
+            .expect("tool registration succeeds");
         let tools = r.tools_filtered(None, None);
         assert_eq!(tools.len(), 2);
     }
@@ -8168,8 +8795,10 @@ mod router_tests {
     #[test]
     fn tools_filtered_by_session_state_disables() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::new("a"));
-        r.add_tool(NamedTool::new("b"));
+        r.add_tool(NamedTool::new("a"))
+            .expect("tool registration succeeds");
+        r.add_tool(NamedTool::new("b"))
+            .expect("tool registration succeeds");
         let state = SessionState::new();
         let disabled: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
         state.set("fastmcp.disabled_tools", &disabled);
@@ -8181,8 +8810,10 @@ mod router_tests {
     #[test]
     fn tools_filtered_by_tags() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::with_tags("a", vec!["db".to_string()]));
-        r.add_tool(NamedTool::with_tags("b", vec!["web".to_string()]));
+        r.add_tool(NamedTool::with_tags("a", vec!["db".to_string()]))
+            .expect("tool registration succeeds");
+        r.add_tool(NamedTool::with_tags("b", vec!["web".to_string()]))
+            .expect("tool registration succeeds");
         let include = vec!["db".to_string()];
         let filters = TagFilters::new(Some(&include), None);
         let tools = r.tools_filtered(None, Some(&filters));
@@ -8333,7 +8964,8 @@ mod router_tests {
     fn mount_tools_with_prefix() {
         let mut main = Router::new();
         let mut sub = Router::new();
-        sub.add_tool(NamedTool::new("query"));
+        sub.add_tool(NamedTool::new("query"))
+            .expect("tool registration succeeds");
         let result = main.mount(sub, Some("db"));
         assert_eq!(result.tools, 1);
         assert!(main.get_tool("db/query").is_some());
@@ -8344,7 +8976,8 @@ mod router_tests {
     fn mount_without_prefix() {
         let mut main = Router::new();
         let mut sub = Router::new();
-        sub.add_tool(NamedTool::new("query"));
+        sub.add_tool(NamedTool::new("query"))
+            .expect("tool registration succeeds");
         let result = main.mount(sub, None);
         assert_eq!(result.tools, 1);
         assert!(main.get_tool("query").is_some());
@@ -8689,9 +9322,11 @@ mod router_tests {
     #[test]
     fn mount_warns_on_conflict() {
         let mut main = Router::new();
-        main.add_tool(NamedTool::new("t"));
+        main.add_tool(NamedTool::new("t"))
+            .expect("tool registration succeeds");
         let mut sub = Router::new();
-        sub.add_tool(NamedTool::new("t"));
+        sub.add_tool(NamedTool::new("t"))
+            .expect("tool registration succeeds");
         let result = main.mount(sub, None);
         assert_eq!(result.tools, 1);
         assert!(!result.warnings.is_empty());
@@ -8701,9 +9336,11 @@ mod router_tests {
     #[test]
     fn mount_rejects_invalid_prefix_without_mutating() {
         let mut main = Router::new();
-        main.add_tool(NamedTool::new("original"));
+        main.add_tool(NamedTool::new("original"))
+            .expect("tool registration succeeds");
         let mut sub = Router::new();
-        sub.add_tool(NamedTool::new("incoming"));
+        sub.add_tool(NamedTool::new("incoming"))
+            .expect("tool registration succeeds");
         let result = main.mount(sub, Some("bad/prefix"));
         assert!(!result.is_success());
         assert_eq!(result.tools, 0);
@@ -8726,7 +9363,8 @@ mod router_tests {
             let mut main = marked_router("original");
             let mut sub = marked_router("incoming");
             if behavior == crate::DuplicateBehavior::Error {
-                sub.add_tool(NamedTool::new("unique_tool"));
+                sub.add_tool(NamedTool::new("unique_tool"))
+                    .expect("tool registration succeeds");
             }
 
             let result = main.mount_with_behavior(sub, None, behavior);
@@ -8766,10 +9404,16 @@ mod router_tests {
     #[test]
     fn behavior_aware_partial_mounts_preflight_error_atomically() {
         let mut tools = Router::new();
-        tools.add_tool(NamedTool::with_tags("same", vec!["original".to_string()]));
+        tools
+            .add_tool(NamedTool::with_tags("same", vec!["original".to_string()]))
+            .expect("tool registration succeeds");
         let mut tool_source = Router::new();
-        tool_source.add_tool(NamedTool::with_tags("same", vec!["incoming".to_string()]));
-        tool_source.add_tool(NamedTool::new("unique"));
+        tool_source
+            .add_tool(NamedTool::with_tags("same", vec!["incoming".to_string()]))
+            .expect("tool registration succeeds");
+        tool_source
+            .add_tool(NamedTool::new("unique"))
+            .expect("tool registration succeeds");
         let tool_result =
             tools.mount_tools_with_behavior(tool_source, None, crate::DuplicateBehavior::Error);
         assert!(!tool_result.is_success());
@@ -8837,13 +9481,15 @@ mod router_tests {
         main.add_tool(NamedTool::with_tags(
             "conflict",
             vec!["original".to_string()],
-        ));
+        ))
+        .expect("tool registration succeeds");
 
         let mut sub = Router::new();
         sub.add_tool(NamedTool::with_tags(
             "conflict",
             vec!["incoming".to_string()],
-        ));
+        ))
+        .expect("tool registration succeeds");
         sub.add_resource(NamedResource::new("unique://resource"));
         sub.add_resource_template(marked_template("unique://{item}", "incoming"));
         sub.add_prompt(NamedPrompt::new("unique_prompt"));
@@ -8866,7 +9512,9 @@ mod router_tests {
     fn invalid_prefix_rejects_every_partial_mount_without_mutation() {
         let mut tools = Router::new();
         let mut tool_source = Router::new();
-        tool_source.add_tool(NamedTool::new("tool"));
+        tool_source
+            .add_tool(NamedTool::new("tool"))
+            .expect("tool registration succeeds");
         let tool_result = tools.mount_tools_with_behavior(
             tool_source,
             Some("peer/secret"),
@@ -8912,7 +9560,8 @@ mod router_tests {
     fn mount_tools_only() {
         let mut main = Router::new();
         let mut sub = Router::new();
-        sub.add_tool(NamedTool::new("t1"));
+        sub.add_tool(NamedTool::new("t1"))
+            .expect("tool registration succeeds");
         sub.add_prompt(NamedPrompt::new("p1"));
         let result = main.mount_tools(sub, Some("ns"));
         assert_eq!(result.tools, 1);
@@ -8924,7 +9573,8 @@ mod router_tests {
     fn mount_prompts_only() {
         let mut main = Router::new();
         let mut sub = Router::new();
-        sub.add_tool(NamedTool::new("t1"));
+        sub.add_tool(NamedTool::new("t1"))
+            .expect("tool registration succeeds");
         sub.add_prompt(NamedPrompt::new("p1"));
         let result = main.mount_prompts(sub, Some("ns"));
         assert_eq!(result.prompts, 1);
@@ -8937,8 +9587,10 @@ mod router_tests {
     #[test]
     fn handle_tools_list_no_pagination() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::new("a"));
-        r.add_tool(NamedTool::new("b"));
+        r.add_tool(NamedTool::new("a"))
+            .expect("tool registration succeeds");
+        r.add_tool(NamedTool::new("b"))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let params = ListToolsParams {
             cursor: None,
@@ -8955,8 +9607,10 @@ mod router_tests {
     fn handle_tools_list_with_pagination() {
         let mut r = Router::new();
         r.set_list_page_size(Some(1));
-        r.add_tool(NamedTool::new("a"));
-        r.add_tool(NamedTool::new("b"));
+        r.add_tool(NamedTool::new("a"))
+            .expect("tool registration succeeds");
+        r.add_tool(NamedTool::new("b"))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let request_ctx = McpContext::new(cx, 1);
 
@@ -8986,8 +9640,10 @@ mod router_tests {
     #[test]
     fn handle_tools_list_with_tag_filter() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::with_tags("a", vec!["db".to_string()]));
-        r.add_tool(NamedTool::with_tags("b", vec!["web".to_string()]));
+        r.add_tool(NamedTool::with_tags("a", vec!["db".to_string()]))
+            .expect("tool registration succeeds");
+        r.add_tool(NamedTool::with_tags("b", vec!["web".to_string()]))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let params = ListToolsParams {
             cursor: None,
@@ -9379,8 +10035,10 @@ mod router_tests {
     #[test]
     fn handle_tools_list_with_session_state_filter() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::new("a"));
-        r.add_tool(NamedTool::new("b"));
+        r.add_tool(NamedTool::new("a"))
+            .expect("tool registration succeeds");
+        r.add_tool(NamedTool::new("b"))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let disabled: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
@@ -9566,7 +10224,8 @@ mod router_tests {
         let mut main = Router::new();
         let mut sub = Router::new();
         sub.add_resource(NamedResource::new("file:///a"));
-        sub.add_tool(NamedTool::new("t1"));
+        sub.add_tool(NamedTool::new("t1"))
+            .expect("tool registration succeeds");
         sub.add_resource_template(ResourceTemplate {
             uri_template: "db://{t}".to_string(),
             name: "db".to_string(),
@@ -9627,7 +10286,8 @@ mod router_tests {
     fn mount_all_component_types() {
         let mut main = Router::new();
         let mut sub = Router::new();
-        sub.add_tool(NamedTool::new("t1"));
+        sub.add_tool(NamedTool::new("t1"))
+            .expect("tool registration succeeds");
         sub.add_resource(NamedResource::new("file:///r1"));
         sub.add_prompt(NamedPrompt::new("p1"));
         sub.add_resource_template(ResourceTemplate {
@@ -9691,9 +10351,12 @@ mod router_tests {
     fn handle_tools_list_pagination_with_tags() {
         let mut r = Router::new();
         r.set_list_page_size(Some(1));
-        r.add_tool(NamedTool::with_tags("a", vec!["db".to_string()]));
-        r.add_tool(NamedTool::with_tags("b", vec!["db".to_string()]));
-        r.add_tool(NamedTool::with_tags("c", vec!["web".to_string()]));
+        r.add_tool(NamedTool::with_tags("a", vec!["db".to_string()]))
+            .expect("tool registration succeeds");
+        r.add_tool(NamedTool::with_tags("b", vec!["db".to_string()]))
+            .expect("tool registration succeeds");
+        r.add_tool(NamedTool::with_tags("c", vec!["web".to_string()]))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let request_ctx = McpContext::new(cx, 1);
 
@@ -9721,8 +10384,8 @@ mod router_tests {
     }
 
     #[test]
-    fn final_mixed_era_mount_excludes_legacy_only_tools_before_cursor_pagination() {
-        let mut router = mixed_era_mounted_tool_router();
+    fn final_mounted_tools_preserve_admitted_order_before_cursor_pagination() {
+        let mut router = mounted_tool_router();
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 164, Budget::INFINITE, &state);
@@ -9744,8 +10407,8 @@ mod router_tests {
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["peer/first", "peer/legacy-middle", "peer/second"],
-            "the legacy catalog retains the mounted legacy-only entry in source order"
+            vec!["peer/first", "peer/second"],
+            "the legacy catalog retains mounted tools in source order"
         );
 
         router.set_list_page_size(Some(1));
@@ -9768,7 +10431,7 @@ mod router_tests {
         assert_eq!(
             decode_cursor_offset(Some(cursor)).expect("cursor is router-generated"),
             1,
-            "the cursor advances across admitted entries, not every legacy registration"
+            "the cursor advances across admitted entries"
         );
 
         let second_page = router
@@ -9781,7 +10444,7 @@ mod router_tests {
                     165_i64,
                 ),
             )
-            .expect("the continuation page skips the legacy-only entry");
+            .expect("the continuation page keeps admitted source order");
         assert_eq!(second_page["tools"][0]["name"], "peer/second");
         assert_eq!(second_page["tools"].as_array().map(Vec::len), Some(1));
         assert!(
@@ -9791,8 +10454,8 @@ mod router_tests {
     }
 
     #[test]
-    fn final_mixed_era_mount_applies_tag_filters_only_to_admitted_order() {
-        let router = mixed_era_mounted_tool_router();
+    fn final_mounted_tools_apply_tag_filters_in_admitted_order() {
+        let router = mounted_tool_router();
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 166, Budget::INFINITE, &state);
@@ -9811,7 +10474,7 @@ mod router_tests {
                 .map(|tool| tool["name"].as_str().expect("tool name is a string"))
                 .collect::<Vec<_>>(),
             vec!["peer/first", "peer/second", "peer/excluded"],
-            "the legacy-only visible entry is absent without disturbing admitted insertion order"
+            "tag filtering preserves admitted insertion order"
         );
 
         let other = router
@@ -9953,7 +10616,8 @@ mod router_tests {
     #[test]
     fn handle_tools_call_disabled_tool_returns_error() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::new("my_tool"));
+        r.add_tool(NamedTool::new("my_tool"))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
         let state = SessionState::new();
@@ -9977,7 +10641,8 @@ mod router_tests {
     #[test]
     fn handle_tools_call_success() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::new("echo"));
+        r.add_tool(NamedTool::new("echo"))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
         let params = CallToolParams {
@@ -10019,7 +10684,8 @@ mod router_tests {
     #[test]
     fn handle_tools_call_zero_poll_balance_allows_handler_without_checkpoint() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::new("t"));
+        r.add_tool(NamedTool::new("t"))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let budget = Budget::unlimited().with_poll_quota(0);
         let params = CallToolParams {
@@ -10038,7 +10704,9 @@ mod router_tests {
     #[test]
     fn handle_tools_call_defers_pending_cancellation_inside_context_mask() {
         let mut router = Router::new();
-        router.add_tool(NamedTool::new("t"));
+        router
+            .add_tool(NamedTool::new("t"))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         cx.set_cancel_requested(true);
         let state = SessionState::new();
@@ -10294,9 +10962,11 @@ mod router_tests {
     fn alternating_tool_resource_recursion_uses_one_effective_depth() {
         let calls = Arc::new(AtomicU64::new(0));
         let mut router = Router::new();
-        router.add_tool(AlternatingTool {
-            calls: Arc::clone(&calls),
-        });
+        router
+            .add_tool(AlternatingTool {
+                calls: Arc::clone(&calls),
+            })
+            .expect("tool registration succeeds");
         router.add_resource(AlternatingResource {
             calls: Arc::clone(&calls),
         });
@@ -10338,10 +11008,12 @@ mod router_tests {
         let remaining_after_nested_debit = Arc::new(AtomicU64::new(u64::MAX));
         let remaining_after_nested_read = Arc::new(AtomicU64::new(u64::MAX));
         let mut router = Router::new();
-        router.add_tool(CostLedgerTool {
-            remaining_after_parent_debit: Arc::clone(&remaining_after_parent_debit),
-            remaining_after_nested_read: Arc::clone(&remaining_after_nested_read),
-        });
+        router
+            .add_tool(CostLedgerTool {
+                remaining_after_parent_debit: Arc::clone(&remaining_after_parent_debit),
+                remaining_after_nested_read: Arc::clone(&remaining_after_nested_read),
+            })
+            .expect("tool registration succeeds");
         router.add_resource(CostLedgerResource {
             remaining_after_nested_debit: Arc::clone(&remaining_after_nested_debit),
         });
@@ -10369,18 +11041,24 @@ mod router_tests {
     #[test]
     fn nested_tool_calls_preserve_framework_terminal_errors() {
         let mut router = Router::new();
-        router.add_tool(ErrorTool {
-            name: "nested_cancelled",
-            code: McpErrorCode::RequestCancelled,
-        });
-        router.add_tool(ErrorTool {
-            name: "nested_internal",
-            code: McpErrorCode::InternalError,
-        });
-        router.add_tool(ErrorTool {
-            name: "nested_tool_failure",
-            code: McpErrorCode::ToolExecutionError,
-        });
+        router
+            .add_tool(ErrorTool {
+                name: "nested_cancelled",
+                code: McpErrorCode::RequestCancelled,
+            })
+            .expect("tool registration succeeds");
+        router
+            .add_tool(ErrorTool {
+                name: "nested_internal",
+                code: McpErrorCode::InternalError,
+            })
+            .expect("tool registration succeeds");
+        router
+            .add_tool(ErrorTool {
+                name: "nested_tool_failure",
+                code: McpErrorCode::ToolExecutionError,
+            })
+            .expect("tool registration succeeds");
         let router = Arc::new(router);
         let cx = Cx::for_testing();
         let state = SessionState::new();
@@ -10407,12 +11085,14 @@ mod router_tests {
         let observed_deadline = Arc::new(Mutex::new(None));
         let timeout_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut router = Router::new();
-        router.add_tool(BudgetProbeTool {
-            timeout: Some(Duration::from_millis(1)),
-            delay: Duration::from_millis(15),
-            observed_deadline: Arc::clone(&observed_deadline),
-            timeout_read: Arc::clone(&timeout_read),
-        });
+        router
+            .add_tool(BudgetProbeTool {
+                timeout: Some(Duration::from_millis(1)),
+                delay: Duration::from_millis(15),
+                observed_deadline: Arc::clone(&observed_deadline),
+                timeout_read: Arc::clone(&timeout_read),
+            })
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
@@ -10443,19 +11123,21 @@ mod router_tests {
     }
 
     #[test]
-    fn handler_timeout_is_anchored_before_definition_and_validation_work() {
+    fn admitted_definition_is_not_requeried_inside_handler_budget() {
         let definition_reads = Arc::new(AtomicU64::new(0));
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut router = Router::new();
-        router.add_tool(SlowDefinitionTool {
-            definition_reads: Arc::clone(&definition_reads),
-            called: Arc::clone(&called),
-        });
+        router
+            .add_tool(SlowDefinitionTool {
+                definition_reads: Arc::clone(&definition_reads),
+                called: Arc::clone(&called),
+            })
+            .expect("the definition snapshot is admitted once");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
 
-        let error = router
+        router
             .handle_tools_call(
                 &request_ctx,
                 CallToolParams {
@@ -10467,12 +11149,10 @@ mod router_tests {
                 None,
                 None,
             )
-            .expect_err("pre-handler framework work must not reset the handler deadline");
+            .expect("dispatch uses the admitted snapshot and reaches the handler");
 
-        assert_eq!(error.code, McpErrorCode::RequestCancelled);
-        assert_eq!(error.message, "Request timeout exceeded");
-        assert!(!called.load(Ordering::Relaxed));
-        assert_eq!(definition_reads.load(Ordering::Relaxed), 2);
+        assert!(called.load(Ordering::Relaxed));
+        assert_eq!(definition_reads.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -10481,12 +11161,14 @@ mod router_tests {
         let timeout_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let request_deadline = wall_now().saturating_add_nanos(5_000_000_000);
         let mut router = Router::new();
-        router.add_tool(BudgetProbeTool {
-            timeout: Some(Duration::ZERO),
-            delay: Duration::ZERO,
-            observed_deadline: Arc::clone(&observed_deadline),
-            timeout_read: Arc::clone(&timeout_read),
-        });
+        router
+            .add_tool(BudgetProbeTool {
+                timeout: Some(Duration::ZERO),
+                delay: Duration::ZERO,
+                observed_deadline: Arc::clone(&observed_deadline),
+                timeout_read: Arc::clone(&timeout_read),
+            })
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(
@@ -10525,12 +11207,14 @@ mod router_tests {
         let ambient_deadline = wall_now().saturating_add_nanos(2_000_000_000);
         let request_deadline = ambient_deadline.saturating_add_nanos(2_000_000_000);
         let mut router = Router::new();
-        router.add_tool(BudgetProbeTool {
-            timeout: Some(Duration::from_secs(10)),
-            delay: Duration::ZERO,
-            observed_deadline: Arc::clone(&observed_deadline),
-            timeout_read,
-        });
+        router
+            .add_tool(BudgetProbeTool {
+                timeout: Some(Duration::from_secs(10)),
+                delay: Duration::ZERO,
+                observed_deadline: Arc::clone(&observed_deadline),
+                timeout_read,
+            })
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(ambient_deadline));
         let state = SessionState::new();
         let request_ctx = request_context(
@@ -10563,7 +11247,9 @@ mod router_tests {
 
     fn assert_sanitized_panic_tool(handler: impl ToolHandler + 'static, name: &str) {
         let mut router = Router::new();
-        router.add_tool(handler);
+        router
+            .add_tool(handler)
+            .expect("panic-test tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
@@ -10624,7 +11310,9 @@ mod router_tests {
         let cx = Cx::for_testing();
 
         let mut tool_router = Router::new();
-        tool_router.add_tool(OpaqueInternalTool);
+        tool_router
+            .add_tool(OpaqueInternalTool)
+            .expect("tool registration succeeds");
         let tool_state = SessionState::new();
         let tool_ctx = request_context(&cx, 1, Budget::INFINITE, &tool_state);
         let tool_error = tool_router
@@ -10735,17 +11423,21 @@ mod router_tests {
     }
 
     #[test]
-    fn list_definition_panics_use_the_same_sanitized_contract() {
+    fn admitted_tool_definition_is_snapshotted_while_other_list_panics_are_sanitized() {
         let cx = Cx::for_testing();
         let request_ctx = McpContext::new(cx, 1);
 
         let mut tool_router = Router::new();
-        tool_router.add_tool(DefinitionPanicTool(std::sync::atomic::AtomicBool::new(
-            false,
-        )));
-        let tool_error = tool_router
+        tool_router
+            .add_tool(DefinitionPanicTool(std::sync::atomic::AtomicBool::new(
+                false,
+            )))
+            .expect("the definition hook is read exactly once during admission");
+        let tools = tool_router
             .handle_tools_list(&request_ctx, ListToolsParams::default(), None)
-            .expect_err("tool definition panic must be sanitized");
+            .expect("listing clones the immutable admitted definition snapshot");
+        assert_eq!(tools.tools.len(), 1);
+        assert_eq!(tools.tools[0].name, "definition_panic_tool");
 
         let mut resource_router = Router::new();
         resource_router.add_resource(DefinitionPanicResource(std::sync::atomic::AtomicBool::new(
@@ -10763,7 +11455,7 @@ mod router_tests {
             .handle_prompts_list(&request_ctx, ListPromptsParams::default(), None)
             .expect_err("prompt definition panic must be sanitized");
 
-        for error in [tool_error, resource_error, prompt_error] {
+        for error in [resource_error, prompt_error] {
             let wire = serde_json::to_string(&error).expect("error serializes");
             assert_eq!(error.code, McpErrorCode::InternalError);
             assert_eq!(error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
@@ -10896,9 +11588,11 @@ mod router_tests {
     #[test]
     fn mount_tools_warns_on_tool_conflict() {
         let mut main = Router::new();
-        main.add_tool(NamedTool::new("t"));
+        main.add_tool(NamedTool::new("t"))
+            .expect("tool registration succeeds");
         let mut sub = Router::new();
-        sub.add_tool(NamedTool::new("t"));
+        sub.add_tool(NamedTool::new("t"))
+            .expect("tool registration succeeds");
         let result = main.mount_tools(sub, None);
         assert!(!result.warnings.is_empty());
         assert!(result.warnings[0].contains("Tool"));
@@ -10923,7 +11617,8 @@ mod router_tests {
     fn invalid_cursor_returns_error() {
         let mut r = Router::new();
         r.set_list_page_size(Some(1));
-        r.add_tool(NamedTool::new("a"));
+        r.add_tool(NamedTool::new("a"))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let params = ListToolsParams {
             cursor: Some("not-valid-base64!!!".to_string()),
@@ -10941,8 +11636,10 @@ mod router_tests {
     fn set_list_page_size_zero_disables_pagination() {
         let mut r = Router::new();
         r.set_list_page_size(Some(0));
-        r.add_tool(NamedTool::new("a"));
-        r.add_tool(NamedTool::new("b"));
+        r.add_tool(NamedTool::new("a"))
+            .expect("tool registration succeeds");
+        r.add_tool(NamedTool::new("b"))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let params = ListToolsParams {
             cursor: None,
@@ -10973,7 +11670,8 @@ mod router_tests {
     #[test]
     fn handle_tools_call_cancelled_cx_returns_error() {
         let mut r = Router::new();
-        r.add_tool(NamedTool::new("t"));
+        r.add_tool(NamedTool::new("t"))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         cx.set_cancel_requested(true);
         let budget = Budget::INFINITE;
@@ -11096,6 +11794,7 @@ mod router_tests {
         let mut router = Router::new();
         assert!(!router.has_completion_handler());
         router.add_completion_handler(EchoCompletion);
+        router.add_prompt(NamedPrompt::new("deploy"));
         assert!(router.has_completion_handler());
         assert!(
             router
@@ -11149,6 +11848,60 @@ mod router_tests {
             Some(&serde_json::json!("complete"))
         );
         assert_eq!(modern.get("completion"), legacy.get("completion"));
+    }
+
+    #[test]
+    fn final_completion_resource_reference_requires_registered_template() {
+        let mut router = Router::new();
+        router.add_completion_handler(EchoCompletion);
+        router.add_resource_template(marked_template("resource://{id}", "registered"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 188, Budget::INFINITE, &state);
+        let baseline = JsonRpcRequest::new(
+            COMPLETION_COMPLETE,
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "ref": {"type": "ref/resource", "uri": "resource://{id}"},
+                "argument": {"name": "id", "value": "sta"},
+            })),
+            188_i64,
+        );
+        let catalog_before = serde_json::to_vec(&router.resource_templates())
+            .expect("resource-template catalog serializes");
+        let accepted = router
+            .dispatch_stateless(&request_ctx, &baseline)
+            .expect("a registered final resource-template reference is accepted");
+
+        let mut planted = baseline.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("ref"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion reference is an object")
+            .insert("uri".to_owned(), serde_json::json!("resource://{other}"));
+        let error = router
+            .dispatch_stateless(&request_ctx, &planted)
+            .expect_err("an otherwise identical unregistered template is refused");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            serde_json::to_vec(&router.resource_templates())
+                .expect("resource-template catalog serializes after refusal"),
+            catalog_before,
+            "completion reference refusal cannot mutate the registered catalog"
+        );
+        assert_eq!(
+            router
+                .dispatch_stateless(&request_ctx, &baseline)
+                .expect("the registered reference remains accepted after refusal"),
+            accepted,
+            "the planted URI is the only changed observable"
+        );
     }
 
     #[test]
@@ -11222,7 +11975,9 @@ mod router_tests {
     fn macro_tool_dispatches_exact_legacy_and_final_complete_results() {
         let mut router = Router::new();
         MACRO_DUAL_ERA_TOOL_CALLS.store(0, Ordering::SeqCst);
-        router.add_tool(MacroDualEraTool);
+        router
+            .add_tool(MacroDualEraTool)
+            .expect("macro tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 91, Budget::INFINITE, &state);
@@ -11284,16 +12039,18 @@ mod router_tests {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let legacy_calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::new();
-        router.add_tool(SchemaBoundaryTool {
-            final_calls: Arc::clone(&final_calls),
-            legacy_calls: Arc::clone(&legacy_calls),
-            output_matches_schema: true,
-            output_is_error: false,
-            output_has_unevaluated_property: false,
-            invalid_final_input_schema: false,
-            missing_final_input_object_type: false,
-            invalid_final_output_schema: false,
-        });
+        router
+            .add_tool(SchemaBoundaryTool {
+                final_calls: Arc::clone(&final_calls),
+                legacy_calls: Arc::clone(&legacy_calls),
+                output_matches_schema: true,
+                output_is_error: false,
+                output_has_unevaluated_property: false,
+                invalid_final_input_schema: false,
+                missing_final_input_object_type: false,
+                invalid_final_output_schema: false,
+            })
+            .expect("schema-boundary tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 150, Budget::INFINITE, &state);
@@ -11373,16 +12130,18 @@ mod router_tests {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let legacy_calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::new();
-        router.add_tool(SchemaBoundaryTool {
-            final_calls: Arc::clone(&final_calls),
-            legacy_calls: Arc::clone(&legacy_calls),
-            output_matches_schema: true,
-            output_is_error: false,
-            output_has_unevaluated_property: false,
-            invalid_final_input_schema: false,
-            missing_final_input_object_type: false,
-            invalid_final_output_schema: false,
-        });
+        router
+            .add_tool(SchemaBoundaryTool {
+                final_calls: Arc::clone(&final_calls),
+                legacy_calls: Arc::clone(&legacy_calls),
+                output_matches_schema: true,
+                output_is_error: false,
+                output_has_unevaluated_property: false,
+                invalid_final_input_schema: false,
+                missing_final_input_object_type: false,
+                invalid_final_output_schema: false,
+            })
+            .expect("schema-boundary tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 153, Budget::INFINITE, &state);
@@ -11427,16 +12186,18 @@ mod router_tests {
         let rejected_final_calls = Arc::new(AtomicUsize::new(0));
         let rejected_legacy_calls = Arc::new(AtomicUsize::new(0));
         let mut rejected_router = Router::new();
-        rejected_router.add_tool(SchemaBoundaryTool {
-            final_calls: Arc::clone(&rejected_final_calls),
-            legacy_calls: Arc::clone(&rejected_legacy_calls),
-            output_matches_schema: false,
-            output_is_error: false,
-            output_has_unevaluated_property: false,
-            invalid_final_input_schema: false,
-            missing_final_input_object_type: false,
-            invalid_final_output_schema: false,
-        });
+        rejected_router
+            .add_tool(SchemaBoundaryTool {
+                final_calls: Arc::clone(&rejected_final_calls),
+                legacy_calls: Arc::clone(&rejected_legacy_calls),
+                output_matches_schema: false,
+                output_is_error: false,
+                output_has_unevaluated_property: false,
+                invalid_final_input_schema: false,
+                missing_final_input_object_type: false,
+                invalid_final_output_schema: false,
+            })
+            .expect("schema-boundary tool registration succeeds");
         let rejected = rejected_router
             .dispatch_stateless(
                 &request_ctx,
@@ -11460,16 +12221,18 @@ mod router_tests {
     fn final_tool_output_schema_applies_to_complete_error_payloads() {
         let accepted_calls = Arc::new(AtomicUsize::new(0));
         let mut accepted_router = Router::new();
-        accepted_router.add_tool(SchemaBoundaryTool {
-            final_calls: Arc::clone(&accepted_calls),
-            legacy_calls: Arc::new(AtomicUsize::new(0)),
-            output_matches_schema: true,
-            output_is_error: true,
-            output_has_unevaluated_property: false,
-            invalid_final_input_schema: false,
-            missing_final_input_object_type: false,
-            invalid_final_output_schema: false,
-        });
+        accepted_router
+            .add_tool(SchemaBoundaryTool {
+                final_calls: Arc::clone(&accepted_calls),
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                output_matches_schema: true,
+                output_is_error: true,
+                output_has_unevaluated_property: false,
+                invalid_final_input_schema: false,
+                missing_final_input_object_type: false,
+                invalid_final_output_schema: false,
+            })
+            .expect("schema-boundary tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 154, Budget::INFINITE, &state);
@@ -11494,16 +12257,18 @@ mod router_tests {
 
         let rejected_calls = Arc::new(AtomicUsize::new(0));
         let mut rejected_router = Router::new();
-        rejected_router.add_tool(SchemaBoundaryTool {
-            final_calls: Arc::clone(&rejected_calls),
-            legacy_calls: Arc::new(AtomicUsize::new(0)),
-            output_matches_schema: false,
-            output_is_error: true,
-            output_has_unevaluated_property: false,
-            invalid_final_input_schema: false,
-            missing_final_input_object_type: false,
-            invalid_final_output_schema: false,
-        });
+        rejected_router
+            .add_tool(SchemaBoundaryTool {
+                final_calls: Arc::clone(&rejected_calls),
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                output_matches_schema: false,
+                output_is_error: true,
+                output_has_unevaluated_property: false,
+                invalid_final_input_schema: false,
+                missing_final_input_object_type: false,
+                invalid_final_output_schema: false,
+            })
+            .expect("schema-boundary tool registration succeeds");
 
         let rejected = rejected_router
             .dispatch_stateless(
@@ -11528,16 +12293,18 @@ mod router_tests {
         let input_final_calls = Arc::new(AtomicUsize::new(0));
         let input_legacy_calls = Arc::new(AtomicUsize::new(0));
         let mut input_router = Router::new();
-        input_router.add_tool(SchemaBoundaryTool {
-            final_calls: Arc::clone(&input_final_calls),
-            legacy_calls: Arc::clone(&input_legacy_calls),
-            output_matches_schema: true,
-            output_is_error: false,
-            output_has_unevaluated_property: false,
-            invalid_final_input_schema: false,
-            missing_final_input_object_type: false,
-            invalid_final_output_schema: false,
-        });
+        input_router
+            .add_tool(SchemaBoundaryTool {
+                final_calls: Arc::clone(&input_final_calls),
+                legacy_calls: Arc::clone(&input_legacy_calls),
+                output_matches_schema: true,
+                output_is_error: false,
+                output_has_unevaluated_property: false,
+                invalid_final_input_schema: false,
+                missing_final_input_object_type: false,
+                invalid_final_output_schema: false,
+            })
+            .expect("schema-boundary tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 155, Budget::INFINITE, &state);
@@ -11573,16 +12340,18 @@ mod router_tests {
         let output_final_calls = Arc::new(AtomicUsize::new(0));
         let output_legacy_calls = Arc::new(AtomicUsize::new(0));
         let mut output_router = Router::new();
-        output_router.add_tool(SchemaBoundaryTool {
-            final_calls: Arc::clone(&output_final_calls),
-            legacy_calls: Arc::clone(&output_legacy_calls),
-            output_matches_schema: true,
-            output_is_error: false,
-            output_has_unevaluated_property: true,
-            invalid_final_input_schema: false,
-            missing_final_input_object_type: false,
-            invalid_final_output_schema: false,
-        });
+        output_router
+            .add_tool(SchemaBoundaryTool {
+                final_calls: Arc::clone(&output_final_calls),
+                legacy_calls: Arc::clone(&output_legacy_calls),
+                output_matches_schema: true,
+                output_is_error: false,
+                output_has_unevaluated_property: true,
+                invalid_final_input_schema: false,
+                missing_final_input_object_type: false,
+                invalid_final_output_schema: false,
+            })
+            .expect("schema-boundary tool registration succeeds");
 
         let rejected_output = output_router
             .dispatch_stateless(
@@ -11604,36 +12373,54 @@ mod router_tests {
     }
 
     #[test]
-    fn invalid_final_schema_preserves_legacy_and_isolates_modern_routes() {
+    fn valid_final_tool_replace_updates_both_catalogs_without_reordering() {
+        let original_legacy_calls = Arc::new(AtomicUsize::new(0));
         let original_final_calls = Arc::new(AtomicUsize::new(0));
-        let legacy_calls = Arc::new(AtomicUsize::new(0));
-        let final_calls = Arc::new(AtomicUsize::new(0));
+        let replacement_legacy_calls = Arc::new(AtomicUsize::new(0));
+        let replacement_final_calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::new();
-        router.add_tool(SchemaBoundaryTool {
-            final_calls: Arc::clone(&original_final_calls),
-            legacy_calls: Arc::new(AtomicUsize::new(0)),
-            output_matches_schema: true,
-            output_is_error: false,
-            output_has_unevaluated_property: false,
-            invalid_final_input_schema: false,
-            missing_final_input_object_type: false,
-            invalid_final_output_schema: false,
-        });
+        router
+            .add_tool(NamedTool::new("before"))
+            .expect("tool registration succeeds");
+        router
+            .add_tool(AdmittedSchemaReplacementTool {
+                legacy_calls: Arc::clone(&original_legacy_calls),
+                final_calls: Arc::clone(&original_final_calls),
+                legacy_label: "original",
+                output_schema: serde_json::json!({"type": "string"}),
+                structured_content: Some(serde_json::json!("original")),
+            })
+            .expect("original tool registration succeeds");
+        router
+            .add_tool(NamedTool::new("after"))
+            .expect("tool registration succeeds");
+        let order_before = router
+            .tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
         router
             .add_tool_with_behavior(
-                SchemaBoundaryTool {
-                    final_calls: Arc::clone(&final_calls),
-                    legacy_calls: Arc::clone(&legacy_calls),
-                    output_matches_schema: true,
-                    output_is_error: false,
-                    output_has_unevaluated_property: false,
-                    invalid_final_input_schema: false,
-                    missing_final_input_object_type: false,
-                    invalid_final_output_schema: true,
+                AdmittedSchemaReplacementTool {
+                    legacy_calls: Arc::clone(&replacement_legacy_calls),
+                    final_calls: Arc::clone(&replacement_final_calls),
+                    legacy_label: "replacement",
+                    output_schema: serde_json::json!({"type": "boolean"}),
+                    structured_content: Some(serde_json::json!(true)),
                 },
                 crate::DuplicateBehavior::Replace,
             )
-            .expect("legacy registration remains valid when only final schema admission fails");
+            .expect("a fully admitted replacement commits both catalog views");
+        assert_eq!(
+            router
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            order_before,
+            "replacement retains the original registration position"
+        );
 
         let cx = Cx::for_testing();
         let state = SessionState::new();
@@ -11642,50 +12429,435 @@ mod router_tests {
             .handle_tools_call(
                 &request_ctx,
                 CallToolParams {
-                    name: "schema-boundary-tool".to_owned(),
-                    arguments: Some(serde_json::json!({"value": "accepted"})),
+                    name: "admitted-schema-replacement-tool".to_owned(),
+                    arguments: Some(serde_json::json!({})),
                     meta: None,
                 },
                 state,
                 None,
                 None,
             )
-            .expect("the legacy-valid replacement remains callable");
-        assert!(!legacy.is_error);
-        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+            .expect("the replacement is installed for legacy dispatch");
+        let legacy_wire = serde_json::to_value(&legacy).expect("legacy result serializes");
+        assert_eq!(legacy_wire["content"][0]["text"], "replacement");
+        assert_eq!(replacement_legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(original_legacy_calls.load(Ordering::SeqCst), 0);
+
+        let modern = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "admitted-schema-replacement-tool",
+                    serde_json::json!({}),
+                    159_i64,
+                ),
+            )
+            .expect("the replacement is installed for modern dispatch");
+        assert_eq!(modern["structuredContent"], serde_json::json!(true));
+        assert_eq!(replacement_final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(original_final_calls.load(Ordering::SeqCst), 0);
 
         let modern_catalog = router
             .dispatch_stateless(
                 &request_ctx,
-                &JsonRpcRequest::new(
-                    "tools/list",
-                    Some(serde_json::json!({
-                        "_meta": {
-                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                            "io.modelcontextprotocol/clientCapabilities": {},
-                        }
-                    })),
-                    159_i64,
-                ),
+                &final_tools_list_request(None, None, None, 160_i64),
             )
-            .expect("a final catalog omits legacy-only tool entries");
-        assert_eq!(modern_catalog["tools"], serde_json::json!([]));
+            .expect("the admitted replacement remains visible to the modern catalog");
+        assert_eq!(
+            modern_catalog["tools"]
+                .as_array()
+                .expect("modern tools remain an array")
+                .iter()
+                .map(|tool| tool["name"].as_str().expect("tool name is a string"))
+                .collect::<Vec<_>>(),
+            vec!["before", "admitted-schema-replacement-tool", "after"]
+        );
+        assert_eq!(
+            modern_catalog["tools"][1]["outputSchema"]["type"],
+            "boolean"
+        );
+    }
 
-        let modern_error = router
+    #[test]
+    fn invalid_final_schema_new_tool_leaves_both_catalogs_unchanged() {
+        let mut router = Router::new();
+        router
+            .add_tool(NamedTool::new("existing"))
+            .expect("baseline tool registration succeeds");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 161, Budget::INFINITE, &state);
+        let legacy_before =
+            serde_json::to_value(router.tools()).expect("legacy catalog serializes");
+        let modern_before = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, None, None, 161_i64),
+            )
+            .expect("baseline modern catalog is available");
+
+        let error = router
+            .add_tool_with_behavior(
+                InvalidFinalSchemaNamedTool::with_tags("new-invalid", Vec::new()),
+                crate::DuplicateBehavior::Error,
+            )
+            .expect_err("a new normal tool with a scalar outputSchema is rejected");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            serde_json::to_value(router.tools()).expect("legacy catalog serializes"),
+            legacy_before,
+            "failed admission cannot add a legacy-only entry"
+        );
+        assert_eq!(
+            router
+                .dispatch_stateless(
+                    &request_ctx,
+                    &final_tools_list_request(None, None, None, 162_i64),
+                )
+                .expect("modern catalog remains available"),
+            modern_before,
+            "failed admission cannot alter the modern catalog"
+        );
+        assert!(router.get_tool("new-invalid").is_none());
+    }
+
+    #[test]
+    fn normal_registration_rejects_missing_input_schema_type_without_catalog_mutation() {
+        let mut router = Router::new();
+        router
+            .add_tool(NamedTool::new("existing"))
+            .expect("baseline tool registration succeeds");
+        let legacy_before =
+            serde_json::to_value(router.tools()).expect("legacy catalog serializes");
+
+        let error = router
+            .add_tool_with_behavior(
+                SchemaBoundaryTool {
+                    final_calls: Arc::new(AtomicUsize::new(0)),
+                    legacy_calls: Arc::new(AtomicUsize::new(0)),
+                    output_matches_schema: true,
+                    output_is_error: false,
+                    output_has_unevaluated_property: false,
+                    invalid_final_input_schema: false,
+                    missing_final_input_object_type: true,
+                    invalid_final_output_schema: false,
+                },
+                crate::DuplicateBehavior::Error,
+            )
+            .expect_err("a normal inputSchema must declare type object");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            serde_json::to_value(router.tools()).expect("legacy catalog serializes"),
+            legacy_before
+        );
+        assert!(router.get_tool("schema-boundary-tool").is_none());
+    }
+
+    #[test]
+    fn final_tool_scalar_and_null_structured_content_are_present_and_validated() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 163, Budget::INFINITE, &state);
+
+        let mut scalar_router = Router::new();
+        scalar_router
+            .add_tool(AdmittedSchemaReplacementTool {
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::new(AtomicUsize::new(0)),
+                legacy_label: "scalar",
+                output_schema: serde_json::json!({"type": "string"}),
+                structured_content: Some(serde_json::json!("")),
+            })
+            .expect("scalar-output tool registration succeeds");
+        let scalar = scalar_router
             .dispatch_stateless(
                 &request_ctx,
                 &final_tools_call_request(
-                    "schema-boundary-tool",
-                    serde_json::json!({"value": "accepted"}),
-                    160_i64,
+                    "admitted-schema-replacement-tool",
+                    serde_json::json!({}),
+                    163_i64,
                 ),
             )
-            .expect_err("a legacy-only tool is not invokable through the final route");
-        assert_eq!(modern_error.code, McpErrorCode::InvalidParams);
-        assert_eq!(modern_error.message, "Unknown tool: schema-boundary-tool");
-        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(original_final_calls.load(Ordering::SeqCst), 0);
+            .expect("an object-valued schema document may describe a scalar result");
+        assert_eq!(
+            scalar.get("structuredContent"),
+            Some(&serde_json::json!("")),
+            "an empty string is present structured content, not an omitted value"
+        );
+
+        let mut null_router = Router::new();
+        null_router
+            .add_tool(AdmittedSchemaReplacementTool {
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::new(AtomicUsize::new(0)),
+                legacy_label: "null",
+                output_schema: serde_json::json!({"type": "null"}),
+                structured_content: Some(serde_json::Value::Null),
+            })
+            .expect("null-output tool registration succeeds");
+        let null = null_router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "admitted-schema-replacement-tool",
+                    serde_json::json!({}),
+                    164_i64,
+                ),
+            )
+            .expect("present JSON null is validated against a null output schema");
+        assert_eq!(
+            null.get("structuredContent"),
+            Some(&serde_json::Value::Null),
+            "explicit JSON null remains present on the server-emission path"
+        );
+    }
+
+    #[test]
+    fn final_tool_declared_output_schema_rejects_absent_structured_content() {
+        let mut router = Router::new();
+        router
+            .add_tool(AdmittedSchemaReplacementTool {
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::new(AtomicUsize::new(0)),
+                legacy_label: "missing",
+                output_schema: serde_json::json!({"type": "string"}),
+                structured_content: None,
+            })
+            .expect("mapped tool registration succeeds");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 165, Budget::INFINITE, &state);
+
+        let error = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "admitted-schema-replacement-tool",
+                    serde_json::json!({}),
+                    165_i64,
+                ),
+            )
+            .expect_err("a declared output schema requires structured content on complete output");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            error.message,
+            "tool output is missing structuredContent required by the declared output schema"
+        );
+    }
+
+    #[test]
+    fn final_tool_error_mapper_covers_input_validation_and_handler_errors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(ErrorMappedTool {
+                mode: ErrorMapperMode::Complete,
+                calls: Arc::clone(&calls),
+            })
+            .expect("both bounded mapper branches satisfy outputSchema");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 169, Budget::INFINITE, &state);
+
+        let input_error = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "error-mapped-tool",
+                    serde_json::json!({"value": 7}),
+                    169_i64,
+                ),
+            )
+            .expect("input rejection is a schema-valid complete tool error");
+        assert_eq!(input_error["isError"], true);
+        assert_eq!(
+            input_error["structuredContent"],
+            serde_json::json!({"error": "input-validation"})
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let handler_error = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "error-mapped-tool",
+                    serde_json::json!({"value": "accepted"}),
+                    170_i64,
+                ),
+            )
+            .expect("handler rejection is a schema-valid complete tool error");
+        assert_eq!(handler_error["isError"], true);
+        assert_eq!(
+            handler_error["structuredContent"],
+            serde_json::json!({"error": "handler"})
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn incomplete_invalid_or_oversized_tool_error_mapper_is_rejected_atomically() {
+        for (mode, expected_message) in [
+            (
+                ErrorMapperMode::MissingHandler,
+                "tool declares outputSchema without a complete tool-error structured-content mapper",
+            ),
+            (
+                ErrorMapperMode::InvalidHandler,
+                "tool error structured-content mapper does not satisfy outputSchema",
+            ),
+            (
+                ErrorMapperMode::OversizedHandler,
+                "tool error structured-content mapper exceeded the registration limit",
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut router = Router::new();
+            router
+                .add_tool(NamedTool::new("existing"))
+                .expect("baseline tool admission succeeds");
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let request_ctx = request_context(&cx, 171, Budget::INFINITE, &state);
+            let legacy_before =
+                serde_json::to_value(router.tools()).expect("legacy catalog serializes");
+            let modern_before = router
+                .dispatch_stateless(
+                    &request_ctx,
+                    &final_tools_list_request(None, None, None, 171_i64),
+                )
+                .expect("modern catalog is available");
+
+            let error = router
+                .add_tool(ErrorMappedTool {
+                    mode,
+                    calls: Arc::clone(&calls),
+                })
+                .expect_err("public add_tool exposes mapper admission failure");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(error.message, expected_message);
+            assert_eq!(
+                serde_json::to_value(router.tools()).expect("legacy catalog serializes"),
+                legacy_before
+            );
+            assert_eq!(
+                router
+                    .dispatch_stateless(
+                        &request_ctx,
+                        &final_tools_list_request(None, None, None, 172_i64),
+                    )
+                    .expect("modern catalog remains available"),
+                modern_before
+            );
+            assert!(router.get_tool("error-mapped-tool").is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn normal_registration_rejects_null_output_schema_without_catalog_mutation() {
+        let mut router = Router::new();
+        let error = router
+            .add_tool_with_behavior(
+                AdmittedSchemaReplacementTool {
+                    legacy_calls: Arc::new(AtomicUsize::new(0)),
+                    final_calls: Arc::new(AtomicUsize::new(0)),
+                    legacy_label: "null-schema",
+                    output_schema: serde_json::Value::Null,
+                    structured_content: None,
+                },
+                crate::DuplicateBehavior::Error,
+            )
+            .expect_err("the outputSchema wire field itself must be an object");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert!(router.tools().is_empty());
+        assert!(
+            router
+                .get_tool("admitted-schema-replacement-tool")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invalid_final_schema_replace_leaves_handlers_and_catalogs_unchanged() {
+        let original_legacy_calls = Arc::new(AtomicUsize::new(0));
+        let original_final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(AdmittedSchemaReplacementTool {
+                legacy_calls: Arc::clone(&original_legacy_calls),
+                final_calls: Arc::clone(&original_final_calls),
+                legacy_label: "original",
+                output_schema: serde_json::json!({"type": "string"}),
+                structured_content: Some(serde_json::json!("original")),
+            })
+            .expect("original tool registration succeeds");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 166, Budget::INFINITE, &state);
+        let legacy_before =
+            serde_json::to_value(router.tools()).expect("legacy catalog serializes");
+        let modern_before = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, None, None, 166_i64),
+            )
+            .expect("baseline modern catalog is available");
+
+        let error = router
+            .add_tool_with_behavior(
+                InvalidFinalSchemaNamedTool::with_tags(
+                    "admitted-schema-replacement-tool",
+                    Vec::new(),
+                ),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect_err("changing only the candidate outputSchema rejects replacement");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            serde_json::to_value(router.tools()).expect("legacy catalog serializes"),
+            legacy_before,
+            "a rejected replacement cannot replace the legacy handler"
+        );
+        assert_eq!(
+            router
+                .dispatch_stateless(
+                    &request_ctx,
+                    &final_tools_list_request(None, None, None, 167_i64),
+                )
+                .expect("modern catalog remains available"),
+            modern_before,
+            "a rejected replacement cannot remove the admitted modern entry"
+        );
+
+        let legacy = router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "admitted-schema-replacement-tool".to_owned(),
+                    arguments: Some(serde_json::json!({})),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("the original legacy handler remains installed");
+        let legacy_wire = serde_json::to_value(&legacy).expect("legacy result serializes");
+        assert_eq!(legacy_wire["content"][0]["text"], "original");
+        assert_eq!(original_legacy_calls.load(Ordering::SeqCst), 1);
+
+        let modern = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "admitted-schema-replacement-tool",
+                    serde_json::json!({}),
+                    168_i64,
+                ),
+            )
+            .expect("the original modern handler remains installed");
+        assert_eq!(modern["structuredContent"], serde_json::json!("original"));
+        assert_eq!(original_final_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -11693,10 +12865,12 @@ mod router_tests {
         let tool_final_calls = Arc::new(AtomicUsize::new(0));
         let prompt_final_calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::new();
-        router.add_tool(InputRequiredTool {
-            legacy_calls: Arc::new(AtomicUsize::new(0)),
-            final_calls: Arc::clone(&tool_final_calls),
-        });
+        router
+            .add_tool(InputRequiredTool {
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::clone(&tool_final_calls),
+            })
+            .expect("tool registration succeeds");
         router.add_prompt(DirectFinalPrompt {
             final_calls: Arc::clone(&prompt_final_calls),
         });
@@ -11826,9 +13000,11 @@ mod router_tests {
         ));
         let mut router = Router::new();
         router.set_final_task_runtime(Some(runtime));
-        router.add_tool(TaskCapableRouterTool {
-            final_calls: Arc::clone(&final_calls),
-        });
+        router
+            .add_tool(TaskCapableRouterTool {
+                final_calls: Arc::clone(&final_calls),
+            })
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 160, Budget::INFINITE, &state);
@@ -11852,9 +13028,11 @@ mod router_tests {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let store = Arc::new(InMemoryFinalTaskStore::default());
         let mut router = Router::new();
-        router.add_tool(TaskCapableRouterTool {
-            final_calls: Arc::clone(&final_calls),
-        });
+        router
+            .add_tool(TaskCapableRouterTool {
+                final_calls: Arc::clone(&final_calls),
+            })
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 161, Budget::INFINITE, &state);
@@ -11886,9 +13064,11 @@ mod router_tests {
             .expect("an installed but unpolled task service remains unready");
         let mut router = Router::new();
         router.set_final_task_runtime(Some(runtime));
-        router.add_tool(TaskCapableRouterTool {
-            final_calls: Arc::clone(&final_calls),
-        });
+        router
+            .add_tool(TaskCapableRouterTool {
+                final_calls: Arc::clone(&final_calls),
+            })
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 162, Budget::INFINITE, &state);
@@ -11926,9 +13106,11 @@ mod router_tests {
         ));
         let mut router = Router::new();
         router.set_final_task_runtime(Some(runtime));
-        router.add_tool(TaskCapableRouterTool {
-            final_calls: Arc::clone(&final_calls),
-        });
+        router
+            .add_tool(TaskCapableRouterTool {
+                final_calls: Arc::clone(&final_calls),
+            })
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 162, Budget::INFINITE, &state);
@@ -11952,9 +13134,11 @@ mod router_tests {
     fn final_router_defensively_rejects_an_undeclared_task_outcome() {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::new();
-        router.add_tool(UndeclaredTaskOutcomeRouterTool {
-            final_calls: Arc::clone(&final_calls),
-        });
+        router
+            .add_tool(UndeclaredTaskOutcomeRouterTool {
+                final_calls: Arc::clone(&final_calls),
+            })
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 163, Budget::INFINITE, &state);
@@ -11990,7 +13174,9 @@ mod router_tests {
     fn macro_tool_final_metadata_negative_is_non_mutating() {
         let mut router = Router::new();
         MACRO_DUAL_ERA_TOOL_CALLS.store(0, Ordering::SeqCst);
-        router.add_tool(MacroDualEraTool);
+        router
+            .add_tool(MacroDualEraTool)
+            .expect("macro tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 92, Budget::INFINITE, &state);
@@ -12077,10 +13263,12 @@ mod router_tests {
         let prompt_legacy_calls = Arc::new(AtomicUsize::new(0));
         let prompt_final_calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::new();
-        router.add_tool(InputRequiredTool {
-            legacy_calls: Arc::clone(&tool_legacy_calls),
-            final_calls: Arc::clone(&tool_final_calls),
-        });
+        router
+            .add_tool(InputRequiredTool {
+                legacy_calls: Arc::clone(&tool_legacy_calls),
+                final_calls: Arc::clone(&tool_final_calls),
+            })
+            .expect("tool registration succeeds");
         router.add_resource(InputRequiredResource {
             legacy_calls: Arc::clone(&resource_legacy_calls),
             final_calls: Arc::clone(&resource_final_calls),
@@ -12192,10 +13380,12 @@ mod router_tests {
         let legacy_calls = Arc::new(AtomicUsize::new(0));
         let final_calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::new();
-        router.add_tool(InputRequiredTool {
-            legacy_calls: Arc::clone(&legacy_calls),
-            final_calls: Arc::clone(&final_calls),
-        });
+        router
+            .add_tool(InputRequiredTool {
+                legacy_calls: Arc::clone(&legacy_calls),
+                final_calls: Arc::clone(&final_calls),
+            })
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 144, Budget::INFINITE, &state);
@@ -12974,12 +14164,21 @@ mod router_tests {
             None,
         )
         .expect("valid final icon");
+        let alternate_icon = RawIcon::try_with_details(
+            "https://example.test/tool-dark.svg",
+            Some("image/svg+xml".to_owned()),
+            Some(vec!["any".to_owned()]),
+            Some(fastmcp_protocol::common_types::IconTheme::Dark),
+        )
+        .expect("valid alternate final icon");
         let mut router = Router::new();
         router.set_final_cache_hint_policy(123, 456, CacheScope::Private);
-        router.add_tool(FinalCatalogTool {
-            metadata,
-            icons: vec![icon],
-        });
+        router
+            .add_tool(FinalCatalogTool {
+                metadata,
+                icons: vec![icon, alternate_icon],
+            })
+            .expect("final catalog tool registration succeeds");
         router.add_resource(NamedResource::new("file:///catalog-resource"));
         let cx = Cx::for_testing();
         let state = SessionState::new();
@@ -13016,7 +14215,15 @@ mod router_tests {
         assert_eq!(modern_list["resultType"], "complete");
         assert_eq!(modern_list["ttlMs"], 123);
         assert_eq!(modern_list["cacheScope"], "private");
-        assert_eq!(modern_list["tools"][0]["title"], "Final Catalog Tool");
+        assert_eq!(modern_list["tools"][0]["title"], "Exact Final Catalog Tool");
+        assert_eq!(
+            modern_list["tools"][0]["annotations"]["title"],
+            "Exact annotation title"
+        );
+        assert_eq!(
+            modern_list["tools"][0]["icons"].as_array().map(Vec::len),
+            Some(2)
+        );
         assert_eq!(
             modern_list["tools"][0]["icons"][0]["sizes"],
             serde_json::json!(["48x48"])
@@ -13044,7 +14251,18 @@ mod router_tests {
             .tools
             .first()
             .expect("final catalog contains the registered tool");
-        assert_eq!(final_tool.title.as_deref(), Some("Final Catalog Tool"));
+        assert_eq!(
+            final_tool.title.as_deref(),
+            Some("Exact Final Catalog Tool")
+        );
+        assert_eq!(
+            final_tool
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.title.as_deref()),
+            Some("Exact annotation title")
+        );
+        assert_eq!(final_tool.icons.as_ref().map(Vec::len), Some(2));
         assert_eq!(
             final_tool
                 .icons
@@ -13116,7 +14334,9 @@ mod router_tests {
     #[test]
     fn final_catalog_missing_metadata_is_non_mutating() {
         let mut router = Router::new();
-        router.add_tool(NamedTool::new("metadata-guarded-tool"));
+        router
+            .add_tool(NamedTool::new("metadata-guarded-tool"))
+            .expect("tool registration succeeds");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 95, Budget::INFINITE, &state);
@@ -13173,10 +14393,12 @@ mod router_tests {
         let started = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(Mutex::new(Vec::new()));
         let mut router = Router::new();
-        router.add_tool(ConcurrentModernTool::new(
-            Arc::clone(&started),
-            Arc::clone(&completed),
-        ));
+        router
+            .add_tool(ConcurrentModernTool::new(
+                Arc::clone(&started),
+                Arc::clone(&completed),
+            ))
+            .expect("tool registration succeeds");
         let router = Arc::new(router);
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -13230,10 +14452,12 @@ mod router_tests {
         let started = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(Mutex::new(Vec::new()));
         let mut router = Router::new();
-        router.add_tool(ConcurrentModernTool::new(
-            Arc::clone(&started),
-            Arc::clone(&completed),
-        ));
+        router
+            .add_tool(ConcurrentModernTool::new(
+                Arc::clone(&started),
+                Arc::clone(&completed),
+            ))
+            .expect("tool registration succeeds");
         let router = Arc::new(router);
         let runtime = RuntimeBuilder::current_thread()
             .build()

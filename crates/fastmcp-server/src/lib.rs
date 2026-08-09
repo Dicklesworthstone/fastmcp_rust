@@ -97,7 +97,7 @@ pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
 pub use handler::{
     BidirectionalSenders, BoxFuture, CompletionHandler, FinalToolOutcome,
-    ProgressNotificationSender, PromptHandler, ResourceHandler, ToolHandler,
+    ProgressNotificationSender, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
     create_context_with_progress, create_context_with_progress_and_senders,
 };
 pub use middleware::{Middleware, MiddlewareDecision};
@@ -182,20 +182,21 @@ use fastmcp_protocol::tasks_extension::{
     TaskStatusNotification as FinalTaskStatusNotification, set_task_subscription_ids,
 };
 use fastmcp_protocol::{
-    CallToolParams, CancelledParams, ClientExtensionDiscovery, CoreRequest, CoreResult,
-    CorrelationKey, DiscoveryCacheHints, ExtensionDescriptor, ExtensionDescriptorRegistry,
-    ExtensionId, ExtensionRegistryError, ExtensionRegistryReceipt, ExtensionSettings,
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SERVER_INFO_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
-    FinalCancelledNotificationParams, FinalCoreResult,
-    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
-    GetPromptParams, InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
-    ListToolsParams, LogLevel, LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES,
-    MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MissingRequiredClientCapabilityError,
-    ProgressMarker, Prompt, ReadResourceParams, RequestId, Resource, ResourceTemplate,
-    SERVER_DISCOVER_METHOD, ServerCapabilities, ServerDiscoverCapabilities, ServerDiscoverRequest,
-    ServerDiscoverResult, ServerExtensionDiscovery, ServerInfo, ServerInstructions,
-    ServerNotification, SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
+    CallToolParams, CancellationSender, CancellationWireMessage, CancelledParams,
+    ClientExtensionDiscovery, CoreRequest, CoreResult, CorrelationKey, DiscoveryCacheHints,
+    ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionId, ExtensionRegistryError,
+    ExtensionRegistryReceipt, ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    FINAL_SERVER_INFO_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams,
+    FinalCoreResult, FinalSubscriptionsAcknowledgedNotificationParams,
+    FinalSubscriptionsListenParams, GetPromptParams, InitializeParams, JsonRpcError,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
+    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
+    MAX_SERVER_INSTRUCTIONS_BYTES, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+    MissingRequiredClientCapabilityError, ProgressMarker, Prompt, ReadResourceParams, RequestId,
+    Resource, ResourceTemplate, SERVER_DISCOVER_METHOD, ServerCapabilities,
+    ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
+    ServerExtensionDiscovery, ServerInfo, ServerInstructions, ServerNotification,
+    SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
     UnsubscribeResourceParams, task_subscription_ids,
 };
 use fastmcp_protocol::{CompleteResult, FinalSubscriptionsListenResult, ResultMeta};
@@ -771,6 +772,7 @@ struct LiveLegacy2024RuntimeHandler<'a> {
     session_id: u64,
     session_principal: SessionPrincipalBinding,
     runtime: LiveLegacy2024ConnectionRuntime,
+    queue_state: Option<Arc<DispatchQueueState>>,
     active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
 }
 
@@ -792,6 +794,10 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
         let request_id = serde_json::from_value::<RequestId>(request_id.clone()).map_err(|_| {
             Legacy2024HandlerError::new("legacy adapter supplied an invalid request ID")
         })?;
+        let request_cancellation = self
+            .queue_state
+            .as_ref()
+            .and_then(|queue| queue.legacy_request_cancellation(&request_id));
         let request = JsonRpcRequest::new(method, params.cloned(), request_id);
         let dispatch = self
             .server
@@ -800,6 +806,7 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
                 self.session_id,
                 &self.session_principal,
                 Some(&self.runtime),
+                request_cancellation,
                 &request,
             )
             .map_err(|error| {
@@ -873,6 +880,7 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
                 &request_cx,
                 self.session_id,
                 &self.session_principal,
+                None,
                 None,
                 &request,
             )
@@ -1147,15 +1155,6 @@ fn reject_initial_stdio_malformed(classifier: &mut StdioEraClassifier) -> StdioE
     classifier.classify_opening(StdioOpeningFrame::Malformed)
 }
 
-fn cancelled_notification_matches_stdio_era(era: ProtocolEra, request: &JsonRpcRequest) -> bool {
-    match era {
-        ProtocolEra::Legacy2024 => modern_protocol_version(request).is_none(),
-        ProtocolEra::Modern2026 => {
-            modern_protocol_version(request) == Some(MODERN_PROTOCOL_VERSION)
-        }
-    }
-}
-
 fn runtime_legacy_binding(generation: u64) -> LegacyPeerBinding {
     let mut partition = [0_u8; LegacyAuthenticatedPeerPartition::BYTE_LEN];
     partition[..8].copy_from_slice(&generation.to_be_bytes());
@@ -1164,6 +1163,29 @@ fn runtime_legacy_binding(generation: u64) -> LegacyPeerBinding {
         LegacyAuthenticatedPeerPartition::from_authenticated_transport(partition),
         generation,
     )
+}
+
+/// Establishes or verifies the connection owner at an ordinary request's
+/// admission boundary.
+///
+/// The live stdio/WebSocket modern path and the exact-2024 adapter both commit
+/// anonymous request authentication internally. Binding that same principal
+/// before queue hand-off lets a following control notification prove ownership
+/// even when it races the first request's dispatch. Cancellation itself still
+/// uses `verify_existing`, so a control frame can never claim an unbound
+/// connection.
+fn bind_anonymous_connection_principal(
+    principal_binding: &SessionPrincipalBinding,
+) -> McpResult<()> {
+    let fingerprint = auth::principal_fingerprint(None)?;
+    if principal_binding.bind_or_verify(fingerprint) {
+        Ok(())
+    } else {
+        Err(McpError::new(
+            McpErrorCode::ResourceForbidden,
+            "Authenticated principal does not own this session",
+        ))
+    }
 }
 
 fn legacy_adapter_response<H: Legacy2024Handler>(
@@ -1237,7 +1259,8 @@ fn legacy_handled_response(
             None,
             cx.clone(),
             budget,
-        ),
+        )
+        .suppress_cancelled_response(),
         None => HandledRequest::untracked(response),
     }
 }
@@ -1346,6 +1369,69 @@ impl SessionMutationRollback {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchPrincipalAdmissionState {
+    Pending,
+    Admitted,
+    Rejected,
+}
+
+struct DispatchPrincipalAdmission {
+    state: Mutex<DispatchPrincipalAdmissionState>,
+    changed: Condvar,
+}
+
+impl DispatchPrincipalAdmission {
+    fn pending() -> Self {
+        Self {
+            state: Mutex::new(DispatchPrincipalAdmissionState::Pending),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn admitted() -> Self {
+        Self {
+            state: Mutex::new(DispatchPrincipalAdmissionState::Admitted),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn resolve(&self, admitted: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert_eq!(*state, DispatchPrincipalAdmissionState::Pending);
+        *state = if admitted {
+            DispatchPrincipalAdmissionState::Admitted
+        } else {
+            DispatchPrincipalAdmissionState::Rejected
+        };
+        self.changed.notify_all();
+    }
+
+    fn wait_timeout(&self, timeout: Duration) -> Option<bool> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, result) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                matches!(state, DispatchPrincipalAdmissionState::Pending)
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *state {
+            DispatchPrincipalAdmissionState::Admitted => Some(true),
+            DispatchPrincipalAdmissionState::Rejected => Some(false),
+            DispatchPrincipalAdmissionState::Pending => {
+                debug_assert!(result.timed_out());
+                None
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct DispatchQueueState {
     inner: Mutex<DispatchQueueStateInner>,
@@ -1358,6 +1444,13 @@ struct DispatchQueueStateInner {
     /// attempt completes. Keeping it across the queued-to-active transition
     /// closes both admission TOCTOU and post-commit ABA races with ID reuse.
     reserved: HashSet<CorrelationKey>,
+    /// Initialization requests remain cancellable only by the server-owned
+    /// connection shutdown path. Peer cancellation cannot erase the request
+    /// that establishes the selected legacy lifecycle.
+    peer_cancellation_protected: HashSet<CorrelationKey>,
+    /// Exact-2024 requests retain one cancellation authority across queue,
+    /// dispatch transition, handler execution, and response finalization.
+    legacy_cancellations: HashMap<CorrelationKey, McpRequestCancellation>,
     /// Reserved requests that a worker has begun dispatching.
     dispatching: HashSet<CorrelationKey>,
     cancelled: HashSet<CorrelationKey>,
@@ -1375,10 +1468,19 @@ enum ModernDispatchStart {
     Stopping,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchCancellationDisposition {
+    NotOwned,
+    Protected,
+    Accepted,
+    AlreadySettled,
+}
+
 struct QueuedDispatchRequest {
     request: JsonRpcRequest,
     era: ProtocolEra,
     serialized_bytes: usize,
+    principal_admission: Arc<DispatchPrincipalAdmission>,
 }
 
 enum QueuedDispatchMessage {
@@ -1391,7 +1493,12 @@ enum QueuedDispatchMessage {
 }
 
 impl DispatchQueueState {
-    fn admit(&self, id: &RequestId) -> bool {
+    fn admit(
+        &self,
+        id: &RequestId,
+        era: ProtocolEra,
+        peer_cancellation_allowed: bool,
+    ) -> bool {
         let Ok(key) = id.correlation_key() else {
             return false;
         };
@@ -1399,7 +1506,19 @@ impl DispatchQueueState {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        !inner.stopping && inner.reserved.insert(key)
+        if inner.stopping || !inner.reserved.insert(key.clone()) {
+            return false;
+        }
+        if matches!(era, ProtocolEra::Legacy2024) {
+            let previous = inner
+                .legacy_cancellations
+                .insert(key.clone(), McpRequestCancellation::new());
+            debug_assert!(previous.is_none());
+        }
+        if !peer_cancellation_allowed {
+            inner.peer_cancellation_protected.insert(key);
+        }
+        true
     }
 
     fn discard(&self, id: &RequestId) {
@@ -1411,8 +1530,20 @@ impl DispatchQueueState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.reserved.remove(&key);
+        inner.peer_cancellation_protected.remove(&key);
+        inner.legacy_cancellations.remove(&key);
         inner.dispatching.remove(&key);
         inner.cancelled.remove(&key);
+    }
+
+    fn legacy_request_cancellation(&self, id: &RequestId) -> Option<McpRequestCancellation> {
+        let key = id.correlation_key().ok()?;
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .legacy_cancellations
+            .get(&key)
+            .cloned()
     }
 
     fn reserve_queued_bytes(&self, serialized_bytes: usize) -> bool {
@@ -1520,19 +1651,38 @@ impl DispatchQueueState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 
-    fn cancel_if_queued(&self, id: &RequestId) -> bool {
+    fn cancel_reserved(&self, id: &RequestId) -> DispatchCancellationDisposition {
         let Ok(key) = id.correlation_key() else {
-            return false;
+            return DispatchCancellationDisposition::NotOwned;
         };
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !inner.reserved.contains(&key) || inner.dispatching.contains(&key) {
-            return false;
+        if !inner.reserved.contains(&key) {
+            return DispatchCancellationDisposition::NotOwned;
         }
-        inner.cancelled.insert(key);
-        true
+        if inner.peer_cancellation_protected.contains(&key) {
+            return DispatchCancellationDisposition::Protected;
+        }
+        if let Some(cancellation) = inner.legacy_cancellations.get(&key).cloned() {
+            if !inner.dispatching.contains(&key) {
+                inner.cancelled.insert(key);
+            }
+            return if cancellation.cancel() {
+                DispatchCancellationDisposition::Accepted
+            } else {
+                DispatchCancellationDisposition::AlreadySettled
+            };
+        }
+        if inner.dispatching.contains(&key) {
+            return DispatchCancellationDisposition::NotOwned;
+        }
+        if inner.cancelled.insert(key) {
+            DispatchCancellationDisposition::Accepted
+        } else {
+            DispatchCancellationDisposition::AlreadySettled
+        }
     }
 
     fn begin_dispatch(&self, id: &RequestId) -> bool {
@@ -1594,6 +1744,7 @@ impl DispatchQueueState {
             inner
                 .modern_cancellations
                 .values()
+                .chain(inner.legacy_cancellations.values())
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -3269,11 +3420,12 @@ impl HttpLegacyCancellationControl {
         match self.server.authenticate_cancelled_control_notification(
             cx,
             &self.session_principal,
+            ProtocolEra::Legacy2024,
             &mut notification,
         ) {
-            Ok(params) => {
+            Ok(cancellation) => {
                 self.server
-                    .handle_cancelled_notification(self.session_id, params);
+                    .handle_cancellation_wire_notification(self.session_id, cancellation);
                 Some(HttpResponse::new(HttpStatus::ACCEPTED))
             }
             Err(_) => Some(HttpResponse::bad_request()),
@@ -5602,6 +5754,7 @@ impl Server {
         session_id: u64,
         session_principal: &SessionPrincipalBinding,
         runtime: Option<&LiveLegacy2024ConnectionRuntime>,
+        admitted_cancellation: Option<McpRequestCancellation>,
         request: &JsonRpcRequest,
     ) -> McpResult<LiveLegacy2024Dispatch> {
         let request_id = request
@@ -5614,11 +5767,12 @@ impl Server {
         // Hold this guard through handler and middleware completion so a
         // concurrently received notifications/cancelled frame targets the
         // exact legacy wire ID rather than an internal synthetic ID.
-        let active_guard = ActiveRequestGuard::try_new(
+        let active_guard = ActiveRequestGuard::try_new_with_cancellation(
             Arc::clone(&self.active_requests),
             session_id,
             request_id,
             cx.clone(),
+            admitted_cancellation.unwrap_or_else(McpRequestCancellation::new),
         )
         .map_err(|_| {
             McpError::invalid_request(
@@ -7206,6 +7360,24 @@ impl Server {
                 worker_queue_state.release_queued_bytes(queued_request.serialized_bytes);
                 let era = queued_request.era;
                 let request = queued_request.request;
+                match queued_request
+                    .principal_admission
+                    .wait_timeout(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
+                {
+                    Some(true) => {}
+                    Some(false) => {
+                        if let Some(id) = request.id.as_ref() {
+                            worker_queue_state.discard(id);
+                        }
+                        continue;
+                    }
+                    None => {
+                        if let Some(id) = request.id.as_ref() {
+                            worker_queue_state.discard(id);
+                        }
+                        break;
+                    }
+                }
 
                 // The hand-off from the receive queue to the worker is the
                 // linearization point for cancellation. Mark it before any
@@ -7226,6 +7398,14 @@ impl Server {
 
                 if cancelled_before_dispatch {
                     if let Some(id) = request.id.as_ref() {
+                        if matches!(era, ProtocolEra::Legacy2024) {
+                            // Exact MCP 2024-11-05 treats an accepted
+                            // cancellation as the peer relinquishing its
+                            // response. The queued request never executes and
+                            // no synthetic RequestCancelled response is sent.
+                            worker_queue_state.discard(id);
+                            continue;
+                        }
                         let cancelled = JsonRpcResponse::error(
                             Some(id.clone()),
                             JsonRpcError {
@@ -7299,6 +7479,7 @@ impl Server {
                                 session_id: legacy_binding.generation(),
                                 session_principal: worker_session_principal.clone(),
                                 runtime: worker_legacy_runtime.clone(),
+                                queue_state: Some(Arc::clone(&worker_queue_state)),
                                 active_request: Arc::clone(&legacy_active_request),
                             },
                         );
@@ -7344,7 +7525,7 @@ impl Server {
                     send_guard(&worker_cx, &JsonRpcMessage::Response(response.clone()))
                 });
                 drop(send_guard);
-                if let Ok(response) = &send_result {
+                if let Ok(Some(response)) = &send_result {
                     if let Some(renderer) = &worker_renderer {
                         renderer.render_response(response, Some(duration), &worker_server.console);
                     }
@@ -7536,28 +7717,40 @@ impl Server {
                     if request.id.is_none() && request.method == "notifications/cancelled" =>
                 {
                     let Some(era) = negotiated_era else {
-                        exit_code = 1;
-                        break;
+                        debug!(
+                            target: targets::SESSION,
+                            "Ignoring cancellation notification before protocol-era negotiation"
+                        );
+                        continue;
                     };
-                    if !cancelled_notification_matches_stdio_era(era, &request) {
-                        exit_code = 1;
-                        break;
-                    }
                     if request.validate().is_err() {
-                        if send_invalid_request(&send, cx, request.id).is_err() {
-                            exit_code = 1;
-                            break;
-                        }
+                        debug!(
+                            target: targets::SESSION,
+                            "Ignoring invalid cancellation notification before request-state mutation"
+                        );
                         continue;
                     }
                     match server.authenticate_cancelled_control_notification(
                         cx,
                         &session_principal,
+                        era,
                         &mut request,
                     ) {
-                        Ok(params) => {
-                            if !queue_state.cancel_if_queued(&params.request_id) {
-                                server.handle_cancelled_notification(session_id, params);
+                        Ok(cancellation) => {
+                            let queue_disposition = queue_state.cancel_reserved(
+                                Server::cancellation_wire_request_id(&cancellation),
+                            );
+                            let cancellation_accepted = match queue_disposition {
+                                DispatchCancellationDisposition::Accepted => true,
+                                DispatchCancellationDisposition::Protected
+                                | DispatchCancellationDisposition::AlreadySettled => false,
+                                DispatchCancellationDisposition::NotOwned => server
+                                    .handle_cancellation_wire_notification(
+                                    session_id,
+                                    cancellation,
+                                ),
+                            };
+                            if cancellation_accepted {
                                 let interrupted = pending_requests.cancel_cancelled();
                                 if interrupted > 0 {
                                     debug!(
@@ -7658,7 +7851,12 @@ impl Server {
                     };
                     let request_id = request.id.clone();
                     if let Some(id) = request_id.as_ref()
-                        && (server.request_id_is_active(session_id, id) || !queue_state.admit(id))
+                        && (server.request_id_is_active(session_id, id)
+                            || !queue_state.admit(
+                                id,
+                                era,
+                                request.method != "initialize",
+                            ))
                     {
                         let duplicate = JsonRpcResponse::error(
                             Some(id.clone()),
@@ -7744,6 +7942,11 @@ impl Server {
 
                     if modern_slot {
                         let response_id = request.id.clone();
+                        let principal_admission = Arc::new(if response_id.is_some() {
+                            DispatchPrincipalAdmission::pending()
+                        } else {
+                            DispatchPrincipalAdmission::admitted()
+                        });
                         let reservation = ModernDispatchReservation::new(
                             Arc::clone(&queue_state),
                             response_id.clone(),
@@ -7753,9 +7956,20 @@ impl Server {
                         let request_server = Arc::clone(&server);
                         let request_send = Arc::clone(&send);
                         let request_renderer = traffic_renderer.clone();
+                        let task_principal_admission = Arc::clone(&principal_admission);
                         let request = request;
                         let submitted = dispatch_cx.spawn_blocking(move |request_cx| {
                             let mut reservation = reservation;
+                            match task_principal_admission
+                                .wait_timeout(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
+                            {
+                                Some(true) => {}
+                                Some(false) => return,
+                                None => {
+                                    reservation.begin();
+                                    return;
+                                }
+                            }
                             reservation.begin();
                             let dispatched = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| {
@@ -7923,8 +8137,35 @@ impl Server {
                                 Ok(Err(_)) | Err(_) => {}
                             }
                         });
-                        if submitted.is_err() {
-                            if let Some(id) = response_id {
+                        if submitted.is_ok() {
+                            let principal_result = response_id.as_ref().map_or(Ok(()), |_| {
+                                bind_anonymous_connection_principal(&session_principal)
+                            });
+                            principal_admission.resolve(principal_result.is_ok());
+                            if let Err(error) = principal_result
+                                && let Some(id) = response_id
+                            {
+                                let rejected = JsonRpcResponse::error(
+                                    Some(id),
+                                    JsonRpcError {
+                                        code: error.code.into(),
+                                        message: error.message,
+                                        data: error.data,
+                                    },
+                                );
+                                if send
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                    cx,
+                                    &JsonRpcMessage::Response(rejected),
+                                )
+                                .is_err()
+                                {
+                                    exit_code = 1;
+                                    break;
+                                }
+                            }
+                        } else if let Some(id) = response_id {
                                 let unavailable = JsonRpcResponse::error(
                                     Some(id),
                                     JsonRpcError {
@@ -7945,22 +8186,95 @@ impl Server {
                                     exit_code = 1;
                                     break;
                                 }
-                            }
                         }
                         continue;
                     }
 
-                    match dispatch_sender.try_send(QueuedDispatchMessage::Request(
-                        QueuedDispatchRequest {
-                            request,
-                            era,
-                            serialized_bytes,
-                        },
-                    )) {
-                        Ok(()) => {}
-                        Err(asupersync_mpsc::SendError::Full(QueuedDispatchMessage::Request(
-                            request,
-                        ))) => {
+                    let permit = match dispatch_sender.try_reserve() {
+                        Ok(permit) => permit,
+                        Err(asupersync_mpsc::SendError::Full(())) => {
+                            queue_state.release_queued_bytes(serialized_bytes);
+                            if let Some(id) = request.id {
+                                queue_state.discard(&id);
+                                let overloaded = JsonRpcResponse::error(
+                                    Some(id),
+                                    JsonRpcError {
+                                        code: RESOURCE_EXHAUSTED_ERROR_CODE,
+                                        message: DISPATCH_QUEUE_CAPACITY_MESSAGE.to_string(),
+                                        data: None,
+                                    },
+                                );
+                                if send
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                    cx,
+                                    &JsonRpcMessage::Response(overloaded),
+                                )
+                                .is_err()
+                                {
+                                    exit_code = 1;
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        Err(
+                            asupersync_mpsc::SendError::Disconnected(())
+                            | asupersync_mpsc::SendError::Cancelled(()),
+                        ) => {
+                            queue_state.release_queued_bytes(serialized_bytes);
+                            if let Some(id) = request.id {
+                                queue_state.discard(&id);
+                            }
+                            exit_code = 1;
+                            break;
+                        }
+                    };
+                    let response_id = request.id.clone();
+                    let principal_admission = Arc::new(if response_id.is_some() {
+                        DispatchPrincipalAdmission::pending()
+                    } else {
+                        DispatchPrincipalAdmission::admitted()
+                    });
+                    let queued = QueuedDispatchMessage::Request(QueuedDispatchRequest {
+                        request,
+                        era,
+                        serialized_bytes,
+                        principal_admission: Arc::clone(&principal_admission),
+                    });
+                    match permit.try_send(queued) {
+                        Ok(()) => {
+                            let principal_result = response_id.as_ref().map_or(Ok(()), |_| {
+                                bind_anonymous_connection_principal(&session_principal)
+                            });
+                            principal_admission.resolve(principal_result.is_ok());
+                            if let Err(error) = principal_result
+                                && let Some(id) = response_id
+                            {
+                                let rejected = JsonRpcResponse::error(
+                                    Some(id),
+                                    JsonRpcError {
+                                        code: error.code.into(),
+                                        message: error.message,
+                                        data: error.data,
+                                    },
+                                );
+                                if send
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                    cx,
+                                    &JsonRpcMessage::Response(rejected),
+                                )
+                                .is_err()
+                                {
+                                    exit_code = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(asupersync_mpsc::SendError::Full(
+                            QueuedDispatchMessage::Request(request),
+                        )) => {
                             queue_state.release_queued_bytes(request.serialized_bytes);
                             if let Some(id) = request.request.id {
                                 queue_state.discard(&id);
@@ -8334,6 +8648,7 @@ impl Server {
                                         session_id: legacy_binding.generation(),
                                         session_principal: session.principal_binding(),
                                         runtime: legacy_runtime.clone(),
+                                        queue_state: None,
                                         active_request: Arc::clone(&legacy_active_request),
                                     },
                                 );
@@ -8422,7 +8737,7 @@ impl Server {
                     guard(cx, &JsonRpcMessage::Response(response.clone()))
                 });
                 drop(guard);
-                if let Ok(response) = &send_result {
+                if let Ok(Some(response)) = &send_result {
                     if let Some(renderer) = &traffic_renderer {
                         renderer.render_response(response, Some(duration), &self.console);
                     }
@@ -8707,6 +9022,7 @@ impl Server {
                                         session_id: legacy_binding.generation(),
                                         session_principal: session.principal_binding(),
                                         runtime: legacy_runtime.clone(),
+                                        queue_state: None,
                                         active_request: Arc::clone(&legacy_active_request),
                                     },
                                 );
@@ -8825,7 +9141,7 @@ impl Server {
                     guard(cx, &JsonRpcMessage::Response(response.clone()))
                 });
                 drop(guard);
-                if let Ok(response) = &send_result {
+                if let Ok(Some(response)) = &send_result {
                     if let Some(renderer) = &traffic_renderer {
                         renderer.render_response(response, Some(duration), &self.console);
                     }
@@ -10288,8 +10604,9 @@ impl Server {
         &self,
         cx: &Cx,
         principal_binding: &SessionPrincipalBinding,
+        era: ProtocolEra,
         request: &mut JsonRpcRequest,
-    ) -> McpResult<CancelledParams> {
+    ) -> McpResult<CancellationWireMessage> {
         let budget = self.create_request_budget(cx);
         Self::enforce_request_budget(cx, budget)?;
         let (request_ctx, _request_lease_guard) =
@@ -10307,7 +10624,9 @@ impl Server {
         };
         let fingerprint = self.authenticate_request(&request_ctx, auth_request)?;
         auth::strip_recognized_access_credentials(&mut request.params);
-        let params = parse_params::<CancelledParams>(request.params.take())?;
+        let cancellation =
+            CancellationWireMessage::decode(era, CancellationSender::Client, request)
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
         if !principal_binding.verify_existing(fingerprint) {
             return Err(McpError::new(
                 McpErrorCode::ResourceForbidden,
@@ -10315,7 +10634,7 @@ impl Server {
             ));
         }
         Self::enforce_request_context(&request_ctx)?;
-        Ok(params)
+        Ok(cancellation)
     }
 
     fn request_id_is_active(&self, session_id: u64, request_id: &RequestId) -> bool {
@@ -10328,71 +10647,102 @@ impl Server {
             .contains_key(&key)
     }
 
-    fn handle_cancelled_notification(&self, session_id: u64, params: CancelledParams) {
-        let reason = params.reason.as_deref().unwrap_or("unspecified");
-        let await_cleanup = params.await_cleanup.unwrap_or(false);
+    /// Requests cancellation of exactly one active request in the originating
+    /// session.
+    ///
+    /// A cancellation notification is advisory: malformed IDs, IDs not owned
+    /// by this session, and IDs whose request has already left the registry
+    /// are all ignored. In particular, none of those inputs may trigger
+    /// cleanup of unrelated bidirectional waiters or alter connection-wide
+    /// state.
+    fn handle_cancelled_notification(&self, session_id: u64, params: CancelledParams) -> bool {
+        self.handle_request_cancellation(session_id, &params.request_id, params.reason.as_deref())
+    }
+
+    fn cancellation_wire_request_id(cancellation: &CancellationWireMessage) -> &RequestId {
+        match cancellation {
+            CancellationWireMessage::Legacy2024 { params, .. } => &params.request_id,
+            CancellationWireMessage::Modern2026 { params, .. } => &params.request_id,
+        }
+    }
+
+    fn handle_cancellation_wire_notification(
+        &self,
+        session_id: u64,
+        cancellation: CancellationWireMessage,
+    ) -> bool {
+        match cancellation {
+            CancellationWireMessage::Legacy2024 { params, .. } => {
+                self.handle_cancelled_notification(session_id, params)
+            }
+            CancellationWireMessage::Modern2026 { params, .. } => self.handle_request_cancellation(
+                session_id,
+                &params.request_id,
+                params.reason.as_deref(),
+            ),
+        }
+    }
+
+    fn handle_request_cancellation(
+        &self,
+        session_id: u64,
+        request_id: &RequestId,
+        reason: Option<&str>,
+    ) -> bool {
+        let reason_present = reason.is_some();
+        let reason = reason.unwrap_or("unspecified");
         info!(
             target: targets::SESSION,
-            "Cancellation requested for request_key={:016x} (reason_present={}, reason_bytes={}, await_cleanup={})",
-            request_id_log_key(&params.request_id),
-            params.reason.is_some(),
-            reason.len(),
-            await_cleanup
+            "Cancellation requested for request_key={:016x} (reason_present={}, reason_bytes={})",
+            request_id_log_key(request_id),
+            reason_present,
+            reason.len()
         );
-        let active_key = ActiveRequestKey::new(session_id, &params.request_id).ok();
-        let active = active_key.and_then(|key| {
+        let Ok(active_key) = ActiveRequestKey::new(session_id, request_id) else {
+            debug!(
+                target: targets::SESSION,
+                "Ignoring cancellation with invalid request key={:016x}",
+                request_id_log_key(request_id)
+            );
+            return false;
+        };
+        // Keep registry membership and the cancellation transition in the
+        // same critical section. A finishing request removes itself under this
+        // lock, so a late notification cannot race from an observed entry into
+        // a completed request.
+        let accepted = {
             let guard = self.active_requests.lock().unwrap_or_else(|poisoned| {
                 error!(target: targets::SERVER, "active_requests lock poisoned, recovering");
                 poisoned.into_inner()
             });
-            guard.get(&key).map(|entry| {
-                (
-                    entry.cancellation.clone(),
-                    entry.region_id,
-                    entry.completion.clone(),
-                )
-            })
-        });
-        if let Some((cancellation, region_id, completion)) = active {
-            let accepted = cancellation.cancel();
-            if await_cleanup && accepted {
-                // The dispatch worker already serializes the session, so later
-                // requests cannot overtake this request's cleanup. Never block
-                // the sole receive pump here: it must remain free to route a
-                // server-to-client response that the cancelling handler may be
-                // awaiting before it can unwind.
-                debug!(
-                    target: targets::SESSION,
-                    "await_cleanup accepted without blocking receive pump for request_key={:016x} (ambient_region={:?}, already_complete={})",
-                    request_id_log_key(&params.request_id),
-                    region_id,
-                    completion.is_done()
-                );
-            } else if cancellation.is_finalizing() {
-                debug!(
-                    target: targets::SESSION,
-                    "Cancellation arrived after response finalization began for request_key={:016x}",
-                    request_id_log_key(&params.request_id)
-                );
-            } else if !accepted {
-                debug!(
-                    target: targets::SESSION,
-                    "Cancellation was already pending for request_key={:016x} (await_cleanup={}, already_complete={})",
-                    request_id_log_key(&params.request_id),
-                    await_cleanup,
-                    completion.is_done()
-                );
-            }
-        } else {
-            fastmcp_core::logging::warn!(
+            guard
+                .get(&active_key)
+                .map(|entry| entry.cancellation.cancel())
+        };
+        let Some(accepted) = accepted else {
+            debug!(
                 target: targets::SESSION,
-                "No active request found for cancellation request_key={:016x}",
-                request_id_log_key(&params.request_id)
+                "Ignoring cancellation for unknown or completed request_key={:016x}",
+                request_id_log_key(request_id)
+            );
+            return false;
+        };
+
+        if !accepted {
+            debug!(
+                target: targets::SESSION,
+                "Ignoring duplicate or finalized cancellation for request_key={:016x}",
+                request_id_log_key(request_id)
             );
         }
+        accepted
     }
 
-    fn cancel_active_requests(&self, kind: CancelKind, await_cleanup: bool) {
+    /// Cancels every active request as part of server-owned shutdown.
+    ///
+    /// `wait_for_shutdown_cleanup` is an internal lifecycle control and is
+    /// deliberately unrelated to MCP cancellation notification parameters.
+    fn cancel_active_requests(&self, kind: CancelKind, wait_for_shutdown_cleanup: bool) {
         let active: Vec<(
             ActiveRequestKey,
             RegionId,
@@ -10422,19 +10772,19 @@ impl Server {
         }
         info!(
             target: targets::SESSION,
-            "Cancelling {} active request(s) (kind={:?}, await_cleanup={})",
+            "Cancelling {} active request(s) (kind={:?}, wait_for_shutdown_cleanup={})",
             active.len(),
             kind,
-            await_cleanup
+            wait_for_shutdown_cleanup
         );
         for (_, _, cx, cancellation, _) in &active {
             cancellation.cancel();
             cx.cancel_with(kind, None);
         }
 
-        if await_cleanup {
+        if wait_for_shutdown_cleanup {
             for (key, region_id, _cx, _cancellation, completion) in active {
-                let completed = completion.wait_timeout(AWAIT_CLEANUP_TIMEOUT);
+                let completed = completion.wait_timeout(SHUTDOWN_CLEANUP_TIMEOUT);
                 if !completed {
                     fastmcp_core::logging::warn!(
                         target: targets::SESSION,
@@ -10612,7 +10962,8 @@ impl Server {
     }
 }
 
-const AWAIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound for server-owned shutdown settlement after cancellation.
+const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct RequestCompletion {
     done: Mutex<bool>,
@@ -10824,6 +11175,7 @@ impl Drop for ActiveRequestGuard {
 struct HandledRequest {
     response: JsonRpcResponse,
     cancellation: Option<McpRequestCancellation>,
+    suppress_cancelled_response: bool,
     _active_guard: Option<ActiveRequestGuard>,
     session_mutation_rollback: Option<SessionMutationRollback>,
     deferred_stats: Option<DeferredRequestStats>,
@@ -10885,6 +11237,7 @@ impl HandledRequest {
         Self {
             response,
             cancellation: None,
+            suppress_cancelled_response: false,
             _active_guard: None,
             session_mutation_rollback: None,
             deferred_stats: None,
@@ -10903,6 +11256,7 @@ impl HandledRequest {
         Self {
             response,
             cancellation: Some(cancellation),
+            suppress_cancelled_response: false,
             _active_guard: active_guard,
             session_mutation_rollback,
             deferred_stats: None,
@@ -10915,6 +11269,11 @@ impl HandledRequest {
 
     fn with_deferred_stats(mut self, deferred_stats: Option<DeferredRequestStats>) -> Self {
         self.deferred_stats = deferred_stats;
+        self
+    }
+
+    fn suppress_cancelled_response(mut self) -> Self {
+        self.suppress_cancelled_response = true;
         self
     }
 
@@ -10941,13 +11300,16 @@ impl HandledRequest {
         );
     }
 
-    fn resolve_commit_race(&mut self, session: &mut Session) {
+    /// Resolves the final response/cancellation race and reports whether an
+    /// explicit request cancellation won. Ambient cancellation and deadline
+    /// expiry still produce their ordinary terminal error response.
+    fn resolve_commit_race(&mut self, session: &mut Session) -> bool {
         if let Some(error) = self.commit_liveness_error() {
             if let Some(cancellation) = &self.cancellation {
                 let _ = cancellation.cancel();
             }
             self.replace_with_terminal_error(session, error);
-            return;
+            return false;
         }
 
         let cancellation_won = self
@@ -10956,7 +11318,7 @@ impl HandledRequest {
             .is_some_and(|cancellation| !cancellation.begin_finalization());
         if cancellation_won {
             self.replace_with_terminal_error(session, McpError::request_cancelled());
-            return;
+            return true;
         }
 
         // The token CAS is the explicit-cancellation linearization point. A
@@ -10966,10 +11328,11 @@ impl HandledRequest {
         if let Some(error) = self.commit_liveness_error() {
             self.replace_with_terminal_error(session, error);
         }
+        false
     }
 
     fn finalize_for_return(mut self, session: &mut Session) -> JsonRpcResponse {
-        self.resolve_commit_race(session);
+        let _ = self.resolve_commit_race(session);
         self.session_mutation_rollback.take();
         if let Some(stats) = self.deferred_stats.take() {
             stats.record();
@@ -10981,21 +11344,27 @@ impl HandledRequest {
         mut self,
         session: &mut Session,
         send: F,
-    ) -> Result<JsonRpcResponse, TransportError>
+    ) -> Result<Option<JsonRpcResponse>, TransportError>
     where
         F: FnOnce(&JsonRpcResponse) -> Result<(), TransportError>,
     {
         // Callers must acquire exclusive output ownership before entering this
         // method. Finalization then linearizes against cancellation immediately
         // before the single fallible write/flush attempt.
-        self.resolve_commit_race(session);
+        let cancellation_won = self.resolve_commit_race(session);
+        if cancellation_won && self.suppress_cancelled_response {
+            if let Some(stats) = self.deferred_stats.take() {
+                stats.record();
+            }
+            return Ok(None);
+        }
         match send(&self.response) {
             Ok(()) => {
                 self.session_mutation_rollback.take();
                 if let Some(stats) = self.deferred_stats.take() {
                     stats.record();
                 }
-                Ok(self.response)
+                Ok(Some(self.response))
             }
             Err(error) => {
                 if let Some(rollback) = self.session_mutation_rollback.take() {
@@ -11880,7 +12249,7 @@ mod lib_unit_tests {
 
     fn http_json_request(method: &str, params: serde_json::Value, id: i64) -> HttpRequest {
         let request = JsonRpcRequest::new(method, Some(params), id);
-        HttpRequest::new(HttpMethod::Post, "/mcp")
+        HttpRequest::new(HttpMethod::Post, "/mcp/v1")
             .with_header("content-type", "application/json")
             .with_body(serde_json::to_vec(&request).expect("serialize JSON-RPC request"))
     }
@@ -12604,19 +12973,71 @@ mod lib_unit_tests {
         }
     }
 
+    struct FinalTasksTestSupervisor;
+
+    impl ApplicationTaskSupervisor for FinalTasksTestSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Holds only the ready-service lease required by route-admission tests.
+    /// Task-service delivery and recovery are exercised against a driven
+    /// runner in `tasks.rs`; these route fixtures deliberately do not claim
+    /// that proof class.
+    fn hold_final_tasks_test_service_readiness(
+        runtime: &FinalTaskRuntime,
+    ) -> std::pin::Pin<Box<dyn Future<Output = McpResult<()>>>> {
+        let runner = runtime
+            .install_task_service(1, Arc::new(FinalTasksTestSupervisor))
+            .expect("test final Tasks service must install");
+        let service_cx = Cx::for_testing();
+        let mut service = Box::pin(async move { runner.run(&service_cx).await });
+        let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            Future::poll(service.as_mut(), &mut poll_cx).is_pending(),
+            "test final Tasks service must publish readiness and remain owned",
+        );
+        service
+    }
+
+    fn final_tasks_test_work_descriptor() -> FinalTaskWorkDescriptor {
+        FinalTaskWorkDescriptor::new(serde_json::json!({
+            "operation": "server-final-tasks-test",
+        }))
+        .expect("test final Tasks work descriptor must be valid")
+    }
+
     #[test]
     fn server_final_task_store_rejects_same_id_notification_base_drift_without_mutation() {
         let store = Arc::new(ServerFinalTaskStore::default());
-        let runtime = FinalTaskRuntime::new(
-            Arc::clone(&store) as Arc<dyn FinalTaskStore>,
-            FinalTaskRuntimeConfig::new(60_000, Some(5_000))
-                .expect("valid final Tasks timing policy"),
-            Arc::new(|_| {}),
+        let timestamp = fastmcp_protocol::TaskTimestamp::parse("2026-07-28T12:00:00.000Z")
+            .expect("fixed final task timestamp must be valid");
+        let task = fastmcp_protocol::Task::Working(fastmcp_protocol::TaskBase {
+            task_id: fastmcp_protocol::FinalTaskId::parse("server-store-drift-test")
+                .expect("fixed final task ID must be valid"),
+            status: fastmcp_protocol::FinalTaskStatus::Working,
+            status_message: None,
+            created_at: timestamp.clone(),
+            last_updated_at: timestamp,
+            ttl_ms: None,
+            poll_interval_ms: None,
+        });
+        let notification = fastmcp_protocol::TaskStatusNotification::new(
+            fastmcp_protocol::tasks_extension::TaskStatusNotificationParams {
+                task: task.clone(),
+                meta: None,
+                additional: BTreeMap::new(),
+            },
         );
-        let created = runtime
-            .create_task(None)
+        store
+            .create_task(task.clone(), notification)
             .expect("matching task and notification create");
-        let task_id = created.task.base().task_id.clone();
+        let task_id = task.base().task_id.clone();
         let snapshot_before = store
             .get_task_snapshot(&task_id)
             .expect("stored task snapshot is readable")
@@ -12649,7 +13070,7 @@ mod lib_unit_tests {
         base.status_message = Some("only the notification task base drifted".to_owned());
 
         let error = store
-            .replace_task_if_current(&snapshot_before, created.task, drifted_notification)
+            .replace_task_if_current(&snapshot_before, task, drifted_notification)
             .expect_err("same-ID notification base drift must be rejected");
 
         assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
@@ -12685,30 +13106,32 @@ mod lib_unit_tests {
     fn final_tasks_test_runtime(
         delivered: Arc<Mutex<Vec<fastmcp_protocol::TaskStatusNotification>>>,
     ) -> FinalTaskRuntime {
-        let store = Arc::new(ServerFinalTaskStore::default());
-        let store: Arc<dyn FinalTaskStore> = store;
         let emitter: FinalTaskNotificationEmitter = Arc::new(move |notification| {
             delivered
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(notification);
         });
-        let runtime = FinalTaskRuntime::new(
-            store,
+        FinalTaskRuntime::in_memory(
             FinalTaskRuntimeConfig::new(60_000, Some(5_000))
                 .expect("valid final Tasks timing policy"),
             emitter,
-        );
-        runtime
+        )
     }
 
     fn final_tasks_test_server(
         delivered: Arc<Mutex<Vec<fastmcp_protocol::TaskStatusNotification>>>,
-    ) -> Server {
-        Server::new("final-tasks-server", "1.0.0")
-            .final_tasks(final_tasks_test_runtime(delivered))
+    ) -> (
+        Server,
+        std::pin::Pin<Box<dyn Future<Output = McpResult<()>>>>,
+    ) {
+        let runtime = final_tasks_test_runtime(delivered);
+        let service = hold_final_tasks_test_service_readiness(&runtime);
+        let server = Server::new("final-tasks-server", "1.0.0")
+            .final_tasks(runtime)
             .expect("final Tasks must install")
-            .build()
+            .build();
+        (server, service)
     }
 
     struct FinalTaskCreatingTool;
@@ -12746,6 +13169,10 @@ mod lib_unit_tests {
                 }))?,
                 status_message: Some("accepted by negotiated tool".to_owned()),
             })
+        }
+
+        fn declares_final_tasks(&self) -> bool {
+            true
         }
     }
 
@@ -12866,12 +13293,15 @@ mod lib_unit_tests {
     #[test]
     fn configured_final_tasks_route_methods_and_typed_notifications() {
         let delivered = Arc::new(Mutex::new(Vec::new()));
-        let server = final_tasks_test_server(Arc::clone(&delivered));
+        let (server, _service) = final_tasks_test_server(Arc::clone(&delivered));
         let runtime = server
             .final_task_runtime()
             .expect("configured final Tasks runtime must be retained");
         let task_id = runtime
-            .create_task(Some("accepted".to_owned()))
+            .create_task_with_work(
+                final_tasks_test_work_descriptor(),
+                Some("accepted".to_owned()),
+            )
             .expect("application store must accept task before reply")
             .task
             .base()
@@ -12964,17 +13394,23 @@ mod lib_unit_tests {
 
     #[test]
     fn final_tool_task_result_mutates_only_after_capability_admission_and_legacy_stays_exact() {
-        let store = Arc::new(ServerFinalTaskStore::default());
-        let runtime = FinalTaskRuntime::new(
-            Arc::clone(&store) as Arc<dyn FinalTaskStore>,
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let delivered_for_emitter = Arc::clone(&delivered);
+        let runtime = FinalTaskRuntime::in_memory(
             FinalTaskRuntimeConfig::new(60_000, Some(5_000))
                 .expect("valid final Tasks timing policy"),
-            Arc::new(|_| {}),
+            Arc::new(move |notification| {
+                delivered_for_emitter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(notification);
+            }),
         );
+        let _service = hold_final_tasks_test_service_readiness(&runtime);
         let server = Server::new("final-tool-task-server", "1.0.0")
             .tool(FinalTaskCreatingTool)
             .mask_error_details(true)
-            .final_tasks(runtime)
+            .final_tasks(runtime.clone())
             .expect("final Tasks must install before task-capable tool dispatch")
             .build();
         let inbound =
@@ -12992,15 +13428,29 @@ mod lib_unit_tests {
             admitted.result.as_ref().map(|result| &result["status"]),
             Some(&serde_json::json!("working"))
         );
+        let task_id = admitted
+            .result
+            .as_ref()
+            .and_then(|result| result["taskId"].as_str())
+            .and_then(|task_id| fastmcp_protocol::FinalTaskId::parse(task_id).ok())
+            .expect("the task result must expose its durable task ID");
         assert_eq!(
-            store
-                .state
+            runtime
+                .get_task(&task_id)
+                .expect("the application task store must remain readable")
+                .task
+                .base()
+                .task_id,
+            task_id,
+            "the admitted result must name a task already durable in the application store"
+        );
+        assert_eq!(
+            delivered
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .tasks
                 .len(),
             1,
-            "the admitted result must name a task already durable in the application store"
+            "the admitted request publishes exactly one durable task transition"
         );
 
         let rejected = server
@@ -13019,11 +13469,9 @@ mod lib_unit_tests {
             }))
         );
         assert_eq!(
-            store
-                .state
+            delivered
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .tasks
                 .len(),
             1,
             "rejected task capability must leave durable state unchanged"
@@ -13056,11 +13504,9 @@ mod lib_unit_tests {
             Some(&serde_json::json!("exact legacy completion"))
         );
         assert_eq!(
-            store
-                .state
+            delivered
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .tasks
                 .len(),
             1,
             "exact MCP 2024-11-05 must never enter the final task producer"
@@ -13071,6 +13517,8 @@ mod lib_unit_tests {
     fn final_tasks_compose_with_an_existing_extension_registry_before_freeze() {
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let (handlers, discovery) = unrelated_extension_registry("example/echo");
+        let runtime = final_tasks_test_runtime(Arc::clone(&delivered));
+        let _service = hold_final_tasks_test_service_readiness(&runtime);
         let server = Server::new("composed-final-tasks-server", "1.0.0")
             .extension_registry(
                 handlers,
@@ -13083,7 +13531,7 @@ mod lib_unit_tests {
                 },
             )
             .expect("unrelated extension registry must install")
-            .final_tasks(final_tasks_test_runtime(Arc::clone(&delivered)))
+            .final_tasks(runtime)
             .expect("final Tasks must merge into the existing registry")
             .build();
 
@@ -13114,7 +13562,7 @@ mod lib_unit_tests {
             .final_task_runtime()
             .expect("composed final Tasks runtime must be retained");
         let task_id = runtime
-            .create_task(None)
+            .create_task_with_work(final_tasks_test_work_descriptor(), None)
             .expect("application-owned task store must accept task")
             .task
             .base()
@@ -13168,12 +13616,12 @@ mod lib_unit_tests {
     #[test]
     fn final_tasks_reject_one_variable_incompatible_extension_settings() {
         let delivered = Arc::new(Mutex::new(Vec::new()));
-        let server = final_tasks_test_server(Arc::clone(&delivered));
+        let (server, _service) = final_tasks_test_server(Arc::clone(&delivered));
         let runtime = server
             .final_task_runtime()
             .expect("configured final Tasks runtime must be retained");
         let task_id = runtime
-            .create_task(None)
+            .create_task_with_work(final_tasks_test_work_descriptor(), None)
             .expect("task must persist")
             .task
             .base()
@@ -13227,7 +13675,7 @@ mod lib_unit_tests {
 
     #[test]
     fn legacy_dispatch_remains_isolated_from_configured_final_tasks() {
-        let server = final_tasks_test_server(Arc::new(Mutex::new(Vec::new())));
+        let (server, _service) = final_tasks_test_server(Arc::new(Mutex::new(Vec::new())));
         let mut session = initialized_test_session(&server);
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
@@ -13974,7 +14422,6 @@ mod lib_unit_tests {
                             serde_json::to_value(CancelledParams {
                                 request_id: RequestId::Number(999),
                                 reason: None,
-                                await_cleanup: None,
                             })
                             .expect("serialize cancellation"),
                         ),
@@ -14118,7 +14565,6 @@ mod lib_unit_tests {
                 serde_json::to_value(CancelledParams {
                     request_id: RequestId::Number(17),
                     reason: None,
-                    await_cleanup: None,
                 })
                 .expect("serialize cancellation"),
             ),
@@ -14128,6 +14574,7 @@ mod lib_unit_tests {
             .authenticate_cancelled_control_notification(
                 &Cx::for_testing(),
                 &binding,
+                ProtocolEra::Legacy2024,
                 &mut cancellation,
             )
             .expect_err("a control frame must not establish session ownership");
@@ -14141,7 +14588,6 @@ mod lib_unit_tests {
                 serde_json::to_value(CancelledParams {
                     request_id: RequestId::Number(17),
                     reason: None,
-                    await_cleanup: None,
                 })
                 .expect("serialize cancellation"),
             ),
@@ -14151,6 +14597,7 @@ mod lib_unit_tests {
                 .authenticate_cancelled_control_notification(
                     &Cx::for_testing(),
                     &binding,
+                    ProtocolEra::Legacy2024,
                     &mut cancellation,
                 )
                 .is_ok()
@@ -14412,35 +14859,78 @@ mod lib_unit_tests {
         let queue = DispatchQueueState::default();
         let request_id = RequestId::String("linearized-request".to_string());
 
-        assert!(queue.admit(&request_id));
+        assert!(queue.admit(&request_id, ProtocolEra::Modern2026, true));
         assert!(!queue.begin_dispatch(&request_id));
         assert!(
-            !queue.admit(&request_id),
+            !queue.admit(&request_id, ProtocolEra::Modern2026, true),
             "an active request must retain its queue reservation"
         );
-        assert!(
-            !queue.cancel_if_queued(&request_id),
+        assert_eq!(
+            queue.cancel_reserved(&request_id),
+            DispatchCancellationDisposition::NotOwned,
             "active cancellation must route through ActiveRequestGuard"
         );
 
         queue.discard(&request_id);
         assert!(
-            queue.admit(&request_id),
+            queue.admit(&request_id, ProtocolEra::Modern2026, true),
             "the id may be reused only after response completion releases it"
         );
+    }
+
+    #[test]
+    fn queued_initialize_ignores_peer_cancellation_and_remains_dispatchable() {
+        let queue = DispatchQueueState::default();
+        let initialize_id = RequestId::Number(6);
+
+        assert!(queue.admit(&initialize_id, ProtocolEra::Legacy2024, false));
+        assert_eq!(
+            queue.cancel_reserved(&initialize_id),
+            DispatchCancellationDisposition::Protected,
+            "peer cancellation must not erase a queued initialize request"
+        );
+        assert!(
+            !queue.begin_dispatch(&initialize_id),
+            "the unchanged initialize request must remain ready to dispatch"
+        );
+        queue.discard(&initialize_id);
+    }
+
+    #[test]
+    fn exact_legacy_cancellation_authority_spans_the_queued_to_active_handoff() {
+        let queue = DispatchQueueState::default();
+        let request_id = RequestId::Integer("7e0".to_owned());
+
+        assert!(queue.admit(&request_id, ProtocolEra::Legacy2024, true));
+        let cancellation = queue
+            .legacy_request_cancellation(&RequestId::Number(7))
+            .expect("numeric aliases must select the admitted cancellation authority");
+        assert!(!queue.begin_dispatch(&request_id));
+
+        assert_eq!(
+            queue.cancel_reserved(&RequestId::Integer("7.0".to_owned())),
+            DispatchCancellationDisposition::Accepted,
+            "a cancellation in the dispatching-before-active interval must not be lost"
+        );
+        assert!(cancellation.is_cancel_requested());
+        queue.discard(&request_id);
     }
 
     #[test]
     fn dispatch_queue_stop_rejects_admission_and_cancels_queued_start() {
         let queue = DispatchQueueState::default();
         let queued = RequestId::Number(7);
-        assert!(queue.admit(&queued));
+        assert!(queue.admit(&queued, ProtocolEra::Modern2026, true));
 
         queue.stop();
 
         assert!(queue.is_stopping());
         assert!(queue.begin_dispatch(&queued));
-        assert!(!queue.admit(&RequestId::Number(8)));
+        assert!(!queue.admit(
+            &RequestId::Number(8),
+            ProtocolEra::Modern2026,
+            true
+        ));
     }
 
     #[test]
@@ -14688,7 +15178,6 @@ mod lib_unit_tests {
             CancelledParams {
                 request_id,
                 reason: Some("owner requested cancellation".to_string()),
-                await_cleanup: Some(false),
             },
         );
 
@@ -14700,8 +15189,8 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn await_cleanup_does_not_block_the_receive_path() {
-        let server = Server::new("nonblocking-await-cleanup-test", "1.0.0").build();
+    fn cancelled_notification_does_not_block_the_receive_path() {
+        let server = Server::new("nonblocking-cancellation-test", "1.0.0").build();
         let request_id = RequestId::Number(41);
         let guard = ActiveRequestGuard::try_new(
             Arc::clone(&server.active_requests),
@@ -14718,7 +15207,6 @@ mod lib_unit_tests {
             CancelledParams {
                 request_id,
                 reason: None,
-                await_cleanup: Some(true),
             },
         );
 
@@ -14743,13 +15231,12 @@ mod lib_unit_tests {
         .expect("request should register");
         let cancellation = guard.cancellation();
 
-        for await_cleanup in [false, true] {
+        for _ in 0..2 {
             server.handle_cancelled_notification(
                 11,
                 CancelledParams {
                     request_id: request_id.clone(),
                     reason: None,
-                    await_cleanup: Some(await_cleanup),
                 },
             );
         }
@@ -14757,6 +15244,105 @@ mod lib_unit_tests {
         assert!(cancellation.is_cancel_requested());
         assert!(!cancellation.is_finalizing());
         assert!(!guard.completion.is_done());
+    }
+
+    #[test]
+    fn cancellation_notification_accepts_arbitrary_precision_integer_request_ids() {
+        let server = Server::new("large-cancellation-id-test", "1.0.0").build();
+        let request_id = RequestId::Integer(
+            "9223372036854775808922337203685477580892233720368547758089".to_string(),
+        );
+        let guard = ActiveRequestGuard::try_new(
+            Arc::clone(&server.active_requests),
+            11,
+            request_id.clone(),
+            Cx::for_testing(),
+        )
+        .expect("an arbitrary-precision mathematical integer must register");
+        let cancellation = guard.cancellation();
+
+        assert!(server.handle_cancelled_notification(
+            11,
+            CancelledParams {
+                request_id,
+                reason: Some("large-id cancellation".to_string()),
+            },
+        ));
+        assert!(cancellation.is_cancel_requested());
+    }
+
+    #[test]
+    fn invalid_or_unknown_cancellation_does_not_mutate_an_active_request() {
+        let server = Server::new("ignored-cancellation-test", "1.0.0").build();
+        let active_request_id = RequestId::Number(42);
+        let guard = ActiveRequestGuard::try_new(
+            Arc::clone(&server.active_requests),
+            11,
+            active_request_id.clone(),
+            Cx::for_testing(),
+        )
+        .expect("active request must register");
+        let cancellation = guard.cancellation();
+
+        assert!(!server.handle_cancelled_notification(
+            11,
+            CancelledParams {
+                request_id: RequestId::Integer("1.5".to_string()),
+                reason: None,
+            },
+        ));
+        assert!(!server.handle_cancelled_notification(
+            11,
+            CancelledParams {
+                request_id: RequestId::Number(43),
+                reason: None,
+            },
+        ));
+
+        assert!(!cancellation.is_cancel_requested());
+        assert!(server.request_id_is_active(11, &active_request_id));
+        assert_eq!(
+            server
+                .active_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "ignored cancellation notifications must leave the request registry unchanged"
+        );
+    }
+
+    #[test]
+    fn completed_request_cancellation_is_ignored_without_registry_mutation() {
+        let server = Server::new("completed-cancellation-test", "1.0.0").build();
+        let request_id = RequestId::Number(44);
+        let cancellation = {
+            let guard = ActiveRequestGuard::try_new(
+                Arc::clone(&server.active_requests),
+                11,
+                request_id.clone(),
+                Cx::for_testing(),
+            )
+            .expect("active request must register");
+            guard.cancellation()
+        };
+
+        assert!(!server.handle_cancelled_notification(
+            11,
+            CancelledParams {
+                request_id,
+                reason: None,
+            },
+        ));
+        assert!(!cancellation.is_cancel_requested());
+        assert!(
+            server
+                .active_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "a completed request must remain absent after a late cancellation"
+        );
     }
 
     #[test]
@@ -16102,6 +16688,26 @@ mod lib_unit_tests {
         }
     }
 
+    struct LiveModernControlledDiscoveryMiddleware {
+        control: Arc<LiveModernControl>,
+        blocked_request_id: u64,
+    }
+
+    impl Middleware for LiveModernControlledDiscoveryMiddleware {
+        fn on_request(
+            &self,
+            ctx: &McpContext,
+            request: &JsonRpcRequest,
+        ) -> McpResult<MiddlewareDecision> {
+            if request.method == SERVER_DISCOVER_METHOD
+                && ctx.request_id() == self.blocked_request_id
+            {
+                self.control.call(ctx)?;
+            }
+            Ok(MiddlewareDecision::Continue)
+        }
+    }
+
     #[derive(Default)]
     struct LiveModernNotificationControl {
         started: Mutex<bool>,
@@ -16223,6 +16829,35 @@ mod lib_unit_tests {
                     matches!(message, JsonRpcMessage::Response(response) if response.id == Some((*id).into()))
                 })
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct BoundedTestSignal {
+        raised: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl BoundedTestSignal {
+        fn raise(&self) {
+            let mut raised = self
+                .raised
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *raised = true;
+            self.changed.notify_all();
+        }
+
+        fn wait(&self, timeout: Duration) -> bool {
+            let raised = self
+                .raised
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (raised, _) = self
+                .changed
+                .wait_timeout_while(raised, timeout, |raised| !*raised)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *raised
         }
     }
 
@@ -16802,7 +17437,7 @@ mod lib_unit_tests {
         receive_calls: Arc<AtomicUsize>,
     }
 
-    fn modern_discovery_opening_request() -> JsonRpcMessage {
+    fn modern_discovery_request(id: i64) -> JsonRpcMessage {
         JsonRpcMessage::Request(JsonRpcRequest::new(
             SERVER_DISCOVER_METHOD,
             Some(serde_json::json!({
@@ -16811,8 +17446,12 @@ mod lib_unit_tests {
                     FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                 },
             })),
-            905_i64,
+            id,
         ))
+    }
+
+    fn modern_discovery_opening_request() -> JsonRpcMessage {
+        modern_discovery_request(905)
     }
 
     fn modern_controlled_tool_request(id: i64) -> JsonRpcMessage {
@@ -16824,6 +17463,17 @@ mod lib_unit_tests {
                 "_meta": {
                     MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
                 },
+            })),
+            id,
+        ))
+    }
+
+    fn legacy_controlled_tool_request(id: i64) -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "live_modern_controlled_tool",
+                "arguments": {},
             })),
             id,
         ))
@@ -16845,9 +17495,6 @@ mod lib_unit_tests {
             "notifications/cancelled",
             Some(serde_json::json!({
                 "requestId": request_id,
-                "_meta": {
-                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                },
             })),
         ))
     }
@@ -17293,48 +17940,54 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn final_cancelled_notification_requires_exact_modern_metadata() {
-        let accepted = JsonRpcRequest::notification(
+    fn cancellation_codec_uses_negotiated_era_and_modern_metadata_is_optional() {
+        let metadata_free = JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({
+                "requestId": 907,
+            })),
+        );
+        assert!(matches!(
+            CancellationWireMessage::decode(
+                ProtocolEra::Legacy2024,
+                CancellationSender::Client,
+                &metadata_free,
+            ),
+            Ok(CancellationWireMessage::Legacy2024 { .. })
+        ));
+        assert!(matches!(
+            CancellationWireMessage::decode(
+                ProtocolEra::Modern2026,
+                CancellationSender::Client,
+                &metadata_free,
+            ),
+            Ok(CancellationWireMessage::Modern2026 { .. })
+        ));
+
+        let with_metadata = JsonRpcRequest::notification(
             "notifications/cancelled",
             Some(serde_json::json!({
                 "requestId": 907,
                 "_meta": {
-                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    "trace": "optional-final-metadata",
                 },
             })),
         );
+        assert!(matches!(
+            CancellationWireMessage::decode(
+                ProtocolEra::Modern2026,
+                CancellationSender::Client,
+                &with_metadata,
+            ),
+            Ok(CancellationWireMessage::Modern2026 { .. })
+        ));
         assert!(
-            cancelled_notification_matches_stdio_era(ProtocolEra::Modern2026, &accepted),
-            "the exact final protocol marker admits a modern cancellation"
-        );
-        assert!(
-            !cancelled_notification_matches_stdio_era(ProtocolEra::Legacy2024, &accepted),
-            "changing only the negotiated era rejects final metadata on a legacy connection"
-        );
-
-        let mut rejected = accepted.clone();
-        rejected
-            .params
-            .as_mut()
-            .and_then(|params| params.get_mut("_meta"))
-            .and_then(serde_json::Value::as_object_mut)
-            .expect("baseline cancellation retains its metadata object")
-            .remove(MODERN_PROTOCOL_VERSION_METADATA_KEY);
-        assert!(
-            !cancelled_notification_matches_stdio_era(ProtocolEra::Modern2026, &rejected),
-            "removing only the final protocol marker rejects the otherwise identical cancellation"
-        );
-        assert_eq!(
-            rejected
-                .params
-                .as_ref()
-                .and_then(|params| params.get("requestId")),
-            Some(&serde_json::json!(907)),
-            "the rejected cancellation preserves every non-era parameter"
-        );
-        assert!(
-            cancelled_notification_matches_stdio_era(ProtocolEra::Legacy2024, &rejected),
-            "removing only the final marker restores the same cancellation to the legacy era"
+            CancellationWireMessage::decode(
+                ProtocolEra::Legacy2024,
+                CancellationSender::Client,
+                &with_metadata,
+            )
+            .is_err()
         );
     }
 
@@ -17404,6 +18057,57 @@ mod lib_unit_tests {
                 .as_ref()
                 .is_some_and(|result| result.get("resultType").is_none())
         );
+    }
+
+    #[test]
+    fn live_legacy_runtime_ignores_invalid_cancellation_without_closing_the_connection() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+
+        Server::new("legacy-invalid-cancellation", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyScriptTransport {
+                    inbound: std::collections::VecDeque::from([
+                        exact_legacy_initialize_request(71, serde_json::json!("1.0.0")),
+                        JsonRpcMessage::Request(JsonRpcRequest::notification(
+                            "notifications/initialized",
+                            None,
+                        )),
+                        JsonRpcMessage::Request(JsonRpcRequest::notification(
+                            "notifications/cancelled",
+                            Some(serde_json::json!({
+                                "requestId": 72,
+                                "unexpected": true,
+                            })),
+                        )),
+                        JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 72_i64)),
+                    ]),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::clone(&receive_calls),
+                },
+            )
+            .expect("an invalid cancellation must leave the legacy connection usable");
+
+        assert_eq!(receive_calls.load(Ordering::Acquire), 5);
+        let sent = sent
+            .lock()
+            .expect("protocol-policy test sent-message mutex must not be poisoned");
+        let [
+            JsonRpcMessage::Response(initialize),
+            JsonRpcMessage::Response(ping),
+        ] = sent.as_slice()
+        else {
+            panic!(
+                "the invalid notification must not respond or prevent the following legacy request"
+            );
+        };
+        assert_eq!(initialize.id, Some(71_i64.into()));
+        assert!(initialize.error.is_none());
+        assert_eq!(ping.id, Some(72_i64.into()));
+        assert!(ping.error.is_none());
     }
 
     #[test]
@@ -17885,10 +18589,10 @@ mod lib_unit_tests {
         assert_eq!(response.id, Some(201_i64.into()));
         assert!(response.error.is_none());
         assert_eq!(
-            response
-                .result
-                .as_ref()
-                .and_then(|result| result["_meta"]["serverInfo"]["name"].as_str()),
+            response.result.as_ref().and_then(|result| {
+                result["_meta"][fastmcp_protocol::SERVER_DISCOVER_SERVER_INFO_META_KEY]["name"]
+                    .as_str()
+            }),
             Some("modern-http-endpoint")
         );
     }
@@ -18137,11 +18841,10 @@ mod lib_unit_tests {
                     "modern loopback request was not dispatched: {response:?}"
                 ));
             }
-            if response
-                .result
-                .as_ref()
-                .and_then(|result| result["serverInfo"]["name"].as_str())
-                != Some("live-modern-http")
+            if response.result.as_ref().and_then(|result| {
+                result["_meta"][fastmcp_protocol::SERVER_DISCOVER_SERVER_INFO_META_KEY]["name"]
+                    .as_str()
+            }) != Some("live-modern-http")
             {
                 return Err(format!(
                     "modern loopback discovery result was unexpected: {response:?}"
@@ -18543,7 +19246,10 @@ mod lib_unit_tests {
                         .map_err(|error| format!("legacy SSE connect failed: {error}"))?;
                     stream
                         .write_all(
-                            b"GET /sse HTTP/1.1\r\nHost: loopback\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                            format!(
+                                "GET /sse HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+                            )
+                            .as_bytes(),
                         )
                         .await
                         .map_err(|error| format!("legacy SSE request write failed: {error}"))?;
@@ -18694,7 +19400,10 @@ mod lib_unit_tests {
                         .map_err(|error| format!("legacy cancellation SSE connect failed: {error}"))?;
                     stream
                         .write_all(
-                            b"GET /sse HTTP/1.1\r\nHost: loopback\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                            format!(
+                                "GET /sse HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+                            )
+                            .as_bytes(),
                         )
                         .await
                         .map_err(|error| format!("legacy cancellation SSE write failed: {error}"))?;
@@ -19153,102 +19862,306 @@ mod lib_unit_tests {
         ));
     }
 
+    struct LiveLegacyActiveCancellationRecv {
+        phase: usize,
+        started: Arc<AtomicBool>,
+        observed_cancellation: Arc<AtomicBool>,
+        responses: Arc<LiveModernResponses>,
+    }
+
+    impl TransportRecvHalf for LiveLegacyActiveCancellationRecv {
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            let phase = self.phase;
+            self.phase = self.phase.saturating_add(1);
+            match phase {
+                0 => Ok(exact_legacy_initialize_request(
+                    71,
+                    serde_json::json!("1.0.0"),
+                )),
+                1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/initialized",
+                    None,
+                ))),
+                2 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "live_legacy_cancellation_tool",
+                        "arguments": {},
+                    })),
+                    72_i64,
+                ))),
+                3 => {
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while !self.started.load(Ordering::Acquire) && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    if !self.started.load(Ordering::Acquire) {
+                        return Err(TransportError::Timeout);
+                    }
+                    Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(serde_json::json!({
+                            "requestId": 72,
+                            "reason": "test cancellation",
+                        })),
+                    )))
+                }
+                4 => {
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while !self.observed_cancellation.load(Ordering::Acquire)
+                        && Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                    if self.observed_cancellation.load(Ordering::Acquire) {
+                        Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                            "ping", None, 73_i64,
+                        )))
+                    } else {
+                        Err(TransportError::Timeout)
+                    }
+                }
+                _ => {
+                    if self
+                        .responses
+                        .wait_for_responses(&[73], Duration::from_secs(1))
+                    {
+                        Err(TransportError::Closed)
+                    } else {
+                        Err(TransportError::Timeout)
+                    }
+                }
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn live_runtime_cancels_exact_legacy_tool_by_its_original_wire_id() {
         let started = Arc::new(AtomicBool::new(false));
         let observed_cancellation = Arc::new(AtomicBool::new(false));
-        let started_for_receive = Arc::clone(&started);
-        let observed_for_receive = Arc::clone(&observed_cancellation);
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let sent_by_worker = Arc::clone(&sent);
-        let phase = Arc::new(AtomicUsize::new(0));
-        let phase_for_receive = Arc::clone(&phase);
+        let responses = Arc::new(LiveModernResponses::default());
 
-        let exit_code = Server::new("live-legacy-cancellation", "1.0.0")
+        Server::new("live-legacy-cancellation", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
             .tool(LiveLegacyCancellationTool {
-                started,
-                observed_cancellation,
+                started: Arc::clone(&started),
+                observed_cancellation: Arc::clone(&observed_cancellation),
             })
             .build()
-            .run_loop_pump(
+            .run_split_transport_returning_with_cx(
                 &Cx::for_testing(),
-                move |_cx, _worker_failed| match phase_for_receive.fetch_add(1, Ordering::AcqRel) {
-                    0 => Ok(exact_legacy_initialize_request(
-                        71,
-                        serde_json::json!("1.0.0"),
-                    )),
-                    1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
-                        "notifications/initialized",
-                        None,
-                    ))),
-                    2 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
-                        "tools/call",
-                        Some(serde_json::json!({
-                            "name": "live_legacy_cancellation_tool",
-                            "arguments": {},
-                        })),
-                        72_i64,
-                    ))),
-                    3 => {
-                        let deadline = Instant::now() + Duration::from_secs(1);
-                        while !started_for_receive.load(Ordering::Acquire)
-                            && Instant::now() < deadline
+                LiveLegacyActiveCancellationRecv {
+                    phase: 0,
+                    started: Arc::clone(&started),
+                    observed_cancellation: Arc::clone(&observed_cancellation),
+                    responses: Arc::clone(&responses),
+                },
+                LiveModernSplitSend {
+                    responses: Arc::clone(&responses),
+                },
+            )
+            .expect("accepted active cancellation must close the public transport cleanly");
+
+        assert!(observed_cancellation.load(Ordering::Acquire));
+        assert_eq!(responses.response_count(71), 1);
+        assert_eq!(responses.response_count(72), 0);
+        assert_eq!(responses.response_count(73), 1);
+        assert!(
+            responses
+                .response(73)
+                .is_some_and(|response| response.error.is_none())
+        );
+    }
+
+    struct LiveLegacyQueuedCancellationRecv {
+        phase: usize,
+        cancelled_request_id: i64,
+        initialize_send_started: Arc<BoundedTestSignal>,
+        initialize_send_release: Arc<BoundedTestSignal>,
+        control: Arc<LiveModernControl>,
+        responses: Arc<LiveModernResponses>,
+    }
+
+    impl TransportRecvHalf for LiveLegacyQueuedCancellationRecv {
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            let phase = self.phase;
+            self.phase = self.phase.saturating_add(1);
+            match phase {
+                0 => Ok(exact_legacy_initialize_request(
+                    75,
+                    serde_json::json!("1.0.0"),
+                )),
+                1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/initialized",
+                    None,
+                ))),
+                2 => {
+                    // Hold the initialization response attempt so request 80
+                    // is certainly the first queued application request when
+                    // its cancellation reaches the receive pump.
+                    if self
+                        .initialize_send_started
+                        .wait(Duration::from_secs(2))
+                    {
+                        Ok(legacy_controlled_tool_request(80))
+                    } else {
+                        Err(TransportError::Timeout)
+                    }
+                }
+                3 => Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/cancelled",
+                    Some(serde_json::json!({
+                        "requestId": self.cancelled_request_id,
+                        "reason": "queued cancellation",
+                    })),
+                ))),
+                4 => {
+                    // `recv` is called again only after the cancellation frame
+                    // from phase 3 has been authenticated and applied.
+                    self.initialize_send_release.raise();
+                    Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "ping", None, 82_i64,
+                    )))
+                }
+                5 => {
+                    if self.cancelled_request_id == 80 {
+                        if !self
+                            .responses
+                            .wait_for_responses(&[82], Duration::from_secs(2))
                         {
-                            std::thread::yield_now();
-                        }
-                        if !started_for_receive.load(Ordering::Acquire) {
                             return Err(TransportError::Timeout);
                         }
-                        Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
-                            "notifications/cancelled",
-                            Some(serde_json::json!({
-                                "requestId": 72,
-                                "reason": "test cancellation",
-                            })),
-                        )))
-                    }
-                    _ => {
-                        let deadline = Instant::now() + Duration::from_secs(1);
-                        while !observed_for_receive.load(Ordering::Acquire)
-                            && Instant::now() < deadline
+                    } else {
+                        if !self.control.wait_for_started(1, Duration::from_secs(2)) {
+                            return Err(TransportError::Timeout);
+                        }
+                        self.control.release(80);
+                        if !self
+                            .responses
+                            .wait_for_responses(&[80, 82], Duration::from_secs(2))
                         {
-                            std::thread::yield_now();
-                        }
-                        if observed_for_receive.load(Ordering::Acquire) {
-                            Err(TransportError::Closed)
-                        } else {
-                            Err(TransportError::Timeout)
+                            return Err(TransportError::Timeout);
                         }
                     }
+                    Err(TransportError::Closed)
+                }
+                _ => Err(TransportError::Closed),
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct LiveLegacyFirstQueuedSend {
+        initialize_send_started: Arc<BoundedTestSignal>,
+        initialize_send_release: Arc<BoundedTestSignal>,
+        responses: Arc<LiveModernResponses>,
+    }
+
+    impl TransportSendHalf for LiveLegacyFirstQueuedSend {
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.responses.record(message.clone());
+            if matches!(
+                message,
+                JsonRpcMessage::Response(response) if response.id == Some(75_i64.into())
+            ) {
+                self.initialize_send_started.raise();
+                if !self
+                    .initialize_send_release
+                    .wait(Duration::from_secs(2))
+                {
+                    return Err(TransportError::Timeout);
+                }
+            }
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn live_legacy_queued_cancellation_transcript(
+        cancelled_request_id: i64,
+    ) -> (
+        McpResult<()>,
+        Arc<LiveModernControl>,
+        Arc<LiveModernResponses>,
+    ) {
+        let control = Arc::new(LiveModernControl::default());
+        let responses = Arc::new(LiveModernResponses::default());
+        let initialize_send_started = Arc::new(BoundedTestSignal::default());
+        let initialize_send_release = Arc::new(BoundedTestSignal::default());
+
+        let result = Server::new("live-legacy-queued-cancellation", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .tool(LiveModernControlledTool {
+                control: Arc::clone(&control),
+            })
+            .build()
+            .run_split_transport_returning_with_cx(
+                &Cx::for_testing(),
+                LiveLegacyQueuedCancellationRecv {
+                    phase: 0,
+                    cancelled_request_id,
+                    initialize_send_started: Arc::clone(&initialize_send_started),
+                    initialize_send_release: Arc::clone(&initialize_send_release),
+                    control: Arc::clone(&control),
+                    responses: Arc::clone(&responses),
                 },
-                move |_cx, message| {
-                    sent_by_worker
-                        .lock()
-                        .expect("legacy cancellation sent-message mutex must not be poisoned")
-                        .push(message.clone());
-                    Ok(())
+                LiveLegacyFirstQueuedSend {
+                    initialize_send_started,
+                    initialize_send_release,
+                    responses: Arc::clone(&responses),
                 },
-                Arc::new(|_| {}),
-                "legacy-cancellation-test",
             );
 
-        assert_eq!(exit_code, 0);
-        let sent = sent
-            .lock()
-            .expect("legacy cancellation sent-message mutex must not be poisoned");
-        let [
-            JsonRpcMessage::Response(initialize),
-            JsonRpcMessage::Response(cancelled),
-        ] = sent.as_slice()
-        else {
-            panic!("exact legacy cancellation must retain initialize and cancellation responses");
-        };
-        assert_eq!(initialize.id, Some(71_i64.into()));
-        assert_eq!(cancelled.id, Some(72_i64.into()));
-        assert_eq!(
-            cancelled.error.as_ref().map(|error| error.code),
-            Some(i32::from(McpErrorCode::RequestCancelled))
+        (result, control, responses)
+    }
+
+    #[test]
+    fn live_exact_legacy_first_queued_cancellation_suppresses_only_the_target_response() {
+        let (result, control, responses) = live_legacy_queued_cancellation_transcript(80);
+
+        result.expect("accepted queued cancellation must close the public transport cleanly");
+        assert_eq!(responses.response_count(75), 1);
+        assert_eq!(responses.response_count(80), 0);
+        assert_eq!(responses.response_count(82), 1);
+        assert_eq!(control.max_active(), 0);
+        assert!(!control.was_cancelled(80));
+        assert!(
+            responses
+                .response(82)
+                .is_some_and(|response| response.error.is_none())
+        );
+    }
+
+    #[test]
+    fn live_exact_legacy_first_queued_unknown_cancellation_preserves_the_request() {
+        // This differs from the positive only in the cancellation request ID.
+        let (result, control, responses) = live_legacy_queued_cancellation_transcript(83);
+
+        result.expect("unknown queued cancellation must leave the public transport usable");
+        assert_eq!(responses.response_count(75), 1);
+        assert_eq!(responses.response_count(80), 1);
+        assert_eq!(responses.response_count(82), 1);
+        assert_eq!(control.max_active(), 1);
+        assert!(!control.was_cancelled(80));
+        assert!(
+            responses
+                .response(80)
+                .is_some_and(|response| response.error.is_none())
+        );
+        assert!(
+            responses
+                .response(82)
+                .is_some_and(|response| response.error.is_none())
         );
     }
 
@@ -19457,7 +20370,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_modern_stdio_cancellation_isolated_to_the_matching_request() {
+    fn live_modern_stdio_metadata_free_cancellation_isolated_to_the_matching_request() {
         let control = Arc::new(LiveModernControl::default());
         let responses = Arc::new(LiveModernResponses::default());
         let control_for_receive = Arc::clone(&control);
@@ -21504,13 +22417,16 @@ mod lib_unit_tests {
     #[test]
     fn final_tasks_runtime_publishes_only_to_acknowledged_exact_task_ids() {
         let application_notifications = Arc::new(Mutex::new(Vec::new()));
-        let server = final_tasks_test_server(Arc::clone(&application_notifications));
+        let (server, _service) = final_tasks_test_server(Arc::clone(&application_notifications));
         let runtime = server
             .final_task_runtime()
             .expect("final Tasks runtime must remain public")
             .clone();
         let created = runtime
-            .create_task(Some("queued".to_owned()))
+            .create_task_with_work(
+                final_tasks_test_work_descriptor(),
+                Some("queued".to_owned()),
+            )
             .expect("task must be durable before subscription");
         let task_id = created.task.base().task_id.clone();
         let foreign_id =
