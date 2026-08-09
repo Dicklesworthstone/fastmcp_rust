@@ -1269,6 +1269,7 @@ fn collision_safe_map_key(
     }
 }
 
+#[cfg(test)]
 fn bounded_json_preview(value: &serde_json::Value) -> serde_json::Value {
     bounded_json_preview_inner(value, 0, &mut JsonPreviewBudget::default())
 }
