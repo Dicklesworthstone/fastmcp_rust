@@ -1158,7 +1158,7 @@ pub mod modern {
             cx: &Cx,
             request_id: RequestId,
             notifications: SubscriptionFilter,
-            limits: fastmcp_transport::sse::SseLimits,
+            limits: fastmcp_client::sse::SseLimits,
         ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError>
         {
             self.inner
