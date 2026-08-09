@@ -25,8 +25,7 @@ use fastmcp_protocol::methods::{
     TOOLS_CALL, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
-    HttpModernProbe, HttpProbeBody, LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION, ProtocolEra,
-    ProtocolPolicy,
+    HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
 };
 use fastmcp_protocol::tasks_extension::{
     TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY,

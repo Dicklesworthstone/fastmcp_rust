@@ -724,11 +724,12 @@ pub mod limits {
                     limit: self.limits.logical_exchange_max_inputs,
                 });
             }
-            let next_state_bytes = counters.state_bytes_admitted.checked_add(state_bytes).ok_or(
-                LogicalExchangeBudgetError::ArithmeticOverflow {
+            let next_state_bytes = counters
+                .state_bytes_admitted
+                .checked_add(state_bytes)
+                .ok_or(LogicalExchangeBudgetError::ArithmeticOverflow {
                     resource: LogicalExchangeBudgetResource::StateBytes,
-                },
-            )?;
+                })?;
             if next_state_bytes > self.limits.logical_exchange_max_state_bytes {
                 return Err(LogicalExchangeBudgetError::StateByteLimitExceeded {
                     limit: self.limits.logical_exchange_max_state_bytes,
@@ -753,11 +754,12 @@ pub mod limits {
         ) -> Result<(), LogicalExchangeBudgetError> {
             let mut counters = self.counters();
             self.check_admission_while_holding_counters(&counters)?;
-            let next_state_bytes = counters.state_bytes_admitted.checked_add(state_bytes).ok_or(
-                LogicalExchangeBudgetError::ArithmeticOverflow {
+            let next_state_bytes = counters
+                .state_bytes_admitted
+                .checked_add(state_bytes)
+                .ok_or(LogicalExchangeBudgetError::ArithmeticOverflow {
                     resource: LogicalExchangeBudgetResource::StateBytes,
-                },
-            )?;
+                })?;
             if next_state_bytes > self.limits.logical_exchange_max_state_bytes {
                 return Err(LogicalExchangeBudgetError::StateByteLimitExceeded {
                     limit: self.limits.logical_exchange_max_state_bytes,
