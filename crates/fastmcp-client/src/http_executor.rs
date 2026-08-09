@@ -24,7 +24,8 @@ use fastmcp_protocol::methods::{
     TOOLS_CALL, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
-    HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
+    HttpModernProbe, HttpProbeBody, LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION, ProtocolEra,
+    ProtocolPolicy,
 };
 use fastmcp_protocol::tasks_extension::{
     TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY,
@@ -36,7 +37,7 @@ use fastmcp_protocol::{
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
     JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
     SERVER_DISCOVER, ServerDiscoverResult, ServerNotification, SubscriptionFilter,
-    decode_strict_jsonrpc_message, task_subscription_ids,
+    decode_strict_jsonrpc_message, decode_strict_jsonrpc_response, task_subscription_ids,
 };
 
 use crate::session::resolve_mcp_apps_activation;
@@ -333,9 +334,19 @@ impl ModernHttpResponseStream {
 
             match message {
                 JsonRpcMessage::Response(response) => {
+                    let admission =
+                        decode_strict_jsonrpc_response(event.as_bytes(), maximum_jsonrpc_bytes)
+                            .map_err(ModernHttpSubscriptionListenError::JsonRpcAdmission)?;
+                    if admission.response() != &response {
+                        return Err(ModernHttpSubscriptionListenError::JsonRpcAdmission(
+                            JsonRpcAdmissionError::InvalidEnvelope,
+                        ));
+                    }
+                    let (_, raw_result) = admission.into_parts();
                     return collect_final_subscriptions_terminal(
                         &core_request,
                         response,
+                        raw_result.as_deref(),
                         request_id,
                         accepted_filter,
                         notifications,
@@ -824,6 +835,7 @@ fn final_subscriptions_listen_core_request(
 fn collect_final_subscriptions_terminal(
     core_request: &CoreRequest,
     response: JsonRpcResponse,
+    result_source: Option<&str>,
     expected_id: RequestId,
     accepted_filter: Option<SubscriptionFilter>,
     notifications: Vec<ServerNotification>,
@@ -841,8 +853,14 @@ fn collect_final_subscriptions_terminal(
             message: error.message.clone(),
         });
     }
+    let result_source = result_source.ok_or_else(|| {
+        ModernHttpSubscriptionListenError::TerminalResult(CoreDispatchError::InvalidResult {
+            era: core_request.era(),
+            method: core_request.method(),
+        })
+    })?;
     let result = core_request
-        .decode_response(&response)
+        .decode_response_result(&response, result_source)
         .map_err(ModernHttpSubscriptionListenError::TerminalResult)?;
     let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
         result: terminal,
@@ -1417,6 +1435,15 @@ impl ClientHttpConnection {
         }
     }
 
+    /// Returns the exact immutable protocol version selected by this connection.
+    #[must_use]
+    pub const fn protocol_version(&self) -> &'static str {
+        match self {
+            Self::Modern(_) => MODERN_PROTOCOL_VERSION,
+            Self::LegacySse(_) => LEGACY_PROTOCOL_VERSION,
+        }
+    }
+
     /// Returns the immutable policy and endpoint bundle used for this connection.
     #[must_use]
     pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
@@ -1537,11 +1564,33 @@ impl ClientHttpConnection {
         request_id: RequestId,
         maximum_response_bytes: usize,
     ) -> Result<JsonRpcResponse, ClientHttpConnectionError> {
+        self.request_json_with_result_source(
+            cx,
+            method,
+            parameters,
+            request_id,
+            maximum_response_bytes,
+        )
+        .await
+        .map(|(response, _)| response)
+    }
+
+    /// Sends one request and retains the exact admitted result source for a
+    /// modern JSON response. Legacy SSE keeps its established typed behavior
+    /// and therefore returns no source sidecar.
+    pub(crate) async fn request_json_with_result_source(
+        &mut self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        maximum_response_bytes: usize,
+    ) -> Result<(JsonRpcResponse, Option<String>), ClientHttpConnectionError> {
         let response = self
             .request(cx, method, parameters, request_id.clone())
             .await?;
         match response {
-            ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => Ok(response),
+            ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => Ok((response, None)),
             ClientHttpResponse::Legacy(JsonRpcMessage::Request(_)) => {
                 Err(ClientHttpConnectionError::UnexpectedResponseMessage { request_id })
             }
@@ -1563,13 +1612,21 @@ impl ClientHttpConnection {
                         request_id,
                     });
                 };
+                let admission = decode_strict_jsonrpc_response(&body, maximum_response_bytes)
+                    .map_err(ClientHttpConnectionError::ResponseAdmission)?;
+                if admission.response() != &response {
+                    return Err(ClientHttpConnectionError::ResponseAdmission(
+                        JsonRpcAdmissionError::InvalidEnvelope,
+                    ));
+                }
                 if response.id.as_ref() != Some(&request_id) {
                     return Err(ClientHttpConnectionError::ResponseIdMismatch {
                         expected: request_id,
                         actual: response.id,
                     });
                 }
-                Ok(response)
+                let (_, result_source) = admission.into_parts();
+                Ok((response, result_source))
             }
         }
     }
@@ -2120,6 +2177,14 @@ impl ModernHttpClient {
         let JsonRpcMessage::Response(response) = message else {
             return Err(ModernHttpClientError::UnexpectedToolCallResult);
         };
+        let admission = decode_strict_jsonrpc_response(&body, maximum_response_bytes)
+            .map_err(ModernHttpClientError::InvalidJsonRpcResponse)?;
+        if admission.response() != &response {
+            return Err(ModernHttpClientError::InvalidJsonRpcResponse(
+                JsonRpcAdmissionError::InvalidEnvelope,
+            ));
+        }
+        let (_, result_source) = admission.into_parts();
         if response.id.as_ref() != Some(&request_id) {
             return Err(ModernHttpClientError::ResponseIdMismatch {
                 expected: request_id,
@@ -2132,8 +2197,11 @@ impl ModernHttpClient {
                 message: error.message.clone(),
             });
         }
+        let result_source = result_source
+            .as_deref()
+            .ok_or(ModernHttpClientError::UnexpectedToolCallResult)?;
         match core_request
-            .decode_response(&response)
+            .decode_response_result(&response, result_source)
             .map_err(ModernHttpClientError::TypedResult)?
         {
             CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
@@ -2984,16 +3052,21 @@ fn decode_modern_discovery_response(
     let JsonRpcMessage::Response(response) = message else {
         return Err(ModernHttpClientError::InvalidDiscoveryResponse);
     };
+    let admission = decode_strict_jsonrpc_response(body, MAX_MODERN_HTTP_PROBE_BODY_BYTES)
+        .map_err(|_| ModernHttpClientError::InvalidDiscoveryResponse)?;
+    if admission.response() != &response {
+        return Err(ModernHttpClientError::InvalidDiscoveryResponse);
+    }
     if response.id != Some(RequestId::Number(1)) {
         return Err(ModernHttpClientError::InvalidDiscoveryResponse);
     }
     if response.error.is_some() {
         return Err(ModernHttpClientError::DiscoveryRejected);
     }
-    let result = response
-        .result
+    let result_source = admission
+        .raw_result()
         .ok_or(ModernHttpClientError::InvalidDiscoveryResponse)?;
-    let discovery: ServerDiscoverResult = serde_json::from_value(result)
+    let discovery: ServerDiscoverResult = serde_json::from_str(result_source)
         .map_err(|_| ModernHttpClientError::InvalidDiscoveryResponse)?;
     if !discovery
         .supported_versions()
@@ -3131,6 +3204,7 @@ mod tests {
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
     use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
+    use fastmcp_protocol::protocol_policy::{LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION};
     use fastmcp_protocol::{
         ClientCapabilities, ClientInfo, RequestId, ServerNotification, SubscriptionFilter,
     };
@@ -3259,7 +3333,7 @@ mod tests {
                 &mut list_stream,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","zeta":{"second":2,"first":1},"alpha":1.20e+4}}"#,
             );
         });
 
@@ -3280,14 +3354,15 @@ mod tests {
         )
         .expect("public client completes final discovery");
         assert_eq!(connection.mcp_apps_active(), apps_active);
-        let response = runtime_block_on(connection.request_json(
-            &cx,
-            "tools/list",
-            serde_json::json!({}),
-            RequestId::Number(2),
-            4_096,
-        ))
-        .expect("public client sends the negotiated Apps request");
+        let (response, result_source) =
+            runtime_block_on(connection.request_json_with_result_source(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+                RequestId::Number(2),
+                4_096,
+            ))
+            .expect("public client sends the negotiated Apps request");
         assert_eq!(response.id, Some(RequestId::Number(2)));
         server.join().expect("Apps negotiation server must join");
     }
@@ -3623,6 +3698,7 @@ mod tests {
             4_096,
         ));
         assert_eq!(connection.selected_protocol_era(), ProtocolEra::Modern2026);
+        assert_eq!(connection.protocol_version(), MODERN_PROTOCOL_VERSION);
         server.join().expect("Tasks HTTP tool server must join");
         result
     }
@@ -3675,17 +3751,31 @@ mod tests {
     }
 
     #[test]
-    fn modern_connect_requires_the_exact_typed_discovery_result() {
+    fn modern_connect_applies_only_the_absent_result_type_compatibility_rule() {
         let exact = br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#;
         let admitted = decode_modern_discovery_response(exact)
             .expect("the exact final discovery result must be retained");
         assert_eq!(admitted.supported_versions(), ["2026-07-28"]);
+        assert!(admitted.peer_diagnostic().is_none());
 
-        let planted = br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#;
-        assert!(matches!(
-            decode_modern_discovery_response(planted),
-            Err(ModernHttpClientError::InvalidDiscoveryResponse)
-        ));
+        let absent = br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#;
+        let compatibility = decode_modern_discovery_response(absent)
+            .expect("an otherwise-valid missing discriminator establishes the modern era");
+        assert_eq!(compatibility.result_type(), "complete");
+        assert_eq!(
+            compatibility.peer_diagnostic(),
+            Some(fastmcp_protocol::ResultPeerDiagnostic::ModernMissingResultType)
+        );
+
+        for planted in [
+            br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":null,"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":{"complete":true},"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                decode_modern_discovery_response(planted),
+                Err(ModernHttpClientError::InvalidDiscoveryResponse)
+            ));
+        }
     }
 
     #[test]
@@ -3770,6 +3860,13 @@ mod tests {
             4_096,
         ))
         .expect("the public HTTP request path retains the selected modern transport");
+        assert_eq!(
+            result_source.as_deref(),
+            Some(
+                r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","zeta":{"second":2,"first":1},"alpha":1.20e+4}"#
+            ),
+            "the shipped HTTP boundary retains result member order and number lexemes",
+        );
         assert_eq!(
             response
                 .result
@@ -4250,6 +4347,7 @@ mod tests {
         )
         .expect("legacy-only opens the exact configured SSE route");
         assert_eq!(connection.selected_protocol_era(), ProtocolEra::Legacy2024);
+        assert_eq!(connection.protocol_version(), LEGACY_PROTOCOL_VERSION);
 
         let response = runtime_block_on(connection.request_json(
             &cx,

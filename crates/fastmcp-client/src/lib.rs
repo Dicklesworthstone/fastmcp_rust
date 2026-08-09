@@ -51,14 +51,16 @@ pub mod sse;
 
 pub use builder::ClientBuilder;
 pub use cache::{
-    CachePartitionKey, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup,
-    FinalCacheMiss, FinalCacheResultSet, FinalCacheStats, FinalResultCache,
-    DEFAULT_FINAL_CACHE_CAPACITY,
+    CachePartitionKey, DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES,
+    FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup, FinalCacheMiss,
+    FinalCacheResultSet, FinalCacheStats, FinalResultCache, MAX_FINAL_CACHE_CAPACITY,
+    MAX_FINAL_CACHE_MAX_BYTES,
 };
 pub use execution::{
     CancellationRequested, ExecutionTerminalReason, ExecutionTerminalRecord,
-    ExecutionTerminalState, OpaquePagination, PaginationBounds, PendingRequestRecord, Request,
-    RequestExecution, RequestExecutor, clt_01_a_manifest_digest, clt_01_b_manifest_digest,
+    ExecutionTerminalState, FinalCacheTtlDiagnostic, OpaquePagination, PaginationBounds,
+    PendingRequestRecord, Request, RequestExecution, RequestExecutor, clt_01_a_manifest_digest,
+    clt_01_b_manifest_digest,
 };
 pub use fastmcp_core::CanonicalHttpUrl;
 pub use fastmcp_protocol::common_types::LoggingLevel;
@@ -131,16 +133,17 @@ use fastmcp_protocol::tasks_extension::{
 use fastmcp_protocol::{
     CallToolParams, CancelTaskParams, CancelTaskResult, CancelledParams, ClientCapabilities,
     ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey, FINAL_CLIENT_CAPABILITIES_META_KEY,
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalLogMessageParams, FinalProgressNotificationParams,
-    FinalRequestMeta, FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams,
-    GetTaskParams, GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION,
-    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent,
-    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListResourceTemplatesParams,
-    ListResourcesParams, ListTasksParams, ListTasksResult, ListToolsParams, LogLevel,
-    LogMessageParams, PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, ReadResourceParams,
-    RequestId, RequestMeta, Resource, ResourceTemplate, ServerCapabilities, ServerInfo,
-    ServerNotification, SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo,
-    TaskResult, TaskStatus, Tool, ToolAnnotations, task_subscription_ids,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreRequest, FinalLogMessageParams,
+    FinalProgressNotificationParams, FinalRequestMeta,
+    FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams, GetTaskParams,
+    GetTaskResult, InitializeParams, InitializeResult, JSONRPC_VERSION, JsonRpcError,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyPromptMessage,
+    LegacyResourceContent, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
+    ListTasksParams, ListTasksResult, ListToolsParams, LogLevel, LogMessageParams,
+    PROTOCOL_VERSION, ProgressMarker, Prompt, PromptArgument, ReadResourceParams, RequestId,
+    RequestMeta, Resource, ResourceTemplate, ServerCapabilities, ServerInfo, ServerNotification,
+    SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId, TaskInfo, TaskResult,
+    TaskStatus, Tool, ToolAnnotations, decode_strict_jsonrpc_response, task_subscription_ids,
 };
 use fastmcp_protocol::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionDirection, ExtensionSettings,
@@ -217,7 +220,10 @@ impl ReverseRequestHandlers {
 }
 use fastmcp_transport::{StdioTransport, Transport, TransportError};
 
-use crate::execution::decode_core_result;
+use crate::cache::{FinalCachePageLookup, final_cache_hints};
+use crate::execution::{
+    decode_core_result_from_source, decode_core_result_with_cache_ttl_from_source,
+};
 
 /// Completion input that retains the complete 2026-07-28 request context.
 ///
@@ -3222,7 +3228,21 @@ fn remote_log_metadata(message: &LogMessageParams) -> RemoteLogMetadata {
     }
 }
 
-type CorrelatedResponse = McpResult<JsonRpcResponse>;
+#[derive(Debug, Clone)]
+struct ReceivedJsonRpcResponse {
+    response: JsonRpcResponse,
+    raw_result: Option<String>,
+}
+
+impl std::ops::Deref for ReceivedJsonRpcResponse {
+    type Target = JsonRpcResponse;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
+type CorrelatedResponse = McpResult<ReceivedJsonRpcResponse>;
 
 /// The receive half owned by exactly one registered request.
 ///
@@ -3237,7 +3257,7 @@ struct ResponseWaiter {
 }
 
 impl ResponseWaiter {
-    fn try_response(&mut self) -> McpResult<Option<JsonRpcResponse>> {
+    fn try_response(&mut self) -> McpResult<Option<ReceivedJsonRpcResponse>> {
         match self.receiver.try_recv() {
             Ok(Ok(response)) => Ok(Some(response)),
             Ok(Err(error)) => Err(error),
@@ -3331,6 +3351,14 @@ impl ResponseRegistry {
     }
 
     fn route(&mut self, response: JsonRpcResponse) -> ResponseRoute {
+        self.route_with_raw_result(response, None)
+    }
+
+    fn route_with_raw_result(
+        &mut self,
+        response: JsonRpcResponse,
+        raw_result: Option<String>,
+    ) -> ResponseRoute {
         self.prune_expired_retained_state(Instant::now());
         if self.terminal_error.is_some() {
             self.note_uncorrelated_response("response received after connection failure");
@@ -3359,7 +3387,10 @@ impl ResponseRegistry {
             return ResponseRoute::UnknownId;
         };
 
-        match sender.send_blocking(Ok(response)) {
+        match sender.send_blocking(Ok(ReceivedJsonRpcResponse {
+            response,
+            raw_result,
+        })) {
             Ok(()) => ResponseRoute::Delivered,
             Err(_) => {
                 self.note_uncorrelated_response("response owner was already dropped");
@@ -3535,6 +3566,9 @@ pub struct HttpClient {
     server_info: ServerInfo,
     legacy_server_capabilities: Option<ServerCapabilities>,
     next_id: AtomicU64,
+    final_result_cache: FinalResultCache,
+    final_cache_ttl_diagnostics: VecDeque<FinalCacheTtlDiagnostic>,
+    mcp_apps_settings: Option<McpAppsClientSettings>,
 }
 
 /// Errors raised while composing a ready public HTTP client.
@@ -3554,6 +3588,8 @@ pub enum HttpClientError {
     LegacyInitializationUnsupportedProtocolVersion { actual: String },
     /// The HTTP request-ID space was exhausted.
     RequestIdExhausted,
+    /// A request or response did not match the selected core-result contract.
+    CoreResult(McpError),
 }
 
 impl std::fmt::Display for HttpClientError {
@@ -3579,6 +3615,7 @@ impl std::fmt::Display for HttpClientError {
             Self::RequestIdExhausted => {
                 formatter.write_str("HTTP client request IDs are exhausted")
             }
+            Self::CoreResult(error) => error.fmt(formatter),
         }
     }
 }
@@ -3593,6 +3630,7 @@ impl std::error::Error for HttpClientError {
             | Self::LegacyInitializationInvalidResult
             | Self::LegacyInitializationUnsupportedProtocolVersion { .. }
             | Self::RequestIdExhausted => None,
+            Self::CoreResult(error) => Some(error),
         }
     }
 }
@@ -3621,7 +3659,7 @@ impl HttpClient {
             protocol_plan,
             client_info.clone(),
             client_capabilities.clone(),
-            mcp_apps_settings,
+            mcp_apps_settings.clone(),
         )
         .await
         .map_err(HttpClientError::Connection)?;
@@ -3683,6 +3721,9 @@ impl HttpClient {
             server_info,
             legacy_server_capabilities,
             next_id: AtomicU64::new(2),
+            final_result_cache: FinalResultCache::default(),
+            final_cache_ttl_diagnostics: VecDeque::new(),
+            mcp_apps_settings,
         })
     }
 
@@ -3761,6 +3802,201 @@ impl HttpClient {
         Ok(RequestId::Number(id as i64))
     }
 
+    /// Returns whether typed final complete-result caching is enabled for this
+    /// HTTP client. The raw streaming [`Self::request`] API remains uncached.
+    #[must_use]
+    pub const fn final_result_cache_enabled(&self) -> bool {
+        self.final_result_cache.is_enabled()
+    }
+
+    /// Enables or disables typed final complete-result caching for this HTTP
+    /// client without discarding its local entries.
+    pub fn set_final_result_cache_enabled(&mut self, enabled: bool) {
+        self.final_result_cache.set_enabled(enabled);
+    }
+
+    /// Returns aggregate counters for the HTTP client's bounded final cache.
+    #[must_use]
+    pub const fn final_result_cache_stats(&self) -> FinalCacheStats {
+        self.final_result_cache.stats()
+    }
+
+    /// Removes all retained typed final complete results for this HTTP client.
+    pub fn clear_final_result_cache(&mut self) {
+        self.final_result_cache.clear();
+    }
+
+    /// Drains compatibility diagnostics for final peer TTLs admitted with zero
+    /// freshness by [`Self::request_final_core`].
+    #[must_use]
+    pub fn take_final_cache_ttl_diagnostics(&mut self) -> Vec<FinalCacheTtlDiagnostic> {
+        self.final_cache_ttl_diagnostics.drain(..).collect()
+    }
+
+    /// Sends one supported core request and returns its typed result. Cacheable
+    /// modern complete results use this HTTP client's bounded local cache; the
+    /// raw streaming [`Self::request`] surface deliberately remains unchanged.
+    pub async fn request_final_core(
+        &mut self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+    ) -> Result<CoreResult, HttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        let method = method.as_ref();
+        let core_parameters = self.core_request_parameters(&parameters)?;
+        let core_request =
+            CoreRequest::decode(self.selected_protocol_era(), method, Some(&core_parameters))
+                .map_err(|_| {
+                    HttpClientError::CoreResult(McpError::invalid_params(
+                        "HTTP core request parameters do not match the negotiated protocol era",
+                    ))
+                })?;
+        let result_set = final_cache_result_set(&core_request);
+        let key = if self.selected_protocol_era() == ProtocolEra::Modern2026 {
+            result_set
+                .as_ref()
+                .map(|result_set| {
+                    self.final_cache_key(method, parameters.clone(), result_set.clone())
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
+        if let Some(key) = key.as_ref()
+            && let FinalCacheLookup::Fresh(result) = self.final_result_cache.lookup(key)
+        {
+            if cx.checkpoint().is_err() {
+                return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+            }
+            return Ok(result);
+        }
+
+        let generation = key
+            .as_ref()
+            .map(|key| self.final_result_cache.begin_fetch(key.result_set()));
+        let request_id = self.next_request_id()?;
+        let response = self
+            .connection
+            .request_json_with_result_source(
+                cx,
+                method,
+                parameters,
+                request_id,
+                DEFAULT_FINAL_CACHE_MAX_BYTES,
+            )
+            .await
+            .map_err(HttpClientError::Connection)?;
+        let (mut response, result_source) = response;
+        let receipt = Instant::now();
+        if let Some(error) = response.error.take() {
+            return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
+        }
+        let raw_result = response.result.take().ok_or_else(|| {
+            HttpClientError::CoreResult(McpError::invalid_request("HTTP response has no result"))
+        })?;
+        let (result, ttl_diagnostic) = decode_core_result_with_cache_ttl_from_source(
+            &core_request,
+            &raw_result,
+            result_source.as_deref(),
+        )
+        .map_err(HttpClientError::CoreResult)?;
+        if let Some(diagnostic) = ttl_diagnostic {
+            if self.final_cache_ttl_diagnostics.len() >= MAX_FINAL_CACHE_TTL_DIAGNOSTICS {
+                self.final_cache_ttl_diagnostics.pop_front();
+            }
+            self.final_cache_ttl_diagnostics.push_back(diagnostic);
+        }
+        if let (Some(key), Some(generation)) = (key, generation) {
+            let _ = self.final_result_cache.insert_if_current_at(
+                key,
+                generation,
+                result.clone(),
+                receipt,
+            );
+        }
+        Ok(result)
+    }
+
+    fn core_request_parameters(
+        &self,
+        parameters: &serde_json::Value,
+    ) -> Result<serde_json::Value, HttpClientError> {
+        if self.selected_protocol_era() != ProtocolEra::Modern2026 {
+            return Ok(parameters.clone());
+        }
+        let mut parameters = parameters.as_object().cloned().ok_or_else(|| {
+            HttpClientError::CoreResult(McpError::invalid_params(
+                "HTTP modern core request parameters must be an object",
+            ))
+        })?;
+        parameters.insert(
+            "_meta".to_owned(),
+            serde_json::to_value(FinalRequestMeta::new(self.client_capabilities.clone())).map_err(
+                |_| {
+                    HttpClientError::CoreResult(McpError::internal_error(
+                        "HTTP client metadata could not form a core request",
+                    ))
+                },
+            )?,
+        );
+        Ok(serde_json::Value::Object(parameters))
+    }
+
+    fn final_cache_key(
+        &self,
+        method: &str,
+        semantic_parameters: serde_json::Value,
+        result_set: FinalCacheResultSet,
+    ) -> Result<FinalCacheKey, HttpClientError> {
+        let normalized_capabilities =
+            serde_json::to_string(&self.client_capabilities).map_err(|_| {
+                HttpClientError::CoreResult(McpError::internal_error(
+                    "HTTP client capabilities could not form a cache key",
+                ))
+            })?;
+        let extension_settings = serde_json::to_string(&serde_json::json!({
+            "mcpApps": self.mcp_apps_settings.as_ref().map(|settings| {
+                settings.to_extension_settings().into_value()
+            }),
+            "descriptorRevision": FINAL_CACHE_EXTENSION_REVISION,
+        }))
+        .map_err(|_| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "HTTP client extension settings could not form a cache key",
+            ))
+        })?;
+        let semantic_projection = serde_json::to_string(&semantic_parameters).map_err(|_| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "HTTP client semantic parameters could not form a cache key",
+            ))
+        })?;
+        Ok(FinalCacheKey::new(
+            self.connection
+                .protocol_plan()
+                .modern_post_target()
+                .unwrap_or("http"),
+            MODERN_PROTOCOL_VERSION,
+            normalized_capabilities,
+            extension_settings,
+            method,
+            semantic_projection,
+            semantic_parameters
+                .get("cursor")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            FINAL_CACHE_POLICY_REVISION,
+            FINAL_CACHE_EXTENSION_REVISION,
+            FINAL_CACHE_REPRESENTATION_POLICY_REVISION,
+            FINAL_CACHE_LIMITS_POLICY_REVISION,
+            CachePartitionKey::new("http-client-connection"),
+            result_set,
+        ))
+    }
+
     /// Sends one request with the next client-owned JSON-RPC request ID.
     pub async fn request(
         &mut self,
@@ -3789,10 +4025,51 @@ impl HttpClient {
     }
 }
 
+fn final_cache_result_set(request: &CoreRequest) -> Option<FinalCacheResultSet> {
+    let CoreRequest::Final(request) = request else {
+        return None;
+    };
+    match request {
+        FinalCoreRequest::ToolsList(_) => Some(FinalCacheResultSet::Tools),
+        FinalCoreRequest::ResourcesList(_) => Some(FinalCacheResultSet::Resources),
+        FinalCoreRequest::ResourceTemplatesList(_) => Some(FinalCacheResultSet::ResourceTemplates),
+        FinalCoreRequest::ResourcesRead(params) => Some(FinalCacheResultSet::Resource(
+            params.uri.as_str().to_owned(),
+        )),
+        FinalCoreRequest::PromptsList(_) => Some(FinalCacheResultSet::Prompts),
+        _ => None,
+    }
+}
+
 /// An MCP client instance.
 ///
 /// Clients are built using [`ClientBuilder`] and own a stdio subprocess
 /// transport. Use [`HttpClient`] for policy-bound HTTP composition.
+const MAX_FINAL_CACHE_TTL_DIAGNOSTICS: usize = 64;
+#[cfg(unix)]
+const FINAL_CACHE_NOTIFICATION_DRAIN_WINDOW: Duration = Duration::from_millis(1);
+const FINAL_CACHE_POLICY_REVISION: u64 = 1;
+const FINAL_CACHE_EXTENSION_REVISION: u64 = 1;
+const FINAL_CACHE_REPRESENTATION_POLICY_REVISION: u64 = 1;
+const FINAL_CACHE_LIMITS_POLICY_REVISION: u64 = 1;
+const FINAL_CACHE_LIST_RESTART_LIMIT_ERROR: &str =
+    "Final list changed while rebuilding its cache-consistent page set";
+
+#[derive(Clone, Copy, Debug)]
+struct FinalCachePageState {
+    generation: FinalCacheGeneration,
+    scope: fastmcp_protocol::CacheScope,
+    miss: Option<FinalCacheMiss>,
+}
+
+/// Raw response bytes paired with the monotonic instant at which the response
+/// became available to this client.
+struct ReceivedPreparedResult {
+    result: serde_json::Value,
+    raw_result: Option<String>,
+    receipt: Instant,
+}
+
 pub struct Client {
     /// The subprocess running the MCP server.
     child: Option<Child>,
@@ -3822,6 +4099,13 @@ pub struct Client {
     final_server_notifications: VecDeque<ServerNotification>,
     /// Bounded final complete-result cache scoped to this client connection.
     final_result_cache: FinalResultCache,
+    /// Bounded compatibility diagnostics for immediately-stale peer TTLs.
+    final_cache_ttl_diagnostics: VecDeque<FinalCacheTtlDiagnostic>,
+    /// Receipt captured as soon as a typed core response reaches this client.
+    last_core_result_receipt: Option<Instant>,
+    /// Per-page provenance retained only until the immediate list aggregator
+    /// consumes it.
+    last_final_cache_page: Option<FinalCachePageState>,
     /// Application handlers for server-initiated requests on this connection.
     reverse_request_handlers: ReverseRequestHandlers,
     /// Idle/absolute policy for ordinary stdio responses.
@@ -4154,6 +4438,9 @@ impl Client {
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
+            final_cache_ttl_diagnostics: VecDeque::new(),
+            last_core_result_receipt: None,
+            last_final_cache_page: None,
             reverse_request_handlers: ReverseRequestHandlers::new(),
             timeout_policy: RequestTimeoutPolicy::default(),
             auto_initialize: false,
@@ -4269,6 +4556,9 @@ impl Client {
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
+            final_cache_ttl_diagnostics: VecDeque::new(),
+            last_core_result_receipt: None,
+            last_final_cache_page: None,
             reverse_request_handlers: ReverseRequestHandlers::new(),
             timeout_policy,
             auto_initialize: false,
@@ -4322,6 +4612,9 @@ impl Client {
             responses: ResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
+            final_cache_ttl_diagnostics: VecDeque::new(),
+            last_core_result_receipt: None,
+            last_final_cache_page: None,
             reverse_request_handlers: ReverseRequestHandlers::new(),
             timeout_policy,
             auto_initialize: true,
@@ -4581,6 +4874,20 @@ impl Client {
         self.final_result_cache.clear();
     }
 
+    /// Drains bounded compatibility diagnostics for peer cache TTLs that were
+    /// accepted with zero freshness.
+    #[must_use]
+    pub fn take_final_cache_ttl_diagnostics(&mut self) -> Vec<FinalCacheTtlDiagnostic> {
+        self.final_cache_ttl_diagnostics.drain(..).collect()
+    }
+
+    fn retain_final_cache_ttl_diagnostic(&mut self, diagnostic: FinalCacheTtlDiagnostic) {
+        if self.final_cache_ttl_diagnostics.len() >= MAX_FINAL_CACHE_TTL_DIAGNOSTICS {
+            self.final_cache_ttl_diagnostics.pop_front();
+        }
+        self.final_cache_ttl_diagnostics.push_back(diagnostic);
+    }
+
     /// Returns the immutable transport policy and endpoint configuration.
     #[must_use]
     pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
@@ -4629,7 +4936,7 @@ impl Client {
                 // request metadata, but its acknowledgement must not be
                 // decoded through `FinalCoreResult`.
                 let params = self.prepare_request_parameters(serde_json::json!({}))?;
-                let _: serde_json::Value = self.send_prepared_request("ping", params)?;
+                let _: serde_json::Value = self.send_prepared_request("ping", params)?.result;
                 Ok(())
             }
             Some(ProtocolEra::Legacy2024) => {
@@ -4820,7 +5127,12 @@ impl Client {
             McpError::internal_error(format!("Failed to serialize final Tasks request: {error}"))
         })?;
         let result = self.send_prepared_request(method, params)?;
-        serde_json::from_value(result).map_err(|_| {
+        let result_source = result.raw_result.as_deref().ok_or_else(|| {
+            self.terminate_connection(McpError::invalid_request(
+                "Peer final Tasks response lost its admitted result source",
+            ))
+        })?;
+        serde_json::from_str(result_source).map_err(|_| {
             self.terminate_connection(McpError::invalid_request(
                 "Peer response does not match the admitted final Tasks result",
             ))
@@ -4869,7 +5181,8 @@ impl Client {
         // Advance the matching generation before exposing the notification or
         // accepting a late fetch completion. A fetch captures its generation
         // before send and can only fill while it remains current.
-        self.final_result_cache.invalidate_notification(&notification);
+        self.final_result_cache
+            .invalidate_notification(&notification);
 
         let ServerNotification::Progress(progress) = notification else {
             if self.final_server_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
@@ -4905,15 +5218,19 @@ impl Client {
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
         let params_value = self.prepare_request_parameters(params_value)?;
         let core_request = self.prepared_core_request(method, &params_value)?;
-        let result = self.send_prepared_request(method, params_value)?;
+        let received = self.send_prepared_request(method, params_value)?;
 
         if let Some(core_request) = core_request
-            && let Err(error) = decode_core_result(&core_request, &result)
+            && let Err(error) = decode_core_result_from_source(
+                &core_request,
+                &received.result,
+                received.raw_result.as_deref(),
+            )
         {
             return Err(self.terminate_connection(error));
         }
 
-        decode_response_payload(result)
+        decode_response_payload(received.result)
     }
 
     /// Sends an already-prepared request and returns its raw result value.
@@ -4924,7 +5241,7 @@ impl Client {
         &mut self,
         method: &str,
         params_value: serde_json::Value,
-    ) -> McpResult<serde_json::Value> {
+    ) -> McpResult<ReceivedPreparedResult> {
         let timeout_policy = self.timeout_policy;
         timeout_policy.validate()?;
         let id = self.next_request_id()?;
@@ -4957,19 +5274,28 @@ impl Client {
         };
 
         // Receive response with ID validation
-        let response = self.recv_response(waiter, deadlines)?;
+        let ReceivedJsonRpcResponse {
+            mut response,
+            raw_result,
+        } = self.recv_response(waiter, deadlines)?;
+        let receipt = Instant::now();
 
         // Check for error response
-        if let Some(error) = response.error {
+        if let Some(error) = response.error.take() {
             return Err(json_rpc_error_to_mcp(error));
         }
 
         // Parse result
         let result = response
             .result
+            .take()
             .ok_or_else(|| McpError::internal_error("No result in response"))?;
 
-        Ok(result)
+        Ok(ReceivedPreparedResult {
+            result,
+            raw_result,
+            receipt,
+        })
     }
 
     /// Sends one supported core request and retains its selected-era result.
@@ -5013,8 +5339,19 @@ impl Client {
                     "Method has no parameter object in the negotiated protocol era",
                 )
             })?;
-        let result = self.send_prepared_request(method, params_value)?;
-        decode_core_result(&core_request, &result).map_err(|error| self.terminate_connection(error))
+        self.last_core_result_receipt = None;
+        let received = self.send_prepared_request(method, params_value)?;
+        let (result, ttl_diagnostic) = decode_core_result_with_cache_ttl_from_source(
+            &core_request,
+            &received.result,
+            received.raw_result.as_deref(),
+        )
+        .map_err(|error| self.terminate_connection(error))?;
+        self.last_core_result_receipt = Some(received.receipt);
+        if let Some(diagnostic) = ttl_diagnostic {
+            self.retain_final_cache_ttl_diagnostic(diagnostic);
+        }
+        Ok(result)
     }
 
     fn final_cache_key(
@@ -5025,14 +5362,18 @@ impl Client {
         result_set: FinalCacheResultSet,
     ) -> McpResult<FinalCacheKey> {
         let normalized_capabilities = serde_json::to_string(self.session.client_capabilities())
-            .map_err(|_| McpError::internal_error("Client capabilities could not form a cache key"))?;
-        let extension_settings = self
-            .session
-            .mcp_apps_settings()
-            .map(|settings| serde_json::to_string(&settings.to_extension_settings().into_value()))
-            .transpose()
-            .map_err(|_| McpError::internal_error("Client extension settings could not form a cache key"))?
-            .unwrap_or_else(|| "{}".to_owned());
+            .map_err(|_| {
+                McpError::internal_error("Client capabilities could not form a cache key")
+            })?;
+        let extension_settings = serde_json::to_string(&serde_json::json!({
+            "mcpApps": self.session.mcp_apps_settings().map(|settings| {
+                settings.to_extension_settings().into_value()
+            }),
+            "descriptorRevision": FINAL_CACHE_EXTENSION_REVISION,
+        }))
+        .map_err(|_| {
+            McpError::internal_error("Client extension settings could not form a cache key")
+        })?;
         let semantic_projection = serde_json::to_string(&semantic_parameters).map_err(|_| {
             McpError::internal_error("Client semantic parameters could not form a cache key")
         })?;
@@ -5044,8 +5385,9 @@ impl Client {
             .to_owned();
 
         // This cache is owned by one client instance, so this fixed local
-        // partition cannot cross a connection or credential boundary. HTTP
-        // cache sharing requires its separately qualified partition adapter.
+        // partition cannot cross a connection or credential boundary. The
+        // revision fields are explicit cache-identity inputs and must change
+        // when their corresponding local policies change.
         Ok(FinalCacheKey::new(
             endpoint_configuration,
             MODERN_PROTOCOL_VERSION,
@@ -5054,8 +5396,10 @@ impl Client {
             method,
             semantic_projection,
             cursor.map(ToOwned::to_owned),
-            0,
-            0,
+            FINAL_CACHE_POLICY_REVISION,
+            FINAL_CACHE_EXTENSION_REVISION,
+            FINAL_CACHE_REPRESENTATION_POLICY_REVISION,
+            FINAL_CACHE_LIMITS_POLICY_REVISION,
             CachePartitionKey::new("stdio-client-connection"),
             result_set,
         ))
@@ -5072,21 +5416,169 @@ impl Client {
     where
         F: FnOnce(&mut Self) -> McpResult<CoreResult>,
     {
+        self.last_final_cache_page = None;
         if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
             return fetch(self);
         }
 
+        self.drain_final_cache_invalidations()?;
         let key = self.final_cache_key(method, semantic_parameters, cursor, result_set)?;
-        if let FinalCacheLookup::Fresh(result) = self.final_result_cache.lookup(&key) {
-            return Ok(result);
+        match self.final_result_cache.lookup_page_at(&key, Instant::now()) {
+            FinalCachePageLookup::Fresh(page) => {
+                self.checkpoint_task_poll()?;
+                self.last_final_cache_page = Some(FinalCachePageState {
+                    generation: page.generation,
+                    scope: page.scope,
+                    miss: None,
+                });
+                return Ok(page.result);
+            }
+            FinalCachePageLookup::Miss(miss) => {
+                let generation = self.final_result_cache.begin_fetch(key.result_set());
+                let result = match fetch(self) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if cursor.is_some() && error.code == McpErrorCode::InvalidParams {
+                            self.final_result_cache
+                                .invalidate_result_set(key.result_set());
+                        }
+                        return Err(error);
+                    }
+                };
+                let scope = final_cache_hints(&result).map(|(_, scope)| scope);
+                let receipt = self
+                    .last_core_result_receipt
+                    .take()
+                    .unwrap_or_else(Instant::now);
+                let page_result_set = key.result_set().clone();
+                let insert = self.final_result_cache.insert_if_current_at(
+                    key,
+                    generation,
+                    result.clone(),
+                    receipt,
+                );
+                let miss = if matches!(insert, FinalCacheInsert::InvalidatedDuringFetch)
+                    && miss != FinalCacheMiss::Disabled
+                {
+                    Some(FinalCacheMiss::Invalidated)
+                } else {
+                    Some(miss)
+                };
+                if let Some(scope) = scope {
+                    self.last_final_cache_page = Some(FinalCachePageState {
+                        generation: self.final_result_cache.begin_fetch(&page_result_set),
+                        scope,
+                        miss,
+                    });
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    /// Drains immediately available stdio frames before a cache hit can be
+    /// served, so an already-delivered list/resource invalidation wins over a
+    /// fresh entry. Targets without a nonblocking child-pipe primitive discard
+    /// retained entries instead of serving an unread notification stale.
+    fn drain_final_cache_invalidations(&mut self) -> McpResult<()> {
+        self.checkpoint_task_poll()?;
+
+        #[cfg(unix)]
+        {
+            let deadline = Instant::now() + FINAL_CACHE_NOTIFICATION_DRAIN_WINDOW;
+            loop {
+                let (message, _) =
+                    match recv_child_transport(&mut self.transport, &self.cx, Some(deadline)) {
+                        Ok(received) => received,
+                        Err(TransportError::ReceiveDeadlineExceeded)
+                            if !self.transport.is_closed() =>
+                        {
+                            return Ok(());
+                        }
+                        Err(TransportError::Cancelled) if !self.transport.is_closed() => {
+                            return Err(self.terminate_connection(McpError::request_cancelled()));
+                        }
+                        Err(error) => {
+                            return Err(self.terminate_connection(transport_error_to_mcp(error)));
+                        }
+                    };
+                self.process_idle_cache_invalidation_message(message)?;
+            }
         }
 
-        let generation = self.final_result_cache.begin_fetch(key.result_set());
-        let result = fetch(self)?;
-        let _ = self
-            .final_result_cache
-            .insert_if_current(key, generation, result.clone());
-        Ok(result)
+        #[cfg(not(unix))]
+        {
+            self.final_result_cache.clear();
+            Ok(())
+        }
+    }
+
+    fn process_idle_cache_invalidation_message(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> McpResult<()> {
+        if let Err(error) = validate_inbound_typed_message(&message) {
+            return Err(self.terminate_connection(error));
+        }
+        match message {
+            JsonRpcMessage::Response(response) => {
+                let route = self
+                    .route_last_received_response(response)
+                    .map_err(|error| self.terminate_connection(error))?;
+                if matches!(
+                    route,
+                    ResponseRoute::InvalidEnvelope
+                        | ResponseRoute::MissingId
+                        | ResponseRoute::ConnectionClosed
+                ) {
+                    let error = self.responses.terminal_error().unwrap_or_else(|| {
+                        McpError::internal_error("Client response correlation failed")
+                    });
+                    return Err(self.terminate_connection(error));
+                }
+            }
+            JsonRpcMessage::Request(request) => {
+                if self.retain_modern_server_notification(&request)?.is_some() {
+                    return Ok(());
+                }
+                if let Some(response) = self.server_request_response(&request) {
+                    if let Err(error) = self.send_server_response_during_receive(response) {
+                        return Err(self.terminate_connection(error));
+                    }
+                } else if server_notification_kind(&request)
+                    == Some(ServerNotificationKind::LogMessage)
+                    && let Some(params) = request.params.as_ref()
+                    && let Ok(message) = serde_json::from_value::<LogMessageParams>(params.clone())
+                {
+                    self.emit_log_message(message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Consumes the immediately preceding cacheable page provenance. A full
+    /// list never combines a page invalidated during fetch or a different
+    /// scope or generation with pages already accumulated for that list.
+    fn final_list_restart_needed(
+        &mut self,
+        result_set: &FinalCacheResultSet,
+        baseline: &mut Option<(FinalCacheGeneration, fastmcp_protocol::CacheScope)>,
+    ) -> bool {
+        let Some(page) = self.last_final_cache_page.take() else {
+            return false;
+        };
+        let generation_drift = page.generation != self.final_result_cache.begin_fetch(result_set);
+        let invalidated_during_fetch = matches!(page.miss, Some(FinalCacheMiss::Invalidated));
+        let scope_drift = baseline.is_some_and(|(_, scope)| scope != page.scope);
+        if generation_drift || invalidated_during_fetch || scope_drift {
+            self.final_result_cache.invalidate_result_set(result_set);
+            return true;
+        }
+        if baseline.is_none() {
+            *baseline = Some((page.generation, page.scope));
+        }
+        false
     }
 
     /// Sends a notification (no response expected).
@@ -5313,6 +5805,25 @@ impl Client {
         outcome
     }
 
+    fn route_last_received_response(
+        &mut self,
+        response: JsonRpcResponse,
+    ) -> McpResult<ResponseRoute> {
+        let frame = self.transport.last_received_frame().ok_or_else(|| {
+            McpError::internal_error("Successful stdio response lost its admitted source frame")
+        })?;
+        let admission = decode_strict_jsonrpc_response(frame, frame.len()).map_err(|_| {
+            McpError::internal_error("Admitted stdio response could not retain its raw result")
+        })?;
+        if admission.response() != &response {
+            return Err(McpError::internal_error(
+                "Typed stdio response differs from its admitted source frame",
+            ));
+        }
+        let (_, raw_result) = admission.into_parts();
+        Ok(self.responses.route_with_raw_result(response, raw_result))
+    }
+
     fn finish_timeout_after_complete_message(
         &mut self,
         request_id: &RequestId,
@@ -5333,7 +5844,13 @@ impl Client {
 
         match message {
             JsonRpcMessage::Response(response) => {
-                let route = self.responses.route(response);
+                let route = match self.route_last_received_response(response) {
+                    Ok(route) => route,
+                    Err(error) => {
+                        let _ = self.terminate_connection(error);
+                        return timeout;
+                    }
+                };
                 if matches!(
                     route,
                     ResponseRoute::InvalidEnvelope
@@ -5376,7 +5893,7 @@ impl Client {
         &mut self,
         mut waiter: ResponseWaiter,
         deadlines: RequestDeadlines,
-    ) -> McpResult<fastmcp_protocol::JsonRpcResponse> {
+    ) -> McpResult<ReceivedJsonRpcResponse> {
         let expected_id = waiter.id.clone();
 
         loop {
@@ -5434,7 +5951,9 @@ impl Client {
                     // The registry preserves responses for other registered
                     // waiters and never lets an unknown/missing ID consume this
                     // request's response slot.
-                    let route = self.responses.route(response);
+                    let route = self
+                        .route_last_received_response(response)
+                        .map_err(|error| self.terminate_connection(error))?;
                     if matches!(
                         route,
                         ResponseRoute::InvalidEnvelope
@@ -5501,11 +6020,18 @@ impl Client {
                 if let Some(error) = response.error.clone() {
                     return Err(json_rpc_error_to_mcp(error));
                 }
-                let result = core_request.decode_response(&response).map_err(|error| {
-                    self.terminate_connection(McpError::invalid_request(format!(
-                        "Invalid final subscriptions/listen termination: {error}"
-                    )))
+                let raw_result = response.raw_result.as_deref().ok_or_else(|| {
+                    self.terminate_connection(McpError::invalid_request(
+                        "Final subscriptions/listen response lost its admitted result source",
+                    ))
                 })?;
+                let result = core_request
+                    .decode_response_result(&response, raw_result)
+                    .map_err(|error| {
+                        self.terminate_connection(McpError::invalid_request(format!(
+                            "Invalid final subscriptions/listen termination: {error}"
+                        )))
+                    })?;
                 let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
                     result: terminal,
                     subscription_id,
@@ -5593,7 +6119,9 @@ impl Client {
 
             match message {
                 JsonRpcMessage::Response(response) => {
-                    let route = self.responses.route(response);
+                    let route = self
+                        .route_last_received_response(response)
+                        .map_err(|error| self.terminate_connection(error))?;
                     if matches!(
                         route,
                         ResponseRoute::InvalidEnvelope
@@ -5871,7 +6399,15 @@ impl Client {
                 ))
             })
             .and_then(|params| self.with_modern_request_metadata(params))?;
-        let result: ServerDiscoverResult = self.send_request(SERVER_DISCOVER_METHOD, params)?;
+        let received = self.send_prepared_request(SERVER_DISCOVER_METHOD, params)?;
+        let result_source = received.raw_result.as_deref().ok_or_else(|| {
+            self.terminate_connection(McpError::invalid_request(
+                "Modern server/discover response lost its admitted result source",
+            ))
+        })?;
+        let result: ServerDiscoverResult = serde_json::from_str(result_source).map_err(|_| {
+            self.terminate_connection(McpError::internal_error(INVALID_RESPONSE_PAYLOAD_ERROR))
+        })?;
         if !result
             .supported_versions()
             .iter()
@@ -5926,23 +6462,34 @@ impl Client {
     /// Returns an error if the request fails.
     pub fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
         self.ensure_initialized()?;
-        let mut all = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut budget = PaginationBudget::new();
+        let mut restarts = 0;
+        'rebuild: loop {
+            let mut all = Vec::new();
+            let mut cursor: Option<String> = None;
+            let mut budget = PaginationBudget::new();
+            let mut baseline = None;
 
-        loop {
-            budget.begin_page()?;
-            let (tools, next_cursor) =
-                convenience_tools_page(self.list_tools_typed(cursor.as_deref())?)?;
-            budget.account_page(&tools)?;
-            all.extend(tools);
-            cursor = budget.admit_next_cursor(next_cursor)?;
-            if cursor.is_none() {
-                break;
+            loop {
+                budget.begin_page()?;
+                let (tools, next_cursor) =
+                    convenience_tools_page(self.list_tools_typed(cursor.as_deref())?)?;
+                if self.final_list_restart_needed(&FinalCacheResultSet::Tools, &mut baseline) {
+                    restarts += 1;
+                    if restarts > 1 {
+                        return Err(McpError::invalid_request(
+                            FINAL_CACHE_LIST_RESTART_LIMIT_ERROR,
+                        ));
+                    }
+                    continue 'rebuild;
+                }
+                budget.account_page(&tools)?;
+                all.extend(tools);
+                cursor = budget.admit_next_cursor(next_cursor)?;
+                if cursor.is_none() {
+                    return Ok(all);
+                }
             }
         }
-
-        Ok(all)
     }
 
     /// Acquires at most one bounded page of tools.
@@ -6186,7 +6733,7 @@ impl Client {
         let params_value = self.prepare_request_parameters(params_value)?;
         let core_request = self.prepared_core_request(method, &params_value)?;
 
-        let result = self.send_prepared_request_with_progress(
+        let received = self.send_prepared_request_with_progress(
             method,
             params_value,
             request_id,
@@ -6195,12 +6742,16 @@ impl Client {
         )?;
 
         if let Some(core_request) = core_request
-            && let Err(error) = decode_core_result(&core_request, &result)
+            && let Err(error) = decode_core_result_from_source(
+                &core_request,
+                &received.result,
+                received.raw_result.as_deref(),
+            )
         {
             return Err(self.terminate_connection(error));
         }
 
-        decode_response_payload(result)
+        decode_response_payload(received.result)
     }
 
     /// Sends one supported core request with progress handling and retains its
@@ -6237,14 +6788,19 @@ impl Client {
                     "Method has no parameter object in the negotiated protocol era",
                 )
             })?;
-        let result = self.send_prepared_request_with_progress(
+        let received = self.send_prepared_request_with_progress(
             method,
             params_value,
             request_id,
             expected_marker,
             on_progress,
         )?;
-        decode_core_result(&core_request, &result).map_err(|error| self.terminate_connection(error))
+        decode_core_result_from_source(
+            &core_request,
+            &received.result,
+            received.raw_result.as_deref(),
+        )
+        .map_err(|error| self.terminate_connection(error))
     }
 
     /// Sends an already-prepared request and waits for its response while
@@ -6256,7 +6812,7 @@ impl Client {
         request_id: u64,
         expected_marker: &ProgressMarker,
         on_progress: ProgressCallback<'_>,
-    ) -> McpResult<serde_json::Value> {
+    ) -> McpResult<ReceivedPreparedResult> {
         let timeout_policy = self.timeout_policy;
         timeout_policy.validate()?;
 
@@ -6283,25 +6839,34 @@ impl Client {
         };
 
         // Receive response, handling progress notifications
-        let response = self.recv_response_with_progress(
+        let ReceivedJsonRpcResponse {
+            mut response,
+            raw_result,
+        } = self.recv_response_with_progress(
             waiter,
             expected_marker,
             on_progress,
             timeout_policy,
             deadlines,
         )?;
+        let receipt = Instant::now();
 
         // Check for error response
-        if let Some(error) = response.error {
+        if let Some(error) = response.error.take() {
             return Err(json_rpc_error_to_mcp(error));
         }
 
         // Parse result
         let result = response
             .result
+            .take()
             .ok_or_else(|| McpError::internal_error("No result in response"))?;
 
-        Ok(result)
+        Ok(ReceivedPreparedResult {
+            result,
+            raw_result,
+            receipt,
+        })
     }
 
     /// Receives a response from the transport, handling progress notifications.
@@ -6312,7 +6877,7 @@ impl Client {
         on_progress: ProgressCallback<'_>,
         timeout_policy: RequestTimeoutPolicy,
         mut deadlines: RequestDeadlines,
-    ) -> McpResult<fastmcp_protocol::JsonRpcResponse> {
+    ) -> McpResult<ReceivedJsonRpcResponse> {
         let expected_id = waiter.id.clone();
         let mut last_progress = None;
 
@@ -6368,7 +6933,9 @@ impl Client {
 
             match message {
                 JsonRpcMessage::Response(response) => {
-                    let route = self.responses.route(response);
+                    let route = self
+                        .route_last_received_response(response)
+                        .map_err(|error| self.terminate_connection(error))?;
                     if matches!(
                         route,
                         ResponseRoute::InvalidEnvelope
@@ -6516,23 +7083,34 @@ impl Client {
     /// Returns an error if the request fails.
     pub fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
         self.ensure_initialized()?;
-        let mut all = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut budget = PaginationBudget::new();
+        let mut restarts = 0;
+        'rebuild: loop {
+            let mut all = Vec::new();
+            let mut cursor: Option<String> = None;
+            let mut budget = PaginationBudget::new();
+            let mut baseline = None;
 
-        loop {
-            budget.begin_page()?;
-            let (resources, next_cursor) =
-                convenience_resources_page(self.list_resources_typed(cursor.as_deref())?)?;
-            budget.account_page(&resources)?;
-            all.extend(resources);
-            cursor = budget.admit_next_cursor(next_cursor)?;
-            if cursor.is_none() {
-                break;
+            loop {
+                budget.begin_page()?;
+                let (resources, next_cursor) =
+                    convenience_resources_page(self.list_resources_typed(cursor.as_deref())?)?;
+                if self.final_list_restart_needed(&FinalCacheResultSet::Resources, &mut baseline) {
+                    restarts += 1;
+                    if restarts > 1 {
+                        return Err(McpError::invalid_request(
+                            FINAL_CACHE_LIST_RESTART_LIMIT_ERROR,
+                        ));
+                    }
+                    continue 'rebuild;
+                }
+                budget.account_page(&resources)?;
+                all.extend(resources);
+                cursor = budget.admit_next_cursor(next_cursor)?;
+                if cursor.is_none() {
+                    return Ok(all);
+                }
             }
         }
-
-        Ok(all)
     }
 
     /// Acquires at most one bounded page of resources.
@@ -6589,24 +7167,38 @@ impl Client {
     /// Returns an error if the request fails.
     pub fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
         self.ensure_initialized()?;
-        let mut all = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut budget = PaginationBudget::new();
+        let mut restarts = 0;
+        'rebuild: loop {
+            let mut all = Vec::new();
+            let mut cursor: Option<String> = None;
+            let mut budget = PaginationBudget::new();
+            let mut baseline = None;
 
-        loop {
-            budget.begin_page()?;
-            let (resource_templates, next_cursor) = convenience_resource_templates_page(
-                self.list_resource_templates_typed(cursor.as_deref())?,
-            )?;
-            budget.account_page(&resource_templates)?;
-            all.extend(resource_templates);
-            cursor = budget.admit_next_cursor(next_cursor)?;
-            if cursor.is_none() {
-                break;
+            loop {
+                budget.begin_page()?;
+                let (resource_templates, next_cursor) = convenience_resource_templates_page(
+                    self.list_resource_templates_typed(cursor.as_deref())?,
+                )?;
+                if self.final_list_restart_needed(
+                    &FinalCacheResultSet::ResourceTemplates,
+                    &mut baseline,
+                ) {
+                    restarts += 1;
+                    if restarts > 1 {
+                        return Err(McpError::invalid_request(
+                            FINAL_CACHE_LIST_RESTART_LIMIT_ERROR,
+                        ));
+                    }
+                    continue 'rebuild;
+                }
+                budget.account_page(&resource_templates)?;
+                all.extend(resource_templates);
+                cursor = budget.admit_next_cursor(next_cursor)?;
+                if cursor.is_none() {
+                    return Ok(all);
+                }
             }
         }
-
-        Ok(all)
     }
 
     /// Acquires at most one bounded page of resource templates.
@@ -6774,23 +7366,34 @@ impl Client {
     /// Returns an error if the request fails.
     pub fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
         self.ensure_initialized()?;
-        let mut all = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut budget = PaginationBudget::new();
+        let mut restarts = 0;
+        'rebuild: loop {
+            let mut all = Vec::new();
+            let mut cursor: Option<String> = None;
+            let mut budget = PaginationBudget::new();
+            let mut baseline = None;
 
-        loop {
-            budget.begin_page()?;
-            let (prompts, next_cursor) =
-                convenience_prompts_page(self.list_prompts_typed(cursor.as_deref())?)?;
-            budget.account_page(&prompts)?;
-            all.extend(prompts);
-            cursor = budget.admit_next_cursor(next_cursor)?;
-            if cursor.is_none() {
-                break;
+            loop {
+                budget.begin_page()?;
+                let (prompts, next_cursor) =
+                    convenience_prompts_page(self.list_prompts_typed(cursor.as_deref())?)?;
+                if self.final_list_restart_needed(&FinalCacheResultSet::Prompts, &mut baseline) {
+                    restarts += 1;
+                    if restarts > 1 {
+                        return Err(McpError::invalid_request(
+                            FINAL_CACHE_LIST_RESTART_LIMIT_ERROR,
+                        ));
+                    }
+                    continue 'rebuild;
+                }
+                budget.account_page(&prompts)?;
+                all.extend(prompts);
+                cursor = budget.admit_next_cursor(next_cursor)?;
+                if cursor.is_none() {
+                    return Ok(all);
+                }
             }
         }
-
-        Ok(all)
     }
 
     /// Acquires at most one bounded page of prompts.
@@ -9725,7 +10328,7 @@ mod tests {
             .expect("second response is retained");
         assert_eq!(second_response.id, Some(second_id));
         assert_eq!(
-            second_response.result,
+            second_response.response.result,
             Some(serde_json::json!({"owner": "second"}))
         );
 
@@ -9742,7 +10345,7 @@ mod tests {
             .expect("first response is retained");
         assert_eq!(first_response.id, Some(first_id));
         assert_eq!(
-            first_response.result,
+            first_response.response.result,
             Some(serde_json::json!({"owner": "first"}))
         );
         assert_eq!(registry.pending_len(), 0);
@@ -11832,6 +12435,58 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn clt_01_stdio_result_source_preserves_unknown_order_and_number_lexemes() {
+        let script = modern_typed_call_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[],"zeta":{"second":2,"first":1},"isError":false,"alpha":1.20e+4}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the exact-source client");
+
+        let result = client
+            .call_tool_typed("echo", serde_json::json!({}))
+            .expect("an absent discriminator uses the bounded modern compatibility rule");
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result, diagnostic }) = result else {
+            panic!("the public stdio path must return the selected final tool result");
+        };
+        assert_eq!(
+            diagnostic,
+            Some(fastmcp_protocol::ResultPeerDiagnostic::ModernMissingResultType)
+        );
+        let extras = result.extras.members();
+        assert_eq!(
+            extras
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zeta", "alpha"],
+            "unknown top-level members retain admitted order",
+        );
+        let fastmcp_protocol::ExactJsonValue::Object(zeta) = &extras[0].value else {
+            panic!("zeta remains an exact object");
+        };
+        assert_eq!(
+            zeta.members()
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"],
+            "nested member order survives the shipped correlation boundary",
+        );
+        assert_eq!(
+            extras[1].value,
+            fastmcp_protocol::ExactJsonValue::Number("1.20e+4".to_owned()),
+            "the original number lexeme reaches exact result decoding",
+        );
+        client.close().expect("exact-source client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clt_tasks_final_get_update_cancel_positive() {
         let script = modern_final_tasks_client_script(
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-1","status":"input_required","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:00Z","ttlMs":null,"inputRequests":{}}}"#,
@@ -12767,6 +13422,236 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cache_03_idle_list_change_is_drained_before_a_fresh_hit() {
+        let discovery = modern_discovery_response(
+            "cache-idle-invalidation-modern-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        let script = format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \
+             IFS= read -r second || exit 1; \
+             case \"$second\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r third || exit 1; \
+             case \"$third\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the idle-invalidation client");
+
+        client
+            .list_tools_typed(None)
+            .expect("first tools/list fills the local cache");
+        client
+            .list_tools_typed(None)
+            .expect("idle list-change notification forces a new tools/list request");
+
+        assert_eq!(client.final_result_cache_stats().hits, 0);
+        assert_eq!(client.final_result_cache_stats().fills, 2);
+        assert!(matches!(
+            client.take_final_server_notifications().as_slice(),
+            [ServerNotification::ToolsListChanged(None)]
+        ));
+        client
+            .close()
+            .expect("modern idle-invalidation client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_cached_hit_observes_client_cancellation() {
+        let script = modern_typed_list_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":1000,"cacheScope":"private"}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the cancellation client");
+        client
+            .list_tools_typed(None)
+            .expect("first tools/list fills the cache");
+        client.cx.set_cancel_requested(true);
+
+        let error = client
+            .list_tools_typed(None)
+            .expect_err("a cached hit must not bypass cancellation");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert!(!client.is_initialized());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_invalid_ttls_are_immediately_stale_and_do_not_close_the_client() {
+        let discovery = modern_discovery_response(
+            "cache-ttl-compatibility-modern-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        let script = format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \
+             IFS= read -r second || exit 1; \
+             case \"$second\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r third || exit 1; \
+             case \"$third\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":-1.5,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r fourth || exit 1; \
+             case \"$fourth\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the TTL compatibility client");
+
+        client
+            .list_tools_typed(None)
+            .expect("a missing TTL is returned as immediately stale");
+        client
+            .list_tools_typed(None)
+            .expect("a negative TTL is returned as immediately stale");
+        client
+            .ping()
+            .expect("TTL compatibility leaves the modern connection usable");
+
+        assert_eq!(
+            client.take_final_cache_ttl_diagnostics(),
+            vec![
+                FinalCacheTtlDiagnostic::Missing,
+                FinalCacheTtlDiagnostic::Negative,
+            ]
+        );
+        assert_eq!(client.final_result_cache_stats().hits, 0);
+        assert_eq!(client.final_result_cache_stats().fills, 0);
+        assert!(client.is_initialized());
+        client.close().expect("modern TTL compatibility cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_cursorless_list_restarts_after_generation_drift() {
+        let discovery = modern_discovery_response(
+            "cache-list-restart-modern-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        let script = format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \
+             IFS= read -r first_page || exit 1; \
+             case \"$first_page\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"nextCursor\":\"page-2\",\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r second_page || exit 1; \
+             case \"$second_page\" in *tools/list*'\"cursor\":\"page-2\"'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r restarted || exit 1; \
+             case \"$restarted\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the list-restart client");
+
+        assert!(client
+            .list_tools()
+            .expect("a generation drift restarts from a cursorless page")
+            .is_empty());
+        assert!(matches!(
+            client.take_final_server_notifications().as_slice(),
+            [ServerNotification::ToolsListChanged(None)]
+        ));
+        client.close().expect("modern list-restart cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_invalid_cursor_flushes_the_cached_result_set() {
+        let discovery = modern_discovery_response(
+            "cache-invalid-cursor-modern-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        let script = format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \
+             IFS= read -r first_page || exit 1; \
+             case \"$first_page\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"nextCursor\":\"page-2\",\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r rejected_page || exit 1; \
+             case \"$rejected_page\" in *tools/list*'\"cursor\":\"page-2\"'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{{\"code\":-32602,\"message\":\"invalid cursor\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r restarted || exit 1; \
+             case \"$restarted\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the cursor-flush client");
+
+        client
+            .list_tools_typed(None)
+            .expect("the first cursorless page enters the cache");
+        let error = client
+            .list_tools_typed(Some("page-2"))
+            .expect_err("the server rejects the opaque cursor");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        client
+            .list_tools_typed(None)
+            .expect("cursor rejection flushes the earlier cached page");
+        assert_eq!(client.final_result_cache_stats().hits, 0);
+        client.close().expect("modern cursor-flush client cleanup");
+    }
+
+    #[test]
+    fn cache_03_scope_drift_forces_a_full_list_restart() {
+        let mut client = make_closed_client(false);
+        let result_set = FinalCacheResultSet::Tools;
+        let generation = client.final_result_cache.begin_fetch(&result_set);
+        let mut baseline = Some((generation, fastmcp_protocol::CacheScope::Private));
+        client.last_final_cache_page = Some(FinalCachePageState {
+            generation,
+            scope: fastmcp_protocol::CacheScope::Public,
+            miss: None,
+        });
+
+        assert!(client.final_list_restart_needed(&result_set, &mut baseline));
+        assert_ne!(
+            generation,
+            client.final_result_cache.begin_fetch(&result_set),
+            "scope drift advances the result-set generation before restart"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clt_01_modern_convenience_list_projects_representable_catalog() {
         let script = modern_typed_list_client_script(
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"echo","description":"representable","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}"#,
@@ -13416,6 +14301,76 @@ mod tests {
             .ping()
             .expect("auto-selected modern client executes normally");
         client.close().expect("auto modern cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_02_discovery_absent_result_type_selects_modern_with_diagnostic() {
+        let baseline =
+            modern_discovery_response("compatibility-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        let mut response: serde_json::Value =
+            serde_json::from_str(&baseline).expect("baseline discovery response is JSON");
+        response["result"]
+            .as_object_mut()
+            .expect("discovery result is an object")
+            .remove("resultType");
+        let response = serde_json::to_string(&response)
+            .expect("missing-discriminator discovery response re-encodes");
+        let script = modern_public_client_script(&response);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("an otherwise-valid missing discriminator establishes modern");
+
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(ProtocolEra::Modern2026)
+        );
+        let discovery = client
+            .server_discovery()
+            .expect("modern classification retains discovery evidence");
+        assert_eq!(discovery.result_type(), "complete");
+        assert_eq!(
+            discovery.peer_diagnostic(),
+            Some(fastmcp_protocol::ResultPeerDiagnostic::ModernMissingResultType)
+        );
+        let retained = serde_json::to_value(discovery)
+            .expect("retained compatibility discovery remains serializable");
+        assert!(
+            retained.get("resultType").is_none(),
+            "captured peer evidence remains schema-invalid instead of gaining a synthetic field"
+        );
+        client.close().expect("compatibility modern cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_02_discovery_null_and_wrong_type_do_not_select_an_era() {
+        let baseline =
+            modern_discovery_response("invalid-discriminator-server", &[MODERN_PROTOCOL_VERSION]);
+        for planted_result_type in [
+            serde_json::Value::Null,
+            serde_json::json!({"complete": true}),
+        ] {
+            let mut response: serde_json::Value =
+                serde_json::from_str(&baseline).expect("baseline discovery response is JSON");
+            response["result"]["resultType"] = planted_result_type;
+            let response = serde_json::to_string(&response)
+                .expect("invalid-discriminator response remains JSON");
+            let script = modern_public_client_script(&response);
+            let error = Client::stdio_with_protocol_plan_with_cx(
+                "sh",
+                &["-c", script.as_str()],
+                ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+                Cx::for_request(),
+            )
+            .err()
+            .expect("explicit null and wrong-kind discriminators reject discovery");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+        }
     }
 
     #[cfg(unix)]

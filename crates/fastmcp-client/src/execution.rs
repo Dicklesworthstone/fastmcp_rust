@@ -6,6 +6,7 @@
 //! owners, retains bounded tombstones for abandoned owners, and never turns
 //! malformed peer ingress into a peer-directed JSON-RPC response.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
@@ -31,6 +32,15 @@ use fastmcp_transport::{Transport, TransportError};
 use serde_json::Value;
 
 use crate::{RequestTimeoutPolicy, transport_error_to_mcp};
+
+/// Bounded compatibility diagnostic for a peer's final cache TTL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalCacheTtlDiagnostic {
+    /// A cacheable final complete result omitted its required `ttlMs` member.
+    Missing,
+    /// A cacheable final complete result supplied a negative `ttlMs`.
+    Negative,
+}
 
 /// Default maximum number of active request owners.
 pub const DEFAULT_MAX_IN_FLIGHT_EXECUTIONS: usize = 1_024;
@@ -123,12 +133,252 @@ pub fn clt_01_b_manifest_digest() -> Sha256Digest {
 /// method's complete payload. The caller owns connection policy after a peer
 /// violates this contract.
 pub(crate) fn decode_core_result(request: &CoreRequest, result: &Value) -> McpResult<CoreResult> {
-    let encoded = serde_json::to_string(result).map_err(|_| {
-        McpError::invalid_request("Peer core result could not be encoded for protocol admission")
-    })?;
+    decode_core_result_from_source(request, result, None)
+}
+
+pub(crate) fn decode_core_result_from_source(
+    request: &CoreRequest,
+    result: &Value,
+    result_source: Option<&str>,
+) -> McpResult<CoreResult> {
+    let encoded = match result_source {
+        Some(source) => {
+            let admitted: Value = serde_json::from_str(source).map_err(|_| {
+                McpError::invalid_request("Peer core result source is not valid JSON")
+            })?;
+            if &admitted != result {
+                return Err(McpError::invalid_request(
+                    "Peer core result source differs from its typed response",
+                ));
+            }
+            Cow::Borrowed(source)
+        }
+        None => Cow::Owned(serde_json::to_string(result).map_err(|_| {
+            McpError::invalid_request(
+                "Peer core result could not be encoded for protocol admission",
+            )
+        })?),
+    };
     request
         .decode_result(&encoded)
         .map_err(|_| McpError::invalid_request("Peer core result failed protocol decoding"))
+}
+
+/// Decodes a core result while applying the final cache-TTL compatibility rule
+/// at the client ingress boundary. Missing or negative peer TTLs are
+/// normalized to zero freshness and reported through a bounded local
+/// diagnostic. All other malformed shapes continue through strict protocol
+/// decoding unchanged.
+pub(crate) fn decode_core_result_with_cache_ttl(
+    request: &CoreRequest,
+    result: &Value,
+) -> McpResult<(CoreResult, Option<FinalCacheTtlDiagnostic>)> {
+    decode_core_result_with_cache_ttl_from_source(request, result, None)
+}
+
+pub(crate) fn decode_core_result_with_cache_ttl_from_source(
+    request: &CoreRequest,
+    result: &Value,
+    result_source: Option<&str>,
+) -> McpResult<(CoreResult, Option<FinalCacheTtlDiagnostic>)> {
+    let mut normalized = result.clone();
+    let diagnostic = tolerant_final_cache_ttl(request, &mut normalized);
+    let normalized_source = result_source
+        .map(|source| normalize_final_cache_ttl_source(source, diagnostic))
+        .transpose()?;
+    decode_core_result_from_source(request, &normalized, normalized_source.as_deref())
+        .map(|result| (result, diagnostic))
+}
+
+fn normalize_final_cache_ttl_source(
+    source: &str,
+    diagnostic: Option<FinalCacheTtlDiagnostic>,
+) -> McpResult<Cow<'_, str>> {
+    match diagnostic {
+        None => Ok(Cow::Borrowed(source)),
+        Some(FinalCacheTtlDiagnostic::Missing) => {
+            let end = source.trim_end().len();
+            let Some(close) = end
+                .checked_sub(1)
+                .filter(|index| source.as_bytes()[*index] == b'}')
+            else {
+                return Err(McpError::invalid_request(
+                    "Peer cacheable result source is not an object",
+                ));
+            };
+            let open = source.find('{').ok_or_else(|| {
+                McpError::invalid_request("Peer cacheable result is not an object")
+            })?;
+            let separator = if source[open + 1..close].trim().is_empty() {
+                ""
+            } else {
+                ","
+            };
+            Ok(Cow::Owned(format!(
+                "{}{}\"ttlMs\":0{}",
+                &source[..close],
+                separator,
+                &source[close..]
+            )))
+        }
+        Some(FinalCacheTtlDiagnostic::Negative) => {
+            let range = top_level_json_member_value_range(source, "ttlMs").ok_or_else(|| {
+                McpError::invalid_request("Peer cache TTL source member could not be located")
+            })?;
+            let mut normalized = String::with_capacity(source.len());
+            normalized.push_str(&source[..range.start]);
+            normalized.push('0');
+            normalized.push_str(&source[range.end..]);
+            Ok(Cow::Owned(normalized))
+        }
+    }
+}
+
+fn top_level_json_member_value_range(
+    source: &str,
+    expected_name: &str,
+) -> Option<std::ops::Range<usize>> {
+    let bytes = source.as_bytes();
+    let mut cursor = bytes.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    if bytes.get(cursor) != Some(&b'{') {
+        return None;
+    }
+    cursor += 1;
+    loop {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b'}') {
+            return None;
+        }
+        let key_start = cursor;
+        let key_end = json_string_end(bytes, cursor)?;
+        let key: String = serde_json::from_str(&source[key_start..key_end]).ok()?;
+        cursor = key_end;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b':') {
+            return None;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let value_start = cursor;
+        let value_end = json_value_end(bytes, cursor)?;
+        if key == expected_name {
+            return Some(value_start..value_end);
+        }
+        cursor = value_end;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        match bytes.get(cursor) {
+            Some(b',') => cursor += 1,
+            Some(b'}') => return None,
+            _ => return None,
+        }
+    }
+}
+
+fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut cursor = start + 1;
+    while let Some(byte) = bytes.get(cursor) {
+        match byte {
+            b'"' => return Some(cursor + 1),
+            b'\\' => cursor = cursor.checked_add(2)?,
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) == Some(&b'"') {
+        return json_string_end(bytes, start);
+    }
+    if matches!(bytes.get(start), Some(b'{') | Some(b'[')) {
+        let mut stack = vec![*bytes.get(start)?];
+        let mut cursor = start + 1;
+        while let Some(byte) = bytes.get(cursor) {
+            match byte {
+                b'"' => cursor = json_string_end(bytes, cursor)?,
+                b'{' | b'[' => {
+                    stack.push(*byte);
+                    cursor += 1;
+                }
+                b'}' if stack.last() == Some(&b'{') => {
+                    stack.pop();
+                    cursor += 1;
+                    if stack.is_empty() {
+                        return Some(cursor);
+                    }
+                }
+                b']' if stack.last() == Some(&b'[') => {
+                    stack.pop();
+                    cursor += 1;
+                    if stack.is_empty() {
+                        return Some(cursor);
+                    }
+                }
+                _ => cursor += 1,
+            }
+        }
+        return None;
+    }
+    let mut cursor = start;
+    while !matches!(bytes.get(cursor), None | Some(b',') | Some(b'}')) {
+        cursor += 1;
+    }
+    let mut end = cursor;
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    (end > start).then_some(end)
+}
+
+fn tolerant_final_cache_ttl(
+    request: &CoreRequest,
+    result: &mut Value,
+) -> Option<FinalCacheTtlDiagnostic> {
+    let CoreRequest::Final(request) = request else {
+        return None;
+    };
+    if !matches!(
+        request,
+        fastmcp_protocol::FinalCoreRequest::ToolsList(_)
+            | fastmcp_protocol::FinalCoreRequest::ResourcesList(_)
+            | fastmcp_protocol::FinalCoreRequest::ResourceTemplatesList(_)
+            | fastmcp_protocol::FinalCoreRequest::ResourcesRead(_)
+            | fastmcp_protocol::FinalCoreRequest::PromptsList(_)
+    ) {
+        return None;
+    }
+    let Some(members) = result.as_object_mut() else {
+        return None;
+    };
+    if members
+        .get("resultType")
+        .is_some_and(|result_type| result_type.as_str() != Some("complete"))
+    {
+        return None;
+    }
+
+    match members.get("ttlMs") {
+        None => {
+            members.insert("ttlMs".to_owned(), Value::Number(0_u64.into()));
+            Some(FinalCacheTtlDiagnostic::Missing)
+        }
+        Some(Value::Number(ttl)) if ttl.to_string().starts_with('-') => {
+            members.insert("ttlMs".to_owned(), Value::Number(0_u64.into()));
+            Some(FinalCacheTtlDiagnostic::Negative)
+        }
+        _ => None,
+    }
 }
 
 /// Public snapshot of one active correlation record.
@@ -2756,5 +3006,87 @@ mod tests {
         assert!(executor.terminal_records().is_empty());
         assert!(executor.take_cancellation_events().is_empty());
         assert!(executor.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn cache_03_tolerates_missing_and_negative_cache_ttl_as_immediately_stale() {
+        let request = CoreRequest::Final(fastmcp_protocol::FinalCoreRequest::ToolsList(
+            fastmcp_protocol::FinalListParams {
+                meta: fastmcp_protocol::OpenMetadata::default(),
+                cursor: None,
+                include_tags: None,
+                exclude_tags: None,
+            },
+        ));
+
+        let (missing, missing_diagnostic) = decode_core_result_with_cache_ttl(
+            &request,
+            &serde_json::json!({
+                "resultType": "complete",
+                "tools": [],
+                "cacheScope": "private",
+            }),
+        )
+        .expect("a missing peer TTL is normalized to zero freshness");
+        assert_eq!(missing_diagnostic, Some(FinalCacheTtlDiagnostic::Missing));
+        assert!(matches!(
+            missing,
+            CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) if result.payload.ttl_ms == 0
+        ));
+
+        let (negative, negative_diagnostic) = decode_core_result_with_cache_ttl(
+            &request,
+            &serde_json::json!({
+                "resultType": "complete",
+                "tools": [],
+                "ttlMs": -1.5,
+                "cacheScope": "private",
+            }),
+        )
+        .expect("a negative peer TTL is normalized to zero freshness");
+        assert_eq!(negative_diagnostic, Some(FinalCacheTtlDiagnostic::Negative));
+        assert!(matches!(
+            negative,
+            CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) if result.payload.ttl_ms == 0
+        ));
+
+        let exact_source = r#"{"resultType":"complete","tools":[],"zeta":{"second":2,"first":1},"ttlMs":-1,"cacheScope":"private","alpha":1.20e+4}"#;
+        let exact_value = serde_json::from_str(exact_source).expect("exact TTL source is JSON");
+        let (exact, diagnostic) = decode_core_result_with_cache_ttl_from_source(
+            &request,
+            &exact_value,
+            Some(exact_source),
+        )
+        .expect("negative TTL compatibility retains every other source lexeme");
+        assert_eq!(diagnostic, Some(FinalCacheTtlDiagnostic::Negative));
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = exact else {
+            panic!("exact TTL source selects tools/list");
+        };
+        assert_eq!(
+            result
+                .extras
+                .members()
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zeta", "alpha"],
+        );
+        assert_eq!(
+            result.extras.members()[1].value,
+            fastmcp_protocol::ExactJsonValue::Number("1.20e+4".to_owned()),
+        );
+
+        assert!(
+            decode_core_result_with_cache_ttl(
+                &request,
+                &serde_json::json!({
+                    "resultType": "complete",
+                    "tools": [],
+                    "ttlMs": 1.5,
+                    "cacheScope": "private",
+                }),
+            )
+            .is_err()
+        );
     }
 }

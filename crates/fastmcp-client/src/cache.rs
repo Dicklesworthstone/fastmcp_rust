@@ -12,6 +12,12 @@ use fastmcp_protocol::{CacheScope, CoreResult, FinalCoreResult, ServerNotificati
 
 /// Default maximum number of retained final complete results per client.
 pub const DEFAULT_FINAL_CACHE_CAPACITY: usize = 128;
+/// Absolute maximum number of retained final complete results per client.
+pub const MAX_FINAL_CACHE_CAPACITY: usize = 10_000;
+/// Default aggregate encoded-byte budget for one client's final-result cache.
+pub const DEFAULT_FINAL_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+/// Absolute aggregate encoded-byte budget for one client's final-result cache.
+pub const MAX_FINAL_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 
 /// Opaque client-local partition for a final cache entry.
 ///
@@ -27,6 +33,10 @@ impl CachePartitionKey {
     #[must_use]
     pub fn new(discriminator: impl Into<String>) -> Self {
         Self(discriminator.into())
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -62,6 +72,8 @@ pub struct FinalCacheKey {
     method: String,
     semantic_projection: String,
     cursor: Option<String>,
+    policy_revision: u64,
+    extension_revision: u64,
     representation_policy_revision: u64,
     limits_policy_revision: u64,
     partition: CachePartitionKey,
@@ -80,6 +92,8 @@ impl FinalCacheKey {
         method: impl Into<String>,
         semantic_projection: impl Into<String>,
         cursor: Option<String>,
+        policy_revision: u64,
+        extension_revision: u64,
         representation_policy_revision: u64,
         limits_policy_revision: u64,
         partition: CachePartitionKey,
@@ -93,6 +107,8 @@ impl FinalCacheKey {
             method: method.into(),
             semantic_projection: semantic_projection.into(),
             cursor,
+            policy_revision,
+            extension_revision,
             representation_policy_revision,
             limits_policy_revision,
             partition,
@@ -104,6 +120,28 @@ impl FinalCacheKey {
     #[must_use]
     pub const fn result_set(&self) -> &FinalCacheResultSet {
         &self.result_set
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        let result_set_bytes = match &self.result_set {
+            FinalCacheResultSet::ServerDiscovery
+            | FinalCacheResultSet::Tools
+            | FinalCacheResultSet::Resources
+            | FinalCacheResultSet::ResourceTemplates
+            | FinalCacheResultSet::Prompts => 1,
+            FinalCacheResultSet::Resource(uri) => 1usize.saturating_add(uri.len()),
+        };
+        self.endpoint_configuration
+            .len()
+            .saturating_add(self.protocol_version.len())
+            .saturating_add(self.normalized_capabilities.len())
+            .saturating_add(self.extension_settings.len())
+            .saturating_add(self.method.len())
+            .saturating_add(self.semantic_projection.len())
+            .saturating_add(self.cursor.as_ref().map_or(0, String::len))
+            .saturating_add(self.partition.estimated_bytes())
+            .saturating_add(result_set_bytes)
+            .saturating_add(std::mem::size_of::<u64>() * 4)
     }
 }
 
@@ -133,6 +171,22 @@ pub enum FinalCacheLookup {
     Miss(FinalCacheMiss),
 }
 
+/// Internal page provenance used to keep one flattened list within one
+/// result-set generation and scope.
+#[derive(Clone, Debug)]
+pub(crate) struct FinalCachePage {
+    pub(crate) result: CoreResult,
+    pub(crate) generation: FinalCacheGeneration,
+    pub(crate) scope: CacheScope,
+}
+
+/// Internal cache lookup including page provenance.
+#[derive(Clone, Debug)]
+pub(crate) enum FinalCachePageLookup {
+    Fresh(FinalCachePage),
+    Miss(FinalCacheMiss),
+}
+
 /// Result of attempting to retain a fetched result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FinalCacheInsert {
@@ -146,6 +200,8 @@ pub enum FinalCacheInsert {
     InvalidatedDuringFetch,
     /// The monotonic expiry could not be represented.
     ExpiryOutOfRange,
+    /// The encoded result and key exceed the configured cache byte budget.
+    Oversized,
 }
 
 /// Bounded, client-local cache counters with no key or result labels.
@@ -172,6 +228,33 @@ struct FinalCacheEntry {
     receipt: Instant,
     expires_at: Instant,
     scope: CacheScope,
+    encoded_bytes: usize,
+}
+
+/// Fixed-cardinality generation classes. A resource update conservatively
+/// advances the shared resource-read class so distinct peer URIs cannot grow
+/// an unbounded generation map.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum FinalCacheGenerationSet {
+    ServerDiscovery,
+    Tools,
+    Resources,
+    ResourceTemplates,
+    Prompts,
+    Resource,
+}
+
+impl From<&FinalCacheResultSet> for FinalCacheGenerationSet {
+    fn from(result_set: &FinalCacheResultSet) -> Self {
+        match result_set {
+            FinalCacheResultSet::ServerDiscovery => Self::ServerDiscovery,
+            FinalCacheResultSet::Tools => Self::Tools,
+            FinalCacheResultSet::Resources => Self::Resources,
+            FinalCacheResultSet::ResourceTemplates => Self::ResourceTemplates,
+            FinalCacheResultSet::Prompts => Self::Prompts,
+            FinalCacheResultSet::Resource(_) => Self::Resource,
+        }
+    }
 }
 
 /// A bounded cache of exact final complete results.
@@ -183,8 +266,10 @@ struct FinalCacheEntry {
 pub struct FinalResultCache {
     enabled: bool,
     capacity: usize,
+    max_bytes: usize,
+    retained_bytes: usize,
     entries: HashMap<FinalCacheKey, FinalCacheEntry>,
-    generations: HashMap<FinalCacheResultSet, u64>,
+    generations: HashMap<FinalCacheGenerationSet, u64>,
     stats: FinalCacheStats,
 }
 
@@ -192,9 +277,18 @@ impl FinalResultCache {
     /// Creates an enabled cache with at least one retained-entry slot.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, DEFAULT_FINAL_CACHE_MAX_BYTES)
+    }
+
+    /// Creates an enabled cache with independently bounded entry and byte
+    /// budgets. Values above the published hard ceilings are clamped.
+    #[must_use]
+    pub fn with_limits(capacity: usize, max_bytes: usize) -> Self {
         Self {
             enabled: true,
-            capacity: capacity.max(1),
+            capacity: capacity.clamp(1, MAX_FINAL_CACHE_CAPACITY),
+            max_bytes: max_bytes.clamp(1, MAX_FINAL_CACHE_MAX_BYTES),
+            retained_bytes: 0,
             entries: HashMap::new(),
             generations: HashMap::new(),
             stats: FinalCacheStats::default(),
@@ -221,6 +315,7 @@ impl FinalResultCache {
     /// Removes every retained entry while preserving configuration and counters.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.retained_bytes = 0;
     }
 
     /// Captures the result-set generation before a request begins.
@@ -231,18 +326,32 @@ impl FinalResultCache {
 
     /// Looks up one complete result at the supplied monotonic instant.
     pub fn lookup_at(&mut self, key: &FinalCacheKey, now: Instant) -> FinalCacheLookup {
+        match self.lookup_page_at(key, now) {
+            FinalCachePageLookup::Fresh(page) => FinalCacheLookup::Fresh(page.result),
+            FinalCachePageLookup::Miss(miss) => FinalCacheLookup::Miss(miss),
+        }
+    }
+
+    /// Looks up one page while retaining its generation and scope for a
+    /// caller that is assembling a full cursor-following list.
+    pub(crate) fn lookup_page_at(
+        &mut self,
+        key: &FinalCacheKey,
+        now: Instant,
+    ) -> FinalCachePageLookup {
         if !self.enabled {
             self.stats.misses = self.stats.misses.saturating_add(1);
-            return FinalCacheLookup::Miss(FinalCacheMiss::Disabled);
+            return FinalCachePageLookup::Miss(FinalCacheMiss::Disabled);
         }
 
         let Some(entry) = self.entries.get(key) else {
             self.stats.misses = self.stats.misses.saturating_add(1);
-            return FinalCacheLookup::Miss(FinalCacheMiss::Absent);
+            return FinalCachePageLookup::Miss(FinalCacheMiss::Absent);
         };
         let entry_generation = entry.generation;
         let expires_at = entry.expires_at;
         let result = entry.result.clone();
+        let scope = entry.scope;
 
         let miss = if entry_generation != self.begin_fetch(key.result_set()) {
             Some(FinalCacheMiss::Invalidated)
@@ -253,16 +362,22 @@ impl FinalResultCache {
         };
 
         if let Some(miss) = miss {
-            self.entries.remove(key);
+            if let Some(removed) = self.entries.remove(key) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(removed.encoded_bytes);
+            }
             self.stats.misses = self.stats.misses.saturating_add(1);
             if miss == FinalCacheMiss::Stale {
                 self.stats.stale = self.stats.stale.saturating_add(1);
             }
-            return FinalCacheLookup::Miss(miss);
+            return FinalCachePageLookup::Miss(miss);
         }
 
         self.stats.hits = self.stats.hits.saturating_add(1);
-        FinalCacheLookup::Fresh(result)
+        FinalCachePageLookup::Fresh(FinalCachePage {
+            result,
+            generation: entry_generation,
+            scope,
+        })
     }
 
     /// Looks up one complete result using the current monotonic instant.
@@ -292,8 +407,23 @@ impl FinalResultCache {
             return FinalCacheInsert::ExpiryOutOfRange;
         };
 
-        if self.entries.len() >= self.capacity && !self.entries.contains_key(&key) {
-            self.evict_oldest();
+        let encoded_bytes = match result.encode() {
+            Ok(encoded) => key.estimated_bytes().saturating_add(encoded.len()),
+            Err(_) => return FinalCacheInsert::Oversized,
+        };
+        if encoded_bytes > self.max_bytes {
+            return FinalCacheInsert::Oversized;
+        }
+
+        if let Some(previous) = self.entries.remove(&key) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(previous.encoded_bytes);
+        }
+        while self.entries.len() >= self.capacity
+            || self.retained_bytes > self.max_bytes.saturating_sub(encoded_bytes)
+        {
+            if !self.evict_oldest() {
+                return FinalCacheInsert::Oversized;
+            }
         }
         self.entries.insert(
             key,
@@ -303,8 +433,10 @@ impl FinalResultCache {
                 receipt,
                 expires_at,
                 scope,
+                encoded_bytes,
             },
         );
+        self.retained_bytes = self.retained_bytes.saturating_add(encoded_bytes);
         self.stats.fills = self.stats.fills.saturating_add(1);
         FinalCacheInsert::Stored
     }
@@ -321,9 +453,24 @@ impl FinalResultCache {
 
     /// Advances a result-set generation before removing its previous entries.
     pub fn invalidate_result_set(&mut self, result_set: &FinalCacheResultSet) {
-        let generation = self.generation(result_set).saturating_add(1);
-        self.generations.insert(result_set.clone(), generation);
-        self.entries.retain(|key, _| key.result_set() != result_set);
+        let generation_set = FinalCacheGenerationSet::from(result_set);
+        let generation = self
+            .generations
+            .get(&generation_set)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.generations.insert(generation_set, generation);
+        match result_set {
+            // Resource-update generations are intentionally shared and
+            // fixed-cardinality, so retire every resource-read entry rather
+            // than retaining immediately-invalid stale bytes for other URIs.
+            FinalCacheResultSet::Resource(_) => self
+                .entries
+                .retain(|key, _| !matches!(key.result_set(), FinalCacheResultSet::Resource(_))),
+            _ => self.entries.retain(|key, _| key.result_set() != result_set),
+        }
+        self.recount_retained_bytes();
         self.stats.invalidations = self.stats.invalidations.saturating_add(1);
     }
 
@@ -353,20 +500,32 @@ impl FinalResultCache {
     }
 
     fn generation(&self, result_set: &FinalCacheResultSet) -> u64 {
-        self.generations.get(result_set).copied().unwrap_or(0)
+        self.generations
+            .get(&FinalCacheGenerationSet::from(result_set))
+            .copied()
+            .unwrap_or(0)
     }
 
-    fn evict_oldest(&mut self) {
+    fn evict_oldest(&mut self) -> bool {
         let Some(oldest) = self
             .entries
             .iter()
             .min_by_key(|(_, entry)| entry.receipt)
             .map(|(key, _)| key.clone())
         else {
-            return;
+            return false;
         };
-        self.entries.remove(&oldest);
+        if let Some(removed) = self.entries.remove(&oldest) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(removed.encoded_bytes);
+        }
         self.stats.evictions = self.stats.evictions.saturating_add(1);
+        true
+    }
+
+    fn recount_retained_bytes(&mut self) {
+        self.retained_bytes = self.entries.values().fold(0usize, |total, entry| {
+            total.saturating_add(entry.encoded_bytes)
+        });
     }
 }
 
@@ -376,7 +535,7 @@ impl Default for FinalResultCache {
     }
 }
 
-fn final_cache_hints(result: &CoreResult) -> Option<(u64, CacheScope)> {
+pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(u64, CacheScope)> {
     let CoreResult::Final(result) = result else {
         return None;
     };
@@ -426,7 +585,14 @@ mod tests {
 
     use super::*;
 
-    fn key(partition: &str, cursor: Option<&str>) -> FinalCacheKey {
+    fn key_with_revisions(
+        partition: &str,
+        cursor: Option<&str>,
+        policy_revision: u64,
+        extension_revision: u64,
+        representation_policy_revision: u64,
+        limits_policy_revision: u64,
+    ) -> FinalCacheKey {
         FinalCacheKey::new(
             "stdio",
             "2026-07-28",
@@ -435,11 +601,17 @@ mod tests {
             "tools/list",
             "{\"includeTags\":null,\"excludeTags\":null}",
             cursor.map(ToOwned::to_owned),
-            0,
-            0,
+            policy_revision,
+            extension_revision,
+            representation_policy_revision,
+            limits_policy_revision,
             CachePartitionKey::new(partition),
             FinalCacheResultSet::Tools,
         )
+    }
+
+    fn key(partition: &str, cursor: Option<&str>) -> FinalCacheKey {
+        key_with_revisions(partition, cursor, 1, 1, 1, 1)
     }
 
     fn tools_result(ttl_ms: u64, scope: &str, extra: Option<&str>) -> CoreResult {
@@ -458,8 +630,10 @@ mod tests {
     }
 
     fn notification(method: &str, params: Option<serde_json::Value>) -> ServerNotification {
-        ServerNotification::decode(&fastmcp_protocol::JsonRpcRequest::notification(method, params))
-            .expect("the cache fixture is an admitted final server notification")
+        ServerNotification::decode(&fastmcp_protocol::JsonRpcRequest::notification(
+            method, params,
+        ))
+        .expect("the cache fixture is an admitted final server notification")
     }
 
     #[test]
@@ -520,6 +694,8 @@ mod tests {
             "resources/read",
             "{\"uri\":\"file:///input-required.txt\"}",
             None,
+            1,
+            1,
             0,
             0,
             CachePartitionKey::new("credential-a"),
@@ -545,11 +721,43 @@ mod tests {
             ),
             FinalCacheInsert::Stored
         );
-        assert!(matches!(cache.lookup(&private_key), FinalCacheLookup::Fresh(_)));
+        assert!(matches!(
+            cache.lookup(&private_key),
+            FinalCacheLookup::Fresh(_)
+        ));
         assert!(matches!(
             cache.lookup(&key("credential-b", None)),
             FinalCacheLookup::Miss(FinalCacheMiss::Absent)
         ));
+    }
+
+    #[test]
+    fn policy_revisions_partition_the_complete_result_identity() {
+        let mut cache = FinalResultCache::default();
+        let baseline = key_with_revisions("credential-a", None, 1, 1, 1, 1);
+        let generation = cache.begin_fetch(baseline.result_set());
+        assert_eq!(
+            cache.insert_if_current(
+                baseline.clone(),
+                generation,
+                tools_result(100, "private", None),
+            ),
+            FinalCacheInsert::Stored
+        );
+
+        for revisions in [(2, 1, 1, 1), (1, 2, 1, 1), (1, 1, 2, 1), (1, 1, 1, 2)] {
+            assert!(matches!(
+                cache.lookup(&key_with_revisions(
+                    "credential-a",
+                    None,
+                    revisions.0,
+                    revisions.1,
+                    revisions.2,
+                    revisions.3,
+                )),
+                FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+            ));
+        }
     }
 
     #[test]
@@ -579,6 +787,8 @@ mod tests {
             "resources/read",
             "{\"uri\":\"file:///changed.txt\"}",
             None,
+            1,
+            1,
             0,
             0,
             CachePartitionKey::new("credential-a"),
@@ -587,8 +797,7 @@ mod tests {
         let request = CoreRequest::Final(FinalCoreRequest::ResourcesRead(
             fastmcp_protocol::FinalReadResourceParams {
                 meta: OpenMetadata::default(),
-                uri: serde_json::from_str("\"file:///changed.txt\"")
-                    .expect("absolute URI fixture"),
+                uri: serde_json::from_str("\"file:///changed.txt\"").expect("absolute URI fixture"),
                 input_responses: None,
                 request_state: None,
             },
@@ -607,7 +816,10 @@ mod tests {
         let FinalCacheLookup::Fresh(replayed) = cache.lookup(&resource_key) else {
             panic!("fresh cached resource result expected");
         };
-        assert_eq!(replayed.encode().expect("cached result re-encodes"), expected);
+        assert_eq!(
+            replayed.encode().expect("cached result re-encodes"),
+            expected
+        );
 
         cache.invalidate_notification(&notification(
             "notifications/resources/updated",
@@ -617,5 +829,45 @@ mod tests {
             cache.lookup(&resource_key),
             FinalCacheLookup::Miss(FinalCacheMiss::Absent)
         ));
+    }
+
+    #[test]
+    fn resource_update_generations_are_fixed_cardinality() {
+        let mut cache = FinalResultCache::default();
+        for index in 0..1_024 {
+            cache.invalidate_notification(&notification(
+                "notifications/resources/updated",
+                Some(serde_json::json!({"uri": format!("file:///changed-{index}.txt")})),
+            ));
+        }
+
+        assert_eq!(
+            cache.generations.len(),
+            1,
+            "distinct resource URIs share one bounded resource generation"
+        );
+    }
+
+    #[test]
+    fn byte_budget_rejects_oversized_complete_result_without_eviction_loop() {
+        let mut cache = FinalResultCache::with_limits(2, 96);
+        let key = key("credential-a", None);
+        let generation = cache.begin_fetch(key.result_set());
+        let result = tools_result(
+            100,
+            "private",
+            Some(r#""padding":"this exceeds the byte budget""#),
+        );
+
+        assert_eq!(
+            cache.insert_if_current(key.clone(), generation, result),
+            FinalCacheInsert::Oversized
+        );
+        assert!(matches!(
+            cache.lookup(&key),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+        assert_eq!(cache.entries.len(), 0);
+        assert_eq!(cache.retained_bytes, 0);
     }
 }
