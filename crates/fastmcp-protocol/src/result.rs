@@ -1155,8 +1155,10 @@ pub fn encode_complete_result(
         name: "resultType".to_owned(),
         value: ExactJsonValue::String("complete".to_owned()),
     }];
-    append_result_meta(&mut members, meta);
+    // Canonical local layout: method-owned members first, then `_meta`, then
+    // inert open siblings — matching the frozen final wires end to end.
     members.extend(known_members);
+    append_result_meta(&mut members, meta);
     members.extend(checked_extras.members);
     validate_local_result_members(&members)?;
     Ok(encode_exact_object(&ExactJsonObject { members }))

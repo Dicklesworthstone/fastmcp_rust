@@ -1019,18 +1019,12 @@ pub mod limits {
             // configured window so both budgets agree and the comparison
             // reaches the ordered counter locking under test.
             let shared_deadline = Some(Time::from_nanos(1_000_000));
-            let first_budget = LogicalExchangeBudget::with_external_deadline(
-                small_limits(),
-                &context,
-                shared_deadline,
-            )
-            .unwrap();
-            let second_budget = LogicalExchangeBudget::with_external_deadline(
-                small_limits(),
-                &context,
-                shared_deadline,
-            )
-            .unwrap();
+            let first_budget =
+                LogicalExchangeBudget::with_external_deadline(small_limits(), &context, shared_deadline)
+                    .unwrap();
+            let second_budget =
+                LogicalExchangeBudget::with_external_deadline(small_limits(), &context, shared_deadline)
+                    .unwrap();
             assert!(!Arc::ptr_eq(
                 &first_budget.counters,
                 &second_budget.counters

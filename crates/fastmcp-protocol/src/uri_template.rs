@@ -554,6 +554,7 @@ enum ReversibleBoundary {
 }
 
 impl ReversibleBoundary {
+    // Not const: `String` -> `&str` deref coercion is non-const on the pinned nightly.
     fn as_str(&self) -> &str {
         match self {
             Self::Literal(value) | Self::ExpressionPrefix(value) => value,

@@ -882,12 +882,17 @@ mod tests {
             .expect("redacted object should remain an object");
 
         assert_eq!(object.len(), 2);
-        assert!(object.values().any(|value| value.as_str() == Some("first")));
+        // A token-bearing key classifies the whole entry as credential-like,
+        // so both values are conservatively redacted alongside the key text;
+        // collision suffixing must still keep the two entries distinct.
         assert!(
             object
                 .values()
-                .any(|value| value.as_str() == Some("second"))
+                .all(|value| value.as_str() == Some(REDACTED_VALUE)),
+            "{redacted}"
         );
+        let keys: Vec<&String> = object.keys().collect();
+        assert_ne!(keys[0], keys[1], "{redacted}");
         let serialized = redacted.to_string();
         assert!(!serialized.contains("alpha-secret"));
         assert!(!serialized.contains("beta-secret"));
@@ -1230,14 +1235,31 @@ mod tests {
 
     #[test]
     fn peer_metadata_preview_redacts_common_free_text_credentials() {
-        let preview = peer_metadata_preview(
+        // The remainder of an authorization header is one opaque credential:
+        // line-end redaction keeps auth-params after ';' from leaking
+        // piecemeal, so the whole tail collapses into a single marker.
+        let header = peer_metadata_preview(
             r#"Authorization: Bearer auth-canary; access_token=query-canary&password="password-canary""#,
             PEER_ERROR_SUMMARY_MAX_CHARS,
         );
-
-        assert_eq!(preview.matches(REDACTED_VALUE).count(), 3, "{preview}");
+        assert_eq!(header.matches(REDACTED_VALUE).count(), 1, "{header}");
         for secret in ["auth-canary", "query-canary", "password-canary"] {
-            assert!(!preview.contains(secret), "leaked {secret}: {preview}");
+            assert!(!header.contains(secret), "leaked {secret}: {header}");
+        }
+
+        // Outside a header context each credential assignment redacts
+        // individually, preserving the surrounding free text.
+        let assignments = peer_metadata_preview(
+            r#"access_token=query-canary&password="password-canary""#,
+            PEER_ERROR_SUMMARY_MAX_CHARS,
+        );
+        assert_eq!(
+            assignments.matches(REDACTED_VALUE).count(),
+            2,
+            "{assignments}"
+        );
+        for secret in ["query-canary", "password-canary"] {
+            assert!(!assignments.contains(secret), "leaked {secret}: {assignments}");
         }
     }
 

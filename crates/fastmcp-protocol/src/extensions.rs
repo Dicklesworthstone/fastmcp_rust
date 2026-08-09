@@ -2261,8 +2261,14 @@ mod tests {
                 direction: ExtensionDirection::ServerToClient,
             }),
             result_discriminator: Some(result_discriminator.to_owned()),
+            // Routing headers are exclusively owned across the registry, so
+            // each helper-built extension derives a distinct header from its
+            // method; a shared literal would collide on the second register.
             routing_headers: vec![ExtensionRoutingHeaderDescriptor {
-                name: "Mcp-Weather".to_owned(),
+                name: format!(
+                    "Mcp-{}",
+                    method.rsplit('/').next().unwrap_or("weather")
+                ),
             }],
             stdio_correlation: None,
         }

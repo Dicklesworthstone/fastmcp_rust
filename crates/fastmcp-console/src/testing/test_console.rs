@@ -25,6 +25,31 @@ struct TestBuffer {
     lines: Vec<String>,
     /// Lines with ANSI codes preserved
     raw_lines: Vec<String>,
+    /// Partial line (stripped) not yet terminated by a newline
+    pending: String,
+    /// Partial line (raw) not yet terminated by a newline
+    raw_pending: String,
+}
+
+impl TestBuffer {
+    /// Appends a chunk, splitting only on real newlines. Rich rendering emits
+    /// one logical line as many small writes (one per styled segment), so
+    /// treating each write as a full line would fragment the output.
+    fn push_chunk(lines: &mut Vec<String>, pending: &mut String, chunk: &str) {
+        pending.push_str(chunk);
+        while let Some(index) = pending.find('\n') {
+            let line: String = pending.drain(..=index).collect();
+            lines.push(line.trim_end_matches(['\n', '\r']).to_owned());
+        }
+    }
+
+    fn snapshot(lines: &[String], pending: &str) -> Vec<String> {
+        let mut snapshot = lines.to_vec();
+        if !pending.is_empty() {
+            snapshot.push(pending.to_owned());
+        }
+        snapshot
+    }
 }
 
 impl TestConsole {
@@ -96,7 +121,7 @@ impl TestConsole {
     pub fn output(&self) -> Vec<String> {
         self.buffer
             .lock()
-            .map(|b| b.lines.clone())
+            .map(|b| TestBuffer::snapshot(&b.lines, &b.pending))
             .unwrap_or_default()
     }
 
@@ -105,7 +130,7 @@ impl TestConsole {
     pub fn raw_output(&self) -> Vec<String> {
         self.buffer
             .lock()
-            .map(|b| b.raw_lines.clone())
+            .map(|b| TestBuffer::snapshot(&b.raw_lines, &b.raw_pending))
             .unwrap_or_default()
     }
 
@@ -254,16 +279,17 @@ impl std::fmt::Debug for BufferWriter {
 
 impl Write for BufferWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let s = String::from_utf8_lossy(buf);
+        let s = String::from_utf8_lossy(buf).into_owned();
 
         if let Ok(mut buffer) = self.0.lock() {
+            let buffer = &mut *buffer;
             // Store raw (with ANSI)
-            buffer.raw_lines.extend(s.lines().map(String::from));
+            TestBuffer::push_chunk(&mut buffer.raw_lines, &mut buffer.raw_pending, &s);
 
             // Store stripped (without ANSI)
             let stripped = strip(buf);
-            let stripped_str = String::from_utf8_lossy(&stripped);
-            buffer.lines.extend(stripped_str.lines().map(String::from));
+            let stripped_str = String::from_utf8_lossy(&stripped).into_owned();
+            TestBuffer::push_chunk(&mut buffer.lines, &mut buffer.pending, &stripped_str);
         }
 
         Ok(buf.len())

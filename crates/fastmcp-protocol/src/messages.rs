@@ -27,9 +27,9 @@ use crate::protocol_policy::ProtocolEra;
 use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
 use crate::result::{
     CompleteResult, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonMember,
-    InputRequiredResult, ResultDecodeError, ResultPeerDiagnostic, UnknownResultMembers,
-    decode_peer_result_for_era, encode_complete_result, encode_result, exact_json_from_serde,
-    exact_json_to_serde, has_final_only_metadata,
+    ExactJsonValue, InputRequiredResult, ResultDecodeError, ResultPeerDiagnostic,
+    UnknownResultMembers, decode_peer_result_for_era, encode_complete_result, encode_result,
+    exact_json_from_serde, exact_json_to_serde, has_final_only_metadata,
 };
 use crate::types::{
     ClientCapabilities, ClientInfo, LegacyContent, LegacyMetadata, LegacyPromptMessage,
@@ -3680,7 +3680,10 @@ fn encode_legacy_result<T: Serialize>(
     if has_final_only_metadata(&value) {
         return Err(CoreDispatchError::CrossEraResultMetadata { method });
     }
-    serde_json::to_string(&value).map_err(|_| CoreDispatchError::InvalidResult {
+    // Serialize the typed result directly: `value` exists only for the era
+    // checks above, and emitting it would alphabetize members through the
+    // BTreeMap-backed Value instead of keeping declaration order.
+    serde_json::to_string(result).map_err(|_| CoreDispatchError::InvalidResult {
         era: ProtocolEra::Legacy2024,
         method,
     })
@@ -3846,10 +3849,21 @@ fn encode_final_complete<T: Serialize>(
             method,
         });
     }
-    let Value::Object(payload) =
-        serde_json::to_value(&result.payload).map_err(|_| CoreDispatchError::InvalidResult {
+    // Stream-serialize the typed payload and reparse it exactly: routing
+    // through serde_json::Value would alphabetize every object (BTreeMap
+    // maps), destroying the declaration-ordered member layout and the
+    // tag-first content blocks that the frozen final wires require.
+    let payload_text =
+        serde_json::to_string(&result.payload).map_err(|_| CoreDispatchError::InvalidResult {
             era: ProtocolEra::Modern2026,
             method,
+        })?;
+    let ExactJsonValue::Object(payload) =
+        crate::result::parse_exact_json(&payload_text).map_err(|_| {
+            CoreDispatchError::InvalidResult {
+                era: ProtocolEra::Modern2026,
+                method,
+            }
         })?
     else {
         return Err(CoreDispatchError::InvalidResult {
@@ -3857,20 +3871,15 @@ fn encode_final_complete<T: Serialize>(
             method,
         });
     };
-    let mut members = Vec::with_capacity(payload.len());
-    for (name, value) in payload {
-        if !known_names.contains(&name.as_str()) {
+    for member in payload.members() {
+        if !known_names.contains(&member.name.as_str()) {
             return Err(CoreDispatchError::InvalidResult {
                 era: ProtocolEra::Modern2026,
                 method,
             });
         }
-        members.push(ExactJsonMember {
-            name,
-            value: exact_json_from_serde(&value)?,
-        });
     }
-    encode_complete_result(&result.meta, members, known_names, &result.extras)
+    encode_complete_result(&result.meta, payload.members().to_vec(), known_names, &result.extras)
         .map_err(CoreDispatchError::from)
 }
 
@@ -7216,7 +7225,10 @@ mod tests {
         let entries = (0..15)
             .map(|index| format!(r#""key-{index}":"{escaped_maximum_value}""#))
             .collect::<Vec<_>>();
-        let prefix = format!(r#"{{{},"tail":"#, entries.join(","));
+        // The tail value's OPENING quote belongs to the prefix; the suffix
+        // carries only the closing quote and brace. Omitting it made the
+        // fixture invalid JSON and turned both assertions vacuous.
+        let prefix = format!(r#"{{{},"tail":""#, entries.join(","));
         let suffix = r#""}"#;
         let tail_bytes = MAX_COMPLETION_CONTEXT_ARGUMENT_BYTES - prefix.len() - suffix.len();
         assert!(tail_bytes <= MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES);
