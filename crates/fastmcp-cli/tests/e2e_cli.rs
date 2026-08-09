@@ -752,7 +752,6 @@ fn e2e_cli_help_shows_usage() {
     assert!(stdout.contains("list"), "Should list list command");
     assert!(stdout.contains("test"), "Should list test command");
     assert!(stdout.contains("dev"), "Should list dev command");
-    assert!(stdout.contains("tasks"), "Should list tasks command");
     assert!(
         stdout.contains("MCP 2026-07-28") && stdout.contains("2024-11-05"),
         "help should disclose the unverified target and current protocol version"
@@ -853,21 +852,6 @@ fn e2e_cli_dev_help() {
     assert!(!stdout.contains("--host"));
     assert!(!stdout.contains("--port"));
     assert!(!stdout.contains("--transport"));
-}
-
-#[test]
-fn e2e_cli_tasks_help() {
-    let output = run_cli(&["tasks", "--help"]);
-
-    assert!(output.status.success());
-
-    let stdout = stdout_str(&output);
-    assert!(stdout.contains("legacy background-task RPCs"));
-    assert!(stdout.contains("quarantined"));
-    assert!(stdout.contains("list"));
-    assert!(stdout.contains("show"));
-    assert!(stdout.contains("cancel"));
-    assert!(stdout.contains("stats"));
 }
 
 // =============================================================================
@@ -1299,82 +1283,6 @@ fn e2e_cli_dev_missing_target_fails() {
     assert!(!output.status.success());
 }
 
-#[test]
-fn e2e_cli_tasks_missing_subcommand_fails() {
-    let output = run_cli(&["tasks"]);
-
-    assert!(!output.status.success());
-}
-
-#[cfg(unix)]
-#[test]
-fn e2e_cli_tasks_list_is_quarantined_by_the_server() {
-    let output = run_cli(&fixture_server_args(&["tasks", "list"], &[]));
-
-    assert!(!output.status.success());
-    assert!(stdout_str(&output).is_empty());
-    assert!(stderr_str(&output).contains("Method not found"));
-}
-
-#[cfg(unix)]
-#[test]
-fn e2e_cli_tasks_list_json_is_quarantined_by_the_server() {
-    let output = run_cli(&fixture_server_args(&["tasks", "list", "--json"], &[]));
-
-    assert!(!output.status.success());
-    assert!(stdout_str(&output).is_empty());
-    assert!(stderr_str(&output).contains("Method not found"));
-}
-
-#[cfg(unix)]
-#[test]
-fn e2e_cli_tasks_list_with_status_filter_is_quarantined() {
-    let output = run_cli(&fixture_server_args(
-        &["tasks", "list", "--status", "pending"],
-        &[],
-    ));
-
-    assert!(!output.status.success());
-    assert!(stdout_str(&output).is_empty());
-    assert!(stderr_str(&output).contains("Method not found"));
-}
-
-#[cfg(unix)]
-#[test]
-fn e2e_cli_tasks_stats_json_is_quarantined_by_the_server() {
-    let output = run_cli(&fixture_server_args(&["tasks", "stats", "--json"], &[]));
-
-    assert!(!output.status.success());
-    assert!(stdout_str(&output).is_empty());
-    assert!(stderr_str(&output).contains("Method not found"));
-}
-
-#[cfg(unix)]
-#[test]
-fn e2e_cli_tasks_show_is_quarantined_before_task_lookup() {
-    let output = run_cli(&fixture_server_args(&["tasks", "show"], &["task-999"]));
-
-    assert!(!output.status.success());
-    assert!(
-        stderr_str(&output).contains("Method not found"),
-        "expected method-not-found quarantine error, stderr: {}",
-        stderr_str(&output)
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn e2e_cli_tasks_cancel_is_quarantined_before_task_lookup() {
-    let output = run_cli(&fixture_server_args(&["tasks", "cancel"], &["task-999"]));
-
-    assert!(!output.status.success());
-    assert!(
-        stderr_str(&output).contains("Method not found"),
-        "expected method-not-found quarantine error, stderr: {}",
-        stderr_str(&output)
-    );
-}
-
 // =============================================================================
 // Invalid Option Tests
 // =============================================================================
@@ -1656,16 +1564,6 @@ fn e2e_cli_run_env_parsing() {
 // =============================================================================
 // Output Format Tests
 // =============================================================================
-
-#[test]
-fn e2e_cli_tasks_list_json_option() {
-    let output = run_cli(&["tasks", "list", "--help"]);
-
-    assert!(output.status.success());
-
-    let stdout = stdout_str(&output);
-    assert!(stdout.contains("--json"), "Should support --json output");
-}
 
 #[test]
 fn e2e_cli_test_json_option() {

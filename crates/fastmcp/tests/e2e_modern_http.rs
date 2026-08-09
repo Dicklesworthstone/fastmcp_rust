@@ -8,22 +8,22 @@
 //!
 //! What this proves (and only this): the shipped dual-era HTTP server and
 //! facade clients can complete Auto classification and a round trip against
-//! each other — modern discovery plus `ping` over the live modern lane,
+//! each other — modern discovery plus `tools/list` over the live modern lane,
 //! then exact 2024-11-05 HTTP+SSE fallback after an eligible live modern-route
 //! refusal. It is not an aggregate MCP 2026-07-28 conformance claim.
 
 use std::net::SocketAddr;
-use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use asupersync::CancelKind;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::reactor::create_reactor;
 use fastmcp_rust::{
-    CanonicalHttpUrl, ClientHttpResponse, ClientProtocolPlan, Cx, JsonRpcMessage,
-    ModernHttpResponseKind, ModernHttpResponseStream, ProtocolEra, ProtocolPolicy, Server,
-    SseLimits, auto,
+    CanonicalHttpUrl, ClientHttpResponse, ClientProtocolPlan, Cx, JsonRpcMessage, JsonRpcRequest,
+    McpContext, McpResult, Middleware, MiddlewareDecision, ModernHttpResponseKind,
+    ModernHttpResponseStream, ProtocolEra, ProtocolPolicy, Server, SseLimits, auto,
 };
 use serde_json::json;
 
@@ -32,6 +32,14 @@ fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .expect("native runtime must build")
         .block_on(future)
+}
+
+fn runtime_block_on_bounded<F: std::future::Future>(cx: &Cx, future: F) -> F::Output {
+    runtime_block_on(async {
+        asupersync::time::timeout(cx.now(), HTTP_SERVER_TEARDOWN_BOUND, future)
+            .await
+            .expect("public HTTP operation stays within its bound")
+    })
 }
 
 const HTTP_SERVER_STARTUP_BOUND: Duration = Duration::from_secs(2);
@@ -44,8 +52,8 @@ const HTTP_SERVER_THREAD_BOUND: Duration = Duration::from_secs(4);
 ///
 /// The fixture deliberately uses the minimal `Server::new(...).build()`
 /// composition published in the facade examples, rather than a test-local
-/// handler. Its only client request is `ping`, which every shipped server
-/// implements without a bespoke test tool.
+/// handler. Its clients use only protocol-defined final methods, so the test
+/// does not need a bespoke test tool.
 struct HttpServerFixture {
     address: SocketAddr,
     shutdown: mpsc::SyncSender<()>,
@@ -55,6 +63,10 @@ struct HttpServerFixture {
 
 impl HttpServerFixture {
     fn spawn() -> Self {
+        Self::spawn_with_middleware(None)
+    }
+
+    fn spawn_with_middleware(middleware: Option<Arc<dyn Middleware>>) -> Self {
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
@@ -83,12 +95,13 @@ impl HttpServerFixture {
                     }
                     let outcome =
                         match asupersync::time::timeout(cx.now(), HTTP_SERVER_THREAD_BOUND, async {
-                            let bound = match Server::new("facade-http-example", "1.0.0")
-                                .protocol_policy(ProtocolPolicy::Auto)
-                                .build()
-                                .bind_http(&cx, "127.0.0.1:0")
-                                .await
-                            {
+                            let builder = Server::new("facade-http-example", "1.0.0")
+                                .protocol_policy(ProtocolPolicy::Auto);
+                            let server = match middleware {
+                                Some(middleware) => builder.middleware(middleware).build(),
+                                None => builder.build(),
+                            };
+                            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                                 Ok(bound) => bound,
                                 Err(error) => {
                                     let message =
@@ -175,24 +188,14 @@ impl HttpServerFixture {
         let address = match ready_rx.recv_timeout(HTTP_SERVER_STARTUP_BOUND) {
             Ok(Ok(address)) => address,
             Ok(Err(error)) => {
-                let settlement = settle_http_server(
-                    &shutdown_tx,
-                    &finished_rx,
-                    join.take()
-                        .expect("HTTP server fixture retains its join handle"),
-                );
+                let settlement = settle_http_server(&shutdown_tx, &finished_rx, &mut join);
                 panic!(
                     "public HTTP server failed to start: {error}; {settlement:?} after thread settlement"
                 );
             }
             Err(error) => {
                 drop(ready_rx);
-                let settlement = settle_http_server(
-                    &shutdown_tx,
-                    &finished_rx,
-                    join.take()
-                        .expect("HTTP server fixture retains its join handle"),
-                );
+                let settlement = settle_http_server(&shutdown_tx, &finished_rx, &mut join);
                 panic!(
                     "public HTTP server startup exceeded its bound: {error}; {settlement:?} after thread settlement"
                 );
@@ -212,13 +215,7 @@ impl HttpServerFixture {
     }
 
     fn settle(&mut self) -> Result<(), String> {
-        settle_http_server(
-            &self.shutdown,
-            &self.finished,
-            self.join
-                .take()
-                .expect("HTTP server fixture retains its join handle"),
-        )
+        settle_http_server(&self.shutdown, &self.finished, &mut self.join)
     }
 
     fn shutdown(mut self) {
@@ -240,22 +237,24 @@ impl Drop for HttpServerFixture {
     }
 }
 
-/// Signals shutdown without blocking and joins the owned server thread before
-/// returning any startup or teardown failure to the test.
+/// Signals shutdown without blocking, waits for the owned thread's bounded
+/// completion report, then joins only after the thread is known to have exited.
+/// A timed-out owner remains retained for a controlled retry rather than being
+/// detached.
 fn settle_http_server(
     shutdown: &mpsc::SyncSender<()>,
     finished: &mpsc::Receiver<Result<(), String>>,
-    join: JoinHandle<()>,
+    join: &mut Option<JoinHandle<()>>,
 ) -> Result<(), String> {
     settle_http_server_with_bound(shutdown, finished, join, HTTP_SERVER_TEARDOWN_BOUND)
 }
 
 /// This helper is separately bounded so the planted timeout test can prove
-/// that a reported timeout follows, rather than replaces, joining the owner.
+/// that a deadline retains ownership until a later controlled settlement.
 fn settle_http_server_with_bound(
     shutdown: &mpsc::SyncSender<()>,
     finished: &mpsc::Receiver<Result<(), String>>,
-    join: JoinHandle<()>,
+    join: &mut Option<JoinHandle<()>>,
     completion_bound: Duration,
 ) -> Result<(), String> {
     match shutdown.try_send(()) {
@@ -264,39 +263,82 @@ fn settle_http_server_with_bound(
     let completion = finished
         .recv_timeout(completion_bound)
         .map_err(|error| format!("public HTTP server teardown exceeded its bound: {error}"));
-    let joined = join
-        .join()
-        .map_err(|_| "HTTP server thread panicked during settlement".to_owned());
+    let completion = completion?;
+    completion.map_err(|error| format!("public HTTP server teardown failed: {error}"))?;
+    join_finished_thread(join, completion_bound, "HTTP server")
+}
 
-    joined?;
-    completion?.map_err(|error| format!("public HTTP server teardown failed: {error}"))
+fn join_finished_thread(
+    join: &mut Option<JoinHandle<()>>,
+    completion_bound: Duration,
+    owner: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + completion_bound;
+    loop {
+        let Some(handle) = join.as_ref() else {
+            return Ok(());
+        };
+        if handle.is_finished() {
+            return join
+                .take()
+                .expect("completed thread retains its join handle")
+                .join()
+                .map_err(|_| format!("{owner} thread panicked during settlement"));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{owner} reported completion but did not exit within its bounded settlement window"
+            ));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
-fn e2e_http_fixture_planted_teardown_timeout_joins_before_failure() {
+fn e2e_http_fixture_planted_teardown_timeout_retains_owner_for_controlled_retry() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
     let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
     let joined = Arc::new(AtomicBool::new(false));
     let joined_by_server = Arc::clone(&joined);
-    let server = thread::spawn(move || {
+    let mut server = Some(thread::spawn(move || {
         shutdown_rx
             .recv()
             .expect("the bounded settlement path sends one shutdown signal");
+        release_rx
+            .recv()
+            .expect("the test releases the planted server after the deadline");
         joined_by_server.store(true, Ordering::SeqCst);
-    });
+        let _ = finished_tx.send(Ok(()));
+    }));
 
     let settlement =
-        settle_http_server_with_bound(&shutdown_tx, &finished_rx, server, Duration::ZERO);
+        settle_http_server_with_bound(&shutdown_tx, &finished_rx, &mut server, Duration::ZERO);
 
     assert!(
-        joined.load(Ordering::SeqCst),
-        "the planted timeout is reported only after the owned server thread joined"
+        !joined.load(Ordering::SeqCst),
+        "a timeout must not make an unbounded join attempt"
     );
     assert!(matches!(settlement, Err(error) if error.contains("exceeded its bound")));
-    drop(finished_tx);
+    assert!(
+        server.is_some(),
+        "the timed-out owner stays retained for an explicit controlled retry"
+    );
+    release_tx
+        .send(())
+        .expect("the retained server remains controllable after its deadline");
+    settle_http_server_with_bound(
+        &shutdown_tx,
+        &finished_rx,
+        &mut server,
+        HTTP_SERVER_TEARDOWN_BOUND,
+    )
+    .expect("the released server settles without detaching its owner");
+    assert!(joined.load(Ordering::SeqCst));
+    assert!(server.is_none(), "settlement joins the retained owner");
 }
 
 fn plan(addr: SocketAddr, policy: ProtocolPolicy) -> ClientProtocolPlan {
@@ -338,7 +380,7 @@ fn plan_with_modern_post_path(
 fn final_response_document(cx: &Cx, response: ModernHttpResponseStream) -> serde_json::Value {
     match response.metadata().kind() {
         ModernHttpResponseKind::Json => {
-            let bytes = runtime_block_on(response.read_to_end(cx, 1 << 20))
+            let bytes = runtime_block_on_bounded(cx, response.read_to_end(cx, 1 << 20))
                 .expect("immediate JSON body reads to end");
             serde_json::from_slice(&bytes).expect("immediate JSON response parses")
         }
@@ -347,8 +389,8 @@ fn final_response_document(cx: &Cx, response: ModernHttpResponseStream) -> serde
                 .into_sse_stream(SseLimits::new(65_536, 1 << 20, 64).expect("nonzero SSE limits"))
                 .expect("SSE response admits the shipped parser");
             let mut terminal = None;
-            while let Some(event) =
-                runtime_block_on(stream.next_event(cx)).expect("SSE stream stays readable")
+            while let Some(event) = runtime_block_on_bounded(cx, stream.next_event(cx))
+                .expect("SSE stream stays readable")
             {
                 let value: serde_json::Value =
                     serde_json::from_str(&event).expect("SSE payload is one JSON document");
@@ -368,6 +410,196 @@ fn final_response_document(cx: &Cx, response: ModernHttpResponseStream) -> serde
     }
 }
 
+#[derive(Default)]
+struct OverlapFinalMethodGate {
+    state: Mutex<OverlapFinalMethodGateState>,
+    entered: Condvar,
+    released: Condvar,
+}
+
+#[derive(Default)]
+struct OverlapFinalMethodGateState {
+    modern_tools_list_entered: bool,
+    legacy_ping_entered: bool,
+    modern_request_id: Option<serde_json::Value>,
+    legacy_request_id: Option<serde_json::Value>,
+    released: bool,
+}
+
+impl OverlapFinalMethodGate {
+    fn wait_for_cross_era_requests(&self) -> Result<(), String> {
+        let deadline = Instant::now() + HTTP_SERVER_TEARDOWN_BOUND;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !(state.modern_tools_list_entered && state.legacy_ping_entered) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(
+                    "the modern tools/list and legacy ping requests did not both reach the overlap gate"
+                        .to_owned(),
+                );
+            }
+            let (next, timeout) = self
+                .entered
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if timeout.timed_out()
+                && !(state.modern_tools_list_entered && state.legacy_ping_entered)
+            {
+                return Err(
+                    "the modern tools/list and legacy ping requests did not both reach the overlap gate"
+                        .to_owned(),
+                );
+            }
+        }
+        if state.modern_request_id != state.legacy_request_id {
+            return Err(format!(
+                "the overlapping modern and legacy requests used different IDs: modern={:?}, legacy={:?}",
+                state.modern_request_id, state.legacy_request_id
+            ));
+        }
+        Ok(())
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.released = true;
+        self.released.notify_all();
+    }
+}
+
+impl Middleware for OverlapFinalMethodGate {
+    fn on_request(
+        &self,
+        _ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<MiddlewareDecision> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let request_id = serde_json::to_value(&request.id).map_err(|error| {
+            McpError::internal_error(format!("overlap request ID serializes: {error}"))
+        })?;
+        match request.method.as_str() {
+            "tools/list" => {
+                state.modern_tools_list_entered = true;
+                state.modern_request_id = Some(request_id);
+            }
+            "ping" => {
+                state.legacy_ping_entered = true;
+                state.legacy_request_id = Some(request_id);
+            }
+            _ => return Ok(MiddlewareDecision::Continue),
+        }
+        self.entered.notify_all();
+        while !state.released {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        Ok(MiddlewareDecision::Continue)
+    }
+}
+
+enum OverlapWorkerCompletion {
+    Modern(Result<serde_json::Value, String>),
+    Legacy(Result<serde_json::Value, String>),
+}
+
+/// Collects the two request outcomes within a deadline. Every caller must
+/// then drive the workers to completion and join their retained owners.
+fn collect_overlap_worker_results(
+    completed: &mpsc::Receiver<OverlapWorkerCompletion>,
+    completion_bound: Duration,
+) -> (
+    Result<serde_json::Value, String>,
+    Result<serde_json::Value, String>,
+) {
+    let deadline = Instant::now() + completion_bound;
+    let mut modern = None;
+    let mut legacy = None;
+
+    while modern.is_none() || legacy.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match completed.recv_timeout(remaining) {
+            Ok(OverlapWorkerCompletion::Modern(result)) if modern.is_none() => {
+                modern = Some(result);
+            }
+            Ok(OverlapWorkerCompletion::Legacy(result)) if legacy.is_none() => {
+                legacy = Some(result);
+            }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    (
+        modern.unwrap_or_else(|| {
+            Err("the modern overlap worker did not complete before the bounded deadline".to_owned())
+        }),
+        legacy.unwrap_or_else(|| {
+            Err("the legacy overlap worker did not complete before the bounded deadline".to_owned())
+        }),
+    )
+}
+
+#[test]
+fn e2e_overlap_worker_timeout_releases_fixture_teardown() {
+    let mut server = HttpServerFixture::spawn();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+    let stalled_completed_tx = completed_tx.clone();
+    let mut stalled_worker = Some(thread::spawn(move || {
+        release_rx
+            .recv()
+            .expect("the test releases the single stalled worker after its deadline");
+        let _ = stalled_completed_tx.send(OverlapWorkerCompletion::Modern(Ok(json!({}))));
+    }));
+
+    completed_tx
+        .send(OverlapWorkerCompletion::Legacy(Ok(json!({}))))
+        .expect("the non-stalled worker completion reaches the collector");
+    drop(completed_tx);
+
+    let (modern, legacy) = collect_overlap_worker_results(&completed_rx, Duration::from_millis(20));
+    assert!(
+        matches!(modern, Err(error) if error.contains("modern overlap worker")),
+        "only the deliberately stalled modern worker may exceed the completion deadline"
+    );
+    assert!(
+        legacy.is_ok(),
+        "the unchanged legacy worker completion is retained"
+    );
+
+    release_tx
+        .send(())
+        .expect("the stalled worker remains controllable after the timeout");
+    let completion = completed_rx
+        .recv_timeout(HTTP_SERVER_TEARDOWN_BOUND)
+        .expect("the released worker reports completion within its bounded cleanup window");
+    assert!(matches!(completion, OverlapWorkerCompletion::Modern(Ok(_))));
+    join_finished_thread(
+        &mut stalled_worker,
+        HTTP_SERVER_TEARDOWN_BOUND,
+        "stalled overlap worker",
+    )
+    .expect("the released worker joins without detaching");
+    assert!(stalled_worker.is_none());
+    let teardown = server.settle();
+    teardown.expect("the bounded fixture teardown runs after a worker completion timeout");
+}
+
 #[test]
 fn e2e_public_http_auto_selects_modern_on_the_shipped_facade_server() {
     let server = HttpServerFixture::spawn();
@@ -380,7 +612,7 @@ fn e2e_public_http_auto_selects_modern_on_the_shipped_facade_server() {
         ProtocolPolicy::Auto
     );
 
-    let mut client = runtime_block_on(builder.connect_http_client_with_cx(&cx))
+    let mut client = runtime_block_on_bounded(&cx, builder.connect_http_client_with_cx(&cx))
         .expect("the public Auto facade client completes live modern discovery");
     assert_eq!(
         client.selected_protocol_era(),
@@ -398,8 +630,11 @@ fn e2e_public_http_auto_selects_modern_on_the_shipped_facade_server() {
         "the public HTTP connection reports the exact modern negotiated version"
     );
 
-    let response = runtime_block_on(client.request(&cx, "ping", json!({})))
-        .expect("the Auto-selected modern connection serves requests");
+    let response = runtime_block_on_bounded(
+        &cx,
+        client.request(&cx, "tools/list", json!({ "cursor": null })),
+    )
+    .expect("the Auto-selected modern connection serves requests");
     let ClientHttpResponse::Modern(response) = response else {
         panic!("the selected modern HTTP client must retain the modern response lane");
     };
@@ -407,7 +642,11 @@ fn e2e_public_http_auto_selects_modern_on_the_shipped_facade_server() {
     assert_eq!(document["id"], json!(2));
     assert!(
         document.get("error").is_none(),
-        "ping over the Auto-selected connection must not fail: {document}"
+        "tools/list over the Auto-selected connection must not fail: {document}"
+    );
+    assert!(
+        document["result"]["tools"].is_array(),
+        "the modern tools/list response must carry its tools result: {document}"
     );
     drop(client);
     server.shutdown();
@@ -432,7 +671,7 @@ fn e2e_public_http_auto_falls_back_to_exact_legacy_on_live_eligible_refusal() {
         builder.selected_protocol_plan().policy(),
         ProtocolPolicy::Auto
     );
-    let mut client = runtime_block_on(builder.connect_http_client_with_cx(&cx))
+    let mut client = runtime_block_on_bounded(&cx, builder.connect_http_client_with_cx(&cx))
         .expect("an eligible live modern-route refusal completes the exact legacy lifecycle");
     assert_eq!(
         client.selected_protocol_era(),
@@ -454,7 +693,7 @@ fn e2e_public_http_auto_falls_back_to_exact_legacy_on_live_eligible_refusal() {
         "facade-http-example",
         "the legacy initialization result comes from the shipped facade server composition"
     );
-    let ping = runtime_block_on(client.request(&cx, "ping", json!({})))
+    let ping = runtime_block_on_bounded(&cx, client.request(&cx, "ping", json!({})))
         .expect("the initialized exact-legacy fallback remains usable");
     let ClientHttpResponse::Legacy(JsonRpcMessage::Response(ping)) = ping else {
         panic!("the exact-legacy fallback must answer ping through its legacy response lane");
@@ -462,4 +701,117 @@ fn e2e_public_http_auto_falls_back_to_exact_legacy_on_live_eligible_refusal() {
     assert!(ping.error.is_none(), "legacy ping must not fail: {ping:?}");
     drop(client);
     server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
+    let gate = Arc::new(OverlapFinalMethodGate::default());
+    let mut server = HttpServerFixture::spawn_with_middleware(Some(Arc::clone(&gate)));
+    let address = server.address();
+
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let modern_completed_tx = completed_tx.clone();
+    let mut modern_worker = Some(thread::spawn(move || {
+        let result = (|| -> Result<serde_json::Value, String> {
+            let cx = Cx::for_request();
+            let builder = auto::client_builder()
+                .client_info("e2e-isolated-modern-client", "1.0.0")
+                .protocol_plan(plan(address, ProtocolPolicy::Auto));
+            let mut client =
+                runtime_block_on_bounded(&cx, builder.connect_http_client_with_cx(&cx)).map_err(
+                    |error| format!("the first Auto client did not select modern: {error}"),
+                )?;
+            if client.selected_protocol_era() != ProtocolEra::Modern2026 {
+                return Err("the first client did not retain an independent modern era".to_owned());
+            }
+            let response = runtime_block_on_bounded(
+                &cx,
+                client.request(&cx, "tools/list", json!({ "cursor": null })),
+            )
+            .map_err(|error| format!("the modern tools/list request failed: {error}"))?;
+            let ClientHttpResponse::Modern(response) = response else {
+                return Err("the first client did not retain its modern response lane".to_owned());
+            };
+            Ok(final_response_document(&cx, response))
+        })();
+        let _ = modern_completed_tx.send(OverlapWorkerCompletion::Modern(result));
+    }));
+    let legacy_completed_tx = completed_tx.clone();
+    let mut legacy_worker = Some(thread::spawn(move || {
+        let result = (|| -> Result<serde_json::Value, String> {
+            let cx = Cx::for_request();
+            let builder = auto::client_builder()
+                .client_info("e2e-isolated-legacy-client", "1.0.0")
+                .protocol_plan(plan_with_modern_post_path(
+                    address,
+                    ProtocolPolicy::Auto,
+                    "/modern-unavailable",
+                ));
+            let mut client =
+                runtime_block_on_bounded(&cx, builder.connect_http_client_with_cx(&cx)).map_err(
+                    |error| format!("the second Auto client did not select legacy: {error}"),
+                )?;
+            if client.selected_protocol_era() != ProtocolEra::Legacy2024 {
+                return Err("the second client inherited a foreign protocol era".to_owned());
+            }
+            let response = runtime_block_on_bounded(&cx, client.request(&cx, "ping", json!({})))
+                .map_err(|error| format!("the legacy ping request failed: {error}"))?;
+            let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) = response else {
+                return Err("the second client did not retain its legacy response lane".to_owned());
+            };
+            serde_json::to_value(response)
+                .map_err(|error| format!("the legacy response did not serialize: {error}"))
+        })();
+        let _ = legacy_completed_tx.send(OverlapWorkerCompletion::Legacy(result));
+    }));
+    drop(completed_tx);
+
+    let admission = gate.wait_for_cross_era_requests();
+    gate.release();
+    let (modern_document, legacy_document) =
+        collect_overlap_worker_results(&completed_rx, HTTP_SERVER_TEARDOWN_BOUND);
+    let modern_join = join_finished_thread(
+        &mut modern_worker,
+        HTTP_SERVER_TEARDOWN_BOUND,
+        "modern overlap worker",
+    );
+    let legacy_join = join_finished_thread(
+        &mut legacy_worker,
+        HTTP_SERVER_TEARDOWN_BOUND,
+        "legacy overlap worker",
+    );
+    let teardown = server.settle();
+
+    admission.expect(
+        "the modern tools/list and legacy ping requests must reach the server before either response runs",
+    );
+    teardown.expect("the bounded server teardown runs after overlap completion collection");
+    modern_join.expect("the modern overlap worker joins without detaching");
+    legacy_join.expect("the legacy overlap worker joins without detaching");
+    let modern_document = modern_document.expect("the overlapping modern request completes");
+    assert_eq!(modern_document["id"], json!(2));
+    assert!(
+        modern_document.get("error").is_none(),
+        "the isolated modern tools/list request must not fail: {modern_document}"
+    );
+    assert!(
+        modern_document["result"]["tools"].is_array(),
+        "the isolated modern tools/list response must carry its tools result: {modern_document}"
+    );
+
+    let legacy_document = legacy_document.expect("the overlapping legacy request completes");
+    assert_eq!(
+        legacy_document["id"],
+        json!(2),
+        "both clients reuse their local final-request id without cross-client correlation"
+    );
+    assert!(
+        legacy_document.get("error").is_none(),
+        "the isolated legacy ping must not fail: {legacy_document}"
+    );
+    assert_eq!(
+        legacy_document["result"],
+        json!({}),
+        "the isolated legacy response must remain the ping acknowledgement: {legacy_document}"
+    );
 }

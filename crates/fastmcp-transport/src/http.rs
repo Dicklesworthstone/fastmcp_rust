@@ -63,7 +63,10 @@ use fastmcp_protocol::protocol_version::{
     FinalHttpRequestMetadata, RequestAdmissionError, RequestVersionMetadata,
     admit_final_http_request,
 };
-use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
+use fastmcp_protocol::{
+    JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    JsonRpcResponseAdmission, RequestId, decode_strict_jsonrpc_response,
+};
 
 use crate::sse::{
     ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits, ModernSseParseError,
@@ -81,7 +84,7 @@ pub struct ModernHttpSseCollector {
     request_id: RequestId,
     decoder: Option<ModernSseDecoder>,
     codec: Codec,
-    terminal: Option<JsonRpcResponse>,
+    terminal: Option<JsonRpcResponseAdmission>,
 }
 
 /// Errors while collecting one request-scoped modern HTTP SSE response body.
@@ -95,6 +98,9 @@ pub enum ModernHttpSseCollectorError {
     Sse(ModernSseParseError),
     /// A completed SSE payload was not one valid bounded JSON-RPC message.
     Codec(CodecError),
+    /// A response could not retain the exact source JSON of its `result`
+    /// member after ordinary JSON-RPC admission classified it as a response.
+    ResponseAdmission(JsonRpcAdmissionError),
     /// The transport context expired while consuming the response body.
     Transport(TransportError),
     /// Notification delivery returned an application transport error.
@@ -139,6 +145,12 @@ impl std::fmt::Display for ModernHttpSseCollectorError {
             Self::Cancelled => formatter.write_str("modern HTTP SSE collection was cancelled"),
             Self::Sse(error) => error.fmt(formatter),
             Self::Codec(error) => error.fmt(formatter),
+            Self::ResponseAdmission(error) => {
+                write!(
+                    formatter,
+                    "modern HTTP SSE response admission failed: {error}"
+                )
+            }
             Self::Transport(error) => error.fmt(formatter),
             Self::NotificationDelivery(error) => error.fmt(formatter),
             Self::NonNotificationRequest { request_id } => write!(
@@ -169,6 +181,7 @@ impl std::error::Error for ModernHttpSseCollectorError {
         match self {
             Self::Sse(error) => Some(error),
             Self::Codec(error) => Some(error),
+            Self::ResponseAdmission(error) => Some(error),
             Self::Transport(error) => Some(error),
             Self::NotificationDelivery(error) => Some(error),
             Self::InvalidRequestId
@@ -261,7 +274,17 @@ impl ModernHttpSseCollector {
                                 actual: response.id,
                             });
                         }
-                        *terminal = Some(response);
+                        // `JsonRpcResponse` holds a deserialized `Value`, so it
+                        // cannot retain numeric spelling or member ordering in
+                        // `result`. Re-admit this response and retain its exact
+                        // result source for final-result consumers.
+                        let admission = decode_strict_jsonrpc_response(
+                            event.as_bytes(),
+                            codec.max_message_size(),
+                        )
+                        .map_err(ModernHttpSseCollectorError::ResponseAdmission)?;
+                        debug_assert_eq!(admission.response(), &response);
+                        *terminal = Some(admission);
                         Ok(())
                     }
                 }
@@ -287,6 +310,21 @@ impl ModernHttpSseCollector {
     /// otherwise clean. An unfinished final SSE event is reported in the EOF
     /// error instead of being synthesized into a JSON-RPC message.
     pub fn finish(&mut self, cx: &Cx) -> Result<JsonRpcResponse, ModernHttpSseCollectorError> {
+        self.finish_admission(cx)
+            .map(|admission| admission.into_parts().0)
+    }
+
+    /// Ends the finite HTTP body and retains the exact JSON source of the
+    /// terminal response's `result` member.
+    ///
+    /// Consumers that perform a final result-algebra decode must use
+    /// [`JsonRpcResponseAdmission::raw_result`] rather than serializing the
+    /// typed `Value` again. [`Self::finish`] remains the compatibility method
+    /// for consumers needing only the ordinary typed response.
+    pub fn finish_admission(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<JsonRpcResponseAdmission, ModernHttpSseCollectorError> {
         if let Err(error) = Self::checkpoint(cx) {
             return Err(self.refuse(error));
         }
@@ -8911,6 +8949,54 @@ X-Checksum: abc123\r\n\
             response
         );
         assert_collector_is_closed(&mut collector, &cx);
+    }
+
+    #[test]
+    fn modern_http_sse_collector_finish_admission_preserves_raw_terminal_result() {
+        let request_id = RequestId::Number(4_210);
+        // The typed `Value` normalizes the exponent, but final-result decoding
+        // needs the source form exactly as received on the SSE wire.
+        let raw_result =
+            r#"{"resultType":"complete","opaque":{"decimal":1.20e+4,"order":{"z":1,"a":2}}}"#;
+        let body = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":4210,\"result\":{raw_result}}}\n\n");
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let mut collector =
+            ModernHttpSseCollector::new(request_id.clone(), limits).expect("valid request ID");
+        let cx = Cx::for_testing();
+
+        collector
+            .push(&cx, body.as_bytes(), |_| Ok(()))
+            .expect("correlated terminal response is admitted");
+        let admission = collector
+            .finish_admission(&cx)
+            .expect("EOF returns the admitted terminal response");
+
+        assert_eq!(admission.response().id, Some(request_id));
+        assert_eq!(admission.raw_result(), Some(raw_result));
+    }
+
+    #[test]
+    fn modern_http_sse_collector_finish_admission_does_not_fabricate_raw_result_for_error() {
+        let request_id = RequestId::Number(4_210);
+        // This differs from the preserved-result case only in the terminal
+        // envelope: an error response has no `result` member to preserve.
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":4210,\"error\":{\"code\":-32000,\"message\":\"failure\"}}\n\n";
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let mut collector =
+            ModernHttpSseCollector::new(request_id.clone(), limits).expect("valid request ID");
+        let cx = Cx::for_testing();
+
+        collector
+            .push(&cx, body.as_bytes(), |_| Ok(()))
+            .expect("correlated error response is admitted");
+        let admission = collector
+            .finish_admission(&cx)
+            .expect("EOF returns the admitted error response");
+
+        assert_eq!(admission.response().id, Some(request_id));
+        assert!(admission.response().error.is_some());
+        assert_eq!(admission.response().result, None);
+        assert_eq!(admission.raw_result(), None);
     }
 
     #[test]

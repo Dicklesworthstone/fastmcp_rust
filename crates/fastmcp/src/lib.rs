@@ -204,6 +204,19 @@ pub use fastmcp_protocol::{
     admit_raw_jsonrpc_document, decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
     dispose_raw_jsonrpc_failure,
 };
+pub use fastmcp_protocol::{
+    MAX_MCP_APPS_BRIDGE_IN_FLIGHT, MAX_MCP_APPS_BRIDGE_TEXT_BYTES,
+    MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeError, McpAppsBridgeImplementation,
+    McpAppsBridgeRequestId, McpAppsCancelledNotification, McpAppsDisplayModeParams,
+    McpAppsDownloadContent, McpAppsDownloadFileParams, McpAppsHostCapabilities, McpAppsHostContext,
+    McpAppsHostNotification, McpAppsHostRequest, McpAppsHostResponse, McpAppsHostToView,
+    McpAppsInitializeParams, McpAppsInitializeResult, McpAppsListParams,
+    McpAppsLogMessageNotification, McpAppsMessageParams, McpAppsMessageRole, McpAppsOpenLinkParams,
+    McpAppsOperationResult, McpAppsPingParams, McpAppsProgressNotification,
+    McpAppsResourceReadParams, McpAppsResourceTeardownParams, McpAppsSandboxSignal,
+    McpAppsToolCallParams, McpAppsUpdateModelContextParams, McpAppsViewCapabilities,
+    McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse, McpAppsViewToHost,
+};
 
 pub use fastmcp_protocol::{
     MAX_URI_TEMPLATE_BYTES, MAX_URI_TEMPLATE_COMPOSITE_ITEMS,
@@ -240,9 +253,8 @@ pub use fastmcp_protocol::{
     FinalArguments, FinalCallToolParams, FinalCallToolResult, FinalCancelledNotificationParams,
     FinalCompletionArgument, FinalCompletionContext, FinalCompletionParams,
     FinalCompletionReference, FinalCompletionResult, FinalCompletionValues, FinalCoreRequest,
-    FinalCoreResult,
-    FinalCreateMessageInputRequiredResult, FinalCreateMessageParams, FinalCreateMessageResult,
-    FinalEmbeddedCreateMessageParams, FinalEmbeddedElicitationParams,
+    FinalCoreResult, FinalCreateMessageInputRequiredResult, FinalCreateMessageParams,
+    FinalCreateMessageResult, FinalEmbeddedCreateMessageParams, FinalEmbeddedElicitationParams,
     FinalEmbeddedElicitationResult, FinalEmbeddedFormElicitationParams, FinalEmbeddedInputKind,
     FinalEmbeddedInputRequest, FinalEmbeddedInputResponse, FinalEmbeddedRootsListParams,
     FinalEmbeddedRootsListResult, FinalEmbeddedUrlElicitationParams, FinalEmptyNotificationParams,
@@ -270,6 +282,18 @@ pub use fastmcp_protocol::{
     FinalSamplingMessage, FinalSamplingMessageContent, FinalSamplingMessageContentBlock, FinalTool,
     FinalToolAnnotations, FinalToolChoice, FinalToolChoiceMode, ModelHint, ModelPreferences,
     StopReason,
+};
+
+// Final MCP Apps metadata, lifecycle, and result-projection vocabulary.
+pub use fastmcp_protocol::{
+    MAX_MCP_APPS_CSP_DOMAIN_BYTES, MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE,
+    MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES, MAX_MCP_APPS_UI_METADATA_MEMBERS,
+    MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY, McpAppsDisplayMode,
+    McpAppsLifecycleError, McpAppsMetadataError, McpAppsResourceBinding,
+    McpAppsResourceBindingError, McpAppsResourceCsp, McpAppsResourceMetadata,
+    McpAppsResourcePermission, McpAppsResourcePermissions, McpAppsResultProjectionError,
+    McpAppsToolMetadata, McpAppsToolResult, McpAppsToolVisibility, McpAppsViewLifecycle,
+    project_final_core_tools_call_result,
 };
 
 // Final extension vocabulary.
@@ -398,11 +422,13 @@ pub use fastmcp_server::{
     FinalToolOutcome, HttpServerConfig, InMemoryFinalTaskStore, InboundRequestContext,
     InboundRequestTransport, Middleware, MiddlewareDecision, MountResult, NotificationSender,
     PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog,
-    ProxyClient, RequestSender, ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint,
-    ServerHttpEndpointResponse, ServerHttpSession, ServerStats, Session, StaticTokenVerifier,
-    StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler,
-    TrafficVerbosity, TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
-    create_context_with_progress, create_context_with_progress_and_senders,
+    ProxyClient, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
+    ProxyToolCatalog, ProxyTypedCatalog, RequestSender, ResourceHandler, Router, Server,
+    ServerBuilder, ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, ServerStats,
+    Session, StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
+    ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
+    TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
+    create_context_with_progress_and_senders,
 };
 pub use fastmcp_server::{
     DuplicateBehavior, LifespanHooks, LoggingConfig, ServerLaunchPolicyError, ShutdownHook,
@@ -441,10 +467,12 @@ pub use fastmcp_client::{
     FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
     FinalCacheTtlDiagnostic, FinalResultCache, FinalTask, FinalTaskInputResponses,
     FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient,
-    HttpClientError, ListPageLimits, MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES,
-    OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback, Request,
-    RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
-    SubscriptionFilter, SubscriptionListenCollector,
+    HttpClientError, HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY,
+    MAX_FINAL_CACHE_MAX_BYTES, McpAppsBridgeTransport, McpAppsHost, McpAppsHostConfiguration,
+    McpAppsHostError, McpAppsHostPolicy, McpAppsInMemoryHostTransport,
+    McpAppsInMemoryViewTransport, OpaquePagination, PaginationBounds, PendingRequestRecord,
+    ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
+    RequestTimeoutSource, SubscriptionFilter, SubscriptionListenCollector, mcp_apps_in_memory_pair,
 };
 
 // Public client HTTP execution and configuration surfaces.
@@ -456,7 +484,8 @@ pub use fastmcp_client::http_executor::{
     ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpExecutor, ModernHttpExecutorError,
     ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseMetadata,
     ModernHttpResponseStream, ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
-    ModernHttpSubscriptionListenError, validate_response_head,
+    ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
+    ModernHttpSubscriptionListener, validate_response_head,
 };
 pub use fastmcp_client::mcp_config::{
     ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
@@ -477,6 +506,7 @@ pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 pub mod auto {
     pub use fastmcp_client::http_executor::{
         ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
+        ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
     };
     pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
     pub use fastmcp_client::{
@@ -485,7 +515,7 @@ pub mod auto {
         ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
         ClientProtocolPlanError, ClientSession, FinalTask, FinalTaskInputResponses,
         FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient,
-        HttpClientError, SubscriptionFilter, SubscriptionListenCollector,
+        HttpClientError, HttpSubscriptionListener, SubscriptionFilter, SubscriptionListenCollector,
     };
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::extensions::{
@@ -523,7 +553,38 @@ pub mod auto {
 /// and policy surfaces instead of relying on the legacy root constant. The
 /// underlying server/client implementations retain their own qualification
 /// boundaries; re-exporting a type here does not claim aggregate protocol
-/// conformance.
+/// conformance. In particular, it does not expose the legacy reverse JSON-RPC
+/// transport senders, policy-reset APIs, dual-era HTTP connectors, or the
+/// era-less server dispatcher. Use the root exports for intentionally
+/// unqualified integration seams, or
+/// [`legacy_2024`](crate::legacy_2024) for exact-2024 APIs.
+///
+/// ```compile_fail
+/// use fastmcp_rust::modern::{ClientBuilder, ProtocolPolicy};
+///
+/// let _ = ClientBuilder::new().protocol_plan(ProtocolPolicy::LegacyOnly);
+/// ```
+///
+/// ```compile_fail
+/// use fastmcp_rust::modern::{ClientBuilder, ReverseRequestHandlers};
+///
+/// let _ = ClientBuilder::new().reverse_request_handlers(ReverseRequestHandlers::new());
+/// ```
+///
+/// ```compile_fail
+/// use fastmcp_rust::modern::{CoreRequest, CoreResult, decode_peer_result};
+/// ```
+///
+/// ```compile_fail
+/// use fastmcp_rust::modern::{ClientHttpConnection, DualEraHttpEndpoint};
+/// ```
+///
+/// ```compile_fail
+/// use fastmcp_rust::modern::ServerBuilder;
+///
+/// let server = ServerBuilder::new("final-only", "1.0.0").build();
+/// let _ = server.dispatch_request;
+/// ```
 pub mod modern {
     pub use fastmcp_client::http_executor::{
         MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
@@ -531,40 +592,26 @@ pub mod modern {
         ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
         ModernHttpResponseMetadata, ModernHttpResponseStream, ModernHttpSseResponseStream,
         ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
-        validate_response_head,
+        ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener, validate_response_head,
     };
-    pub use fastmcp_client::mcp_config::{
-        ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
-        ServerConfig, claude_desktop_config_path, default_config_paths,
-    };
-    pub use fastmcp_client::sse;
-    pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
     pub use fastmcp_client::{
-        BoundedListPage, CachePartitionKey, CancellationRequested, Client, ClientBuilder,
-        ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
-        ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
-        ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-        CompletionContext, CompletionParams, CompletionReference, DEFAULT_FINAL_CACHE_CAPACITY,
+        BoundedListPage, CachePartitionKey, CancellationRequested, CompletionContext,
+        CompletionParams, CompletionReference, DEFAULT_FINAL_CACHE_CAPACITY,
         DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason, ExecutionTerminalRecord,
         ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey,
         FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
         FinalCacheTtlDiagnostic, FinalResultCache, FinalTask, FinalTaskInputResponses,
-        FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient,
-        HttpClientError, ListPageLimits, MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES,
-        OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback, Request,
-        RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
+        FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, ListPageLimits,
+        MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES, OpaquePagination, PaginationBounds,
+        PendingRequestRecord, ProgressCallback, RequestTimeoutPolicy, RequestTimeoutSource,
         SubscriptionFilter, SubscriptionListenCollector,
     };
-    pub use fastmcp_client::{http_executor, mcp_config};
     pub use fastmcp_core::{
-        CanonicalHttpUrl, ClientCapabilityInfo, Cx, ElicitationAction, ElicitationMode,
-        ElicitationRequest, ElicitationResponse, ElicitationSender, MAX_RESOURCE_READ_DEPTH,
-        MAX_TOOL_CALL_DEPTH, McpContext, McpContextLeaseGuard, McpError, McpOutcome,
-        McpRequestCancellation, McpResult, NoOpElicitationSender, NoOpNotificationSender,
-        NoOpSamplingSender, NotificationSender, Outcome, ProgressReporter, ResourceContentItem,
-        ResourceReadResult, ResourceReader, SamplingRequest, SamplingRequestMessage,
-        SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo,
-        ToolCallResult, ToolCaller, ToolContentItem,
+        CanonicalHttpUrl, ClientCapabilityInfo, Cx, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH,
+        McpContext, McpContextLeaseGuard, McpError, McpOutcome, McpRequestCancellation, McpResult,
+        NoOpNotificationSender, NotificationSender, Outcome, ProgressReporter, ResourceContentItem,
+        ResourceReadResult, ResourceReader, ServerCapabilityInfo, ToolCallResult, ToolCaller,
+        ToolContentItem,
     };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::common_types::{
@@ -612,30 +659,21 @@ pub mod modern {
         resolve_official_mcp_apps_settings,
     };
     pub use fastmcp_protocol::methods::Final2026Peer;
-    pub use fastmcp_protocol::protocol_policy::{
-        HttpEndpointBundle, HttpEndpointBundleError, HttpEndpointBundleKey, HttpEraCache,
-        HttpEraDecision, HttpModernProbe, HttpProbeBody, HttpRouteKind, MODERN_PROTOCOL_VERSION,
-        ModernVersionSupport, ProtocolEra, ProtocolPolicy, ProtocolPolicyError,
-        ProtocolPolicySelection, ProtocolRole, ProtocolVersion, ProtocolVersionError,
-        StdioEraClassifier, StdioEraDecision, StdioEraRejection, StdioEraState, StdioOpeningFrame,
-    };
+    pub use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
     pub use fastmcp_protocol::schema::FINAL_JSON_SCHEMA_DIALECT;
     pub use fastmcp_protocol::tasks_extension::TASK_UPDATE;
     pub use fastmcp_protocol::{
         AdmittedSchema, CacheScope, CacheTtl, CacheableResult, CancellationSender,
         CancellationWireCodecError, CancellationWireMessage, ClientCapabilities, ClientInfo,
         ClientNotification, CompleteResult, CompleteResultPayload, CompleteTaskResult,
-        CoreDispatchError, CoreRequest, CoreResult,
-        CoreResultDiscriminatorPolicy, CreateTaskResult, DecodedResult, DiscoveryCacheHints,
-        EmptyTaskResult, ExactJsonMember, ExactJsonObject, ExactJsonValue,
-        FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
+        CreateTaskResult, DiscoveryCacheHints, EmptyTaskResult, ExactJsonMember, ExactJsonObject,
+        ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
         FINAL_PROTOCOL_VERSION as PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY,
         FINAL_SERVER_INFO_META_KEY, FinalArguments, FinalBaseMetadata, FinalCallToolParams,
         FinalCallToolResult, FinalCancelTaskParams, FinalCancelTaskResult,
         FinalCancelledNotificationParams, FinalCompletionArgument, FinalCompletionContext,
         FinalCompletionParams, FinalCompletionReference, FinalCompletionResult,
-        FinalCompletionValues, FinalCoreRequest, FinalCoreResult, FinalCoreResultType,
-        FinalCreateMessageInputRequiredResult,
+        FinalCompletionValues, FinalCoreResultType, FinalCreateMessageInputRequiredResult,
         FinalCreateMessageParams, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams,
         FinalEmbeddedElicitationParams, FinalEmbeddedElicitationResult,
         FinalEmbeddedFormElicitationParams, FinalEmbeddedInputKind, FinalEmbeddedInputRequest,
@@ -654,16 +692,22 @@ pub mod modern {
         FinalTaskError, FinalTaskId, FinalTaskStatus, FinalTaskStatusNotificationParams, FinalTool,
         FinalToolAnnotations, FinalToolChoice, FinalToolChoiceMode, HEADER_MISMATCH_ERROR_CODE,
         HeaderMismatchError, HeaderMismatchReason, IncludeContext, InputRequiredResult,
+        MAX_MCP_APPS_CSP_DOMAIN_BYTES, MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE,
+        MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES, MAX_MCP_APPS_UI_METADATA_MEMBERS,
         MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
         MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES, MAX_TASK_ID_BYTES,
-        MAX_TASK_INPUT_MAP_ENTRIES, MAX_TASK_SUBSCRIPTION_IDS, MCP_METHOD_HEADER, MCP_NAME_HEADER,
-        MCP_PROTOCOL_VERSION_HEADER, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MetadataView,
+        MAX_TASK_INPUT_MAP_ENTRIES, MAX_TASK_SUBSCRIPTION_IDS,
+        MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY, MCP_METHOD_HEADER,
+        MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
+        MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, McpAppsDisplayMode, McpAppsLifecycleError,
+        McpAppsMetadataError, McpAppsResourceBinding, McpAppsResourceBindingError,
+        McpAppsResourceCsp, McpAppsResourceMetadata, McpAppsResourcePermission,
+        McpAppsResourcePermissions, McpAppsResultProjectionError, McpAppsToolMetadata,
+        McpAppsToolResult, McpAppsToolVisibility, McpAppsViewLifecycle, MetadataView,
         MissingRequiredClientCapabilityError, ModelHint, ModelPreferences, PaginatedResult,
         ProgressMarker, ProtocolVersionError as FinalProtocolVersionError, RELATED_TASK_META_KEY,
         RawResultEnvelope, RequestAdmissionError, RequestId, RequestVersionMetadata,
-        RequiredCapabilitiesError, ResultDecodeError, ResultDecodeErrorKind,
-        ResultDiscriminatorDecision, ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic,
-        ResultPeerEra, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
+        RequiredCapabilitiesError, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
         SUPPORTED_FINAL_PROTOCOL_VERSIONS, SchemaAdmissionError, ServerBehavior,
         ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
         ServerDiscoverResult, ServerDiscoveryError, ServerInstructionError, ServerInstructions,
@@ -677,17 +721,12 @@ pub mod modern {
         UnsupportedProtocolVersionError, UpdateTaskParams as FinalUpdateTaskParams, UriTemplate,
         UriTemplateError, UriTemplateExpansionLimits, UriTemplateExpression, UriTemplateModifier,
         UriTemplateOperator, UriTemplatePart, ValidationError, ValidationResult,
-        admit_final_http_request, admit_final_request, admit_final_schema, decode_peer_result,
-        decode_peer_result_for_era, decode_typed_complete, encode_complete_result, encode_result,
-        exact_json_from_serde, exact_json_to_serde, parse_exact_json, set_task_subscription_ids,
+        admit_final_http_request, admit_final_request, admit_final_schema, decode_typed_complete,
+        encode_complete_result, encode_result, exact_json_from_serde, exact_json_to_serde,
+        parse_exact_json, project_final_core_tools_call_result, set_task_subscription_ids,
         task_subscription_ids, validate_final_core_result, validate_final_protocol_version,
     };
-    pub use fastmcp_protocol::{
-        JsonRpcAdmissionError, JsonRpcMessage, decode_strict_jsonrpc_message,
-    };
-    pub use fastmcp_protocol::{
-        common_types, extensions, methods, protocol_policy, schema, tasks_extension,
-    };
+    pub use fastmcp_protocol::{common_types, extensions, schema, tasks_extension};
     pub use fastmcp_server::bidirectional::{
         DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND, DEFAULT_MAX_MRTR_INPUT_REQUESTS_TOTAL,
         DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES, DEFAULT_MAX_MRTR_REQUEST_STATES,
@@ -697,45 +736,230 @@ pub mod modern {
         HARD_MAX_MRTR_REQUEST_STATES, HARD_MAX_MRTR_ROUNDS, MrtrCompletedInputs,
         MrtrExchangeRegistry, MrtrInputKind, MrtrInputRequest, MrtrInputRequests,
         MrtrInputRequired, MrtrInputResponse, MrtrInputResponses, MrtrRequestState, MrtrRetry,
-        PendingRequests, RequestSender, TransportElicitationSender, TransportRootsProvider,
-        TransportSamplingSender,
     };
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthProvider, AuthRequest, AuthorizedTaskServiceRunner,
-        BidirectionalSenders, BoundHttpServer, BoxFuture, CompletionHandler,
-        DEFAULT_IN_MEMORY_FINAL_TASKS, DuplicateBehavior, ExtensionHandler,
-        ExtensionHandlerInvocationError, ExtensionHandlerKey, ExtensionHandlerLookupError,
-        ExtensionHandlerRegistrationError, ExtensionHandlerRegistry, FinalTaskAcceptedInput,
-        FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
-        FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
-        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-        FinalToolOutcome, HttpServerConfig, InMemoryFinalTaskStore, InboundRequestContext,
-        InboundRequestTransport, LifespanHooks, LoggingConfig, Middleware, MiddlewareDecision,
-        MountResult, ProgressNotificationSender, PromptHandler, ResourceHandler, Router, Server,
-        ServerBuilder, ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession,
-        ShutdownHook, StartupHook, TagFilters, ToolErrorKind, ToolHandler,
-        create_context_with_progress, create_context_with_progress_and_senders,
-    };
-    pub use fastmcp_transport as transport;
-    pub use fastmcp_transport::http::{
-        DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
-        DualEraHttpEndpointResponse, DualEraHttpJsonResponse, DualEraHttpLegacySseResponse,
-        DualEraHttpSession, DualEraHttpSseResponse,
+        BoundHttpServer, BoxFuture, CompletionHandler, DEFAULT_IN_MEMORY_FINAL_TASKS,
+        DuplicateBehavior, ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
+        ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
+        FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
+        FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
+        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
+        FinalTaskWorkDescriptor, FinalToolOutcome, InMemoryFinalTaskStore, LifespanHooks,
+        LoggingConfig, Middleware, MiddlewareDecision, MountResult, ProgressNotificationSender,
+        PromptHandler, ResourceHandler, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
+        ToolHandler, create_context_with_progress,
     };
     pub use fastmcp_transport::{
-        AsyncStdioTransport, Codec, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest,
-        HttpRequestHandler, HttpResponse, HttpResponseRepresentation, HttpStatus,
-        ModernHttpRequestAdmission, SendPermit, StdioTransport, StreamableHttpRequestCancellation,
+        ModernHttpRequestAdmission, SendPermit, StreamableHttpRequestCancellation,
         StreamableHttpRequestResponseStream, StreamableHttpResponseStream, StreamableHttpTransport,
-        Transport, TransportError, TransportRecvHalf, TransportSendHalf, TwoPhaseTransport, http,
-        memory, websocket,
+        TransportError,
     };
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
+
+    /// A non-resettable marker for the modern facade's sole protocol policy.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ModernOnly;
+
+    /// Final-only facade over the underlying client builder.
+    #[derive(Clone)]
+    pub struct ClientBuilder {
+        inner: fastmcp_client::ClientBuilder,
+    }
+
+    impl ClientBuilder {
+        /// Creates a builder permanently pinned to MCP 2026-07-28 stdio.
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                inner: fastmcp_client::ClientBuilder::new().protocol_plan(
+                    fastmcp_client::ClientProtocolPlan::stdio(
+                        fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+                    ),
+                ),
+            }
+        }
+
+        /// Returns the sole policy admitted by this facade.
+        #[must_use]
+        pub const fn protocol_policy(&self) -> ModernOnly {
+            ModernOnly
+        }
+
+        /// Sets the client identity for final discovery.
+        #[must_use]
+        pub fn client_info(self, name: impl Into<String>, version: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.client_info(name, version),
+            }
+        }
+
+        /// Sets the ordinary request timeout policy.
+        #[must_use]
+        pub fn request_timeout_policy(self, policy: RequestTimeoutPolicy) -> Self {
+            Self {
+                inner: self.inner.request_timeout_policy(policy),
+            }
+        }
+
+        /// Configures final discovery capabilities.
+        #[must_use]
+        pub fn capabilities(self, capabilities: ClientCapabilities) -> Self {
+            Self {
+                inner: self.inner.capabilities(capabilities),
+            }
+        }
+
+        /// Configures the MCP Apps MIME types advertised during final discovery.
+        #[must_use]
+        pub fn mcp_apps(self, settings: McpAppsClientSettings) -> Self {
+            Self {
+                inner: self.inner.mcp_apps(settings),
+            }
+        }
+
+        /// Connects the final-only stdio plan using the current capability context.
+        pub fn connect_stdio(self, command: &str, args: &[&str]) -> McpResult<Client> {
+            self.inner
+                .connect_stdio(command, args)
+                .map(Client::from_inner)
+        }
+
+        /// Connects the final-only stdio plan with an explicit capability context.
+        pub fn connect_stdio_with_cx(
+            self,
+            command: &str,
+            args: &[&str],
+            cx: &Cx,
+        ) -> McpResult<Client> {
+            self.inner
+                .connect_stdio_with_cx(command, args, cx)
+                .map(Client::from_inner)
+        }
+    }
+
+    impl Default for ClientBuilder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// Final-only facade over a connected client.
+    pub struct Client {
+        inner: fastmcp_client::Client,
+    }
+
+    impl Client {
+        fn from_inner(inner: fastmcp_client::Client) -> Self {
+            Self { inner }
+        }
+
+        /// Returns the pinned final protocol version.
+        #[must_use]
+        pub const fn protocol_version(&self) -> &'static str {
+            MODERN_PROTOCOL_VERSION
+        }
+
+        /// Closes the owned final client connection.
+        pub fn close(&mut self) -> McpResult<()> {
+            self.inner.close()
+        }
+    }
+
+    /// Final-only facade over the underlying server builder.
+    pub struct ServerBuilder {
+        inner: fastmcp_server::ServerBuilder,
+    }
+
+    impl ServerBuilder {
+        /// Creates a builder pinned to MCP 2026-07-28.
+        #[must_use]
+        pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+            Self {
+                inner: fastmcp_server::ServerBuilder::new(name, version)
+                    .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly),
+            }
+        }
+
+        /// Returns the sole policy admitted by this facade.
+        #[must_use]
+        pub const fn protocol_policy(&self) -> ModernOnly {
+            ModernOnly
+        }
+
+        /// Installs the official MCP Apps discovery marker.
+        pub fn mcp_apps(self) -> Result<Self, fastmcp_server::ServerExtensionConfigurationError> {
+            self.inner.mcp_apps().map(|inner| Self { inner })
+        }
+
+        /// Registers one tool handler.
+        #[must_use]
+        pub fn tool<H: ToolHandler + 'static>(self, handler: H) -> Self {
+            Self {
+                inner: self.inner.tool(handler),
+            }
+        }
+
+        /// Registers one resource handler.
+        #[must_use]
+        pub fn resource<H: ResourceHandler + 'static>(self, handler: H) -> Self {
+            Self {
+                inner: self.inner.resource(handler),
+            }
+        }
+
+        /// Registers one prompt handler.
+        #[must_use]
+        pub fn prompt<H: PromptHandler + 'static>(self, handler: H) -> Self {
+            Self {
+                inner: self.inner.prompt(handler),
+            }
+        }
+
+        /// Builds a server with no facade-exposed legacy dispatcher.
+        #[must_use]
+        pub fn build(self) -> Server {
+            Server {
+                inner: self.inner.build(),
+            }
+        }
+    }
+
+    /// Final-only facade over a built server.
+    pub struct Server {
+        inner: fastmcp_server::Server,
+    }
+
+    impl Server {
+        /// Returns final discovery metadata.
+        pub fn server_discovery(&self) -> McpResult<ServerDiscoverResult> {
+            self.inner.server_discovery()
+        }
+
+        /// Publishes a final catalog or resource change notification.
+        pub fn publish_subscription_notification(
+            &self,
+            notification: ServerNotification,
+        ) -> McpResult<usize> {
+            self.inner.publish_subscription_notification(notification)
+        }
+
+        /// Runs this final-only server over stdio.
+        pub fn run_stdio(self) -> ! {
+            self.inner.run_stdio()
+        }
+    }
 
     /// Creates a client builder pinned to the ModernOnly stdio plan.
     #[must_use]
     pub fn client_builder() -> ClientBuilder {
-        ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+        ClientBuilder::new()
+    }
+
+    /// Creates a server builder pinned to MCP 2026-07-28.
+    #[must_use]
+    pub fn server_builder(name: impl Into<String>, version: impl Into<String>) -> ServerBuilder {
+        ServerBuilder::new(name, version)
     }
 }
 
@@ -752,9 +976,9 @@ pub mod legacy_2024 {
         CreateMessageParams as LegacyCreateMessageParams,
         CreateMessageResult as LegacyCreateMessageResult,
         ElicitRequestParams as LegacyElicitRequestParams, ElicitResult as LegacyElicitResult,
-        ElicitationRequestHandler as LegacyElicitationRequestHandler, HttpClient, HttpClientError,
-        ListRootsParams as LegacyListRootsParams, ListRootsResult as LegacyListRootsResult,
-        Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource,
+        HttpClient, HttpClientError, ListRootsParams as LegacyListRootsParams,
+        ListRootsResult as LegacyListRootsResult, Request, RequestExecution, RequestExecutor,
+        RequestTimeoutPolicy, RequestTimeoutSource,
         ReverseRequestHandlers as LegacyReverseRequestHandlers,
         RootsRequestHandler as LegacyRootsRequestHandler,
         SamplingRequestHandler as LegacySamplingRequestHandler,
@@ -930,6 +1154,7 @@ pub mod prelude {
         HttpResponse,
         HttpServerConfig,
         HttpStatus,
+        HttpSubscriptionListener,
         // Server
         InboundRequestContext,
         InboundRequestTransport,
@@ -938,8 +1163,28 @@ pub mod prelude {
         JsonValue,
         ListPageLimits,
         LoggingConfig,
+        MAX_MCP_APPS_CSP_DOMAIN_BYTES,
+        MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE,
+        MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES,
+        MAX_MCP_APPS_UI_METADATA_MEMBERS,
+        MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY,
+        MCP_APPS_UI_METADATA_KEY,
         McpAppsClientSettings,
+        McpAppsDisplayMode,
+        McpAppsLifecycleError,
+        McpAppsMetadataError,
         McpAppsNegotiationResolver,
+        McpAppsResourceBinding,
+        McpAppsResourceBindingError,
+        McpAppsResourceCsp,
+        McpAppsResourceMetadata,
+        McpAppsResourcePermission,
+        McpAppsResourcePermissions,
+        McpAppsResultProjectionError,
+        McpAppsToolMetadata,
+        McpAppsToolResult,
+        McpAppsToolVisibility,
+        McpAppsViewLifecycle,
         McpConfig,
         McpContext,
         McpError,
@@ -953,8 +1198,11 @@ pub mod prelude {
         ModernHttpExecutor,
         ModernHttpExecutorError,
         ModernHttpRequest,
+        ModernHttpResponseStream,
         ModernHttpSubscriptionListenCollector,
         ModernHttpSubscriptionListenError,
+        ModernHttpSubscriptionListenEvent,
+        ModernHttpSubscriptionListener,
         NegotiatedExtensionSet,
         OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
         OfficialTasksNegotiationResolver,
@@ -971,6 +1219,11 @@ pub mod prelude {
         ProxyBackend,
         ProxyCatalog,
         ProxyClient,
+        ProxyPromptCatalog,
+        ProxyResourceCatalog,
+        ProxyResourceTemplateCatalog,
+        ProxyToolCatalog,
+        ProxyTypedCatalog,
         RequestAdmissionError,
         RequestId,
         RequestTimeoutPolicy,
@@ -1019,6 +1272,7 @@ pub mod prelude {
         official_tasks_descriptor,
         official_tasks_empty_settings,
         ok,
+        project_final_core_tools_call_result,
         // Macros
         prompt,
         providers::FilesystemProvider,
@@ -1233,9 +1487,17 @@ mod tests {
 
         let explicit_modern_builder = modern::client_builder();
         assert_eq!(
-            explicit_modern_builder.selected_protocol_plan().policy(),
-            modern::ProtocolPolicy::ModernOnly
+            explicit_modern_builder.protocol_policy(),
+            modern::ModernOnly
         );
+        let _: modern::ClientBuilder = explicit_modern_builder;
+
+        let explicit_modern_server_builder = modern::server_builder("final-only", "1.0.0");
+        assert_eq!(
+            explicit_modern_server_builder.protocol_policy(),
+            modern::ModernOnly
+        );
+        let _: modern::Server = explicit_modern_server_builder.build();
 
         let _: Option<modern::ServerBuilder> = None;
         let _: Option<modern::ServerDiscoverRequest> = None;
@@ -1585,7 +1847,6 @@ mod tests {
         let _: Option<legacy_2024::LegacyReverseRequestHandlers> = None;
         let _: Option<legacy_2024::LegacySamplingRequestHandler> = None;
         let _: Option<legacy_2024::LegacyRootsRequestHandler> = None;
-        let _: Option<legacy_2024::LegacyElicitationRequestHandler> = None;
         let _: Option<legacy_2024::LegacyCreateMessageParams> = None;
         let _: Option<legacy_2024::LegacyCreateMessageResult> = None;
         let _: Option<legacy_2024::LegacyListRootsParams> = None;
@@ -1599,8 +1860,9 @@ mod tests {
         use super::{
             FinalCreateMessageParams, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams,
             FinalEmbeddedElicitationParams, FinalEmbeddedElicitationResult,
-            FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult, legacy_2024, modern,
-            prelude,
+            FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult, RequestSender, Server,
+            ServerBuilder, TransportElicitationSender, TransportRootsProvider,
+            TransportSamplingSender, legacy_2024, modern, prelude,
         };
 
         let _: Option<FinalCreateMessageParams> = None;
@@ -1627,6 +1889,16 @@ mod tests {
         let _: Option<legacy_2024::LegacyListRootsResult> = None;
         let _: Option<legacy_2024::LegacyElicitRequestParams> = None;
         let _: Option<legacy_2024::LegacyElicitResult> = None;
+
+        // The intentionally unqualified integration surface retains legacy
+        // reverse-JSON-RPC machinery; `modern` compile-fail docs above lock
+        // that machinery out of the final-era namespace.
+        let _: Option<RequestSender> = None;
+        let _: Option<TransportSamplingSender> = None;
+        let _: Option<TransportElicitationSender> = None;
+        let _: Option<TransportRootsProvider> = None;
+        let _: Option<Server> = None;
+        let _: Option<ServerBuilder> = None;
     }
 
     #[test]
@@ -1651,7 +1923,9 @@ mod tests {
 
     #[test]
     fn api_03_facade_exposes_apps_and_dual_era_configuration() {
-        use super::{Client, DuplicateBehavior, LoggingConfig, ServerBuilder, legacy_2024, modern};
+        use super::{
+            Client, DuplicateBehavior, LoggingConfig, McpResult, ServerBuilder, legacy_2024, modern,
+        };
 
         let settings =
             modern::McpAppsClientSettings::new(vec![modern::MCP_APPS_HTML_MIME_TYPE.to_owned()])
@@ -1663,7 +1937,7 @@ mod tests {
             .expect("facade must expose MCP Apps descriptor registration");
         assert_eq!(apps_id.as_str(), modern::OFFICIAL_MCP_APPS_EXTENSION_ID);
 
-        let _: fn(&mut Client, legacy_2024::LegacyReverseRequestHandlers) =
+        let _: fn(&mut Client, legacy_2024::LegacyReverseRequestHandlers) -> McpResult<()> =
             Client::set_reverse_request_handlers;
         let _: fn(ServerBuilder, DuplicateBehavior) -> ServerBuilder = ServerBuilder::on_duplicate;
         let _: fn(ServerBuilder, LoggingConfig) -> ServerBuilder = ServerBuilder::logging;

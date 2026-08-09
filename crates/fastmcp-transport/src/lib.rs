@@ -63,7 +63,16 @@ pub use http::{
     StreamableHttpRequestResponseStream, StreamableHttpResponseStream, StreamableHttpTransport,
 };
 pub use sse::{ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits, ModernSseParseError};
-pub use stdio::{AsyncStdioTransport, StdioTransport};
+pub use stdio::{AsyncStdioTransport, StdioRecvHalf, StdioSendHalf, StdioTransport};
+/// Public WebSocket ownership halves for caller-owned full-duplex lifecycles.
+///
+/// `WsTransport::into_split` and `WsClientTransport::into_split` return these
+/// handles. The receive half owns ingress plus control-frame replies; the send
+/// half exclusively owns application egress.
+pub use websocket::{
+    WsClientRecvHalf, WsClientSendHalf, WsClientTransport, WsServerRecvHalf, WsServerSendHalf,
+    WsTransport,
+};
 
 use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};

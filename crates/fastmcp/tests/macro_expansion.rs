@@ -22,7 +22,7 @@
 #![allow(dead_code)]
 
 use fastmcp_rust::asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
-use fastmcp_rust::serde_json::{self, json};
+use fastmcp_rust::serde_json::json;
 use fastmcp_rust::{
     ApplicationTaskSupervisor, CacheScope, CompleteResult, Content, ContentBlock, Cx,
     EmbeddedResourceContents, FinalAbsoluteUri, FinalCallToolResult, FinalGetPromptResult,
@@ -139,6 +139,194 @@ mod facade_only_macro_compile_proofs {
         let _: Option<fastmcp_rust::modern::FinalCallToolParams> = None;
         let _: Option<ResourceContent> = None;
     }
+}
+
+#[test]
+fn facade_only_dual_era_apps_and_subscription_surfaces_compile() {
+    use fastmcp_rust::{
+        FinalAbsoluteUri, FinalCoreResult, HttpSubscriptionListener, MAX_MCP_APPS_CSP_DOMAIN_BYTES,
+        MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE, MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES,
+        MAX_MCP_APPS_UI_METADATA_MEMBERS, MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY,
+        MCP_APPS_UI_METADATA_KEY, McpAppsDisplayMode, McpAppsLifecycleError, McpAppsMetadataError,
+        McpAppsResourceBinding, McpAppsResourceBindingError, McpAppsResourceCsp,
+        McpAppsResourceMetadata, McpAppsResourcePermission, McpAppsResourcePermissions,
+        McpAppsResultProjectionError, McpAppsToolMetadata, McpAppsToolResult,
+        McpAppsToolVisibility, McpAppsViewLifecycle, ModernHttpResponseStream,
+        ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener, RequestId, SseLimits,
+        SubscriptionFilter, legacy_2024, modern, prelude, project_final_core_tools_call_result,
+    };
+
+    let resource_uri = FinalAbsoluteUri::parse("ui://apps.example.test/view")
+        .expect("facade must expose final absolute URI parsing");
+    let metadata =
+        McpAppsToolMetadata::try_new(Some(resource_uri), Some(vec![McpAppsToolVisibility::Model]))
+            .expect("facade must expose valid final MCP Apps metadata admission");
+    assert_eq!(
+        metadata.effective_visibility(),
+        &[McpAppsToolVisibility::Model]
+    );
+    assert!(
+        metadata
+            .to_open_metadata()
+            .expect("facade metadata encoding must remain available")
+            .entries()
+            .contains_key(MCP_APPS_UI_METADATA_KEY)
+    );
+
+    let csp = McpAppsResourceCsp::try_new(
+        Some(vec!["https://api.example.test".to_owned()]),
+        None,
+        None,
+        None,
+    )
+    .expect("facade must expose bounded MCP Apps CSP admission");
+    let permissions = McpAppsResourcePermissions {
+        camera: Some(McpAppsResourcePermission {}),
+        ..McpAppsResourcePermissions::default()
+    };
+    let resource_metadata = McpAppsResourceMetadata::try_new(
+        Some(csp),
+        Some(permissions),
+        Some("apps.example.test".to_owned()),
+        Some(true),
+    )
+    .expect("facade must expose bounded MCP Apps resource metadata admission");
+    assert_eq!(resource_metadata.prefers_border, Some(true));
+    let tool_result = McpAppsToolResult::try_new(Vec::new(), false, None)
+        .expect("facade must expose bounded MCP Apps tool-result construction");
+    assert!(tool_result.content.is_empty());
+    assert_eq!(McpAppsDisplayMode::Pip, McpAppsDisplayMode::Pip);
+
+    let mut lifecycle = McpAppsViewLifecycle::default();
+    lifecycle
+        .begin_initialize()
+        .expect("final Apps lifecycle initialization must be admitted");
+    lifecycle
+        .initialization_succeeded()
+        .expect("final Apps lifecycle initialization response must be admitted");
+    lifecycle
+        .admit_initialized()
+        .expect("final Apps lifecycle notification must be admitted");
+    assert!(lifecycle.permits_application_traffic());
+
+    let non_ui_uri = FinalAbsoluteUri::parse("https://apps.example.test/view")
+        .expect("only the URI scheme differs from the accepted metadata baseline");
+    assert_eq!(
+        McpAppsToolMetadata::try_new(Some(non_ui_uri), Some(vec![McpAppsToolVisibility::Model]),),
+        Err(McpAppsMetadataError::ResourceUriMustUseUiScheme),
+        "changing only the resource URI scheme must be rejected"
+    );
+
+    let event = ModernHttpSubscriptionListenEvent::Acknowledged {
+        accepted_filter: SubscriptionFilter::default(),
+    };
+    assert!(matches!(
+        event,
+        ModernHttpSubscriptionListenEvent::Acknowledged { .. }
+    ));
+
+    let _: fn(
+        ModernHttpResponseStream,
+        RequestId,
+        SubscriptionFilter,
+        SseLimits,
+    ) -> Result<
+        ModernHttpSubscriptionListener,
+        fastmcp_rust::ModernHttpSubscriptionListenError,
+    > = ModernHttpResponseStream::into_final_subscriptions_listener;
+    let _: fn(&FinalCoreResult) -> Result<McpAppsToolResult, McpAppsResultProjectionError> =
+        project_final_core_tools_call_result;
+    let _: fn(&modern::FinalTool) -> Result<Option<McpAppsResourceBinding>, McpAppsMetadataError> =
+        modern::FinalTool::mcp_apps_resource_binding;
+    let _: fn(
+        &modern::FinalResource,
+    ) -> Result<Option<McpAppsResourceMetadata>, McpAppsMetadataError> =
+        modern::FinalResource::mcp_apps_metadata;
+
+    let _: Option<HttpSubscriptionListener<'static>> = None;
+    let _: Option<modern::ModernHttpSubscriptionListenEvent> = None;
+    let _: Option<modern::ModernHttpSubscriptionListener> = None;
+    let _: Option<prelude::McpAppsToolMetadata> = None;
+    let _: Option<prelude::McpAppsResourceBinding> = None;
+    let _: Option<prelude::McpAppsResourceCsp> = None;
+    let _: Option<prelude::McpAppsResourcePermission> = None;
+    let _: Option<prelude::McpAppsResourcePermissions> = None;
+    let _: Option<prelude::McpAppsToolResult> = None;
+    let _: Option<prelude::McpAppsViewLifecycle> = None;
+    let _: Option<prelude::HttpSubscriptionListener<'static>> = None;
+    let _: Option<prelude::ModernHttpSubscriptionListenEvent> = None;
+    let _: Option<prelude::ModernHttpSubscriptionListener> = None;
+    let _: usize = prelude::MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE;
+    let _: usize = prelude::MAX_MCP_APPS_CSP_DOMAIN_BYTES;
+    let _: usize = prelude::MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES;
+    let _: usize = prelude::MAX_MCP_APPS_UI_METADATA_MEMBERS;
+    assert_eq!(prelude::MCP_APPS_UI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY);
+    let _: Option<legacy_2024::LegacyReverseRequestHandlers> = None;
+    let _: Option<legacy_2024::LegacySamplingRequestHandler> = None;
+    let _: Option<legacy_2024::LegacyRootsRequestHandler> = None;
+    let _: Option<legacy_2024::LegacySseHttpClient> = None;
+    let _: Option<McpAppsLifecycleError> = None;
+    let _: Option<McpAppsResourceBindingError> = None;
+    let _: usize = MAX_MCP_APPS_UI_METADATA_MEMBERS;
+    let _: usize = MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES;
+    let _: usize = MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE;
+    let _: usize = MAX_MCP_APPS_CSP_DOMAIN_BYTES;
+    assert_eq!(
+        MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY,
+        "ui/resourceUri"
+    );
+}
+
+#[test]
+fn facade_only_typed_proxy_catalogs_compile_for_legacy_and_final_eras() {
+    use fastmcp_rust::{
+        CoreResult, FinalPrompt, FinalResource, FinalResourceTemplate, FinalTool, JsonValue,
+        McpContext, McpResult, Prompt, ProxyClient, ProxyPromptCatalog, ProxyResourceCatalog,
+        ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, ProtocolEra, Resource,
+        ResourceTemplate, Tool,
+    };
+
+    let legacy = ProxyTypedCatalog {
+        tools: ProxyToolCatalog::Legacy(Vec::<Tool>::new()),
+        resources: ProxyResourceCatalog::Legacy(Vec::<Resource>::new()),
+        resource_templates: ProxyResourceTemplateCatalog::Legacy(Vec::<ResourceTemplate>::new()),
+        prompts: ProxyPromptCatalog::Legacy(Vec::<Prompt>::new()),
+    };
+    assert_eq!(
+        legacy.era().expect("legacy catalog has one exact era"),
+        ProtocolEra::Legacy2024
+    );
+
+    let final_catalog = ProxyTypedCatalog {
+        tools: ProxyToolCatalog::Final(Vec::<FinalTool>::new()),
+        resources: ProxyResourceCatalog::Final(Vec::<FinalResource>::new()),
+        resource_templates: ProxyResourceTemplateCatalog::Final(
+            Vec::<FinalResourceTemplate>::new(),
+        ),
+        prompts: ProxyPromptCatalog::Final(Vec::<FinalPrompt>::new()),
+    };
+    assert_eq!(
+        final_catalog
+            .era()
+            .expect("final catalog has one exact era"),
+        ProtocolEra::Modern2026
+    );
+    assert!(final_catalog.final_tools().is_some());
+    assert!(final_catalog.final_resources().is_some());
+    assert!(final_catalog.final_resource_templates().is_some());
+    assert!(final_catalog.final_prompts().is_some());
+
+    let _: fn(&ProxyClient) -> McpResult<ProxyTypedCatalog> = ProxyClient::catalog_typed;
+    let _: fn(&ProxyClient, &McpContext, &str, JsonValue) -> McpResult<CoreResult> =
+        ProxyClient::call_tool_typed;
+    let _: fn(&ProxyClient, &McpContext, &str) -> McpResult<CoreResult> =
+        ProxyClient::read_resource_typed;
+    let _: fn(
+        &ProxyClient,
+        &McpContext,
+        &str,
+        std::collections::HashMap<String, String>,
+    ) -> McpResult<CoreResult> = ProxyClient::get_prompt_typed;
 }
 
 // ============================================================================

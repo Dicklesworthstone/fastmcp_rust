@@ -25,7 +25,7 @@ use fastmcp_rust::{
     TokenAuthProvider,
 };
 #[cfg(unix)]
-use fastmcp_rust::{Client, Cx, ProtocolEra, ProtocolPolicy, auto};
+use fastmcp_rust::{Client, Cx, ProtocolEra, ProtocolPolicy, auto, legacy_2024, modern};
 use serde_json::json;
 
 // ============================================================================
@@ -1205,6 +1205,36 @@ fn connect_auto_stdio_to_shipped_echo_server(server_policy: &str) -> Client {
 }
 
 #[cfg(unix)]
+fn connect_modern_stdio_to_shipped_echo_server(server_policy: &str) -> McpResult<Client> {
+    let executable = shipped_echo_server_executable();
+    let command = executable
+        .to_str()
+        .expect("the shipped example path is valid UTF-8");
+    let builder = modern::client_builder().env("FASTMCP_PROTOCOL_POLICY", server_policy);
+    assert_eq!(
+        builder.selected_protocol_plan().policy(),
+        ProtocolPolicy::ModernOnly
+    );
+
+    builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
+}
+
+#[cfg(unix)]
+fn connect_legacy_stdio_to_shipped_echo_server(server_policy: &str) -> McpResult<Client> {
+    let executable = shipped_echo_server_executable();
+    let command = executable
+        .to_str()
+        .expect("the shipped example path is valid UTF-8");
+    let builder = legacy_2024::client_builder().env("FASTMCP_PROTOCOL_POLICY", server_policy);
+    assert_eq!(
+        builder.selected_protocol_plan().policy(),
+        ProtocolPolicy::LegacyOnly
+    );
+
+    builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
+}
+
+#[cfg(unix)]
 #[test]
 fn e2e_public_stdio_auto_selects_modern_on_the_shipped_facade_server() {
     let mut client = connect_auto_stdio_to_shipped_echo_server("auto");
@@ -1224,9 +1254,13 @@ fn e2e_public_stdio_auto_selects_modern_on_the_shipped_facade_server() {
         client.server_discovery().is_some(),
         "a modern selection retains its public discovery observable"
     );
-    client
-        .ping()
-        .expect("the selected modern stdio client remains usable");
+    let tools = client
+        .list_tools()
+        .expect("the selected modern stdio client accepts tools/list");
+    assert!(
+        tools.iter().any(|tool| tool.name == "echo"),
+        "the modern tools/list result must expose the shipped echo tool"
+    );
     client.close().expect("modern stdio client cleanup");
 }
 
@@ -1254,4 +1288,76 @@ fn e2e_public_stdio_auto_falls_back_to_exact_legacy_on_the_shipped_facade_server
         .ping()
         .expect("the selected exact-legacy stdio client remains usable");
     client.close().expect("legacy stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_only_round_trips_with_the_shipped_facade_server() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    assert_eq!(client.protocol_policy(), ProtocolPolicy::ModernOnly);
+    assert_eq!(
+        client.selected_protocol_era(),
+        Some(ProtocolEra::Modern2026)
+    );
+    assert_eq!(
+        client.protocol_version(),
+        fastmcp_rust::modern::PROTOCOL_VERSION
+    );
+    let tools = client
+        .list_tools()
+        .expect("the explicit ModernOnly connection accepts tools/list");
+    assert!(
+        tools.iter().any(|tool| tool.name == "echo"),
+        "the modern tools/list result must expose the shipped echo tool"
+    );
+    client.close().expect("modern-only stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_only_rejects_the_exact_legacy_shipped_server() {
+    // This differs from the matched ModernOnly positive only in the child
+    // server's policy. The public client must not silently downgrade.
+    let result = connect_modern_stdio_to_shipped_echo_server("legacy-only");
+
+    assert!(
+        result.is_err(),
+        "a ModernOnly facade client must reject the exact legacy server instead of downgrading"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_only_round_trips_with_the_shipped_facade_server() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    assert_eq!(client.protocol_policy(), ProtocolPolicy::LegacyOnly);
+    assert_eq!(
+        client.selected_protocol_era(),
+        Some(ProtocolEra::Legacy2024)
+    );
+    assert_eq!(
+        client.protocol_version(),
+        fastmcp_rust::legacy_2024::PROTOCOL_VERSION
+    );
+    client
+        .ping()
+        .expect("the explicit LegacyOnly core connection remains usable");
+    client.close().expect("legacy-only stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_only_rejects_the_modern_shipped_server() {
+    // This differs from the matched LegacyOnly positive only in the child
+    // server's policy. The public client must not infer a legacy lifecycle.
+    let result = connect_legacy_stdio_to_shipped_echo_server("modern-only");
+
+    assert!(
+        result.is_err(),
+        "a LegacyOnly facade client must reject the modern server instead of selecting a foreign era"
+    );
 }

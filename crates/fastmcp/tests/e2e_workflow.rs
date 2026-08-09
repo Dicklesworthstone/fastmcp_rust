@@ -11,14 +11,23 @@
 //! - Client info propagation
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
-use std::thread::JoinHandle;
+use std::sync::{Arc, mpsc};
+use std::task::Poll;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use fastmcp_protocol::{LegacyContent, LegacyPromptMessage, LegacyResourceContent, Tool};
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
-    McpContext, McpResult, PromptMessage, ResourceContent, ResourceTemplate, Role, Server,
-    ToolHandler, prompt, resource, tool,
+    ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, CanonicalHttpUrl,
+    ClientHttpConnectionError, ClientProtocolPlan, Cx, FinalTask, FinalTaskInputRequests,
+    FinalTaskInputResponses, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalToolOutcome,
+    McpContext, McpResult, PromptMessage, ProtocolPolicy, RequestId, ResourceContent,
+    ResourceTemplate, Role, Server, ToolHandler, auto, prompt, resource, tool,
 };
 use serde_json::json;
 
@@ -742,668 +751,449 @@ impl LegacyContentExt for LegacyContent {
 // Background Tasks E2E Tests (bd-og1)
 // ============================================================================
 
-// Network Tasks are quarantined pending TASK-01/TASK-02. Keep this historical
-// E2E source compile-inert so it cannot imply a supported or advertised RPC
-// surface while the replacement ownership and structured-concurrency design is
-// implemented.
-#[cfg(any())]
-#[rustfmt::skip]
-mod quarantined_network_tasks_e2e {
-use super::*;
+// ============================================================================
+// Final Tasks public-facade HTTP E2E tests
+// ============================================================================
 
-use fastmcp_rust::TaskManager;
+const FINAL_TASKS_E2E_BOUND: Duration = Duration::from_secs(2);
+const FINAL_TASKS_SERVER_BOUND: Duration = Duration::from_secs(4);
 
-/// Helper: build a server with background task support.
-fn setup_task_server() -> TestHarness {
-    let (builder, client_transport, server_transport) = TestServer::builder()
-        .with_name("task-test-server")
-        .with_version("1.0.0")
-        .build_server_builder();
+fn final_tasks_runtime_block_on<F: Future>(future: F) -> F::Output {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("final Tasks E2E runtime builds")
+        .block_on(future)
+}
 
-    // Create task manager and register handlers
-    let task_manager = TaskManager::new();
+fn final_tasks_runtime_block_on_bounded<F: Future>(cx: &Cx, future: F) -> F::Output {
+    final_tasks_runtime_block_on(async {
+        asupersync::time::timeout(cx.now(), FINAL_TASKS_E2E_BOUND, future)
+            .await
+            .expect("final Tasks public HTTP operation stays within its bound")
+    })
+}
 
-    // Register a simple counter task that completes quickly
-    task_manager.register_handler("quick_task", |_cx, params| async move {
-        let value = params.get("value").and_then(|v| v.as_i64()).unwrap_or(0);
-        Ok(serde_json::json!({"result": value * 2}))
-    });
+struct FinalTasksHttpFixture {
+    address: SocketAddr,
+    shutdown: mpsc::SyncSender<()>,
+    finished: mpsc::Receiver<Result<(), String>>,
+    join: Option<JoinHandle<()>>,
+}
 
-    // Register a long-running task that can report progress
-    task_manager.register_handler("progress_task", |_cx, params| async move {
-        let steps = params.get("steps").and_then(|v| v.as_i64()).unwrap_or(3) as usize;
-        // Simulate work by returning after "steps" iterations
-        Ok(serde_json::json!({"completed_steps": steps}))
-    });
+impl FinalTasksHttpFixture {
+    fn spawn(server: Server, runner: AuthorizedTaskServiceRunner) -> Self {
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let mut join = Some(thread::spawn(move || {
+            let (task_done_tx, task_done_rx) = mpsc::channel();
+            let (server_cx_tx, server_cx_rx) = mpsc::sync_channel(1);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(
+                    asupersync::runtime::reactor::create_reactor()
+                        .expect("final Tasks E2E server reactor initializes"),
+                )
+                .blocking_threads(4, 64)
+                .build()
+                .expect("final Tasks E2E server runtime builds");
+            runtime
+                    .handle()
+                    .try_spawn_with_cx(move |cx| async move {
+                        let _ = server_cx_tx.send(cx.clone());
+                        let mut service = Box::pin(runner.run(&cx));
+                        let service_ready = std::future::poll_fn(|task_context| {
+                            match service.as_mut().poll(task_context) {
+                                Poll::Pending => Poll::Ready(Ok(())),
+                                Poll::Ready(Ok(())) => Poll::Ready(Err(
+                                    "final Tasks service stopped before HTTP startup".to_owned(),
+                                )),
+                                Poll::Ready(Err(error)) => Poll::Ready(Err(format!(
+                                    "final Tasks service failed before HTTP startup: {error}"
+                                ))),
+                            }
+                        })
+                        .await;
+                        if let Err(error) = service_ready {
+                            let _ = ready_tx.send(Err(error.clone()));
+                            let _ = finished_tx.send(Err(error));
+                            let _ = task_done_tx.send(());
+                            return;
+                        }
+                        let outcome =
+                            asupersync::time::timeout(cx.now(), FINAL_TASKS_SERVER_BOUND, async {
+                                let bound = server.bind_http(&cx, "127.0.0.1:0").await.map_err(
+                                    |error| format!("final Tasks E2E bind failed: {error}"),
+                                )?;
+                                let address = bound.local_addr().map_err(|error| {
+                                    format!("final Tasks E2E address failed: {error}")
+                                })?;
+                                ready_tx.send(Ok(address)).map_err(|_| {
+                                    "final Tasks E2E startup receiver went away".to_owned()
+                                })?;
+                                let mut serving = Box::pin(bound.serve(&cx));
+                                let mut service_stopped = false;
+                                std::future::poll_fn(|task_context| {
+                                    if !service_stopped {
+                                        match service.as_mut().poll(task_context) {
+                                            Poll::Ready(Ok(())) if cx.checkpoint().is_ok() => {
+                                                return Poll::Ready(Err(
+                                                    "final Tasks service stopped while HTTP server remained live"
+                                                        .to_owned(),
+                                                ));
+                                            }
+                                            Poll::Ready(Err(error)) if cx.checkpoint().is_ok() => {
+                                                return Poll::Ready(Err(format!(
+                                                    "final Tasks service failed while HTTP server remained live: {error}"
+                                                )));
+                                            }
+                                            Poll::Ready(_) => service_stopped = true,
+                                            Poll::Pending => {}
+                                        }
+                                    }
+                                    match serving.as_mut().poll(task_context) {
+                                        Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                                        Poll::Ready(Err(error)) => Poll::Ready(Err(format!(
+                                            "final Tasks E2E server stopped: {error}"
+                                        ))),
+                                        Poll::Pending => Poll::Pending,
+                                    }
+                                })
+                                .await
+                            })
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err("final Tasks E2E server exceeded its deadline".to_owned())
+                            });
+                        let _ = finished_tx.send(outcome);
+                        let _ = task_done_tx.send(());
+                    })
+                    .expect("final Tasks E2E server task is admitted");
+            runtime.block_on(async move {
+                let mut server_cx = None;
+                loop {
+                    if let Ok(cx) = server_cx_rx.try_recv() {
+                        server_cx = Some(cx);
+                    }
+                    match shutdown_rx.try_recv() {
+                        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                            if let Some(cx) = server_cx.as_ref() {
+                                cx.cancel_with(
+                                    asupersync::CancelKind::User,
+                                    Some("final Tasks E2E fixture shutdown"),
+                                );
+                            }
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
+                    }
+                    if task_done_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    let cx = Cx::current().expect("server runtime installs an ambient Cx");
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+            });
+        }));
+        let address = ready_rx
+            .recv_timeout(FINAL_TASKS_E2E_BOUND)
+            .expect("final Tasks E2E server starts within its bound")
+            .expect("final Tasks E2E server starts successfully");
+        Self {
+            address,
+            shutdown: shutdown_tx,
+            finished: finished_rx,
+            join,
+        }
+    }
 
-    // Register a task that fails
-    task_manager.register_handler("failing_task", |_cx, _params| async move {
-        Err(fastmcp_rust::McpError::internal_error(
-            "Task intentionally failed",
-        ))
-    });
+    fn plan(&self, policy: ProtocolPolicy) -> ClientProtocolPlan {
+        let modern = CanonicalHttpUrl::parse(&format!("http://{}/mcp", self.address))
+            .expect("final Tasks modern endpoint is canonical");
+        let legacy_sse = CanonicalHttpUrl::parse(&format!("http://{}/sse", self.address))
+            .expect("final Tasks legacy SSE endpoint is canonical");
+        let legacy_message = CanonicalHttpUrl::parse(&format!("http://{}/messages", self.address))
+            .expect("final Tasks legacy message endpoint is canonical");
+        ClientProtocolPlan::http(
+            policy,
+            (!matches!(policy, ProtocolPolicy::LegacyOnly)).then_some(modern),
+            (!matches!(policy, ProtocolPolicy::ModernOnly)).then_some(legacy_sse),
+            (!matches!(policy, ProtocolPolicy::ModernOnly)).then_some(legacy_message),
+            "final-tasks-e2e-credential".to_owned(),
+            "final-tasks-e2e-security".to_owned(),
+            "final-tasks-e2e-native-h1".to_owned(),
+            1,
+            1,
+            0,
+        )
+        .expect("final Tasks HTTP plan is valid")
+    }
 
-    let server = builder
-        .tool(EchoTool)
-        .with_task_manager(task_manager.into_shared())
-        .build();
+    fn shutdown(mut self) {
+        let _ = self.shutdown.try_send(());
+        let outcome = self
+            .finished
+            .recv_timeout(FINAL_TASKS_E2E_BOUND)
+            .expect("final Tasks E2E server stops within its bound")
+            .expect("final Tasks E2E server stops cleanly");
+        join_final_tasks_thread(&mut self.join)
+            .expect("final Tasks E2E server exits within its bounded settlement window");
+        drop(outcome);
+    }
+}
 
-    let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
-    });
+impl Drop for FinalTasksHttpFixture {
+    fn drop(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
+        let _ = self.shutdown.try_send(());
+        let outcome = self
+            .finished
+            .recv_timeout(FINAL_TASKS_E2E_BOUND)
+            .expect("final Tasks E2E server stops within its bound")
+            .expect("final Tasks E2E server stops cleanly");
+        join_final_tasks_thread(&mut self.join)
+            .expect("final Tasks E2E server exits within its bounded settlement window");
+        drop(outcome);
+    }
+}
 
-    TestHarness::new(TestClient::new(client_transport), handle)
+fn join_final_tasks_thread(join: &mut Option<JoinHandle<()>>) -> Result<(), String> {
+    let deadline = Instant::now() + FINAL_TASKS_E2E_BOUND;
+    loop {
+        let Some(handle) = join.as_ref() else {
+            return Ok(());
+        };
+        if handle.is_finished() {
+            return join
+                .take()
+                .expect("completed final Tasks server retains its join handle")
+                .join()
+                .map_err(|_| "final Tasks E2E server thread panicked".to_owned());
+        }
+        if Instant::now() >= deadline {
+            return Err("final Tasks E2E server reported completion but did not exit".to_owned());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+struct E2eFinalTaskSupervisor {
+    runtime: FinalTaskRuntime,
+    input_required: mpsc::SyncSender<()>,
+    cancelled: mpsc::SyncSender<()>,
+}
+
+impl ApplicationTaskSupervisor for E2eFinalTaskSupervisor {
+    fn resume<'a>(
+        &'a self,
+        cx: &'a Cx,
+        handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        let runtime = self.runtime.clone();
+        let input_required = self.input_required.clone();
+        let cancelled = self.cancelled.clone();
+        Box::pin(async move {
+            match handoff {
+                FinalTaskSupervisorHandoff::Initial(initial) => {
+                    let requests: FinalTaskInputRequests = serde_json::from_value(json!({
+                        "roots": {"method": "roots/list"}
+                    }))
+                    .expect("the public final roots input descriptor is typed");
+                    runtime.require_input(
+                        initial.task_id(),
+                        requests,
+                        Some("awaiting roots from live supervisor".to_owned()),
+                    )?;
+                    input_required.send(()).map_err(|_| {
+                        McpError::internal_error("E2E input-required observer dropped")
+                    })?;
+                }
+                FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                    let task_id = accepted.task_id().clone();
+                    loop {
+                        if runtime.is_cancellation_requested(&task_id)? {
+                            runtime.honor_cancellation(
+                                &task_id,
+                                Some("cancelled by live supervisor".to_owned()),
+                            )?;
+                            cancelled.send(()).map_err(|_| {
+                                McpError::internal_error("E2E cancellation observer dropped")
+                            })?;
+                            break;
+                        }
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+struct PublicFinalTaskTool;
+
+impl ToolHandler for PublicFinalTaskTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "public-final-task".to_owned(),
+            description: Some("Creates one official final Tasks operation".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("exact legacy completion")])
+    }
+
+    fn declares_final_tasks(&self) -> bool {
+        true
+    }
+
+    fn call_final_outcome(
+        &self,
+        _ctx: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        Ok(FinalToolOutcome::CreateTask {
+            work_descriptor: FinalTaskWorkDescriptor::new(json!({
+                "operation": "public-final-task-e2e",
+            }))?,
+            status_message: Some("working through the public final API".to_owned()),
+        })
+    }
 }
 
 #[test]
-fn workflow_task_submit_and_get() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Verify server has task capability
-    let caps = client.server_capabilities().unwrap();
-    assert!(caps.tasks.is_some(), "Server should have tasks capability");
-
-    // Submit a task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({
-                "taskType": "quick_task",
-                "params": {"value": 21}
+fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
+    let runtime = FinalTaskRuntime::in_memory(
+        FinalTaskRuntimeConfig::new(60_000, Some(1_000)).expect("finite final Tasks policy"),
+        Arc::new(|_| {}),
+    );
+    let (input_required_tx, input_required_rx) = mpsc::sync_channel(1);
+    let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(1);
+    let runner = runtime
+        .install_task_service(
+            1,
+            Arc::new(E2eFinalTaskSupervisor {
+                runtime: runtime.clone(),
+                input_required: input_required_tx,
+                cancelled: cancelled_tx,
             }),
         )
-        .unwrap();
+        .expect("application-owned final Task service installs");
 
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-    assert!(
-        task_id.starts_with("task-"),
-        "Task ID should have correct prefix"
-    );
+    let server = Server::new("final-tasks-e2e", "1.0.0")
+        .tool(PublicFinalTaskTool)
+        .final_tasks(runtime.clone())
+        .expect("official final Tasks extension installs")
+        .build();
+    let fixture = FinalTasksHttpFixture::spawn(server, runner);
+    let cx = Cx::for_request();
+    let modern_builder = auto::client_builder()
+        .client_info("final-tasks-e2e-client", "1.0.0")
+        .protocol_plan(fixture.plan(ProtocolPolicy::ModernOnly));
+    let modern =
+        final_tasks_runtime_block_on_bounded(&cx, modern_builder.connect_http_client_with_cx(&cx))
+            .expect("public HTTP facade selects the final protocol");
 
-    // Get task info
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    let task_info = &get_result["task"];
-    assert_eq!(task_info["id"], task_id);
-    assert_eq!(task_info["taskType"], "quick_task");
-
-    // Give the task time to complete
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Get again and check for completion
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    let status = get_result["task"]["status"].as_str().unwrap();
-    // Task should be completed or still running
-    assert!(
-        status == "completed" || status == "running" || status == "pending",
-        "Unexpected status: {status}"
-    );
-}
-
-#[test]
-fn workflow_task_list_with_filtering() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit multiple tasks
-    let _task1 = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 1}}),
-        )
-        .unwrap();
-
-    let _task2 = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 2}}),
-        )
-        .unwrap();
-
-    // List all tasks
-    let list_result = client.send_raw_request("tasks/list", json!({})).unwrap();
-
-    let tasks = list_result["tasks"].as_array().unwrap();
-    assert!(tasks.len() >= 2, "Should have at least 2 tasks");
-
-    // Wait for tasks to complete
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // List completed tasks
-    let completed_result = client
-        .send_raw_request("tasks/list", json!({"status": "completed"}))
-        .unwrap();
-
-    let completed_tasks = completed_result["tasks"].as_array().unwrap();
-    for task in completed_tasks {
-        assert_eq!(task["status"], "completed");
-    }
-}
-
-#[test]
-fn workflow_task_cancellation() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "progress_task", "params": {"steps": 100}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Cancel the task immediately
-    let cancel_result = client
-        .send_raw_request(
-            "tasks/cancel",
-            json!({"id": task_id, "reason": "User requested cancellation"}),
-        )
-        .unwrap();
-
-    assert!(cancel_result["cancelled"].as_bool().unwrap_or(false));
-
-    // Verify task is cancelled
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    let status = get_result["task"]["status"].as_str().unwrap();
-    assert_eq!(status, "cancelled", "Task should be cancelled");
-
-    // Verify error message is set
-    let error = get_result["task"]["error"].as_str();
-    assert!(error.is_some(), "Cancelled task should have error message");
-}
-
-#[test]
-fn workflow_task_failure_handling() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a failing task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "failing_task", "params": {}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Wait for task to fail
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Get task and verify failure
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    let task = &get_result["task"];
-    let status = task["status"].as_str().unwrap();
-
-    // Task should be failed (or still running if it hasn't finished)
-    if status == "failed" {
-        assert!(
-            task["error"].as_str().is_some(),
-            "Failed task should have error message"
-        );
-    }
-}
-
-#[test]
-fn workflow_task_unknown_type_rejected() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Try to submit unknown task type
-    let result = client.send_raw_request(
-        "tasks/submit",
-        json!({"taskType": "nonexistent_task", "params": {}}),
-    );
-
-    assert!(result.is_err(), "Unknown task type should be rejected");
-}
-
-#[test]
-fn workflow_task_get_nonexistent() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Try to get a task that doesn't exist
-    let result = client.send_raw_request("tasks/get", json!({"id": "task-nonexistent"}));
-
-    assert!(result.is_err(), "Getting nonexistent task should fail");
-}
-
-#[test]
-fn workflow_task_cancel_already_completed() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a quick task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 5}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Wait for completion
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // Verify it's completed
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    if get_result["task"]["status"] == "completed" {
-        // Try to cancel completed task (should fail)
-        let cancel_result = client.send_raw_request("tasks/cancel", json!({"id": task_id}));
-
-        assert!(
-            cancel_result.is_err(),
-            "Cancelling completed task should fail"
-        );
-    }
-}
-
-#[test]
-fn workflow_task_result_available_after_completion() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 42}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Wait for completion
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // Get task with result
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    if get_result["task"]["status"] == "completed" {
-        // Result should be available
-        let result = &get_result["result"];
-        assert!(
-            result.is_object(),
-            "Result should be present for completed task"
-        );
-        assert!(result["success"].as_bool().unwrap_or(false));
-
-        // Check the data
-        let data = &result["data"];
-        assert_eq!(data["result"], 84, "42 * 2 = 84");
-    }
-}
-
-#[test]
-fn workflow_task_session_continues_after_task_error() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a failing task
-    let _fail_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "failing_task", "params": {}}),
-        )
-        .unwrap();
-
-    // Wait for it to fail
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Session should still be functional - submit another task
-    let success_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 10}}),
-        )
-        .unwrap();
-
-    assert!(
-        success_result["task"]["id"].as_str().is_some(),
-        "Should be able to submit new tasks after failure"
-    );
-
-    // Regular tool calls should also still work
-    let echo_result = client
-        .call_tool("echo", json!({"message": "still working"}))
-        .unwrap();
-
-    assert!(
-        matches!(echo_result.first(), Some(Content::Text { .. })),
-        "expected text content"
-    );
-    let Some(Content::Text { text }) = echo_result.first() else {
-        return;
+    let created = final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern.connection().call_tool_final_outcome(
+            &cx,
+            RequestId::Number(2),
+            "public-final-task",
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("public final tools/call creates a task");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!("the task-capable final tool must return the task result branch");
     };
-    assert_eq!(text, "still working");
-}
+    let task_id = created.task.base().task_id.clone();
+    assert!(matches!(created.task, FinalTask::Working(_)));
 
-#[test]
-fn workflow_task_capabilities_advertised() {
-    let mut client = setup_task_server();
-    let init_result = client.initialize().unwrap();
+    input_required_rx
+        .recv_timeout(FINAL_TASKS_E2E_BOUND)
+        .expect("the live supervisor moves the task to input_required within its bound");
+    let input_required = final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern
+            .connection()
+            .get_task_final(&cx, RequestId::Number(4), task_id.clone(), 1 << 20),
+    )
+    .expect("official tasks/get observes input_required");
+    assert!(matches!(
+        input_required.task,
+        FinalTask::InputRequired { .. }
+    ));
 
-    // Verify task capabilities
-    let tasks_cap = init_result.capabilities.tasks;
-    assert!(
-        tasks_cap.is_some(),
-        "Server should advertise tasks capability"
-    );
-}
+    let responses: FinalTaskInputResponses =
+        serde_json::from_value(json!({"roots": {"roots": []}}))
+            .expect("the public final roots response is typed");
+    final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern.connection().update_task_final(
+            &cx,
+            RequestId::Number(5),
+            &input_required.task,
+            responses,
+            1 << 20,
+        ),
+    )
+    .expect("official tasks/update accepts matching typed input");
+    let resumed = final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern
+            .connection()
+            .get_task_final(&cx, RequestId::Number(6), task_id.clone(), 1 << 20),
+    )
+    .expect("official tasks/get observes the resumed working task");
+    assert!(matches!(resumed.task, FinalTask::Working(_)));
 
-#[test]
-fn workflow_task_multiple_sequential() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
+    final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern
+            .connection()
+            .cancel_task_final(&cx, RequestId::Number(7), task_id.clone(), 1 << 20),
+    )
+    .expect("official tasks/cancel acknowledges the cancellation intent");
+    cancelled_rx
+        .recv_timeout(FINAL_TASKS_E2E_BOUND)
+        .expect("the live supervisor honors cancellation within its bound");
+    let cancelled = final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern
+            .connection()
+            .get_task_final(&cx, RequestId::Number(8), task_id.clone(), 1 << 20),
+    )
+    .expect("official tasks/get returns the cancelled task");
+    assert!(matches!(cancelled.task, FinalTask::Cancelled(_)));
 
-    // Submit tasks sequentially and track their IDs
-    let mut task_ids = Vec::new();
-    for i in 0..5 {
-        let result = client
-            .send_raw_request(
-                "tasks/submit",
-                json!({"taskType": "quick_task", "params": {"value": i}}),
-            )
-            .unwrap();
+    let legacy_builder = auto::client_builder()
+        .client_info("final-tasks-e2e-client", "1.0.0")
+        .protocol_plan(fixture.plan(ProtocolPolicy::LegacyOnly));
+    let legacy =
+        final_tasks_runtime_block_on_bounded(&cx, legacy_builder.connect_http_client_with_cx(&cx))
+            .expect("the real facade server retains its exact legacy route");
+    let legacy_error = final_tasks_runtime_block_on_bounded(
+        &cx,
+        legacy
+            .connection()
+            .get_task_final(&cx, RequestId::Number(8), task_id, 1 << 20),
+    )
+    .expect_err("exact legacy selection rejects the official final Tasks method");
+    assert!(matches!(
+        legacy_error,
+        ClientHttpConnectionError::FinalTasksRequiresModern { .. }
+    ));
 
-        let task_id = result["task"]["id"].as_str().unwrap().to_string();
-        task_ids.push(task_id);
-    }
-
-    // All task IDs should be unique
-    let unique_ids: std::collections::HashSet<_> = task_ids.iter().collect();
-    assert_eq!(
-        unique_ids.len(),
-        task_ids.len(),
-        "All task IDs should be unique"
-    );
-
-    // Wait for all to complete
-    std::thread::sleep(std::time::Duration::from_millis(300));
-
-    // Verify all are either completed or in a valid state
-    for task_id in &task_ids {
-        let result = client
-            .send_raw_request("tasks/get", json!({"id": task_id}))
-            .unwrap();
-
-        let status = result["task"]["status"].as_str().unwrap();
-        assert!(
-            matches!(status, "pending" | "running" | "completed"),
-            "Task {task_id} has unexpected status: {status}"
-        );
-    }
-}
-
-// ============================================================================
-// Additional Task Management E2E Tests (bd-3n2)
-// ============================================================================
-
-#[test]
-fn workflow_task_polling_until_complete() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a quick task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 50}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Poll until complete (simulating wait_for_task behavior)
-    let mut attempts = 0;
-    let max_attempts = 20;
-    let mut final_status = String::new();
-
-    while attempts < max_attempts {
-        let get_result = client
-            .send_raw_request("tasks/get", json!({"id": task_id}))
-            .unwrap();
-
-        let status = get_result["task"]["status"].as_str().unwrap();
-        final_status = status.to_string();
-
-        if status == "completed" || status == "failed" || status == "cancelled" {
-            break;
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        attempts += 1;
-    }
-
-    // Should eventually complete
-    assert!(
-        attempts < max_attempts || final_status == "completed",
-        "Task should complete within timeout"
-    );
-}
-
-#[test]
-fn workflow_task_status_transitions() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 1}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-    let initial_status = submit_result["task"]["status"].as_str().unwrap();
-
-    // Initial status should be pending or running
-    assert!(
-        initial_status == "pending" || initial_status == "running",
-        "Initial status should be pending or running, got: {}",
-        initial_status
-    );
-
-    // Wait for completion
-    std::thread::sleep(std::time::Duration::from_millis(300));
-
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    let final_status = get_result["task"]["status"].as_str().unwrap();
-
-    // Valid terminal states
-    assert!(
-        final_status == "completed" || final_status == "failed" || final_status == "cancelled",
-        "Final status should be terminal, got: {}",
-        final_status
-    );
-}
-
-#[test]
-fn workflow_task_list_pagination() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit several tasks
-    for i in 0..5 {
-        client
-            .send_raw_request(
-                "tasks/submit",
-                json!({"taskType": "quick_task", "params": {"value": i}}),
-            )
-            .unwrap();
-    }
-
-    // List all tasks
-    let list_result = client.send_raw_request("tasks/list", json!({})).unwrap();
-
-    let tasks = list_result["tasks"].as_array().unwrap();
-    assert!(
-        tasks.len() >= 5,
-        "Should have at least 5 tasks, got {}",
-        tasks.len()
-    );
-
-    // Each task should have required fields
-    for task in tasks {
-        assert!(task["id"].is_string());
-        assert!(task["status"].is_string());
-        assert!(task["taskType"].is_string());
-    }
-}
-
-#[test]
-fn workflow_task_cancel_pending() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a task that takes time (progress_task with many steps)
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "progress_task", "params": {"steps": 100}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Cancel immediately
-    let cancel_result = client
-        .send_raw_request(
-            "tasks/cancel",
-            json!({"id": task_id, "reason": "Cancelled during pending"}),
-        )
-        .unwrap();
-
-    assert!(cancel_result["cancelled"].as_bool().unwrap_or(false));
-
-    // Verify the task is cancelled
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    assert_eq!(get_result["task"]["status"].as_str().unwrap(), "cancelled");
-}
-
-#[test]
-fn workflow_task_result_structure() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a task that returns data
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 123}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Wait for completion
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    // If completed, verify result structure
-    if get_result["task"]["status"].as_str().unwrap() == "completed" {
-        let result = &get_result["result"];
-        assert!(result["success"].as_bool().unwrap_or(false));
-        assert!(result["data"].is_object());
-        // The task multiplies by 2
-        assert_eq!(result["data"]["result"], 246);
-    }
-}
-
-#[test]
-fn workflow_task_error_message_preserved() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a failing task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "failing_task", "params": {}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Wait for failure
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    // If failed, verify error is preserved
-    if get_result["task"]["status"].as_str().unwrap() == "failed" {
-        let error = get_result["task"]["error"].as_str();
-        assert!(error.is_some(), "Failed task should have error message");
-        assert!(
-            error.unwrap().contains("intentionally") || error.unwrap().contains("failed"),
-            "Error message should describe failure"
-        );
-    }
-}
-
-#[test]
-fn workflow_task_type_preserved() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit different task types
-    let task_types = ["quick_task", "progress_task"];
-
-    for task_type in task_types {
-        let submit_result = client
-            .send_raw_request(
-                "tasks/submit",
-                json!({"taskType": task_type, "params": {"value": 1}}),
-            )
-            .unwrap();
-
-        let task_id = submit_result["task"]["id"].as_str().unwrap();
-        let returned_type = submit_result["task"]["taskType"].as_str().unwrap();
-        assert_eq!(returned_type, task_type);
-
-        // Verify on get as well
-        let get_result = client
-            .send_raw_request("tasks/get", json!({"id": task_id}))
-            .unwrap();
-
-        assert_eq!(get_result["task"]["taskType"].as_str().unwrap(), task_type);
-    }
-}
-
+    fixture.shutdown();
 }
 
 // ============================================================================
