@@ -1,10 +1,13 @@
 //! Client session state.
 
 use fastmcp_core::CanonicalHttpUrl;
+use std::collections::BTreeMap;
+
 use fastmcp_protocol::extensions::{
-    ExtensionSettings, ExtensionSettingsResolution, McpAppsClientSettings,
-    official_mcp_apps_descriptor, official_mcp_apps_extension_id,
-    resolve_official_mcp_apps_settings,
+    ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionLocalEnablement,
+    ExtensionSettings, McpAppsActivationReceipt, McpAppsClientSettings, ServerExtensionDiscovery,
+    official_mcp_apps_empty_server_settings, official_mcp_apps_extension_id,
+    official_mcp_apps_negotiation_resolver, register_official_mcp_apps_extension,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
@@ -166,8 +169,9 @@ pub struct ClientSession {
     server_discovery: Option<ServerDiscoverResult>,
     /// Local MCP Apps settings selected before connection.
     mcp_apps_settings: Option<McpAppsClientSettings>,
-    /// Whether the final server discovery admitted an active MCP Apps bridge.
-    mcp_apps_active: bool,
+    /// Opaque bilateral Apps receipt retained from the current modern discovery
+    /// exchange. Legacy and inactive sessions deliberately retain no receipt.
+    mcp_apps_activation_receipt: Option<McpAppsActivationReceipt>,
     /// Negotiated protocol version.
     protocol_version: String,
     /// Immutable era selected from the successful handshake.
@@ -232,7 +236,7 @@ impl ClientSession {
             server_capabilities,
             server_discovery: None,
             mcp_apps_settings: None,
-            mcp_apps_active: false,
+            mcp_apps_activation_receipt: None,
             selected_era,
             protocol_version,
             // A peer-selected era must never rewrite the pre-connect policy.
@@ -277,8 +281,11 @@ impl ClientSession {
         self
     }
 
-    pub(crate) fn set_mcp_apps_active(&mut self, active: bool) {
-        self.mcp_apps_active = active;
+    pub(crate) fn set_mcp_apps_activation_receipt(
+        &mut self,
+        receipt: Option<McpAppsActivationReceipt>,
+    ) {
+        self.mcp_apps_activation_receipt = receipt;
     }
 
     pub(crate) fn mcp_apps_settings(&self) -> Option<&McpAppsClientSettings> {
@@ -288,7 +295,14 @@ impl ClientSession {
     /// Returns whether MCP Apps was bilaterally activated during final discovery.
     #[must_use]
     pub const fn mcp_apps_active(&self) -> bool {
-        self.mcp_apps_active
+        self.mcp_apps_activation_receipt.is_some()
+    }
+
+    /// Returns the immutable current Apps activation receipt, if modern
+    /// discovery negotiated the official extension bilaterally.
+    #[must_use]
+    pub(crate) fn mcp_apps_activation_receipt(&self) -> Option<&McpAppsActivationReceipt> {
+        self.mcp_apps_activation_receipt.as_ref()
     }
 
     pub(crate) fn set_protocol_plan(&mut self, protocol_plan: ClientProtocolPlan) {
@@ -374,15 +388,15 @@ impl ClientSession {
 /// Absent or incompatible peer settings deliberately leave Apps inactive. The
 /// public protocol decoder has already bounded the discovery capability shape;
 /// this helper only interprets the registered official descriptor.
-pub(crate) fn resolve_mcp_apps_activation(
+pub(crate) fn mcp_apps_activation_receipt(
     client_settings: Option<&McpAppsClientSettings>,
     discovery: &ServerDiscoverResult,
-) -> bool {
+) -> Option<McpAppsActivationReceipt> {
     let Some(client_settings) = client_settings else {
-        return false;
+        return None;
     };
     let Ok(capabilities) = serde_json::to_value(discovery.capabilities()) else {
-        return false;
+        return None;
     };
     let Some(server_settings) = capabilities
         .get("extensions")
@@ -390,19 +404,47 @@ pub(crate) fn resolve_mcp_apps_activation(
         .and_then(|extensions| extensions.get(official_mcp_apps_extension_id().as_str()))
         .cloned()
     else {
-        return false;
+        return None;
     };
     let Ok(server_settings) = ExtensionSettings::new(server_settings) else {
-        return false;
+        return None;
     };
-    matches!(
-        resolve_official_mcp_apps_settings(
-            &official_mcp_apps_descriptor(),
-            &client_settings.to_extension_settings(),
-            &server_settings,
-        ),
-        Ok(ExtensionSettingsResolution::Active(_))
-    )
+    let mut registry = ExtensionDescriptorRegistry::new();
+    let apps_extension = register_official_mcp_apps_extension(&mut registry).ok()?;
+    registry.freeze().ok()?;
+
+    let mut local = ExtensionLocalEnablement::default();
+    local.enable(apps_extension.clone());
+    let client = ClientExtensionDiscovery {
+        extensions: BTreeMap::from([(
+            apps_extension.clone(),
+            client_settings.to_extension_settings(),
+        )]),
+    };
+    let server = ServerExtensionDiscovery {
+        extensions: BTreeMap::from([(apps_extension, server_settings)]),
+    };
+    let mut resolver = official_mcp_apps_negotiation_resolver();
+    registry
+        .negotiate(
+            ProtocolEra::Modern2026,
+            &local,
+            &client,
+            &server,
+            &mut resolver,
+        )
+        .ok()?
+        .mcp_apps_activation_receipt(&registry)
+}
+
+/// Compatibility predicate for callers that only need to advertise Apps over
+/// an already-negotiated HTTP connection. Session-bearing clients retain the
+/// opaque receipt through [`mcp_apps_activation_receipt`] instead.
+pub(crate) fn resolve_mcp_apps_activation(
+    client_settings: Option<&McpAppsClientSettings>,
+    discovery: &ServerDiscoverResult,
+) -> bool {
+    mcp_apps_activation_receipt(client_settings, discovery).is_some()
 }
 
 #[cfg(test)]

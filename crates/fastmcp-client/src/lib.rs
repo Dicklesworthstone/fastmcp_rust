@@ -91,9 +91,12 @@ pub use http_executor::{
     ModernHttpSubscriptionListener,
 };
 pub use mcp_apps::{
-    McpAppsBridgeTransport, McpAppsHost, McpAppsHostConfiguration, McpAppsHostError,
-    McpAppsHostPolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
-    mcp_apps_in_memory_pair,
+    McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
+    McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport,
+    McpAppsInMemoryViewTransport, McpAppsInMemoryWireHostTransport,
+    McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
+    McpAppsWireHostConfiguration, McpAppsWireHostPolicy, mcp_apps_in_memory_pair,
+    mcp_apps_in_memory_wire_pair,
 };
 pub use mcp_config::claude_desktop_config_path;
 pub use negotiation::{
@@ -162,7 +165,7 @@ use fastmcp_protocol::{
 };
 use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
 
-use crate::session::resolve_mcp_apps_activation;
+use crate::session::mcp_apps_activation_receipt;
 
 /// Callback for receiving progress notifications during tool execution.
 ///
@@ -4117,6 +4120,7 @@ pub struct HttpClient {
     final_result_cache: FinalResultCache,
     final_cache_ttl_diagnostics: VecDeque<FinalCacheTtlDiagnostic>,
     mcp_apps_settings: Option<McpAppsClientSettings>,
+    mcp_apps_activation_receipt: Option<fastmcp_protocol::extensions::McpAppsActivationReceipt>,
 }
 
 /// Errors raised while composing a ready public HTTP client.
@@ -4358,6 +4362,10 @@ impl HttpClient {
             }
         };
 
+        let mcp_apps_activation_receipt = connection.server_discovery().and_then(|discovery| {
+            mcp_apps_activation_receipt(mcp_apps_settings.as_ref(), discovery)
+        });
+
         Ok(Self {
             connection,
             client_info,
@@ -4368,6 +4376,7 @@ impl HttpClient {
             final_result_cache: FinalResultCache::default(),
             final_cache_ttl_diagnostics: VecDeque::new(),
             mcp_apps_settings,
+            mcp_apps_activation_receipt,
         })
     }
 
@@ -4380,7 +4389,7 @@ impl HttpClient {
     /// Returns whether final discovery activated the official MCP Apps extension.
     #[must_use]
     pub fn mcp_apps_active(&self) -> bool {
-        self.connection.mcp_apps_active()
+        self.mcp_apps_activation_receipt.is_some()
     }
 
     /// Starts one browser-agnostic Apps Host for a negotiated modern connection.
@@ -4395,11 +4404,8 @@ impl HttpClient {
         T: McpAppsBridgeTransport,
         P: McpAppsHostPolicy,
     {
-        if !self.mcp_apps_active() {
-            return Err(McpAppsHostError::NotNegotiated);
-        }
-        let activation_proof = mcp_apps::McpAppsActivationProof::from_bilateral_activation(
-            self.mcp_apps_active(),
+        let activation_proof = mcp_apps::McpAppsActivationProof::from_activation_receipt(
+            self.mcp_apps_activation_receipt.as_ref(),
         )?;
         Ok(McpAppsHost::new_negotiated(
             transport,
@@ -4407,6 +4413,82 @@ impl HttpClient {
             policy,
             activation_proof,
         ))
+    }
+
+    /// Starts the closed JSON-RPC Apps bridge on this ready modern HTTP
+    /// connection. Reused View methods allocate fresh HTTP core request IDs.
+    pub fn mcp_apps_wire_host<'client, T>(
+        &'client mut self,
+        transport: T,
+        configuration: mcp_apps::McpAppsWireHostConfiguration,
+    ) -> Result<
+        mcp_apps::McpAppsWireHost<T, mcp_apps::McpAppsHttpClientWirePolicy<'client>>,
+        McpAppsHostError,
+    >
+    where
+        T: mcp_apps::McpAppsWireBridgeTransport,
+    {
+        let activation_proof = mcp_apps::McpAppsActivationProof::from_activation_receipt(
+            self.mcp_apps_activation_receipt.as_ref(),
+        )?;
+        Ok(mcp_apps::McpAppsWireHost::new_negotiated(
+            transport,
+            configuration,
+            mcp_apps::McpAppsHttpClientWirePolicy::new(self),
+            activation_proof,
+        ))
+    }
+
+    async fn forward_mcp_apps_reused_core(
+        &mut self,
+        cx: &Cx,
+        method: fastmcp_protocol::McpAppsRoutedMethod,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<serde_json::Value> {
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if !self.mcp_apps_active() {
+            return Err(McpError::invalid_request(
+                "MCP Apps reused methods require the current bilateral activation receipt",
+            ));
+        }
+        let (core_method, parameters) = match method {
+            fastmcp_protocol::McpAppsRoutedMethod::ToolsCall => (
+                "tools/call",
+                params.ok_or_else(|| {
+                    McpError::invalid_params("Apps tools/call is missing parameters")
+                })?,
+            ),
+            fastmcp_protocol::McpAppsRoutedMethod::ResourcesRead => (
+                "resources/read",
+                params.ok_or_else(|| {
+                    McpError::invalid_params("Apps resources/read is missing parameters")
+                })?,
+            ),
+            fastmcp_protocol::McpAppsRoutedMethod::ResourcesList => (
+                "resources/list",
+                params.unwrap_or_else(|| serde_json::json!({})),
+            ),
+            fastmcp_protocol::McpAppsRoutedMethod::ResourceTemplatesList => (
+                "resources/templates/list",
+                params.unwrap_or_else(|| serde_json::json!({})),
+            ),
+            fastmcp_protocol::McpAppsRoutedMethod::PromptsList => (
+                "prompts/list",
+                params.unwrap_or_else(|| serde_json::json!({})),
+            ),
+            _ => {
+                return Err(McpError::invalid_params(
+                    "Apps method is not a direction-correct standard-reused core request",
+                ));
+            }
+        };
+        let result = self
+            .request_final_core(cx, core_method, parameters)
+            .await
+            .map_err(|error| McpError::invalid_request(error.to_string()))?;
+        mcp_apps::project_reused_core_result(method, result)
     }
 
     /// Returns the immutable policy and endpoints used to create this client.
@@ -5626,16 +5708,38 @@ impl Client {
         T: McpAppsBridgeTransport,
         P: McpAppsHostPolicy,
     {
-        if !self.mcp_apps_active() {
-            return Err(McpAppsHostError::NotNegotiated);
-        }
-        let activation_proof = mcp_apps::McpAppsActivationProof::from_bilateral_activation(
-            self.mcp_apps_active(),
+        let activation_proof = mcp_apps::McpAppsActivationProof::from_activation_receipt(
+            self.session.mcp_apps_activation_receipt(),
         )?;
         Ok(McpAppsHost::new_negotiated(
             transport,
             configuration,
             policy,
+            activation_proof,
+        ))
+    }
+
+    /// Starts the closed JSON-RPC Apps bridge after final discovery retained
+    /// the current bilateral activation receipt. Standard-reused View methods
+    /// become fresh selected-era core requests owned by this client.
+    pub fn mcp_apps_wire_host<'client, T>(
+        &'client mut self,
+        transport: T,
+        configuration: mcp_apps::McpAppsWireHostConfiguration,
+    ) -> Result<
+        mcp_apps::McpAppsWireHost<T, mcp_apps::McpAppsClientWirePolicy<'client>>,
+        McpAppsHostError,
+    >
+    where
+        T: mcp_apps::McpAppsWireBridgeTransport,
+    {
+        let activation_proof = mcp_apps::McpAppsActivationProof::from_activation_receipt(
+            self.session.mcp_apps_activation_receipt(),
+        )?;
+        Ok(mcp_apps::McpAppsWireHost::new_negotiated(
+            transport,
+            configuration,
+            mcp_apps::McpAppsClientWirePolicy::new(self),
             activation_proof,
         ))
     }
@@ -6190,7 +6294,8 @@ impl Client {
                 FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
             ));
         }
-        self.final_progress_notifications.push_back(progress.clone());
+        self.final_progress_notifications
+            .push_back(progress.clone());
 
         Ok(Some(ModernServerNotification::Progress(progress)))
     }
@@ -6309,6 +6414,125 @@ impl Client {
         params: P,
     ) -> McpResult<CoreResult> {
         self.send_typed_core_request_with_tasks(method, params, false)
+    }
+
+    /// Forwards one admitted Apps standard-reused method through a new
+    /// client-owned selected-era core request. Apps envelope IDs and transport
+    /// controls never enter this request path.
+    pub(crate) fn forward_mcp_apps_reused_core(
+        &mut self,
+        cx: &Cx,
+        method: fastmcp_protocol::McpAppsRoutedMethod,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<serde_json::Value> {
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if !self.mcp_apps_active() {
+            return Err(McpError::invalid_request(
+                "MCP Apps reused methods require the current bilateral activation receipt",
+            ));
+        }
+
+        let result = match method {
+            fastmcp_protocol::McpAppsRoutedMethod::ToolsCall => {
+                let mut params: CallToolParams =
+                    serde_json::from_value(params.ok_or_else(|| {
+                        McpError::invalid_params("Apps tools/call is missing parameters")
+                    })?)
+                    .map_err(|_| {
+                        McpError::invalid_params("Apps tools/call parameters are invalid")
+                    })?;
+                params.meta = None;
+                self.send_typed_core_request("tools/call", params)?
+            }
+            fastmcp_protocol::McpAppsRoutedMethod::ResourcesRead => {
+                let mut params: ReadResourceParams =
+                    serde_json::from_value(params.ok_or_else(|| {
+                        McpError::invalid_params("Apps resources/read is missing parameters")
+                    })?)
+                    .map_err(|_| {
+                        McpError::invalid_params("Apps resources/read parameters are invalid")
+                    })?;
+                params.meta = None;
+                self.send_typed_core_request("resources/read", params)?
+            }
+            fastmcp_protocol::McpAppsRoutedMethod::ResourcesList => {
+                let params: ListResourcesParams =
+                    serde_json::from_value(params.unwrap_or_else(|| serde_json::json!({})))
+                        .map_err(|_| {
+                            McpError::invalid_params("Apps resources/list parameters are invalid")
+                        })?;
+                self.send_typed_core_request("resources/list", params)?
+            }
+            fastmcp_protocol::McpAppsRoutedMethod::ResourceTemplatesList => {
+                let params: ListResourceTemplatesParams =
+                    serde_json::from_value(params.unwrap_or_else(|| serde_json::json!({})))
+                        .map_err(|_| {
+                            McpError::invalid_params(
+                                "Apps resources/templates/list parameters are invalid",
+                            )
+                        })?;
+                self.send_typed_core_request("resources/templates/list", params)?
+            }
+            fastmcp_protocol::McpAppsRoutedMethod::PromptsList => {
+                let params: ListPromptsParams =
+                    serde_json::from_value(params.unwrap_or_else(|| serde_json::json!({})))
+                        .map_err(|_| {
+                            McpError::invalid_params("Apps prompts/list parameters are invalid")
+                        })?;
+                self.send_typed_core_request("prompts/list", params)?
+            }
+            _ => {
+                return Err(McpError::invalid_params(
+                    "Apps method is not a direction-correct standard-reused core request",
+                ));
+            }
+        };
+
+        let response = match (method, result) {
+            (
+                fastmcp_protocol::McpAppsRoutedMethod::ToolsCall,
+                CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }),
+            ) => serde_json::to_value(result.payload),
+            (
+                fastmcp_protocol::McpAppsRoutedMethod::ToolsCall,
+                CoreResult::Final(FinalCoreResult::ToolsCallTask { result }),
+            ) => serde_json::to_value(result),
+            (
+                fastmcp_protocol::McpAppsRoutedMethod::ToolsCall,
+                CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }),
+            ) => serde_json::to_value(result),
+            (
+                fastmcp_protocol::McpAppsRoutedMethod::ResourcesRead,
+                CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }),
+            ) => serde_json::to_value(result.payload),
+            (
+                fastmcp_protocol::McpAppsRoutedMethod::ResourcesRead,
+                CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }),
+            ) => serde_json::to_value(result),
+            (
+                fastmcp_protocol::McpAppsRoutedMethod::ResourcesList,
+                CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }),
+            ) => serde_json::to_value(result.payload),
+            (
+                fastmcp_protocol::McpAppsRoutedMethod::ResourceTemplatesList,
+                CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }),
+            ) => serde_json::to_value(result.payload),
+            (
+                fastmcp_protocol::McpAppsRoutedMethod::PromptsList,
+                CoreResult::Final(FinalCoreResult::PromptsList { result, .. }),
+            ) => serde_json::to_value(result.payload),
+            _ => {
+                return Err(McpError::invalid_request(
+                    "Apps reused request received a contradictory selected-era core result",
+                ));
+            }
+        }
+        .map_err(|_| {
+            McpError::internal_error("Apps core result could not form a bridge response")
+        })?;
+        Ok(response)
     }
 
     fn send_typed_core_request_with_tasks<P: serde::Serialize>(
@@ -7428,10 +7652,10 @@ impl Client {
             .with_server_discovery(discovery),
         };
         session = session.with_mcp_apps_settings(mcp_apps_settings);
-        let apps_active = session.server_discovery().is_some_and(|discovery| {
-            resolve_mcp_apps_activation(session.mcp_apps_settings(), discovery)
+        let apps_activation_receipt = session.server_discovery().and_then(|discovery| {
+            mcp_apps_activation_receipt(session.mcp_apps_settings(), discovery)
         });
-        session.set_mcp_apps_active(apps_active);
+        session.set_mcp_apps_activation_receipt(apps_activation_receipt);
         self.session = session.try_with_protocol_plan(protocol_plan).map_err(|_| {
             McpError::internal_error("Configured protocol policy rejects the negotiated era")
         })?;

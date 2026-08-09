@@ -1259,7 +1259,10 @@ mod tests {
             "{assignments}"
         );
         for secret in ["query-canary", "password-canary"] {
-            assert!(!assignments.contains(secret), "leaked {secret}: {assignments}");
+            assert!(
+                !assignments.contains(secret),
+                "leaked {secret}: {assignments}"
+            );
         }
     }
 

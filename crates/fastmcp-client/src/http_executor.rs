@@ -41,11 +41,11 @@ use fastmcp_protocol::tasks_extension::{
 use fastmcp_protocol::{
     CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo, CompleteResult,
     CoreDispatchError, CoreRequest, CoreResult, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult,
-    FinalNotificationError, FinalRequestMeta, FinalSubscriptionsAcknowledgedNotificationParams,
-    FinalSubscriptionsListenResult, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification,
-    SubscriptionFilter, decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
-    task_subscription_ids,
+    FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
+    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
+    JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
+    SERVER_DISCOVER, ServerDiscoverResult, ServerNotification, SubscriptionFilter,
+    decode_strict_jsonrpc_message, decode_strict_jsonrpc_response, task_subscription_ids,
 };
 
 use crate::session::resolve_mcp_apps_activation;
@@ -89,6 +89,18 @@ fn raw_final_notification_params(
 
 /// Maximum response bytes retained while classifying a disposable modern probe.
 pub const MAX_MODERN_HTTP_PROBE_BODY_BYTES: usize = 64 * 1024;
+
+/// Maximum completed SSE payloads retained from one native HTTP body frame
+/// before a caller receives the next event.
+///
+/// This is independent of the per-event [`SseLimits`] bound: one valid body
+/// frame can contain many individually valid events.
+pub const MAX_PENDING_MODERN_HTTP_SSE_EVENTS: usize = 128;
+
+/// Maximum UTF-8 encoded bytes retained by pending modern HTTP SSE payloads
+/// from one or more native body frames before a caller receives the next
+/// event.
+pub const MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES: usize = 64 * 1024;
 
 /// Maximum retained bytes in one legacy SSE event, including its field names.
 const MAX_LEGACY_SSE_EVENT_BYTES: usize = 64 * 1024;
@@ -326,8 +338,53 @@ impl ModernHttpResponseStream {
             response: Some(self.response),
             parser: Some(BoundedSseParser::new(limits)),
             pending_events: VecDeque::new(),
+            pending_event_bytes: 0,
             end_of_stream: None,
         })
+    }
+
+    /// Converts this response into a typed, request-owned final core listener.
+    ///
+    /// The listener accepts only final server notifications and the one
+    /// response correlated to `request_id`. Progress is decoded from the raw
+    /// SSE event so its JSON-number lexemes remain intact.
+    pub fn into_final_core_listener(
+        self,
+        request_id: RequestId,
+        core_request: CoreRequest,
+        limits: SseLimits,
+    ) -> Result<ModernHttpFinalCoreListener, ModernHttpFinalCoreListenError> {
+        if request_id.validate().is_err() {
+            return Err(ModernHttpFinalCoreListenError::InvalidRequestId);
+        }
+        if !matches!(core_request, CoreRequest::Final(_)) {
+            return Err(ModernHttpFinalCoreListenError::NonFinalCoreRequest);
+        }
+        let maximum_jsonrpc_bytes = limits.max_event_bytes();
+        let stream = self
+            .into_sse_stream(limits)
+            .map_err(ModernHttpFinalCoreListenError::Executor)?;
+        Ok(ModernHttpFinalCoreListener {
+            stream,
+            core_request,
+            request_id,
+            maximum_jsonrpc_bytes,
+            tasks_result_negotiated: false,
+            terminal_received: false,
+        })
+    }
+
+    /// Converts this response into the Tasks-authorized final `tools/call`
+    /// listener used only after bilateral Tasks discovery admission.
+    fn into_final_tasks_tool_call_listener(
+        self,
+        request_id: RequestId,
+        core_request: CoreRequest,
+        limits: SseLimits,
+    ) -> Result<ModernHttpFinalCoreListener, ModernHttpFinalCoreListenError> {
+        let mut listener = self.into_final_core_listener(request_id, core_request, limits)?;
+        listener.tasks_result_negotiated = true;
+        Ok(listener)
     }
 
     /// Converts this response into a live final `subscriptions/listen` listener.
@@ -695,6 +752,365 @@ impl ModernHttpSubscriptionListener {
     }
 }
 
+/// Maximum exact final progress notifications retained by one ordinary modern
+/// HTTP request-owned collector.
+pub const MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS: usize = 64;
+
+/// One accepted record from an ordinary final core HTTP response stream.
+#[derive(Debug, Clone)]
+pub enum ModernHttpFinalCoreEvent {
+    /// An exact progress notification retained without `f64` conversion.
+    Progress(FinalProgressNotificationParams),
+    /// Another exact final server notification admitted by its declared direction.
+    Notification(ServerNotification),
+    /// The one final core result correlated to the request that opened this stream.
+    Terminal(FinalCoreResult),
+}
+
+/// The terminal record collected from one ordinary final core HTTP response stream.
+#[derive(Debug, Clone)]
+pub struct ModernHttpFinalCoreCollector {
+    /// The JSON-RPC request identity that owns the response stream.
+    pub request_id: RequestId,
+    /// Exact final progress notifications in received order.
+    pub progress_notifications: Vec<FinalProgressNotificationParams>,
+    /// The final core result correlated to `request_id`.
+    pub terminal: FinalCoreResult,
+}
+
+/// A live, request-owned final core HTTP response stream.
+///
+/// This listener is intentionally final-only. It never projects a notification
+/// through the legacy progress callback or invokes a legacy reverse-request
+/// handler.
+#[derive(Debug)]
+pub struct ModernHttpFinalCoreListener {
+    stream: ModernHttpSseResponseStream,
+    core_request: CoreRequest,
+    request_id: RequestId,
+    maximum_jsonrpc_bytes: usize,
+    tasks_result_negotiated: bool,
+    terminal_received: bool,
+}
+
+impl ModernHttpFinalCoreListener {
+    /// Returns the JSON-RPC request ID that owns this listener.
+    #[must_use]
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn fail<T>(
+        &mut self,
+        error: ModernHttpFinalCoreListenError,
+    ) -> Result<T, ModernHttpFinalCoreListenError> {
+        self.stream.close();
+        Err(error)
+    }
+
+    /// Reads and validates one request-owned server notification or terminal result.
+    ///
+    /// The listener closes its owned response body if `cx` is cancelled. A
+    /// server cancellation notification is invalid on modern HTTP because body
+    /// closure is the sole cancellation mechanism for this response stream.
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError> {
+        if self.terminal_received {
+            return Ok(None);
+        }
+
+        loop {
+            let event = match self.stream.next_event(cx).await {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    return self.fail(ModernHttpFinalCoreListenError::EndOfStream {
+                        framing: self.stream.end_of_stream(),
+                    });
+                }
+                Err(ModernHttpExecutorError::Cancelled) => {
+                    return self.fail(ModernHttpFinalCoreListenError::CallerCancelled {
+                        request_id: self.request_id.clone(),
+                    });
+                }
+                Err(error) => return self.fail(ModernHttpFinalCoreListenError::Executor(error)),
+            };
+            let message =
+                match decode_strict_jsonrpc_message(event.as_bytes(), self.maximum_jsonrpc_bytes) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        return self.fail(ModernHttpFinalCoreListenError::JsonRpcAdmission(error));
+                    }
+                };
+
+            match message {
+                JsonRpcMessage::Response(response) => {
+                    let admission = match decode_strict_jsonrpc_response(
+                        event.as_bytes(),
+                        self.maximum_jsonrpc_bytes,
+                    ) {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            return self
+                                .fail(ModernHttpFinalCoreListenError::JsonRpcAdmission(error));
+                        }
+                    };
+                    if admission.response() != &response {
+                        return self.fail(ModernHttpFinalCoreListenError::JsonRpcAdmission(
+                            JsonRpcAdmissionError::InvalidEnvelope,
+                        ));
+                    }
+                    let (_, raw_result) = admission.into_parts();
+                    let terminal = match decode_final_core_terminal(
+                        &self.core_request,
+                        response,
+                        raw_result.as_deref(),
+                        self.request_id.clone(),
+                        self.tasks_result_negotiated,
+                    ) {
+                        Ok(terminal) => terminal,
+                        Err(error) => return self.fail(error),
+                    };
+                    self.terminal_received = true;
+                    self.stream.close();
+                    return Ok(Some(ModernHttpFinalCoreEvent::Terminal(terminal)));
+                }
+                JsonRpcMessage::Request(request) => {
+                    let raw_params = match raw_final_notification_params(&request, event.as_bytes())
+                    {
+                        Ok(raw_params) => raw_params,
+                        Err(error) => {
+                            return self.fail(
+                                ModernHttpFinalCoreListenError::NotificationAdmission(error),
+                            );
+                        }
+                    };
+                    let notification = match raw_params.as_deref() {
+                        Some(raw_params) => {
+                            ServerNotification::decode_with_raw_params(&request, raw_params)
+                        }
+                        None => ServerNotification::decode(&request),
+                    };
+                    let notification = match notification {
+                        Ok(notification) => notification,
+                        Err(error) => {
+                            return self.fail(
+                                ModernHttpFinalCoreListenError::NotificationAdmission(error),
+                            );
+                        }
+                    };
+
+                    match notification {
+                        ServerNotification::Progress(progress) => {
+                            return Ok(Some(ModernHttpFinalCoreEvent::Progress(progress)));
+                        }
+                        ServerNotification::Cancelled(_) => {
+                            return self
+                                .fail(ModernHttpFinalCoreListenError::ServerCancellationOnHttp);
+                        }
+                        notification => {
+                            return Ok(Some(ModernHttpFinalCoreEvent::Notification(notification)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collects exact progress notifications until the one terminal core result.
+    pub async fn collect(
+        mut self,
+        cx: &Cx,
+    ) -> Result<ModernHttpFinalCoreCollector, ModernHttpFinalCoreListenError> {
+        let mut progress_notifications = Vec::new();
+        loop {
+            let Some(event) = self.next_event(cx).await? else {
+                return self.fail(ModernHttpFinalCoreListenError::EndOfStream {
+                    framing: self.stream.end_of_stream(),
+                });
+            };
+            match event {
+                ModernHttpFinalCoreEvent::Progress(progress) => {
+                    if progress_notifications.len() >= MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS
+                    {
+                        return self.fail(ModernHttpFinalCoreListenError::ProgressQueueFull);
+                    }
+                    progress_notifications.push(progress);
+                }
+                ModernHttpFinalCoreEvent::Notification(_) => {}
+                ModernHttpFinalCoreEvent::Terminal(terminal) => {
+                    return Ok(ModernHttpFinalCoreCollector {
+                        request_id: self.request_id.clone(),
+                        progress_notifications,
+                        terminal,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Errors raised while consuming an ordinary final core HTTP SSE response stream.
+#[derive(Debug)]
+pub enum ModernHttpFinalCoreListenError {
+    /// The supplied request ID is not a valid JSON-RPC correlation key.
+    InvalidRequestId,
+    /// A non-final core request cannot own this final-only listener.
+    NonFinalCoreRequest,
+    /// Constructing or issuing the final core request failed.
+    Request(ModernHttpClientError),
+    /// The response did not use the required SSE body lane or could not be read.
+    Executor(ModernHttpExecutorError),
+    /// An SSE event was not one strictly admitted JSON-RPC object.
+    JsonRpcAdmission(JsonRpcAdmissionError),
+    /// A server request was not one exact final server notification.
+    NotificationAdmission(FinalNotificationError),
+    /// The server emitted a terminal response for another request.
+    ResponseIdMismatch {
+        /// The immutable outgoing request ID.
+        expected: RequestId,
+        /// The response ID observed on the stream.
+        actual: Option<RequestId>,
+    },
+    /// The server terminated the request with a JSON-RPC error.
+    RemoteError {
+        /// Server-provided JSON-RPC code.
+        code: i32,
+        /// Server-provided JSON-RPC message.
+        message: String,
+    },
+    /// The terminal result contradicted the selected final core method.
+    TerminalResult(CoreDispatchError),
+    /// A generic core listener received a Tasks-only `tools/call` result.
+    TasksResultRequiresNegotiatedListener,
+    /// The decoded terminal branch was not final.
+    UnexpectedTerminalResult,
+    /// The bounded progress queue is full.
+    ProgressQueueFull,
+    /// A server cancellation notification is invalid on a modern HTTP response stream.
+    ServerCancellationOnHttp,
+    /// The caller cancelled this request-owned listener context.
+    CallerCancelled { request_id: RequestId },
+    /// The SSE stream reached EOF before a terminal response.
+    EndOfStream { framing: Option<SseEndOfStream> },
+}
+
+impl fmt::Display for ModernHttpFinalCoreListenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequestId => {
+                formatter.write_str("final core HTTP listener requires a valid JSON-RPC request ID")
+            }
+            Self::NonFinalCoreRequest => {
+                formatter.write_str("final core HTTP listener requires a final core request")
+            }
+            Self::Request(error) => error.fmt(formatter),
+            Self::Executor(error) => error.fmt(formatter),
+            Self::JsonRpcAdmission(error) => write!(
+                formatter,
+                "final core SSE event failed strict JSON-RPC admission: {error}"
+            ),
+            Self::NotificationAdmission(error) => write!(
+                formatter,
+                "final core SSE event was not a valid final server notification: {error}"
+            ),
+            Self::ResponseIdMismatch { expected, actual } => write!(
+                formatter,
+                "final core response ID {actual:?} did not match request {expected:?}"
+            ),
+            Self::RemoteError { code, message } => write!(
+                formatter,
+                "final core request failed with JSON-RPC {code}: {message}"
+            ),
+            Self::TerminalResult(error) => {
+                write!(formatter, "invalid final core terminal result: {error}")
+            }
+            Self::TasksResultRequiresNegotiatedListener => formatter
+                .write_str("final core listener received a Tasks result without Tasks negotiation"),
+            Self::UnexpectedTerminalResult => {
+                formatter.write_str("final core listener decoded a non-final terminal result")
+            }
+            Self::ProgressQueueFull => {
+                formatter.write_str("final core progress queue capacity exceeded")
+            }
+            Self::ServerCancellationOnHttp => formatter.write_str(
+                "final core HTTP response received an invalid server cancellation notification",
+            ),
+            Self::CallerCancelled { request_id } => write!(
+                formatter,
+                "final core request {request_id:?} was cancelled by the caller"
+            ),
+            Self::EndOfStream { .. } => {
+                formatter.write_str("final core SSE reached EOF before terminal response")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ModernHttpFinalCoreListenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Request(error) => Some(error),
+            Self::Executor(error) => Some(error),
+            Self::JsonRpcAdmission(error) => Some(error),
+            Self::NotificationAdmission(error) => Some(error),
+            Self::TerminalResult(error) => Some(error),
+            Self::InvalidRequestId
+            | Self::NonFinalCoreRequest
+            | Self::ResponseIdMismatch { .. }
+            | Self::RemoteError { .. }
+            | Self::TasksResultRequiresNegotiatedListener
+            | Self::UnexpectedTerminalResult
+            | Self::ProgressQueueFull
+            | Self::ServerCancellationOnHttp
+            | Self::CallerCancelled { .. }
+            | Self::EndOfStream { .. } => None,
+        }
+    }
+}
+
+fn decode_final_core_terminal(
+    core_request: &CoreRequest,
+    response: JsonRpcResponse,
+    result_source: Option<&str>,
+    expected_id: RequestId,
+    tasks_result_negotiated: bool,
+) -> Result<FinalCoreResult, ModernHttpFinalCoreListenError> {
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|response_id| response_id.correlates_with(&expected_id))
+    {
+        return Err(ModernHttpFinalCoreListenError::ResponseIdMismatch {
+            expected: expected_id,
+            actual: response.id,
+        });
+    }
+    if let Some(error) = response.error.as_ref() {
+        return Err(ModernHttpFinalCoreListenError::RemoteError {
+            code: error.code,
+            message: error.message.clone(),
+        });
+    }
+    let result_source = result_source.ok_or_else(|| {
+        ModernHttpFinalCoreListenError::TerminalResult(CoreDispatchError::InvalidResult {
+            era: core_request.era(),
+            method: core_request.method(),
+        })
+    })?;
+    let CoreResult::Final(result) = core_request
+        .decode_response_result(&response, result_source)
+        .map_err(ModernHttpFinalCoreListenError::TerminalResult)?
+    else {
+        return Err(ModernHttpFinalCoreListenError::UnexpectedTerminalResult);
+    };
+    if matches!(result, FinalCoreResult::ToolsCallTask { .. }) && !tasks_result_negotiated {
+        return Err(ModernHttpFinalCoreListenError::TasksResultRequiresNegotiatedListener);
+    }
+    Ok(result)
+}
+
 /// A live bounded parser over one modern HTTP SSE response body.
 ///
 /// This owns both the native response body and the parser, so a parser
@@ -705,14 +1121,60 @@ pub struct ModernHttpSseResponseStream {
     response: Option<ClientStreamingResponse<ClientIo>>,
     parser: Option<BoundedSseParser>,
     pending_events: VecDeque<String>,
+    pending_event_bytes: usize,
     end_of_stream: Option<SseEndOfStream>,
 }
 
 impl ModernHttpSseResponseStream {
-    fn close_response_for_cancellation(&mut self) {
+    /// Releases the owned response body and parser immediately.
+    ///
+    /// A request-owned listener uses this for cancellation, terminal delivery,
+    /// and every refused wire record so a caller cannot resume a malformed
+    /// stream.
+    fn close(&mut self) {
         self.response = None;
         self.parser = None;
         self.pending_events.clear();
+        self.pending_event_bytes = 0;
+    }
+
+    fn retain_pending_events(
+        &mut self,
+        events: Vec<String>,
+    ) -> Result<(), ModernHttpExecutorError> {
+        let event_count = match self.pending_events.len().checked_add(events.len()) {
+            Some(event_count) => event_count,
+            None => {
+                self.close();
+                return Err(ModernHttpExecutorError::PendingSseEventCountExceeded {
+                    maximum_events: MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
+                });
+            }
+        };
+        if event_count > MAX_PENDING_MODERN_HTTP_SSE_EVENTS {
+            self.close();
+            return Err(ModernHttpExecutorError::PendingSseEventCountExceeded {
+                maximum_events: MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
+            });
+        }
+        let event_bytes = events
+            .iter()
+            .try_fold(0_usize, |total, event| total.checked_add(event.len()));
+        let event_bytes =
+            match event_bytes.and_then(|bytes| self.pending_event_bytes.checked_add(bytes)) {
+                Some(event_bytes) if event_bytes <= MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES => {
+                    event_bytes
+                }
+                _ => {
+                    self.close();
+                    return Err(ModernHttpExecutorError::PendingSseEventBytesExceeded {
+                        maximum_bytes: MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES,
+                    });
+                }
+            };
+        self.pending_events.extend(events);
+        self.pending_event_bytes = event_bytes;
+        Ok(())
     }
 
     /// Returns the next completed SSE `data` payload, or `None` at EOF.
@@ -721,10 +1183,11 @@ impl ModernHttpSseResponseStream {
     /// it through the protocol's strict response/notification admission path.
     pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<String>, ModernHttpExecutorError> {
         if cx.checkpoint().is_err() {
-            self.close_response_for_cancellation();
+            self.close();
             return Err(ModernHttpExecutorError::Cancelled);
         }
         if let Some(event) = self.pending_events.pop_front() {
+            self.pending_event_bytes = self.pending_event_bytes.saturating_sub(event.len());
             return Ok(Some(event));
         }
         if self.end_of_stream.is_some() {
@@ -734,7 +1197,7 @@ impl ModernHttpSseResponseStream {
 
         loop {
             if cx.checkpoint().is_err() {
-                self.close_response_for_cancellation();
+                self.close();
                 return Err(ModernHttpExecutorError::Cancelled);
             }
             let frame = {
@@ -757,14 +1220,14 @@ impl ModernHttpSseResponseStream {
             let frame = match frame {
                 Ok(frame) => frame,
                 Err(()) => {
-                    self.close_response_for_cancellation();
+                    self.close();
                     return Err(ModernHttpExecutorError::Cancelled);
                 }
             };
             let frame = match reject_body_frame_after_cancellation(cx, frame) {
                 Ok(frame) => frame,
                 Err(ModernHttpExecutorError::Cancelled) => {
-                    self.close_response_for_cancellation();
+                    self.close();
                     return Err(ModernHttpExecutorError::Cancelled);
                 }
                 Err(error) => return Err(error),
@@ -788,22 +1251,25 @@ impl ModernHttpSseResponseStream {
 
             while data.has_remaining() {
                 let chunk = data.chunk();
-                let parser = self
+                let parsed_events = self
                     .parser
                     .as_mut()
-                    .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
-                match parser.push(chunk) {
-                    Ok(events) => self.pending_events.extend(events),
+                    .ok_or(ModernHttpExecutorError::SseStreamClosed)?
+                    .push(chunk);
+                match parsed_events {
+                    Ok(events) => self.retain_pending_events(events)?,
                     Err(error) => {
                         self.response = None;
                         self.parser = None;
                         self.pending_events.clear();
+                        self.pending_event_bytes = 0;
                         return Err(ModernHttpExecutorError::SseParse(error));
                     }
                 }
                 data.advance(chunk.len());
             }
             if let Some(event) = self.pending_events.pop_front() {
+                self.pending_event_bytes = self.pending_event_bytes.saturating_sub(event.len());
                 return Ok(Some(event));
             }
         }
@@ -1293,6 +1759,16 @@ pub enum ModernHttpExecutorError {
     SseParse(SseParseError),
     /// The SSE stream was already consumed, closed, or refused.
     SseStreamClosed,
+    /// One native HTTP body frame would exceed the bounded pending SSE event count.
+    PendingSseEventCountExceeded {
+        /// Maximum retained completed SSE payloads.
+        maximum_events: usize,
+    },
+    /// One native HTTP body frame would exceed the bounded pending SSE payload bytes.
+    PendingSseEventBytesExceeded {
+        /// Maximum retained UTF-8 encoded SSE payload bytes.
+        maximum_bytes: usize,
+    },
 }
 
 impl fmt::Display for ModernHttpExecutorError {
@@ -1337,6 +1813,14 @@ impl fmt::Display for ModernHttpExecutorError {
             Self::SseStreamClosed => {
                 formatter.write_str("modern MCP SSE response stream is closed")
             }
+            Self::PendingSseEventCountExceeded { maximum_events } => write!(
+                formatter,
+                "modern MCP SSE response exceeds the {maximum_events}-event pending limit"
+            ),
+            Self::PendingSseEventBytesExceeded { maximum_bytes } => write!(
+                formatter,
+                "modern MCP SSE response exceeds the {maximum_bytes}-byte pending limit"
+            ),
         }
     }
 }
@@ -1544,6 +2028,10 @@ pub enum ClientHttpConnectionError {
     SubscriptionsListenRequiresModern,
     /// A modern subscription response stream failed typed admission or collection.
     SubscriptionsListen(ModernHttpSubscriptionListenError),
+    /// An ordinary modern final core response stream failed typed admission or collection.
+    FinalCoreListen(ModernHttpFinalCoreListenError),
+    /// Ordinary final core response streams require the modern HTTP transport.
+    FinalCoreListenRequiresModern,
     /// Final Tasks-backed `tools/call` requires the modern HTTP transport.
     FinalToolCallRequiresModern,
     /// Official final Tasks lifecycle methods require the modern HTTP transport.
@@ -1628,6 +2116,10 @@ impl fmt::Display for ClientHttpConnectionError {
                 formatter.write_str("subscriptions/listen requires the modern HTTP transport")
             }
             Self::SubscriptionsListen(error) => error.fmt(formatter),
+            Self::FinalCoreListen(error) => error.fmt(formatter),
+            Self::FinalCoreListenRequiresModern => {
+                formatter.write_str("final core response streams require the modern HTTP transport")
+            }
             Self::FinalToolCallRequiresModern => formatter
                 .write_str("final Tasks-backed tools/call requires the modern HTTP transport"),
             Self::FinalTasksRequiresModern { method } => {
@@ -1658,10 +2150,12 @@ impl std::error::Error for ClientHttpConnectionError {
             | Self::ModernCancellationRequiresResponseClose
             | Self::ModernClientNotificationPostUnsupported { .. }
             | Self::SubscriptionsListenRequiresModern
+            | Self::FinalCoreListenRequiresModern
             | Self::FinalToolCallRequiresModern
             | Self::FinalTasksRequiresModern { .. } => None,
             Self::ResponseAdmission(error) => Some(error),
             Self::SubscriptionsListen(error) => Some(error),
+            Self::FinalCoreListen(error) => Some(error),
         }
     }
 }
@@ -2101,6 +2595,68 @@ impl ClientHttpConnection {
             .collect(cx)
             .await
             .map_err(ClientHttpConnectionError::SubscriptionsListen)
+    }
+
+    /// Opens one live typed final core response stream.
+    ///
+    /// This is the ordinary request counterpart to
+    /// [`Self::open_subscriptions_listener`]. Its collector retains bounded
+    /// exact final progress notifications, while live iteration forwards each
+    /// notification once and accepts only the terminal response correlated to
+    /// `request_id`.
+    pub async fn open_final_core_listener(
+        &self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        limits: SseLimits,
+    ) -> Result<ModernHttpFinalCoreListener, ClientHttpConnectionError> {
+        match self {
+            Self::Modern(client) => client
+                .open_final_core_listener(cx, method, parameters, request_id, limits)
+                .await
+                .map_err(ClientHttpConnectionError::FinalCoreListen),
+            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalCoreListenRequiresModern),
+        }
+    }
+
+    /// Opens one live typed final `tools/call` response stream.
+    pub async fn open_final_tool_call_listener(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        name: &str,
+        arguments: serde_json::Value,
+        limits: SseLimits,
+    ) -> Result<ModernHttpFinalCoreListener, ClientHttpConnectionError> {
+        self.open_final_core_listener(
+            cx,
+            TOOLS_CALL,
+            serde_json::json!({ "name": name, "arguments": arguments }),
+            request_id,
+            limits,
+        )
+        .await
+    }
+
+    /// Opens one live typed final `tools/call` response stream after bilateral
+    /// Tasks result-discriminator admission.
+    pub async fn open_final_tasks_tool_call_listener(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        name: &str,
+        arguments: serde_json::Value,
+        limits: SseLimits,
+    ) -> Result<ModernHttpFinalCoreListener, ClientHttpConnectionError> {
+        match self {
+            Self::Modern(client) => client
+                .open_final_tasks_tool_call_listener(cx, request_id, name, arguments, limits)
+                .await
+                .map_err(ClientHttpConnectionError::FinalCoreListen),
+            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalCoreListenRequiresModern),
+        }
     }
 
     /// Reads one task through the official final Tasks extension.
@@ -2776,6 +3332,126 @@ impl ModernHttpClient {
             .execute(cx, &request)
             .await
             .map_err(ModernHttpClientError::Executor)
+    }
+
+    /// Opens one typed final core response stream for an ordinary core request.
+    ///
+    /// The request is constructed through the same immutable metadata and
+    /// extension path as [`Self::request`]. Its collector retains exact server
+    /// progress notifications from the request-owned SSE body without
+    /// projecting them through a legacy `f64` callback; live iteration does
+    /// not retain a hidden duplicate queue.
+    pub async fn open_final_core_listener(
+        &self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        limits: SseLimits,
+    ) -> Result<ModernHttpFinalCoreListener, ModernHttpFinalCoreListenError> {
+        if request_id.validate().is_err() {
+            return Err(ModernHttpFinalCoreListenError::InvalidRequestId);
+        }
+        let method = method.as_ref();
+        let client_extensions = merge_client_extensions(self.active_mcp_apps_settings(), None);
+        let request = build_modern_request_with_extensions(
+            &self.modern_post_target,
+            &self.client_info,
+            &self.client_capabilities,
+            method,
+            parameters,
+            Some(request_id.clone()),
+            client_extensions.as_ref(),
+        )
+        .map_err(ModernHttpFinalCoreListenError::Request)?;
+        let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
+            ModernHttpFinalCoreListenError::Request(ModernHttpClientError::RequestEncodingFailed)
+        })?;
+        let core_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            method,
+            wire_request.params.as_ref(),
+        )
+        .map_err(ModernHttpFinalCoreListenError::TerminalResult)?;
+        let response = self
+            .executor
+            .execute(cx, &request)
+            .await
+            .map_err(ModernHttpFinalCoreListenError::Executor)?;
+        response.into_final_core_listener(request_id, core_request, limits)
+    }
+
+    /// Opens one typed final `tools/call` response stream.
+    pub async fn open_final_tool_call_listener(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        name: &str,
+        arguments: serde_json::Value,
+        limits: SseLimits,
+    ) -> Result<ModernHttpFinalCoreListener, ModernHttpFinalCoreListenError> {
+        self.open_final_core_listener(
+            cx,
+            TOOLS_CALL,
+            serde_json::json!({ "name": name, "arguments": arguments }),
+            request_id,
+            limits,
+        )
+        .await
+    }
+
+    /// Opens one typed final `tools/call` response stream after exact bilateral
+    /// Tasks result-discriminator admission.
+    pub async fn open_final_tasks_tool_call_listener(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        name: &str,
+        arguments: serde_json::Value,
+        limits: SseLimits,
+    ) -> Result<ModernHttpFinalCoreListener, ModernHttpFinalCoreListenError> {
+        if request_id.validate().is_err() {
+            return Err(ModernHttpFinalCoreListenError::InvalidRequestId);
+        }
+        admit_final_tasks_result_discriminator(
+            &self.server_discovery,
+            OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+        )
+        .map_err(|_| {
+            ModernHttpFinalCoreListenError::Request(ModernHttpClientError::TasksNegotiation)
+        })?;
+
+        let task_extensions = BTreeMap::from([(
+            fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+            serde_json::json!({}),
+        )]);
+        let client_extensions =
+            merge_client_extensions(self.active_mcp_apps_settings(), Some(&task_extensions));
+        let request = build_modern_request_with_extensions(
+            &self.modern_post_target,
+            &self.client_info,
+            &self.client_capabilities,
+            TOOLS_CALL,
+            serde_json::json!({ "name": name, "arguments": arguments }),
+            Some(request_id.clone()),
+            client_extensions.as_ref(),
+        )
+        .map_err(ModernHttpFinalCoreListenError::Request)?;
+        let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
+            ModernHttpFinalCoreListenError::Request(ModernHttpClientError::RequestEncodingFailed)
+        })?;
+        let core_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            TOOLS_CALL,
+            wire_request.params.as_ref(),
+        )
+        .map_err(ModernHttpFinalCoreListenError::TerminalResult)?;
+        let response = self
+            .executor
+            .execute(cx, &request)
+            .await
+            .map_err(ModernHttpFinalCoreListenError::Executor)?;
+        response.into_final_tasks_tool_call_listener(request_id, core_request, limits)
     }
 
     /// Opens and consumes one typed final `subscriptions/listen` HTTP stream.
@@ -4344,11 +5020,13 @@ mod tests {
 
     use super::{
         ClientHttpConnection, ClientHttpConnectionError, LegacySseHttpClientError,
-        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, ModernHttpClient,
-        ModernHttpClientError, ModernHttpExecutorError, ModernHttpResponseKind,
-        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
-        decode_modern_discovery_response, merge_client_extensions,
-        reject_body_frame_after_cancellation, validate_response_head,
+        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS,
+        MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES, MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
+        MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS, ModernHttpClient, ModernHttpClientError,
+        ModernHttpExecutorError, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
+        ModernHttpResponseKind, ModernHttpSubscriptionListenCollector,
+        ModernHttpSubscriptionListenError, decode_modern_discovery_response,
+        merge_client_extensions, reject_body_frame_after_cancellation, validate_response_head,
     };
     use crate::sse::SseLimits;
     use crate::{
@@ -4694,6 +5372,28 @@ mod tests {
     fn write_chunked_sse_event(stream: &mut TcpStream, event: &str) {
         write!(stream, "{:X}\r\n{event}\r\n", event.len()).expect("write chunked legacy SSE event");
         stream.flush().expect("flush chunked legacy SSE event");
+    }
+
+    fn write_chunked_sse_frame(stream: &mut TcpStream, frame: &str) {
+        write!(stream, "{:X}\r\n{frame}\r\n", frame.len())
+            .expect("write one chunked modern SSE body frame");
+        stream
+            .flush()
+            .expect("flush one chunked modern SSE body frame");
+    }
+
+    fn final_progress_payload(message_bytes: usize) -> String {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":2,\"progress\":1,\"message\":\"{}\"}}}}",
+            "x".repeat(message_bytes)
+        )
+    }
+
+    fn one_frame_sse_body(payloads: &[String]) -> String {
+        payloads
+            .iter()
+            .map(|payload| format!("data: {payload}\n\n"))
+            .collect()
     }
 
     fn finish_chunked_sse(stream: &mut TcpStream) {
@@ -5042,6 +5742,555 @@ mod tests {
             .join()
             .expect("Tasks lifecycle HTTP server must join");
         result
+    }
+
+    #[test]
+    fn final_core_listener_live_progress_is_exact_and_terminal_closes_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind final core listener peer");
+        let address = listener
+            .local_addr()
+            .expect("read final core listener peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern discovery probe");
+            let probe = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe.body)
+                    .expect("modern discovery probe is JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener.accept().expect("accept final core tool stream");
+            let request = read_request(&mut stream);
+            let request = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("final core tool stream request is JSON-RPC");
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "tools/call");
+            begin_chunked_sse(&mut stream);
+            for _ in 0..=MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS {
+                write_chunked_sse_event(
+                    &mut stream,
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":1e400,\"total\":1e401,\"message\":\"exact\"}}\n\n",
+                );
+            }
+            write_chunked_sse_event(
+                &mut stream,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"isError\":false}}\n\n",
+            );
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "final-core-listener-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery selects the public final core listener");
+        let mut listener = runtime_block_on(connection.open_final_tool_call_listener(
+            &cx,
+            RequestId::Number(2),
+            "echo",
+            serde_json::json!({}),
+            SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+        ))
+        .expect("open final core listener");
+        for index in 0..=MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS {
+            let progress = runtime_block_on(listener.next_event(&cx))
+                .expect("admit exact final progress")
+                .expect("progress event before terminal");
+            if index == 0 {
+                assert!(matches!(
+                    progress,
+                    ModernHttpFinalCoreEvent::Progress(progress)
+                        if progress.progress.as_str() == "1e400"
+                            && progress.total.as_ref().is_some_and(|total| total.as_str() == "1e401")
+                            && progress.message.as_deref() == Some("exact")
+                ));
+            } else {
+                assert!(matches!(progress, ModernHttpFinalCoreEvent::Progress(_)));
+            }
+        }
+        let terminal = runtime_block_on(listener.next_event(&cx))
+            .expect("admit correlated terminal")
+            .expect("terminal event after progress");
+        assert!(matches!(
+            terminal,
+            ModernHttpFinalCoreEvent::Terminal(fastmcp_protocol::FinalCoreResult::ToolsCall { .. })
+        ));
+        assert!(
+            listener.stream.response.is_none(),
+            "terminal must release the body"
+        );
+        assert!(
+            listener.stream.parser.is_none(),
+            "terminal must release the parser"
+        );
+        assert!(
+            runtime_block_on(listener.next_event(&cx))
+                .expect("terminal listener cannot resume")
+                .is_none()
+        );
+        server.join().expect("final core listener peer joins");
+    }
+
+    fn read_one_frame_final_progress(
+        payloads: Vec<String>,
+        limits: SseLimits,
+    ) -> (
+        Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError>,
+        bool,
+        bool,
+        usize,
+        usize,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind one-frame SSE peer");
+        let address = listener
+            .local_addr()
+            .expect("read one-frame SSE peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let body = one_frame_sse_body(&payloads);
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept one-frame discovery probe");
+            let _ = read_request(&mut probe);
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener.accept().expect("accept one-frame tool request");
+            let _ = read_request(&mut stream);
+            begin_chunked_sse(&mut stream);
+            write_chunked_sse_frame(&mut stream, &body);
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "one-frame-pending-events-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("one-frame discovery selects modern HTTP");
+        let mut listener = runtime_block_on(connection.open_final_tool_call_listener(
+            &cx,
+            RequestId::Number(2),
+            "echo",
+            serde_json::json!({}),
+            limits,
+        ))
+        .expect("open one-frame final core listener");
+        let result = runtime_block_on(listener.next_event(&cx));
+        let snapshot = (
+            listener.stream.response.is_some(),
+            listener.stream.parser.is_some(),
+            listener.stream.pending_events.len(),
+            listener.stream.pending_event_bytes,
+        );
+        drop(listener);
+        server.join().expect("one-frame SSE peer joins");
+        (result, snapshot.0, snapshot.1, snapshot.2, snapshot.3)
+    }
+
+    #[test]
+    fn one_frame_pending_sse_events_admit_the_count_limit() {
+        let payload = final_progress_payload(0);
+        let (result, body_open, parser_open, pending_count, pending_bytes) =
+            read_one_frame_final_progress(
+                vec![payload.clone(); MAX_PENDING_MODERN_HTTP_SSE_EVENTS],
+                SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+            );
+
+        assert!(matches!(
+            result,
+            Ok(Some(ModernHttpFinalCoreEvent::Progress(_)))
+        ));
+        assert!(
+            body_open,
+            "the admitted stream remains request-owned and live"
+        );
+        assert!(parser_open, "the admitted stream retains its parser");
+        assert_eq!(
+            pending_count,
+            MAX_PENDING_MODERN_HTTP_SSE_EVENTS - 1,
+            "one dispatched event leaves the remaining one-frame payloads bounded"
+        );
+        assert_eq!(pending_bytes, payload.len() * pending_count);
+    }
+
+    #[test]
+    fn one_frame_pending_sse_events_reject_one_extra_and_release_body() {
+        let (result, body_open, parser_open, pending_count, pending_bytes) =
+            read_one_frame_final_progress(
+                vec![final_progress_payload(0); MAX_PENDING_MODERN_HTTP_SSE_EVENTS + 1],
+                SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+            );
+
+        assert!(matches!(
+            result,
+            Err(ModernHttpFinalCoreListenError::Executor(
+                ModernHttpExecutorError::PendingSseEventCountExceeded {
+                    maximum_events: MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
+                }
+            ))
+        ));
+        assert!(!body_open, "count overflow must release the response body");
+        assert!(!parser_open, "count overflow must release the parser");
+        assert_eq!(pending_count, 0);
+        assert_eq!(pending_bytes, 0);
+    }
+
+    #[test]
+    fn one_frame_pending_sse_bytes_admit_the_byte_limit() {
+        let empty_payload = final_progress_payload(0);
+        let accepted_message_bytes = MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES
+            .checked_sub(empty_payload.len())
+            .expect("explicit pending byte limit exceeds the progress envelope");
+        let accepted_payload = final_progress_payload(accepted_message_bytes);
+        let (result, body_open, parser_open, pending_count, pending_bytes) =
+            read_one_frame_final_progress(
+                vec![accepted_payload.clone()],
+                SseLimits::new(accepted_payload.len() + 32, accepted_payload.len() + 32, 8)
+                    .expect("SSE limits admit the exact pending payload"),
+            );
+
+        assert!(matches!(
+            result,
+            Ok(Some(ModernHttpFinalCoreEvent::Progress(_)))
+        ));
+        assert!(body_open, "the exact byte limit remains admitted");
+        assert!(parser_open, "the exact byte limit retains the parser");
+        assert_eq!(pending_count, 0, "the delivered event is not retained");
+        assert_eq!(pending_bytes, 0, "the delivered event is not retained");
+    }
+
+    #[test]
+    fn one_frame_pending_sse_bytes_reject_one_extra_and_release_body() {
+        let empty_payload = final_progress_payload(0);
+        let accepted_message_bytes = MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES
+            .checked_sub(empty_payload.len())
+            .expect("explicit pending byte limit exceeds the progress envelope");
+        let rejected_payload = final_progress_payload(accepted_message_bytes + 1);
+        assert_eq!(
+            final_progress_payload(accepted_message_bytes).len(),
+            MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES
+        );
+        let (result, body_open, parser_open, pending_count, pending_bytes) =
+            read_one_frame_final_progress(
+                vec![rejected_payload.clone()],
+                SseLimits::new(rejected_payload.len() + 32, rejected_payload.len() + 32, 8)
+                    .expect("SSE limits admit the one oversized pending payload"),
+            );
+
+        assert!(matches!(
+            result,
+            Err(ModernHttpFinalCoreListenError::Executor(
+                ModernHttpExecutorError::PendingSseEventBytesExceeded {
+                    maximum_bytes: MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES,
+                }
+            ))
+        ));
+        assert!(!body_open, "byte overflow must release the response body");
+        assert!(!parser_open, "byte overflow must release the parser");
+        assert_eq!(pending_count, 0);
+        assert_eq!(pending_bytes, 0);
+    }
+
+    #[test]
+    fn final_core_listener_rejects_one_terminal_id_change_and_closes_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind final core ID peer");
+        let address = listener
+            .local_addr()
+            .expect("read final core ID peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern discovery probe");
+            let _ = read_request(&mut probe);
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener.accept().expect("accept final core tool stream");
+            let _ = read_request(&mut stream);
+            begin_chunked_sse(&mut stream);
+            // This differs from the admitted terminal above only in its JSON-RPC ID.
+            write_chunked_sse_event(
+                &mut stream,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"isError\":false}}\n\n",
+            );
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "final-core-ID-listener-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery selects the final core listener");
+        let mut listener = runtime_block_on(connection.open_final_tool_call_listener(
+            &cx,
+            RequestId::Number(2),
+            "echo",
+            serde_json::json!({}),
+            SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+        ))
+        .expect("open final core listener");
+        let error = runtime_block_on(listener.next_event(&cx))
+            .expect_err("one terminal ID change must fail closed");
+        assert!(matches!(
+            error,
+            ModernHttpFinalCoreListenError::ResponseIdMismatch {
+                expected: RequestId::Number(2),
+                actual: Some(RequestId::Number(3)),
+            }
+        ));
+        assert!(
+            listener.stream.response.is_none(),
+            "ID refusal must release the body"
+        );
+        assert!(
+            listener.stream.parser.is_none(),
+            "ID refusal must release the parser"
+        );
+        server.join().expect("final core ID peer joins");
+    }
+
+    #[test]
+    fn generic_final_core_listener_rejects_tasks_tool_result_and_closes_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind generic Tasks peer");
+        let address = listener
+            .local_addr()
+            .expect("read generic Tasks peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept Tasks discovery probe");
+            let _ = read_request(&mut probe);
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                &modern_tasks_discovery_body(),
+            );
+
+            let (mut stream, _) = listener.accept().expect("accept generic tool stream");
+            let request = read_request(&mut stream);
+            let request = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("generic tool stream request is JSON-RPC");
+            assert!(request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                ["extensions"]
+                .get(fastmcp_protocol::TASKS_EXTENSION)
+                .is_none());
+            begin_chunked_sse(&mut stream);
+            write_chunked_sse_event(
+                &mut stream,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"task\",\"taskId\":\"task-73\",\"status\":\"working\",\"createdAt\":\"2026-07-28T12:00:00.000Z\",\"lastUpdatedAt\":\"2026-07-28T12:00:00.000Z\",\"ttlMs\":null}}\n\n",
+            );
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "generic-final-core-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("Tasks-capable discovery selects modern HTTP");
+        let mut listener = runtime_block_on(connection.open_final_tool_call_listener(
+            &cx,
+            RequestId::Number(2),
+            "durable-tool",
+            serde_json::json!({}),
+            SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+        ))
+        .expect("generic listener opens without a Tasks request");
+        assert!(matches!(
+            runtime_block_on(listener.next_event(&cx)),
+            Err(ModernHttpFinalCoreListenError::TasksResultRequiresNegotiatedListener)
+        ));
+        assert!(
+            listener.stream.response.is_none(),
+            "Tasks refusal must release the body"
+        );
+        assert!(
+            listener.stream.parser.is_none(),
+            "Tasks refusal must release the parser"
+        );
+        server.join().expect("generic Tasks peer joins");
+    }
+
+    #[test]
+    fn negotiated_tasks_tool_listener_admits_tasks_tool_result() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind negotiated Tasks peer");
+        let address = listener
+            .local_addr()
+            .expect("read negotiated Tasks peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept Tasks discovery probe");
+            let _ = read_request(&mut probe);
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                &modern_tasks_discovery_body(),
+            );
+
+            let (mut stream, _) = listener.accept().expect("accept Tasks tool stream");
+            let request = read_request(&mut stream);
+            let request = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("Tasks tool stream request is JSON-RPC");
+            assert_eq!(
+                request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    [fastmcp_protocol::TASKS_EXTENSION],
+                serde_json::json!({})
+            );
+            begin_chunked_sse(&mut stream);
+            write_chunked_sse_event(
+                &mut stream,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"task\",\"taskId\":\"task-73\",\"status\":\"working\",\"createdAt\":\"2026-07-28T12:00:00.000Z\",\"lastUpdatedAt\":\"2026-07-28T12:00:00.000Z\",\"ttlMs\":null}}\n\n",
+            );
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "negotiated-final-core-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("Tasks-capable discovery selects modern HTTP");
+        let mut listener = runtime_block_on(connection.open_final_tasks_tool_call_listener(
+            &cx,
+            RequestId::Number(2),
+            "durable-tool",
+            serde_json::json!({}),
+            SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+        ))
+        .expect("Tasks-negotiated listener opens");
+        assert!(matches!(
+            runtime_block_on(listener.next_event(&cx)),
+            Ok(Some(ModernHttpFinalCoreEvent::Terminal(
+                fastmcp_protocol::FinalCoreResult::ToolsCallTask { .. }
+            )))
+        ));
+        assert!(
+            listener.stream.response.is_none(),
+            "terminal must release the body"
+        );
+        assert!(
+            listener.stream.parser.is_none(),
+            "terminal must release the parser"
+        );
+        server.join().expect("negotiated Tasks peer joins");
+    }
+
+    #[test]
+    fn final_core_collector_rejects_one_extra_progress_before_terminal() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind final core overflow peer");
+        let address = listener
+            .local_addr()
+            .expect("read final core overflow peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern discovery probe");
+            let _ = read_request(&mut probe);
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener.accept().expect("accept final core tool stream");
+            let _ = read_request(&mut stream);
+            begin_chunked_sse(&mut stream);
+            for _ in 0..=MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS {
+                write_chunked_sse_event(
+                    &mut stream,
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":1e400,\"total\":1e401,\"message\":\"exact\"}}\n\n",
+                );
+            }
+            write_chunked_sse_event(
+                &mut stream,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"isError\":false}}\n\n",
+            );
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "final-core-overflow-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery selects the final core listener")
+        .into_modern()
+        .expect("modern-only connection cannot select legacy");
+        let error = runtime_block_on(async {
+            client
+                .open_final_tool_call_listener(
+                    &cx,
+                    RequestId::Number(2),
+                    "echo",
+                    serde_json::json!({}),
+                    SseLimits::new(4_096, 65_536, 128).expect("bounded SSE limits"),
+                )
+                .await?
+                .collect(&cx)
+                .await
+        })
+        .expect_err("one extra exact progress notification must fail closed");
+        assert!(matches!(
+            error,
+            ModernHttpFinalCoreListenError::ProgressQueueFull
+        ));
+        server.join().expect("final core overflow peer joins");
     }
 
     #[test]
