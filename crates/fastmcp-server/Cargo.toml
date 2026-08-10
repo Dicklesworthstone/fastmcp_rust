@@ -15,8 +15,10 @@ categories = ["network-programming", "development-tools"]
 exclude = ["src/docket.rs"]
 
 [features]
-# The dated adapter is deliberately opt-in for direct server consumers.  The
-# CLI and facade decide whether their ordinary default profile enables it.
+default = ["legacy-2024-11-05"]
+# Direct server consumers retain the historical dual-era default. The facade
+# disables dependency defaults and forwards this feature explicitly, so every
+# no-legacy facade profile excludes the dated runtime graph.
 legacy-2024-11-05 = [
     "fastmcp-protocol/legacy-2024-11-05",
     "fastmcp-transport/legacy-2024-11-05",
@@ -64,6 +66,10 @@ redis = { version = "=1.4.1", default-features = false, features = ["acl", "scri
 
 [dev-dependencies]
 fastmcp-derive.workspace = true
+# Unit tests exercise the dated adapter explicitly, without making it part of
+# the production dependency graph selected by a no-legacy facade profile.
+fastmcp-protocol = { workspace = true, features = ["legacy-2024-11-05"] }
+fastmcp-transport = { workspace = true, features = ["legacy-2024-11-05"] }
 # Test-only context construction and deterministic lab exercises.
 asupersync = { workspace = true, features = ["test-internals"] }
 

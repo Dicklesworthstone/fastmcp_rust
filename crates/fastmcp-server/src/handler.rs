@@ -426,7 +426,7 @@ where
     where
         Self: 'static,
     {
-        ProgressReporter::new(Arc::new(self))
+        ProgressReporter::with_marker(self.marker.clone(), Arc::new(self))
     }
 
     fn send_progress_with_serializer<E>(

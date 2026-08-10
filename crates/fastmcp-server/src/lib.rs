@@ -71,6 +71,8 @@ mod handler;
 pub mod http_admission;
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod legacy_2024;
+#[cfg(all(not(feature = "legacy-2024-11-05"), test))]
+mod legacy_2024;
 mod middleware;
 pub mod oauth;
 pub mod oidc;
@@ -117,10 +119,12 @@ use proxy::ProxyFinalTaskRelay;
 #[cfg(feature = "proxy")]
 pub use proxy::{
     FinalProgressCallback, ProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
-    ProxyClient, ProxyFinalCatalog, ProxyFinalTaskListener, ProxyFinalTaskListenerEvent,
-    ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
-    ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
+    ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog,
+    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter,
+    ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+pub use proxy::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
 pub use router::{
     InboundRequestContext, InboundRequestTransport, MountResult, NotificationSender, Router,
     TagFilters,
@@ -158,14 +162,300 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 use fastmcp_transport::http::{
     DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
     DualEraHttpEndpointResponse, DualEraHttpLegacySseResponse, DualEraHttpSession,
-    DualEraHttpSseResponse, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest,
-    HttpRequestHandler, HttpResponse, HttpStatus, HttpTransport, StreamableHttpRequestCancellation,
+    DualEraHttpSseResponse,
+};
+use fastmcp_transport::http::{
+    HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
+    HttpStatus, HttpTransport, StreamableHttpRequestCancellation,
     StreamableHttpRequestResponseSender,
 };
 use fastmcp_transport::sse::SseEvent;
+#[cfg(all(not(feature = "legacy-2024-11-05"), not(test)))]
+use modern_http_only::{
+    DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
+    DualEraHttpEndpointResponse, DualEraHttpSession, DualEraHttpSseResponse,
+};
+
+// The normal no-legacy graph deliberately omits the transport's dual-era
+// adapter. The server still needs the modern request-owned HTTP primitives, so
+// provide a private modern-only composition with the same internal seam. It
+// has no `/sse` or legacy-message admission branch.
+#[cfg(all(not(feature = "legacy-2024-11-05"), not(test)))]
+mod modern_http_only {
+    use std::sync::Arc;
+
+    use asupersync::Cx;
+    use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
+    use fastmcp_transport::http::{
+        HttpError, HttpHandlerConfig, HttpRequest, HttpRequestHandler, HttpResponse,
+        HttpResponseRepresentation, HttpStatus, StreamableHttpRequestCancellation,
+        StreamableHttpRequestResponseSender, StreamableHttpRequestResponseStream,
+        StreamableHttpResponseStream, StreamableHttpTransport,
+    };
+    use fastmcp_transport::sse::SseEvent;
+    use fastmcp_transport::{Transport, TransportError};
+
+    #[derive(Debug)]
+    pub enum DualEraHttpEndpointError {
+        InvalidConfiguration(String),
+        Http(HttpError),
+        Transport(TransportError),
+        Closed,
+    }
+
+    impl std::fmt::Display for DualEraHttpEndpointError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::InvalidConfiguration(message) => formatter.write_str(message),
+                Self::Http(error) => error.fmt(formatter),
+                Self::Transport(error) => error.fmt(formatter),
+                Self::Closed => formatter.write_str("modern HTTP session is closed"),
+            }
+        }
+    }
+    impl std::error::Error for DualEraHttpEndpointError {}
+    impl From<HttpError> for DualEraHttpEndpointError {
+        fn from(error: HttpError) -> Self {
+            Self::Http(error)
+        }
+    }
+    impl From<TransportError> for DualEraHttpEndpointError {
+        fn from(error: TransportError) -> Self {
+            Self::Transport(error)
+        }
+    }
+
+    pub struct DualEraHttpEndpointConfig {
+        pub legacy_sse_path: String,
+        pub legacy_message_path: String,
+        pub legacy_request_capacity: usize,
+    }
+    impl DualEraHttpEndpointConfig {
+        pub fn new(
+            legacy_sse_path: String,
+            legacy_message_path: String,
+            _legacy_origin: &str,
+        ) -> Self {
+            Self {
+                legacy_sse_path,
+                legacy_message_path,
+                legacy_request_capacity: 64,
+            }
+        }
+    }
+
+    pub struct DualEraHttpEndpoint {
+        handler: Arc<HttpRequestHandler>,
+        capacity: usize,
+    }
+    impl DualEraHttpEndpoint {
+        pub fn new(
+            handler: HttpRequestHandler,
+            config: DualEraHttpEndpointConfig,
+        ) -> Result<Self, DualEraHttpEndpointError> {
+            if config.legacy_request_capacity == 0 {
+                return Err(DualEraHttpEndpointError::InvalidConfiguration(
+                    "modern HTTP request capacity must be nonzero".to_owned(),
+                ));
+            }
+            Ok(Self {
+                handler: Arc::new(handler),
+                capacity: config.legacy_request_capacity,
+            })
+        }
+
+        pub fn open_session(&self) -> Result<DualEraHttpSession, DualEraHttpEndpointError> {
+            let mut transport = StreamableHttpTransport::with_capacity(self.capacity)?;
+            let ingress = transport.request_ingress()?;
+            let responses = transport.response_stream()?;
+            Ok(DualEraHttpSession {
+                handler: Arc::clone(&self.handler),
+                transport,
+                ingress,
+                responses,
+                closed: false,
+            })
+        }
+    }
+
+    pub enum DualEraHttpEndpointResponse {
+        Immediate(HttpResponse),
+        ModernJson(DualEraHttpJsonResponse),
+        ModernSse(DualEraHttpSseResponse),
+    }
+
+    pub struct DualEraHttpJsonResponse {
+        handler: Arc<HttpRequestHandler>,
+        responses: StreamableHttpResponseStream,
+        request_id: RequestId,
+        origin: Option<String>,
+    }
+    impl DualEraHttpJsonResponse {
+        pub fn try_response(&self) -> Result<Option<HttpResponse>, DualEraHttpEndpointError> {
+            let Some(response) = self.responses.pop_response(Some(&self.request_id))? else {
+                return Ok(None);
+            };
+            Ok(Some(
+                self.handler
+                    .try_create_response(&response, self.origin.as_deref())?,
+            ))
+        }
+    }
+
+    pub struct DualEraHttpSseResponse {
+        response: HttpResponse,
+        body: StreamableHttpRequestResponseStream,
+    }
+    impl DualEraHttpSseResponse {
+        pub fn response(&self) -> &HttpResponse {
+            &self.response
+        }
+        pub fn cancellation(&self) -> StreamableHttpRequestCancellation {
+            self.body.cancellation()
+        }
+        pub fn sender(&self) -> StreamableHttpRequestResponseSender {
+            self.body.sender()
+        }
+        pub fn is_finished(&self) -> bool {
+            self.body.is_finished()
+        }
+        pub fn pop_event(&self) -> Result<Option<SseEvent>, DualEraHttpEndpointError> {
+            self.body
+                .pop_message()
+                .map(|message| message.map(frame_message))
+                .map_err(Into::into)
+        }
+        pub fn recv_event(&self, cx: &Cx) -> Result<SseEvent, DualEraHttpEndpointError> {
+            self.body
+                .recv_message(cx)
+                .map(frame_message)
+                .map_err(Into::into)
+        }
+    }
+
+    fn frame_message(
+        message: fastmcp_transport::http::StreamableHttpRequestResponseMessage,
+    ) -> SseEvent {
+        let value = match message {
+            fastmcp_transport::http::StreamableHttpRequestResponseMessage::Notification(
+                request,
+            ) => serde_json::to_string(&request),
+            fastmcp_transport::http::StreamableHttpRequestResponseMessage::Response(response) => {
+                serde_json::to_string(&response)
+            }
+        }
+        .expect("validated JSON-RPC message must serialize for a modern HTTP SSE body");
+        SseEvent::message(value)
+    }
+
+    pub struct DualEraHttpSession {
+        handler: Arc<HttpRequestHandler>,
+        transport: StreamableHttpTransport,
+        ingress: fastmcp_transport::http::StreamableHttpRequestIngress,
+        responses: StreamableHttpResponseStream,
+        closed: bool,
+    }
+    impl DualEraHttpSession {
+        pub fn handle(
+            &mut self,
+            cx: &Cx,
+            request: HttpRequest,
+        ) -> Result<DualEraHttpEndpointResponse, DualEraHttpEndpointError> {
+            if self.closed {
+                return Err(DualEraHttpEndpointError::Closed);
+            }
+            if request.path != self.handler.config().base_path {
+                return Ok(DualEraHttpEndpointResponse::Immediate(HttpResponse::new(
+                    HttpStatus::NOT_FOUND,
+                )));
+            }
+            let origin = request.header("origin").map(str::to_owned);
+            let admission = self.handler.admit_modern_request(&request)?;
+            let json_rpc = admission.request().clone();
+            match admission.response_representation() {
+                HttpResponseRepresentation::Json => {
+                    self.ingress.push_request(cx, json_rpc.clone())?;
+                    let Some(request_id) = json_rpc.id else {
+                        return Ok(DualEraHttpEndpointResponse::Immediate(HttpResponse::new(
+                            HttpStatus::ACCEPTED,
+                        )));
+                    };
+                    Ok(DualEraHttpEndpointResponse::ModernJson(
+                        DualEraHttpJsonResponse {
+                            handler: Arc::clone(&self.handler),
+                            responses: self.responses.clone(),
+                            request_id,
+                            origin,
+                        },
+                    ))
+                }
+                HttpResponseRepresentation::Sse => {
+                    let body = admission.bind_sse_response_body(&self.responses)?;
+                    self.ingress.push_request(cx, json_rpc)?;
+                    Ok(DualEraHttpEndpointResponse::ModernSse(
+                        DualEraHttpSseResponse {
+                            response: HttpResponse::new(HttpStatus::OK)
+                                .with_header("content-type", "text/event-stream")
+                                .with_header("cache-control", "no-cache")
+                                .with_header("connection", "keep-alive")
+                                .with_body(Vec::new()),
+                            body,
+                        },
+                    ))
+                }
+            }
+        }
+        pub fn recv_modern_request(
+            &mut self,
+            cx: &Cx,
+        ) -> Result<JsonRpcRequest, DualEraHttpEndpointError> {
+            match self.transport.recv(cx)? {
+                JsonRpcMessage::Request(request) => Ok(request),
+                JsonRpcMessage::Response(_) => {
+                    Err(DualEraHttpEndpointError::Transport(TransportError::Io(
+                        std::io::Error::other("modern HTTP ingress yielded a response"),
+                    )))
+                }
+            }
+        }
+        pub fn send_modern_json_response(
+            &mut self,
+            cx: &Cx,
+            response: JsonRpcResponse,
+        ) -> Result<(), DualEraHttpEndpointError> {
+            self.transport
+                .send(cx, &JsonRpcMessage::Response(response))?;
+            Ok(())
+        }
+        pub fn send_modern_sse_response(
+            &mut self,
+            cx: &Cx,
+            cancellation: &StreamableHttpRequestCancellation,
+            response: JsonRpcResponse,
+        ) -> Result<(), DualEraHttpEndpointError> {
+            self.transport
+                .send_response_for_request(cx, cancellation, response)?;
+            Ok(())
+        }
+        pub fn send_modern_sse_notification(
+            &mut self,
+            cx: &Cx,
+            cancellation: &StreamableHttpRequestCancellation,
+            notification: JsonRpcRequest,
+        ) -> Result<(), DualEraHttpEndpointError> {
+            self.transport
+                .send_notification_for_request(cx, cancellation, notification)?;
+            Ok(())
+        }
+        pub fn close(&mut self) {
+            self.closed = true;
+        }
+    }
+}
 
 use crate::http_admission::{
     AdmittedModernPost, HttpAdmissionLimits, HttpEndpointConfig, ModernPostRejection,
@@ -191,18 +481,28 @@ use fastmcp_core::{
 };
 use fastmcp_protocol::common_types::OpenMetadata;
 use fastmcp_protocol::common_types::{Implementation, LoggingLevel};
+#[cfg(feature = "apps")]
+use fastmcp_protocol::extensions::McpAppsNegotiationResolver;
+#[cfg(feature = "tasks")]
+use fastmcp_protocol::extensions::TasksNegotiationResolver;
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, ExtensionNegotiationError, ExtensionSettingsCompatibilityResolver,
-    ExtensionSettingsResolution, McpAppsNegotiationResolver, TasksNegotiationResolver,
+    ExtensionSettingsResolution,
 };
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+use fastmcp_protocol::methods::decode_legacy_2024_11_05_client_capabilities;
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 use fastmcp_protocol::methods::{
     Legacy2024ListChangedCapability, Legacy2024ResourcesCapability, Legacy2024ServerCapabilities,
-    SUBSCRIPTIONS_LISTEN, decode_legacy_2024_11_05_client_capabilities, final_2026_07_28_method,
 };
+use fastmcp_protocol::methods::{SUBSCRIPTIONS_LISTEN, final_2026_07_28_method};
 use fastmcp_protocol::protocol_policy::{
     LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION, ModernVersionSupport, ProtocolEra,
     ProtocolPolicy, StdioEraClassifier, StdioEraDecision, StdioOpeningFrame,
 };
+#[cfg(feature = "tasks")]
+use fastmcp_protocol::task_subscription_ids;
+#[cfg(feature = "tasks")]
 use fastmcp_protocol::tasks_extension::{
     TaskStatusNotification as FinalTaskStatusNotification, set_task_subscription_ids,
 };
@@ -222,9 +522,10 @@ use fastmcp_protocol::{
     ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
     ServerExtensionDiscovery, ServerInfo, ServerInstructions, ServerNotification,
     SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
-    UnsubscribeResourceParams, task_subscription_ids,
+    UnsubscribeResourceParams,
 };
 use fastmcp_protocol::{CompleteResult, FinalSubscriptionsListenResult, ResultMeta};
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 use legacy_2024::{
     Legacy2024AdapterError, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Outbound,
     Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo, Legacy2024StateSnapshot,
@@ -586,13 +887,16 @@ impl ServerExtensionRuntime {
         }
 
         let resolver = BoxedExtensionSettingsResolver(Box::new(resolver));
-        let apps_id = fastmcp_protocol::extensions::official_mcp_apps_extension_id();
-        let resolver = if server_discovery.extensions.contains_key(&apps_id) {
-            BoxedExtensionSettingsResolver(Box::new(McpAppsNegotiationResolver::with_fallback(
-                resolver,
-            )))
-        } else {
-            resolver
+        #[cfg(feature = "apps")]
+        let resolver = {
+            let apps_id = fastmcp_protocol::extensions::official_mcp_apps_extension_id();
+            if server_discovery.extensions.contains_key(&apps_id) {
+                BoxedExtensionSettingsResolver(Box::new(McpAppsNegotiationResolver::with_fallback(
+                    resolver,
+                )))
+            } else {
+                resolver
+            }
         };
 
         Ok(Self {
@@ -603,6 +907,7 @@ impl ServerExtensionRuntime {
         })
     }
 
+    #[cfg(feature = "apps")]
     pub(crate) fn with_official_mcp_apps() -> Result<Self, ServerExtensionConfigurationError> {
         let handlers = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
         let mut runtime = Self::new(
@@ -621,6 +926,7 @@ impl ServerExtensionRuntime {
         Ok(runtime)
     }
 
+    #[cfg(feature = "tasks")]
     pub(crate) fn with_final_tasks(
         task_runtime: &FinalTaskRuntime,
     ) -> Result<Self, ServerExtensionConfigurationError> {
@@ -641,6 +947,7 @@ impl ServerExtensionRuntime {
         Ok(runtime)
     }
 
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub(crate) fn with_proxy_final_tasks(
         task_relay: Arc<ProxyFinalTaskRelay>,
     ) -> Result<Self, ServerExtensionConfigurationError> {
@@ -668,6 +975,7 @@ impl ServerExtensionRuntime {
     /// descriptor and resolver path. A pre-existing official Tasks descriptor
     /// is a real duplicate ownership conflict because the final runtime owns
     /// all three Tasks request handlers as one atomic surface.
+    #[cfg(feature = "tasks")]
     pub(crate) fn install_final_tasks(
         &mut self,
         task_runtime: &FinalTaskRuntime,
@@ -760,6 +1068,7 @@ impl ServerExtensionRuntime {
     /// upstream relay. The handlers deliberately construct fresh upstream
     /// request metadata through that selected client; downstream `_meta` is
     /// admission data and is never replayed across a proxy boundary.
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub(crate) fn install_proxy_final_tasks(
         &mut self,
         task_relay: Arc<ProxyFinalTaskRelay>,
@@ -846,6 +1155,7 @@ impl ServerExtensionRuntime {
     /// Merges the official MCP Apps descriptor, its exact empty discovery
     /// marker, and its disposition-preserving resolver branch into this
     /// still-mutable runtime.
+    #[cfg(feature = "apps")]
     pub(crate) fn install_official_mcp_apps(
         &mut self,
     ) -> Result<(), ServerExtensionConfigurationError> {
@@ -932,6 +1242,7 @@ impl ServerExtensionRuntime {
 
 /// Request-owned state retained until the exact legacy response reaches its
 /// stdio commit boundary.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct LiveLegacy2024ActiveRequest {
     cancellation: McpRequestCancellation,
     active_guard: ActiveRequestGuard,
@@ -940,6 +1251,7 @@ struct LiveLegacy2024ActiveRequest {
 
 /// Result of a live exact-2024 dispatch together with its still-active
 /// cancellation authority.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct LiveLegacy2024Dispatch {
     result: McpResult<serde_json::Value>,
     active_request: LiveLegacy2024ActiveRequest,
@@ -952,6 +1264,7 @@ struct LiveLegacy2024Dispatch {
 /// together prevents an admitted legacy request from receiving a fresh state
 /// bag or a disconnected outbound request registry.
 #[derive(Clone)]
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct LiveLegacy2024ConnectionRuntime {
     session_state: SessionState,
     notification_sender: NotificationSender,
@@ -962,6 +1275,7 @@ struct LiveLegacy2024ConnectionRuntime {
     logging_ceiling: LevelFilter,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn map_legacy_log_level(level: &str, ceiling: LevelFilter) -> Option<LogLevel> {
     let mapped = match level {
         "debug" => LogLevel::Debug,
@@ -998,6 +1312,7 @@ fn map_legacy_log_level(level: &str, ceiling: LevelFilter) -> Option<LogLevel> {
     })
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl LiveLegacy2024ConnectionRuntime {
     fn new(
         session_state: SessionState,
@@ -1073,6 +1388,7 @@ impl LiveLegacy2024ConnectionRuntime {
 
 /// Bridges an admitted exact-2024 operation to the server's legacy result
 /// surface while retaining the peer's original request identity.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct LiveLegacy2024RuntimeHandler<'a> {
     server: &'a Server,
     cx: Cx,
@@ -1083,6 +1399,7 @@ struct LiveLegacy2024RuntimeHandler<'a> {
     active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
     fn handle_legacy_2024(
         &mut self,
@@ -1149,6 +1466,7 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
 /// Owns a server reference for an exact-2024 HTTP session. The session updates
 /// the request context before every adapter call, while the adapter retains the
 /// lifecycle and original wire identity across independent HTTP requests.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct HttpLegacy2024RuntimeHandler {
     server: Arc<Server>,
     session_id: u64,
@@ -1162,6 +1480,7 @@ struct HttpLegacy2024RuntimeHandler {
     legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
     fn handle_legacy_2024(
         &mut self,
@@ -1450,7 +1769,20 @@ fn classify_initial_stdio_envelope(
         }
         JsonRpcMessage::Request(request) => stdio_opening_frame(request),
     };
-    match classifier.classify_opening(opening) {
+    let decision = classifier.classify_opening(opening);
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    if matches!(
+        &decision,
+        StdioEraDecision::Selected {
+            era: ProtocolEra::Legacy2024,
+            ..
+        }
+    ) {
+        // No-legacy profiles must reject at the envelope boundary, before an
+        // adapter, session, request authority, or handler can be installed.
+        return Err(decision);
+    }
+    match decision {
         StdioEraDecision::Selected {
             era: ProtocolEra::Modern2026,
             modern_version: Some(ModernVersionSupport::Supported),
@@ -1463,6 +1795,16 @@ fn classify_initial_stdio_envelope(
     }
 }
 
+/// Preserves the configured runtime classifier policy.
+///
+/// A no-legacy build rejects an exact legacy selection at the envelope
+/// boundary in [`classify_initial_stdio_envelope`]. It must not silently turn
+/// `LegacyOnly` into `ModernOnly`: the former is an unavailable configuration,
+/// while the latter is an explicit final-era admission policy.
+fn runtime_stdio_policy(policy: ProtocolPolicy) -> ProtocolPolicy {
+    policy
+}
+
 /// Rejects a malformed receive failure as an Auto connection's terminal
 /// opening frame. Later malformed frames retain ordinary JSON-RPC recovery
 /// behavior because their era was already selected.
@@ -1470,6 +1812,7 @@ fn reject_initial_stdio_malformed(classifier: &mut StdioEraClassifier) -> StdioE
     classifier.classify_opening(StdioOpeningFrame::Malformed)
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn runtime_legacy_binding(generation: u64) -> LegacyPeerBinding {
     let mut partition = [0_u8; LegacyAuthenticatedPeerPartition::BYTE_LEN];
     partition[..8].copy_from_slice(&generation.to_be_bytes());
@@ -1503,6 +1846,7 @@ fn bind_anonymous_connection_principal(
     }
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn legacy_adapter_response<H: Legacy2024Handler>(
     adapter: &mut Legacy2024ServerAdapter<H>,
     binding: LegacyPeerBinding,
@@ -1523,6 +1867,7 @@ fn legacy_adapter_response<H: Legacy2024Handler>(
     }
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn sync_live_legacy_runtime_from_adapter<H: Legacy2024Handler>(
     runtime: &LiveLegacy2024ConnectionRuntime,
     adapter: &Legacy2024ServerAdapter<H>,
@@ -1533,6 +1878,7 @@ fn sync_live_legacy_runtime_from_adapter<H: Legacy2024Handler>(
 /// Applies an exact legacy client response to the adapter that allocated its
 /// reverse-request ID. A response cannot produce peer output, so any other
 /// adapter result is a protocol failure.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn legacy_adapter_accept_response<H: Legacy2024Handler>(
     adapter: &mut Legacy2024ServerAdapter<H>,
     binding: LegacyPeerBinding,
@@ -1548,6 +1894,7 @@ fn legacy_adapter_accept_response<H: Legacy2024Handler>(
     )
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn take_live_legacy_active_request(
     active_request: &Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
 ) -> Option<LiveLegacy2024ActiveRequest> {
@@ -1557,6 +1904,7 @@ fn take_live_legacy_active_request(
         .take()
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn legacy_handled_response(
     response: JsonRpcResponse,
     active_request: Option<LiveLegacy2024ActiveRequest>,
@@ -1811,6 +2159,7 @@ enum QueuedDispatchMessage {
     /// that allocated their reverse-request IDs. Generic bidirectional
     /// responses never enter this variant: they are consumed directly by the
     /// generic pending-request registry.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     LegacyResponse(JsonRpcResponse),
 }
 
@@ -2908,14 +3257,23 @@ pub struct ServerHttpEndpoint {
 pub struct ServerHttpSession {
     server: Arc<Server>,
     endpoint_session: Arc<Mutex<DualEraHttpSession>>,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_session_id: String,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_session: Session,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_binding: LegacyPeerBinding,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_adapter: Option<Legacy2024ServerAdapter<HttpLegacy2024RuntimeHandler>>,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_request_cx: Arc<Mutex<Cx>>,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_pending_requests: Arc<PendingRequests>,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_runtime: LiveLegacy2024ConnectionRuntime,
     /// The admitted modern session's mutable state and continuation namespace.
     /// Stateless HTTP requests receive a fresh instance, while callers that
@@ -2925,6 +3283,9 @@ pub struct ServerHttpSession {
     /// embedding caller. Handles are retained because dropping an asupersync
     /// task handle detaches it from the session lifecycle.
     modern_dispatches: Arc<Mutex<Vec<OwnedModernHttpDispatch>>>,
+    /// The first recognized, policy-admitted wire era for this public session.
+    /// A session never bridges state across the two incompatible HTTP eras.
+    selected_era: Option<ProtocolEra>,
     closed: bool,
 }
 
@@ -3413,6 +3774,7 @@ pub enum ServerHttpEndpointResponse {
     /// A finite modern request-scoped SSE response body.
     ModernSse(ServerHttpSseResponse),
     /// A live exact MCP 2024-11-05 SSE stream.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     LegacySse(DualEraHttpLegacySseResponse),
 }
 
@@ -3759,6 +4121,7 @@ impl FinalSubscriptionRegistry {
         Ok(count)
     }
 
+    #[cfg(feature = "tasks")]
     fn publish_task(&self, notification: FinalTaskStatusNotification) -> McpResult<usize> {
         let task_id = notification.params.task.base().task_id.as_str();
         let targets = {
@@ -3968,6 +4331,8 @@ fn accepted_subscription_filter(
     requested: &SubscriptionFilter,
     accept_tasks: bool,
 ) -> McpResult<SubscriptionFilter> {
+    #[cfg(not(feature = "tasks"))]
+    let _ = accept_tasks;
     let mut accepted = SubscriptionFilter {
         prompts_list_changed: requested.prompts_list_changed.filter(|accepted| *accepted),
         resource_subscriptions: requested.resource_subscriptions.clone(),
@@ -3979,6 +4344,7 @@ fn accepted_subscription_filter(
         // activated by the core server execution path.
         additional: BTreeMap::new(),
     };
+    #[cfg(feature = "tasks")]
     if let Some(task_ids) = task_subscription_ids(requested)
         .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
     {
@@ -4003,6 +4369,7 @@ fn accepted_subscription_filter(
 /// extension members cannot make an upstream acknowledgement appear narrower;
 /// every admitted category plus the resource URI and Tasks ID sets must still
 /// match.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
 fn subscription_filter_admission_matches(
     expected: &SubscriptionFilter,
     acknowledged: &SubscriptionFilter,
@@ -4017,19 +4384,26 @@ fn subscription_filter_admission_matches(
         .resource_subscriptions
         .as_deref()
         .map(|uris| uris.iter().map(String::as_str).collect::<BTreeSet<_>>());
+    #[cfg(feature = "tasks")]
     let expected_task_ids = task_subscription_ids(&expected)
         .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
         .map(|task_ids| task_ids.into_iter().collect::<BTreeSet<_>>());
+    #[cfg(feature = "tasks")]
     let acknowledged_task_ids = task_subscription_ids(&acknowledged)
         .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
         .map(|task_ids| task_ids.into_iter().collect::<BTreeSet<_>>());
-    Ok(
-        expected.prompts_list_changed == acknowledged.prompts_list_changed
-            && expected_resource_subscriptions == acknowledged_resource_subscriptions
-            && expected.resources_list_changed == acknowledged.resources_list_changed
-            && expected.tools_list_changed == acknowledged.tools_list_changed
-            && expected_task_ids == acknowledged_task_ids,
-    )
+    let core_filters_match = expected.prompts_list_changed == acknowledged.prompts_list_changed
+        && expected_resource_subscriptions == acknowledged_resource_subscriptions
+        && expected.resources_list_changed == acknowledged.resources_list_changed
+        && expected.tools_list_changed == acknowledged.tools_list_changed;
+    #[cfg(feature = "tasks")]
+    {
+        Ok(core_filters_match && expected_task_ids == acknowledged_task_ids)
+    }
+    #[cfg(not(feature = "tasks"))]
+    {
+        Ok(core_filters_match)
+    }
 }
 
 fn subscription_metadata(
@@ -4138,6 +4512,7 @@ fn tag_subscription_notification(
     }
 }
 
+#[cfg(feature = "tasks")]
 fn tag_task_subscription_notification(
     notification: &FinalTaskStatusNotification,
     subscription_id: &RequestId,
@@ -4156,6 +4531,7 @@ fn tag_task_subscription_notification(
 /// The generation binds cleanup to this precise admission. It prevents a late
 /// response finalizer from removing a future admission that reused the same
 /// wire ID.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct HttpLegacyRequestAdmission {
     generation: u64,
     cancellation: McpRequestCancellation,
@@ -4163,6 +4539,7 @@ struct HttpLegacyRequestAdmission {
 }
 
 #[derive(Default)]
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct HttpLegacyRequestAdmissionsInner {
     next_generation: u64,
     entries: HashMap<CorrelationKey, HttpLegacyRequestAdmission>,
@@ -4175,11 +4552,13 @@ struct HttpLegacyRequestAdmissionsInner {
 /// exact authority throughout admission, mutex wait, active dispatch, and
 /// response finalization without taking the session mutex.
 #[derive(Default)]
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct HttpLegacyRequestAdmissions {
     inner: Mutex<HttpLegacyRequestAdmissionsInner>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 enum HttpLegacyAdmissionCancellationDisposition {
     NotOwned,
     Protected,
@@ -4189,12 +4568,14 @@ enum HttpLegacyAdmissionCancellationDisposition {
 
 /// Retains an HTTP admission until its target POST has completed response
 /// finalization. Dropping the guard releases only its matching generation.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct HttpLegacyRequestAdmissionGuard {
     admissions: Arc<HttpLegacyRequestAdmissions>,
     key: CorrelationKey,
     generation: u64,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl HttpLegacyRequestAdmissions {
     fn admit(
         self: &Arc<Self>,
@@ -4325,6 +4706,7 @@ impl HttpLegacyRequestAdmissions {
     }
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl Drop for HttpLegacyRequestAdmissionGuard {
     fn drop(&mut self) {
         self.admissions.release(&self.key, self.generation);
@@ -4338,6 +4720,7 @@ impl Drop for HttpLegacyRequestAdmissionGuard {
 /// control frame authenticates first, then resolves the session admission map
 /// before falling back to the server active-request registry.
 #[derive(Clone)]
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct HttpLegacyCancellationControl {
     server: Arc<Server>,
     session_id: u64,
@@ -4346,6 +4729,7 @@ struct HttpLegacyCancellationControl {
     admissions: Arc<HttpLegacyRequestAdmissions>,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl HttpLegacyCancellationControl {
     /// Revokes every exact-2024 request admitted by this SSE peer without
     /// taking the serialized `ServerHttpSession` mutex.  The transport must
@@ -4424,6 +4808,7 @@ impl HttpLegacyCancellationControl {
     }
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct LiveHttpSession {
     session: Mutex<ServerHttpSession>,
     cancellation: HttpLegacyCancellationControl,
@@ -4439,6 +4824,7 @@ struct LiveHttpSession {
     legacy_pending_requests: Arc<PendingRequests>,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveHttpSession>>>>;
 
 const MODERN_HTTP_RESPONSE_BODY_TTL: Duration = Duration::from_secs(15 * 60);
@@ -4737,6 +5123,10 @@ impl Drop for HttpConnectionPermit {
 #[derive(Default)]
 struct HttpConnectionChildren {
     tasks: Vec<asupersync::runtime::TaskHandle<()>>,
+    /// Panic and handle-consumption failures already observed by a nonblocking
+    /// settlement poll. Cancellation is expected after listener shutdown and
+    /// therefore is deliberately not recorded as a failed child.
+    terminal_failures: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4754,6 +5144,9 @@ enum HttpConnectionShutdown {
 pub enum HttpShutdownSettlement {
     /// Every retained connection child has completed and been observed.
     Settled,
+    /// Every retained child has reached a terminal state, but one or more
+    /// children panicked or violated the handle's single-consumption contract.
+    Failed { failures: usize },
     /// The retained children are still live.
     Pending { remaining: usize },
 }
@@ -4784,7 +5177,13 @@ impl HttpNonquiescentShutdown {
     pub fn poll_settlement(&mut self) -> HttpShutdownSettlement {
         self.children.reap_finished();
         if self.children.tasks.is_empty() {
-            HttpShutdownSettlement::Settled
+            if self.children.terminal_failures.is_empty() {
+                HttpShutdownSettlement::Settled
+            } else {
+                HttpShutdownSettlement::Failed {
+                    failures: self.children.terminal_failures.len(),
+                }
+            }
         } else {
             HttpShutdownSettlement::Pending {
                 remaining: self.children.tasks.len(),
@@ -4797,7 +5196,11 @@ impl HttpNonquiescentShutdown {
         let deadline = Instant::now() + timeout;
         loop {
             let settlement = self.poll_settlement();
-            if matches!(settlement, HttpShutdownSettlement::Settled) || Instant::now() >= deadline {
+            if matches!(
+                settlement,
+                HttpShutdownSettlement::Settled | HttpShutdownSettlement::Failed { .. }
+            ) || Instant::now() >= deadline
+            {
                 return settlement;
             }
             asupersync::runtime::yield_now().await;
@@ -4810,7 +5213,8 @@ impl HttpNonquiescentShutdown {
     /// ignore cancellation indefinitely, so FastMCP never performs this
     /// unbounded join inside the public listener shutdown path.
     pub async fn settle(mut self, cx: &Cx) -> McpResult<()> {
-        let mut failures = Vec::new();
+        self.children.reap_finished();
+        let mut failures = std::mem::take(&mut self.children.terminal_failures);
         for mut child in std::mem::take(&mut self.children.tasks) {
             match child.join(cx).await {
                 Ok(()) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
@@ -4848,7 +5252,8 @@ impl HttpConnectionChildren {
         for mut task in std::mem::take(&mut self.tasks) {
             match task.try_join() {
                 Ok(None) => active.push(task),
-                Ok(Some(())) | Err(_) => {}
+                Ok(Some(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                Err(error) => self.terminal_failures.push(error.to_string()),
             }
         }
         self.tasks = active;
@@ -4898,6 +5303,7 @@ impl HttpConnectionChildren {
 /// POST from observing a detached-but-still-routable session. A busy legacy
 /// handler may hold its session mutex while observing the server's earlier
 /// cancellation signal, so this cleanup never waits on that mutex.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 async fn close_live_http_sessions(cx: &Cx, sessions: &LiveHttpSessionRegistry) {
     let sessions = {
         let mut sessions = sessions
@@ -5015,6 +5421,7 @@ fn take_unsettled_retired_modern_http_dispatches(
 pub struct BoundHttpServer {
     listener: AsyncTcpListener,
     endpoint: Arc<ServerHttpEndpoint>,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_sessions: LiveHttpSessionRegistry,
     modern_sessions: LiveModernHttpSessionRegistry,
     connection_limiter: Arc<HttpConnectionLimiter>,
@@ -5102,16 +5509,26 @@ impl BoundHttpServer {
                 continue;
             };
             let endpoint = Arc::clone(&self.endpoint);
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             let legacy_sessions = Arc::clone(&self.legacy_sessions);
             let modern_sessions = Arc::clone(&self.modern_sessions);
             let connection = cx
                 .spawn_in(&connection_scope, move |connection_cx| async move {
                     let _permit = permit;
+                    #[cfg(any(feature = "legacy-2024-11-05", test))]
                     serve_http_connection(
                         &connection_cx,
                         stream,
                         endpoint,
                         legacy_sessions,
+                        modern_sessions,
+                    )
+                    .await;
+                    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+                    serve_modern_http_connection(
+                        &connection_cx,
+                        stream,
+                        endpoint,
                         modern_sessions,
                     )
                     .await;
@@ -5133,6 +5550,7 @@ impl BoundHttpServer {
         let terminal_receipt = server.final_subscriptions.terminate_with_receipt();
         modern_session_reaper.abort();
         let _ = modern_session_reaper.join(cx).await;
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         close_live_http_sessions(cx, &self.legacy_sessions).await;
         // Phase one closes response-body admission before any uninterruptible
         // connection-child join can begin. Leave the SSE queues alive until
@@ -5160,10 +5578,14 @@ impl BoundHttpServer {
         connection_children.reap_finished();
         server.graceful_shutdown_returning();
         match (connection_shutdown, connection_children.tasks.len()) {
-            (_, 0) => {
+            (_, 0) if connection_children.terminal_failures.is_empty() => {
                 result?;
                 Ok(HttpServerShutdown::Quiescent)
             }
+            (_, 0) => Err(McpError::internal_error(format!(
+                "HTTP connection shutdown observed terminal child failure(s): {}",
+                connection_children.terminal_failures.join("; ")
+            ))),
             (_, remaining) => {
                 debug_assert!(remaining > 0);
                 Ok(HttpServerShutdown::Nonquiescent(HttpNonquiescentShutdown {
@@ -5184,8 +5606,6 @@ impl Server {
         self,
         legacy_origin: impl Into<String>,
     ) -> Result<ServerHttpEndpoint, DualEraHttpEndpointError> {
-        self.ensure_launch_policy_is_valid()
-            .map_err(|error| DualEraHttpEndpointError::InvalidConfiguration(error.to_string()))?;
         let endpoint = ServerHttpEndpoint {
             server: Arc::new(self),
             legacy_origin: legacy_origin.into(),
@@ -5202,7 +5622,6 @@ impl Server {
     /// authority from the client's `Host` header, with the resolved local
     /// address as the fallback for direct embeddings.
     pub async fn bind_http(self, cx: &Cx, addr: impl Into<String>) -> McpResult<BoundHttpServer> {
-        self.ensure_launch_policy_is_valid()?;
         if cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
@@ -5221,6 +5640,7 @@ impl Server {
         Ok(BoundHttpServer {
             listener,
             endpoint: Arc::new(endpoint),
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_sessions: Arc::new(Mutex::new(HashMap::new())),
             modern_sessions: Arc::new(LiveModernHttpSessionRegistryState::new()),
             connection_limiter: Arc::new(HttpConnectionLimiter::new(max_connections)),
@@ -5272,20 +5692,25 @@ impl ServerHttpEndpoint {
         let endpoint_session = Arc::new(Mutex::new(
             self.transport_endpoint(legacy_origin)?.open_session()?,
         ));
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         let legacy_session_id = endpoint_session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .session_id()
             .to_owned();
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         let legacy_session =
             Session::new(self.server.info.clone(), self.server.capabilities.clone());
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         let legacy_binding = runtime_legacy_binding(legacy_session.id());
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         let legacy_pending_requests = Arc::new(
             PendingRequests::with_max_in_flight_for_exact_legacy(
                 self.server.max_bidirectional_requests_per_connection,
             )
             .expect("ServerBuilder validates the bidirectional request limit"),
         );
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         let notification_sender: NotificationSender = {
             let endpoint_session = Arc::clone(&endpoint_session);
             Arc::new(move |notification| {
@@ -5295,6 +5720,7 @@ impl ServerHttpEndpoint {
                     .publish_legacy_message(&JsonRpcMessage::Request(notification));
             })
         };
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         let legacy_request_sender = RequestSender::new(Arc::clone(&legacy_pending_requests), {
             let endpoint_session = Arc::clone(&endpoint_session);
             Arc::new(move |message| {
@@ -5306,6 +5732,7 @@ impl ServerHttpEndpoint {
                     .map_err(|error| error.to_string())
             })
         });
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
             legacy_session.state().clone(),
             notification_sender,
@@ -5315,21 +5742,32 @@ impl ServerHttpEndpoint {
         Ok(ServerHttpSession {
             server: Arc::clone(&self.server),
             endpoint_session,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_session_id,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_session,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_binding,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_adapter: None,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_active_request: Arc::new(Mutex::new(None)),
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_request_cx: Arc::new(Mutex::new(cx.clone())),
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_admissions: Arc::new(HttpLegacyRequestAdmissions::default()),
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_pending_requests,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_runtime,
             modern_connection: Arc::new(ModernConnection::new()),
             modern_dispatches: Arc::new(Mutex::new(Vec::new())),
+            selected_era: None,
             closed: false,
         })
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn open_session_for_legacy_sse(
         &self,
         cx: &Cx,
@@ -5346,6 +5784,7 @@ impl ServerHttpEndpoint {
 impl ServerHttpSession {
     /// Returns the exact opaque session value required by the legacy POST URI.
     #[must_use]
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     pub fn legacy_session_id(&self) -> &str {
         &self.legacy_session_id
     }
@@ -5355,6 +5794,17 @@ impl ServerHttpSession {
         &mut self,
         cx: &Cx,
         request: HttpRequest,
+    ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
+        self.handle_with_modern_request_cancellation(cx, request, None)
+    }
+
+    /// Routes one request while retaining a cancellation authority owned by
+    /// an ordinary modern JSON response body.
+    fn handle_with_modern_request_cancellation(
+        &mut self,
+        cx: &Cx,
+        request: HttpRequest,
+        modern_request_cancellation: Option<McpRequestCancellation>,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         self.reap_modern_dispatches();
         let mut request = request;
@@ -5366,14 +5816,59 @@ impl ServerHttpSession {
         }
 
         let is_modern = request.path == self.server.http_config.handler_config.base_path;
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         let is_legacy = request.path == self.server.http_config.legacy_sse_path
             || request.path == self.server.http_config.legacy_message_path;
+        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        if request.path == self.server.http_config.legacy_sse_path
+            || request.path == self.server.http_config.legacy_message_path
+        {
+            // These routes do not exist in a no-legacy server profile. Reject
+            // before opening a transport session, pinning an era, installing
+            // the adapter, or allocating any request-owned authority.
+            return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
+                HttpStatus::NOT_FOUND,
+            )));
+        }
+        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        if matches!(self.server.protocol_policy, ProtocolPolicy::LegacyOnly) {
+            return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
+                HttpStatus::BAD_REQUEST,
+            )));
+        }
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         if (is_modern && matches!(self.server.protocol_policy, ProtocolPolicy::LegacyOnly))
             || (is_legacy && matches!(self.server.protocol_policy, ProtocolPolicy::ModernOnly))
         {
             return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
                 HttpStatus::BAD_REQUEST,
             )));
+        }
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        let request_era = if is_modern {
+            Some(ProtocolEra::Modern2026)
+        } else if is_legacy {
+            Some(ProtocolEra::Legacy2024)
+        } else {
+            None
+        };
+        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        let request_era = is_modern.then_some(ProtocolEra::Modern2026);
+        if request_era.is_some_and(|era| self.selected_era.is_some_and(|selected| selected != era))
+        {
+            // Reject before modern admission or legacy adapter dispatch: a
+            // retained public session is one era's mutable namespace, never
+            // a bridge between exact-2024 and final HTTP state.
+            return Ok(ServerHttpEndpointResponse::Immediate(
+                HttpResponse::bad_request(),
+            ));
+        }
+        // The first recognized, policy-admitted HTTP era irrevocably owns
+        // this public session, including malformed requests which never reach
+        // a handler. Otherwise a rejected modern request could be followed by
+        // a legacy request that reuses the same mutable session shell.
+        if let Some(era) = request_era {
+            self.selected_era.get_or_insert(era);
         }
         if is_modern {
             if request.header("mcp-session-id").is_some() {
@@ -5386,8 +5881,10 @@ impl ServerHttpSession {
                 Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
             };
         }
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         if let Some(response) = self.legacy_reverse_response_from_http(&request) {
-            return self.handle_legacy_reverse_response(response);
+            let result = self.handle_legacy_reverse_response(response)?;
+            return Ok(result);
         }
         let endpoint_response = self
             .endpoint_session
@@ -5395,9 +5892,17 @@ impl ServerHttpSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .handle(cx, request)?;
         if is_modern {
-            return self.handle_modern(cx, endpoint_response);
+            return self.handle_modern(cx, endpoint_response, modern_request_cancellation);
         }
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         self.handle_legacy(cx, endpoint_response)
+        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        {
+            let _ = endpoint_response;
+            Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
+                HttpStatus::NOT_FOUND,
+            )))
+        }
     }
 
     fn prepare_modern_http_request(
@@ -5460,6 +5965,7 @@ impl ServerHttpSession {
     /// Returns a transport-backed roots provider after exact-2024 roots
     /// capability negotiation has completed for this HTTP connection.
     #[must_use]
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     pub fn legacy_roots_provider(&self) -> Option<TransportRootsProvider> {
         if !self.legacy_adapter.as_ref().is_some_and(|adapter| {
             let snapshot = adapter.snapshot();
@@ -5492,6 +5998,7 @@ impl ServerHttpSession {
     /// Returns `false` without emitting a message when the connection has not
     /// subscribed to the URI, has not completed legacy initialization, or its
     /// SSE stream is not live.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     pub fn notify_legacy_resource_updated(&mut self, uri: &str) -> bool {
         let Some(adapter) = self.legacy_adapter.as_mut() else {
             return false;
@@ -5521,6 +6028,7 @@ impl ServerHttpSession {
             .is_ok()
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn legacy_reverse_response_from_http(&self, request: &HttpRequest) -> Option<JsonRpcResponse> {
         if request.method != HttpMethod::Post
             || request.path != self.server.http_config.legacy_message_path
@@ -5541,6 +6049,7 @@ impl ServerHttpSession {
         )
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn handle_legacy_reverse_response(
         &mut self,
         response: JsonRpcResponse,
@@ -5580,6 +6089,7 @@ impl ServerHttpSession {
         &mut self,
         cx: &Cx,
         endpoint_response: DualEraHttpEndpointResponse,
+        modern_request_cancellation: Option<McpRequestCancellation>,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         let request = self
             .endpoint_session
@@ -5648,10 +6158,11 @@ impl ServerHttpSession {
                         HttpStatus::NOT_ACCEPTABLE,
                     )));
                 }
-                let response = self.server.dispatch_with_protocol_policy(
+                let response = self.server.dispatch_with_protocol_policy_and_cancellation(
                     self.server.protocol_policy,
                     &inbound,
                     &request,
+                    modern_request_cancellation,
                 );
                 if let Some(response) = response {
                     self.endpoint_session
@@ -5776,6 +6287,7 @@ impl ServerHttpSession {
                 debug_assert!(request.id.is_none());
                 Ok(ServerHttpEndpointResponse::Immediate(response))
             }
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             DualEraHttpEndpointResponse::LegacySse(_) => {
                 unreachable!("the modern route cannot create a legacy SSE response")
             }
@@ -5826,7 +6338,9 @@ impl ServerHttpSession {
             Err(error) => return Err(error),
         };
         let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
-            return self.handle_modern(cx, endpoint_response).map(Err);
+            return self
+                .handle_modern(cx, endpoint_response, None)
+                .map(Err);
         };
         let request = self
             .endpoint_session
@@ -5841,6 +6355,7 @@ impl ServerHttpSession {
         Ok(Ok((request, sse)))
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn handle_legacy(
         &mut self,
         cx: &Cx,
@@ -5946,7 +6461,9 @@ impl ServerHttpSession {
         self.closed = true;
         self.modern_connection.disconnect();
         let dispatches = cancel_modern_http_dispatches(&self.server, &self.modern_dispatches, None);
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         self.legacy_admissions.cancel_all();
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         if let Some(adapter) = self.legacy_adapter.as_mut() {
             let _ = adapter.close(self.legacy_binding);
         }
@@ -5981,6 +6498,7 @@ impl ServerHttpSession {
             .is_empty()
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn cancellation_control(&self) -> HttpLegacyCancellationControl {
         HttpLegacyCancellationControl {
             server: Arc::clone(&self.server),
@@ -6009,6 +6527,7 @@ impl Drop for ServerHttpSession {
 
 /// Decodes only a strict JSON-RPC reverse response. Caller-specific legacy
 /// session identity checks remain at the ingress that owns the session.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn decode_legacy_reverse_response(
     request: &HttpRequest,
     maximum_body_size: usize,
@@ -6021,6 +6540,7 @@ fn decode_legacy_reverse_response(
     }
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn legacy_origin_from_host(host: &str) -> Option<String> {
     if host.is_empty()
         || host.bytes().any(|byte| {
@@ -6142,6 +6662,7 @@ async fn send_h1_response(
     .map_err(|_| ())
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn legacy_sse_response_head(response: &HttpResponse) -> Result<Vec<u8>, ()> {
     let mut head = format!("HTTP/1.1 {} OK\r\n", response.status.0).into_bytes();
     for (name, value) in &response.headers {
@@ -6164,6 +6685,7 @@ fn legacy_sse_response_head(response: &HttpResponse) -> Result<Vec<u8>, ()> {
     Ok(head)
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 async fn send_legacy_sse_stream(
     cx: &Cx,
     stream: AsyncTcpStream,
@@ -6546,10 +7068,12 @@ fn http_endpoint_response_to_static(cx: &Cx, response: ServerHttpEndpointRespons
             }
             response
         }
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         ServerHttpEndpointResponse::LegacySse(_) => HttpResponse::internal_error(),
     }
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn admit_live_http_legacy_request(
     endpoint: &ServerHttpEndpoint,
     legacy_sessions: &LiveHttpSessionRegistry,
@@ -6659,6 +7183,7 @@ fn dispatch_modern_http_request(
         })
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn dispatch_http_request(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
@@ -6762,6 +7287,7 @@ fn dispatch_http_request(
         })
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 async fn serve_http_connection(
     cx: &Cx,
     stream: AsyncTcpStream,
@@ -7007,6 +7533,179 @@ async fn serve_http_connection(
     }
 }
 
+/// Production HTTP/1 connection path for a feature-off server.
+///
+/// This is intentionally separate from the dual-era listener: the only
+/// request route admitted here is final Streamable HTTP. Historical `/sse`
+/// and `/messages` traffic reaches `ServerHttpSession::handle` as a 404 and
+/// can neither allocate a legacy session nor pin a legacy era.
+#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+async fn serve_modern_http_connection(
+    cx: &Cx,
+    stream: AsyncTcpStream,
+    endpoint: Arc<ServerHttpEndpoint>,
+    modern_sessions: LiveModernHttpSessionRegistry,
+) {
+    let http_config = &endpoint.server.http_config.handler_config;
+    let mut framed = Framed::new(
+        stream,
+        Http1Codec::new().max_body_size(http_config.max_body_size),
+    );
+    let Some(request) = framed.next().await else {
+        return;
+    };
+    let request = match request {
+        Ok(request) => request,
+        Err(_) => {
+            let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
+            return;
+        }
+    };
+    if !framed.read_buffer().is_empty() {
+        let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
+        return;
+    }
+    let raw_path = request
+        .uri
+        .split_once('?')
+        .map_or(request.uri.as_str(), |(path, _)| path);
+    if matches!(&request.method, Http1Method::Post) && raw_path == http_config.base_path.as_str() {
+        let headers = request
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        if let Err(response) =
+            admit_modern_http_post(http_config, "POST", raw_path, &headers, &request.body)
+        {
+            let _ = send_h1_response(cx, &mut framed, response).await;
+            return;
+        }
+    }
+    let request = match h1_request_to_transport(&request) {
+        Ok(request) => request,
+        Err(response) => {
+            let _ = send_h1_response(cx, &mut framed, response).await;
+            return;
+        }
+    };
+    let is_modern_sse = request.method == HttpMethod::Post
+        && request.path == endpoint.server.http_config.handler_config.base_path
+        && http_request_accepts_sse(&request);
+    if is_modern_sse {
+        if request.header("mcp-session-id").is_some() {
+            let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
+            return;
+        }
+        let live_session = match endpoint.open_session(cx) {
+            Ok(session) => Arc::new(LiveModernHttpSession::new(session)),
+            Err(_) => {
+                let _ = send_h1_response(cx, &mut framed, HttpResponse::internal_error()).await;
+                return;
+            }
+        };
+        let response = {
+            let mut session = live_session
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match session.begin_modern_sse(cx, request.clone()) {
+                Ok(Ok((request, response))) => Ok(Ok((
+                    InboundRequestContext::with_modern_connection(
+                        cx.clone(),
+                        request_id_to_u64(request.id.as_ref()),
+                        InboundRequestTransport::Http,
+                        &session.modern_connection,
+                    ),
+                    request,
+                    response,
+                ))),
+                Ok(Err(response)) => Ok(Err(response)),
+                Err(error) => Err(error),
+            }
+        };
+        match response {
+            Ok(Ok((inbound, request, response))) => {
+                let response_body_generation = next_live_modern_http_response_body_generation();
+                let live_session = match modern_sessions
+                    .register_response_body(response_body_generation, Arc::clone(&live_session))
+                {
+                    Ok(()) => live_session,
+                    Err(live_session) => {
+                        close_detached_modern_http_session(&modern_sessions, live_session);
+                        let _ = send_h1_response(
+                            cx,
+                            &mut framed,
+                            HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let stream = framed.into_inner();
+                let _ = send_modern_sse_stream(
+                    cx,
+                    stream,
+                    Arc::clone(&endpoint.server),
+                    &live_session,
+                    &modern_sessions,
+                    next_modern_http_stream_generation(),
+                    inbound,
+                    request,
+                    response,
+                )
+                .await;
+                if let Some(live_session) =
+                    modern_sessions.take_response_body(response_body_generation)
+                {
+                    close_detached_modern_http_session(&modern_sessions, live_session);
+                }
+                return;
+            }
+            Ok(Err(response)) => {
+                let _ = send_h1_response(
+                    cx,
+                    &mut framed,
+                    http_endpoint_response_to_static(cx, response),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                let _ = send_h1_response(
+                    cx,
+                    &mut framed,
+                    http_endpoint_error_response(&request, error, http_config.max_body_size),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    let response = if request.method == HttpMethod::Post
+        && request.path == endpoint.server.http_config.handler_config.base_path
+    {
+        dispatch_modern_http_request(cx, &endpoint, &modern_sessions, request)
+    } else {
+        let mut session = match endpoint.open_session(cx) {
+            Ok(session) => session,
+            Err(_) => {
+                let _ = send_h1_response(cx, &mut framed, HttpResponse::internal_error()).await;
+                return;
+            }
+        };
+        let error_request = request.clone();
+        session
+            .handle(cx, request)
+            .map(|response| http_endpoint_response_to_static(cx, response))
+            .unwrap_or_else(|error| {
+                http_endpoint_error_response(&error_request, error, http_config.max_body_size)
+            })
+    };
+    let _ = send_h1_response(cx, &mut framed, response).await;
+}
+
 /// An MCP server instance.
 ///
 /// Servers are built using [`ServerBuilder`] and can run on various
@@ -7038,23 +7737,22 @@ pub struct Server {
     active_requests: Arc<Mutex<HashMap<ActiveRequestKey, ActiveRequest>>>,
     /// Test-only legacy task manager retained while the task subsystem is
     /// rebuilt. It is absent from production library builds.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tasks"))]
     task_manager: Option<SharedTaskManager>,
     /// Per-connection ceiling for pending server-to-client requests.
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy selected by [`ServerBuilder`].
     protocol_policy: ProtocolPolicy,
-    /// Malformed reserved launch policy retained by the infallible builder so
-    /// every runtime entry point can reject startup before I/O begins.
-    launch_policy_error: Option<ServerLaunchPolicyError>,
     /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
     /// Frozen modern-only extension descriptors, handlers, and resolver.
     extension_runtime: Option<Arc<ServerExtensionRuntime>>,
     /// Application-owned final Tasks state retained for the caller's supervisor.
+    #[cfg(feature = "tasks")]
     final_task_runtime: Option<FinalTaskRuntime>,
     /// One route-bound upstream final Tasks relay, distinct from local durable
     /// task state because its identifiers and lifecycle remain upstream-owned.
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
     final_task_relay: Option<Arc<ProxyFinalTaskRelay>>,
     /// Request-owned final subscription streams shared by stdio and HTTP.
     final_subscriptions: Arc<FinalSubscriptionRegistry>,
@@ -7095,20 +7793,6 @@ impl Server {
         self.protocol_policy
     }
 
-    fn ensure_launch_policy_is_valid(&self) -> McpResult<()> {
-        match self.launch_policy_error {
-            Some(error) => Err(McpError::invalid_request(error.to_string())),
-            None => Ok(()),
-        }
-    }
-
-    fn reject_invalid_launch_policy_or_exit(&self) {
-        if let Err(error) = self.ensure_launch_policy_is_valid() {
-            error!(target: targets::SERVER, "Server startup rejected: {error}");
-            std::process::exit(1);
-        }
-    }
-
     /// Returns the installed frozen extension handler registry, if configured.
     #[must_use]
     pub fn extension_handler_registry(&self) -> Option<&ExtensionHandlerRegistry> {
@@ -7130,6 +7814,7 @@ impl Server {
     /// caller-owned structured supervisor drives worker transitions through
     /// this handle while the server routes only the negotiated wire methods.
     #[must_use]
+    #[cfg(feature = "tasks")]
     pub fn final_task_runtime(&self) -> Option<&FinalTaskRuntime> {
         self.final_task_runtime.as_ref()
     }
@@ -7157,6 +7842,7 @@ impl Server {
     /// Only subscriptions whose acknowledged `taskIds` set contains the
     /// notification's exact opaque task identifier receive it. The server adds
     /// the request's subscription ID without changing Task state.
+    #[cfg(feature = "tasks")]
     pub fn publish_task_status_notification(
         &self,
         notification: FinalTaskStatusNotification,
@@ -7193,6 +7879,7 @@ impl Server {
         runtime.negotiate(client)
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn legacy_2024_server_config(&self) -> Legacy2024ServerConfig {
         Legacy2024ServerConfig {
             capabilities: Legacy2024ServerCapabilities {
@@ -8080,11 +8767,25 @@ impl Server {
                 "subscriptions/listen requires exact final request metadata",
             ));
         }
+        #[cfg(feature = "tasks")]
         let tasks_requested = task_subscription_ids(&params.notifications)
             .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
             .is_some();
+        #[cfg(not(feature = "tasks"))]
+        let tasks_requested = false;
+        #[cfg(feature = "tasks")]
         if tasks_requested {
-            if self.final_task_runtime.is_none() && self.final_task_relay.is_none() {
+            let has_task_service = self.final_task_runtime.is_some() || {
+                #[cfg(feature = "proxy")]
+                {
+                    self.final_task_relay.is_some()
+                }
+                #[cfg(not(feature = "proxy"))]
+                {
+                    false
+                }
+            };
+            if !has_task_service {
                 return Err(McpError::invalid_params(
                     "Tasks subscription filter is unavailable on this server",
                 ));
@@ -8124,7 +8825,9 @@ impl Server {
         // narrowed upstream filter rather than advertising task IDs we cannot
         // later deliver. The listener itself remains owned by this downstream
         // request future; dropping it closes its upstream response body.
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
         let mut relay_listener: Option<Box<dyn ProxyFinalTaskListener>> = None;
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
         if tasks_requested && let Some(relay) = self.final_task_relay.as_ref() {
             let mut listener = relay.open_listener(request_ctx, params.notifications.clone())?;
             match listener.next(request_ctx.cx(), &request_cancellation)? {
@@ -8156,6 +8859,7 @@ impl Server {
         )?;
 
         while !self.final_subscriptions.is_terminating() {
+            #[cfg(all(feature = "proxy", feature = "tasks"))]
             if let Some(listener) = relay_listener.as_mut() {
                 match listener.next(request_ctx.cx(), &request_cancellation)? {
                     ProxyFinalTaskListenerEvent::Notification(notification) => {
@@ -8298,6 +9002,7 @@ impl Server {
     /// method-specific result serialization. In particular, it must never
     /// reuse [`Self::dispatch_stateless`]: that modern surface adds
     /// `resultType: "complete"`, which has no exact-2024 representation.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn dispatch_legacy_2024(
         &self,
         cx: &Cx,
@@ -8739,7 +9444,6 @@ impl Server {
     /// blocking stdio pump runs as a caller-owned blocking child, leaving the
     /// caller runtime free to schedule bounded, request-owned modern children.
     pub fn run_stdio(self) -> ! {
-        self.reject_invalid_launch_policy_or_exit();
         block_on(async move {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
             self.run_stdio_with_cx(&cx).await
@@ -8762,7 +9466,6 @@ impl Server {
     /// shutdown hook; running a hook concurrently with a live handler would
     /// violate the hook's quiescence contract.
     pub async fn run_stdio_with_cx(self, cx: &Cx) -> ! {
-        self.reject_invalid_launch_policy_or_exit();
         let dispatch_cx = cx.clone();
         let mut pump =
             match cx.spawn_blocking(move |pump_cx| self.run_stdio_pump(&pump_cx, &dispatch_cx)) {
@@ -8891,7 +9594,6 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
-        self.reject_invalid_launch_policy_or_exit();
         block_on(async move {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
             self.run_transport_with_cx(&cx, transport)
@@ -8905,7 +9607,6 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
-        self.reject_invalid_launch_policy_or_exit();
         self.run_transport_with_label(cx, transport, "custom")
     }
 
@@ -8913,7 +9614,6 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
-        self.reject_invalid_launch_policy_or_exit();
         self.init_rich_logging();
 
         let shared = SharedTransport::new(transport);
@@ -8926,6 +9626,7 @@ impl Server {
 
         let shared_recv = shared.clone();
         let shared_send = shared;
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         self.run_loop_legacy(
             cx,
             move |cx| shared_recv.recv(cx),
@@ -8933,7 +9634,15 @@ impl Server {
             notification_sender,
             Some(notification_failure),
             label,
-        )
+        );
+        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        std::process::exit(self.run_loop_pump(
+            cx,
+            move |cx, _worker_failed| shared_recv.recv(cx),
+            move |cx, message| shared_send.send(cx, message),
+            notification_sender,
+            label,
+        ))
     }
 
     /// Runs the server on a custom transport until clean closure, cancellation,
@@ -8957,7 +9666,6 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
-        self.ensure_launch_policy_is_valid()?;
         self.init_rich_logging();
 
         let shared = SharedTransport::new(transport);
@@ -8970,6 +9678,7 @@ impl Server {
 
         let shared_recv = shared.clone();
         let shared_send = shared.clone();
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         let run_result = self.run_loop_returning_legacy(
             cx,
             move |cx| shared_recv.recv(cx),
@@ -8978,6 +9687,21 @@ impl Server {
             Some(notification_failure),
             "custom",
         );
+        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        let run_result = match self.run_loop_pump(
+            cx,
+            move |cx, _worker_failed| shared_recv.recv(cx),
+            move |cx, message| shared_send.send(cx, message),
+            notification_sender,
+            "custom",
+        ) {
+            0 => Ok(()),
+            _ => Err(server_run_error(
+                "transport",
+                "feature_off_pump_failure",
+                "Feature-off modern transport loop failed",
+            )),
+        };
         let close_result = shared
             .close()
             .map_err(|error| transport_run_error("close", &error));
@@ -9034,7 +9758,6 @@ impl Server {
         R: TransportRecvHalf + Send + 'static,
         S: TransportSendHalf + 'static,
     {
-        self.ensure_launch_policy_is_valid()?;
         self.init_rich_logging();
         let recv_half = SharedRecvHalf::new(recv_half);
         let send_half = SharedSendHalf::new(send_half);
@@ -9076,7 +9799,6 @@ impl Server {
         R: TransportRecvHalf + Send + 'static,
         S: TransportSendHalf + 'static,
     {
-        self.reject_invalid_launch_policy_or_exit();
         let dispatch_cx = cx.clone();
         let mut pump = match cx.spawn_blocking(move |pump_cx| {
             self.run_split_transport_returning_with_dispatch_cx(
@@ -9133,7 +9855,6 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
-        self.ensure_launch_policy_is_valid()?;
         block_on(async move {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
             self.run_transport_returning_with_cx(&cx, transport)
@@ -9148,7 +9869,6 @@ impl Server {
         W: Write + Send + 'static,
         R: Iterator<Item = JsonRpcRequest> + Send + 'static,
     {
-        self.reject_invalid_launch_policy_or_exit();
         let (recv_half, send_half) =
             SseServerTransport::new(writer, request_source, endpoint_url).into_split();
         block_on(async move {
@@ -9170,7 +9890,6 @@ impl Server {
         W: Write + Send + 'static,
         R: Iterator<Item = JsonRpcRequest> + Send + 'static,
     {
-        self.reject_invalid_launch_policy_or_exit();
         let (recv_half, send_half) =
             SseServerTransport::new(writer, request_source, endpoint_url).into_split();
         self.run_split_transport_with_label(cx, recv_half, send_half, "sse")
@@ -9292,7 +10011,7 @@ impl Server {
         if !self.run_startup_hook() {
             error!(target: targets::SERVER, "Startup hook failed");
             if returning {
-                self.graceful_shutdown_returning();
+                server.graceful_shutdown_returning();
                 return;
             }
             self.graceful_shutdown(1);
@@ -9777,6 +10496,148 @@ impl Server {
         }
     }
 
+    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    fn run_loop_pump<R, S>(
+        self,
+        cx: &Cx,
+        recv: R,
+        send: S,
+        notification_sender: NotificationSender,
+        transport_label: &'static str,
+    ) -> i32
+    where
+        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
+        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
+    {
+        self.run_loop_pump_with_policy(
+            cx,
+            cx,
+            recv,
+            send,
+            notification_sender,
+            transport_label,
+            true,
+            None,
+            true,
+        )
+    }
+
+    /// Feature-off stdio runner: only final-era envelopes can reach dispatch.
+    ///
+    /// This deliberately owns no legacy adapter, session state, reverse
+    /// request registry, or worker branch. The dual-era implementation below
+    /// remains compiled only with the dated feature (or crate unit tests).
+    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_loop_pump_with_policy<R, S>(
+        self,
+        cx: &Cx,
+        _dispatch_cx: &Cx,
+        mut recv: R,
+        mut send: S,
+        notification_sender: NotificationSender,
+        transport_label: &'static str,
+        _detach_on_worker_timeout: bool,
+        connection_failure: Option<Arc<AtomicBool>>,
+        enforce_runtime_era: bool,
+    ) -> i32
+    where
+        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
+        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
+    {
+        let server = Arc::new(self);
+        if let Some(stats) = &server.stats {
+            stats.connection_opened();
+        }
+        if server.console_config.show_banner && !banner_suppressed() {
+            server.render_startup_banner(transport_label);
+        }
+        if !server.run_startup_hook() {
+            server.graceful_shutdown_returning();
+            return 1;
+        }
+
+        let modern_connection = ModernConnection::new();
+        let mut classifier = StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
+        let worker_failed = AtomicBool::new(false);
+        let mut negotiated_era = None;
+        let mut exit_code = 0;
+        loop {
+            if cx.checkpoint().is_err()
+                || connection_failure
+                    .as_ref()
+                    .is_some_and(|failed| failed.load(Ordering::Acquire))
+            {
+                break;
+            }
+            let message = match recv(cx, &worker_failed) {
+                Ok(message) => message,
+                Err(TransportError::Closed | TransportError::Cancelled) => break,
+                Err(_) => {
+                    exit_code = 1;
+                    break;
+                }
+            };
+            let JsonRpcMessage::Request(request) = message else {
+                continue;
+            };
+            if request.validate().is_err() {
+                exit_code = 1;
+                break;
+            }
+            if enforce_runtime_era && negotiated_era.is_none() {
+                match classify_initial_stdio_envelope(&mut classifier, &JsonRpcMessage::Request(request.clone())) {
+                    Ok(ProtocolEra::Modern2026) => negotiated_era = Some(ProtocolEra::Modern2026),
+                    Ok(ProtocolEra::Legacy2024) | Err(_) => {
+                        if let Some(response) = protocol_era_refusal(&request) {
+                            let _ = send(cx, &JsonRpcMessage::Response(response));
+                        }
+                        exit_code = 1;
+                        break;
+                    }
+                }
+            }
+            if negotiated_era != Some(ProtocolEra::Modern2026)
+                || modern_protocol_version(&request) != Some(MODERN_PROTOCOL_VERSION)
+            {
+                if let Some(response) = protocol_era_refusal(&request) {
+                    let _ = send(cx, &JsonRpcMessage::Response(response));
+                }
+                exit_code = 1;
+                break;
+            }
+            let inbound = InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                request_id_to_u64(request.id.as_ref()),
+                InboundRequestTransport::Stdio,
+                &modern_connection,
+            );
+            let response = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                server.protocol_policy,
+                &inbound,
+                request,
+                None,
+                McpRequestCancellation::new(),
+                None,
+                Arc::clone(&notification_sender),
+            ));
+            if let Some(response) = response
+                && send(cx, &JsonRpcMessage::Response(response)).is_err()
+            {
+                exit_code = 1;
+                break;
+            }
+        }
+        let _ = server.terminate_subscription_streams();
+        server.cancel_active_requests(CancelKind::Shutdown, false);
+        server.run_shutdown_hook();
+        if let Some(stats) = &server.stats {
+            stats.connection_closed();
+        }
+        exit_code
+    }
+
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     #[allow(clippy::too_many_lines)]
     fn run_loop_pump<R, S>(
         self,
@@ -9799,10 +10660,11 @@ impl Server {
             transport_label,
             true,
             None,
-            false,
+            true,
         )
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     #[allow(clippy::too_many_lines)]
     fn run_loop_pump_with_policy<R, S>(
         self,
@@ -10164,7 +11026,8 @@ impl Server {
             }
         });
 
-        let mut era_classifier = StdioEraClassifier::new(server.protocol_policy);
+        let mut era_classifier =
+            StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
         let mut negotiated_era = None;
         let mut exit_code = 0;
         let mut drain_modern_before_stop = false;
@@ -10729,7 +11592,17 @@ impl Server {
                                                     .unwrap_or_else(
                                                         std::sync::PoisonError::into_inner,
                                                     );
-                                                if !request_cancellation.begin_finalization() {
+                                                // Server shutdown elects a final subscription
+                                                // completion before cancelling its request to
+                                                // wake this worker. That completion is the
+                                                // request's one sanctioned terminal response;
+                                                // do not overwrite it with RequestCancelled at
+                                                // the stdio writer fence.
+                                                let graceful_subscription_completion =
+                                                    final_subscription_completion_response(&response);
+                                                if !graceful_subscription_completion
+                                                    && !request_cancellation.begin_finalization()
+                                                {
                                                     response = JsonRpcResponse::error(
                                                         response.id.clone(),
                                                         JsonRpcError {
@@ -10978,6 +11851,12 @@ impl Server {
             }
         }
 
+        // Elect graceful final-subscription completion while the writer and
+        // dispatch worker still own their response path. The election sends
+        // its correlated stdio control, then wakes the listen future by
+        // cancellation; cancelling children first would erase that completion
+        // before the writer can commit it.
+        let _ = server.terminate_subscription_streams();
         // Notification children have no response commit to protect, so they
         // are cancelled before the drain windows instead of being waited out.
         queue_state.cancel_uncorrelated_modern_children();
@@ -11078,6 +11957,7 @@ impl Server {
     }
 
     /// Legacy synchronous loop retained privately for differential tests.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn run_loop_legacy<R, S>(
         self,
         cx: &Cx,
@@ -11091,43 +11971,45 @@ impl Server {
         R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
-        let mut session = Session::new(self.info.clone(), self.capabilities.clone());
+        let server = Arc::new(self);
+        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
         let legacy_binding = runtime_legacy_binding(session.id());
         let mut legacy_adapter: Option<Legacy2024ServerAdapter<LiveLegacy2024RuntimeHandler<'_>>> =
             None;
         let legacy_active_request = Arc::new(Mutex::new(None));
-        let mut era_classifier = StdioEraClassifier::new(self.protocol_policy);
+        let mut era_classifier =
+            StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
         let mut negotiated_era = None;
 
         // Keep response output and inbound pending-response routing connection-scoped.
         let send = Arc::new(Mutex::new(send));
-        let pending_requests = self.new_pending_requests_for_connection();
+        let pending_requests = server.new_pending_requests_for_connection();
         let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
             SessionState::new(),
             Arc::clone(&notification_sender),
             None,
-            self.logging.level,
+            server.logging.level,
         );
         let modern_connection = ModernConnection::new();
 
         // Track connection opened
-        if let Some(ref stats) = self.stats {
+        if let Some(ref stats) = server.stats {
             stats.connection_opened();
         }
 
         // Render startup banner if enabled (respects both config and legacy env var)
-        if self.console_config.show_banner && !banner_suppressed() {
-            self.render_startup_banner(transport_label);
+        if server.console_config.show_banner && !banner_suppressed() {
+            server.render_startup_banner(transport_label);
         }
 
         // Run startup hook
-        if !self.run_startup_hook() {
+        if !server.run_startup_hook() {
             error!(target: targets::SERVER, "Startup hook failed, exiting");
-            self.graceful_shutdown(1);
+            server.graceful_shutdown(1);
         }
 
         // Create traffic renderer if enabled
-        let traffic_renderer = self.configured_traffic_renderer();
+        let traffic_renderer = server.configured_traffic_renderer();
 
         // Main request loop
         loop {
@@ -11136,12 +12018,12 @@ impl Server {
                 .is_some_and(|failed| failed.load(Ordering::Acquire))
             {
                 error!(target: targets::TRANSPORT, "Notification send failed; terminating transport");
-                self.graceful_shutdown(1);
+                server.graceful_shutdown(1);
             }
             // Check for cancellation
             if cx.checkpoint().is_err() {
                 info!(target: targets::SERVER, "Cancellation requested, shutting down");
-                self.graceful_shutdown(0);
+                server.graceful_shutdown(0);
             }
 
             // Receive next message
@@ -11151,24 +12033,24 @@ impl Server {
                 .is_some_and(|failed| failed.load(Ordering::Acquire))
             {
                 error!(target: targets::TRANSPORT, "Notification send failed; terminating transport");
-                self.graceful_shutdown(1);
+                server.graceful_shutdown(1);
             }
             let message = match receive_result {
                 Ok(msg) => msg,
                 Err(TransportError::Closed) => {
                     // Clean shutdown - track connection close
-                    self.graceful_shutdown(0);
+                    server.graceful_shutdown(0);
                 }
                 Err(TransportError::Cancelled) => {
                     info!(target: targets::SERVER, "Transport cancelled");
-                    self.graceful_shutdown(0);
+                    server.graceful_shutdown(0);
                 }
                 Err(error) => match classify_receive_error(&error) {
                     ReceiveErrorDisposition::ReplyWithParseError => {
                         error!(target: targets::TRANSPORT, "Rejected malformed transport message");
                         if send_uncorrelated_parse_error(&send, cx).is_err() {
                             error!(target: targets::TRANSPORT, "Failed to send parse-error response; terminating transport");
-                            self.graceful_shutdown(1);
+                            server.graceful_shutdown(1);
                         }
                         continue;
                     }
@@ -11176,13 +12058,13 @@ impl Server {
                         error!(target: targets::TRANSPORT, "Rejected invalid JSON-RPC request");
                         if send_invalid_request(&send, cx, request_id).is_err() {
                             error!(target: targets::TRANSPORT, "Failed to send invalid-request response; terminating transport");
-                            self.graceful_shutdown(1);
+                            server.graceful_shutdown(1);
                         }
                         continue;
                     }
                     ReceiveErrorDisposition::Terminate => {
                         error!(target: targets::TRANSPORT, "Fatal transport receive failure; terminating transport");
-                        self.graceful_shutdown(1);
+                        server.graceful_shutdown(1);
                     }
                 },
             };
@@ -11190,7 +12072,7 @@ impl Server {
             // Log request traffic
             if let Some(renderer) = &traffic_renderer {
                 if let JsonRpcMessage::Request(req) = &message {
-                    renderer.render_request(req, &self.console);
+                    renderer.render_request(req, &server.console);
                 }
             }
 
@@ -11201,12 +12083,12 @@ impl Server {
                 JsonRpcMessage::Request(request) => {
                     if request.validate().is_err() {
                         if send_invalid_request(&send, cx, request.id).is_err() {
-                            self.graceful_shutdown(1);
+                            server.graceful_shutdown(1);
                         }
                         continue;
                     }
                     // Track bytes received (approximate from serialized request size)
-                    if let Some(ref stats) = self.stats {
+                    if let Some(ref stats) = server.stats {
                         // Estimate request size by serializing back to JSON
                         // This is approximate but accurate enough for statistics
                         if let Ok(json) = serde_json::to_string(&request) {
@@ -11241,7 +12123,7 @@ impl Server {
                                     "Failed to send protocol-era refusal; terminating transport: {send_error}"
                                 );
                             }
-                            self.graceful_shutdown(1);
+                            server.graceful_shutdown(1);
                         }
                         None => {
                             match era_classifier.classify_opening(stdio_opening_frame(&request)) {
@@ -11273,7 +12155,7 @@ impl Server {
                                             "Failed to send protocol-era refusal; terminating transport: {send_error}"
                                         );
                                     }
-                                    self.graceful_shutdown(1);
+                                    server.graceful_shutdown(1);
                                 }
                             }
                         }
@@ -11286,12 +12168,16 @@ impl Server {
                             InboundRequestTransport::Stdio,
                             &modern_connection,
                         );
-                        self.dispatch_with_protocol_policy_and_final_logging(
-                            self.protocol_policy,
+                        let request_cancellation = McpRequestCancellation::new();
+                        block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                            server.protocol_policy,
                             &inbound,
-                            &request,
-                            &notification_sender,
-                        )
+                            request,
+                            None,
+                            request_cancellation,
+                            None,
+                            Arc::clone(&notification_sender),
+                        ))
                         .map(HandledRequest::untracked)
                     } else {
                         let adapter = match legacy_adapter.as_mut() {
@@ -11299,9 +12185,9 @@ impl Server {
                             None => {
                                 let adapter = Legacy2024ServerAdapter::install(
                                     legacy_binding,
-                                    self.legacy_2024_server_config(),
+                                    server.legacy_2024_server_config(),
                                     LiveLegacy2024RuntimeHandler {
-                                        server: &self,
+                                        server: server.as_ref(),
                                         cx: cx.clone(),
                                         session_id: legacy_binding.generation(),
                                         session_principal: session.principal_binding(),
@@ -11311,7 +12197,7 @@ impl Server {
                                     },
                                 );
                                 let Ok(adapter) = adapter else {
-                                    self.graceful_shutdown(1);
+                                    server.graceful_shutdown(1);
                                 };
                                 legacy_adapter.insert(adapter)
                             }
@@ -11340,13 +12226,13 @@ impl Server {
                                 );
                                 None
                             }
-                            Err(_) => self.graceful_shutdown(1),
+                            Err(_) => server.graceful_shutdown(1),
                         }
                     }
                 }
                 JsonRpcMessage::Response(response) => {
                     if response.validate().is_err() {
-                        self.graceful_shutdown(1);
+                        server.graceful_shutdown(1);
                     }
                     // Generic server-initiated requests retain their existing
                     // pending-request ownership. Only an unmatched response
@@ -11364,10 +12250,10 @@ impl Server {
                     ) && matches!(negotiated_era, Some(ProtocolEra::Legacy2024))
                     {
                         let Some(adapter) = legacy_adapter.as_mut() else {
-                            self.graceful_shutdown(1);
+                            server.graceful_shutdown(1);
                         };
                         if !legacy_adapter_accept_response(adapter, legacy_binding, &response) {
-                            self.graceful_shutdown(1);
+                            server.graceful_shutdown(1);
                         }
                     } else if matches!(
                         disposition,
@@ -11390,7 +12276,7 @@ impl Server {
                 .is_some_and(|failed| failed.load(Ordering::Acquire))
             {
                 error!(target: targets::TRANSPORT, "Notification send failed; terminating transport");
-                self.graceful_shutdown(1);
+                server.graceful_shutdown(1);
             }
 
             let duration = start_time.elapsed();
@@ -11412,9 +12298,9 @@ impl Server {
                 drop(guard);
                 if let Ok(Some(response)) = &send_result {
                     if let Some(renderer) = &traffic_renderer {
-                        renderer.render_response(response, Some(duration), &self.console);
+                        renderer.render_response(response, Some(duration), &server.console);
                     }
-                    if let Some(ref stats) = self.stats
+                    if let Some(ref stats) = server.stats
                         && let Ok(json) = serde_json::to_string(response)
                     {
                         stats.add_bytes_sent(json.len() as u64 + 1);
@@ -11422,7 +12308,7 @@ impl Server {
                 }
                 if send_result.is_err() {
                     error!(target: targets::TRANSPORT, "Failed to send response; terminating transport");
-                    self.graceful_shutdown(1);
+                    server.graceful_shutdown(1);
                 }
             }
         }
@@ -11434,6 +12320,7 @@ impl Server {
     /// entrypoints use `std::process::exit` on shutdown for subprocess use-cases. Clean EOF and
     /// cancellation return success; startup, protocol, and fatal transport failures return errors.
     #[allow(clippy::too_many_lines)]
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn run_loop_returning_legacy<R, S>(
         self,
         cx: &Cx,
@@ -11447,39 +12334,41 @@ impl Server {
         R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
-        let mut session = Session::new(self.info.clone(), self.capabilities.clone());
+        let server = Arc::new(self);
+        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
         let legacy_binding = runtime_legacy_binding(session.id());
         let mut legacy_adapter: Option<Legacy2024ServerAdapter<LiveLegacy2024RuntimeHandler<'_>>> =
             None;
         let legacy_active_request = Arc::new(Mutex::new(None));
-        let mut era_classifier = StdioEraClassifier::new(self.protocol_policy);
+        let mut era_classifier =
+            StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
         let mut negotiated_era = None;
 
         // Keep response output and inbound pending-response routing connection-scoped.
         let send = Arc::new(Mutex::new(send));
-        let pending_requests = self.new_pending_requests_for_connection();
+        let pending_requests = server.new_pending_requests_for_connection();
         let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
             SessionState::new(),
             Arc::clone(&notification_sender),
             None,
-            self.logging.level,
+            server.logging.level,
         );
         let modern_connection = ModernConnection::new();
 
         // Track connection opened
-        if let Some(ref stats) = self.stats {
+        if let Some(ref stats) = server.stats {
             stats.connection_opened();
         }
 
         // Render startup banner if enabled (respects both config and legacy env var)
-        if self.console_config.show_banner && !banner_suppressed() {
-            self.render_startup_banner(transport_label);
+        if server.console_config.show_banner && !banner_suppressed() {
+            server.render_startup_banner(transport_label);
         }
 
         // Run startup hook
-        if !self.run_startup_hook() {
+        if !server.run_startup_hook() {
             error!(target: targets::SERVER, "Startup hook failed, stopping");
-            self.graceful_shutdown_returning();
+            server.graceful_shutdown_returning();
             return Err(server_run_error(
                 "startup",
                 "hook_failure",
@@ -11488,7 +12377,7 @@ impl Server {
         }
 
         // Create traffic renderer if enabled
-        let traffic_renderer = self.configured_traffic_renderer();
+        let traffic_renderer = server.configured_traffic_renderer();
 
         // Main request loop
         loop {
@@ -11496,7 +12385,7 @@ impl Server {
                 .as_ref()
                 .is_some_and(|failed| failed.load(Ordering::Acquire))
             {
-                self.graceful_shutdown_returning();
+                server.graceful_shutdown_returning();
                 return Err(server_run_error(
                     "notification",
                     "send_failure",
@@ -11506,7 +12395,7 @@ impl Server {
             // Check for cancellation
             if cx.checkpoint().is_err() {
                 info!(target: targets::SERVER, "Cancellation requested, stopping");
-                self.graceful_shutdown_returning();
+                server.graceful_shutdown_returning();
                 return Ok(());
             }
 
@@ -11516,7 +12405,7 @@ impl Server {
                 .as_ref()
                 .is_some_and(|failed| failed.load(Ordering::Acquire))
             {
-                self.graceful_shutdown_returning();
+                server.graceful_shutdown_returning();
                 return Err(server_run_error(
                     "notification",
                     "send_failure",
@@ -11526,12 +12415,12 @@ impl Server {
             let message = match receive_result {
                 Ok(msg) => msg,
                 Err(TransportError::Closed) => {
-                    self.graceful_shutdown_returning();
+                    server.graceful_shutdown_returning();
                     return Ok(());
                 }
                 Err(TransportError::Cancelled) => {
                     info!(target: targets::SERVER, "Transport cancelled");
-                    self.graceful_shutdown_returning();
+                    server.graceful_shutdown_returning();
                     return Ok(());
                 }
                 Err(error) => match classify_receive_error(&error) {
@@ -11539,7 +12428,7 @@ impl Server {
                         error!(target: targets::TRANSPORT, "Rejected malformed transport message");
                         if let Err(send_error) = send_uncorrelated_parse_error(&send, cx) {
                             error!(target: targets::TRANSPORT, "Failed to send parse-error response; terminating transport");
-                            self.graceful_shutdown_returning();
+                            server.graceful_shutdown_returning();
                             return returning_send_result_with_connection_failure(
                                 &send_error,
                                 &connection_failure,
@@ -11551,7 +12440,7 @@ impl Server {
                         error!(target: targets::TRANSPORT, "Rejected invalid JSON-RPC request");
                         if let Err(send_error) = send_invalid_request(&send, cx, request_id) {
                             error!(target: targets::TRANSPORT, "Failed to send invalid-request response; terminating transport");
-                            self.graceful_shutdown_returning();
+                            server.graceful_shutdown_returning();
                             return returning_send_result_with_connection_failure(
                                 &send_error,
                                 &connection_failure,
@@ -11561,7 +12450,7 @@ impl Server {
                     }
                     ReceiveErrorDisposition::Terminate => {
                         error!(target: targets::TRANSPORT, "Fatal transport receive failure; terminating transport");
-                        self.graceful_shutdown_returning();
+                        server.graceful_shutdown_returning();
                         return Err(transport_run_error("receive", &error));
                     }
                 },
@@ -11570,7 +12459,7 @@ impl Server {
             // Log request traffic
             if let Some(renderer) = &traffic_renderer {
                 if let JsonRpcMessage::Request(req) = &message {
-                    renderer.render_request(req, &self.console);
+                    renderer.render_request(req, &server.console);
                 }
             }
 
@@ -11581,7 +12470,7 @@ impl Server {
                 JsonRpcMessage::Request(request) => {
                     if request.validate().is_err() {
                         if let Err(send_error) = send_invalid_request(&send, cx, request.id) {
-                            self.graceful_shutdown_returning();
+                            server.graceful_shutdown_returning();
                             return returning_send_result_with_connection_failure(
                                 &send_error,
                                 &connection_failure,
@@ -11590,7 +12479,7 @@ impl Server {
                         continue;
                     }
                     // Track bytes received (approximate from serialized request size)
-                    if let Some(ref stats) = self.stats {
+                    if let Some(ref stats) = server.stats {
                         // Estimate request size by serializing back to JSON
                         // This is approximate but accurate enough for statistics
                         if let Ok(json) = serde_json::to_string(&request) {
@@ -11620,13 +12509,13 @@ impl Server {
                                     &JsonRpcMessage::Response(response),
                                 )
                             {
-                                self.graceful_shutdown_returning();
+                                server.graceful_shutdown_returning();
                                 return returning_send_result_with_connection_failure(
                                     &send_error,
                                     &connection_failure,
                                 );
                             }
-                            self.graceful_shutdown_returning();
+                            server.graceful_shutdown_returning();
                             return Err(server_run_error(
                                 "protocol",
                                 "era_admission",
@@ -11658,13 +12547,13 @@ impl Server {
                                             &JsonRpcMessage::Response(response),
                                         )
                                     {
-                                        self.graceful_shutdown_returning();
+                                        server.graceful_shutdown_returning();
                                         return returning_send_result_with_connection_failure(
                                             &send_error,
                                             &connection_failure,
                                         );
                                     }
-                                    self.graceful_shutdown_returning();
+                                    server.graceful_shutdown_returning();
                                     return Err(server_run_error(
                                         "protocol",
                                         "era_admission",
@@ -11682,12 +12571,16 @@ impl Server {
                             InboundRequestTransport::Stdio,
                             &modern_connection,
                         );
-                        self.dispatch_with_protocol_policy_and_final_logging(
-                            self.protocol_policy,
+                        let request_cancellation = McpRequestCancellation::new();
+                        block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                            server.protocol_policy,
                             &inbound,
-                            &request,
-                            &notification_sender,
-                        )
+                            request,
+                            None,
+                            request_cancellation,
+                            None,
+                            Arc::clone(&notification_sender),
+                        ))
                         .map(HandledRequest::untracked)
                     } else {
                         let adapter = match legacy_adapter.as_mut() {
@@ -11695,9 +12588,9 @@ impl Server {
                             None => {
                                 let adapter = Legacy2024ServerAdapter::install(
                                     legacy_binding,
-                                    self.legacy_2024_server_config(),
+                                    server.legacy_2024_server_config(),
                                     LiveLegacy2024RuntimeHandler {
-                                        server: &self,
+                                        server: server.as_ref(),
                                         cx: cx.clone(),
                                         session_id: legacy_binding.generation(),
                                         session_principal: session.principal_binding(),
@@ -11707,7 +12600,7 @@ impl Server {
                                     },
                                 );
                                 let Ok(adapter) = adapter else {
-                                    self.graceful_shutdown_returning();
+                                    server.graceful_shutdown_returning();
                                     return Err(server_run_error(
                                         "protocol",
                                         "legacy_adapter_install",
@@ -11744,7 +12637,7 @@ impl Server {
                                 None
                             }
                             Err(_) => {
-                                self.graceful_shutdown_returning();
+                                server.graceful_shutdown_returning();
                                 return Err(server_run_error(
                                     "protocol",
                                     "legacy_adapter",
@@ -11756,7 +12649,7 @@ impl Server {
                 }
                 JsonRpcMessage::Response(response) => {
                     if response.validate().is_err() {
-                        self.graceful_shutdown_returning();
+                        server.graceful_shutdown_returning();
                         return Err(server_run_error(
                             "receive",
                             "invalid_response",
@@ -11778,7 +12671,7 @@ impl Server {
                     ) && matches!(negotiated_era, Some(ProtocolEra::Legacy2024))
                     {
                         let Some(adapter) = legacy_adapter.as_mut() else {
-                            self.graceful_shutdown_returning();
+                            server.graceful_shutdown_returning();
                             return Err(server_run_error(
                                 "protocol",
                                 "legacy_adapter",
@@ -11786,7 +12679,7 @@ impl Server {
                             ));
                         };
                         if !legacy_adapter_accept_response(adapter, legacy_binding, &response) {
-                            self.graceful_shutdown_returning();
+                            server.graceful_shutdown_returning();
                             return Err(server_run_error(
                                 "protocol",
                                 "legacy_adapter",
@@ -11813,7 +12706,7 @@ impl Server {
                 .as_ref()
                 .is_some_and(|failed| failed.load(Ordering::Acquire))
             {
-                self.graceful_shutdown_returning();
+                server.graceful_shutdown_returning();
                 return Err(server_run_error(
                     "notification",
                     "send_failure",
@@ -11840,9 +12733,9 @@ impl Server {
                 drop(guard);
                 if let Ok(Some(response)) = &send_result {
                     if let Some(renderer) = &traffic_renderer {
-                        renderer.render_response(response, Some(duration), &self.console);
+                        renderer.render_response(response, Some(duration), &server.console);
                     }
-                    if let Some(ref stats) = self.stats
+                    if let Some(ref stats) = server.stats
                         && let Ok(json) = serde_json::to_string(response)
                     {
                         stats.add_bytes_sent(json.len() as u64 + 1);
@@ -11850,7 +12743,7 @@ impl Server {
                 }
                 if let Err(send_error) = send_result {
                     error!(target: targets::TRANSPORT, "Failed to send response; terminating transport");
-                    self.graceful_shutdown_returning();
+                    server.graceful_shutdown_returning();
                     return returning_send_result_with_connection_failure(
                         &send_error,
                         &connection_failure,
@@ -15120,6 +16013,22 @@ mod lib_unit_tests {
         result.unwrap();
     }
 
+    async fn require_quiescent_http_shutdown(
+        shutdown: HttpServerShutdown,
+        probe: &str,
+    ) -> Result<(), String> {
+        match shutdown {
+            HttpServerShutdown::Quiescent => Ok(()),
+            HttpServerShutdown::Nonquiescent(mut shutdown) => {
+                let initial = shutdown.poll_settlement();
+                let settled = shutdown.settle_for(Duration::from_secs(1)).await;
+                Err(format!(
+                    "{probe} unexpectedly retained caller-owned HTTP children; initial={initial:?}, after bounded settlement={settled:?}"
+                ))
+            }
+        }
+    }
+
     fn run_live_modern_pump<R>(server: Server, recv: R, responses: Arc<LiveModernResponses>) -> i32
     where
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError> + Send + 'static,
@@ -15266,6 +16175,7 @@ mod lib_unit_tests {
     ) -> Result<Vec<u8>, String> {
         let bound = Server::new("live-http-strict-admission", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .build()
             .bind_http(cx, "127.0.0.1:0")
             .await
@@ -15301,7 +16211,8 @@ mod lib_unit_tests {
             .join(cx)
             .await
             .map_err(|error| format!("strict admission client failed: {error:?}"))??;
-        serve.map_err(|error| format!("strict admission server failed: {error}"))?;
+        let shutdown = serve.map_err(|error| format!("strict admission server failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "strict admission").await?;
         Ok(response)
     }
 
@@ -20736,6 +21647,7 @@ mod lib_unit_tests {
 
         let exit_code = Server::new("bounded-legacy-worker-shutdown-test", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
             .tool(NonQuiescentLegacyTool {
                 control: Arc::clone(&control),
             })
@@ -20801,6 +21713,7 @@ mod lib_unit_tests {
         let run_result = run_live_split_transport(
             Server::new("returning-legacy-worker-shutdown-test", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .tool(NonQuiescentLegacyTool {
                     control: Arc::clone(&control),
                 })
@@ -20836,6 +21749,7 @@ mod lib_unit_tests {
         let run_result = run_live_split_transport(
             Server::new("returning-modern-worker-shutdown-test", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .tool(NonQuiescentModernTool {
                     control: Arc::clone(&control),
                 })
@@ -20867,6 +21781,7 @@ mod lib_unit_tests {
         let control_for_receive = Arc::clone(&control);
         let server = Server::new("stdio-modern-worker-shutdown-test", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
             .tool(NonQuiescentModernTool {
                 control: Arc::clone(&control),
             })
@@ -21406,6 +22321,7 @@ mod lib_unit_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let bound = Server::new("live-http-mrtr-retry", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .tool(LiveHttpMrtrTool {
                 calls: Arc::clone(&calls),
             })
@@ -21520,7 +22436,9 @@ mod lib_unit_tests {
             .join(cx)
             .await
             .map_err(|error| format!("live HTTP MRTR retry client failed: {error:?}"))??;
-        serve.map_err(|error| format!("live HTTP MRTR retry server failed: {error}"))?;
+        let shutdown =
+            serve.map_err(|error| format!("live HTTP MRTR retry server failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "live HTTP MRTR retry").await?;
         Ok((initial, retry, calls.load(Ordering::Acquire)))
     }
 
@@ -22814,6 +23732,7 @@ mod lib_unit_tests {
         run_live_split_transport(
             Server::new("live-legacy-runtime-connection", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .tool(LiveLegacyRuntimeConnectionTool)
                 .build(),
             LiveLegacyRuntimeSplitRecv {
@@ -22838,6 +23757,7 @@ mod lib_unit_tests {
         run_live_split_transport(
             Server::new("legacy-roots-context", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .tool(LegacyRootsContextTool)
                 .build(),
             LegacyRootsContextSplitRecv {
@@ -22874,6 +23794,7 @@ mod lib_unit_tests {
         }
         Server::new("legacy-stdio-progress", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
             .tool(LiveLegacyRuntimeConnectionTool)
             .build()
             .run_transport_returning_with_cx(
@@ -23240,6 +24161,400 @@ mod lib_unit_tests {
         ))
     }
 
+    fn modern_subscriptions_listen_request(id: i64) -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::new(
+            SUBSCRIPTIONS_LISTEN,
+            Some(serde_json::json!({
+                "notifications": {
+                    "tools/list_changed": true,
+                },
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            id,
+        ))
+    }
+
+    fn public_stdio_final_subscription_transcript(
+        cancellation: Option<JsonRpcMessage>,
+    ) -> Vec<JsonRpcMessage> {
+        const DISCOVERY_ID: i64 = 905;
+        const SUBSCRIPTION_ID: i64 = 906;
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+        let server = Arc::new(
+            Server::new("public-stdio-final-subscription", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .build(),
+        );
+        let weak_server = Arc::downgrade(&server);
+        let sent_for_terminator = Arc::clone(&sent);
+        let terminator = thread::spawn(move || {
+            for _ in 0..100 {
+                let acknowledged = sent_for_terminator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .any(|message| {
+                        matches!(
+                            message,
+                            JsonRpcMessage::Request(request)
+                                if request.method == "notifications/subscriptions/acknowledged"
+                        )
+                    });
+                if acknowledged {
+                    return weak_server
+                        .upgrade()
+                        .is_some_and(|server| server.terminate_subscription_streams() == 1);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            false
+        });
+
+        let mut inbound =
+            std::collections::VecDeque::from([modern_discovery_request(DISCOVERY_ID)]);
+        if let Some(cancellation) = cancellation {
+            inbound.push_back(cancellation);
+        }
+        inbound.push_back(modern_subscriptions_listen_request(SUBSCRIPTION_ID));
+        let server = match Arc::try_unwrap(server) {
+            Ok(server) => server,
+            Err(_) => panic!("the terminator retains only a weak server reference"),
+        };
+        server
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyScriptTransport {
+                    inbound,
+                    sent: Arc::clone(&sent),
+                    receive_calls,
+                },
+            )
+            .expect("public modern stdio transport must settle the subscription stream");
+        assert!(
+            terminator
+                .join()
+                .expect("subscription terminator must not panic"),
+            "the public listener must acknowledge before server termination"
+        );
+        sent.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[derive(Clone, Copy)]
+    enum PublicSplitSubscriptionTerminal {
+        Eof,
+        Shutdown,
+    }
+
+    struct PublicSplitSubscriptionRecv {
+        phase: u8,
+        sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
+        terminal: PublicSplitSubscriptionTerminal,
+    }
+
+    impl TransportRecvHalf for PublicSplitSubscriptionRecv {
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            let phase = self.phase;
+            self.phase = self.phase.saturating_add(1);
+            match phase {
+                0 => Ok(modern_discovery_request(915)),
+                1 => Ok(modern_subscriptions_listen_request(916)),
+                2 => {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while Instant::now() < deadline {
+                        let acknowledged = self
+                            .sent
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .iter()
+                            .any(|message| {
+                                matches!(
+                                    message,
+                                    JsonRpcMessage::Request(request)
+                                        if request.method
+                                            == "notifications/subscriptions/acknowledged"
+                                )
+                            });
+                        if acknowledged {
+                            return Err(match self.terminal {
+                                PublicSplitSubscriptionTerminal::Eof => TransportError::Closed,
+                                PublicSplitSubscriptionTerminal::Shutdown => {
+                                    TransportError::Cancelled
+                                }
+                            });
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(TransportError::Timeout)
+                }
+                _ => Err(TransportError::Closed),
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct PublicSplitSubscriptionSend {
+        sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
+    }
+
+    impl TransportSendHalf for PublicSplitSubscriptionSend {
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(message.clone());
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn public_split_stdio_final_subscription_transcript(
+        terminal: PublicSplitSubscriptionTerminal,
+    ) -> Result<Vec<JsonRpcMessage>, String> {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        run_live_split_transport(
+            Server::new("public-split-stdio-final-subscription", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .build(),
+            PublicSplitSubscriptionRecv {
+                phase: 0,
+                sent: Arc::clone(&sent),
+                terminal,
+            },
+            PublicSplitSubscriptionSend {
+                sent: Arc::clone(&sent),
+            },
+        )?;
+        Ok(sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone())
+    }
+
+    fn assert_public_split_stdio_subscription_shutdown(terminal: PublicSplitSubscriptionTerminal) {
+        let sent = public_split_stdio_final_subscription_transcript(terminal)
+            .expect("public split stdio shutdown must preserve the listener completion");
+
+        assert_eq!(
+            sent.len(),
+            4,
+            "the public split transport must emit only discovery, acknowledgement, cancellation, and completion: {sent:?}"
+        );
+        assert!(sent.iter().any(|message| {
+            matches!(
+                message,
+                JsonRpcMessage::Response(response) if response.id == Some(915_i64.into())
+            )
+        }));
+
+        let acknowledgement = sent
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    JsonRpcMessage::Request(request)
+                        if matches!(
+                            ServerNotification::decode(request),
+                            Ok(ServerNotification::SubscriptionsAcknowledged(_))
+                        )
+                )
+            })
+            .expect("public split transport must acknowledge subscriptions/listen");
+        let cancellation = sent
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    JsonRpcMessage::Request(request)
+                        if matches!(
+                            ServerNotification::decode(request),
+                            Ok(ServerNotification::Cancelled(params))
+                                if params.request_id == RequestId::Number(916)
+                        )
+                )
+            })
+            .expect("public split transport must cancel the final subscription");
+        let completion = sent
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    JsonRpcMessage::Response(response)
+                        if response.id == Some(916_i64.into())
+                            && final_subscription_completion_response(response)
+                )
+            })
+            .expect("public split transport must preserve graceful subscription completion");
+        assert!(
+            acknowledgement < cancellation && cancellation < completion,
+            "subscription acknowledgement, cancellation, and completion must retain their graceful order: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn public_split_stdio_eof_elects_subscription_completion_before_cancellation_drain() {
+        assert_public_split_stdio_subscription_shutdown(PublicSplitSubscriptionTerminal::Eof);
+    }
+
+    #[test]
+    fn public_split_stdio_shutdown_elects_subscription_completion_before_cancellation_drain() {
+        assert_public_split_stdio_subscription_shutdown(PublicSplitSubscriptionTerminal::Shutdown);
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn no_legacy_stdio_refuses_the_opening_envelope_before_a_second_request_or_dispatch() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+        let result = Server::new("no-legacy-stdio-route", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyScriptTransport {
+                    inbound: std::collections::VecDeque::from([
+                        exact_legacy_initialize_request(917, serde_json::json!("1.0.0")),
+                        JsonRpcMessage::Request(JsonRpcRequest::new(
+                            "tools/list",
+                            Some(serde_json::json!({})),
+                            918_i64,
+                        )),
+                    ]),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::clone(&receive_calls),
+                },
+            );
+
+        assert!(
+            result.is_err(),
+            "a no-legacy stdio opening must be terminal"
+        );
+        assert_eq!(
+            receive_calls.load(Ordering::Acquire),
+            1,
+            "the legacy opening must not admit a follow-up request into dispatch"
+        );
+        assert!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .all(|message| !matches!(
+                    message,
+                    JsonRpcMessage::Response(response)
+                        if response.id == Some(917_i64.into()) && response.error.is_none()
+                )),
+            "the exact legacy initialize response proves adapter admission and must never be emitted"
+        );
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn no_legacy_http_routes_are_not_found_without_pinning_or_adapter_admission() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("no-legacy-http-routes", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
+            .build()
+            .into_http_endpoint("http://localhost")
+            .expect("modern-only HTTP endpoint must construct without legacy transport support");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("modern-only HTTP session must open");
+
+        for request in [
+            HttpRequest::new(HttpMethod::Get, "/sse"),
+            HttpRequest::new(HttpMethod::Post, "/messages"),
+        ] {
+            let response = session
+                .handle(&cx, request)
+                .expect("a disabled legacy route is an ordinary zero-route response");
+            assert!(matches!(
+                response,
+                ServerHttpEndpointResponse::Immediate(HttpResponse {
+                    status: HttpStatus::NOT_FOUND,
+                    ..
+                })
+            ));
+            assert_eq!(session.selected_era, None);
+            assert!(session.legacy_adapter.is_none());
+        }
+        assert!(
+            endpoint
+                .server
+                .active_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "zero-route HTTP rejection must not create request authority"
+        );
+    }
+
+    #[test]
+    fn public_stdio_final_subscription_listener_acknowledges_then_cancels_and_completes() {
+        let sent = public_stdio_final_subscription_transcript(None);
+
+        assert!(matches!(
+            sent.as_slice(),
+            [
+                JsonRpcMessage::Response(discovery),
+                JsonRpcMessage::Request(acknowledgement),
+                JsonRpcMessage::Request(cancellation),
+                JsonRpcMessage::Response(completion),
+            ] if discovery.id == Some(905_i64.into())
+                && matches!(
+                    ServerNotification::decode(acknowledgement),
+                    Ok(ServerNotification::SubscriptionsAcknowledged(_))
+                )
+                && matches!(
+                    ServerNotification::decode(cancellation),
+                    Ok(ServerNotification::Cancelled(params)) if params.request_id == RequestId::Number(906)
+                )
+                && completion.id == Some(906_i64.into())
+                && final_subscription_completion_response(completion)
+        ));
+    }
+
+    #[test]
+    fn public_stdio_final_subscription_wrong_cancellation_id_preserves_listener_correlation() {
+        let sent =
+            public_stdio_final_subscription_transcript(Some(modern_cancelled_notification(907)));
+
+        assert!(matches!(
+            sent.as_slice(),
+            [
+                JsonRpcMessage::Response(discovery),
+                JsonRpcMessage::Request(acknowledgement),
+                JsonRpcMessage::Request(cancellation),
+                JsonRpcMessage::Response(completion),
+            ] if discovery.id == Some(905_i64.into())
+                && matches!(
+                    ServerNotification::decode(acknowledgement),
+                    Ok(ServerNotification::SubscriptionsAcknowledged(_))
+                )
+                && matches!(
+                    ServerNotification::decode(cancellation),
+                    Ok(ServerNotification::Cancelled(params)) if params.request_id == RequestId::Number(906)
+                )
+                && completion.id == Some(906_i64.into())
+                && final_subscription_completion_response(completion)
+        ));
+    }
+
     fn exact_legacy_initialize_request(
         id: i64,
         client_version: serde_json::Value,
@@ -23499,34 +24814,14 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn latched_launch_policy_rejects_transport_before_receive_side_effect() {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let receive_calls = Arc::new(AtomicUsize::new(0));
-        let server = ServerBuilder::from_launch_protocol_policy(
+    fn invalid_launch_policy_rejects_server_builder_before_transport_setup() {
+        let builder = ServerBuilder::from_launch_protocol_policy(
             "invalid-launch-policy",
             "1.0.0",
             Err(ServerLaunchPolicyError::InvalidValue),
-        )
-        .build();
-
-        let error = server
-            .run_transport_returning_with_cx(
-                &Cx::for_testing(),
-                ProtocolPolicyProbeTransport {
-                    next: Some(modern_discovery_opening_request()),
-                    sent: Arc::clone(&sent),
-                    receive_calls: Arc::clone(&receive_calls),
-                },
-            )
-            .expect_err("latched launch policy must reject before transport receive");
-
-        assert_eq!(error.code, McpErrorCode::InvalidRequest);
-        assert_eq!(receive_calls.load(Ordering::Acquire), 0);
-        assert!(
-            sent.lock()
-                .expect("sent mutex must not be poisoned")
-                .is_empty()
         );
+
+        assert!(matches!(builder, Err(ServerLaunchPolicyError::InvalidValue)));
     }
 
     #[test]
@@ -23535,6 +24830,7 @@ mod lib_unit_tests {
         let receive_calls = Arc::new(AtomicUsize::new(0));
         let server = Server::new("selected-modern-runtime-policy", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .build();
 
         assert_eq!(server.protocol_policy(), ProtocolPolicy::ModernOnly);
@@ -23567,6 +24863,7 @@ mod lib_unit_tests {
         let receive_calls = Arc::new(AtomicUsize::new(0));
         let server = Server::new("selected-modern-runtime-policy", "1.0.0")
             .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly must be available to this test build")
             .build();
 
         assert_eq!(server.protocol_policy(), ProtocolPolicy::LegacyOnly);
@@ -23614,6 +24911,7 @@ mod lib_unit_tests {
 
         Server::new("auto-modern-runtime-policy", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
             .build()
             .run_transport_returning_with_cx(
                 &Cx::for_testing(),
@@ -23739,6 +25037,7 @@ mod lib_unit_tests {
 
         Server::new("live-legacy-runtime", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
             .tool(LiveRuntimeListedTool)
             .build()
             .run_transport_returning_with_cx(
@@ -23807,6 +25106,7 @@ mod lib_unit_tests {
 
         Server::new("legacy-invalid-cancellation", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
             .build()
             .run_transport_returning_with_cx(
                 &Cx::for_testing(),
@@ -24012,6 +25312,7 @@ mod lib_unit_tests {
         let result = run_live_split_transport(
             Server::new("legacy-cancel-late", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .tool(LiveLegacyRuntimeConnectionTool)
                 .build(),
             LegacyCancelLateRecv {
@@ -24051,6 +25352,7 @@ mod lib_unit_tests {
         let result = run_live_split_transport(
             Server::new("legacy-cancel-numeric-alias", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .tool(LiveLegacyRuntimeConnectionTool)
                 .build(),
             LegacyCancelLateRecv {
@@ -24093,6 +25395,7 @@ mod lib_unit_tests {
         let result = run_live_split_transport(
             Server::new("legacy-cancel-next-negative", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .tool(LiveLegacyRuntimeConnectionTool)
                 .build(),
             LegacyCancelLateRecv {
@@ -24181,6 +25484,7 @@ mod lib_unit_tests {
 
         Server::new("live-legacy-runtime-negative", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
             .tool(LiveRuntimeListedTool)
             .build()
             .run_transport_returning_with_cx(
@@ -24266,6 +25570,7 @@ mod lib_unit_tests {
 
         Server::new("live-legacy-completion", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
             .completion_handler(LiveLegacyCompletionHandler)
             .build()
             .run_transport_returning_with_cx(
@@ -24332,6 +25637,7 @@ mod lib_unit_tests {
 
         Server::new("live-legacy-completion-id", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
             .completion_handler(CountingLegacyCompletionHandler {
                 calls: Arc::clone(&calls),
             })
@@ -24433,6 +25739,94 @@ mod lib_unit_tests {
                     .as_str()
             }),
             Some("modern-http-endpoint")
+        );
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn public_http_session_rejects_legacy_after_modern_admission_without_mutation() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("http-era-pin-modern", "1.0.0")
+            .build_http_endpoint("http://legacy.test")
+            .expect("dual-era endpoint must build");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("session must open before first-era admission");
+
+        let modern = session
+            .handle(&cx, modern_http_json_tool_request("missing", 2_021))
+            .expect("an admitted modern request may return a JSON-RPC handler error");
+        assert!(matches!(modern, ServerHttpEndpointResponse::Immediate(_)));
+        let before_era = session.selected_era;
+        let before_dispatches = session
+            .modern_dispatches
+            .lock()
+            .expect("modern dispatch registry must not be poisoned")
+            .len();
+        assert_eq!(before_era, Some(ProtocolEra::Modern2026));
+        assert!(session.legacy_adapter.is_none());
+
+        let rejected = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .expect("cross-era request must become an HTTP rejection");
+        assert!(matches!(
+            rejected,
+            ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::BAD_REQUEST
+        ));
+        assert_eq!(session.selected_era, before_era);
+        assert!(session.legacy_adapter.is_none());
+        assert_eq!(
+            session
+                .modern_dispatches
+                .lock()
+                .expect("rejection must not poison modern dispatch state")
+                .len(),
+            before_dispatches,
+            "changing only the HTTP era must not allocate legacy or modern session work",
+        );
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn public_http_session_rejects_modern_after_legacy_admission_without_mutation() {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("http-era-pin-legacy", "1.0.0")
+            .build_http_endpoint("http://legacy.test")
+            .expect("dual-era endpoint must build");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("session must open before first-era admission");
+
+        let legacy = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .expect("legacy SSE opening request must be admitted");
+        assert!(matches!(legacy, ServerHttpEndpointResponse::LegacySse(_)));
+        let before_era = session.selected_era;
+        let before_session_id = session.legacy_session_id().to_owned();
+        let before_dispatches = session
+            .modern_dispatches
+            .lock()
+            .expect("modern dispatch registry must not be poisoned")
+            .len();
+        assert_eq!(before_era, Some(ProtocolEra::Legacy2024));
+
+        let rejected = session
+            .handle(&cx, modern_http_json_tool_request("missing", 2_022))
+            .expect("cross-era request must become an HTTP rejection");
+        assert!(matches!(
+            rejected,
+            ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::BAD_REQUEST
+        ));
+        assert_eq!(session.selected_era, before_era);
+        assert_eq!(session.legacy_session_id(), before_session_id);
+        assert_eq!(
+            session
+                .modern_dispatches
+                .lock()
+                .expect("rejection must not poison modern dispatch state")
+                .len(),
+            before_dispatches,
+            "changing only the HTTP era must not allocate modern session work",
         );
     }
 
@@ -24553,6 +25947,7 @@ mod lib_unit_tests {
             InboundRequestContext::new(Cx::for_testing(), 218, InboundRequestTransport::Http);
         let legacy_only = Server::new("legacy-only-http-policy", "1.0.0")
             .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly must be available to this test build")
             .build();
         let modern_response = legacy_only.dispatch_http_with_protocol_policy(
             ProtocolPolicy::LegacyOnly,
@@ -24574,6 +25969,7 @@ mod lib_unit_tests {
             InboundRequestContext::new(Cx::for_testing(), 219, InboundRequestTransport::Http);
         let modern_only = Server::new("modern-only-http-policy", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .build();
         let legacy_response = modern_only.dispatch_http_with_protocol_policy(
             ProtocolPolicy::ModernOnly,
@@ -24599,6 +25995,7 @@ mod lib_unit_tests {
             InboundRequestContext::new(Cx::for_testing(), 220, InboundRequestTransport::Http);
         let server = Server::new("modern-http-policy", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .build();
 
         let response = server.dispatch_http_with_protocol_policy(
@@ -24625,6 +26022,7 @@ mod lib_unit_tests {
             InboundRequestContext::new(Cx::for_testing(), 220, InboundRequestTransport::Http);
         let server = Server::new("modern-http-policy", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .build();
 
         let response = server.dispatch_http_with_protocol_policy(
@@ -24844,6 +26242,7 @@ mod lib_unit_tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let bound = Server::new("live-http-stateless-sse", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .tool(LiveHttpMrtrTool {
                     calls: Arc::clone(&calls),
                 })
@@ -24929,6 +26328,7 @@ mod lib_unit_tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let bound = Server::new("live-http-anonymous-disablement", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .tool(HttpSessionDisablingTool {
                     calls: Arc::clone(&calls),
                 })
@@ -25072,6 +26472,7 @@ mod lib_unit_tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let bound = Server::new("live-http-mrtr-wrong-kind", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .tool(LiveHttpMrtrTool {
                     calls: Arc::clone(&calls),
                 })
@@ -25282,6 +26683,7 @@ mod lib_unit_tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let bound = Server::new("live-http-mrtr-shutdown", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .tool(LiveHttpMrtrTool {
                     calls: Arc::clone(&calls),
                 })
@@ -25408,6 +26810,7 @@ mod lib_unit_tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let bound = Server::new("live-http-stateless-sse-reject", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .tool(LiveHttpMrtrTool {
                     calls: Arc::clone(&calls),
                 })
@@ -25478,6 +26881,7 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             let bound = Server::new("live-http-stateless-discovery", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .build()
                 .bind_http(&cx, "127.0.0.1:0")
                 .await
@@ -25553,6 +26957,7 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             let bound = Server::new("live-http-protocol-admission", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .build()
                 .bind_http(&cx, "127.0.0.1:0")
                 .await
@@ -25668,6 +27073,7 @@ mod lib_unit_tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let bound = Server::new("live-modern-sse-frames", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .log_level(Level::Debug)
                 .tool(HttpRequestScopedProgressTool {
                     calls: Arc::clone(&calls),
@@ -25814,6 +27220,7 @@ mod lib_unit_tests {
             let control = Arc::new(LiveModernControl::default());
             let bound = Server::new("live-http-tool-body-drop", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .log_level(Level::Debug)
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
@@ -25956,6 +27363,7 @@ mod lib_unit_tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let bound = Server::new("live-modern-sse-qvalue", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .log_level(Level::Debug)
                 .tool(HttpRequestScopedProgressTool {
                     calls: Arc::clone(&calls),
@@ -26022,6 +27430,7 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             let bound = Server::new("live-http-sse-discovery-reject", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .build()
                 .bind_http(&cx, "127.0.0.1:0")
                 .await
@@ -26093,6 +27502,7 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             let bound = Server::new("live-http-listen-half-close", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .build()
                 .bind_http(&cx, "127.0.0.1:0")
                 .await
@@ -26856,7 +28266,9 @@ mod lib_unit_tests {
             .join(cx)
             .await
             .map_err(|error| format!("legacy reverse-response client failed: {error:?}"))??;
-        serve.map_err(|error| format!("legacy reverse-response server failed: {error}"))
+        let shutdown =
+            serve.map_err(|error| format!("legacy reverse-response server failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "legacy reverse-response").await
     }
 
     #[test]
@@ -26881,6 +28293,7 @@ mod lib_unit_tests {
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         let bound = Server::new("live-http-cross-era", "1.0.0")
             .protocol_policy(policy)
+            .map_err(|error| format!("cross-era HTTP policy rejected: {error}"))?
             .build()
             .bind_http(cx, "127.0.0.1:0")
             .await
@@ -26961,7 +28374,8 @@ mod lib_unit_tests {
             .join(cx)
             .await
             .map_err(|error| format!("cross-era HTTP client failed: {error:?}"))??;
-        serve.map_err(|error| format!("cross-era HTTP server failed: {error}"))?;
+        let shutdown = serve.map_err(|error| format!("cross-era HTTP server failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "cross-era HTTP").await?;
         Ok(transcript)
     }
 
@@ -27089,7 +28503,8 @@ mod lib_unit_tests {
         let response = client
             .join()
             .map_err(|_| "shutdown-fence client panicked".to_owned())??;
-        serve.map_err(|error| format!("shutdown-fence server failed: {error}"))?;
+        let shutdown = serve.map_err(|error| format!("shutdown-fence server failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "shutdown fence").await?;
         Ok(response)
     }
 
@@ -27397,7 +28812,9 @@ mod lib_unit_tests {
             .join(cx)
             .await
             .map_err(|error| format!("legacy admission client task failed: {error:?}"))??;
-        serve.map_err(|error| format!("legacy admission HTTP server failed: {error}"))?;
+        let shutdown =
+            serve.map_err(|error| format!("legacy admission HTTP server failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "legacy admission HTTP").await?;
         Ok(target_calls.load(Ordering::Acquire))
     }
 
@@ -27876,15 +29293,9 @@ mod lib_unit_tests {
             .await
             .map_err(|error| format!("legacy peer-close client failed: {error:?}"));
         client_result??;
-        match serve.map_err(|error| format!("legacy peer-close server failed: {error}"))? {
-            HttpServerShutdown::Quiescent => {}
-            HttpServerShutdown::Nonquiescent(mut shutdown) => {
-                return Err(format!(
-                    "legacy peer-close left caller-owned HTTP children unsettled: {:?}",
-                    shutdown.poll_settlement()
-                ));
-            }
-        }
+        let shutdown =
+            serve.map_err(|error| format!("legacy peer-close server failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "legacy peer-close").await?;
         if !observed_cancellation.load(Ordering::Acquire) {
             return Err("originating legacy peer close did not cancel its request".to_string());
         }
@@ -28023,10 +29434,13 @@ mod lib_unit_tests {
             (true, HttpServerShutdown::Quiescent) => {
                 Err("cooperative HTTP handler was joined before recording completion".to_owned())
             }
-            (true, HttpServerShutdown::Nonquiescent(mut shutdown)) => Err(format!(
-                "cooperative HTTP shutdown unexpectedly retained children: {:?}",
-                shutdown.poll_settlement()
-            )),
+            (true, HttpServerShutdown::Nonquiescent(mut shutdown)) => {
+                let initial = shutdown.poll_settlement();
+                let settled = shutdown.settle_for(Duration::from_secs(1)).await;
+                Err(format!(
+                    "cooperative HTTP shutdown unexpectedly retained children: initial={initial:?}, after bounded settlement={settled:?}"
+                ))
+            }
             (false, HttpServerShutdown::Quiescent) => {
                 Err("non-cooperative HTTP handler was falsely reported as quiescent".to_owned())
             }
@@ -28850,6 +30264,7 @@ mod lib_unit_tests {
 
         Server::new("live-legacy-cancellation", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
             .tool(LiveLegacyCancellationTool {
                 started: Arc::clone(&started),
                 observed_cancellation: Arc::clone(&observed_cancellation),
@@ -28998,6 +30413,7 @@ mod lib_unit_tests {
 
         let result = Server::new("live-legacy-queued-cancellation", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
             .tool(LiveModernControlledTool {
                 control: Arc::clone(&control),
             })
@@ -29074,6 +30490,7 @@ mod lib_unit_tests {
         let exit_code = run_live_modern_pump(
             Server::new("live-modern-overlap", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
                 })
@@ -29123,6 +30540,7 @@ mod lib_unit_tests {
         let run_result = run_live_split_transport(
             Server::new("live-modern-split-overlap", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
                 })
@@ -29166,6 +30584,7 @@ mod lib_unit_tests {
         run_live_split_transport(
             Server::new("live-modern-split-overlap", "1.0.0")
                 .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly must be available to this test build")
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
                 })
@@ -29199,6 +30618,7 @@ mod lib_unit_tests {
         let exit_code = run_live_modern_pump(
             Server::new("live-modern-cancellation", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
                 })
@@ -29269,6 +30689,7 @@ mod lib_unit_tests {
         let exit_code = run_live_modern_pump(
             Server::new("public-stdio-final-progress", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .log_level(Level::Debug)
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
@@ -29374,6 +30795,7 @@ mod lib_unit_tests {
         let exit_code = run_live_modern_pump(
             Server::new("public-stdio-final-progress-cancel", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .log_level(Level::Debug)
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
@@ -29458,6 +30880,7 @@ mod lib_unit_tests {
         let exit_code = run_live_modern_pump(
             Server::new("public-stdio-progress-cancellation-fence", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .log_level(Level::Debug)
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
@@ -29527,6 +30950,7 @@ mod lib_unit_tests {
         let exit_code = run_live_modern_pump(
             Server::new("live-modern-notification-shutdown", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .middleware(LiveModernBlockingNotificationMiddleware {
                     control: Arc::clone(&control),
                 })
@@ -29565,6 +30989,7 @@ mod lib_unit_tests {
         let exit_code = run_live_modern_pump(
             Server::new("live-modern-backpressure", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
                 })
@@ -31921,6 +33346,7 @@ mod lib_unit_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let endpoint = Server::new("modern-http-session-isolation", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .tool(HttpSessionDisablingTool {
                 calls: Arc::clone(&calls),
             })
@@ -31960,6 +33386,7 @@ mod lib_unit_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let endpoint = Server::new("modern-http-session-disablement", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .tool(HttpSessionDisablingTool {
                 calls: Arc::clone(&calls),
             })
@@ -32016,6 +33443,7 @@ mod lib_unit_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let endpoint = Server::new("modern-http-mrtr-session-isolation", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .tool(LiveHttpMrtrTool {
                 calls: Arc::clone(&calls),
             })
@@ -32110,6 +33538,7 @@ mod lib_unit_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let endpoint = Server::new("final-http-request-scoped", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .log_level(Level::Debug)
             .tool(HttpRequestScopedProgressTool {
                 calls: Arc::clone(&calls),
@@ -32277,6 +33706,7 @@ mod lib_unit_tests {
         let cx = Cx::for_testing();
         let endpoint = Server::new("final-http-progress-exhaustion", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .log_level(Level::Debug)
             .tool(HttpRequestScopedProgressTool {
                 calls: Arc::new(AtomicUsize::new(0)),
@@ -32330,6 +33760,7 @@ mod lib_unit_tests {
         let cx = Cx::for_testing();
         let endpoint = Server::new("final-http-progress-cancellation", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .log_level(Level::Debug)
             .tool(HttpFinalProgressCancellationTool)
             .build_http_endpoint("http://final.test")
@@ -32391,6 +33822,7 @@ mod lib_unit_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let endpoint = Server::new("final-http-request-scoped", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .log_level(Level::Debug)
             .tool(HttpRequestScopedProgressTool {
                 calls: Arc::clone(&calls),
@@ -32443,6 +33875,7 @@ mod lib_unit_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let endpoint = Server::new("final-http-json-only", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .tool(HttpRequestScopedProgressTool {
                 calls: Arc::clone(&calls),
             })
@@ -32493,6 +33926,7 @@ mod lib_unit_tests {
         let cx = Cx::for_testing();
         let endpoint = Server::new("final-log-runtime", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .log_level(Level::Debug)
             .build_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
@@ -32568,6 +34002,7 @@ mod lib_unit_tests {
         let cx = Cx::for_testing();
         let endpoint = Server::new("final-log-runtime", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .log_level(Level::Debug)
             .build_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
@@ -33087,6 +34522,7 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             let endpoint = Server::new("public-http-listen", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .build_http_endpoint("http://legacy.test")
                 .map_err(|error| format!("public endpoint setup failed: {error}"))?;
             let mut first_session = endpoint
@@ -33321,6 +34757,7 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             let endpoint = Server::new("public-http-last-session-drop", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
                 .build_http_endpoint("http://legacy.test")
                 .map_err(|error| format!("public endpoint setup failed: {error}"))?;
             let mut session = endpoint

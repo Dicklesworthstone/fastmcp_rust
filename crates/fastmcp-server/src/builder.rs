@@ -8,37 +8,49 @@ use std::sync::{Arc, Mutex};
 use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
 use fastmcp_core::McpResult;
+use fastmcp_protocol::extensions::ExtensionSettingsCompatibilityResolver;
+#[cfg(feature = "apps")]
 use fastmcp_protocol::extensions::{
-    ExtensionSettingsCompatibilityResolver, official_mcp_apps_extension_id,
-    validate_official_mcp_apps_descriptor, validate_official_mcp_apps_server_settings,
+    official_mcp_apps_extension_id, validate_official_mcp_apps_descriptor,
+    validate_official_mcp_apps_server_settings,
 };
-use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
+#[cfg(feature = "proxy")]
+use fastmcp_protocol::protocol_policy::ProtocolEra;
+use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{
     LoggingCapability, PromptsCapability, ResourceTemplate, ResourcesCapability,
     ServerCapabilities, ServerExtensionDiscovery, ServerInfo, ToolsCapability,
 };
 use log::{Level, LevelFilter};
 
+#[cfg(feature = "tasks")]
+use crate::FinalTaskRuntime;
+use crate::handler::CompletionHandler;
+#[cfg(feature = "proxy")]
 use crate::handler::{
-    CompletionHandler, FinalProxyPromptHandler, FinalProxyResourceHandler,
-    FinalProxyResourceTemplateHandler,
+    FinalProxyPromptHandler, FinalProxyResourceHandler, FinalProxyResourceTemplateHandler,
 };
+#[cfg(feature = "apps")]
 use crate::providers::McpAppsUiResource;
-#[cfg(test)]
+#[cfg(all(test, feature = "proxy"))]
 use crate::proxy::ProxyFinalCatalog;
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+use crate::proxy::ProxyFinalTaskRelay;
+#[cfg(feature = "proxy")]
 use crate::proxy::{
-    ProxyCompletionHandler, ProxyFinalTaskRelay, ProxyPromptCatalog, ProxyPromptHandler,
-    ProxyResourceCatalog, ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog,
-    ProxyToolHandler, ProxyTypedCatalog,
+    ProxyCompletionHandler, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
+    ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler,
+    ProxyTypedCatalog,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "tasks"))]
 use crate::tasks::SharedTaskManager;
 use crate::{
     AuthProvider, DuplicateBehavior, ExtensionHandlerRegistry, FinalSubscriptionRegistry,
-    FinalTaskRuntime, HttpServerConfig, LifespanHooks, LoggingConfig, PromptHandler, ProxyCatalog,
-    ProxyClient, ResourceHandler, Router, Server, ServerExtensionConfigurationError,
-    ServerExtensionRuntime, ToolHandler,
+    HttpServerConfig, LifespanHooks, LoggingConfig, PromptHandler, ResourceHandler, Router, Server,
+    ServerExtensionConfigurationError, ServerExtensionRuntime, ToolHandler,
 };
+#[cfg(feature = "proxy")]
+use crate::{ProxyCatalog, ProxyClient};
 
 /// Default request timeout in seconds.
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -46,13 +58,16 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Reserved launch setting written by `fastmcp run` for FastMCP server targets.
 const FASTMCP_PROTOCOL_POLICY_ENV: &str = "FASTMCP_PROTOCOL_POLICY";
 
-/// The reserved launch policy is absent, malformed, or not valid Unicode.
+/// The selected launch policy is malformed, not valid Unicode, or unavailable
+/// in the compiled server feature set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerLaunchPolicyError {
     /// The reserved launch setting was present but was not valid Unicode.
     NonUnicode,
     /// The reserved launch setting was not one of the exact supported values.
     InvalidValue,
+    /// The selected policy requires a server feature that is not compiled in.
+    FeatureUnavailable,
 }
 
 impl fmt::Display for ServerLaunchPolicyError {
@@ -65,6 +80,10 @@ impl fmt::Display for ServerLaunchPolicyError {
             Self::InvalidValue => write!(
                 formatter,
                 "{FASTMCP_PROTOCOL_POLICY_ENV} must be auto, modern-only, or legacy-only"
+            ),
+            Self::FeatureUnavailable => write!(
+                formatter,
+                "{FASTMCP_PROTOCOL_POLICY_ENV}=auto or legacy-only requires the legacy-2024-11-05 feature"
             ),
         }
     }
@@ -94,6 +113,27 @@ fn protocol_policy_from_server_launch_environment()
     )
 }
 
+const fn legacy_protocol_is_available() -> bool {
+    cfg!(any(feature = "legacy-2024-11-05", test))
+}
+
+fn resolve_protocol_policy(
+    launch_protocol_policy: Option<ProtocolPolicy>,
+    legacy_protocol_available: bool,
+) -> Result<ProtocolPolicy, ServerLaunchPolicyError> {
+    let protocol_policy = launch_protocol_policy.unwrap_or(if legacy_protocol_available {
+        ProtocolPolicy::Auto
+    } else {
+        ProtocolPolicy::ModernOnly
+    });
+
+    if !legacy_protocol_available && !matches!(protocol_policy, ProtocolPolicy::ModernOnly) {
+        return Err(ServerLaunchPolicyError::FeatureUnavailable);
+    }
+
+    Ok(protocol_policy)
+}
+
 /// Builder for configuring an MCP server.
 pub struct ServerBuilder {
     info: ServerInfo,
@@ -118,7 +158,7 @@ pub struct ServerBuilder {
     middleware: Vec<Box<dyn crate::Middleware>>,
     /// Test-only legacy task manager. Production builds have no task-manager
     /// field or builder edge.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tasks"))]
     task_manager: Option<SharedTaskManager>,
     /// Behavior when registering duplicate component names.
     on_duplicate: DuplicateBehavior,
@@ -128,17 +168,18 @@ pub struct ServerBuilder {
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy for live stdio/runtime connections.
     protocol_policy: ProtocolPolicy,
-    /// Reserved CLI launch policy, retaining malformed input for the
-    /// fallible build boundary.
-    launch_protocol_policy: Result<Option<ProtocolPolicy>, ServerLaunchPolicyError>,
+    /// Reserved CLI launch policy, when one was selected before construction.
+    launch_protocol_policy: Option<ProtocolPolicy>,
     /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
     /// Installed extension handlers and current server discovery settings.
     extension_runtime: Option<ServerExtensionRuntime>,
     /// Application-owned state for the configured final Tasks extension.
+    #[cfg(feature = "tasks")]
     final_task_runtime: Option<FinalTaskRuntime>,
     /// One route-bound upstream final Tasks relay. The official Task methods
     /// cannot disambiguate two independent upstream task-ID namespaces.
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
     final_task_relay: Option<Arc<ProxyFinalTaskRelay>>,
 }
 
@@ -152,6 +193,19 @@ impl ServerBuilder {
     /// [`with_console_config`](Self::with_console_config) for programmatic control.
     #[must_use]
     pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self::try_new(name, version).unwrap_or_else(|error| {
+            panic!("ServerBuilder::new rejected launch configuration: {error}")
+        })
+    }
+
+    /// Creates a new server builder after validating the reserved launch policy.
+    ///
+    /// This is the typed construction boundary for applications that need to
+    /// report a malformed or unavailable launch policy instead of panicking.
+    pub fn try_new(
+        name: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Result<Self, ServerLaunchPolicyError> {
         Self::from_launch_protocol_policy(
             name,
             version,
@@ -163,15 +217,13 @@ impl ServerBuilder {
         name: impl Into<String>,
         version: impl Into<String>,
         launch_protocol_policy: Result<Option<ProtocolPolicy>, ServerLaunchPolicyError>,
-    ) -> Self {
+    ) -> Result<Self, ServerLaunchPolicyError> {
+        let launch_protocol_policy = launch_protocol_policy?;
         let console_config = ConsoleConfig::from_env();
         let logging = LoggingConfig::from(&console_config);
-        let protocol_policy = launch_protocol_policy
-            .as_ref()
-            .ok()
-            .and_then(|policy| *policy)
-            .unwrap_or(ProtocolPolicy::Auto);
-        Self {
+        let protocol_policy =
+            resolve_protocol_policy(launch_protocol_policy, legacy_protocol_is_available())?;
+        Ok(Self {
             info: ServerInfo {
                 name: name.into(),
                 version: version.into(),
@@ -190,7 +242,7 @@ impl ServerBuilder {
             lifespan: LifespanHooks::default(),
             auth_provider: None,
             middleware: Vec::new(),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "tasks"))]
             task_manager: None,
             on_duplicate: DuplicateBehavior::default(),
             strict_input_validation: false,
@@ -200,9 +252,11 @@ impl ServerBuilder {
             launch_protocol_policy,
             http_config: HttpServerConfig::default(),
             extension_runtime: None,
+            #[cfg(feature = "tasks")]
             final_task_runtime: None,
+            #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay: None,
-        }
+        })
     }
 
     /// Sets the behavior when registering duplicate component names.
@@ -396,16 +450,21 @@ impl ServerBuilder {
 
     /// Selects the immutable MCP protocol-era policy for live stdio and runtime connections.
     ///
-    /// The default [`ProtocolPolicy::Auto`] classifies the first accepted opening frame and then
-    /// pins that connection to its selected era. `ModernOnly` and `LegacyOnly` reject an opening
-    /// frame from the other exact supported era before it can enter request dispatch. A policy
-    /// supplied through the reserved launch environment takes precedence at [`Self::try_build`].
-    #[must_use]
-    pub fn protocol_policy(mut self, policy: ProtocolPolicy) -> Self {
-        if matches!(self.launch_protocol_policy, Ok(None)) {
+    /// With the exact legacy adapter enabled, the default [`ProtocolPolicy::Auto`] classifies the
+    /// first accepted opening frame and then pins that connection to its selected era. Without
+    /// that adapter, construction defaults to [`ProtocolPolicy::ModernOnly`]. `ModernOnly` and
+    /// `LegacyOnly` reject an opening frame from the other exact supported era before it can enter
+    /// request dispatch. In a no-legacy production build, `Auto` and `LegacyOnly` return
+    /// [`ServerLaunchPolicyError::FeatureUnavailable`] before either can be stored.
+    pub fn protocol_policy(
+        mut self,
+        policy: ProtocolPolicy,
+    ) -> Result<Self, ServerLaunchPolicyError> {
+        resolve_protocol_policy(Some(policy), legacy_protocol_is_available())?;
+        if self.launch_protocol_policy.is_none() {
             self.protocol_policy = policy;
         }
-        self
+        Ok(self)
     }
 
     /// Installs the server's modern-only extension handlers and discovery settings.
@@ -426,6 +485,7 @@ impl ServerBuilder {
         if self.extension_runtime.is_some() {
             return Err(ServerExtensionConfigurationError::AlreadyInstalled);
         }
+        #[cfg(feature = "apps")]
         if let Some(settings) = server_discovery
             .extensions
             .get(&official_mcp_apps_extension_id())
@@ -435,10 +495,15 @@ impl ServerBuilder {
         }
         let mut extension_runtime =
             ServerExtensionRuntime::new(handlers, server_discovery, resolver)?;
+        #[cfg(feature = "tasks")]
         if let Some(task_runtime) = self.final_task_runtime.as_ref() {
             extension_runtime.install_final_tasks(task_runtime)?;
-        } else if let Some(task_relay) = self.final_task_relay.as_ref() {
-            extension_runtime.install_proxy_final_tasks(Arc::clone(task_relay))?;
+        }
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        if self.final_task_runtime.is_none() {
+            if let Some(task_relay) = self.final_task_relay.as_ref() {
+                extension_runtime.install_proxy_final_tasks(Arc::clone(task_relay))?;
+            }
         }
         self.extension_runtime = Some(extension_runtime);
         Ok(self)
@@ -451,15 +516,21 @@ impl ServerBuilder {
     /// `server/discover` metadata only. It composes in either order with
     /// [`Self::final_tasks`], preserving an Apps inactive disposition when a
     /// client does not advertise the Apps HTML MIME type.
+    #[cfg(feature = "apps")]
     pub fn mcp_apps(mut self) -> Result<Self, ServerExtensionConfigurationError> {
         if let Some(extension_runtime) = self.extension_runtime.as_mut() {
             extension_runtime.install_official_mcp_apps()?;
         } else {
             let mut extension_runtime = ServerExtensionRuntime::with_official_mcp_apps()?;
+            #[cfg(feature = "tasks")]
             if let Some(task_runtime) = self.final_task_runtime.as_ref() {
                 extension_runtime.install_final_tasks(task_runtime)?;
-            } else if let Some(task_relay) = self.final_task_relay.as_ref() {
-                extension_runtime.install_proxy_final_tasks(Arc::clone(task_relay))?;
+            }
+            #[cfg(all(feature = "proxy", feature = "tasks"))]
+            if self.final_task_runtime.is_none() {
+                if let Some(task_relay) = self.final_task_relay.as_ref() {
+                    extension_runtime.install_proxy_final_tasks(Arc::clone(task_relay))?;
+                }
             }
             self.extension_runtime = Some(extension_runtime);
         }
@@ -470,6 +541,7 @@ impl ServerBuilder {
     /// capability configuration. Merely advertising the official identifier
     /// is insufficient: the frozen descriptor, local enablement, and exact
     /// empty server settings must all be present.
+    #[cfg(feature = "apps")]
     fn has_active_official_mcp_apps(&self) -> bool {
         let apps_id = official_mcp_apps_extension_id();
         self.extension_runtime.as_ref().is_some_and(|runtime| {
@@ -496,6 +568,7 @@ impl ServerBuilder {
     /// This resource is deliberately absent from exact MCP 2024-11-05
     /// discovery and reads. Call [`Self::mcp_apps`] first so the server also
     /// advertises the matching modern bilateral extension capability.
+    #[cfg(feature = "apps")]
     pub fn mcp_apps_ui_resource(mut self, resource: McpAppsUiResource) -> McpResult<Self> {
         if !self.has_active_official_mcp_apps() {
             return Err(fastmcp_core::McpError::invalid_request(
@@ -517,6 +590,7 @@ impl ServerBuilder {
     /// HTML resource before either tool catalog is changed. Unlike
     /// [`Self::tool`], this Apps-specific entry point returns the registration
     /// failure directly.
+    #[cfg(feature = "apps")]
     pub fn mcp_apps_tool<H: ToolHandler + 'static>(mut self, handler: H) -> McpResult<Self> {
         if !self.has_active_official_mcp_apps() {
             return Err(fastmcp_core::McpError::invalid_request(
@@ -537,11 +611,21 @@ impl ServerBuilder {
     /// [`FinalTaskRuntime`] retained on the built [`Server`]. This builder
     /// installs the official descriptor, its three client-to-server request
     /// handlers, and its `notifications/tasks` delivery path together.
+    #[cfg(feature = "tasks")]
     pub fn final_tasks(
         mut self,
         task_runtime: FinalTaskRuntime,
     ) -> Result<Self, ServerExtensionConfigurationError> {
-        if self.final_task_runtime.is_some() || self.final_task_relay.is_some() {
+        if self.final_task_runtime.is_some() || {
+            #[cfg(feature = "proxy")]
+            {
+                self.final_task_relay.is_some()
+            }
+            #[cfg(not(feature = "proxy"))]
+            {
+                false
+            }
+        } {
             return Err(ServerExtensionConfigurationError::FinalTasksAlreadyInstalled);
         }
         if let Some(extension_runtime) = self.extension_runtime.as_mut() {
@@ -843,6 +927,7 @@ impl ServerBuilder {
     /// `Ignore` retains an existing target. Completion providers must not use
     /// that successful no-op as authorization to bind an upstream to the
     /// retained local target.
+    #[cfg(feature = "proxy")]
     fn proxy_prompt_wins_admission(&self, name: &str) -> bool {
         self.router.get_prompt(name).is_none() || self.on_duplicate == DuplicateBehavior::Replace
     }
@@ -852,6 +937,7 @@ impl ServerBuilder {
     ///
     /// See [`Self::proxy_prompt_wins_admission`] for why `Ok(())` alone is
     /// insufficient for proxy completion binding.
+    #[cfg(feature = "proxy")]
     fn proxy_resource_template_wins_admission(&self, uri_template: &str) -> bool {
         self.router.get_resource_template(uri_template).is_none()
             || self.on_duplicate == DuplicateBehavior::Replace
@@ -861,6 +947,7 @@ impl ServerBuilder {
     ///
     /// Use [`ProxyCatalog::from_client`] or [`ProxyClient::catalog`] to fetch
     /// definitions before calling this method.
+    #[cfg(feature = "proxy")]
     #[must_use]
     pub fn proxy(mut self, client: ProxyClient, catalog: ProxyCatalog) -> Self {
         if let Err(error) = client.admit_catalog(&catalog) {
@@ -1138,6 +1225,7 @@ impl ServerBuilder {
     ///
     /// Returns an error if the catalog fetch fails or the configured duplicate
     /// policy rejects a proxied component.
+    #[cfg(feature = "proxy")]
     pub fn as_proxy(
         mut self,
         prefix: &str,
@@ -1311,6 +1399,7 @@ impl ServerBuilder {
     ///
     /// Returns an error if catalog discovery fails or the configured duplicate
     /// policy rejects any unprefixed proxy component.
+    #[cfg(feature = "proxy")]
     pub fn as_proxy_raw(
         self,
         client: fastmcp_client::Client,
@@ -1321,6 +1410,7 @@ impl ServerBuilder {
     /// Registers one already-negotiated, typed upstream catalog without any
     /// legacy projection. Final components are visible only to final routes;
     /// legacy components remain visible only to exact MCP 2024-11-05 routes.
+    #[cfg(feature = "proxy")]
     pub fn proxy_typed(
         self,
         proxy_client: ProxyClient,
@@ -1329,6 +1419,7 @@ impl ServerBuilder {
         self.register_raw_typed_proxy_catalog(proxy_client, catalog)
     }
 
+    #[cfg(feature = "proxy")]
     fn as_proxy_raw_with_proxy_client(
         self,
         proxy_client: ProxyClient,
@@ -1340,6 +1431,7 @@ impl ServerBuilder {
     /// Registers one already-negotiated typed upstream catalog without
     /// projecting final resource/template/prompt definitions through their
     /// narrower legacy models.
+    #[cfg(feature = "proxy")]
     fn register_raw_typed_proxy_catalog(
         mut self,
         proxy_client: ProxyClient,
@@ -1357,11 +1449,13 @@ impl ServerBuilder {
             ));
         }
         let completion_supported = proxy_client.supports_completion()?;
+        #[cfg(feature = "tasks")]
         let task_relay = if catalog_era == ProtocolEra::Modern2026 {
             proxy_client.final_tasks_relay()?
         } else {
             None
         };
+        #[cfg(feature = "tasks")]
         if let Some(task_relay) = task_relay.as_ref() {
             if self.final_task_runtime.is_some() || self.final_task_relay.is_some() {
                 return Err(fastmcp_core::McpError::invalid_request(
@@ -1464,6 +1558,9 @@ impl ServerBuilder {
                 ProxyPromptCatalog::Final(prompts),
             ) => {
                 for tool in tools {
+                    #[cfg(not(feature = "tasks"))]
+                    let handler = ProxyToolHandler::from_final(tool, proxy_client.clone())?;
+                    #[cfg(feature = "tasks")]
                     let handler = match task_relay.as_ref() {
                         Some(task_relay) => ProxyToolHandler::from_final_with_task_relay(
                             tool,
@@ -1568,6 +1665,7 @@ impl ServerBuilder {
     /// the failure is logged and fluent builder construction continues.
     #[must_use]
     pub fn mount(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        #[cfg(feature = "apps")]
         if server.router.has_mcp_apps_bound_components() && !self.has_active_official_mcp_apps() {
             log::error!(
                 target: "fastmcp_rust::mount",
@@ -1631,6 +1729,7 @@ impl ServerBuilder {
     /// Duplicate handling follows [`on_duplicate`](Self::on_duplicate).
     #[must_use]
     pub fn mount_tools(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        #[cfg(feature = "apps")]
         if server.router.has_mcp_apps_bound_components() && !self.has_active_official_mcp_apps() {
             log::error!(
                 target: "fastmcp_rust::mount",
@@ -1683,6 +1782,7 @@ impl ServerBuilder {
     /// both static resources and resource templates.
     #[must_use]
     pub fn mount_resources(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        #[cfg(feature = "apps")]
         if server.router.has_mcp_apps_bound_components() && !self.has_active_official_mcp_apps() {
             log::error!(
                 target: "fastmcp_rust::mount",
@@ -1969,7 +2069,7 @@ impl ServerBuilder {
 
     /// Retains the legacy task manager for unit-test archaeology only.
     /// Production builds expose no task-manager builder edge.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tasks"))]
     #[must_use]
     pub(crate) fn with_task_manager(mut self, task_manager: SharedTaskManager) -> Self {
         self.task_manager = Some(task_manager);
@@ -1985,18 +2085,12 @@ impl ServerBuilder {
         self.request_timeout_secs
     }
 
-    /// Builds the server.
+    /// Builds the server after a valid builder-level configuration.
     ///
-    /// This preserves the infallible construction API. Launch paths that
-    /// receive `FASTMCP_PROTOCOL_POLICY` must use [`Self::try_build`] so a
-    /// malformed reserved setting cannot start a server with an implicit
-    /// fallback policy.
+    /// Both [`Self::try_new`] and [`Self::protocol_policy`] reject invalid or
+    /// unavailable policy selections before a builder exists.
     #[must_use]
     pub fn build(mut self) -> Server {
-        if let Some(error) = self.launch_protocol_policy.as_ref().err().copied() {
-            return self.build_latched_invalid(error);
-        }
-
         // Configure router with strict input validation setting
         self.router
             .set_strict_input_validation(self.strict_input_validation);
@@ -2004,8 +2098,11 @@ impl ServerBuilder {
             self.console_config.should_use_rich(),
         );
         let final_subscriptions = Arc::new(FinalSubscriptionRegistry::default());
+        #[cfg(feature = "tasks")]
         let final_task_runtime = self.final_task_runtime.clone();
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
         let final_task_relay = self.final_task_relay.clone();
+        #[cfg(feature = "tasks")]
         if let Some(task_runtime) = final_task_runtime.as_ref() {
             let subscriptions = Arc::clone(&final_subscriptions);
             task_runtime.add_notification_emitter(Arc::new(move |notification| {
@@ -2017,8 +2114,10 @@ impl ServerBuilder {
                 }
             }));
         }
+        #[cfg(feature = "tasks")]
         self.router
             .set_final_task_runtime(final_task_runtime.clone());
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
         self.router.set_final_task_relay(final_task_relay.clone());
         let extension_runtime = match self.extension_runtime {
             Some(mut runtime) => {
@@ -2027,6 +2126,7 @@ impl ServerBuilder {
                     .expect("validated server extension descriptors must freeze");
                 Some(Arc::new(runtime))
             }
+            #[cfg(all(feature = "proxy", feature = "tasks"))]
             None => match (final_task_runtime.as_ref(), final_task_relay.as_ref()) {
                 (Some(task_runtime), None) => {
                     let mut runtime = ServerExtensionRuntime::with_final_tasks(task_runtime)
@@ -2050,6 +2150,20 @@ impl ServerBuilder {
                 (None, None) => None,
                 (Some(_), Some(_)) => unreachable!("builder rejects mixed final Tasks owners"),
             },
+            #[cfg(all(feature = "tasks", not(feature = "proxy")))]
+            None => match final_task_runtime.as_ref() {
+                Some(task_runtime) => {
+                    let mut runtime = ServerExtensionRuntime::with_final_tasks(task_runtime)
+                        .expect("final Tasks must install into an empty extension registry");
+                    runtime
+                        .freeze()
+                        .expect("final Tasks extension descriptors must freeze");
+                    Some(Arc::new(runtime))
+                }
+                None => None,
+            },
+            #[cfg(not(feature = "tasks"))]
+            None => None,
         };
 
         Server {
@@ -2071,70 +2185,26 @@ impl ServerBuilder {
             auth_provider: self.auth_provider,
             middleware: Arc::new(self.middleware),
             active_requests: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "tasks"))]
             task_manager: self.task_manager,
             max_bidirectional_requests_per_connection: self
                 .max_bidirectional_requests_per_connection,
             protocol_policy: self.protocol_policy,
-            launch_policy_error: self.launch_protocol_policy.err(),
             http_config: self.http_config,
             extension_runtime,
+            #[cfg(feature = "tasks")]
             final_task_runtime: self.final_task_runtime,
+            #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay,
             final_subscriptions,
         }
     }
 
-    fn build_latched_invalid(self, launch_policy_error: ServerLaunchPolicyError) -> Server {
-        let console = fastmcp_console::console::FastMcpConsole::with_enabled(
-            self.console_config.should_use_rich(),
-        );
-
-        Server {
-            info: self.info,
-            capabilities: self.capabilities,
-            router: Arc::new(self.router),
-            instructions: self.instructions,
-            request_timeout_secs: self.request_timeout_secs,
-            stats: if self.stats_enabled {
-                Some(ServerStats::new())
-            } else {
-                None
-            },
-            mask_error_details: self.mask_error_details,
-            logging: self.logging,
-            console_config: self.console_config,
-            console,
-            lifespan: Mutex::new(Some(self.lifespan)),
-            auth_provider: self.auth_provider,
-            middleware: Arc::new(self.middleware),
-            active_requests: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(test)]
-            task_manager: self.task_manager,
-            max_bidirectional_requests_per_connection: self
-                .max_bidirectional_requests_per_connection,
-            protocol_policy: self.protocol_policy,
-            launch_policy_error: Some(launch_policy_error),
-            http_config: self.http_config,
-            // Do not freeze extension handlers or install task emitters after
-            // a reserved launch-policy failure.
-            extension_runtime: None,
-            final_task_runtime: None,
-            final_task_relay: None,
-            final_subscriptions: Arc::new(FinalSubscriptionRegistry::default()),
-        }
-    }
-
-    /// Builds a server after validating the reserved CLI launch policy.
+    /// Builds a server through the historical fallible spelling.
     ///
-    /// A valid reserved policy takes precedence over an application-supplied
-    /// [`Self::protocol_policy`] choice. A malformed or non-Unicode reserved
-    /// value is retained from [`Self::new`] and returned without constructing
-    /// a server.
+    /// Invalid launch configuration is rejected by [`Self::try_new`] before
+    /// the builder exists, so this always returns the result of [`Self::build`].
     pub fn try_build(self) -> Result<Server, ServerLaunchPolicyError> {
-        self.launch_protocol_policy
-            .as_ref()
-            .map_err(|error| *error)?;
         Ok(self.build())
     }
 }
@@ -2821,7 +2891,9 @@ mod tests {
     #[test]
     fn explicit_protocol_policy_applies_without_reserved_launch_setting() {
         let server = ServerBuilder::from_launch_protocol_policy("srv", "1.0", Ok(None))
+            .expect("unset launch policy must construct a builder")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
             .try_build()
             .expect("unset launch policy must permit a server");
 
@@ -2831,6 +2903,25 @@ mod tests {
     #[test]
     fn launch_policy_unset_defaults_to_auto() {
         assert_eq!(protocol_policy_from_server_launch_value(None), Ok(None));
+    }
+
+    #[test]
+    fn no_legacy_construction_defaults_to_modern_only() {
+        assert_eq!(
+            resolve_protocol_policy(None, false),
+            Ok(ProtocolPolicy::ModernOnly)
+        );
+    }
+
+    #[test]
+    fn no_legacy_construction_rejects_every_policy_requiring_legacy_behavior() {
+        for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+            assert_eq!(
+                resolve_protocol_policy(Some(policy), false),
+                Err(ServerLaunchPolicyError::FeatureUnavailable),
+                "{policy:?} differs from the modern-only no-legacy default only by requiring legacy behavior"
+            );
+        }
     }
 
     #[test]
@@ -2856,7 +2947,9 @@ mod tests {
             "1.0",
             Ok(Some(ProtocolPolicy::ModernOnly)),
         )
+        .expect("valid launch policy must construct a builder")
         .protocol_policy(ProtocolPolicy::LegacyOnly)
+        .expect("the unit-test dual-era build supports LegacyOnly")
         .try_build()
         .expect("valid launch policy must build");
 
@@ -2864,51 +2957,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_launch_policy_is_latched_through_fluent_configuration() {
+    fn invalid_launch_policy_is_rejected_before_builder_construction() {
         let result = ServerBuilder::from_launch_protocol_policy(
             "srv",
             "1.0",
             Err(ServerLaunchPolicyError::InvalidValue),
-        )
-        .protocol_policy(ProtocolPolicy::ModernOnly)
-        .try_build();
+        );
 
         assert!(matches!(result, Err(ServerLaunchPolicyError::InvalidValue)));
-    }
-
-    #[test]
-    fn latched_invalid_launch_policy_blocks_infallible_build_http_startup() {
-        let endpoint = ServerBuilder::from_launch_protocol_policy(
-            "srv",
-            "1.0",
-            Err(ServerLaunchPolicyError::InvalidValue),
-        )
-        .build()
-        .into_http_endpoint("http://legacy.test");
-        let Err(error) = endpoint else {
-            panic!("latched launch policy must block endpoint startup");
-        };
-
-        assert!(matches!(
-            error,
-            fastmcp_transport::http::DualEraHttpEndpointError::InvalidConfiguration(message)
-                if message.contains(FASTMCP_PROTOCOL_POLICY_ENV)
-        ));
-    }
-
-    #[test]
-    fn latched_invalid_launch_policy_quarantines_builder_runtime_configuration() {
-        let server = ServerBuilder::from_launch_protocol_policy(
-            "srv",
-            "1.0",
-            Err(ServerLaunchPolicyError::InvalidValue),
-        )
-        .mcp_apps()
-        .expect("builder configuration remains ergonomic before launch")
-        .build();
-
-        assert!(server.extension_handler_registry().is_none());
-        assert!(server.final_task_runtime().is_none());
     }
 
     #[test]

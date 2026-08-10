@@ -13,8 +13,12 @@ use std::marker::PhantomData;
 use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::extensions::{
     ExtensionDispatchError, ExtensionRegistryError, MAX_EXTENSION_MEMBER_NAME_BYTES,
-    NegotiatedExtensionSet, ServerExtensionDiscovery, official_mcp_apps_empty_server_settings,
-    register_official_mcp_apps_extension, validate_official_mcp_apps_server_settings,
+    NegotiatedExtensionSet, ServerExtensionDiscovery,
+};
+#[cfg(feature = "apps")]
+use fastmcp_protocol::extensions::{
+    official_mcp_apps_empty_server_settings, register_official_mcp_apps_extension,
+    validate_official_mcp_apps_server_settings,
 };
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
@@ -122,6 +126,7 @@ pub enum ExtensionHandlerRegistrationError {
     /// Server discovery metadata is already registered for this extension.
     DuplicateServerMetadata(ExtensionId),
     /// The official MCP Apps descriptor and server marker are already installed.
+    #[cfg(feature = "apps")]
     OfficialMcpAppsAlreadyInstalled,
     /// The protocol registry rejected official MCP Apps descriptor installation.
     Registry(ExtensionRegistryError),
@@ -165,6 +170,7 @@ impl fmt::Display for ExtensionHandlerRegistrationError {
                     "extension server metadata is already registered: {id}"
                 )
             }
+            #[cfg(feature = "apps")]
             Self::OfficialMcpAppsAlreadyInstalled => {
                 formatter.write_str("official MCP Apps extension is already installed")
             }
@@ -186,8 +192,9 @@ impl std::error::Error for ExtensionHandlerRegistrationError {
             | Self::MethodNotOwned(_)
             | Self::MethodNotClientToServer(_)
             | Self::DuplicateHandler(_)
-            | Self::DuplicateServerMetadata(_)
-            | Self::OfficialMcpAppsAlreadyInstalled => None,
+            | Self::DuplicateServerMetadata(_) => None,
+            #[cfg(feature = "apps")]
+            Self::OfficialMcpAppsAlreadyInstalled => None,
         }
     }
 }
@@ -374,6 +381,7 @@ impl ExtensionHandlerRegistry {
                 extension_id.to_string(),
             ));
         }
+        #[cfg(feature = "apps")]
         if extension_id == fastmcp_protocol::official_mcp_apps_extension_id() {
             validate_official_mcp_apps_server_settings(&settings)
                 .map_err(ExtensionHandlerRegistrationError::Registry)?;
@@ -395,6 +403,7 @@ impl ExtensionHandlerRegistry {
     /// metadata. The resolver remains caller-owned and must preserve its
     /// `ExtensionSettingsCompatibilityResolver::resolve_with_disposition`
     /// result when this registry is installed into a live server runtime.
+    #[cfg(feature = "apps")]
     pub fn install_official_mcp_apps(
         &mut self,
     ) -> Result<ExtensionId, ExtensionHandlerRegistrationError> {
