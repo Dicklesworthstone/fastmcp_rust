@@ -432,7 +432,7 @@ pub use fastmcp_server::{
 };
 pub use fastmcp_server::{
     DuplicateBehavior, LifespanHooks, LoggingConfig, ServerLaunchPolicyError, ShutdownHook,
-    StartupHook,
+    StartupHook, ServerExtensionConfigurationError,
 };
 pub use fastmcp_server::{
     ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
@@ -472,7 +472,8 @@ pub use fastmcp_client::{
     McpAppsHostError, McpAppsHostPolicy, McpAppsInMemoryHostTransport,
     McpAppsInMemoryViewTransport, OpaquePagination, PaginationBounds, PendingRequestRecord,
     ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
-    RequestTimeoutSource, SubscriptionFilter, SubscriptionListenCollector, mcp_apps_in_memory_pair,
+    RequestTimeoutSource, ReverseRequestCancellation, SubscriptionFilter,
+    SubscriptionListenCollector, mcp_apps_in_memory_pair,
 };
 
 // Public client HTTP execution and configuration surfaces.
@@ -796,8 +797,8 @@ pub mod modern {
         FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
         FinalTaskWorkDescriptor, FinalToolOutcome, InMemoryFinalTaskStore, LifespanHooks,
         LoggingConfig, Middleware, MiddlewareDecision, MountResult, ProgressNotificationSender,
-        PromptHandler, ResourceHandler, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
-        ToolHandler, create_context_with_progress,
+        PromptHandler, ResourceHandler, ServerExtensionConfigurationError, ShutdownHook,
+        StartupHook, TagFilters, ToolErrorKind, ToolHandler, create_context_with_progress,
     };
     pub use fastmcp_transport::{
         ModernHttpRequestAdmission, SendPermit, StreamableHttpRequestResponseStream,
@@ -1296,8 +1297,33 @@ pub mod modern {
         }
 
         /// Installs the official MCP Apps discovery marker.
-        pub fn mcp_apps(self) -> Result<Self, fastmcp_server::ServerExtensionConfigurationError> {
+        pub fn mcp_apps(self) -> Result<Self, ServerExtensionConfigurationError> {
             self.inner.mcp_apps().map(|inner| Self { inner })
+        }
+
+        /// Installs final-only extension handlers and discovery settings.
+        pub fn extension_registry<R>(
+            self,
+            handlers: ExtensionHandlerRegistry,
+            server_discovery: ServerExtensionDiscovery,
+            resolver: R,
+        ) -> Result<Self, ServerExtensionConfigurationError>
+        where
+            R: ExtensionSettingsCompatibilityResolver + Send + 'static,
+        {
+            self.inner
+                .extension_registry(handlers, server_discovery, resolver)
+                .map(|inner| Self { inner })
+        }
+
+        /// Installs the official final Tasks extension around application-owned state.
+        pub fn final_tasks(
+            self,
+            task_runtime: FinalTaskRuntime,
+        ) -> Result<Self, ServerExtensionConfigurationError> {
+            self.inner
+                .final_tasks(task_runtime)
+                .map(|inner| Self { inner })
         }
 
         /// Registers one tool handler.
@@ -1334,6 +1360,14 @@ pub mod modern {
         pub fn prompt<H: PromptHandler + 'static>(self, handler: H) -> Self {
             Self {
                 inner: self.inner.prompt(handler),
+            }
+        }
+
+        /// Registers the server-wide final `completion/complete` handler.
+        #[must_use]
+        pub fn completion_handler<H: CompletionHandler + 'static>(self, handler: H) -> Self {
+            Self {
+                inner: self.inner.completion_handler(handler),
             }
         }
 
@@ -1434,6 +1468,7 @@ pub mod legacy_2024 {
         ListRootsResult as LegacyListRootsResult, Request, RequestExecution, RequestExecutor,
         RequestTimeoutPolicy, RequestTimeoutSource,
         ReverseRequestHandlers as LegacyReverseRequestHandlers,
+        ReverseRequestCancellation,
         RootsRequestHandler as LegacyRootsRequestHandler,
         SamplingRequestHandler as LegacySamplingRequestHandler,
     };
@@ -1743,8 +1778,9 @@ pub mod prelude {
         ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender,
         FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup, FinalCacheMiss,
         FinalCacheResultSet, FinalCacheStats, FinalCacheTtlDiagnostic, FinalResultCache,
-        FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskRetentionAuthority,
-        FinalTaskSnapshot, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
+        FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
+        FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
+        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
         FinalTaskWorkDescriptor, InMemoryFinalTaskStore, JsonRpcAdmissionError, JsonRpcMessage,
         MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES, MAX_RESOURCE_READ_DEPTH,
         MAX_TOOL_CALL_DEPTH, McpContextLeaseGuard, McpRequestCancellation, NoOpElicitationSender,

@@ -64,6 +64,35 @@ fn assert_completion_handler_reachability() {
     accepts_modern_completion_handler::<DownstreamCompletionHandler>();
 }
 
+fn assert_modern_server_builder_forwarders() {
+    let _: fn(
+        modern::ServerBuilder,
+        modern::ExtensionHandlerRegistry,
+        modern::ServerExtensionDiscovery,
+        modern::OfficialTasksNegotiationResolver,
+    ) -> Result<modern::ServerBuilder, modern::ServerExtensionConfigurationError> =
+        modern::ServerBuilder::extension_registry::<modern::OfficialTasksNegotiationResolver>;
+    let _: fn(
+        modern::ServerBuilder,
+        modern::FinalTaskRuntime,
+    ) -> Result<modern::ServerBuilder, modern::ServerExtensionConfigurationError> =
+        modern::ServerBuilder::final_tasks;
+    let _: fn(modern::ServerBuilder, DownstreamCompletionHandler) -> modern::ServerBuilder =
+        modern::ServerBuilder::completion_handler::<DownstreamCompletionHandler>;
+}
+
+fn legacy_sampling_callback(
+    _cancellation: legacy_2024::ReverseRequestCancellation,
+    _params: legacy_2024::CreateMessageParams,
+) -> fastmcp_rust::McpResult<legacy_2024::CreateMessageResult> {
+    unreachable!("compile-only legacy callback signature")
+}
+
+fn assert_legacy_reverse_callback_cancellation_export() {
+    let _: legacy_2024::LegacySamplingRequestHandler = Box::new(legacy_sampling_callback);
+    let _: Option<fastmcp_rust::ReverseRequestCancellation> = None;
+}
+
 mod prelude_completion_handler_reachability {
     use fastmcp_rust::prelude::*;
 
@@ -272,8 +301,12 @@ fn assert_modern_companion_facade_exports() {
         fastmcp_rust::FinalArguments::Value("root".to_owned());
     let _: Option<fastmcp_rust::FinalTaskAcceptedInput> = None;
     let _: Option<fastmcp_rust::FinalTaskInitialWork> = None;
+    let _: Option<fastmcp_rust::FinalTaskNotificationEmitter> = None;
     let _: Option<std::sync::Arc<dyn fastmcp_rust::FinalTaskRetentionAuthority>> = None;
+    let _: Option<fastmcp_rust::FinalTaskRuntime> = None;
+    let _: Option<fastmcp_rust::FinalTaskRuntimeConfig> = None;
     let _: Option<fastmcp_rust::FinalTaskSnapshot> = None;
+    let _: Option<std::sync::Arc<dyn fastmcp_rust::FinalTaskStore>> = None;
     let _: Option<fastmcp_rust::FinalTaskSupervisorFuture<'static>> = None;
     let _: Option<fastmcp_rust::FinalTaskSupervisorHandoff> = None;
     let _: Option<fastmcp_rust::FinalTaskWorkDescriptor> = None;
@@ -309,8 +342,12 @@ mod prelude_companion_facade_reachability {
         let _: Option<FinalCacheStats> = None;
         let _: Option<FinalTaskAcceptedInput> = None;
         let _: Option<FinalTaskInitialWork> = None;
+        let _: Option<FinalTaskNotificationEmitter> = None;
         let _: Option<std::sync::Arc<dyn FinalTaskRetentionAuthority>> = None;
+        let _: Option<FinalTaskRuntime> = None;
+        let _: Option<FinalTaskRuntimeConfig> = None;
         let _: Option<FinalTaskSnapshot> = None;
+        let _: Option<std::sync::Arc<dyn FinalTaskStore>> = None;
         let _: Option<FinalTaskSupervisorFuture<'static>> = None;
         let _: Option<FinalTaskSupervisorHandoff> = None;
         let _: Option<FinalTaskWorkDescriptor> = None;
@@ -654,6 +691,8 @@ fn main() {
     assert_task_opt_in_macro_surface();
     let _ = assert_legacy_sse_method_signatures;
     assert_completion_handler_reachability();
+    assert_modern_server_builder_forwarders();
+    assert_legacy_reverse_callback_cancellation_export();
     prelude_completion_handler_reachability::assert_reachable();
     assert_client_completion_input_exports();
     prelude_client_completion_input_reachability::assert_reachable();
