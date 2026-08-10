@@ -12,7 +12,7 @@ use fastmcp_protocol::extensions::{
     ExtensionSettingsCompatibilityResolver, official_mcp_apps_extension_id,
     validate_official_mcp_apps_server_settings,
 };
-use fastmcp_protocol::protocol_policy::ProtocolPolicy;
+use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
 use fastmcp_protocol::{
     LoggingCapability, PromptsCapability, ResourceTemplate, ResourcesCapability,
     ServerCapabilities, ServerExtensionDiscovery, ServerInfo, ToolsCapability,
@@ -23,11 +23,13 @@ use crate::handler::{
     CompletionHandler, FinalProxyPromptHandler, FinalProxyResourceHandler,
     FinalProxyResourceTemplateHandler,
 };
+use crate::providers::McpAppsUiResource;
 #[cfg(test)]
 use crate::proxy::ProxyFinalCatalog;
 use crate::proxy::{
-    ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog, ProxyResourceHandler,
-    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler, ProxyTypedCatalog,
+    ProxyFinalTaskRelay, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
+    ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler,
+    ProxyTypedCatalog,
 };
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
@@ -135,6 +137,9 @@ pub struct ServerBuilder {
     extension_runtime: Option<ServerExtensionRuntime>,
     /// Application-owned state for the configured final Tasks extension.
     final_task_runtime: Option<FinalTaskRuntime>,
+    /// One route-bound upstream final Tasks relay. The official Task methods
+    /// cannot disambiguate two independent upstream task-ID namespaces.
+    final_task_relay: Option<Arc<ProxyFinalTaskRelay>>,
 }
 
 impl ServerBuilder {
@@ -196,6 +201,7 @@ impl ServerBuilder {
             http_config: HttpServerConfig::default(),
             extension_runtime: None,
             final_task_runtime: None,
+            final_task_relay: None,
         }
     }
 
@@ -431,6 +437,8 @@ impl ServerBuilder {
             ServerExtensionRuntime::new(handlers, server_discovery, resolver)?;
         if let Some(task_runtime) = self.final_task_runtime.as_ref() {
             extension_runtime.install_final_tasks(task_runtime)?;
+        } else if let Some(task_relay) = self.final_task_relay.as_ref() {
+            extension_runtime.install_proxy_final_tasks(Arc::clone(task_relay))?;
         }
         self.extension_runtime = Some(extension_runtime);
         Ok(self)
@@ -450,9 +458,35 @@ impl ServerBuilder {
             let mut extension_runtime = ServerExtensionRuntime::with_official_mcp_apps()?;
             if let Some(task_runtime) = self.final_task_runtime.as_ref() {
                 extension_runtime.install_final_tasks(task_runtime)?;
+            } else if let Some(task_relay) = self.final_task_relay.as_ref() {
+                extension_runtime.install_proxy_final_tasks(Arc::clone(task_relay))?;
             }
             self.extension_runtime = Some(extension_runtime);
         }
+        Ok(self)
+    }
+
+    /// Registers one final-only `ui://` HTML document for a negotiated MCP Apps View.
+    ///
+    /// This resource is deliberately absent from exact MCP 2024-11-05
+    /// discovery and reads. Call [`Self::mcp_apps`] first so the server also
+    /// advertises the matching modern bilateral extension capability.
+    pub fn mcp_apps_ui_resource(mut self, resource: McpAppsUiResource) -> McpResult<Self> {
+        let apps_id = official_mcp_apps_extension_id();
+        let configured = self
+            .extension_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.server_discovery.extensions.contains_key(&apps_id));
+        if !configured {
+            return Err(fastmcp_core::McpError::invalid_request(
+                "MCP Apps UI resources require ServerBuilder::mcp_apps first",
+            ));
+        }
+        self.router
+            .add_final_resource_with_behavior(resource, self.on_duplicate)?;
+        self.capabilities
+            .resources
+            .get_or_insert_with(ResourcesCapability::default);
         Ok(self)
     }
 
@@ -468,7 +502,7 @@ impl ServerBuilder {
         mut self,
         task_runtime: FinalTaskRuntime,
     ) -> Result<Self, ServerExtensionConfigurationError> {
-        if self.final_task_runtime.is_some() {
+        if self.final_task_runtime.is_some() || self.final_task_relay.is_some() {
             return Err(ServerExtensionConfigurationError::FinalTasksAlreadyInstalled);
         }
         if let Some(extension_runtime) = self.extension_runtime.as_mut() {
@@ -728,6 +762,38 @@ impl ServerBuilder {
     #[must_use]
     pub fn legacy_completion_handler<H: CompletionHandler + 'static>(mut self, handler: H) -> Self {
         self.router.add_legacy_completion_handler(handler);
+        self
+    }
+
+    /// Registers a final completion provider for one exact prompt name.
+    ///
+    /// Final `completion/complete` dispatch validates the referenced prompt
+    /// and argument before selecting this provider. Exact MCP 2024-11-05
+    /// completion remains on [`Self::completion_handler`] or
+    /// [`Self::legacy_completion_handler`].
+    #[must_use]
+    pub fn prompt_completion_handler<H: CompletionHandler + 'static>(
+        mut self,
+        prompt_name: impl Into<String>,
+        handler: H,
+    ) -> Self {
+        self.router
+            .add_prompt_completion_handler(prompt_name, handler);
+        self
+    }
+
+    /// Registers a final completion provider for one exact resource-template URI.
+    ///
+    /// Final dispatch admits the registered resource template and requested
+    /// template variable before selecting this provider.
+    #[must_use]
+    pub fn resource_template_completion_handler<H: CompletionHandler + 'static>(
+        mut self,
+        uri_template: impl Into<String>,
+        handler: H,
+    ) -> Self {
+        self.router
+            .add_resource_template_completion_handler(uri_template, handler);
         self
     }
 
@@ -1081,7 +1147,32 @@ impl ServerBuilder {
         // `catalog_typed` calls this too, but keep the shape gate at this
         // ownership boundary so an internal caller cannot accidentally compose
         // mixed vectors into a downstream router.
-        catalog.era()?;
+        let catalog_era = catalog.era()?;
+        if let Some(binding) = proxy_client.upstream_binding()
+            && binding.era() != catalog_era
+        {
+            return Err(fastmcp_core::McpError::invalid_request(
+                "proxy typed catalog era contradicts its immutable upstream route",
+            ));
+        }
+        let task_relay = if catalog_era == ProtocolEra::Modern2026 {
+            proxy_client.final_tasks_relay()?
+        } else {
+            None
+        };
+        if let Some(task_relay) = task_relay.as_ref() {
+            if self.final_task_runtime.is_some() || self.final_task_relay.is_some() {
+                return Err(fastmcp_core::McpError::invalid_request(
+                    "a server may install only one local or route-bound final Tasks service",
+                ));
+            }
+            if let Some(extension_runtime) = self.extension_runtime.as_mut() {
+                extension_runtime.install_proxy_final_tasks(Arc::clone(task_relay))?;
+            }
+            self.router
+                .set_final_task_relay(Some(Arc::clone(task_relay)));
+            self.final_task_relay = Some(Arc::clone(task_relay));
+        }
         match (
             catalog.tools,
             catalog.resources,
@@ -1140,10 +1231,16 @@ impl ServerBuilder {
                 ProxyPromptCatalog::Final(prompts),
             ) => {
                 for tool in tools {
-                    self.router.add_final_tool_with_behavior(
-                        ProxyToolHandler::from_final(tool, proxy_client.clone())?,
-                        self.on_duplicate,
-                    )?;
+                    let handler = match task_relay.as_ref() {
+                        Some(task_relay) => ProxyToolHandler::from_final_with_task_relay(
+                            tool,
+                            proxy_client.clone(),
+                            Arc::clone(task_relay),
+                        )?,
+                        None => ProxyToolHandler::from_final(tool, proxy_client.clone())?,
+                    };
+                    self.router
+                        .add_final_tool_with_behavior(handler, self.on_duplicate)?;
                 }
                 for resource in resources {
                     self.router.add_final_resource_with_behavior(
@@ -1625,6 +1722,7 @@ impl ServerBuilder {
         );
         let final_subscriptions = Arc::new(FinalSubscriptionRegistry::default());
         let final_task_runtime = self.final_task_runtime.clone();
+        let final_task_relay = self.final_task_relay.clone();
         if let Some(task_runtime) = final_task_runtime.as_ref() {
             let subscriptions = Arc::clone(&final_subscriptions);
             task_runtime.add_notification_emitter(Arc::new(move |notification| {
@@ -1638,6 +1736,7 @@ impl ServerBuilder {
         }
         self.router
             .set_final_task_runtime(final_task_runtime.clone());
+        self.router.set_final_task_relay(final_task_relay.clone());
         let extension_runtime = match self.extension_runtime {
             Some(mut runtime) => {
                 runtime
@@ -1645,14 +1744,29 @@ impl ServerBuilder {
                     .expect("validated server extension descriptors must freeze");
                 Some(Arc::new(runtime))
             }
-            None => final_task_runtime.map(|task_runtime| {
-                let mut runtime = ServerExtensionRuntime::with_final_tasks(&task_runtime)
-                    .expect("final Tasks must install into an empty extension registry");
-                runtime
-                    .freeze()
-                    .expect("final Tasks extension descriptors must freeze");
-                Arc::new(runtime)
-            }),
+            None => match (final_task_runtime.as_ref(), final_task_relay.as_ref()) {
+                (Some(task_runtime), None) => {
+                    let mut runtime = ServerExtensionRuntime::with_final_tasks(task_runtime)
+                        .expect("final Tasks must install into an empty extension registry");
+                    runtime
+                        .freeze()
+                        .expect("final Tasks extension descriptors must freeze");
+                    Some(Arc::new(runtime))
+                }
+                (None, Some(task_relay)) => {
+                    let mut runtime =
+                        ServerExtensionRuntime::with_proxy_final_tasks(Arc::clone(task_relay))
+                            .expect(
+                                "proxy final Tasks must install into an empty extension registry",
+                            );
+                    runtime
+                        .freeze()
+                        .expect("proxy final Tasks extension descriptors must freeze");
+                    Some(Arc::new(runtime))
+                }
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!("builder rejects mixed final Tasks owners"),
+            },
         };
 
         Server {
@@ -1683,6 +1797,7 @@ impl ServerBuilder {
             http_config: self.http_config,
             extension_runtime,
             final_task_runtime: self.final_task_runtime,
+            final_task_relay,
             final_subscriptions,
         }
     }
@@ -1722,6 +1837,7 @@ impl ServerBuilder {
             // a reserved launch-policy failure.
             extension_runtime: None,
             final_task_runtime: None,
+            final_task_relay: None,
             final_subscriptions: Arc::new(FinalSubscriptionRegistry::default()),
         }
     }
@@ -1749,9 +1865,9 @@ mod tests {
     use fastmcp_protocol::extensions::ExtensionNegotiationError;
     use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy, StdioOpeningFrame};
     use fastmcp_protocol::{
-        CallToolResult, CompleteResult, Content, CoreResult, FinalCallToolResult,
-        FinalCoreResult, JsonRpcRequest, LegacyContent, LegacyCoreResult, Prompt, Resource,
-        ResourceContent, ResultMeta, Tool,
+        CallToolResult, CompleteResult, Content, CoreResult, FinalCallToolResult, FinalCoreResult,
+        JsonRpcRequest, LegacyContent, LegacyCoreResult, Prompt, Resource, ResourceContent,
+        ResultMeta, Tool,
     };
 
     // ── Stub handlers ────────────────────────────────────────────────
@@ -2172,6 +2288,37 @@ mod tests {
         let wire = serde_json::to_value(discovery).expect("discovery serializes");
 
         assert_eq!(wire["capabilities"]["completions"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn builder_provider_specific_completion_requires_an_admitted_final_target() {
+        let unmatched = ServerBuilder::new("srv", "1.0")
+            .prompt_completion_handler("duplicate_prompt", TestCompletion)
+            .build();
+        let unmatched_discovery = unmatched
+            .server_discovery()
+            .expect("the unmatched provider-only server still discovers");
+        let unmatched_wire =
+            serde_json::to_value(unmatched_discovery).expect("discovery serializes");
+        assert!(
+            unmatched_wire["capabilities"].get("completions").is_none(),
+            "an unbound provider-only registration must not advertise completion"
+        );
+
+        let matched = ServerBuilder::new("srv", "1.0")
+            .prompt(MarkedPrompt("provider-target"))
+            .prompt_completion_handler("duplicate_prompt", TestCompletion)
+            .build();
+        let matched_discovery = matched
+            .server_discovery()
+            .expect("an admitted final prompt activates its provider route");
+        let matched_wire = serde_json::to_value(matched_discovery).expect("discovery serializes");
+
+        assert_eq!(
+            matched_wire["capabilities"]["completions"],
+            serde_json::json!({}),
+            "adding only the final prompt target makes the provider discoverable"
+        );
     }
 
     #[test]
@@ -3244,8 +3391,8 @@ mod tests {
         ) -> McpResult<CoreResult> {
             self.record(name, arguments);
             match self.route {
-                DualEraProxyRoute::Legacy => Ok(CoreResult::Legacy(
-                    LegacyCoreResult::ToolsCall(CallToolResult {
+                DualEraProxyRoute::Legacy => Ok(CoreResult::Legacy(LegacyCoreResult::ToolsCall(
+                    CallToolResult {
                         content: vec![LegacyContent::Text {
                             text: "bound legacy proxy".to_owned(),
                             annotations: None,
@@ -3254,8 +3401,8 @@ mod tests {
                         is_error: false,
                         meta: None,
                         additional: std::collections::BTreeMap::new(),
-                    }),
-                )),
+                    },
+                ))),
                 DualEraProxyRoute::Final => Ok(CoreResult::Final(FinalCoreResult::ToolsCall {
                     result: CompleteResult::new(
                         FinalCallToolResult {
@@ -3298,7 +3445,14 @@ mod tests {
         };
         let mut bindings = ProxyClient::upstream_binding_registry();
         let binding = bindings
-            .bind_stdio(route_id, upstream_identity, "dual-era-receipt", 1, policy, opening)
+            .bind_stdio(
+                route_id,
+                upstream_identity,
+                "dual-era-receipt",
+                1,
+                policy,
+                opening,
+            )
             .expect("the test route selects one immutable era");
         let upstream_protocol_version = era.version().as_str().to_owned();
         ProxyClient::from_backend_with_upstream_binding(
@@ -3309,8 +3463,7 @@ mod tests {
         .expect("the selected upstream version matches its immutable binding")
     }
 
-    fn dual_era_proxy_server(
-    ) -> (
+    fn dual_era_proxy_server() -> (
         crate::Server,
         Arc<Mutex<Vec<(String, serde_json::Value)>>>,
         Arc<Mutex<Vec<(String, serde_json::Value)>>>,
@@ -3517,18 +3670,17 @@ mod tests {
         let final_call = server
             .dispatch_stateless(
                 &final_call_inbound,
-                &final_tools_call_request(
-                    "weather",
-                    serde_json::json!({"city": "Boston"}),
-                    804,
-                ),
+                &final_tools_call_request("weather", serde_json::json!({"city": "Boston"}), 804),
             )
             .expect("the final tools/call request receives a response")
             .result
             .expect("the final tools/call response has a result payload");
         assert_eq!(final_call["resultType"], "complete");
         assert_eq!(final_call["content"][0]["text"], "bound final proxy");
-        assert_eq!(final_call["structuredContent"], serde_json::json!({"route": "final"}));
+        assert_eq!(
+            final_call["structuredContent"],
+            serde_json::json!({"route": "final"})
+        );
 
         assert_eq!(
             legacy_calls
