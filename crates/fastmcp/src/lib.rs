@@ -108,8 +108,21 @@ extern crate self as fastmcp_rust;
 #[doc(hidden)]
 pub mod __private {
     pub use fastmcp_core as core;
-    pub use fastmcp_server as server;
     pub use serde_json;
+
+    /// Macro-expansion server vocabulary.
+    ///
+    /// Proc macros only need handler traits and their result vocabulary. Do not
+    /// expose the lower crate wholesale here: that would provide an unpinned
+    /// `Server`/`ServerBuilder` construction route around the facade policy
+    /// surfaces.
+    pub mod server {
+        pub use fastmcp_server::bidirectional;
+        pub use fastmcp_server::{
+            BoxFuture, FinalMethodOutcome, FinalToolOutcome, PromptHandler, ResourceHandler,
+            ToolHandler,
+        };
+    }
 
     /// Macro-expansion protocol vocabulary.
     ///
@@ -119,8 +132,8 @@ pub mod __private {
         pub use fastmcp_protocol::{
             CallToolResult, CompleteResult, Content, FinalCallToolResult, FinalGetPromptResult,
             FinalReadResourceResult, Prompt, PromptArgument, PromptMessage, Resource,
-            ResourceContent, ResourceTemplate, Tool, ToolAnnotations, UriTemplate,
-            UriTemplatePart, common_types,
+            ResourceContent, ResourceTemplate, Tool, ToolAnnotations, UriTemplate, UriTemplatePart,
+            common_types,
         };
         #[cfg(feature = "apps")]
         pub use fastmcp_protocol::{
@@ -128,14 +141,14 @@ pub mod __private {
             MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeError, McpAppsBridgeImplementation,
             McpAppsBridgeRequestId, McpAppsCancelledNotification, McpAppsDisplayModeParams,
             McpAppsDownloadContent, McpAppsDownloadFileParams, McpAppsHostCapabilities,
-            McpAppsHostContext, McpAppsHostNotification, McpAppsHostRequest,
-            McpAppsHostResponse, McpAppsHostToView, McpAppsInitializeParams,
-            McpAppsInitializeResult, McpAppsListParams, McpAppsLogMessageNotification,
-            McpAppsMessageParams, McpAppsMessageRole, McpAppsOpenLinkParams,
-            McpAppsOperationResult, McpAppsPingParams, McpAppsProgressNotification,
-            McpAppsResourceReadParams, McpAppsResourceTeardownParams, McpAppsSandboxSignal,
-            McpAppsToolCallParams, McpAppsUpdateModelContextParams, McpAppsViewCapabilities,
-            McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse, McpAppsViewToHost,
+            McpAppsHostContext, McpAppsHostNotification, McpAppsHostRequest, McpAppsHostResponse,
+            McpAppsHostToView, McpAppsInitializeParams, McpAppsInitializeResult, McpAppsListParams,
+            McpAppsLogMessageNotification, McpAppsMessageParams, McpAppsMessageRole,
+            McpAppsOpenLinkParams, McpAppsOperationResult, McpAppsPingParams,
+            McpAppsProgressNotification, McpAppsResourceReadParams, McpAppsResourceTeardownParams,
+            McpAppsSandboxSignal, McpAppsToolCallParams, McpAppsUpdateModelContextParams,
+            McpAppsViewCapabilities, McpAppsViewNotification, McpAppsViewRequest,
+            McpAppsViewResponse, McpAppsViewToHost,
         };
     }
 }
@@ -238,6 +251,9 @@ pub mod protocol {
 /// [`modern::server_builder`] or [`legacy_2024::server_builder`] instead, so
 /// the protocol policy is fixed before application configuration begins.
 pub mod server {
+    pub use fastmcp_server::bidirectional;
+    #[cfg(feature = "legacy-2024-11-05")]
+    pub use fastmcp_server::legacy_2024;
     pub use fastmcp_server::{
         AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
         BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, DuplicateBehavior,
@@ -247,25 +263,14 @@ pub mod server {
         FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown,
         HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, LifespanHooks,
         LoggingConfig, Middleware, MiddlewareDecision, MountResult, NotificationSender,
-        PendingRequests, ProgressNotificationSender, PromptHandler, RequestSender,
-        ResourceHandler, Router, ServerExtensionConfigurationError, ServerHttpEndpoint,
-        ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
-        ServerHttpSseResponse, ServerLaunchPolicyError, ServerStats, Session,
-        StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
-        ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
-        TransportRootsProvider, TransportSamplingSender, caching, create_context_with_progress,
-        create_context_with_progress_and_senders, oauth, oidc, providers, rate_limiting,
-        transform,
-    };
-    pub use fastmcp_server::bidirectional;
-    #[cfg(feature = "legacy-2024-11-05")]
-    pub use fastmcp_server::legacy_2024;
-    #[cfg(feature = "proxy")]
-    pub use fastmcp_server::{
-        FinalProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint, ProxyClient,
-        ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
-        ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding,
-        ProxyUpstreamBindingRegistry,
+        PendingRequests, ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler,
+        Router, ServerExtensionConfigurationError, ServerHttpEndpoint, ServerHttpEndpointResponse,
+        ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse,
+        ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier, StatsSnapshot,
+        TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
+        TransportElicitationSender, TransportRootsProvider, TransportSamplingSender, caching,
+        create_context_with_progress, create_context_with_progress_and_senders, oauth, oidc,
+        providers, rate_limiting, transform,
     };
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
@@ -274,6 +279,13 @@ pub mod server {
         FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
         FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
         FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+    };
+    #[cfg(feature = "proxy")]
+    pub use fastmcp_server::{
+        FinalProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint, ProxyClient,
+        ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
+        ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding,
+        ProxyUpstreamBindingRegistry,
     };
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub use fastmcp_server::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
@@ -381,7 +393,8 @@ pub use fastmcp_protocol::{
     UriTemplateExpansionLimits, UriTemplateExpression, UriTemplateModifier, UriTemplateOperator,
     UriTemplatePart,
 };
-pub use fastmcp_protocol::{common_types, extensions, methods, protocol_policy};
+pub use fastmcp_protocol::{common_types, methods, protocol_policy};
+pub use modern::extensions;
 // Final common wire vocabulary. `FinalAbsoluteUri` avoids colliding with the
 // established core URI type; `modern::AbsoluteUri` retains the exact name.
 pub use fastmcp_protocol::common_types::{
@@ -608,8 +621,8 @@ pub use fastmcp_server::{
     NotificationSender, PendingRequests, ProgressNotificationSender, PromptHandler, RequestSender,
     ResourceHandler, Router, ServerHttpEndpoint, ServerHttpEndpointResponse,
     ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse, ServerStats, Session,
-    StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind,
-    ToolHandler, TrafficVerbosity, TransportElicitationSender,
+    StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
+    ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
     TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
     create_context_with_progress_and_senders,
 };
@@ -1042,9 +1055,8 @@ pub mod modern {
             MAX_MCP_APPS_MIME_TYPE_BYTES, MAX_MCP_APPS_MIME_TYPES,
             MCP_APPS_ACTIVATION_PREDICATE_ID, MCP_APPS_CLIENT_SETTINGS_SCHEMA_ID,
             MCP_APPS_DOWNLOAD_FILE_METHOD, MCP_APPS_HOST_CONTEXT_CHANGED_NOTIFICATION,
-            MCP_APPS_HTML_MIME_TYPE, MCP_APPS_INITIALIZE_METHOD,
-            MCP_APPS_INITIALIZED_NOTIFICATION, MCP_APPS_MESSAGE_METHOD,
-            MCP_APPS_NEGOTIATION_RESOLVER_ID, MCP_APPS_OPEN_LINK_METHOD,
+            MCP_APPS_HTML_MIME_TYPE, MCP_APPS_INITIALIZE_METHOD, MCP_APPS_INITIALIZED_NOTIFICATION,
+            MCP_APPS_MESSAGE_METHOD, MCP_APPS_NEGOTIATION_RESOLVER_ID, MCP_APPS_OPEN_LINK_METHOD,
             MCP_APPS_REQUEST_DISPLAY_MODE_METHOD, MCP_APPS_REQUEST_TEARDOWN_NOTIFICATION,
             MCP_APPS_RESOURCE_TEARDOWN_METHOD, MCP_APPS_SANDBOX_PROXY_READY_NOTIFICATION,
             MCP_APPS_SANDBOX_RESOURCE_READY_NOTIFICATION, MCP_APPS_SERVER_SETTINGS_SCHEMA_ID,
@@ -5452,8 +5464,8 @@ mod tests {
             FinalCreateMessageParams, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams,
             FinalEmbeddedElicitationParams, FinalEmbeddedElicitationResult,
             FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult, RequestSender,
-            TransportElicitationSender, TransportRootsProvider,
-            TransportSamplingSender, legacy_2024, modern, prelude,
+            TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+            legacy_2024, modern, prelude,
         };
 
         let _: Option<FinalCreateMessageParams> = None;
@@ -5512,9 +5524,7 @@ mod tests {
     #[test]
     #[cfg(all(feature = "legacy-2024-11-05", feature = "apps"))]
     fn api_03_facade_exposes_apps_and_dual_era_configuration() {
-        use super::{
-            Client, DuplicateBehavior, LoggingConfig, McpResult, legacy_2024, modern,
-        };
+        use super::{Client, DuplicateBehavior, LoggingConfig, McpResult, legacy_2024, modern};
 
         let settings =
             modern::McpAppsClientSettings::new(vec![modern::MCP_APPS_HTML_MIME_TYPE.to_owned()])

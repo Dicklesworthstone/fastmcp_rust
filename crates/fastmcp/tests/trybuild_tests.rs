@@ -124,6 +124,19 @@ pub fn probe() {
         absent_feature_diagnostic: Some("MCP_APPS_HTML_MIME_TYPE"),
     },
     DownstreamFeatureSymbolProbe {
+        name: "apps-absent-root-extensions-namespace",
+        features: &[],
+        source: r#"
+use mcp::extensions::MCP_APPS_HTML_MIME_TYPE;
+
+pub fn probe() {
+    let _: &str = MCP_APPS_HTML_MIME_TYPE;
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("MCP_APPS_HTML_MIME_TYPE"),
+    },
+    DownstreamFeatureSymbolProbe {
         name: "apps-absent-modern-extensions-namespace",
         features: &[],
         source: r#"
@@ -194,6 +207,19 @@ pub fn probe() {
         features: &[],
         source: r#"
 use mcp::server::ServerBuilder;
+
+pub fn probe() {
+    let _ = ServerBuilder::new("escaped", "1.0.0");
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("ServerBuilder"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "server-escape-private-namespace",
+        features: &[],
+        source: r#"
+use mcp::__private::server::ServerBuilder;
 
 pub fn probe() {
     let _ = ServerBuilder::new("escaped", "1.0.0");
@@ -386,9 +412,8 @@ mcp = {{ package = "fastmcp-rust", path = "{facade_path}", default-features = fa
             status,
         );
         if let Some(expected_diagnostic) = probe.absent_feature_diagnostic {
-            let diagnostics = fs::read_to_string(&diagnostic_path).unwrap_or_else(|error| {
-                panic!("read {} diagnostic capture: {error}", probe.name)
-            });
+            let diagnostics = fs::read_to_string(&diagnostic_path)
+                .unwrap_or_else(|error| panic!("read {} diagnostic capture: {error}", probe.name));
             assert!(
                 diagnostics.contains(expected_diagnostic),
                 "{} absent-feature probe must fail because `{expected_diagnostic}` is unavailable; diagnostics:\n{diagnostics}",

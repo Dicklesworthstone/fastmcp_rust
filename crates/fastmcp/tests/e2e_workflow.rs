@@ -20,7 +20,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fastmcp_protocol::{LegacyContent, LegacyPromptMessage, LegacyResourceContent, Tool};
-use fastmcp_server::Server;
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, BoxFuture, CanonicalHttpUrl,
@@ -34,6 +33,7 @@ use fastmcp_rust::{
     ResourceTemplate, ResultMeta, ResultPeerEra, Role, SseLimits, ToolHandler, auto,
     decode_peer_result, prompt, resource, tool,
 };
+use fastmcp_server::Server;
 use serde_json::json;
 
 // ============================================================================

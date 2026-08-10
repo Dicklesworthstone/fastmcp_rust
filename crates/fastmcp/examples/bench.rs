@@ -13,8 +13,8 @@
 
 use std::time::{Duration, Instant};
 
-use fastmcp_rust::prelude::*;
 use fastmcp_rust::modern::ServerBuilder;
+use fastmcp_rust::prelude::*;
 
 // ============================================================================
 // Benchmark Utilities

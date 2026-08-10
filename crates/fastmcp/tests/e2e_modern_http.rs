@@ -1,10 +1,11 @@
 //! Public modern HTTP round trip: shipped client against shipped server.
 //!
-//! Both ends of these tests are real shipped-facade surfaces — the turnkey
-//! `Server::bind_http`/`serve` lifecycle on one side and
-//! `auto::client_builder()` connection lifecycle on the other — joined over
-//! one real localhost socket. No scripted peer, fixture transcript, mock, or
-//! direct FastMCP component-crate import stands in for either endpoint.
+//! Both ends of these tests are real shipped surfaces — the turnkey
+//! `Server::bind_http`/`serve` lifecycle on one side and facade client
+//! connection lifecycles on the other — joined over one real localhost socket.
+//! The fixture uses the lower server builder only to select the explicit
+//! Auto, ModernOnly, or LegacyOnly server policy under test; no scripted peer,
+//! fixture transcript, or mock stands in for either endpoint.
 //!
 //! What this proves (and only this): the shipped dual-era HTTP server and
 //! facade clients can complete Auto classification plus typed ModernOnly and
@@ -24,9 +25,9 @@ use fastmcp_rust::{
     CanonicalHttpUrl, ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, Content,
     Cx, HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, JsonRpcMessage,
     JsonRpcRequest, McpContext, McpError, McpResult, Middleware, MiddlewareDecision,
-    ModernHttpResponseKind, ModernHttpResponseStream, PromptHandler, PromptMessage,
-    ProtocolEra, ProtocolPolicy, ResourceHandler, Role, SseLimits, ToolHandler, auto, core,
-    legacy_2024, modern, prompt, resource, tool,
+    ModernHttpResponseKind, ModernHttpResponseStream, PromptHandler, PromptMessage, ProtocolEra,
+    ProtocolPolicy, ResourceHandler, Role, SseLimits, ToolHandler, auto, core, legacy_2024, modern,
+    prompt, resource, tool,
 };
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
@@ -95,11 +96,7 @@ impl ToolHandler for CountingPublicHttpValue {
         PublicHttpValue.definition()
     }
 
-    fn call(
-        &self,
-        context: &McpContext,
-        arguments: serde_json::Value,
-    ) -> McpResult<Vec<Content>> {
+    fn call(&self, context: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         self.counters.tool.fetch_add(1, Ordering::SeqCst);
         PublicHttpValue.call(context, arguments)
     }
@@ -160,13 +157,15 @@ const HTTP_OPERATION_BOUND: Duration = Duration::from_secs(2);
 
 /// Owns one real public HTTP server composition and proves its teardown.
 ///
-/// The fixture composes one public `Server` with deterministic public tool,
-/// resource, and prompt handlers. Its clients use only shipped facade HTTP
-/// clients and real localhost routes; no transcript or mock peer is involved.
+/// The fixture composes one policy-selected server with deterministic public
+/// tool, resource, and prompt handlers. Its clients use only shipped facade
+/// HTTP clients and real localhost routes; no transcript or mock peer is
+/// involved.
 struct HttpServerFixture {
     address: SocketAddr,
     server_cx: Cx,
     finished: mpsc::Receiver<Result<HttpServerShutdown, String>>,
+    shutdown_completion: Option<Result<HttpServerShutdown, String>>,
     join: Option<JoinHandle<()>>,
     nonquiescent: Option<HttpNonquiescentShutdown>,
     handler_calls: Arc<PublicHttpHandlerCallCounters>,
@@ -245,7 +244,9 @@ impl Drop for HttpServerStartupGuard {
         let Some(finished) = self.finished.as_ref() else {
             return;
         };
-        let settlement = await_http_server_shutdown(finished, &mut self.join);
+        let mut shutdown_completion = None;
+        let settlement =
+            await_http_server_shutdown(finished, &mut shutdown_completion, &mut self.join);
         if settlement.is_err() && self.join.is_some() {
             eprintln!(
                 "public HTTP server startup left a live unjoinable thread after bounded settlement"
@@ -367,6 +368,7 @@ impl HttpServerFixture {
             address,
             server_cx,
             finished,
+            shutdown_completion: None,
             join,
             nonquiescent: None,
             handler_calls,
@@ -398,7 +400,11 @@ impl HttpServerFixture {
             };
         }
         self.server_cx.set_cancel_requested(true);
-        match await_http_server_shutdown(&self.finished, &mut self.join)? {
+        match await_http_server_shutdown(
+            &self.finished,
+            &mut self.shutdown_completion,
+            &mut self.join,
+        )? {
             HttpServerShutdown::Quiescent => Ok(()),
             HttpServerShutdown::Nonquiescent(shutdown) => {
                 self.nonquiescent = Some(shutdown);
@@ -434,53 +440,66 @@ impl Drop for HttpServerFixture {
 /// detached.
 fn await_http_server_shutdown(
     finished: &mpsc::Receiver<Result<HttpServerShutdown, String>>,
+    completion: &mut Option<Result<HttpServerShutdown, String>>,
     join: &mut Option<JoinHandle<()>>,
 ) -> Result<HttpServerShutdown, String> {
-    let completion = finished
-        .recv_timeout(HTTP_SERVER_TEARDOWN_BOUND)
-        .map_err(|error| format!("public HTTP server teardown exceeded its bound: {error}"));
+    let completion_result = if completion.is_some() {
+        Ok(())
+    } else {
+        finished
+            .recv_timeout(HTTP_SERVER_TEARDOWN_BOUND)
+            .map(|shutdown| *completion = Some(shutdown))
+            .map_err(|error| format!("public HTTP server teardown exceeded its bound: {error}"))
+    };
     let join_result = join_finished_thread(join, HTTP_SERVER_TEARDOWN_BOUND, "HTTP server");
-    match (completion, join_result) {
-        (Ok(Ok(shutdown)), Ok(())) => Ok(shutdown),
-        (Ok(Err(completion)), Ok(())) => {
-            Err(format!("public HTTP server teardown failed: {completion}"))
-        }
+    match (completion_result, join_result) {
+        (Ok(()), Ok(())) => match completion
+            .take()
+            .expect("a completed server shutdown retains its completion report")
+        {
+            Ok(shutdown) => Ok(shutdown),
+            Err(completion) => Err(format!("public HTTP server teardown failed: {completion}")),
+        },
+        (Ok(()), Err(join)) => Err(join),
         (Err(completion), Ok(())) => Err(completion),
-        (Ok(Ok(_)), Err(join)) => Err(join),
-        (Ok(Err(completion)), Err(join)) => Err(format!(
-            "public HTTP server teardown failed: {completion}; owned thread settlement failed: {join}"
-        )),
         (Err(completion), Err(join)) => Err(format!(
             "{completion}; owned thread settlement failed: {join}"
         )),
     }
 }
 
-/// This helper is separately bounded so the planted timeout test can prove
-/// that a deadline retains ownership until a later controlled settlement.
+/// This helper is separately bounded so planted timeout tests can prove that
+/// both an unread completion and a received-but-unjoined completion retain
+/// their owner for a later controlled retry.
 fn settle_http_server_with_bound(
     shutdown: &mpsc::SyncSender<()>,
     finished: &mpsc::Receiver<Result<(), String>>,
+    completion: &mut Option<Result<(), String>>,
     join: &mut Option<JoinHandle<()>>,
     completion_bound: Duration,
 ) -> Result<(), String> {
     match shutdown.try_send(()) {
         Ok(()) | Err(mpsc::TrySendError::Full(())) | Err(mpsc::TrySendError::Disconnected(())) => {}
     }
-    let completion = finished
-        .recv_timeout(completion_bound)
-        .map_err(|error| format!("public HTTP server teardown exceeded its bound: {error}"));
+    let completion_result = if completion.is_some() {
+        Ok(())
+    } else {
+        finished
+            .recv_timeout(completion_bound)
+            .map(|reported_completion| *completion = Some(reported_completion))
+            .map_err(|error| format!("public HTTP server teardown exceeded its bound: {error}"))
+    };
     let join_result = join_finished_thread(join, completion_bound, "HTTP server");
-    match (completion, join_result) {
-        (Ok(Ok(())), Ok(())) => Ok(()),
-        (Ok(Err(completion)), Ok(())) => {
-            Err(format!("public HTTP server teardown failed: {completion}"))
-        }
+    match (completion_result, join_result) {
+        (Ok(()), Ok(())) => match completion
+            .take()
+            .expect("a completed server shutdown retains its completion report")
+        {
+            Ok(()) => Ok(()),
+            Err(completion) => Err(format!("public HTTP server teardown failed: {completion}")),
+        },
+        (Ok(()), Err(join)) => Err(join),
         (Err(completion), Ok(())) => Err(completion),
-        (Ok(Ok(())), Err(join)) => Err(join),
-        (Ok(Err(completion)), Err(join)) => Err(format!(
-            "public HTTP server teardown failed: {completion}; owned thread settlement failed: {join}"
-        )),
         (Err(completion), Err(join)) => Err(format!(
             "{completion}; owned thread settlement failed: {join}"
         )),
@@ -523,6 +542,7 @@ fn e2e_http_fixture_planted_teardown_timeout_retains_owner_for_controlled_retry(
     let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
     let joined = Arc::new(AtomicBool::new(false));
     let joined_by_server = Arc::clone(&joined);
+    let mut completion = None;
     let mut server = Some(thread::spawn(move || {
         shutdown_rx
             .recv()
@@ -534,8 +554,13 @@ fn e2e_http_fixture_planted_teardown_timeout_retains_owner_for_controlled_retry(
         let _ = finished_tx.send(Ok(()));
     }));
 
-    let settlement =
-        settle_http_server_with_bound(&shutdown_tx, &finished_rx, &mut server, Duration::ZERO);
+    let settlement = settle_http_server_with_bound(
+        &shutdown_tx,
+        &finished_rx,
+        &mut completion,
+        &mut server,
+        Duration::ZERO,
+    );
 
     assert!(
         !joined.load(Ordering::SeqCst),
@@ -552,12 +577,89 @@ fn e2e_http_fixture_planted_teardown_timeout_retains_owner_for_controlled_retry(
     settle_http_server_with_bound(
         &shutdown_tx,
         &finished_rx,
+        &mut completion,
         &mut server,
         HTTP_SERVER_TEARDOWN_BOUND,
     )
     .expect("the released server settles without detaching its owner");
     assert!(joined.load(Ordering::SeqCst));
     assert!(server.is_none(), "settlement joins the retained owner");
+}
+
+#[test]
+fn e2e_http_fixture_post_completion_join_timeout_retains_completion_for_retry() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (completion_reported_tx, completion_reported_rx) = mpsc::sync_channel::<()>(1);
+    let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+    let joined = Arc::new(AtomicBool::new(false));
+    let joined_by_server = Arc::clone(&joined);
+    let mut completion = None;
+    let mut server = Some(thread::spawn(move || {
+        shutdown_rx
+            .recv()
+            .expect("the controlled test sends one shutdown signal");
+        finished_tx
+            .send(Ok(()))
+            .expect("the completion receiver remains available before the join timeout");
+        completion_reported_tx
+            .send(())
+            .expect("the test observes the queued completion before settlement");
+        release_rx
+            .recv()
+            .expect("the test releases the server after its bounded join timeout");
+        joined_by_server.store(true, Ordering::SeqCst);
+    }));
+
+    shutdown_tx
+        .send(())
+        .expect("the test initiates shutdown before waiting for the completion report");
+    completion_reported_rx
+        .recv_timeout(HTTP_SERVER_TEARDOWN_BOUND)
+        .expect("the planted server reports completion within the bound");
+
+    let settlement = settle_http_server_with_bound(
+        &shutdown_tx,
+        &finished_rx,
+        &mut completion,
+        &mut server,
+        Duration::ZERO,
+    );
+
+    assert!(matches!(settlement, Err(error) if error.contains("reported completion")));
+    assert!(
+        matches!(completion.as_ref(), Some(Ok(()))),
+        "a failed bounded join retains the already-received completion for retry"
+    );
+    assert!(
+        server.is_some(),
+        "a post-completion join timeout retains the owned thread for controlled retry"
+    );
+    assert!(
+        !joined.load(Ordering::SeqCst),
+        "a received completion must not permit an unbounded join"
+    );
+
+    release_tx
+        .send(())
+        .expect("the retained server remains controllable after the join timeout");
+    settle_http_server_with_bound(
+        &shutdown_tx,
+        &finished_rx,
+        &mut completion,
+        &mut server,
+        HTTP_SERVER_TEARDOWN_BOUND,
+    )
+    .expect("retry consumes the retained completion only after joining the released owner");
+    assert!(joined.load(Ordering::SeqCst));
+    assert!(
+        completion.is_none(),
+        "successful settlement consumes the retained completion"
+    );
+    assert!(server.is_none(), "retry joins the retained owner");
 }
 
 #[test]
@@ -569,6 +671,7 @@ fn e2e_http_fixture_reported_teardown_failure_still_joins_owner() {
     let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let joined = Arc::new(AtomicBool::new(false));
     let joined_by_server = Arc::clone(&joined);
+    let mut completion = None;
     let mut server = Some(thread::spawn(move || {
         shutdown_rx
             .recv()
@@ -580,6 +683,7 @@ fn e2e_http_fixture_reported_teardown_failure_still_joins_owner() {
     let settlement = settle_http_server_with_bound(
         &shutdown_tx,
         &finished_rx,
+        &mut completion,
         &mut server,
         HTTP_SERVER_TEARDOWN_BOUND,
     );

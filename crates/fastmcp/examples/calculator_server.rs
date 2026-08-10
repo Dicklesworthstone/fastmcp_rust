@@ -23,8 +23,8 @@
     clippy::cast_possible_truncation
 )]
 
-use fastmcp_rust::prelude::*;
 use fastmcp_rust::modern::ServerBuilder;
+use fastmcp_rust::prelude::*;
 
 // ============================================================================
 // Basic Arithmetic Tools
