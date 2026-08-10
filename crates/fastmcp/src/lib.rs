@@ -417,7 +417,7 @@ pub use fastmcp_transport::{event_store, http, memory, websocket};
 pub use fastmcp_server::{
     AllowAllAuthProvider, ApplicationTaskSupervisor, AuthProvider, AuthRequest,
     AuthorizedTaskServiceRunner, BannerStyle, BidirectionalSenders, BoundHttpServer, BoxFuture,
-    CompletionHandler, ConsoleConfig, DEFAULT_IN_MEMORY_FINAL_TASKS,
+    CompletionHandler, ConsoleConfig, DEFAULT_IN_MEMORY_FINAL_TASKS, FinalProgressCallback,
     FinalResourceReadCacheHintProvenance, FinalTaskAcceptedInput, FinalTaskInitialWork,
     FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
@@ -425,14 +425,21 @@ pub use fastmcp_server::{
     FinalToolSchemaAuthority, HttpServerConfig, InMemoryFinalTaskStore, InboundRequestContext,
     InboundRequestTransport, Middleware, MiddlewareDecision, MountResult, NotificationSender,
     PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog,
-    ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog,
-    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, RequestSender,
+    ProxyCatalogCacheHint, ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog,
+    ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
+    ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry, RequestSender,
     ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint, ServerHttpEndpointResponse,
     ServerHttpSession, ServerStats, Session, StaticTokenVerifier, StatsSnapshot, TagFilters,
     TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
     TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
     create_context_with_progress, create_context_with_progress_and_senders,
 };
+
+/// Proxy-backend legacy progress callback.
+///
+/// This intentionally differs from the client [`ProgressCallback`]: proxy
+/// backends preserve an owned optional message from their legacy handler API.
+pub type ProxyProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<String>);
 pub use fastmcp_server::{
     DuplicateBehavior, LifespanHooks, LoggingConfig, ServerExtensionConfigurationError,
     ServerLaunchPolicyError, ShutdownHook, StartupHook,
@@ -2087,6 +2094,7 @@ pub mod prelude {
         FinalGetPromptResult,
         FinalLogMessageParams,
         FinalNotificationError,
+        FinalProgressCallback,
         FinalProgressNotificationParams,
         FinalProtocolVersion,
         FinalReadResourceResult,
@@ -2182,13 +2190,18 @@ pub mod prelude {
         ProtocolVersion,
         ProxyBackend,
         ProxyCatalog,
+        ProxyCatalogCacheHint,
         ProxyClient,
         ProxyFinalCatalog,
+        ProxyProgressCallback,
         ProxyPromptCatalog,
         ProxyResourceCatalog,
         ProxyResourceTemplateCatalog,
         ProxyToolCatalog,
         ProxyTypedCatalog,
+        ProxyUpstreamAdapter,
+        ProxyUpstreamBinding,
+        ProxyUpstreamBindingRegistry,
         RequestAdmissionError,
         RequestId,
         RequestTimeoutPolicy,
