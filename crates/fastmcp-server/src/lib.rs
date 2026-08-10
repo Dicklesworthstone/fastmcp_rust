@@ -22696,6 +22696,9 @@ mod lib_unit_tests {
                     "single-request HTTP response did not declare connection closure: {response}"
                 ));
             }
+            if live_http_response_header(response.as_bytes(), "mcp-session-id").is_ok() {
+                return Err("modern discovery response issued MCP-Session-Id".to_owned());
+            }
             let response: JsonRpcResponse = serde_json::from_slice(live_http_response_body(
                 response.as_bytes(),
             )?)
@@ -22871,22 +22874,17 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_mrtr_shutdown_invalidates_state_without_reentering_handler() {
+    fn live_http_modern_discovery_does_not_retain_a_session_after_shutdown() {
         run_live_http_test(|cx| async move {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let bound = Server::new("live-http-mrtr-shutdown", "1.0.0")
+            let bound = Server::new("live-http-stateless-discovery", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
-                .tool(LiveHttpMrtrTool {
-                    calls: Arc::clone(&calls),
-                })
                 .build()
                 .bind_http(&cx, "127.0.0.1:0")
                 .await
-                .map_err(|error| format!("live HTTP MRTR shutdown bind failed: {error}"))?;
+                .map_err(|error| format!("live HTTP stateless discovery bind failed: {error}"))?;
             let address = bound
                 .local_addr()
-                .map_err(|error| format!("live HTTP MRTR shutdown address failed: {error}"))?;
-            let endpoint = Arc::clone(&bound.endpoint);
+                .map_err(|error| format!("live HTTP stateless discovery address failed: {error}"))?;
             let modern_sessions = Arc::clone(&bound.modern_sessions);
             let caller_cx = cx.clone();
             let mut client = cx
@@ -22902,7 +22900,7 @@ mod lib_unit_tests {
                         931_i64,
                     );
                     let discovery_body = serde_json::to_vec(&discovery).map_err(|error| {
-                        format!("MRTR shutdown discovery did not serialize: {error}")
+                        format!("stateless discovery did not serialize: {error}")
                     })?;
                     let discovery = live_http_exchange(
                         address,
@@ -22917,65 +22915,29 @@ mod lib_unit_tests {
                         ),
                     )
                     .await?;
-                    let session_id = live_http_response_header(&discovery, "mcp-session-id")?;
-                    let initial = JsonRpcRequest::new(
-                        "tools/call",
-                        Some(serde_json::json!({
-                            "name": "live_http_mrtr",
-                            "arguments": {},
-                            "_meta": {
-                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                            },
-                        })),
-                        932_i64,
-                    );
-                    let initial_body = serde_json::to_vec(&initial).map_err(|error| {
-                        format!("MRTR shutdown initial request did not serialize: {error}")
-                    })?;
-                    let initial = live_http_exchange(
-                        address,
-                        live_http_post(
-                            "/mcp",
-                            &initial_body,
-                            &[
-                                ("Accept", "application/json"),
-                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
-                                ("Mcp-Method", "tools/call"),
-                                ("MCP-Session-Id", session_id.as_str()),
-                            ],
-                        ),
-                    )
-                    .await?;
-                    let initial: JsonRpcResponse =
-                        serde_json::from_slice(live_http_response_body(&initial)?).map_err(
-                            |error| format!("MRTR shutdown initial response was invalid: {error}"),
-                        )?;
-                    let request_state = initial
-                        .result
-                        .as_ref()
-                        .and_then(|result| result.get("requestState"))
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| {
-                            "MRTR shutdown initial response omitted requestState".to_owned()
-                        })?
-                        .to_owned();
                     caller_cx.cancel_with(
                         CancelKind::User,
-                        Some("live HTTP MRTR shutdown after input_required"),
+                        Some("live HTTP stateless discovery complete"),
                     );
-                    Ok::<_, String>((session_id, request_state))
+                    Ok::<_, String>(discovery)
                 })
                 .map_err(|error| {
-                    format!("live HTTP MRTR shutdown client admission failed: {error}")
+                    format!("live HTTP stateless discovery client admission failed: {error}")
                 })?;
 
             let serve = bound.serve(&cx).await;
-            let (session_id, request_state) = client
+            let response = client
                 .join(&cx)
                 .await
-                .map_err(|error| format!("live HTTP MRTR shutdown client failed: {error:?}"))??;
-            serve.map_err(|error| format!("live HTTP MRTR shutdown server failed: {error}"))?;
+                .map_err(|error| {
+                    format!("live HTTP stateless discovery client failed: {error:?}")
+                })??;
+            serve.map_err(|error| format!("live HTTP stateless discovery server failed: {error}"))?;
+            if !response.starts_with(b"HTTP/1.1 200")
+                || live_http_response_header(&response, "mcp-session-id").is_ok()
+            {
+                return Err("modern discovery issued a session identifier".to_owned());
+            }
             if !modern_sessions
                 .sessions
                 .lock()
@@ -22983,46 +22945,6 @@ mod lib_unit_tests {
                 .is_empty()
             {
                 return Err("listener shutdown retained a modern HTTP session".to_owned());
-            }
-            let roots = serde_json::to_value(
-                bidirectional::MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
-                    .map_err(|error| format!("MRTR shutdown roots response failed: {error}"))?,
-            )
-            .map_err(|error| format!("MRTR shutdown roots response did not serialize: {error}"))?;
-            let retry = HttpRequest::new(HttpMethod::Post, "/mcp")
-                .with_header("content-type", "application/json")
-                .with_header("accept", "application/json")
-                .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
-                .with_header("mcp-method", "tools/call")
-                .with_header("mcp-session-id", session_id)
-                .with_body(
-                    serde_json::to_vec(&JsonRpcRequest::new(
-                        "tools/call",
-                        Some(serde_json::json!({
-                            "name": "live_http_mrtr",
-                            "arguments": {},
-                            "inputResponses": {"roots": roots},
-                            "requestState": request_state,
-                            "_meta": {
-                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                            },
-                        })),
-                        933_i64,
-                    ))
-                    .map_err(|error| format!("MRTR shutdown retry did not serialize: {error}"))?,
-                );
-            let retry = dispatch_registered_modern_http_request(
-                &Cx::for_testing(),
-                &endpoint,
-                &modern_sessions,
-                retry,
-            );
-            if retry.status != HttpStatus::NOT_FOUND || calls.load(Ordering::Acquire) != 1 {
-                return Err(
-                    "shutdown-invalidated MRTR retry reached the handler or was not refused"
-                        .to_owned(),
-                );
             }
             Ok(())
         });
