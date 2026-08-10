@@ -530,6 +530,7 @@ fn body_mirror_name(request: &JsonRpcRequest) -> Option<&str> {
     let key = match request.method.as_str() {
         "tools/call" | "prompts/get" => "name",
         "resources/read" => "uri",
+        "tasks/get" | "tasks/update" | "tasks/cancel" => "taskId",
         _ => return None,
     };
     request
@@ -875,6 +876,64 @@ mod tests {
         headers.push(("Mcp-Name".to_owned(), "echo".to_owned()));
         let admitted = admit(&headers, &body).expect("mirrored tools/call admits");
         assert_eq!(admitted.request().method, "tools/call");
+    }
+
+    #[test]
+    fn task_lifecycle_methods_mirror_task_id_through_mcp_name() {
+        for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+            let body = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": method,
+                "params": {
+                    "taskId": "task-73",
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {
+                            "extensions": {"io.modelcontextprotocol/tasks": {}}
+                        }
+                    }
+                }
+            }))
+            .expect("Tasks lifecycle body serializes");
+            let mut headers = canonical_headers();
+            headers[3].1 = method.to_owned();
+            headers.push(("Mcp-Name".to_owned(), "task-73".to_owned()));
+
+            let admitted =
+                admit(&headers, &body).expect("a matching taskId/Mcp-Name mirror must be admitted");
+            assert_eq!(admitted.request().method, method);
+        }
+    }
+
+    #[test]
+    fn task_get_rejects_only_a_mismatched_task_id_mcp_name_before_dispatch() {
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tasks/get",
+            "params": {
+                "taskId": "task-73",
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {"io.modelcontextprotocol/tasks": {}}
+                    }
+                }
+            }
+        }))
+        .expect("Tasks lifecycle body serializes");
+        let mut headers = canonical_headers();
+        headers[3].1 = "tasks/get".to_owned();
+        headers.push(("Mcp-Name".to_owned(), "task-other".to_owned()));
+
+        assert!(
+            matches!(
+                admit(&headers, &body),
+                Err(ModernPostRejection::FinalAdmission(_))
+            ),
+            "changing only Mcp-Name must reject before dispatch"
+        );
     }
 
     #[test]

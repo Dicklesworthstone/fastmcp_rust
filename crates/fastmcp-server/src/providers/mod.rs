@@ -9,6 +9,8 @@
 //!   resources. Its public `build` method currently fails closed on every
 //!   target because the server does not yet provide a guaranteed non-inline,
 //!   bounded, owned-and-drained blocking-I/O capability.
+//! - [`McpAppsUiResource`]: One immutable final-only `ui://` HTML document
+//!   for a negotiated MCP Apps View.
 //!
 //! # Example
 //!
@@ -27,5 +29,7 @@
 #![forbid(unsafe_code)]
 
 mod filesystem;
+mod mcp_apps;
 
 pub use filesystem::{FilesystemProvider, FilesystemProviderError, FilesystemResourceHandler};
+pub use mcp_apps::{McpAppsUiResource, McpAppsUiResourceError};

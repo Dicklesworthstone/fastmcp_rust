@@ -533,11 +533,13 @@ impl Default for PendingRequests {
 ///
 /// Once the outbound request has been committed to the transport, dropping its
 /// future without a routed response must both free the local slot and tell the
-/// peer to stop work. The latter is best effort because a closing transport
-/// cannot reliably deliver another frame.
+/// exact-2024 peer to stop work. MCP 2026-07-28 does not permit this reverse
+/// cancellation control. The legacy notification remains best effort because
+/// a closing transport cannot reliably deliver another frame.
 struct PendingRequestGuard {
     pending: Arc<PendingRequests>,
     send_fn: TransportSendFn,
+    era: ProtocolEra,
     id: RequestId,
     request_sent: bool,
     finished: bool,
@@ -560,7 +562,7 @@ impl PendingRequestGuard {
     }
 
     fn send_cancellation_notification(&self) {
-        if !self.request_sent {
+        if !self.request_sent || self.era != ProtocolEra::Legacy2024 {
             return;
         }
 
@@ -600,16 +602,34 @@ pub struct RequestSender {
     pending: Arc<PendingRequests>,
     /// Transport send callback.
     send_fn: TransportSendFn,
+    /// Exact protocol era that governs reverse-request cleanup controls.
+    era: ProtocolEra,
     /// Request-local cancellation domain installed by server dispatch.
     request_cancellation: Option<McpRequestCancellation>,
 }
 
 impl RequestSender {
-    /// Creates a new request sender.
+    /// Creates an exact MCP 2024-11-05 request sender.
+    ///
+    /// Use [`Self::new_for_era`] when the negotiated era is available.
     pub fn new(pending: Arc<PendingRequests>, send_fn: TransportSendFn) -> Self {
+        Self::new_for_era(ProtocolEra::Legacy2024, pending, send_fn)
+    }
+
+    /// Creates a request sender bound to one negotiated protocol era.
+    ///
+    /// Dropped reverse requests emit `notifications/cancelled` only for exact
+    /// MCP 2024-11-05. MCP 2026-07-28 retains local cleanup but emits no
+    /// server cancellation notification.
+    pub fn new_for_era(
+        era: ProtocolEra,
+        pending: Arc<PendingRequests>,
+        send_fn: TransportSendFn,
+    ) -> Self {
         Self {
             pending,
             send_fn,
+            era,
             request_cancellation: None,
         }
     }
@@ -618,6 +638,7 @@ impl RequestSender {
         Self {
             pending: Arc::clone(&self.pending),
             send_fn: Arc::clone(&self.send_fn),
+            era: self.era,
             request_cancellation: Some(request_cancellation),
         }
     }
@@ -655,6 +676,7 @@ impl RequestSender {
         let mut guard = PendingRequestGuard {
             pending: Arc::clone(&self.pending),
             send_fn: Arc::clone(&self.send_fn),
+            era: self.era,
             id: id.clone(),
             request_sent: false,
             finished: false,
@@ -3649,8 +3671,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reverse_request_mismatched_response_is_not_routed_and_drop_cleans_up() {
+    fn dropped_reverse_request_outbound(era: ProtocolEra) -> Vec<JsonRpcMessage> {
         let pending = Arc::new(PendingRequests::new());
         let pending_clone = Arc::clone(&pending);
         let outbound = Arc::new(Mutex::new(Vec::new()));
@@ -3673,7 +3694,7 @@ mod tests {
             }
             Ok(())
         });
-        let sender = RequestSender::new(Arc::clone(&pending), send_fn);
+        let sender = RequestSender::new_for_era(era, Arc::clone(&pending), send_fn);
         let cx = Cx::for_testing();
 
         {
@@ -3690,12 +3711,18 @@ mod tests {
         }
 
         assert_eq!(pending.in_flight_len(), 0);
-        let outbound = outbound
+        outbound
             .lock()
-            .expect("test outbound mutex must not be poisoned");
+            .expect("test outbound mutex must not be poisoned")
+            .clone()
+    }
+
+    #[test]
+    fn dropped_legacy_reverse_request_emits_cancellation_control() {
+        let outbound = dropped_reverse_request_outbound(ProtocolEra::Legacy2024);
         assert_eq!(outbound.len(), 2);
         let JsonRpcMessage::Request(cancelled) = &outbound[1] else {
-            panic!("dropped reverse request must emit a cancellation notification");
+            panic!("dropped exact-2024 reverse request must notify the peer");
         };
         assert_eq!(cancelled.id, None);
         assert_eq!(cancelled.method, "notifications/cancelled");
@@ -3703,6 +3730,19 @@ mod tests {
             cancelled.params,
             Some(serde_json::json!({ "requestId": FIRST_SERVER_REQUEST_ID }))
         );
+    }
+
+    #[test]
+    fn dropped_modern_reverse_request_omits_cancellation_control() {
+        // RH-5 planted negative: only the selected protocol era differs from
+        // the legacy positive above.
+        let outbound = dropped_reverse_request_outbound(ProtocolEra::Modern2026);
+        assert_eq!(outbound.len(), 1);
+        let JsonRpcMessage::Request(request) = &outbound[0] else {
+            panic!("dropped modern reverse request must retain its initial request frame");
+        };
+        assert_eq!(request.method, "test/method");
+        assert_eq!(request.id, Some(RequestId::Number(FIRST_SERVER_REQUEST_ID)));
     }
 
     #[test]

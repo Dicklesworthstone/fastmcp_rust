@@ -364,7 +364,8 @@ where
     F: Fn(JsonRpcRequest) + Send + Sync,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FinalProgressRuntime").finish_non_exhaustive()
+        f.debug_struct("FinalProgressRuntime")
+            .finish_non_exhaustive()
     }
 }
 
@@ -3374,7 +3375,9 @@ mod tests {
         );
         assert!(runtime.finalize());
 
-        let sent = sent.lock().expect("notification collection is not poisoned");
+        let sent = sent
+            .lock()
+            .expect("notification collection is not poisoned");
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].params.as_ref().unwrap()["progress"], -2);
         assert_eq!(sent[0].params.as_ref().unwrap()["total"], -3);
@@ -3386,15 +3389,13 @@ mod tests {
     fn final_progress_runtime_rejects_regression_without_replacing_pending_value() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_clone = Arc::clone(&sent);
-        let runtime = FinalProgressRuntime::new(
-            ProgressMarker::from("runtime-regression"),
-            move |request| {
+        let runtime =
+            FinalProgressRuntime::new(ProgressMarker::from("runtime-regression"), move |request| {
                 sent_clone
                     .lock()
                     .expect("notification collection is not poisoned")
                     .push(request);
-            },
-        );
+            });
 
         runtime.send_progress_exact(
             final_progress_number("12"),
@@ -3410,7 +3411,9 @@ mod tests {
         );
         assert!(runtime.finalize());
 
-        let sent = sent.lock().expect("notification collection is not poisoned");
+        let sent = sent
+            .lock()
+            .expect("notification collection is not poisoned");
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].params.as_ref().unwrap()["progress"], 12);
         assert_eq!(sent[0].params.as_ref().unwrap()["total"], 11);
@@ -3425,15 +3428,13 @@ mod tests {
     fn final_progress_runtime_coalesces_increasing_updates_to_the_latest_value() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_clone = Arc::clone(&sent);
-        let runtime = FinalProgressRuntime::new(
-            ProgressMarker::from("runtime-coalesce"),
-            move |request| {
+        let runtime =
+            FinalProgressRuntime::new(ProgressMarker::from("runtime-coalesce"), move |request| {
                 sent_clone
                     .lock()
                     .expect("notification collection is not poisoned")
                     .push(request);
-            },
-        );
+            });
 
         for progress in [1, 2, 3] {
             runtime.send_progress_exact(
@@ -3445,7 +3446,9 @@ mod tests {
         assert!(runtime.flush_pending());
         assert!(!runtime.flush_pending());
 
-        let sent = sent.lock().expect("notification collection is not poisoned");
+        let sent = sent
+            .lock()
+            .expect("notification collection is not poisoned");
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].params.as_ref().unwrap()["progress"], 3);
     }
@@ -3454,15 +3457,13 @@ mod tests {
     fn final_progress_runtime_cancellation_discards_pending_while_finalization_flushes_it() {
         let finalized = Arc::new(Mutex::new(Vec::new()));
         let finalized_clone = Arc::clone(&finalized);
-        let finalizing_runtime = FinalProgressRuntime::new(
-            ProgressMarker::from("runtime-finalize"),
-            move |request| {
+        let finalizing_runtime =
+            FinalProgressRuntime::new(ProgressMarker::from("runtime-finalize"), move |request| {
                 finalized_clone
                     .lock()
                     .expect("notification collection is not poisoned")
                     .push(request);
-            },
-        );
+            });
         finalizing_runtime.send_progress_exact(final_progress_number("1"), None, None);
         finalizing_runtime.send_progress_exact(final_progress_number("2"), None, None);
         assert!(finalizing_runtime.finalize());
@@ -3480,15 +3481,13 @@ mod tests {
 
         let cancelled = Arc::new(Mutex::new(Vec::new()));
         let cancelled_clone = Arc::clone(&cancelled);
-        let cancelled_runtime = FinalProgressRuntime::new(
-            ProgressMarker::from("runtime-cancel"),
-            move |request| {
+        let cancelled_runtime =
+            FinalProgressRuntime::new(ProgressMarker::from("runtime-cancel"), move |request| {
                 cancelled_clone
                     .lock()
                     .expect("notification collection is not poisoned")
                     .push(request);
-            },
-        );
+            });
         cancelled_runtime.send_progress_exact(final_progress_number("1"), None, None);
         cancelled_runtime.send_progress_exact(final_progress_number("2"), None, None);
         assert!(cancelled_runtime.cancel());
