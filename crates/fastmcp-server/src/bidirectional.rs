@@ -1093,6 +1093,26 @@ impl MrtrInputKind {
     }
 }
 
+/// Elicitation parameters selected by the negotiated protocol era.
+///
+/// Final embedded descriptors and exact-2024 JSON-RPC parameters deliberately
+/// remain separate: the former has no legacy `elicitationId`, while the latter
+/// requires one.
+#[derive(Debug, Clone)]
+pub enum DualEraElicitationParams {
+    /// Exact-2024 reverse JSON-RPC elicitation parameters.
+    Legacy2024(fastmcp_protocol::ElicitRequestParams),
+    /// Final embedded MRTR elicitation parameters.
+    Modern2026(fastmcp_protocol::FinalEmbeddedElicitationParams),
+}
+
+#[derive(Debug, Clone)]
+enum MrtrInputParams {
+    LegacyElicitation(fastmcp_protocol::ElicitRequestParams),
+    FinalElicitation(fastmcp_protocol::FinalEmbeddedElicitationParams),
+    Json(serde_json::Value),
+}
+
 /// One final MRTR embedded input descriptor.
 ///
 /// Its wire representation is exactly `{ "method": ..., "params": ... }`
@@ -1102,18 +1122,31 @@ impl MrtrInputKind {
 #[derive(Debug, Clone)]
 pub struct MrtrInputRequest {
     kind: MrtrInputKind,
-    params: Option<serde_json::Value>,
+    params: Option<MrtrInputParams>,
 }
 
 impl MrtrInputRequest {
-    /// Creates a final form or URL elicitation input descriptor.
+    /// Creates an exact-2024 form or URL elicitation request.
     ///
-    /// # Errors
-    ///
-    /// Returns an internal error only if its protocol parameters cannot be
-    /// represented as JSON.
-    pub fn elicitation(params: fastmcp_protocol::ElicitRequestParams) -> McpResult<Self> {
-        Self::with_params(MrtrInputKind::Elicitation, params)
+    #[must_use]
+    pub fn legacy_elicitation(params: fastmcp_protocol::ElicitRequestParams) -> Self {
+        Self {
+            kind: MrtrInputKind::Elicitation,
+            params: Some(MrtrInputParams::LegacyElicitation(params)),
+        }
+    }
+
+    /// Creates one final-era elicitation descriptor without translating it
+    /// through the exact-2024 request shape.
+    fn final_elicitation(
+        params: fastmcp_protocol::FinalEmbeddedElicitationParams,
+    ) -> McpResult<Self> {
+        serde_json::to_value(&params)
+            .map_err(|_| McpError::internal_error(REQUEST_PAYLOAD_ERROR))?;
+        Ok(Self {
+            kind: MrtrInputKind::Elicitation,
+            params: Some(MrtrInputParams::FinalElicitation(params)),
+        })
     }
 
     /// Creates a final sampling input descriptor.
@@ -1165,7 +1198,7 @@ impl MrtrInputRequest {
             "elicitation/create" => {
                 let params =
                     params.ok_or_else(|| McpError::invalid_params(MRTR_INPUT_MAP_ERROR))?;
-                Self::elicitation(
+                Self::final_elicitation(
                     serde_json::from_value(params.clone())
                         .map_err(|_| McpError::invalid_params(MRTR_INPUT_MAP_ERROR))?,
                 )
@@ -1188,8 +1221,20 @@ impl MrtrInputRequest {
             .map_err(|_| McpError::internal_error(REQUEST_PAYLOAD_ERROR))?;
         Ok(Self {
             kind,
-            params: Some(params),
+            params: Some(MrtrInputParams::Json(params)),
         })
+    }
+
+    fn into_legacy_params(self) -> McpResult<serde_json::Value> {
+        match self.params {
+            None => Ok(serde_json::json!({})),
+            Some(MrtrInputParams::LegacyElicitation(params)) => serde_json::to_value(params)
+                .map_err(|_| McpError::internal_error(REQUEST_PAYLOAD_ERROR)),
+            Some(MrtrInputParams::FinalElicitation(_)) => {
+                Err(McpError::invalid_params(INVALID_ELICITATION_REQUEST_ERROR))
+            }
+            Some(MrtrInputParams::Json(params)) => Ok(params),
+        }
     }
 }
 
@@ -1204,7 +1249,17 @@ impl Serialize for MrtrInputRequest {
         )?;
         descriptor.serialize_field("method", self.kind.method())?;
         if let Some(params) = &self.params {
-            descriptor.serialize_field("params", params)?;
+            match params {
+                MrtrInputParams::LegacyElicitation(params) => {
+                    descriptor.serialize_field("params", params)?;
+                }
+                MrtrInputParams::FinalElicitation(params) => {
+                    descriptor.serialize_field("params", params)?;
+                }
+                MrtrInputParams::Json(params) => {
+                    descriptor.serialize_field("params", params)?;
+                }
+            }
         }
         descriptor.end()
     }
@@ -2170,15 +2225,19 @@ impl DualEraServerToClient {
         cx: &Cx,
         owner_cancellation: McpRequestCancellation,
         input_key: impl Into<String>,
-        params: fastmcp_protocol::ElicitRequestParams,
+        params: DualEraElicitationParams,
     ) -> McpResult<DualEraServerToClientResult<fastmcp_protocol::ElicitResult>> {
-        self.dispatch(
-            cx,
-            owner_cancellation,
-            input_key.into(),
-            MrtrInputRequest::elicitation(params)?,
-        )
-        .await
+        let input = match (self, params) {
+            (Self::Legacy2024 { .. }, DualEraElicitationParams::Legacy2024(params)) => {
+                MrtrInputRequest::legacy_elicitation(params)
+            }
+            (Self::Modern2026 { .. }, DualEraElicitationParams::Modern2026(params)) => {
+                MrtrInputRequest::final_elicitation(params)?
+            }
+            _ => return Err(McpError::invalid_params(INVALID_ELICITATION_REQUEST_ERROR)),
+        };
+        self.dispatch(cx, owner_cancellation, input_key.into(), input)
+            .await
     }
 
     /// Requests the client's filesystem roots.
@@ -2237,9 +2296,7 @@ impl DualEraServerToClient {
         match self {
             Self::Legacy2024 { sender } => {
                 let method = input_request.kind().method();
-                let params = input_request
-                    .params
-                    .unwrap_or_else(|| serde_json::json!({}));
+                let params = input_request.into_legacy_params()?;
                 let response = sender
                     .for_request(owner_cancellation)
                     .send_request(cx, method, params)
@@ -2284,6 +2341,29 @@ mod tests {
             .expect("roots response must serialize")
     }
 
+    fn final_form_elicitation_params() -> fastmcp_protocol::FinalEmbeddedElicitationParams {
+        serde_json::from_value(serde_json::json!({
+            "mode": "form",
+            "message": "Choose a display name",
+            "requestedSchema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {"displayName": {"type": "string", "minLength": 1}},
+                "required": ["displayName"],
+            },
+        }))
+        .expect("final form elicitation parameters must admit")
+    }
+
+    fn final_url_elicitation_params() -> fastmcp_protocol::FinalEmbeddedElicitationParams {
+        serde_json::from_value(serde_json::json!({
+            "mode": "url",
+            "message": "Authorize access",
+            "url": "https://example.com/authorize",
+        }))
+        .expect("final URL elicitation parameters must admit")
+    }
+
     #[test]
     fn mrtr_embeds_exact_input_maps_and_completes_with_bound_responses() {
         let registry = MrtrExchangeRegistry::new();
@@ -2291,11 +2371,8 @@ mod tests {
         let input_requests = MrtrInputRequests::new([
             (
                 "elicit".to_owned(),
-                MrtrInputRequest::elicitation(fastmcp_protocol::ElicitRequestParams::form(
-                    "Continue?",
-                    serde_json::json!({"type": "object"}),
-                ))
-                .expect("elicitation request must serialize"),
+                MrtrInputRequest::final_elicitation(final_form_elicitation_params())
+                    .expect("elicitation request must serialize"),
             ),
             (
                 "sample".to_owned(),
@@ -2726,10 +2803,10 @@ mod tests {
             &cx,
             McpRequestCancellation::new(),
             "elicit",
-            fastmcp_protocol::ElicitRequestParams::form(
+            DualEraElicitationParams::Legacy2024(fastmcp_protocol::ElicitRequestParams::form(
                 "Continue?",
                 serde_json::json!({"type": "object"}),
-            ),
+            )),
         ))
         .expect("legacy elicitation must await a direct response");
         assert!(matches!(
@@ -2757,6 +2834,191 @@ mod tests {
                 "elicitation/create".to_owned(),
                 "roots/list".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn dual_era_elicitation_keeps_legacy_url_identity_out_of_final_mrtr() {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_for_send = Arc::clone(&pending);
+        let sent_params = Arc::new(Mutex::new(Vec::new()));
+        let sent_params_for_send = Arc::clone(&sent_params);
+        let send_fn: TransportSendFn = Arc::new(move |message| {
+            let JsonRpcMessage::Request(request) = message else {
+                panic!("legacy isolation boundary may only emit requests");
+            };
+            assert_eq!(request.method, "elicitation/create");
+            sent_params_for_send
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(
+                    request
+                        .params
+                        .clone()
+                        .expect("legacy elicitation carries params"),
+                );
+            let id = request
+                .id
+                .clone()
+                .expect("legacy elicitation requires a JSON-RPC id");
+            assert!(pending_for_send.route_response(&JsonRpcResponse::success(
+                id,
+                serde_json::json!({"action": "decline"}),
+            )));
+            Ok(())
+        });
+        let legacy = DualEraServerToClient::new(
+            ProtocolEra::Legacy2024,
+            RequestSender::new(pending, send_fn),
+            Arc::new(MrtrExchangeRegistry::new()),
+        );
+        let cx = Cx::for_testing();
+
+        block_on(legacy.elicitation_create(
+            &cx,
+            McpRequestCancellation::new(),
+            "legacy-url",
+            DualEraElicitationParams::Legacy2024(fastmcp_protocol::ElicitRequestParams::url(
+                "Authorize legacy access",
+                "https://example.com/legacy-authorize",
+                "legacy-elicitation-id",
+            )),
+        ))
+        .expect("exact-2024 URL elicitation must retain its identity");
+        assert_eq!(
+            sent_params
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[serde_json::json!({
+                "mode": "url",
+                "message": "Authorize legacy access",
+                "url": "https://example.com/legacy-authorize",
+                "elicitationId": "legacy-elicitation-id",
+            })],
+        );
+
+        let legacy_error = block_on(legacy.elicitation_create(
+            &cx,
+            McpRequestCancellation::new(),
+            "final-on-legacy",
+            DualEraElicitationParams::Modern2026(final_url_elicitation_params()),
+        ))
+        .expect_err("a final descriptor must not cross into exact-2024 JSON-RPC");
+        assert_eq!(legacy_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            sent_params
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "rejected final input must not reach the legacy sender",
+        );
+
+        let modern_registry = Arc::new(MrtrExchangeRegistry::new());
+        let modern = DualEraServerToClient::Modern2026 {
+            exchanges: Arc::clone(&modern_registry),
+        };
+        let modern_error = block_on(modern.elicitation_create(
+            &cx,
+            McpRequestCancellation::new(),
+            "legacy-on-final",
+            DualEraElicitationParams::Legacy2024(fastmcp_protocol::ElicitRequestParams::url(
+                "Authorize legacy access",
+                "https://example.com/legacy-authorize",
+                "legacy-elicitation-id",
+            )),
+        ))
+        .expect_err("a legacy descriptor must not mint final MRTR state");
+        assert_eq!(modern_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(modern_registry.active_len(), 0);
+    }
+
+    fn assert_modern_elicitation_issues_and_reconstructs(
+        input_key: &str,
+        params: fastmcp_protocol::FinalEmbeddedElicitationParams,
+        expected_params: serde_json::Value,
+    ) {
+        let registry = Arc::new(MrtrExchangeRegistry::new());
+        let boundary = DualEraServerToClient::Modern2026 {
+            exchanges: Arc::clone(&registry),
+        };
+        let cx = Cx::for_testing();
+        let result = block_on(boundary.elicitation_create(
+            &cx,
+            McpRequestCancellation::new(),
+            input_key,
+            DualEraElicitationParams::Modern2026(params),
+        ))
+        .expect("final elicitation must issue MRTR state");
+        let DualEraServerToClientResult::InputRequired(required) = result else {
+            panic!("modern elicitation must issue a final input_required result");
+        };
+        assert_eq!(registry.active_len(), 1);
+        let wire = serde_json::to_value(&required).expect("final input request serializes");
+        let descriptor = wire["inputRequests"][input_key].clone();
+        assert_eq!(descriptor["method"], "elicitation/create");
+        assert_eq!(descriptor["params"], expected_params);
+
+        let reconstructed = MrtrInputRequest::from_wire(&descriptor)
+            .expect("final emitted descriptor must reconstruct without legacy conversion");
+        assert_eq!(
+            serde_json::to_value(reconstructed).expect("reconstructed descriptor serializes"),
+            descriptor,
+        );
+
+        let complete = boundary
+            .accept_input_retry(
+                &cx,
+                &mrtr_state_from_wire(&required),
+                MrtrInputResponses::new([(
+                    input_key.to_owned(),
+                    MrtrInputResponse::elicitation(fastmcp_protocol::ElicitResult::decline())
+                        .expect("elicitation response must serialize"),
+                )])
+                .expect("one matching final elicitation response"),
+            )
+            .expect("final elicitation retry must complete");
+        let MrtrRetry::Complete(complete) = complete else {
+            panic!("one matching elicitation response must complete the exchange");
+        };
+        assert_eq!(
+            complete
+                .responses()
+                .get(input_key)
+                .map(MrtrInputResponse::kind),
+            Some(MrtrInputKind::Elicitation),
+        );
+    }
+
+    #[test]
+    fn dual_era_boundary_modern_issues_and_reconstructs_final_form_elicitation() {
+        assert_modern_elicitation_issues_and_reconstructs(
+            "form",
+            final_form_elicitation_params(),
+            serde_json::json!({
+                "mode": "form",
+                "message": "Choose a display name",
+                "requestedSchema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {"displayName": {"type": "string", "minLength": 1}},
+                    "required": ["displayName"],
+                },
+            }),
+        );
+    }
+
+    #[test]
+    fn dual_era_boundary_modern_issues_and_reconstructs_final_url_elicitation() {
+        assert_modern_elicitation_issues_and_reconstructs(
+            "url",
+            final_url_elicitation_params(),
+            serde_json::json!({
+                "mode": "url",
+                "message": "Authorize access",
+                "url": "https://example.com/authorize",
+            }),
         );
     }
 
