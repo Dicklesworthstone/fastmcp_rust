@@ -20,9 +20,10 @@
 </p>
 
 > **Protocol status (2026-08-02):** MCP 2026-07-28 support is under
-> implementation and remains unverified. The current public
-> `PROTOCOL_VERSION` is `2024-11-05`. Source presence, examples, and historical
-> parity rows are not conformance or release evidence. Release publication
+> implementation and remains unverified. The root compatibility
+> `PROTOCOL_VERSION` is `2024-11-05`; the modern facade's
+> `modern::PROTOCOL_VERSION` is `2026-07-28`. Source presence, examples, and
+> historical parity rows are not conformance or release evidence. Release publication
 > remains quarantined; source edits alone do not prove historical workflow
 > identities, queued runs, or credentials inert, so provider-side evidence is
 > still required.
@@ -38,8 +39,9 @@
 - **Bidirectional calls are not qualified:** the Unix stdio receive pump can
   route sampling, elicitation, and roots responses while its dispatch worker
   is occupied. Non-Unix stdio and custom/SSE/WebSocket paths reject or lack
-  that split routing, public HTTP is fail-closed, and end-to-end
-  lifecycle/cancellation evidence is incomplete.
+  that split routing. Public HTTP has its own dual-era request and response
+  routing, but end-to-end bidirectional lifecycle/cancellation evidence is
+  incomplete.
 - **Response caching is conservatively partitioned:** eligible production
   requests are keyed by committed authentication facts plus opaque session
   identity and revision. Uncommitted authentication, local-only state views,
@@ -47,10 +49,9 @@
   to fail closed rather than sharing an entry.
 - **Authentication admission is incomplete:** recognized credentials in JSON-RPC
   params are supported only as a legacy fallback and are stripped before
-  extension middleware and handlers. The quarantined private HTTP helper now
-  carries its native `Authorization` field separately through pre-dispatch
-  admission, but the public turnkey HTTP path remains fail-closed and no
-  complete transport-boundary admission/challenge integration is qualified.
+  extension middleware and handlers. The public turnkey HTTP path is live,
+  but no complete transport-boundary native `Authorization`
+  admission/challenge integration is qualified.
 - **Tasks are quarantined:** `tasks/list`, `tasks/get`, `tasks/submit`, and
   `tasks/cancel` are not advertised and return JSON-RPC `MethodNotFound`.
 - **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
@@ -131,7 +132,7 @@ This project includes an [`AGENTS.md`](AGENTS.md) file with guidelines for AI co
 - **Toolchain:** Rust 2024 edition; pinned `nightly-2026-07-11` / rustc 1.99.0-nightly (`rust-version = "1.99"`)
 - **MCP 2026-07-28 support is under implementation and remains unverified.**
 - **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**
-- **The current public `PROTOCOL_VERSION` is still `2024-11-05`; newer in-tree types are not proof of negotiated 2026-07-28 support.**
+- **The root compatibility `PROTOCOL_VERSION` is `2024-11-05`; the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`. Neither is proof of negotiated 2026-07-28 support.**
 
 ---
 
@@ -506,7 +507,7 @@ fastmcp_rust/
 | `fastmcp-protocol` | MCP message types, capabilities, JSON-RPC framing |
 | `fastmcp-transport` | Transport trait and stdio/SSE/WebSocket/HTTP/memory implementations |
 | `fastmcp-server` | `Server`, `ServerBuilder`, routing, handler traits |
-| `fastmcp-client` | Subprocess-stdio `Client`; lower-level SSE/WebSocket transport types are not wired into this public client |
+| `fastmcp-client` | Subprocess-stdio `Client`, plus public `ClientHttpConnection` and `HttpClient` support for modern HTTP and exact legacy SSE; raw WebSocket types are not wired into those clients |
 | `fastmcp-derive` | Procedural macros for handler generation |
 
 ---
@@ -601,23 +602,23 @@ fn commit_revision(
 | Limitation | Details |
 |------------|---------|
 | **Pinned Nightly Required** | The project contract pins `nightly-2026-07-11`; do not substitute a different toolchain merely because it supports Edition 2024 |
-| **Protocol Modernization** | The public protocol constant remains `2024-11-05`; MCP 2026-07-28 implementation and verification are incomplete |
+| **Protocol Modernization** | The root compatibility `PROTOCOL_VERSION` remains `2024-11-05`; the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`. MCP 2026-07-28 implementation and verification are incomplete |
 | **Runtime-context migration** | The workspace still enables asupersync `test-internals` as a stopgap while synchronous entry points are migrated to runtime-managed contexts |
-| **Network Transports** | HTTP parsing/framing primitives exist, but the turnkey `run_http*` entry points fail closed before binding until stateless per-request dispatch is qualified; SSE and WebSocket entry points require caller-provided I/O integration |
-| **Client Transport Coverage** | The public `fastmcp-client::Client` currently connects only to subprocess stdio; lower-level SSE and WebSocket transport types do not constitute client integration |
+| **Network Transports** | The turnkey `run_http*` entry points provide a caller-owned dual-era HTTP listener and dispatch lifecycle. This is not aggregate conformance or full lifecycle qualification; SSE and WebSocket server entry points require caller-provided I/O integration |
+| **Client Transport Coverage** | `fastmcp-client::Client` is subprocess-stdio only; public `ClientHttpConnection` and `HttpClient` provide modern HTTP and exact legacy SSE integration. Raw WebSocket types remain outside those client surfaces |
 | **No Built-in TLS** | Transport encryption must be handled externally |
-| **HTTP Dispatch Qualification** | The old sessionful listener is private and unreachable; public `run_http*` calls fail closed before binding. Modern `LatestOnly` still needs immutable stateless per-request dispatch and an owned request execution; a bounded owner-bound Session registry belongs only to the feature-gated LEG-02 MCP 2025-11-25 adapter |
+| **HTTP Dispatch Qualification** | Public `run_http*` binds and serves the caller-owned dual-era HTTP lifecycle. `ModernOnly` selects the exact MCP 2026-07-28 era and `LegacyOnly` selects the exact MCP 2024-11-05 era; MCP 2025-11-25 is not an adapter or supported policy. This executable surface does not establish aggregate MCP conformance or complete lifecycle qualification |
 | **Wire Cancellation** | On Unix, stdio has a continuous receive pump plus serialized dispatch worker and can route `notifications/cancelled` during handler execution. Non-Unix stdio and custom/SSE/WebSocket loops retain sequential/blocking boundaries, while request-owned `Cx` isolation and reliable `awaitCleanup` semantics remain unverified |
 | **Silent stdio peers** | On Unix, the public subprocess `Client` enforces configured idle/absolute deadlines at child-pipe readiness and decode boundaries, including silent and partial-frame peers. Generic blocking `StdioTransport::recv`, non-Unix child-pipe reads, and blocking writes retain their documented frame/I/O-boundary limitation; these deadlines are therefore not a portable end-to-end request or process wall-clock guarantee. Those residuals remain FND-04 work |
 | **Stdio output backpressure** | On Unix, primary server responses and notifications use serialized nonblocking writes with a two-second commit deadline for ordinary pipes/sockets; a timeout, lock poison, partial write, notification encoding failure, or descriptor-flag restoration failure is connection-fatal. The writer attempts to restore descriptor flags before releasing the local lock; on restoration failure the descriptor may remain nonblocking, and inherited duplicate descriptors can observe the temporary `O_NONBLOCK` setting. Regular files/devices and non-Unix stdout retain blocking-I/O limits. A handler that ignores cancellation may force unsuccessful process exit; shutdown hooks are skipped unless worker quiescence is proven |
 | **Subprocess cleanup** | `Client::close(&mut self) -> McpResult<()>` is the proof-bearing path; Drop is best effort. `fastmcp test` uses Unix-only anchored process-group ownership; successful connections report explicit final cleanup separately, and initialization-cleanup failures remain visible. Descendants can escape via a new group/session, host forks can copy the control descriptor, and `SIGCHLD=SIG_IGN`, `SA_NOCLDWAIT`, or competing global reapers can invalidate reap evidence. Windows Job Object support is not implemented |
 | **Development subprocess cleanup** | On Unix, each `fastmcp dev` build/server group contains a signal-immune watchdog tied to a private owner-held control pipe, so ordinary shutdown, child-handle drop, and CLI owner death trigger bounded TERM-then-KILL cleanup. A host-side fork that copies the owner descriptor or a descendant that changes group/session remains outside this boundary; non-Unix `dev` remains fail-closed |
-| **Synchronous HTTP readers** | Low-level HTTP parsing checkpoints before/after reads and retries `EINTR`, but a generic synchronous `Read` already blocked in the kernel cannot be preempted. A bounded host must supply readiness-aware/asynchronous I/O. Public turnkey `run_http*` remains fail-closed |
+| **Synchronous HTTP readers** | Low-level HTTP parsing checkpoints before/after reads and retries `EINTR`, but a generic synchronous `Read` already blocked in the kernel cannot be preempted. A bounded host must supply readiness-aware/asynchronous I/O. Public turnkey `run_http*` uses its caller-owned asynchronous listener lifecycle, whose broader qualification boundaries remain documented here |
 | **Returning transport runners** | `run_transport_returning*` returns fatal receive/send/close errors and preserves simultaneous run-plus-close failures. Clean EOF/cancellation is `Ok(())`. The legacy custom loop still uses one ambient `Cx` and does not prove request-owned isolation |
 | **Request Cancellation Ownership** | Request work does not yet have an independently owned child `Cx`; cancellation must not be treated as a sibling-isolated guarantee |
-| **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while its dispatch worker is occupied. Non-Unix stdio and custom/SSE/WebSocket paths do not provide the same split routing, public HTTP is fail-closed, and end-to-end lifecycle qualification remains open |
+| **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while its dispatch worker is occupied. Non-Unix stdio and custom/SSE/WebSocket paths do not provide the same split routing. Public HTTP has separate dual-era routing, while end-to-end bidirectional lifecycle qualification remains open |
 | **Response Cache Partitioning** | Eligible entries are partitioned by committed authentication facts and opaque session identity/revision; ambiguous admission and state mutation fail closed. This does not promote OAuth/OIDC or establish protocol conformance |
-| **Authentication Admission** | JSON-RPC credential fields are a stripped legacy fallback. The quarantined private HTTP helper carries native `Authorization` metadata separately, but public turnkey HTTP remains fail-closed and no complete transport-boundary admission/challenge path is qualified |
+| **Authentication Admission** | JSON-RPC credential fields are a stripped legacy fallback. Public turnkey HTTP is live, but no complete transport-boundary native `Authorization` admission/challenge path is qualified |
 | **Tasks RPC** | Task methods are not advertised and return `MethodNotFound`; client/task source presence is not a usable server capability |
 | **OAuth/OIDC Promotion** | Public source APIs exist, but production security and profile conformance remain unverified; they are quarantined from production-support claims |
 | **Early Development** | API may change before 1.0 |
@@ -632,7 +633,7 @@ A: FastMCP Rust is built around asupersync capability contexts, budgets, and coo
 
 **Q: Can I use this with Claude Desktop?**
 
-A: Stdio integration exists, but compatibility must be checked against the client because the current public protocol constant is `2024-11-05` and MCP 2026-07-28 support is not yet verified.
+A: Stdio integration exists, but compatibility must be checked against the client: the root compatibility `PROTOCOL_VERSION` is `2024-11-05`, the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`, and MCP 2026-07-28 support is not yet verified.
 
 **Q: How do I add authentication?**
 
