@@ -6,9 +6,10 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::common_types::{Implementation, OpenMetadata};
+use crate::common_types::{Implementation, JsonInteger, OpenMetadata};
 use crate::jsonrpc::{RawJsonAdmissionError, admit_raw_jsonrpc_document};
 use crate::protocol_policy::ProtocolEra;
 
@@ -704,22 +705,144 @@ impl InputRequiredResult {
     }
 }
 
-/// A nonnegative cache TTL used only by server-side safe constructors.
+/// A nonnegative final cache TTL that retains its exact JSON-integer spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheTtl(JsonInteger);
+
+/// Failure while validating or converting a final cache TTL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheTtl(u64);
+pub enum CacheTtlConversionError {
+    /// The wire integer is mathematically negative.
+    Negative,
+    /// The wire integer is valid but exceeds the local `u64` runtime domain.
+    RuntimeOutOfRange,
+}
+
+impl fmt::Display for CacheTtlConversionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Negative => "cache ttlMs must be a nonnegative JSON integer",
+            Self::RuntimeOutOfRange => "cache ttlMs exceeds the local u64 runtime domain",
+        })
+    }
+}
+
+impl std::error::Error for CacheTtlConversionError {}
 
 impl CacheTtl {
     /// Creates a nonnegative TTL in milliseconds.
     #[must_use]
-    pub const fn milliseconds(value: u64) -> Self {
-        Self(value)
+    pub fn milliseconds(value: u64) -> Self {
+        Self(JsonInteger::from(value))
     }
 
-    /// Returns the TTL in milliseconds.
+    /// Returns the exact nonnegative JSON-integer wire spelling.
     #[must_use]
-    pub const fn as_millis(self) -> u64 {
-        self.0
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
+
+    /// Converts this wire value into the bounded local millisecond domain.
+    ///
+    /// This is intentionally checked: the final schema has no maximum, while
+    /// local duration APIs accept at most `u64` milliseconds.
+    pub fn try_as_millis(&self) -> Result<u64, CacheTtlConversionError> {
+        cache_ttl_runtime_millis(self.0.as_str())
+    }
+}
+
+impl TryFrom<JsonInteger> for CacheTtl {
+    type Error = CacheTtlConversionError;
+
+    fn try_from(value: JsonInteger) -> Result<Self, Self::Error> {
+        if cache_ttl_is_negative(value.as_str()) {
+            return Err(CacheTtlConversionError::Negative);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl Serialize for CacheTtl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CacheTtl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = JsonInteger::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn cache_ttl_is_negative(lexeme: &str) -> bool {
+    let Some(absolute) = lexeme.strip_prefix('-') else {
+        return false;
+    };
+    absolute
+        .split(['e', 'E'])
+        .next()
+        .is_some_and(|mantissa| mantissa.bytes().any(|byte| matches!(byte, b'1'..=b'9')))
+}
+
+fn cache_ttl_runtime_millis(lexeme: &str) -> Result<u64, CacheTtlConversionError> {
+    let unsigned = lexeme.strip_prefix('-').unwrap_or(lexeme);
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent),
+        None => (unsigned, "0"),
+    };
+    let exponent = exponent
+        .parse::<i128>()
+        .map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)?;
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{whole}{fraction}");
+    if !digits.bytes().any(|byte| matches!(byte, b'1'..=b'9')) {
+        return Ok(0);
+    }
+
+    let fraction_len =
+        i128::try_from(fraction.len()).map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)?;
+    let decimal_shift = exponent
+        .checked_sub(fraction_len)
+        .ok_or(CacheTtlConversionError::RuntimeOutOfRange)?;
+    let integer_digits = if decimal_shift >= 0 {
+        let zeroes = usize::try_from(decimal_shift)
+            .map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)?;
+        let length = digits
+            .len()
+            .checked_add(zeroes)
+            .ok_or(CacheTtlConversionError::RuntimeOutOfRange)?;
+        if length > 20 {
+            return Err(CacheTtlConversionError::RuntimeOutOfRange);
+        }
+        format!("{digits}{}", "0".repeat(zeroes))
+    } else {
+        let trimmed = usize::try_from(decimal_shift.unsigned_abs())
+            .map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)?;
+        let Some(length) = digits.len().checked_sub(trimmed) else {
+            return Err(CacheTtlConversionError::RuntimeOutOfRange);
+        };
+        if !digits[length..].bytes().all(|byte| byte == b'0') {
+            return Err(CacheTtlConversionError::RuntimeOutOfRange);
+        }
+        digits[..length].to_owned()
+    };
+    let normalized = integer_digits.trim_start_matches('0');
+    if normalized.is_empty() {
+        return Ok(0);
+    }
+    if normalized.len() > 20 {
+        return Err(CacheTtlConversionError::RuntimeOutOfRange);
+    }
+    normalized
+        .parse()
+        .map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)
 }
 
 /// Peer cache scope. `Public` is a wire value, not an authority grant.
@@ -1601,6 +1724,45 @@ impl<'a> ExactJsonParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_ttl_retains_the_unbounded_wire_value_until_runtime_conversion() {
+        let boundary = CacheTtl::milliseconds(u64::MAX);
+        assert_eq!(boundary.as_str(), "18446744073709551615");
+        assert_eq!(boundary.try_as_millis(), Ok(u64::MAX));
+
+        let exponent: JsonInteger = serde_json::from_str("1.0e3")
+            .expect("an exponent spelling for an integer is valid JSON");
+        assert_eq!(
+            CacheTtl::try_from(exponent)
+                .expect("a nonnegative exponent integer is admitted")
+                .try_as_millis(),
+            Ok(1_000)
+        );
+
+        let over_boundary: JsonInteger = serde_json::from_str("18446744073709551616")
+            .expect("the one-over-u64 boundary is a JSON integer");
+        let over_boundary = CacheTtl::try_from(over_boundary)
+            .expect("the unbounded final wire integer is admitted");
+        assert_eq!(over_boundary.as_str(), "18446744073709551616");
+        assert_eq!(
+            over_boundary.try_as_millis(),
+            Err(CacheTtlConversionError::RuntimeOutOfRange),
+            "only the checked runtime conversion rejects the one-over-u64 boundary"
+        );
+        assert_eq!(
+            serde_json::to_string(&over_boundary).expect("unbounded TTL re-encodes"),
+            "18446744073709551616"
+        );
+        assert!(
+            serde_json::from_str::<CacheTtl>("-1").is_err(),
+            "the final minimum rejects a negative integer TTL"
+        );
+        assert!(
+            serde_json::from_str::<CacheTtl>("18446744073709551616.5").is_err(),
+            "changing only the one-over-u64 boundary to a fraction must reject"
+        );
+    }
 
     #[test]
     fn result_unit_a_positive_round_trip() {

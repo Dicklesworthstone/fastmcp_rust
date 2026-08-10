@@ -43,14 +43,15 @@ use crate::types::{
 
 /// Progress marker used to correlate progress notifications with requests.
 ///
-/// Per MCP spec, progress markers can be either strings or integers.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Per MCP spec, progress markers can be either strings or arbitrary-width
+/// JSON integers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProgressMarker {
     /// String progress marker.
     String(String),
-    /// Integer progress marker.
-    Number(i64),
+    /// Arbitrary-width JSON integer progress marker.
+    Number(JsonInteger),
 }
 
 impl From<String> for ProgressMarker {
@@ -67,7 +68,28 @@ impl From<&str> for ProgressMarker {
 
 impl From<i64> for ProgressMarker {
     fn from(n: i64) -> Self {
-        ProgressMarker::Number(n)
+        ProgressMarker::Number(JsonInteger::from(n))
+    }
+}
+
+impl From<JsonInteger> for ProgressMarker {
+    fn from(n: JsonInteger) -> Self {
+        Self::Number(n)
+    }
+}
+
+impl std::hash::Hash for ProgressMarker {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::String(value) => {
+                std::hash::Hash::hash(&0_u8, state);
+                std::hash::Hash::hash(value, state);
+            }
+            Self::Number(value) => {
+                std::hash::Hash::hash(&1_u8, state);
+                std::hash::Hash::hash(value.as_str(), state);
+            }
+        }
     }
 }
 
@@ -75,7 +97,7 @@ impl std::fmt::Display for ProgressMarker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProgressMarker::String(s) => write!(f, "{s}"),
-            ProgressMarker::Number(n) => write!(f, "{n}"),
+            ProgressMarker::Number(n) => f.write_str(n.as_str()),
         }
     }
 }
@@ -1963,9 +1985,9 @@ pub struct FinalListToolsResult {
     /// Opaque next cursor, if another page is available.
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    /// Required final cache lifetime in milliseconds.
+    /// Required lossless final cache lifetime.
     #[serde(rename = "ttlMs")]
-    pub ttl_ms: u64,
+    pub ttl_ms: crate::result::CacheTtl,
     /// Required final cache sharing scope.
     #[serde(
         rename = "cacheScope",
@@ -2012,9 +2034,9 @@ pub struct FinalListResourcesResult {
     /// Opaque next cursor, if another page is available.
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    /// Required final cache lifetime in milliseconds.
+    /// Required lossless final cache lifetime.
     #[serde(rename = "ttlMs")]
-    pub ttl_ms: u64,
+    pub ttl_ms: crate::result::CacheTtl,
     /// Required final cache sharing scope.
     #[serde(
         rename = "cacheScope",
@@ -2033,9 +2055,9 @@ pub struct FinalListResourceTemplatesResult {
     /// Opaque next cursor, if another page is available.
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    /// Required final cache lifetime in milliseconds.
+    /// Required lossless final cache lifetime.
     #[serde(rename = "ttlMs")]
-    pub ttl_ms: u64,
+    pub ttl_ms: crate::result::CacheTtl,
     /// Required final cache sharing scope.
     #[serde(
         rename = "cacheScope",
@@ -2050,9 +2072,9 @@ pub struct FinalListResourceTemplatesResult {
 pub struct FinalReadResourceResult {
     /// Read resource contents.
     pub contents: Vec<EmbeddedResourceContents>,
-    /// Required final cache lifetime in milliseconds.
+    /// Required lossless final cache lifetime.
     #[serde(rename = "ttlMs")]
-    pub ttl_ms: u64,
+    pub ttl_ms: crate::result::CacheTtl,
     /// Required final cache sharing scope.
     #[serde(
         rename = "cacheScope",
@@ -2070,9 +2092,9 @@ pub struct FinalListPromptsResult {
     /// Opaque next cursor, if another page is available.
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    /// Required final cache lifetime in milliseconds.
+    /// Required lossless final cache lifetime.
     #[serde(rename = "ttlMs")]
-    pub ttl_ms: u64,
+    pub ttl_ms: crate::result::CacheTtl,
     /// Required final cache sharing scope.
     #[serde(
         rename = "cacheScope",
@@ -5048,8 +5070,8 @@ pub enum ElicitContentValue {
     Null,
     /// Boolean value.
     Bool(bool),
-    /// Integer value.
-    Int(i64),
+    /// Arbitrary-width JSON integer value.
+    Int(JsonInteger),
     /// Float value.
     Float(f64),
     /// String value.
@@ -5066,6 +5088,12 @@ impl From<bool> for ElicitContentValue {
 
 impl From<i64> for ElicitContentValue {
     fn from(v: i64) -> Self {
+        Self::Int(JsonInteger::from(v))
+    }
+}
+
+impl From<JsonInteger> for ElicitContentValue {
+    fn from(v: JsonInteger) -> Self {
         Self::Int(v)
     }
 }
@@ -5194,12 +5222,12 @@ impl ElicitResult {
         })
     }
 
-    /// Gets an integer value from the content.
+    /// Gets the exact JSON integer value from the content.
     #[must_use]
-    pub fn get_int(&self, key: &str) -> Option<i64> {
+    pub fn get_int(&self, key: &str) -> Option<&JsonInteger> {
         self.content.as_ref().and_then(|c| {
             c.get(key).and_then(|v| match v {
-                ElicitContentValue::Int(i) => Some(*i),
+                ElicitContentValue::Int(i) => Some(i),
                 _ => None,
             })
         })
@@ -5257,9 +5285,32 @@ mod tests {
 
     #[test]
     fn progress_marker_number_serialization() {
-        let progress = ProgressMarker::Number(42);
+        let progress = ProgressMarker::Number(JsonInteger::from(42_i64));
         let value = serde_json::to_value(&progress).expect("serialize");
         assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn progress_marker_integer_preserves_arbitrary_width_and_rejects_fractional_values() {
+        let accepted_wire = "922337203685477580812345678901234567890";
+        let accepted: ProgressMarker =
+            serde_json::from_str(accepted_wire).expect("arbitrary-width progress marker parses");
+        assert!(matches!(
+            &accepted,
+            ProgressMarker::Number(value)
+                if value.as_str() == "922337203685477580812345678901234567890"
+        ));
+        assert_eq!(
+            serde_json::to_string(&accepted).expect("arbitrary-width progress marker encodes"),
+            accepted_wire,
+            "the exact integer progress marker lexeme round-trips"
+        );
+
+        assert!(
+            serde_json::from_str::<ProgressMarker>("922337203685477580812345678901234567890.5")
+                .is_err(),
+            "changing only the integer progress marker to a fractional number rejects it"
+        );
     }
 
     #[test]
@@ -5271,7 +5322,7 @@ mod tests {
         assert!(matches!(from_string, ProgressMarker::String(_)));
 
         let from_i64: ProgressMarker = 99i64.into();
-        assert!(matches!(from_i64, ProgressMarker::Number(99)));
+        assert!(matches!(from_i64, ProgressMarker::Number(value) if value.as_str() == "99"));
     }
 
     #[test]
@@ -5283,13 +5334,22 @@ mod tests {
             ),
             "progress_value_test_1"
         );
-        assert_eq!(format!("{}", ProgressMarker::Number(42)), "42");
+        assert_eq!(
+            format!("{}", ProgressMarker::Number(JsonInteger::from(42_i64))),
+            "42"
+        );
     }
 
     #[test]
     fn progress_marker_equality() {
-        assert_eq!(ProgressMarker::Number(1), ProgressMarker::Number(1));
-        assert_ne!(ProgressMarker::Number(1), ProgressMarker::Number(2));
+        assert_eq!(
+            ProgressMarker::Number(JsonInteger::from(1_i64)),
+            ProgressMarker::Number(JsonInteger::from(1_i64))
+        );
+        assert_ne!(
+            ProgressMarker::Number(JsonInteger::from(1_i64)),
+            ProgressMarker::Number(JsonInteger::from(2_i64))
+        );
         assert_eq!(
             ProgressMarker::String("a".to_string()),
             ProgressMarker::String("a".to_string())
@@ -6075,6 +6135,47 @@ mod tests {
     }
 
     #[test]
+    fn final_catalog_ttl_ms_preserves_an_unbounded_wire_integer() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_LIST, Some(&params))
+            .expect("final tools/list request");
+        let accepted = r#"{"resultType":"complete","tools":[],"ttlMs":18446744073709551616,"cacheScope":"private"}"#;
+        let decoded = request
+            .decode_result(accepted)
+            .expect("the unbounded nonnegative final TTL is admitted");
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = &decoded else {
+            panic!("final tools/list result");
+        };
+        assert_eq!(result.payload.ttl_ms.as_str(), "18446744073709551616");
+        assert_eq!(
+            result.payload.ttl_ms.try_as_millis(),
+            Err(crate::result::CacheTtlConversionError::RuntimeOutOfRange),
+            "only the runtime conversion rejects the one-over-u64 TTL"
+        );
+        assert_eq!(
+            decoded.encode().expect("unbounded final TTL re-encodes"),
+            accepted
+        );
+
+        let fractional = r#"{"resultType":"complete","tools":[],"ttlMs":18446744073709551616.5,"cacheScope":"private"}"#;
+        assert!(
+            matches!(
+                request.decode_result(fractional),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_LIST,
+                })
+            ),
+            "changing only ttlMs from a huge integer to a fraction must reject"
+        );
+    }
+
+    #[test]
     fn final_retry_parameters_preserve_input_state_and_require_object_arguments() {
         let call_params = serde_json::json!({
             "_meta": {
@@ -6364,7 +6465,14 @@ mod tests {
             Some("Use tools before answering."),
             "instructions remain part of the typed discovery result"
         );
-        assert_eq!(decoded.cache_hints().ttl_ms(), 60_000);
+        assert_eq!(
+            decoded
+                .cache_hints()
+                .ttl_ms()
+                .try_as_millis()
+                .expect("local TTL fits the runtime domain"),
+            60_000
+        );
         assert!(!decoded.cache_hints().is_public());
         assert_eq!(
             serde_json::from_str::<Value>(&result.encode().expect("typed result re-encodes"))
@@ -8087,7 +8195,7 @@ mod tests {
             name: "add".to_string(),
             arguments: Some(serde_json::json!({"a": 1, "b": 2})),
             meta: Some(RequestMeta {
-                progress_marker: Some(ProgressMarker::Number(100)),
+                progress_marker: Some(ProgressMarker::Number(JsonInteger::from(100_i64))),
             }),
         };
         let value = serde_json::to_value(&params).expect("serialize");
@@ -9064,7 +9172,10 @@ mod tests {
             "name".to_string(),
             ElicitContentValue::String("Alice".to_string()),
         );
-        content.insert("age".to_string(), ElicitContentValue::Int(30));
+        content.insert(
+            "age".to_string(),
+            ElicitContentValue::Int(JsonInteger::from(30_i64)),
+        );
         content.insert("active".to_string(), ElicitContentValue::Bool(true));
 
         let result = ElicitResult::accept(content);
@@ -9072,8 +9183,38 @@ mod tests {
         assert!(!result.is_declined());
         assert!(!result.is_cancelled());
         assert_eq!(result.get_string("name"), Some("Alice"));
-        assert_eq!(result.get_int("age"), Some(30));
+        assert_eq!(result.get_int("age").map(JsonInteger::as_str), Some("30"));
         assert_eq!(result.get_bool("active"), Some(true));
+    }
+
+    #[test]
+    fn elicit_integer_content_preserves_arbitrary_width_and_distinguishes_fractional_values() {
+        let integer_wire =
+            r#"{"action":"accept","content":{"count":922337203685477580812345678901234567890}}"#;
+        let integer: ElicitResult =
+            serde_json::from_str(integer_wire).expect("arbitrary-width elicitation integer parses");
+        assert_eq!(
+            integer.get_int("count").map(JsonInteger::as_str),
+            Some("922337203685477580812345678901234567890")
+        );
+        assert_eq!(
+            serde_json::to_string(&integer).expect("arbitrary-width elicitation integer encodes"),
+            integer_wire,
+            "the exact integer elicitation value lexeme round-trips"
+        );
+
+        let fractional: ElicitResult = serde_json::from_str(
+            r#"{"action":"accept","content":{"count":922337203685477580812345678901234567890.5}}"#,
+        )
+        .expect("changing only the elicitation value to fractional remains a valid float");
+        assert!(matches!(
+            fractional
+                .content
+                .as_ref()
+                .and_then(|content| content.get("count")),
+            Some(ElicitContentValue::Float(_))
+        ));
+        assert!(fractional.get_int("count").is_none());
     }
 
     #[test]
@@ -9094,7 +9235,7 @@ mod tests {
         assert!(matches!(s, ElicitContentValue::String(_)));
 
         let i: ElicitContentValue = 42i64.into();
-        assert!(matches!(i, ElicitContentValue::Int(42)));
+        assert!(matches!(i, ElicitContentValue::Int(value) if value.as_str() == "42"));
 
         let b: ElicitContentValue = true.into();
         assert!(matches!(b, ElicitContentValue::Bool(true)));

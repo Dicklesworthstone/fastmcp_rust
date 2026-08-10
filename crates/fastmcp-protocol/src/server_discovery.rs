@@ -13,6 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, se
 use serde_json::Value;
 
 use crate::common_types::OpenMetadata;
+use crate::result::CacheTtl;
 use crate::{
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, ResultPeerDiagnostic,
     ServerInfo, protocol_version::FINAL_PROTOCOL_VERSION,
@@ -261,10 +262,10 @@ const COMPLETE_DISCOVERY_RESULT_TYPE: &str = "complete";
 /// Safe local construction is intentionally limited to the private scope.
 /// A public cache scope is peer provenance admitted only while decoding an
 /// already-received wire result; it is not a general authority grant.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DiscoveryCacheHints {
     #[serde(rename = "ttlMs")]
-    ttl_ms: u64,
+    ttl_ms: CacheTtl,
     #[serde(rename = "cacheScope")]
     scope: DiscoveryCacheScope,
 }
@@ -273,26 +274,26 @@ impl DiscoveryCacheHints {
     /// Creates a server-generated, private cache hint with a nonnegative TTL
     /// in milliseconds.
     #[must_use]
-    pub const fn private_ttl_ms(ttl_ms: u64) -> Self {
+    pub fn private_ttl_ms(ttl_ms: u64) -> Self {
         Self {
-            ttl_ms,
+            ttl_ms: CacheTtl::milliseconds(ttl_ms),
             scope: DiscoveryCacheScope::Private,
         }
     }
 
-    /// Returns the cache TTL in milliseconds.
+    /// Returns the lossless cache TTL wire value.
     #[must_use]
-    pub const fn ttl_ms(self) -> u64 {
-        self.ttl_ms
+    pub fn ttl_ms(&self) -> &CacheTtl {
+        &self.ttl_ms
     }
 
     /// Returns whether this was an admitted public peer cache hint.
     #[must_use]
-    pub const fn is_public(self) -> bool {
+    pub const fn is_public(&self) -> bool {
         matches!(self.scope, DiscoveryCacheScope::Public)
     }
 
-    const fn from_peer_wire(ttl_ms: u64, scope: DiscoveryCacheScope) -> Self {
+    const fn from_peer_wire(ttl_ms: CacheTtl, scope: DiscoveryCacheScope) -> Self {
         Self { ttl_ms, scope }
     }
 }
@@ -650,8 +651,8 @@ impl ServerDiscoverResult {
 
     /// Returns the required cache hints attached to this discovery result.
     #[must_use]
-    pub const fn cache_hints(&self) -> DiscoveryCacheHints {
-        self.cache_hints
+    pub const fn cache_hints(&self) -> &DiscoveryCacheHints {
+        &self.cache_hints
     }
 }
 
@@ -668,7 +669,7 @@ struct ServerDiscoverResultWire {
     #[serde(default)]
     instructions: OptionalServerInstructions,
     #[serde(rename = "ttlMs")]
-    ttl_ms: u64,
+    ttl_ms: CacheTtl,
     #[serde(rename = "cacheScope")]
     cache_scope: DiscoveryCacheScope,
     #[serde(flatten)]
@@ -895,8 +896,55 @@ mod tests {
             decoded.instructions().map(ServerInstructions::as_str),
             Some("")
         );
-        assert_eq!(decoded.cache_hints().ttl_ms(), 60_000);
+        assert_eq!(
+            decoded
+                .cache_hints()
+                .ttl_ms()
+                .try_as_millis()
+                .expect("local TTL fits the runtime domain"),
+            60_000
+        );
         assert!(!decoded.cache_hints().is_public());
+    }
+
+    #[test]
+    fn server_discover_ttl_ms_preserves_an_unbounded_wire_integer() {
+        let admitted = ServerDiscoverResult::new(
+            fully_installed_capabilities(),
+            ServerInfo {
+                name: "contract-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            DiscoveryCacheHints::private_ttl_ms(u64::MAX),
+        );
+        let mut accepted = serde_json::to_value(&admitted).expect("local discovery result encodes");
+        accepted["ttlMs"] = serde_json::from_str("18446744073709551616")
+            .expect("the one-over-u64 TTL is valid JSON");
+
+        let decoded: ServerDiscoverResult = serde_json::from_value(accepted.clone())
+            .expect("the unbounded nonnegative discovery TTL is admitted");
+        assert_eq!(
+            decoded.cache_hints().ttl_ms().as_str(),
+            "18446744073709551616"
+        );
+        assert_eq!(
+            decoded.cache_hints().ttl_ms().try_as_millis(),
+            Err(crate::result::CacheTtlConversionError::RuntimeOutOfRange),
+            "only the runtime conversion rejects the one-over-u64 TTL"
+        );
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("unbounded discovery TTL re-encodes"),
+            accepted
+        );
+
+        let mut fractional = accepted;
+        fractional["ttlMs"] = serde_json::from_str("18446744073709551616.5")
+            .expect("the fractional mutation is valid JSON");
+        assert!(
+            serde_json::from_value::<ServerDiscoverResult>(fractional).is_err(),
+            "changing only ttlMs from a huge integer to a fraction must reject"
+        );
     }
 
     #[test]

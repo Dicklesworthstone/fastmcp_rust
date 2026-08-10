@@ -142,26 +142,45 @@ impl fmt::Display for TaskWireError {
 
 impl std::error::Error for TaskWireError {}
 
-/// A positive integer millisecond duration with canonical integer emission.
+/// A positive integer millisecond duration retaining its exact JSON spelling.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskDuration(u64);
+pub struct TaskDuration(JsonInteger);
+
+/// Failure while converting a final task duration for a bounded local runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskDurationConversionError {
+    /// The valid wire integer exceeds the local `u64` millisecond domain.
+    RuntimeOutOfRange,
+}
+
+impl fmt::Display for TaskDurationConversionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("task duration exceeds the local u64 millisecond runtime domain")
+    }
+}
+
+impl std::error::Error for TaskDurationConversionError {}
 
 impl TaskDuration {
-    /// Admits an exactly representable positive JSON mathematical integer.
+    /// Admits a positive JSON mathematical integer without narrowing it.
     pub fn from_json_integer(value: JsonInteger) -> Result<Self, TaskWireError> {
-        let canonical = canonical_positive_integer(value.as_str())?;
-        canonical
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0)
-            .map(Self)
+        task_duration_is_positive(value.as_str())
+            .then_some(Self(value))
             .ok_or(TaskWireError::Invalid("duration"))
     }
 
-    /// Returns the retained millisecond count.
+    /// Returns the exact positive JSON-integer wire spelling.
     #[must_use]
-    pub const fn as_millis(&self) -> u64 {
-        self.0
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Converts this wire value into the bounded local millisecond domain.
+    ///
+    /// This is intentionally checked: the final Tasks schema has no maximum,
+    /// while local duration APIs accept at most `u64` milliseconds.
+    pub fn try_as_millis(&self) -> Result<u64, TaskDurationConversionError> {
+        task_duration_runtime_millis(self.0.as_str())
     }
 }
 
@@ -170,7 +189,7 @@ impl Serialize for TaskDuration {
     where
         S: Serializer,
     {
-        serializer.serialize_u64(self.0)
+        self.0.serialize(serializer)
     }
 }
 
@@ -184,47 +203,58 @@ impl<'de> Deserialize<'de> for TaskDuration {
     }
 }
 
-fn canonical_positive_integer(value: &str) -> Result<String, TaskWireError> {
-    let (negative, body) = match value.strip_prefix('-') {
-        Some(body) => (true, body),
-        None => (false, value),
+fn task_duration_is_positive(lexeme: &str) -> bool {
+    !lexeme.starts_with('-')
+        && lexeme
+            .split(['e', 'E'])
+            .next()
+            .is_some_and(|mantissa| mantissa.bytes().any(|byte| matches!(byte, b'1'..=b'9')))
+}
+
+fn task_duration_runtime_millis(lexeme: &str) -> Result<u64, TaskDurationConversionError> {
+    let (mantissa, exponent) = match lexeme.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent),
+        None => (lexeme, "0"),
     };
-    if negative {
-        return Err(TaskWireError::Invalid("duration"));
-    }
-    let (mantissa, exponent) = match body.find(['e', 'E']) {
-        Some(index) => (&body[..index], body[index + 1..].parse::<i32>().ok()),
-        None => (body, Some(0)),
-    };
-    let exponent = exponent.ok_or(TaskWireError::Invalid("duration"))?;
+    let exponent = exponent
+        .parse::<i128>()
+        .map_err(|_| TaskDurationConversionError::RuntimeOutOfRange)?;
     let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if whole.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(TaskWireError::Invalid("duration"));
-    }
     let digits = format!("{whole}{fraction}");
-    let shift =
-        exponent - i32::try_from(fraction.len()).map_err(|_| TaskWireError::Invalid("duration"))?;
-    let result = if shift >= 0 {
-        let zeros = usize::try_from(shift).map_err(|_| TaskWireError::Invalid("duration"))?;
-        format!("{digits}{}", "0".repeat(zeros))
-    } else {
-        let trim = usize::try_from(-shift).map_err(|_| TaskWireError::Invalid("duration"))?;
-        if digits.len() < trim
-            || !digits.as_bytes()[digits.len() - trim..]
-                .iter()
-                .all(|byte| *byte == b'0')
-        {
-            return Err(TaskWireError::Invalid("duration"));
+    let fraction_len = i128::try_from(fraction.len())
+        .map_err(|_| TaskDurationConversionError::RuntimeOutOfRange)?;
+    let decimal_shift = exponent
+        .checked_sub(fraction_len)
+        .ok_or(TaskDurationConversionError::RuntimeOutOfRange)?;
+    let integer_digits = if decimal_shift >= 0 {
+        let zeroes = usize::try_from(decimal_shift)
+            .map_err(|_| TaskDurationConversionError::RuntimeOutOfRange)?;
+        let length = digits
+            .len()
+            .checked_add(zeroes)
+            .ok_or(TaskDurationConversionError::RuntimeOutOfRange)?;
+        if length > 20 {
+            return Err(TaskDurationConversionError::RuntimeOutOfRange);
         }
-        digits[..digits.len() - trim].to_owned()
+        format!("{digits}{}", "0".repeat(zeroes))
+    } else {
+        let trimmed = usize::try_from(decimal_shift.unsigned_abs())
+            .map_err(|_| TaskDurationConversionError::RuntimeOutOfRange)?;
+        let Some(length) = digits.len().checked_sub(trimmed) else {
+            return Err(TaskDurationConversionError::RuntimeOutOfRange);
+        };
+        if !digits[length..].bytes().all(|byte| byte == b'0') {
+            return Err(TaskDurationConversionError::RuntimeOutOfRange);
+        }
+        digits[..length].to_owned()
     };
-    let canonical = result.trim_start_matches('0');
-    (!canonical.is_empty())
-        .then(|| canonical.to_owned())
-        .ok_or(TaskWireError::Invalid("duration"))
+    let normalized = integer_digits.trim_start_matches('0');
+    if normalized.is_empty() || normalized.len() > 20 {
+        return Err(TaskDurationConversionError::RuntimeOutOfRange);
+    }
+    normalized
+        .parse()
+        .map_err(|_| TaskDurationConversionError::RuntimeOutOfRange)
 }
 
 /// A strict final task timestamp retained in canonical final spelling.
@@ -1290,9 +1320,36 @@ mod tests {
             status_message: None,
             created_at: TaskTimestamp::parse("2026-07-28T12:00:00.000Z").expect("timestamp"),
             last_updated_at: TaskTimestamp::parse("2026-07-28T12:00:00.000Z").expect("timestamp"),
-            ttl_ms: Some(TaskDuration(1)),
+            ttl_ms: Some(
+                TaskDuration::from_json_integer(JsonInteger::from(1_u64))
+                    .expect("positive test duration"),
+            ),
             poll_interval_ms: None,
         }
+    }
+
+    #[test]
+    fn task_duration_retains_unbounded_wire_integer_until_checked_runtime_conversion() {
+        let duration: TaskDuration = serde_json::from_str("18446744073709551616")
+            .expect("an unbounded positive final task duration is valid on the wire");
+        assert_eq!(duration.as_str(), "18446744073709551616");
+        assert_eq!(
+            serde_json::to_string(&duration).expect("unbounded duration re-encodes"),
+            "18446744073709551616"
+        );
+        assert_eq!(
+            duration.try_as_millis(),
+            Err(TaskDurationConversionError::RuntimeOutOfRange),
+            "only the bounded runtime conversion rejects the one-over-u64 duration"
+        );
+        assert!(
+            serde_json::from_str::<TaskDuration>("18446744073709551616.5").is_err(),
+            "changing only the huge duration to a fraction must reject"
+        );
+        assert!(
+            serde_json::from_str::<TaskDuration>("-18446744073709551616").is_err(),
+            "changing only the huge duration to negative must reject"
+        );
     }
 
     #[test]
