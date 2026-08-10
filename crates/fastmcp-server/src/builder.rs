@@ -114,7 +114,7 @@ fn protocol_policy_from_server_launch_environment()
 }
 
 const fn legacy_protocol_is_available() -> bool {
-    cfg!(any(feature = "legacy-2024-11-05", test))
+    cfg!(feature = "legacy-2024-11-05")
 }
 
 fn resolve_protocol_policy(
@@ -456,15 +456,26 @@ impl ServerBuilder {
     /// `LegacyOnly` reject an opening frame from the other exact supported era before it can enter
     /// request dispatch. In a no-legacy production build, `Auto` and `LegacyOnly` return
     /// [`ServerLaunchPolicyError::FeatureUnavailable`] before either can be stored.
-    pub fn protocol_policy(
-        mut self,
+    pub fn protocol_policy(mut self, policy: ProtocolPolicy) -> Result<Self, ServerLaunchPolicyError> {
+        self.try_set_protocol_policy(policy)?;
+        Ok(self)
+    }
+
+    /// Attempts to select the immutable MCP protocol-era policy without
+    /// consuming the builder.
+    ///
+    /// A policy unavailable in the compiled feature set is rejected before
+    /// this builder is changed. A reserved launch policy still takes
+    /// precedence over an explicit builder selection.
+    pub fn try_set_protocol_policy(
+        &mut self,
         policy: ProtocolPolicy,
-    ) -> Result<Self, ServerLaunchPolicyError> {
+    ) -> Result<(), ServerLaunchPolicyError> {
         resolve_protocol_policy(Some(policy), legacy_protocol_is_available())?;
         if self.launch_protocol_policy.is_none() {
             self.protocol_policy = policy;
         }
-        Ok(self)
+        Ok(())
     }
 
     /// Installs the server's modern-only extension handlers and discovery settings.
@@ -2905,23 +2916,54 @@ mod tests {
         assert_eq!(protocol_policy_from_server_launch_value(None), Ok(None));
     }
 
+    #[cfg(not(feature = "legacy-2024-11-05"))]
     #[test]
-    fn no_legacy_construction_defaults_to_modern_only() {
-        assert_eq!(
-            resolve_protocol_policy(None, false),
-            Ok(ProtocolPolicy::ModernOnly)
-        );
+    fn no_legacy_public_builder_defaults_to_modern_only() {
+        let server = ServerBuilder::try_new("srv", "1.0")
+            .expect("no-legacy construction must succeed")
+            .try_build()
+            .expect("the default no-legacy builder must build");
+
+        assert_eq!(server.protocol_policy(), ProtocolPolicy::ModernOnly);
     }
 
+    #[cfg(not(feature = "legacy-2024-11-05"))]
     #[test]
-    fn no_legacy_construction_rejects_every_policy_requiring_legacy_behavior() {
+    fn no_legacy_public_builder_rejects_legacy_policies_without_mutation() {
         for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+            let mut builder = ServerBuilder::try_new("srv", "1.0")
+                .expect("no-legacy construction must succeed");
+
             assert_eq!(
-                resolve_protocol_policy(Some(policy), false),
+                builder.try_set_protocol_policy(policy),
                 Err(ServerLaunchPolicyError::FeatureUnavailable),
-                "{policy:?} differs from the modern-only no-legacy default only by requiring legacy behavior"
+                "{policy:?} must reject before changing a no-legacy builder"
+            );
+
+            let server = builder
+                .try_build()
+                .expect("a rejected policy must leave the builder buildable");
+            assert_eq!(
+                server.protocol_policy(),
+                ProtocolPolicy::ModernOnly,
+                "{policy:?} differs from the default only by requiring unavailable legacy behavior"
             );
         }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_enabled_public_builder_preserves_auto() {
+        let mut builder = ServerBuilder::try_new("srv", "1.0")
+            .expect("legacy-enabled construction must succeed");
+        builder
+            .try_set_protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must remain available with the legacy adapter enabled");
+
+        let server = builder
+            .try_build()
+            .expect("legacy-enabled Auto builder must build");
+        assert_eq!(server.protocol_policy(), ProtocolPolicy::Auto);
     }
 
     #[test]
@@ -2940,6 +2982,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn valid_launch_policy_wins_over_explicit_builder_policy() {
         let server = ServerBuilder::from_launch_protocol_policy(
