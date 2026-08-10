@@ -456,7 +456,10 @@ impl ServerBuilder {
     /// `LegacyOnly` reject an opening frame from the other exact supported era before it can enter
     /// request dispatch. In a no-legacy production build, `Auto` and `LegacyOnly` return
     /// [`ServerLaunchPolicyError::FeatureUnavailable`] before either can be stored.
-    pub fn protocol_policy(mut self, policy: ProtocolPolicy) -> Result<Self, ServerLaunchPolicyError> {
+    pub fn protocol_policy(
+        mut self,
+        policy: ProtocolPolicy,
+    ) -> Result<Self, ServerLaunchPolicyError> {
         self.try_set_protocol_policy(policy)?;
         Ok(self)
     }
@@ -2931,8 +2934,8 @@ mod tests {
     #[test]
     fn no_legacy_public_builder_rejects_legacy_policies_without_mutation() {
         for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
-            let mut builder = ServerBuilder::try_new("srv", "1.0")
-                .expect("no-legacy construction must succeed");
+            let mut builder =
+                ServerBuilder::try_new("srv", "1.0").expect("no-legacy construction must succeed");
 
             assert_eq!(
                 builder.try_set_protocol_policy(policy),
@@ -2954,8 +2957,8 @@ mod tests {
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_enabled_public_builder_preserves_auto() {
-        let mut builder = ServerBuilder::try_new("srv", "1.0")
-            .expect("legacy-enabled construction must succeed");
+        let mut builder =
+            ServerBuilder::try_new("srv", "1.0").expect("legacy-enabled construction must succeed");
         builder
             .try_set_protocol_policy(ProtocolPolicy::Auto)
             .expect("Auto must remain available with the legacy adapter enabled");
