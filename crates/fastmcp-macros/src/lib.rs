@@ -423,32 +423,58 @@ mod helper_tests {
 
     #[test]
     fn template_params_basic() {
-        let params = extract_template_params("users/{id}/posts/{post_id}");
+        let params = extract_template_params("users/{id}/posts/{post_id}")
+            .expect("simple template parameters parse");
         assert_eq!(params, vec!["id", "post_id"]);
     }
 
     #[test]
     fn template_params_none() {
-        let params = extract_template_params("static/path/no/params");
+        let params = extract_template_params("static/path/no/params")
+            .expect("literal-only template parses");
         assert!(params.is_empty());
     }
 
     #[test]
     fn template_params_single() {
-        let params = extract_template_params("config://{name}");
+        let params = extract_template_params("config://{name}")
+            .expect("single parameter template parses");
         assert_eq!(params, vec!["name"]);
     }
 
     #[test]
     fn template_params_adjacent_braces() {
-        let params = extract_template_params("{a}{b}");
+        let params =
+            extract_template_params("{a}{b}").expect("adjacent expressions parse");
         assert_eq!(params, vec!["a", "b"]);
     }
 
     #[test]
-    fn template_params_empty_braces_skipped() {
-        let params = extract_template_params("prefix/{}");
-        assert!(params.is_empty());
+    fn template_params_parse_level_four_operators_varlists_and_modifiers() {
+        let params = extract_template_params(
+            "mcp://resource{/collection}{?revision,locale*}{+path:12}{#fragment}{.label}{;matrix}{&continuation}",
+        )
+        .expect("level-four template expressions parse");
+        assert_eq!(
+            params,
+            vec![
+                "collection",
+                "revision",
+                "locale",
+                "path",
+                "fragment",
+                "label",
+                "matrix",
+                "continuation",
+            ]
+        );
+    }
+
+    #[test]
+    fn template_params_reject_one_variable_malformed_prefix() {
+        let error = extract_template_params("mcp://resource/{item:0}")
+            .expect_err("zero-valued prefix modifier is malformed");
+        assert!(error.contains("positive decimal prefix"));
     }
 
     #[test]
@@ -478,27 +504,167 @@ mod helper_tests {
     }
 }
 
-/// Extracts template parameter names from a URI template string.
-fn extract_template_params(uri: &str) -> Vec<String> {
+/// Extracts RFC 6570 Level 4 variable names from a URI template string.
+///
+/// The resource macro needs Rust argument names, not expression syntax. This
+/// parser therefore removes expression operators and varspec modifiers before
+/// returning each variable name: `{?revision,locale*}` becomes `revision` and
+/// `locale`, while `{+path:12}` becomes `path`.
+fn extract_template_params(uri: &str) -> Result<Vec<String>, String> {
     let mut params = Vec::new();
-    let mut chars = uri.chars();
+    let bytes = uri.as_bytes();
+    let mut cursor = 0;
 
-    while let Some(ch) = chars.next() {
-        if ch == '{' {
-            let mut name = String::new();
-            for next in chars.by_ref() {
-                if next == '}' {
-                    break;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'{' => {
+                let expression_start = cursor;
+                cursor += 1;
+                let body_start = cursor;
+                while cursor < bytes.len() && bytes[cursor] != b'}' {
+                    if bytes[cursor] == b'{' {
+                        return Err(format!(
+                            "nested '{{' in URI-template expression starting at byte {expression_start}"
+                        ));
+                    }
+                    cursor += 1;
                 }
-                name.push(next);
+                if cursor == bytes.len() {
+                    return Err(format!(
+                        "unterminated URI-template expression starting at byte {expression_start}"
+                    ));
+                }
+                params.extend(parse_template_expression(
+                    &uri[body_start..cursor],
+                    body_start,
+                )?);
+                cursor += 1;
             }
-            if !name.is_empty() {
-                params.push(name);
+            b'}' => {
+                return Err(format!("unmatched '}}' in URI template at byte {cursor}"));
             }
+            b'%' if cursor + 2 < bytes.len()
+                && bytes[cursor + 1].is_ascii_hexdigit()
+                && bytes[cursor + 2].is_ascii_hexdigit() =>
+            {
+                cursor += 3;
+            }
+            b'%' => {
+                return Err(format!(
+                    "invalid percent-encoding in URI template at byte {cursor}"
+                ));
+            }
+            _ => cursor += 1,
         }
     }
 
-    params
+    Ok(params)
+}
+
+/// Parses one RFC 6570 expression body, excluding its surrounding braces.
+fn parse_template_expression(
+    expression: &str,
+    byte_offset: usize,
+) -> Result<Vec<String>, String> {
+    if expression.is_empty() {
+        return Err(format!("empty URI-template expression at byte {byte_offset}"));
+    }
+
+    let mut variable_offset = byte_offset;
+    let variable_list = match expression.as_bytes()[0] {
+        b'+' | b'#' | b'.' | b'/' | b';' | b'?' | b'&' => {
+            variable_offset += 1;
+            &expression[1..]
+        }
+        _ => expression,
+    };
+
+    if variable_list.is_empty() {
+        return Err(format!(
+            "URI-template operator at byte {byte_offset} requires a variable list"
+        ));
+    }
+
+    let mut variables = Vec::new();
+    for variable in variable_list.split(',') {
+        if variable.is_empty() {
+            return Err(format!(
+                "empty URI-template variable in expression at byte {variable_offset}"
+            ));
+        }
+        variables.push(parse_template_variable(variable, variable_offset)?);
+        variable_offset += variable.len() + 1;
+    }
+    Ok(variables)
+}
+
+/// Parses an RFC 6570 varspec and returns only its variable name.
+fn parse_template_variable(variable: &str, byte_offset: usize) -> Result<String, String> {
+    let (variable, exploded) = match variable.strip_suffix('*') {
+        Some(name) => (name, true),
+        None => (variable, false),
+    };
+
+    let (name, prefix) = match variable.rsplit_once(':') {
+        Some((name, prefix)) => (name, Some(prefix)),
+        None => (variable, None),
+    };
+
+    if exploded && prefix.is_some() {
+        return Err(format!(
+            "URI-template variable at byte {byte_offset} cannot combine ':' and '*' modifiers"
+        ));
+    }
+    if let Some(prefix) = prefix {
+        let prefix_bytes = prefix.as_bytes();
+        if prefix_bytes.len() > 4
+            || !matches!(prefix_bytes.first(), Some(b'1'..=b'9'))
+            || !prefix_bytes.iter().all(u8::is_ascii_digit)
+        {
+            return Err(format!(
+                "URI-template variable at byte {byte_offset} requires a positive decimal prefix of at most four digits"
+            ));
+        }
+    }
+
+    validate_template_variable_name(name, byte_offset)?;
+    Ok(name.to_owned())
+}
+
+/// Validates RFC 6570 `varname = varchar *( "." varchar )` syntax.
+fn validate_template_variable_name(name: &str, byte_offset: usize) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("empty URI-template variable at byte {byte_offset}"));
+    }
+
+    for component in name.split('.') {
+        if component.is_empty() {
+            return Err(format!(
+                "URI-template variable at byte {byte_offset} has an empty dotted name component"
+            ));
+        }
+
+        let bytes = component.as_bytes();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' => cursor += 1,
+                b'%' if cursor + 2 < bytes.len()
+                    && bytes[cursor + 1].is_ascii_hexdigit()
+                    && bytes[cursor + 2].is_ascii_hexdigit() =>
+                {
+                    cursor += 3;
+                }
+                _ => {
+                    return Err(format!(
+                        "invalid URI-template variable name at byte {}",
+                        byte_offset + cursor
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Converts a snake_case identifier to PascalCase.
@@ -3975,7 +4141,17 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|tag| quote! { #tag.to_string() })
         .collect();
 
-    let template_params = extract_template_params(&uri);
+    let template_params = match extract_template_params(&uri) {
+        Ok(params) => params,
+        Err(error) => {
+            return syn::Error::new_spanned(
+                &input_fn.sig.ident,
+                format!("invalid resource URI template: {error}"),
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
 
     // Parse parameters (skip first if it's &McpContext)
     let mut params: Vec<(&Ident, &Type)> = Vec::new();
