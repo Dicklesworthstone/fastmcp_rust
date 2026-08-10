@@ -2568,12 +2568,14 @@ fn http_request_accepts_sse(request: &HttpRequest) -> bool {
 /// Modern Streamable HTTP POSTs, including discovery, are independently
 /// dispatched and neither emit nor accept `MCP-Session-Id`. A final
 /// `subscriptions/listen` SSE body retains its request-owned dispatch only for
-/// that response body. Exact MCP 2024-11-05 requests retain the
-/// transport-issued session identifier, lifecycle adapter, and SSE response
-/// stream for this one session.
+/// that response body, while the endpoint retains modern continuation state
+/// across stateless POSTs until endpoint shutdown. Exact MCP 2024-11-05
+/// requests retain the transport-issued session identifier, lifecycle adapter,
+/// and SSE response stream for this one session.
 pub struct ServerHttpEndpoint {
     server: Arc<Server>,
     legacy_origin: String,
+    modern_connection: Arc<ModernConnection>,
 }
 
 /// A server-owned session opened through [`ServerHttpEndpoint`].
@@ -2595,8 +2597,8 @@ pub struct ServerHttpSession {
     legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
     legacy_pending_requests: Arc<PendingRequests>,
     legacy_runtime: LiveLegacy2024ConnectionRuntime,
-    /// The request-local modern partition and retained-continuation owner.
-    /// Closing the session cancels every MRTR state minted by this POST.
+    /// The endpoint-owned modern continuation namespace shared by stateless
+    /// POSTs. Closing one request body must not disconnect it.
     modern_connection: Arc<ModernConnection>,
     /// Owned modern listen dispatches whose SSE bodies were returned to the
     /// embedding caller. Handles are retained because dropping an asupersync
@@ -3001,6 +3003,11 @@ const MAX_FINAL_SUBSCRIPTION_STREAMS: usize = 64;
 /// collapsing unrelated HTTP response streams that happen to reuse a JSON-RPC
 /// request ID.
 static NEXT_MODERN_HTTP_STREAM_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque endpoint-local ownership for live modern response bodies. This is
+/// intentionally unrelated to JSON-RPC request IDs and never appears on the
+/// wire, so listener teardown can own every active SSE dispatch.
+static NEXT_LIVE_MODERN_HTTP_RESPONSE_BODY_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// A server-wide registry of request-owned final subscription streams.
 ///
