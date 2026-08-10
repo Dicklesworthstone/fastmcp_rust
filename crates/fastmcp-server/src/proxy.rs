@@ -3,17 +3,16 @@
 //! This module provides lightweight proxy handlers that forward tool/resource/prompt
 //! calls to another MCP server via a backend client.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
-use fastmcp_client::http_executor::{
-    LegacySseHttpClient, ModernHttpClient, ModernHttpResponseKind,
-};
+use fastmcp_client::http_executor::{ModernHttpClient, ModernHttpResponseKind};
 use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{
-    Client, ClientHttpConnection, ClientProtocolPlan, FinalToolCallOutcome,
-    ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
+    Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse,
+    ClientProtocolPlan, FinalToolCallOutcome, ModernHttpSubscriptionListenEvent,
+    ModernHttpSubscriptionListener, ReverseRequestHandlers,
 };
 use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpResult, block_on};
 use fastmcp_protocol::common_types::RawIcon;
@@ -28,16 +27,15 @@ use fastmcp_protocol::protocol_policy::{
     StdioEraDecision, StdioOpeningFrame,
 };
 use fastmcp_protocol::{
-    CacheScope, CacheTtl, CallToolResult, CancellationSender, CancellationWireMessage,
-    ClientCapabilities, ClientExtensionDiscovery, ClientInfo, CompleteResult, Content, CoreRequest,
-    CoreResult, CreateMessageParams, CreateTaskResult, ExtensionDescriptorRegistry,
-    ExtensionDirection, ExtensionSettings, FinalCallToolResult, FinalCancelTaskParams,
-    FinalCancelTaskResult, FinalCoreResult, FinalGetPromptResult, FinalGetTaskParams,
-    FinalGetTaskResult, FinalProgressNotificationParams, FinalReadResourceResult, FinalRequestMeta,
-    FinalTaskId, GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage,
-    JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
-    LegacyResourceContent, ListRootsParams, ListRootsResult, Prompt, PromptMessage,
-    ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate,
+    CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientExtensionDiscovery, ClientInfo,
+    CompleteResult, Content, CoreRequest, CoreResult, CreateTaskResult,
+    ExtensionDescriptorRegistry, ExtensionDirection, ExtensionSettings, FinalCallToolResult,
+    FinalCancelTaskParams, FinalCancelTaskResult, FinalCoreResult, FinalGetPromptResult,
+    FinalGetTaskParams, FinalGetTaskResult, FinalProgressNotificationParams,
+    FinalReadResourceResult, FinalRequestMeta, FinalTaskId, GetPromptResult, InitializeParams,
+    InitializeResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent,
+    LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent, ListRootsResult, Prompt,
+    PromptMessage, ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate,
     ServerDiscoverResult, ServerExtensionDiscovery, ServerNotification, SubscriptionFilter,
     Task as FinalTask, TaskInputResponses as FinalTaskInputResponses, Tool, ToolAnnotations,
     UpdateTaskParams, UpdateTaskResult, decode_strict_jsonrpc_message, task_subscription_ids,
@@ -1707,7 +1705,6 @@ pub struct ProxyHttpClient {
     client_capabilities: ClientCapabilities,
     next_request_id: i64,
     legacy_initialized: bool,
-    legacy_retired_request_ids: VecDeque<RequestId>,
 }
 
 impl std::fmt::Debug for ProxyHttpClient {
@@ -1746,7 +1743,6 @@ impl ProxyHttpClient {
             client_capabilities,
             next_request_id,
             legacy_initialized: false,
-            legacy_retired_request_ids: VecDeque::new(),
         }
     }
 
@@ -1799,38 +1795,22 @@ impl ProxyHttpClient {
         if self.legacy_initialized {
             return Ok(());
         }
+        self.configure_legacy_reverse_request_handlers()?;
         let request_id = self.next_request_id()?;
         let parameters = InitializeParams {
             protocol_version: fastmcp_protocol::PROTOCOL_VERSION.to_owned(),
             capabilities: self.client_capabilities.clone(),
             client_info: self.client_info.clone(),
         };
-        let message = JsonRpcMessage::Request(JsonRpcRequest::new(
+        let response = self.request_legacy_response(
             fastmcp_protocol::methods::INITIALIZE,
-            Some(serde_json::to_value(parameters).map_err(|error| {
+            serde_json::to_value(parameters).map_err(|error| {
                 McpError::internal_error(format!(
                     "Proxy HTTP legacy initialize parameters could not be encoded: {error}"
                 ))
-            })?),
+            })?,
             request_id.clone(),
-        ));
-        let response = match &mut self.connection {
-            ClientHttpConnection::LegacySse { client, .. } => {
-                block_on(client.send(&self.cx, &message)).map_err(legacy_http_error)?;
-                receive_legacy_response(
-                    client,
-                    &self.cx,
-                    &self.client_capabilities,
-                    &request_id,
-                    &mut self.legacy_retired_request_ids,
-                )?
-            }
-            ClientHttpConnection::Modern(_) => {
-                return Err(McpError::internal_error(
-                    "Modern HTTP proxy connection entered legacy initialization",
-                ));
-            }
-        };
+        )?;
         if let Some(error) = response.error.as_ref() {
             return Err(McpError::internal_error(format!(
                 "Proxy HTTP legacy initialize was rejected: {} ({})",
@@ -1851,19 +1831,65 @@ impl ProxyHttpClient {
             ));
         }
 
-        let notification = JsonRpcMessage::Request(JsonRpcRequest::initialized_notification());
-        match &mut self.connection {
-            ClientHttpConnection::LegacySse { client, .. } => {
-                block_on(client.send(&self.cx, &notification)).map_err(legacy_http_error)?;
-            }
-            ClientHttpConnection::Modern(_) => {
-                return Err(McpError::internal_error(
-                    "Modern HTTP proxy connection entered legacy lifecycle acknowledgement",
-                ));
-            }
-        }
+        block_on(self.connection.notify(
+            &self.cx,
+            fastmcp_protocol::methods::NOTIFICATIONS_INITIALIZED,
+            None,
+        ))
+        .map_err(proxy_http_connection_error)?;
         self.legacy_initialized = true;
         Ok(())
+    }
+
+    fn configure_legacy_reverse_request_handlers(&mut self) -> McpResult<()> {
+        if self.connection.selected_protocol_era() != ProtocolEra::Legacy2024 {
+            return Err(McpError::internal_error(
+                "Modern HTTP proxy connection entered legacy initialization",
+            ));
+        }
+
+        let mut handlers = ReverseRequestHandlers::new();
+        if self.client_capabilities.sampling.is_some() {
+            handlers = handlers.with_sampling_create_message(|_, _| {
+                Err(McpError::internal_error(
+                    "Proxy HTTP legacy sampling callback is unavailable",
+                ))
+            });
+        }
+        if self.client_capabilities.roots.is_some() {
+            handlers = handlers.with_roots_list(|_, _| Ok(ListRootsResult::empty()));
+        }
+        self.connection
+            .set_legacy_reverse_request_handlers(handlers)
+    }
+
+    fn request_legacy_response(
+        &mut self,
+        method: &str,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+    ) -> McpResult<JsonRpcResponse> {
+        if self.connection.selected_protocol_era() != ProtocolEra::Legacy2024 {
+            return Err(McpError::internal_error(
+                "Modern HTTP proxy connection entered a legacy request path",
+            ));
+        }
+        let response = block_on(
+            self.connection
+                .request(&self.cx, method, parameters, request_id),
+        )
+        .map_err(proxy_http_connection_error)?;
+        match response {
+            ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => Ok(response),
+            ClientHttpResponse::Legacy(JsonRpcMessage::Request(_)) => {
+                Err(McpError::invalid_request(
+                    "Proxy HTTP legacy client returned a request while its response was required",
+                ))
+            }
+            ClientHttpResponse::Modern(_) => Err(McpError::internal_error(
+                "Modern HTTP proxy connection entered a legacy request path",
+            )),
+        }
     }
 
     fn request_result(
@@ -1893,29 +1919,24 @@ impl ProxyHttpClient {
             },
         )?;
         let request_id = self.next_request_id()?;
-        let response = match &mut self.connection {
-            ClientHttpConnection::Modern(client) => receive_modern_response(
-                client,
-                &self.cx,
-                method,
-                parameters,
-                &request_id,
-                on_progress,
-            )?,
-            ClientHttpConnection::LegacySse { client, .. } => {
-                let message = JsonRpcMessage::Request(JsonRpcRequest::new(
-                    method,
-                    Some(parameters),
-                    request_id.clone(),
-                ));
-                block_on(client.send(&self.cx, &message)).map_err(legacy_http_error)?;
-                receive_legacy_response(
+        let response = match self.connection.selected_protocol_era() {
+            ProtocolEra::Modern2026 => {
+                let ClientHttpConnection::Modern(client) = &mut self.connection else {
+                    return Err(McpError::internal_error(
+                        "HTTP proxy connection era disagrees with its modern transport",
+                    ));
+                };
+                receive_modern_response(
                     client,
                     &self.cx,
-                    &self.client_capabilities,
+                    method,
+                    parameters,
                     &request_id,
-                    &mut self.legacy_retired_request_ids,
+                    on_progress,
                 )?
+            }
+            ProtocolEra::Legacy2024 => {
+                self.request_legacy_response(method, parameters, request_id.clone())?
             }
         };
         if let Some(error) = response.error.as_ref() {
@@ -2449,7 +2470,7 @@ fn discovery_admits_final_tasks_relay(discovery: &ServerDiscoverResult) -> McpRe
         })?;
     for method in [
         fastmcp_protocol::TASK_GET,
-        fastmcp_protocol::TASK_UPDATE,
+        fastmcp_protocol::tasks_extension::TASK_UPDATE,
         fastmcp_protocol::TASK_CANCEL,
     ] {
         negotiated
@@ -2596,174 +2617,6 @@ fn forward_modern_progress_notification(
     Ok(())
 }
 
-/// Maximum interleaved control frames accepted while one exact-2024 request
-/// waits for its correlated upstream response.
-const MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES: usize = 64;
-
-/// Maximum cancelled request IDs retained to discard a late response before a
-/// later request consumes the shared exact-2024 SSE stream.
-const MAX_RETIRED_LEGACY_REQUEST_IDS: usize = 64;
-
-fn receive_legacy_response(
-    client: &mut LegacySseHttpClient,
-    cx: &Cx,
-    client_capabilities: &ClientCapabilities,
-    request_id: &RequestId,
-    retired_request_ids: &mut VecDeque<RequestId>,
-) -> McpResult<JsonRpcResponse> {
-    let mut interleaved_control_frames = 0_usize;
-    loop {
-        let message = block_on(client.next_message(cx)).map_err(legacy_http_error)?;
-        let Some(message) = message else {
-            return Err(McpError::invalid_request(
-                "Proxy HTTP legacy SSE stream ended before its correlated result",
-            ));
-        };
-        match message {
-            JsonRpcMessage::Request(request) if request.is_notification() => {
-                admit_legacy_interleaved_control_frame(&mut interleaved_control_frames)?;
-                if request.method == fastmcp_protocol::methods::NOTIFICATIONS_CANCELLED {
-                    let cancellation = CancellationWireMessage::decode(
-                        ProtocolEra::Legacy2024,
-                        CancellationSender::Server,
-                        &request,
-                    )
-                    .map_err(|_| {
-                        McpError::invalid_request(
-                            "Proxy HTTP legacy cancellation notification was invalid",
-                        )
-                    })?;
-                    let CancellationWireMessage::Legacy2024 { params, .. } = cancellation else {
-                        return Err(McpError::invalid_request(
-                            "Proxy HTTP legacy cancellation selected a non-legacy payload",
-                        ));
-                    };
-                    if params.request_id.correlates_with(request_id) {
-                        retire_legacy_request_id(retired_request_ids, request_id)?;
-                        return Err(McpError::request_cancelled());
-                    }
-                }
-            }
-            JsonRpcMessage::Request(request) => {
-                admit_legacy_interleaved_control_frame(&mut interleaved_control_frames)?;
-                let Some(reply) = legacy_reverse_request_reply(&request, client_capabilities)
-                else {
-                    return Err(McpError::invalid_request(
-                        "Proxy HTTP legacy upstream request omitted its JSON-RPC ID",
-                    ));
-                };
-                block_on(client.send(cx, &reply)).map_err(legacy_http_error)?;
-            }
-            JsonRpcMessage::Response(response) => {
-                if response.id.as_ref().is_some_and(|response_id| {
-                    consume_retired_legacy_response(retired_request_ids, response_id)
-                }) {
-                    continue;
-                }
-                return response_for_request(JsonRpcMessage::Response(response), request_id);
-            }
-        }
-    }
-}
-
-fn admit_legacy_interleaved_control_frame(count: &mut usize) -> McpResult<()> {
-    if *count >= MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES {
-        return Err(McpError::invalid_request(
-            "Proxy HTTP legacy request exceeded its interleaved control-frame bound",
-        ));
-    }
-    *count = count.checked_add(1).ok_or_else(|| {
-        McpError::invalid_request("Proxy HTTP legacy interleaved control frame count overflowed")
-    })?;
-    Ok(())
-}
-
-fn retire_legacy_request_id(
-    retired_request_ids: &mut VecDeque<RequestId>,
-    request_id: &RequestId,
-) -> McpResult<()> {
-    if retired_request_ids
-        .iter()
-        .any(|retired| retired.correlates_with(request_id))
-    {
-        return Ok(());
-    }
-    if retired_request_ids.len() >= MAX_RETIRED_LEGACY_REQUEST_IDS {
-        return Err(McpError::invalid_request(
-            "Proxy HTTP legacy retired-response capacity exceeded",
-        ));
-    }
-    retired_request_ids.push_back(request_id.clone());
-    Ok(())
-}
-
-fn consume_retired_legacy_response(
-    retired_request_ids: &mut VecDeque<RequestId>,
-    response_id: &RequestId,
-) -> bool {
-    let Some(index) = retired_request_ids
-        .iter()
-        .position(|retired| retired.correlates_with(response_id))
-    else {
-        return false;
-    };
-    retired_request_ids.remove(index);
-    true
-}
-
-fn legacy_reverse_request_reply(
-    request: &JsonRpcRequest,
-    client_capabilities: &ClientCapabilities,
-) -> Option<JsonRpcMessage> {
-    let request_id = request.id.clone()?;
-    let result = match request.method.as_str() {
-        fastmcp_protocol::methods::SAMPLING_CREATE_MESSAGE
-            if client_capabilities.sampling.is_some() =>
-        {
-            decode_legacy_reverse_request_params::<CreateMessageParams>(request).and_then(|_| {
-                Err(McpError::internal_error(
-                    "Proxy HTTP legacy sampling callback is unavailable",
-                ))
-            })
-        }
-        fastmcp_protocol::methods::ROOTS_LIST if client_capabilities.roots.is_some() => {
-            decode_legacy_reverse_request_params::<ListRootsParams>(request)
-                .map(|_| ListRootsResult::empty())
-        }
-        "elicitation/create" => Err(McpError::method_not_found(&request.method)),
-        _ => Err(McpError::method_not_found(&request.method)),
-    };
-    Some(legacy_reverse_request_response(request_id, result))
-}
-
-fn decode_legacy_reverse_request_params<T>(request: &JsonRpcRequest) -> McpResult<T>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let parameters = request
-        .params
-        .clone()
-        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-    serde_json::from_value(parameters)
-        .map_err(|_| McpError::invalid_params("Invalid legacy reverse request parameters"))
-}
-
-fn legacy_reverse_request_response<T>(request_id: RequestId, result: McpResult<T>) -> JsonRpcMessage
-where
-    T: serde::Serialize,
-{
-    match result.and_then(|result| {
-        serde_json::to_value(result).map_err(|_| {
-            McpError::internal_error("Proxy HTTP legacy reverse response could not be encoded")
-        })
-    }) {
-        Ok(result) => JsonRpcMessage::Response(JsonRpcResponse::success(request_id, result)),
-        Err(error) => {
-            JsonRpcMessage::Response(JsonRpcResponse::error(Some(request_id), error.into()))
-        }
-    }
-}
-
 fn response_for_request(
     message: JsonRpcMessage,
     request_id: &RequestId,
@@ -2781,8 +2634,24 @@ fn response_for_request(
     Ok(response)
 }
 
-fn legacy_http_error(error: impl std::fmt::Display) -> McpError {
-    McpError::internal_error(format!("Proxy HTTP legacy request failed: {error}"))
+fn proxy_http_connection_error(error: ClientHttpConnectionError) -> McpError {
+    match error {
+        ClientHttpConnectionError::LegacyRequestCancelled { .. } => McpError::request_cancelled(),
+        error @ (ClientHttpConnectionError::LegacyResponseStreamEnded { .. }
+        | ClientHttpConnectionError::LegacyUnexpectedMessage { .. }
+        | ClientHttpConnectionError::LegacyResponseIdMismatch { .. }
+        | ClientHttpConnectionError::LegacyCancelledResponseQueueFull
+        | ClientHttpConnectionError::LegacyCancelledRequestStillDraining { .. }
+        | ClientHttpConnectionError::LegacyNotificationQueueFull
+        | ClientHttpConnectionError::LegacyInterleavedControlFrameLimitExceeded {
+            ..
+        }) => McpError::invalid_request(format!("Proxy HTTP legacy request failed: {error}")),
+        error @ (ClientHttpConnectionError::LegacyFinalMetadata { .. }
+        | ClientHttpConnectionError::RegisteredExtensionMethodRequiresAdmission {
+            ..
+        }) => McpError::invalid_params(format!("Proxy HTTP legacy request failed: {error}")),
+        error => McpError::internal_error(format!("Proxy HTTP request failed: {error}")),
+    }
 }
 
 fn unexpected_proxy_result(method: &str) -> McpError {
@@ -4049,11 +3918,10 @@ mod tests {
     };
 
     use super::{
-        MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
-        ProxyClient, ProxyFinalCatalog, ProxyFinalTaskListener, ProxyFinalTaskListenerEvent,
-        ProxyHttpClient, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
-        ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler, ProxyUpstreamAdapter,
-        ProxyUpstreamBinding, ProxyUpstreamBindingRegistry, admit_legacy_interleaved_control_frame,
+        ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint, ProxyClient, ProxyFinalCatalog,
+        ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyHttpClient, ProxyPromptCatalog,
+        ProxyPromptHandler, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
+        ProxyToolHandler, ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
         decode_modern_server_notification, final_tool_legacy_fallback,
         forward_modern_progress_notification, legacy_contents_to_handler,
         legacy_prompt_messages_to_handler, legacy_resource_to_handler,
@@ -6127,19 +5995,6 @@ exec sleep 2
             panic!("exact legacy proxy request must retain a legacy tools/list result");
         };
         result.tools.into_iter().map(|tool| tool.name).collect()
-    }
-
-    #[test]
-    fn proxy_legacy_http_refuses_one_interleaved_control_frame_past_its_bound_unchanged() {
-        let mut accepted = 0;
-        for _ in 0..MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES {
-            admit_legacy_interleaved_control_frame(&mut accepted)
-                .expect("the configured control-frame bound is admitted exactly");
-        }
-        let error = admit_legacy_interleaved_control_frame(&mut accepted)
-            .expect_err("one additional interleaved control frame must be refused");
-        assert_eq!(error.code, McpErrorCode::InvalidRequest);
-        assert_eq!(accepted, MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES);
     }
 
     #[derive(Clone, Copy)]
