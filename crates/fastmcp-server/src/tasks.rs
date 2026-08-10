@@ -2976,6 +2976,12 @@ fn validate_final_task_runtime_durations(task: &FinalTask) -> McpResult<()> {
     Ok(())
 }
 
+fn stale_final_task_handoff_error() -> McpError {
+    McpError::invalid_params(
+        "Final task handoff is no longer the elected generation and dispatch fence",
+    )
+}
+
 fn in_memory_final_task_expiry(task: &FinalTask, now: Instant) -> McpResult<Option<Instant>> {
     let Some(ttl_ms) = task.base().ttl_ms.as_ref() else {
         return Ok(None);
@@ -4961,7 +4967,11 @@ impl AuthorizedTaskServiceRunner {
         Ok(())
     }
 
-    async fn resume_handoff(&self, cx: &Cx, handoff: FinalTaskSupervisorHandoff) -> McpResult<()> {
+    async fn resume_handoff(
+        &self,
+        cx: &Cx,
+        mut handoff: FinalTaskSupervisorHandoff,
+    ) -> McpResult<()> {
         let mut guard = FinalTaskExecutionGuard::new(&self.runtime, &self.dispatch_owner, &handoff);
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
@@ -4972,6 +4982,7 @@ impl AuthorizedTaskServiceRunner {
             guard.disarm();
             return Ok(());
         }
+        handoff.attach_authority(guard.authority()?);
         match self
             .run_supervisor_with_lease_heartbeat(cx, handoff, &mut guard)
             .await
@@ -5119,6 +5130,21 @@ impl FinalTaskExecutionGuard {
 
     fn heartbeat_interval(&self) -> McpResult<StdDuration> {
         self.runtime.handoff_dispatch_lease_heartbeat_interval()
+    }
+
+    fn authority(&self) -> McpResult<FinalTaskHandoffAuthority> {
+        let dispatch_fence = self.dispatch_fence.ok_or_else(|| {
+            McpError::internal_error(
+                "Final task handoff authority was requested before dispatch election",
+            )
+        })?;
+        Ok(FinalTaskHandoffAuthority {
+            runtime: self.runtime.clone(),
+            task_id: self.task_id.clone(),
+            generation: self.generation,
+            owner_id: self.owner_id.clone(),
+            dispatch_fence,
+        })
     }
 
     fn finish(&self) -> McpResult<bool> {
@@ -6254,7 +6280,6 @@ mod tests {
     }
 
     struct TerminalTransitionThenFailingFinalTaskSupervisor {
-        runtime: FinalTaskRuntime,
     }
 
     impl ApplicationTaskSupervisor for TerminalTransitionThenFailingFinalTaskSupervisor {
@@ -6263,15 +6288,18 @@ mod tests {
             _cx: &'a Cx,
             handoff: FinalTaskSupervisorHandoff,
         ) -> FinalTaskSupervisorFuture<'a> {
-            let runtime = self.runtime.clone();
-            let task_id = final_task_handoff_task_id(&handoff).clone();
             Box::pin(async move {
                 let result: FinalTaskCallToolResult =
                     serde_json::from_value(serde_json::json!({"content": []}))
                         .expect("typed terminal task result");
-                runtime
-                    .complete_task(&task_id, result, None)
-                    .expect("newer terminal transition wins before supervisor failure");
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => initial
+                        .complete_task(result, None)
+                        .expect("the elected initial handoff commits the terminal task"),
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => accepted
+                        .complete_task(result, None)
+                        .expect("the elected resumed handoff commits the terminal task"),
+                };
                 Err(McpError::internal_error(
                     "planted supervisor failure after a newer transition",
                 ))
@@ -9351,9 +9379,7 @@ mod tests {
         let runner = recovered_runtime
             .install_task_service(
                 1,
-                Arc::new(TerminalTransitionThenFailingFinalTaskSupervisor {
-                    runtime: recovered_runtime.clone(),
-                }),
+                Arc::new(TerminalTransitionThenFailingFinalTaskSupervisor),
             )
             .expect("install caller-owned transitioning failing service runner");
         let application_runtime = RuntimeBuilder::current_thread()
