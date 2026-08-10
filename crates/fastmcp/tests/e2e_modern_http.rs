@@ -7,82 +7,204 @@
 //! direct FastMCP component-crate import stands in for either endpoint.
 //!
 //! What this proves (and only this): the shipped dual-era HTTP server and
-//! facade clients can complete Auto classification and a round trip against
-//! each other — modern discovery plus `tools/list` over the live modern lane,
-//! then exact 2024-11-05 HTTP+SSE fallback after a real LegacyOnly endpoint
-//! refuses the modern request. It is not an aggregate MCP 2026-07-28
-//! conformance claim.
+//! facade clients can complete Auto classification plus typed ModernOnly and
+//! LegacyOnly tool, resource, and prompt round trips against each other. The
+//! cross-era refusal cases additionally prove that a rejected connection does
+//! not change later matched-era handler observables. It is not an aggregate
+//! MCP 2026-07-28 conformance claim.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use asupersync::CancelKind;
-use asupersync::runtime::RuntimeBuilder;
-use asupersync::runtime::reactor::create_reactor;
 use fastmcp_rust::{
-    CanonicalHttpUrl, ClientHttpResponse, ClientProtocolPlan, Cx, HttpServerShutdown,
-    JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpResult, Middleware,
-    MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream, ProtocolEra,
-    ProtocolPolicy, Server, SseLimits, auto,
+    CanonicalHttpUrl, ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, Content,
+    Cx, HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, JsonRpcMessage,
+    JsonRpcRequest, McpContext, McpError, McpResult, Middleware, MiddlewareDecision,
+    ModernHttpResponseKind, ModernHttpResponseStream, PromptHandler, PromptMessage,
+    ProtocolEra, ProtocolPolicy, ResourceHandler, Role, SseLimits, ToolHandler, auto, core,
+    legacy_2024, modern, prompt, resource, tool,
 };
 use serde_json::json;
 
-fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
-    RuntimeBuilder::current_thread()
-        .build()
-        .expect("native runtime must build")
-        .block_on(future)
+const PUBLIC_HTTP_TOOL_NAME: &str = "public-http-e2e-tool";
+const PUBLIC_HTTP_RESOURCE_URI: &str = "test://public-http-e2e/resource";
+const PUBLIC_HTTP_PROMPT_NAME: &str = "public-http-e2e-prompt";
+const PUBLIC_HTTP_TOOL_ARGUMENT: &str = "cross-era";
+const PUBLIC_HTTP_TOOL_TEXT: &str = "tool:cross-era";
+const PUBLIC_HTTP_RESOURCE_TEXT: &str = "resource:deterministic";
+const PUBLIC_HTTP_PROMPT_TEXT: &str = "prompt:cross-era";
+
+/// The deterministic user handler exercised through both public HTTP facades.
+#[tool(name = "public-http-e2e-tool")]
+fn public_http_value(_ctx: &McpContext, value: String) -> String {
+    format!("tool:{value}")
 }
 
+/// The deterministic resource exercised through both public HTTP facades.
+#[resource(uri = "test://public-http-e2e/resource")]
+fn public_http_snapshot(_ctx: &McpContext) -> String {
+    PUBLIC_HTTP_RESOURCE_TEXT.to_owned()
+}
+
+/// The deterministic prompt exercised through both public HTTP facades.
+#[prompt(name = "public-http-e2e-prompt")]
+fn public_http_instruction(_ctx: &McpContext, subject: String) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text {
+            text: format!("prompt:{subject}"),
+        },
+    }]
+}
+
+#[derive(Default)]
+struct PublicHttpHandlerCallCounters {
+    tool: AtomicUsize,
+    resource: AtomicUsize,
+    prompt: AtomicUsize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PublicHttpHandlerCallSnapshot {
+    tool: usize,
+    resource: usize,
+    prompt: usize,
+}
+
+impl PublicHttpHandlerCallCounters {
+    fn snapshot(&self) -> PublicHttpHandlerCallSnapshot {
+        PublicHttpHandlerCallSnapshot {
+            tool: self.tool.load(Ordering::SeqCst),
+            resource: self.resource.load(Ordering::SeqCst),
+            prompt: self.prompt.load(Ordering::SeqCst),
+        }
+    }
+}
+
+struct CountingPublicHttpValue {
+    counters: Arc<PublicHttpHandlerCallCounters>,
+}
+
+impl ToolHandler for CountingPublicHttpValue {
+    fn definition(&self) -> fastmcp_rust::Tool {
+        PublicHttpValue.definition()
+    }
+
+    fn call(
+        &self,
+        context: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<Vec<Content>> {
+        self.counters.tool.fetch_add(1, Ordering::SeqCst);
+        PublicHttpValue.call(context, arguments)
+    }
+}
+
+struct CountingPublicHttpSnapshot {
+    counters: Arc<PublicHttpHandlerCallCounters>,
+}
+
+impl ResourceHandler for CountingPublicHttpSnapshot {
+    fn definition(&self) -> fastmcp_rust::Resource {
+        PublicHttpSnapshotResource.definition()
+    }
+
+    fn read(&self, context: &McpContext) -> McpResult<Vec<fastmcp_rust::ResourceContent>> {
+        self.counters.resource.fetch_add(1, Ordering::SeqCst);
+        PublicHttpSnapshotResource.read(context)
+    }
+}
+
+struct CountingPublicHttpInstruction {
+    counters: Arc<PublicHttpHandlerCallCounters>,
+}
+
+impl PromptHandler for CountingPublicHttpInstruction {
+    fn definition(&self) -> fastmcp_rust::Prompt {
+        PublicHttpInstructionPrompt.definition()
+    }
+
+    fn get(
+        &self,
+        context: &McpContext,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        self.counters.prompt.fetch_add(1, Ordering::SeqCst);
+        PublicHttpInstructionPrompt.get(context, arguments)
+    }
+}
+
+fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
+    core::block_on(future)
+}
+
+/// Runs one public HTTP operation on the facade-owned runtime. The operation
+/// itself is bounded against the supplied caller-owned context clock, so a
+/// stalled peer cannot hold this test thread indefinitely.
 fn runtime_block_on_bounded<F: std::future::Future>(cx: &Cx, future: F) -> F::Output {
     runtime_block_on(async {
-        asupersync::time::timeout(cx.now(), HTTP_SERVER_TEARDOWN_BOUND, future)
+        asupersync::time::timeout(cx.now(), HTTP_OPERATION_BOUND, future)
             .await
-            .expect("public HTTP operation stays within its bound")
+            .expect("public HTTP operation stays within its caller-owned deadline")
     })
 }
 
 const HTTP_SERVER_STARTUP_BOUND: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(2);
-/// Hard ceiling for the server task itself. This bounds the owned thread even
-/// if cancellation is not observed by a future regression in server teardown.
-const HTTP_SERVER_THREAD_BOUND: Duration = Duration::from_secs(4);
+const HTTP_OPERATION_BOUND: Duration = Duration::from_secs(2);
 
 /// Owns one real public HTTP server composition and proves its teardown.
 ///
-/// The fixture deliberately uses the minimal `Server::new(...).build()`
-/// composition published in the facade examples, rather than a test-local
-/// handler. Its clients use only protocol-defined final methods, so the test
-/// does not need a bespoke test tool.
+/// The fixture composes one public `Server` with deterministic public tool,
+/// resource, and prompt handlers. Its clients use only shipped facade HTTP
+/// clients and real localhost routes; no transcript or mock peer is involved.
 struct HttpServerFixture {
     address: SocketAddr,
-    shutdown: mpsc::SyncSender<()>,
-    finished: mpsc::Receiver<Result<(), String>>,
+    server_cx: Cx,
+    finished: mpsc::Receiver<Result<HttpServerShutdown, String>>,
     join: Option<JoinHandle<()>>,
+    nonquiescent: Option<HttpNonquiescentShutdown>,
+    handler_calls: Arc<PublicHttpHandlerCallCounters>,
 }
 
 /// Retains a just-spawned fixture until the ready handshake succeeds and it
 /// can be transferred into `HttpServerFixture`.
 struct HttpServerStartupGuard {
-    shutdown: Option<mpsc::SyncSender<()>>,
-    finished: Option<mpsc::Receiver<Result<(), String>>>,
+    server_cx: Option<Cx>,
+    server_cx_rx: Option<mpsc::Receiver<Cx>>,
+    finished: Option<mpsc::Receiver<Result<HttpServerShutdown, String>>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl HttpServerStartupGuard {
+    fn capture_server_cx(&mut self) {
+        if self.server_cx.is_some() {
+            return;
+        }
+        let Some(server_cx_rx) = self.server_cx_rx.as_ref() else {
+            return;
+        };
+        if let Ok(server_cx) = server_cx_rx.try_recv() {
+            self.server_cx = Some(server_cx);
+            self.server_cx_rx = None;
+        }
+    }
+
     fn into_parts(
         mut self,
     ) -> (
-        mpsc::SyncSender<()>,
-        mpsc::Receiver<Result<(), String>>,
+        Cx,
+        mpsc::Receiver<Result<HttpServerShutdown, String>>,
         Option<JoinHandle<()>>,
     ) {
         (
-            self.shutdown
+            self.server_cx
                 .take()
-                .expect("startup guard retains shutdown"),
+                .expect("startup guard retains the runtime-installed server context"),
             self.finished
                 .take()
                 .expect("startup guard retains completion"),
@@ -112,13 +234,17 @@ impl Drop for HttpServerStartupGuard {
         if self.join.is_none() {
             return;
         }
-        let Some(shutdown) = self.shutdown.as_ref() else {
-            return;
-        };
+        self.capture_server_cx();
+        // If the context has not arrived yet, dropping this receiver makes
+        // the server task fail closed before it binds a listener.
+        self.server_cx_rx = None;
+        if let Some(server_cx) = self.server_cx.as_ref() {
+            server_cx.set_cancel_requested(true);
+        }
         let Some(finished) = self.finished.as_ref() else {
             return;
         };
-        let settlement = settle_http_server(shutdown, finished, &mut self.join);
+        let settlement = await_http_server_shutdown(finished, &mut self.join);
         if settlement.is_err() && self.join.is_some() {
             eprintln!(
                 "public HTTP server startup left a live unjoinable thread after bounded settlement"
@@ -145,158 +271,104 @@ impl HttpServerFixture {
         protocol_policy: ProtocolPolicy,
         middleware: Option<Arc<dyn Middleware>>,
     ) -> Self {
+        let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+        let tool_calls = Arc::clone(&handler_calls);
+        let resource_calls = Arc::clone(&handler_calls);
+        let prompt_calls = Arc::clone(&handler_calls);
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
-        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
-        let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+        let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+        let (finished_tx, finished_rx) =
+            mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
         let join = Some(thread::spawn(move || {
             let ready_for_spawn_failure = ready_tx.clone();
             let finished_for_spawn_failure = finished_tx.clone();
-            let (task_done_tx, task_done_rx) = mpsc::channel::<()>();
-            let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
-            let runtime = RuntimeBuilder::current_thread()
-                .with_reactor(create_reactor().expect("server reactor initializes"))
-                .blocking_threads(4, 64)
-                .build()
-                .expect("server runtime builds");
-            let server_task = runtime.handle().try_spawn_with_cx(move |cx| {
-                let server_cx_tx = server_cx_tx;
-                async move {
-                    if server_cx_tx.send(cx.clone()).is_err() {
-                        cx.cancel_with(
-                            CancelKind::User,
-                            Some("HTTP E2E server control receiver went away"),
-                        );
-                        let _ = finished_tx
-                            .send(Err("HTTP E2E server control receiver went away".to_owned()));
-                        let _ = task_done_tx.send(());
-                        return;
-                    }
-                    let outcome =
-                        match asupersync::time::timeout(cx.now(), HTTP_SERVER_THREAD_BOUND, async {
-                            let builder = Server::new("facade-http-example", "1.0.0")
-                                .protocol_policy(protocol_policy);
-                            let server = match middleware {
-                                Some(middleware) => builder.middleware(middleware).build(),
-                                None => builder.build(),
-                            };
-                            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
-                                Ok(bound) => bound,
-                                Err(error) => {
-                                    let message =
-                                        format!("facade HTTP server bind failed: {error}");
-                                    let _ = ready_tx.send(Err(message.clone()));
-                                    return Err(message);
-                                }
-                            };
-                            let address = match bound.local_addr() {
-                                Ok(address) => address,
-                                Err(error) => {
-                                    let message =
-                                        format!("facade HTTP server address failed: {error}");
-                                    let _ = ready_tx.send(Err(message.clone()));
-                                    return Err(message);
-                                }
-                            };
-                            if ready_tx.send(Ok(address)).is_err() {
-                                cx.cancel_with(
-                                    CancelKind::User,
-                                    Some("HTTP E2E startup receiver went away"),
-                                );
-                                return Err("HTTP E2E startup receiver went away".to_owned());
-                            }
-                            bound
-                                .serve(&cx)
-                                .await
-                                .map_err(|error| {
-                                    format!("facade HTTP server stopped unexpectedly: {error}")
-                                })
-                                .and_then(|shutdown| match shutdown {
-                                    HttpServerShutdown::Quiescent => Ok(()),
-                                    HttpServerShutdown::Nonquiescent(mut shutdown) => Err(format!(
-                                        "facade HTTP server stopped nonquiescently: {:?}",
-                                        shutdown.poll_settlement()
-                                    )),
-                                })
-                        })
-                        .await
-                        {
-                            Ok(outcome) => outcome,
-                            Err(_) => {
-                                cx.cancel_with(
-                                    CancelKind::User,
-                                    Some("HTTP E2E server task hard deadline exceeded"),
-                                );
-                                Err("facade HTTP server exceeded its hard task deadline".to_owned())
-                            }
-                        };
-                    let _ = finished_tx.send(outcome);
-                    let _ = task_done_tx.send(());
+            let outcome = runtime_block_on(async move {
+                let cx = Cx::current().expect("facade runtime installs an ambient server context");
+                if server_cx_tx.send(cx.clone()).is_err() {
+                    cx.set_cancel_requested(true);
+                    return Err("HTTP E2E server control receiver went away".to_owned());
                 }
+                let builder = modern::ServerBuilder::new("facade-http-example", "1.0.0")
+                    .protocol_policy(protocol_policy)
+                    .expect("the fixture selects an available protocol policy");
+                let builder = builder
+                    .tool(CountingPublicHttpValue {
+                        counters: tool_calls,
+                    })
+                    .resource(CountingPublicHttpSnapshot {
+                        counters: resource_calls,
+                    })
+                    .prompt(CountingPublicHttpInstruction {
+                        counters: prompt_calls,
+                    });
+                let server = match middleware {
+                    Some(middleware) => builder.middleware(middleware).build(),
+                    None => builder.build(),
+                };
+                let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        let message = format!("facade HTTP server bind failed: {error}");
+                        let _ = ready_tx.send(Err(message.clone()));
+                        return Err(message);
+                    }
+                };
+                let address = match bound.local_addr() {
+                    Ok(address) => address,
+                    Err(error) => {
+                        let message = format!("facade HTTP server address failed: {error}");
+                        let _ = ready_tx.send(Err(message.clone()));
+                        return Err(message);
+                    }
+                };
+                if ready_tx.send(Ok(address)).is_err() {
+                    cx.set_cancel_requested(true);
+                    return Err("HTTP E2E startup receiver went away".to_owned());
+                }
+                bound
+                    .serve(&cx)
+                    .await
+                    .map_err(|error| format!("facade HTTP server stopped unexpectedly: {error}"))
             });
-            if let Err(error) = server_task {
-                let message = format!("facade HTTP server task was not admitted: {error}");
+            if let Err(message) = &outcome {
                 let _ = ready_for_spawn_failure.send(Err(message.clone()));
-                let _ = finished_for_spawn_failure.send(Err(message));
-                return;
             }
-            runtime.block_on(async move {
-                let mut server_cx = None;
-                let mut shutdown_requested = false;
-                loop {
-                    match shutdown_rx.try_recv() {
-                        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
-                            shutdown_requested = true;
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {}
-                    }
-                    if server_cx.is_none() {
-                        if let Ok(cx) = server_cx_rx.try_recv() {
-                            server_cx = Some(cx);
-                        }
-                    }
-                    if shutdown_requested {
-                        if let Some(cx) = server_cx.as_ref() {
-                            cx.cancel_with(
-                                CancelKind::User,
-                                Some("HTTP E2E fixture shutdown requested"),
-                            );
-                        }
-                    }
-                    match task_done_rx.try_recv() {
-                        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
-                        Err(mpsc::TryRecvError::Empty) => {
-                            let cx = Cx::current().expect("server runtime installs an ambient Cx");
-                            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
-                        }
-                    }
-                }
-            });
+            let _ = finished_for_spawn_failure.send(outcome);
         }));
 
         let mut startup = HttpServerStartupGuard {
-            shutdown: Some(shutdown_tx),
+            server_cx: None,
+            server_cx_rx: Some(server_cx_rx),
             finished: Some(finished_rx),
             join,
         };
-        let address = match ready_rx.recv_timeout(HTTP_SERVER_STARTUP_BOUND) {
-            Ok(Ok(address)) => address,
-            Ok(Err(error)) => panic!("public HTTP server failed to start: {error}"),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                startup.resume_thread_panic_if_finished();
-                panic!("public HTTP server startup readiness channel disconnected")
+        let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+        let address = loop {
+            startup.capture_server_cx();
+            let remaining = startup_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!("public HTTP server startup exceeded its bound");
             }
-            Err(error) => {
-                drop(ready_rx);
-                panic!("public HTTP server startup exceeded its bound: {error}");
+            match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(Ok(address)) => break address,
+                Ok(Err(error)) => panic!("public HTTP server failed to start: {error}"),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    startup.resume_thread_panic_if_finished();
+                    panic!("public HTTP server startup readiness channel disconnected")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         };
-        let (shutdown, finished, join) = startup.into_parts();
+        startup.capture_server_cx();
+        let (server_cx, finished, join) = startup.into_parts();
 
         Self {
             address,
-            shutdown,
+            server_cx,
             finished,
             join,
+            nonquiescent: None,
+            handler_calls,
         }
     }
 
@@ -304,8 +376,34 @@ impl HttpServerFixture {
         self.address
     }
 
+    fn handler_call_snapshot(&self) -> PublicHttpHandlerCallSnapshot {
+        self.handler_calls.snapshot()
+    }
+
     fn settle(&mut self) -> Result<(), String> {
-        settle_http_server(&self.shutdown, &self.finished, &mut self.join)
+        if let Some(shutdown) = self.nonquiescent.as_mut() {
+            return match runtime_block_on(shutdown.settle_for(HTTP_SERVER_TEARDOWN_BOUND)) {
+                HttpShutdownSettlement::Settled => {
+                    self.nonquiescent = None;
+                    Err("facade HTTP server stopped nonquiescently but settled during fixture cleanup"
+                        .to_owned())
+                }
+                HttpShutdownSettlement::Failed { failures } => Err(format!(
+                    "facade HTTP server child settlement observed {failures} terminal failure(s)"
+                )),
+                HttpShutdownSettlement::Pending { remaining } => Err(format!(
+                    "facade HTTP server remains nonquiescent after bounded fixture cleanup ({remaining} retained children)"
+                )),
+            };
+        }
+        self.server_cx.set_cancel_requested(true);
+        match await_http_server_shutdown(&self.finished, &mut self.join)? {
+            HttpServerShutdown::Quiescent => Ok(()),
+            HttpServerShutdown::Nonquiescent(shutdown) => {
+                self.nonquiescent = Some(shutdown);
+                self.settle()
+            }
+        }
     }
 
     fn shutdown(mut self) {
@@ -316,7 +414,7 @@ impl HttpServerFixture {
 
 impl Drop for HttpServerFixture {
     fn drop(&mut self) {
-        if self.join.is_none() {
+        if self.join.is_none() && self.nonquiescent.is_none() {
             return;
         }
         if let Err(error) = self.settle() {
@@ -333,12 +431,28 @@ impl Drop for HttpServerFixture {
 /// completion report, then joins only after the thread is known to have exited.
 /// A timed-out owner remains retained for a controlled retry rather than being
 /// detached.
-fn settle_http_server(
-    shutdown: &mpsc::SyncSender<()>,
-    finished: &mpsc::Receiver<Result<(), String>>,
+fn await_http_server_shutdown(
+    finished: &mpsc::Receiver<Result<HttpServerShutdown, String>>,
     join: &mut Option<JoinHandle<()>>,
-) -> Result<(), String> {
-    settle_http_server_with_bound(shutdown, finished, join, HTTP_SERVER_TEARDOWN_BOUND)
+) -> Result<HttpServerShutdown, String> {
+    let completion = finished
+        .recv_timeout(HTTP_SERVER_TEARDOWN_BOUND)
+        .map_err(|error| format!("public HTTP server teardown exceeded its bound: {error}"));
+    let join_result = join_finished_thread(join, HTTP_SERVER_TEARDOWN_BOUND, "HTTP server");
+    match (completion, join_result) {
+        (Ok(Ok(shutdown)), Ok(())) => Ok(shutdown),
+        (Ok(Err(completion)), Ok(())) => {
+            Err(format!("public HTTP server teardown failed: {completion}"))
+        }
+        (Err(completion), Ok(())) => Err(completion),
+        (Ok(Ok(_)), Err(join)) => Err(join),
+        (Ok(Err(completion)), Err(join)) => Err(format!(
+            "public HTTP server teardown failed: {completion}; owned thread settlement failed: {join}"
+        )),
+        (Err(completion), Err(join)) => Err(format!(
+            "{completion}; owned thread settlement failed: {join}"
+        )),
+    }
 }
 
 /// This helper is separately bounded so the planted timeout test can prove
@@ -356,9 +470,20 @@ fn settle_http_server_with_bound(
         .recv_timeout(completion_bound)
         .map_err(|error| format!("public HTTP server teardown exceeded its bound: {error}"));
     let join_result = join_finished_thread(join, completion_bound, "HTTP server");
-    let completion = completion?;
-    completion.map_err(|error| format!("public HTTP server teardown failed: {error}"))?;
-    join_result
+    match (completion, join_result) {
+        (Ok(Ok(())), Ok(())) => Ok(()),
+        (Ok(Err(completion)), Ok(())) => {
+            Err(format!("public HTTP server teardown failed: {completion}"))
+        }
+        (Err(completion), Ok(())) => Err(completion),
+        (Ok(Ok(())), Err(join)) => Err(join),
+        (Ok(Err(completion)), Err(join)) => Err(format!(
+            "public HTTP server teardown failed: {completion}; owned thread settlement failed: {join}"
+        )),
+        (Err(completion), Err(join)) => Err(format!(
+            "{completion}; owned thread settlement failed: {join}"
+        )),
+    }
 }
 
 fn join_finished_thread(
@@ -468,15 +593,12 @@ fn e2e_http_fixture_reported_teardown_failure_still_joins_owner() {
 
 #[test]
 fn e2e_http_startup_guard_preserves_planted_startup_error() {
-    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
-    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
     let startup = HttpServerStartupGuard {
-        shutdown: Some(shutdown_tx),
+        server_cx: Some(Cx::for_request()),
+        server_cx_rx: None,
         finished: Some(finished_rx),
         join: Some(thread::spawn(move || {
-            shutdown_rx
-                .recv()
-                .expect("startup guard requests bounded shutdown");
             let _ = finished_tx.send(Err("planted startup failure".to_owned()));
         })),
     };
@@ -496,10 +618,10 @@ fn e2e_http_startup_guard_preserves_planted_startup_error() {
 
 #[test]
 fn e2e_http_startup_guard_resumes_planted_pre_readiness_panic() {
-    let (shutdown_tx, _shutdown_rx) = mpsc::sync_channel::<()>(1);
-    let (_finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (_finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
     let mut startup = HttpServerStartupGuard {
-        shutdown: Some(shutdown_tx),
+        server_cx: None,
+        server_cx_rx: None,
         finished: Some(finished_rx),
         join: Some(thread::spawn(|| panic!("planted pre-readiness panic"))),
     };
@@ -597,6 +719,184 @@ fn final_response_document(cx: &Cx, response: ModernHttpResponseStream) -> serde
             response.metadata().status()
         ),
     }
+}
+
+#[derive(Debug, PartialEq)]
+struct PublicHttpHandlerObservables {
+    tool: serde_json::Value,
+    resource: serde_json::Value,
+    prompt: serde_json::Value,
+}
+
+fn public_http_target(address: SocketAddr, path: &str) -> CanonicalHttpUrl {
+    CanonicalHttpUrl::parse(&format!("http://{address}{path}"))
+        .expect("a fixture route must form a canonical HTTP target")
+}
+
+fn assert_public_handler_observables(observables: &PublicHttpHandlerObservables) {
+    assert_eq!(
+        observables.tool["content"][0]["type"],
+        json!("text"),
+        "the public tool result must retain text content"
+    );
+    assert_eq!(
+        observables.tool["content"][0]["text"],
+        json!(PUBLIC_HTTP_TOOL_TEXT),
+        "the public tool result must retain the deterministic handler value"
+    );
+    assert_eq!(
+        observables.resource["contents"][0]["uri"],
+        json!(PUBLIC_HTTP_RESOURCE_URI),
+        "the public resource result must retain the registered URI"
+    );
+    assert_eq!(
+        observables.resource["contents"][0]["text"],
+        json!(PUBLIC_HTTP_RESOURCE_TEXT),
+        "the public resource result must retain the deterministic handler value"
+    );
+    assert_eq!(
+        observables.prompt["messages"][0]["role"],
+        json!("user"),
+        "the public prompt result must retain its message role"
+    );
+    assert_eq!(
+        observables.prompt["messages"][0]["content"]["type"],
+        json!("text"),
+        "the public prompt result must retain text content"
+    );
+    assert_eq!(
+        observables.prompt["messages"][0]["content"]["text"],
+        json!(PUBLIC_HTTP_PROMPT_TEXT),
+        "the public prompt result must retain the deterministic handler value"
+    );
+}
+
+fn invoke_modern_public_handlers(cx: &Cx, address: SocketAddr) -> PublicHttpHandlerObservables {
+    let mut client = runtime_block_on_bounded(
+        cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-modern-handler-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(address, "/mcp"), cx),
+    )
+    .expect("the ModernOnly public facade connects to the live modern route");
+
+    let tool = runtime_block_on_bounded(
+        cx,
+        client.call_tool_with_mrtr_retry(
+            cx,
+            Instant::now() + HTTP_SERVER_TEARDOWN_BOUND,
+            PUBLIC_HTTP_TOOL_NAME,
+            json!({ "value": PUBLIC_HTTP_TOOL_ARGUMENT }),
+            SseLimits::new(65_536, 1 << 20, 64).expect("nonzero SSE limits"),
+            1 << 20,
+            |_| {
+                Err(McpError::invalid_request(
+                    "the deterministic public tool must not request MRTR input",
+                ))
+            },
+        ),
+    )
+    .expect("the ModernOnly public facade invokes the live deterministic tool");
+    let modern::FinalCoreResult::ToolsCall { result: tool, .. } = tool else {
+        panic!("the deterministic public tool must complete without MRTR input");
+    };
+    let tool = serde_json::to_value(tool.payload)
+        .expect("the typed modern tool result serializes for its observable assertion");
+
+    let resource = runtime_block_on_bounded(cx, client.read_resource(cx, PUBLIC_HTTP_RESOURCE_URI))
+        .expect("the ModernOnly public facade reads the live deterministic resource");
+    let resource = serde_json::to_value(resource)
+        .expect("the typed modern resource result serializes for its observable assertion");
+
+    let prompt = runtime_block_on_bounded(
+        cx,
+        client.get_prompt(
+            cx,
+            PUBLIC_HTTP_PROMPT_NAME,
+            HashMap::from([("subject".to_owned(), PUBLIC_HTTP_TOOL_ARGUMENT.to_owned())]),
+        ),
+    )
+    .expect("the ModernOnly public facade gets the live deterministic prompt");
+    let prompt = serde_json::to_value(prompt)
+        .expect("the typed modern prompt result serializes for its observable assertion");
+
+    let observables = PublicHttpHandlerObservables {
+        tool,
+        resource,
+        prompt,
+    };
+    assert_public_handler_observables(&observables);
+    observables
+}
+
+fn invoke_legacy_public_handlers(cx: &Cx, address: SocketAddr) -> PublicHttpHandlerObservables {
+    let mut client = runtime_block_on_bounded(
+        cx,
+        legacy_2024::http_client_builder(
+            public_http_target(address, "/sse"),
+            public_http_target(address, "/messages"),
+        )
+        .expect("the exact legacy HTTP endpoints form one public facade plan")
+        .client_info("e2e-public-legacy-handler-client", "1.0.0")
+        .connect_http_client_with_cx(cx),
+    )
+    .expect("the LegacyOnly public facade connects to the live exact-legacy routes");
+    assert_eq!(client.protocol_policy(), ProtocolPolicy::LegacyOnly);
+
+    let tool = runtime_block_on_bounded(
+        cx,
+        client.call_tool(
+            cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_TOOL_NAME.to_owned(),
+                arguments: Some(json!({ "value": PUBLIC_HTTP_TOOL_ARGUMENT })),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the LegacyOnly public facade invokes the live deterministic tool");
+    let tool = serde_json::to_value(tool)
+        .expect("the typed legacy tool result serializes for its observable assertion");
+
+    let resource = runtime_block_on_bounded(
+        cx,
+        client.read_resource(
+            cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the LegacyOnly public facade reads the live deterministic resource");
+    let resource = serde_json::to_value(resource)
+        .expect("the typed legacy resource result serializes for its observable assertion");
+
+    let prompt = runtime_block_on_bounded(
+        cx,
+        client.get_prompt(
+            cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_PROMPT_NAME.to_owned(),
+                arguments: Some(HashMap::from([(
+                    "subject".to_owned(),
+                    PUBLIC_HTTP_TOOL_ARGUMENT.to_owned(),
+                )])),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the LegacyOnly public facade gets the live deterministic prompt");
+    let prompt = serde_json::to_value(prompt)
+        .expect("the typed legacy prompt result serializes for its observable assertion");
+
+    let observables = PublicHttpHandlerObservables {
+        tool,
+        resource,
+        prompt,
+    };
+    assert_public_handler_observables(&observables);
+    observables
 }
 
 #[derive(Default)]
@@ -823,6 +1123,113 @@ fn e2e_overlap_worker_timeout_releases_fixture_teardown() {
     assert!(stalled_worker.join.is_none());
     let teardown = server.settle();
     teardown.expect("the bounded fixture teardown runs after a worker completion timeout");
+}
+
+#[test]
+fn e2e_public_http_typed_facades_invoke_real_handlers_in_each_exact_era() {
+    let cx = Cx::for_request();
+
+    let modern_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::ModernOnly);
+    let modern = invoke_modern_public_handlers(&cx, modern_server.address());
+    assert_public_handler_observables(&modern);
+    modern_server.shutdown();
+
+    let legacy_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::LegacyOnly);
+    let legacy = invoke_legacy_public_handlers(&cx, legacy_server.address());
+    assert_public_handler_observables(&legacy);
+    legacy_server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_cross_era_refusals_leave_handler_observables_unchanged() {
+    let cx = Cx::for_request();
+
+    let modern_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::ModernOnly);
+    let modern_before = invoke_modern_public_handlers(&cx, modern_server.address());
+    let modern_calls_before_refusal = modern_server.handler_call_snapshot();
+    // Keep the legacy facade configuration identical to its matched-era
+    // control; the endpoint's live server policy is the only intentional
+    // protocol-selection variable.
+    let legacy_refusal = match runtime_block_on_bounded(
+        &cx,
+        legacy_2024::http_client_builder(
+            public_http_target(modern_server.address(), "/sse"),
+            public_http_target(modern_server.address(), "/messages"),
+        )
+        .expect("the exact legacy HTTP endpoints form one public facade plan")
+        .client_info("e2e-public-legacy-handler-client", "1.0.0")
+        .connect_http_client_with_cx(&cx),
+    ) {
+        Err(error) => error,
+        Ok(_) => {
+            panic!(
+                "a LegacyOnly public facade must reject the ModernOnly server's live SSE refusal"
+            )
+        }
+    };
+    assert!(matches!(
+        legacy_refusal,
+        legacy_2024::HttpClientConnectError::Connect(legacy_2024::HttpClientError::Connection(
+            ClientHttpConnectionError::Modern(fastmcp_rust::ModernHttpClientError::LegacySse(
+                fastmcp_rust::LegacySseHttpClientError::SseGetRejected { status: 400 }
+            ))
+        ))
+    ));
+    assert_eq!(
+        modern_server.handler_call_snapshot(),
+        modern_calls_before_refusal,
+        "the refused exact-legacy connection must not invoke a ModernOnly handler"
+    );
+    let modern_after = invoke_modern_public_handlers(&cx, modern_server.address());
+    assert_eq!(
+        modern_after, modern_before,
+        "the refused exact-legacy connection must not alter later ModernOnly handler observables"
+    );
+    modern_server.shutdown();
+
+    let legacy_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::LegacyOnly);
+    let legacy_before = invoke_legacy_public_handlers(&cx, legacy_server.address());
+    let legacy_calls_before_refusal = legacy_server.handler_call_snapshot();
+    // Keep the modern facade configuration identical to its matched-era
+    // control; the endpoint's live server policy is the only intentional
+    // protocol-selection variable.
+    let modern_refusal = match runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-modern-handler-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(legacy_server.address(), "/mcp"), &cx),
+    ) {
+        Err(error) => error,
+        Ok(_) => {
+            panic!(
+                "a ModernOnly public facade must reject the LegacyOnly server's live probe refusal"
+            )
+        }
+    };
+    assert!(matches!(
+        modern_refusal,
+        modern::HttpClientConnectError::Connect(
+            modern::HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                fastmcp_rust::ModernHttpClientError::Negotiation(
+                    fastmcp_rust::ClientHttpNegotiationError::ModernProbeRejectedWithoutLegacyFallback {
+                        status: 400,
+                        ..
+                    }
+                )
+            ))
+        )
+    ));
+    assert_eq!(
+        legacy_server.handler_call_snapshot(),
+        legacy_calls_before_refusal,
+        "the refused modern connection must not invoke a LegacyOnly handler"
+    );
+    let legacy_after = invoke_legacy_public_handlers(&cx, legacy_server.address());
+    assert_eq!(
+        legacy_after, legacy_before,
+        "the refused modern connection must not alter later LegacyOnly handler observables"
+    );
+    legacy_server.shutdown();
 }
 
 #[test]

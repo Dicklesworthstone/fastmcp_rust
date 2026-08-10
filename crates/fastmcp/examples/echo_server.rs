@@ -16,6 +16,7 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use fastmcp_rust::prelude::*;
+use fastmcp_rust::modern::ServerBuilder;
 
 // ============================================================================
 // Tools
@@ -130,7 +131,7 @@ fn code_review_prompt(_ctx: &McpContext, code: String, language: String) -> Vec<
 
 fn main() {
     // Build and run the server
-    Server::new("echo-server", "1.0.0")
+    ServerBuilder::new("echo-server", "1.0.0")
         // Register tools
         .tool(Echo)
         .tool(Add)

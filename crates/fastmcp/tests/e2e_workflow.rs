@@ -20,6 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fastmcp_protocol::{LegacyContent, LegacyPromptMessage, LegacyResourceContent, Tool};
+use fastmcp_server::Server;
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, BoxFuture, CanonicalHttpUrl,
@@ -30,7 +31,7 @@ use fastmcp_rust::{
     FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalToolOutcome, HttpServerShutdown,
     Implementation, InputRequiredResult, McpContext, McpError, McpErrorCode, McpOutcome, McpResult,
     MrtrCompletedInputs, Outcome, PromptMessage, ProtocolPolicy, RequestId, ResourceContent,
-    ResourceTemplate, ResultMeta, ResultPeerEra, Role, Server, SseLimits, ToolHandler, auto,
+    ResourceTemplate, ResultMeta, ResultPeerEra, Role, SseLimits, ToolHandler, auto,
     decode_peer_result, prompt, resource, tool,
 };
 use serde_json::json;
@@ -1553,6 +1554,7 @@ fn workflow_public_http_state_only_mrtr_rejects_explicit_empty_without_consuming
     let resumed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let server = Server::new("public-state-only-mrtr", "1.0.0")
         .protocol_policy(ProtocolPolicy::ModernOnly)
+        .expect("the MRTR fixture selects the universally available modern policy")
         .tool(PublicStateOnlyMrtrTool {
             initial_calls: Arc::clone(&initial_calls),
             resumed_calls: Arc::clone(&resumed_calls),

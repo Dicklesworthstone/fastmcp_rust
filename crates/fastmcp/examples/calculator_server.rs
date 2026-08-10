@@ -24,6 +24,7 @@
 )]
 
 use fastmcp_rust::prelude::*;
+use fastmcp_rust::modern::ServerBuilder;
 
 // ============================================================================
 // Basic Arithmetic Tools
@@ -312,7 +313,7 @@ fn solve_problem(_ctx: &McpContext, problem: String) -> Vec<PromptMessage> {
 // ============================================================================
 
 fn main() {
-    Server::new("calculator-server", "1.0.0")
+    ServerBuilder::new("calculator-server", "1.0.0")
         // Basic arithmetic
         .tool(Add)
         .tool(Subtract)

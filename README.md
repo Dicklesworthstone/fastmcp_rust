@@ -95,7 +95,7 @@ MCP server implementations need to solve several recurring problems:
 **FastMCP Rust** is an MCP framework with asupersync capability contexts, attribute macros, and explicit cancellation/budget surfaces:
 
 ```rust
-use fastmcp_rust::prelude::*;
+use fastmcp_rust::{modern::ServerBuilder, prelude::*};
 
 #[tool]
 async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
@@ -104,7 +104,7 @@ async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
 }
 
 fn main() {
-    Server::new("my-server", "1.0.0")
+    ServerBuilder::new("my-server", "1.0.0")
         // Attribute macros generate PascalCase handler values.
         .tool(Greet)
         .build()
@@ -142,7 +142,7 @@ This project includes an [`AGENTS.md`](AGENTS.md) file with guidelines for AI co
 ## Quick Example
 
 ```rust
-use fastmcp_rust::prelude::*;
+use fastmcp_rust::{modern::ServerBuilder, prelude::*};
 
 // Define a tool with automatic JSON schema generation
 #[tool(description = "Calculate the sum of two numbers")]
@@ -170,7 +170,7 @@ async fn greeting(ctx: &McpContext, name: String) -> McpResult<Vec<PromptMessage
 }
 
 fn main() {
-    Server::new("example-server", "1.0.0")
+    ServerBuilder::new("example-server", "1.0.0")
         .tool(Add)
         .resource(ConfigResource)
         .prompt(GreetingPrompt)
@@ -215,7 +215,7 @@ Timeouts are "we gave up." Budgets are "you have X resources." The `Budget` type
 
 ```rust
 // Configure a 30-second server-owned request ceiling
-Server::new("server", "1.0.0")
+ServerBuilder::new("server", "1.0.0")
     .request_timeout(30)
     .tool(MyTool)
     .build()
@@ -403,7 +403,7 @@ fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
 
 ```rust
 // src/main.rs
-use fastmcp_rust::prelude::*;
+use fastmcp_rust::{modern::ServerBuilder, prelude::*};
 
 #[tool(description = "Echo the input message")]
 async fn echo(ctx: &McpContext, message: String) -> McpResult<String> {
@@ -412,7 +412,7 @@ async fn echo(ctx: &McpContext, message: String) -> McpResult<String> {
 }
 
 fn main() {
-    Server::new("echo-server", "1.0.0")
+    ServerBuilder::new("echo-server", "1.0.0")
         .tool(Echo)
         .instructions("A simple echo server for testing")
         .build()

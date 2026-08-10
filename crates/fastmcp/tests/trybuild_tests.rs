@@ -18,6 +18,359 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PROCESS_TERM_GRACE: Duration = Duration::from_millis(500);
 const TRYBUILD_WORKER_ENV: &str = "FASTMCP_TRYBUILD_BOUNDED_WORKER";
 
+/// Facade feature selections that must compile from the manifest itself.
+///
+/// The default and ModernOnly probes prove that optional symbols do not leak
+/// into the curated facade. The remaining entries cover every independently
+/// selectable optional surface and each feature composite owned by the facade.
+const FACADE_FEATURE_COMPILE_PROBES: &[(&str, &[&str])] = &[
+    ("default", &[]),
+    ("modern-only", &["--no-default-features"]),
+    (
+        "legacy",
+        &["--no-default-features", "--features", "legacy-2024-11-05"],
+    ),
+    ("tasks", &["--no-default-features", "--features", "tasks"]),
+    ("apps", &["--no-default-features", "--features", "apps"]),
+    // Proxy without Tasks must not name the final-task listener re-exports.
+    ("proxy", &["--no-default-features", "--features", "proxy"]),
+    // The legacy composite also intentionally omits the Tasks-only listeners.
+    (
+        "proxy-legacy",
+        &["--no-default-features", "--features", "proxy-legacy"],
+    ),
+    (
+        "proxy-tasks",
+        &["--no-default-features", "--features", "proxy-tasks"],
+    ),
+    (
+        "websocket-experimental",
+        &[
+            "--no-default-features",
+            "--features",
+            "websocket-experimental",
+        ],
+    ),
+    (
+        "testing",
+        &["--no-default-features", "--features", "testing"],
+    ),
+    (
+        "testing-lab",
+        &["--no-default-features", "--features", "testing-lab"],
+    ),
+    ("all-features", &["--all-features"]),
+];
+
+struct DownstreamFeatureSymbolProbe {
+    name: &'static str,
+    features: &'static [&'static str],
+    source: &'static str,
+    should_compile: bool,
+    absent_feature_diagnostic: Option<&'static str>,
+}
+
+/// Each enabled profile has a near-identical feature-off negative. These are
+/// real downstream crates, so a transitive or namespaced re-export leak is
+/// rejected at the public facade boundary rather than merely by this crate's
+/// internal feature compilation.
+const DOWNSTREAM_FEATURE_SYMBOL_PROBES: &[DownstreamFeatureSymbolProbe] = &[
+    DownstreamFeatureSymbolProbe {
+        name: "apps-present",
+        features: &["apps"],
+        source: r#"
+use mcp::{
+    MCP_APPS_HTML_MIME_TYPE,
+    McpAppsClientSettings,
+    client::mcp_apps,
+    modern::McpAppsUiResource as ModernMcpAppsUiResource,
+    providers::McpAppsUiResource,
+};
+
+pub fn probe() {
+    let _: Option<McpAppsUiResource> = None;
+    let _: Option<ModernMcpAppsUiResource> = None;
+    let _ = McpAppsClientSettings::new(vec![MCP_APPS_HTML_MIME_TYPE.to_owned()]);
+    let _ = mcp_apps::mcp_apps_in_memory_pair(1);
+}
+"#,
+        should_compile: true,
+        absent_feature_diagnostic: None,
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "apps-absent-root",
+        features: &[],
+        source: r#"
+use mcp::McpAppsClientSettings;
+
+pub fn probe() {
+    let _: Option<McpAppsClientSettings> = None;
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("McpAppsClientSettings"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "apps-absent-protocol-namespace",
+        features: &[],
+        source: r#"
+use mcp::protocol::extensions::MCP_APPS_HTML_MIME_TYPE;
+
+pub fn probe() {
+    let _: &str = MCP_APPS_HTML_MIME_TYPE;
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("MCP_APPS_HTML_MIME_TYPE"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "apps-absent-modern-extensions-namespace",
+        features: &[],
+        source: r#"
+use mcp::modern::extensions::MCP_APPS_HTML_MIME_TYPE;
+
+pub fn probe() {
+    let _: &str = MCP_APPS_HTML_MIME_TYPE;
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("MCP_APPS_HTML_MIME_TYPE"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "modern-server-construction-present",
+        features: &[],
+        source: r#"
+use mcp::modern::ServerBuilder;
+
+pub fn probe() {
+    let _ = ServerBuilder::new("modern-probe", "1.0.0");
+}
+"#,
+        should_compile: true,
+        absent_feature_diagnostic: None,
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "server-escape-root",
+        features: &[],
+        source: r#"
+use mcp::ServerBuilder;
+
+pub fn probe() {
+    let _ = ServerBuilder::new("escaped", "1.0.0");
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("ServerBuilder"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "server-escape-server-namespace",
+        features: &[],
+        source: r#"
+use mcp::server::ServerBuilder;
+
+pub fn probe() {
+    let _ = ServerBuilder::new("escaped", "1.0.0");
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("ServerBuilder"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "tasks-present",
+        features: &["tasks"],
+        source: r#"
+use mcp::{FinalTaskId, FinalTaskRuntime};
+
+pub fn probe() {
+    let _: Option<FinalTaskId> = None;
+    let _: Option<FinalTaskRuntime> = None;
+}
+"#,
+        should_compile: true,
+        absent_feature_diagnostic: None,
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "tasks-absent",
+        features: &[],
+        source: r#"
+use mcp::{FinalTaskId, FinalTaskRuntime};
+
+pub fn probe() {
+    let _: Option<FinalTaskId> = None;
+    let _: Option<FinalTaskRuntime> = None;
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("FinalTaskId"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "proxy-present",
+        features: &["proxy"],
+        source: r#"
+use mcp::{ProxyClient, ProxyUpstreamBinding};
+
+pub fn probe() {
+    let _: Option<ProxyClient> = None;
+    let _: Option<ProxyUpstreamBinding> = None;
+}
+"#,
+        should_compile: true,
+        absent_feature_diagnostic: None,
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "proxy-absent",
+        features: &[],
+        source: r#"
+use mcp::{ProxyClient, ProxyUpstreamBinding};
+
+pub fn probe() {
+    let _: Option<ProxyClient> = None;
+    let _: Option<ProxyUpstreamBinding> = None;
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("ProxyClient"),
+    },
+];
+
+#[test]
+fn facade_feature_profile_compile_probes() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir.join("Cargo.toml");
+    let target_dir = cargo_target_dir(manifest_dir).join("facade-feature-compile-probes");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+
+    for (profile, arguments) in FACADE_FEATURE_COMPILE_PROBES {
+        let mut command = Command::new(&cargo);
+        command
+            .arg("check")
+            .arg("--locked")
+            .arg("--offline")
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .args(*arguments)
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let status = run_bounded(
+            command,
+            &format!("facade feature compile probe ({profile})"),
+            COMPILE_DEADLINE,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            status.success(),
+            "facade feature compile probe {profile} failed with {status}",
+        );
+    }
+}
+
+#[test]
+fn downstream_feature_symbol_probes() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let facade_path = toml_path(manifest_dir);
+    let target_dir = cargo_target_dir(manifest_dir).join("downstream-feature-symbol-probes");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+
+    for probe in DOWNSTREAM_FEATURE_SYMBOL_PROBES {
+        let fixture_root = target_dir.join(probe.name);
+        let fixture_src = fixture_root.join("src");
+        fs::create_dir_all(&fixture_src)
+            .unwrap_or_else(|error| panic!("create {} fixture source: {error}", probe.name));
+
+        let features = probe
+            .features
+            .iter()
+            .map(|feature| format!("\"{feature}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::write(
+            fixture_root.join("Cargo.toml"),
+            format!(
+                r#"[package]
+name = "fastmcp-downstream-feature-{}"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+mcp = {{ package = "fastmcp-rust", path = "{facade_path}", default-features = false, features = [{features}] }}
+"#,
+                probe.name,
+            ),
+        )
+        .unwrap_or_else(|error| panic!("write {} fixture manifest: {error}", probe.name));
+        fs::write(fixture_src.join("lib.rs"), probe.source)
+            .unwrap_or_else(|error| panic!("write {} fixture source: {error}", probe.name));
+
+        let fixture_manifest = fixture_root.join("Cargo.toml");
+        let fixture_target_dir = target_dir.join(format!("{}-target", probe.name));
+        let mut lock_command = Command::new(&cargo);
+        lock_command
+            .arg("generate-lockfile")
+            .arg("--offline")
+            .arg("--manifest-path")
+            .arg(&fixture_manifest)
+            .env("CARGO_TARGET_DIR", &fixture_target_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let lock_status = run_bounded(
+            lock_command,
+            &format!("{} downstream feature lock generation", probe.name),
+            COMPILE_DEADLINE,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            lock_status.success(),
+            "{} downstream feature lock generation failed with {lock_status}",
+            probe.name,
+        );
+
+        let diagnostic_path = fixture_root.join("check.stderr");
+        let mut check_command = Command::new(&cargo);
+        check_command
+            .arg("check")
+            .arg("--locked")
+            .arg("--offline")
+            .arg("--manifest-path")
+            .arg(&fixture_manifest)
+            .env("CARGO_TARGET_DIR", &fixture_target_dir)
+            .stdout(Stdio::inherit());
+        if probe.absent_feature_diagnostic.is_some() {
+            let diagnostics = fs::File::create(&diagnostic_path).unwrap_or_else(|error| {
+                panic!("create {} diagnostic capture: {error}", probe.name)
+            });
+            check_command.stderr(Stdio::from(diagnostics));
+        } else {
+            check_command.stderr(Stdio::inherit());
+        }
+        let label = format!("{} downstream feature symbol probe", probe.name);
+        let status = run_bounded(check_command, &label, COMPILE_DEADLINE)
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            status.success(),
+            probe.should_compile,
+            "{} downstream feature symbol probe expected success={}, got {}",
+            probe.name,
+            probe.should_compile,
+            status,
+        );
+        if let Some(expected_diagnostic) = probe.absent_feature_diagnostic {
+            let diagnostics = fs::read_to_string(&diagnostic_path).unwrap_or_else(|error| {
+                panic!("read {} diagnostic capture: {error}", probe.name)
+            });
+            assert!(
+                diagnostics.contains(expected_diagnostic),
+                "{} absent-feature probe must fail because `{expected_diagnostic}` is unavailable; diagnostics:\n{diagnostics}",
+                probe.name,
+            );
+        }
+    }
+}
+
 #[test]
 fn compile_fail_tests() {
     if std::env::var_os(TRYBUILD_WORKER_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {

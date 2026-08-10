@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fastmcp_rust::prelude::*;
+use fastmcp_rust::modern::ServerBuilder;
 
 // ============================================================================
 // Data Structures
@@ -372,7 +373,7 @@ fn summarize_notes(_ctx: &McpContext, notes_content: String) -> Vec<PromptMessag
 // ============================================================================
 
 fn main() {
-    Server::new("notes-server", "1.0.0")
+    ServerBuilder::new("notes-server", "1.0.0")
         // CRUD operations
         .tool(CreateNote)
         .tool(GetNote)

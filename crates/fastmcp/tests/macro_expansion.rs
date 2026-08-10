@@ -24,6 +24,7 @@
 use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
 use asupersync::{LabConfig, LabRuntime};
 use fastmcp_rust::serde_json::json;
+use fastmcp_server::Server;
 #[cfg(feature = "tasks")]
 use fastmcp_rust::{
     ApplicationTaskSupervisor, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
@@ -35,7 +36,7 @@ use fastmcp_rust::{
     FinalReadResourceResult, FinalTaskWorkDescriptor, FinalToolOutcome, Implementation,
     InboundRequestContext, InboundRequestTransport, InputRequiredResult, JsonRpcRequest,
     JsonSchema, MODERN_PROTOCOL_VERSION, McpContext, McpError, McpOutcome, McpResult, Outcome,
-    PromptHandler, PromptMessage, ResourceContent, ResourceHandler, ResultMeta, Role, Server,
+    PromptHandler, PromptMessage, ResourceContent, ResourceHandler, ResultMeta, Role,
     ToolHandler, prompt, resource, tool,
 };
 use std::collections::{BTreeMap, HashMap};

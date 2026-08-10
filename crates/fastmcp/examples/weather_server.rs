@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 
 use fastmcp_rust::prelude::*;
+use fastmcp_rust::modern::ServerBuilder;
 
 // ============================================================================
 // Mock Data
@@ -448,7 +449,7 @@ fn packing_list(
 // ============================================================================
 
 fn main() {
-    Server::new("weather-server", "1.0.0")
+    ServerBuilder::new("weather-server", "1.0.0")
         // Weather tools
         .tool(GetWeather)
         .tool(GetForecast)

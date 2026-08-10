@@ -14,6 +14,7 @@
 use std::time::{Duration, Instant};
 
 use fastmcp_rust::prelude::*;
+use fastmcp_rust::modern::ServerBuilder;
 
 // ============================================================================
 // Benchmark Utilities
@@ -109,7 +110,7 @@ fn bench_server_creation() {
 
     // Minimal server
     let start = Instant::now();
-    let _server = Server::new("bench", "1.0.0").build();
+    let _server = ServerBuilder::new("bench", "1.0.0").build();
     let minimal = start.elapsed();
     println!(
         "Minimal server (no handlers):      {}",
@@ -118,7 +119,7 @@ fn bench_server_creation() {
 
     // Server with one tool
     let start = Instant::now();
-    let _server = Server::new("bench", "1.0.0").tool(Noop).build();
+    let _server = ServerBuilder::new("bench", "1.0.0").tool(Noop).build();
     let one_tool = start.elapsed();
     println!(
         "Server with 1 tool:                {}",
@@ -127,7 +128,7 @@ fn bench_server_creation() {
 
     // Server with multiple handlers
     let start = Instant::now();
-    let _server = Server::new("bench", "1.0.0")
+    let _server = ServerBuilder::new("bench", "1.0.0")
         .tool(Noop)
         .tool(BenchEcho)
         .tool(JsonRoundtrip)
@@ -142,7 +143,7 @@ fn bench_server_creation() {
 
     // Stress test: many tools (simulated by repeated registration)
     let start = Instant::now();
-    let mut builder = Server::new("bench", "1.0.0");
+    let mut builder = ServerBuilder::new("bench", "1.0.0");
     for _ in 0..100 {
         builder = builder.tool(Noop);
     }
