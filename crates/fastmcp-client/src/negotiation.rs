@@ -61,6 +61,8 @@ pub enum ClientHttpNegotiationError {
     ModernProbeTransportFailure,
     /// The response cannot authorize a legacy SSE fallback.
     ModernProbeRejectedWithoutLegacyFallback { status: u16, body: HttpProbeBody },
+    /// The plan requires a policy or extension this crate build omitted.
+    FeatureConfigurationRejected,
 }
 
 impl fmt::Display for ClientHttpNegotiationError {
@@ -83,6 +85,9 @@ impl fmt::Display for ClientHttpNegotiationError {
             Self::ModernProbeRejectedWithoutLegacyFallback { status, body } => write!(
                 formatter,
                 "modern HTTP probe status {status} with {body:?} cannot authorize legacy fallback"
+            ),
+            Self::FeatureConfigurationRejected => formatter.write_str(
+                "the client plan requires a policy or extension this crate build did not include",
             ),
         }
     }

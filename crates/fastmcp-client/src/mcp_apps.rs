@@ -1243,11 +1243,17 @@ fn wire_host_notification_parts(
     match notification {
         McpAppsHostNotification::ToolInput { arguments } => Ok((
             McpAppsRoutedMethod::ToolInput,
-            optional_member("arguments", arguments.map(Value::Object)),
+            optional_member(
+                "arguments",
+                arguments.map(|arguments| Value::Object(arguments.into_iter().collect())),
+            ),
         )),
         McpAppsHostNotification::ToolInputPartial { arguments } => Ok((
             McpAppsRoutedMethod::ToolInputPartial,
-            optional_member("arguments", arguments.map(Value::Object)),
+            optional_member(
+                "arguments",
+                arguments.map(|arguments| Value::Object(arguments.into_iter().collect())),
+            ),
         )),
         McpAppsHostNotification::ToolResult(result) => Ok((
             McpAppsRoutedMethod::ToolResult,
