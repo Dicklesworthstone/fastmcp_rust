@@ -9456,7 +9456,7 @@ mod tests {
         let runner = recovered_runtime
             .install_task_service(
                 1,
-                Arc::new(TerminalTransitionThenFailingFinalTaskSupervisor),
+                Arc::new(TerminalTransitionThenFailingFinalTaskSupervisor {}),
             )
             .expect("install caller-owned transitioning failing service runner");
         let application_runtime = RuntimeBuilder::current_thread()
