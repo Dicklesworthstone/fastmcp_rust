@@ -31,17 +31,20 @@
 ### Current qualification boundaries
 
 - **Wire cancellation is only partially qualified:** on Unix, the primary
-  stdio path keeps receiving while one bounded worker serializes dispatch, so
-  it can route a cancellation while a handler is running. Non-Unix stdio and
-  custom/SSE/WebSocket entry points retain sequential or blocking boundaries,
-  and independently owned request `Cx` lifetimes plus reliable `awaitCleanup`
-  semantics remain unverified.
+  stdio path keeps receiving while bounded modern requests run in independent
+  request-owned children, so it can route cancellation during handler
+  execution. Response and notification commits remain serialized at the
+  output writer, while exact MCP 2024-11-05 traffic remains serialized through
+  its lifecycle worker. Non-Unix stdio and custom/SSE/WebSocket entry points
+  retain sequential or blocking boundaries. A non-cooperative handler can
+  still exceed the bounded process-exit drain, so end-to-end quiescence and
+  reliable `awaitCleanup` semantics remain unverified.
 - **Bidirectional calls are not qualified:** the Unix stdio receive pump can
-  route sampling, elicitation, and roots responses while its dispatch worker
-  is occupied. Non-Unix stdio and custom/SSE/WebSocket paths reject or lack
-  that split routing. Public HTTP has its own dual-era request and response
-  routing, but end-to-end bidirectional lifecycle/cancellation evidence is
-  incomplete.
+  route sampling, elicitation, and roots responses while exact-2024 lifecycle
+  work or modern request children are active. Non-Unix stdio and
+  custom/SSE/WebSocket paths reject or lack that split routing. Public HTTP
+  has its own dual-era request and response routing, but end-to-end
+  bidirectional lifecycle/cancellation evidence is incomplete.
 - **Response caching is conservatively partitioned:** eligible production
   requests are keyed by committed authentication facts plus opaque session
   identity and revision. Uncommitted authentication, local-only state views,
@@ -571,7 +574,7 @@ pub trait PromptHandler: Send + Sync {
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | JSON-RPC `MethodNotFound` for `tools/call` | Tool not registered | Register the generated handler, for example `.tool(MyTool)` |
-| Request cancelled mid-operation | Local request cancellation or budget exhaustion | Add checkpoints and mask only the smallest atomic section that must finish; Unix stdio has a continuous receive pump, but non-Unix stdio, custom/SSE/WebSocket loops, and request-owned cleanup semantics remain unqualified |
+| Request cancelled mid-operation | Local request cancellation or budget exhaustion | Add checkpoints and mask only the smallest atomic section that must finish; Unix stdio keeps receiving while bounded modern request children run, but output commits are serialized, non-Unix/custom/SSE/WebSocket loops retain blocking boundaries, and a non-cooperative handler can exceed the process-exit quiescence drain |
 | Budget exhausted errors | Deadline, poll, or cost dimension exhausted | Inspect the exhausted dimension; increase `.request_timeout(...)` only for a deadline that is intentionally too short |
 | `#[tool]` macro compilation error | Unsupported return conversion or argument schema | Prefer `String`, `Vec<Content>`, `McpResult<String>`, or `McpResult<Vec<Content>>` and ensure custom argument types implement `JsonSchema` |
 | `TransportError::Io` on startup | stdin unavailable | Ensure nothing else reads stdin |
@@ -608,15 +611,15 @@ fn commit_revision(
 | **Client Transport Coverage** | `fastmcp-client::Client` is subprocess-stdio only; public `ClientHttpConnection` and `HttpClient` provide modern HTTP and exact legacy SSE integration. Raw WebSocket types remain outside those client surfaces |
 | **No Built-in TLS** | Transport encryption must be handled externally |
 | **HTTP Dispatch Qualification** | Public `run_http*` binds and serves the caller-owned dual-era HTTP lifecycle. `ModernOnly` selects the exact MCP 2026-07-28 era and `LegacyOnly` selects the exact MCP 2024-11-05 era; MCP 2025-11-25 is not an adapter or supported policy. This executable surface does not establish aggregate MCP conformance or complete lifecycle qualification |
-| **Wire Cancellation** | On Unix, stdio has a continuous receive pump plus serialized dispatch worker and can route `notifications/cancelled` during handler execution. Non-Unix stdio and custom/SSE/WebSocket loops retain sequential/blocking boundaries, while request-owned `Cx` isolation and reliable `awaitCleanup` semantics remain unverified |
+| **Wire Cancellation** | On Unix, stdio has a continuous receive pump and bounded concurrent modern request-owned children, so it can route `notifications/cancelled` during handler execution. Response and notification commits are serialized at the output writer; exact MCP 2024-11-05 traffic remains serialized through its lifecycle worker. Non-Unix stdio and custom/SSE/WebSocket loops retain sequential/blocking boundaries, while a non-cooperative handler can exceed the bounded process-exit drain and reliable `awaitCleanup` semantics remain unverified |
 | **Silent stdio peers** | On Unix, the public subprocess `Client` enforces configured idle/absolute deadlines at child-pipe readiness and decode boundaries, including silent and partial-frame peers. Generic blocking `StdioTransport::recv`, non-Unix child-pipe reads, and blocking writes retain their documented frame/I/O-boundary limitation; these deadlines are therefore not a portable end-to-end request or process wall-clock guarantee. Those residuals remain FND-04 work |
-| **Stdio output backpressure** | On Unix, primary server responses and notifications use serialized nonblocking writes with a two-second commit deadline for ordinary pipes/sockets; a timeout, lock poison, partial write, notification encoding failure, or descriptor-flag restoration failure is connection-fatal. The writer attempts to restore descriptor flags before releasing the local lock; on restoration failure the descriptor may remain nonblocking, and inherited duplicate descriptors can observe the temporary `O_NONBLOCK` setting. Regular files/devices and non-Unix stdout retain blocking-I/O limits. A handler that ignores cancellation may force unsuccessful process exit; shutdown hooks are skipped unless worker quiescence is proven |
+| **Stdio output backpressure** | On Unix, primary server responses and notifications use serialized nonblocking writes with a two-second commit deadline for ordinary pipes/sockets; a timeout, lock poison, partial write, notification encoding failure, or descriptor-flag restoration failure is connection-fatal. The writer attempts to restore descriptor flags before releasing the local lock; on restoration failure the descriptor may remain nonblocking, and inherited duplicate descriptors can observe the temporary `O_NONBLOCK` setting. Regular files/devices and non-Unix stdout retain blocking-I/O limits. A handler that ignores cancellation may force unsuccessful process exit after the bounded drain; shutdown hooks are skipped unless all worker and modern-child quiescence is proven |
 | **Subprocess cleanup** | `Client::close(&mut self) -> McpResult<()>` is the proof-bearing path; Drop is best effort. `fastmcp test` uses Unix-only anchored process-group ownership; successful connections report explicit final cleanup separately, and initialization-cleanup failures remain visible. Descendants can escape via a new group/session, host forks can copy the control descriptor, and `SIGCHLD=SIG_IGN`, `SA_NOCLDWAIT`, or competing global reapers can invalidate reap evidence. Windows Job Object support is not implemented |
 | **Development subprocess cleanup** | On Unix, each `fastmcp dev` build/server group contains a signal-immune watchdog tied to a private owner-held control pipe, so ordinary shutdown, child-handle drop, and CLI owner death trigger bounded TERM-then-KILL cleanup. A host-side fork that copies the owner descriptor or a descendant that changes group/session remains outside this boundary; non-Unix `dev` remains fail-closed |
 | **Synchronous HTTP readers** | Low-level HTTP parsing checkpoints before/after reads and retries `EINTR`, but a generic synchronous `Read` already blocked in the kernel cannot be preempted. A bounded host must supply readiness-aware/asynchronous I/O. Public turnkey `run_http*` uses its caller-owned asynchronous listener lifecycle, whose broader qualification boundaries remain documented here |
 | **Returning transport runners** | `run_transport_returning*` returns fatal receive/send/close errors and preserves simultaneous run-plus-close failures. Clean EOF/cancellation is `Ok(())`. The legacy custom loop still uses one ambient `Cx` and does not prove request-owned isolation |
-| **Request Cancellation Ownership** | Request work does not yet have an independently owned child `Cx`; cancellation must not be treated as a sibling-isolated guarantee |
-| **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while its dispatch worker is occupied. Non-Unix stdio and custom/SSE/WebSocket paths do not provide the same split routing. Public HTTP has separate dual-era routing, while end-to-end bidirectional lifecycle qualification remains open |
+| **Request Cancellation Ownership** | Unix modern stdio request work runs in independently owned bounded child contexts, but process-exiting shutdown does not wait unboundedly for a non-cooperative child; cancellation therefore is not yet a complete quiescence or `awaitCleanup` guarantee |
+| **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while exact-2024 lifecycle work or modern request children are active. Non-Unix stdio and custom/SSE/WebSocket paths do not provide the same split routing. Public HTTP has separate dual-era routing, while end-to-end bidirectional lifecycle qualification remains open |
 | **Response Cache Partitioning** | Eligible entries are partitioned by committed authentication facts and opaque session identity/revision; ambiguous admission and state mutation fail closed. This does not promote OAuth/OIDC or establish protocol conformance |
 | **Authentication Admission** | JSON-RPC credential fields are a stripped legacy fallback. Public turnkey HTTP is live, but no complete transport-boundary native `Authorization` admission/challenge path is qualified |
 | **Tasks RPC** | Task methods are not advertised and return `MethodNotFound`; client/task source presence is not a usable server capability |
