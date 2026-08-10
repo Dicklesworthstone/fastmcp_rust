@@ -10995,8 +10995,7 @@ mod tests {
             assert_eq!(get_request["method"], "tasks/get");
             assert_eq!(get_request["params"]["taskId"], "task-73");
             assert_eq!(
-                get_request["params"]["_meta"]
-                    ["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                get_request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
                     ["io.modelcontextprotocol/tasks"],
                 serde_json::json!({})
             );
@@ -11017,8 +11016,7 @@ mod tests {
                 serde_json::json!(["task-73"])
             );
             assert_eq!(
-                watch_request["params"]["_meta"]
-                    ["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                watch_request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
                     ["io.modelcontextprotocol/tasks"],
                 serde_json::json!({})
             );
@@ -11045,9 +11043,7 @@ mod tests {
                     br#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}"#,
                 );
 
-                let (mut poll, _) = listener
-                    .accept()
-                    .expect("accept final task handle poll");
+                let (mut poll, _) = listener.accept().expect("accept final task handle poll");
                 let poll_request = read_http_cache_test_request(&mut poll);
                 assert_eq!(poll_request["id"], 5);
                 assert_eq!(poll_request["method"], "tasks/get");
@@ -11089,10 +11085,17 @@ mod tests {
         ))
         .expect("public HTTP task attachment admits the first snapshot");
         assert!(matches!(handle.task(), FinalTask::Working(_)));
-        assert_eq!(handle.task().base().poll_interval_ms.as_ref().map(|value| value.as_str()), Some("25"));
+        assert_eq!(
+            handle
+                .task()
+                .base()
+                .poll_interval_ms
+                .as_ref()
+                .map(|value| value.as_str()),
+            Some("25")
+        );
 
-        let limits =
-            sse::SseLimits::new(1_024, 8_192, 8).expect("bounded final task watch limits");
+        let limits = sse::SseLimits::new(1_024, 8_192, 8).expect("bounded final task watch limits");
         let mut watcher = http_test_runtime_block_on(handle.watch(&cx, &mut client, limits))
             .expect("public HTTP task watcher opens");
         assert!(matches!(
@@ -11105,7 +11108,9 @@ mod tests {
         let (task, error, next_id) = if notification_matches_handle {
             assert!(matches!(
                 notification.expect("matching task status notification is admitted"),
-                Some(FinalTaskWatchEvent::TaskUpdated(FinalTaskStatusNotification { .. }))
+                Some(FinalTaskWatchEvent::TaskUpdated(
+                    FinalTaskStatusNotification { .. }
+                ))
             ));
             assert!(matches!(
                 http_test_runtime_block_on(watcher.next_event(&cx))
@@ -11115,18 +11120,12 @@ mod tests {
             drop(watcher);
             assert!(matches!(handle.task(), FinalTask::InputRequired { .. }));
 
-            let acknowledgement = http_test_runtime_block_on(handle.resume_input(
-                &cx,
-                &mut client,
-                BTreeMap::new(),
-            ))
-            .expect("input-required task resumes with its exact empty ledger");
+            let acknowledgement =
+                http_test_runtime_block_on(handle.resume_input(&cx, &mut client, BTreeMap::new()))
+                    .expect("input-required task resumes with its exact empty ledger");
             assert!(acknowledgement.meta.is_none());
             assert!(acknowledgement.additional.is_empty());
-            assert!(matches!(
-                handle.task(),
-                FinalTask::InputRequired { .. }
-            ));
+            assert!(matches!(handle.task(), FinalTask::InputRequired { .. }));
             http_test_runtime_block_on(handle.poll(&cx, &mut client))
                 .expect("poll reconciles the acknowledged task state");
             (
