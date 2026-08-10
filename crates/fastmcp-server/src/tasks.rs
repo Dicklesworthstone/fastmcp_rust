@@ -1638,6 +1638,29 @@ pub trait FinalTaskStore: Send + Sync {
         ))
     }
 
+    /// Atomically commits one application-owned handoff transition only when
+    /// the exact elected owner, generation, and dispatch fence remain live.
+    ///
+    /// `cancellation_required` selects the only two valid cancellation
+    /// dispositions. Normal completion, failure, and input-required
+    /// transitions require that cancellation has not won. A cancellation
+    /// terminal transition requires that cancellation intent has won. The
+    /// check and replacement share one durable linearization point, so a
+    /// former worker cannot mutate a task after its lease is reclaimed.
+    fn replace_task_and_clear_input_for_handoff_if_current(
+        &self,
+        _expected: &FinalTaskSnapshot,
+        _owner_id: &str,
+        _dispatch_fence: u64,
+        _cancellation_required: bool,
+        _task: FinalTask,
+        _notification: FinalTaskStatusNotification,
+    ) -> McpResult<bool> {
+        Err(McpError::internal_error(
+            "Final task store does not implement fenced handoff transitions",
+        ))
+    }
+
     /// Legacy raw accepted-input claim.
     ///
     /// New task-service code must use
@@ -2340,6 +2363,56 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
+            return Ok(false);
+        }
+        replace_in_memory_final_task(
+            &mut state,
+            task,
+            notification,
+            now,
+            InMemoryFinalTaskInputMutation::Clear,
+        )?;
+        Ok(true)
+    }
+
+    fn replace_task_and_clear_input_for_handoff_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+        owner_id: &str,
+        dispatch_fence: u64,
+        cancellation_required: bool,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+    ) -> McpResult<bool> {
+        if owner_id.is_empty() {
+            return Err(McpError::invalid_params(
+                "Final task handoff owner must be non-empty",
+            ));
+        }
+        let task_id = task.base().task_id.clone();
+        if expected.task().base().task_id != task_id {
+            return Err(McpError::invalid_params(
+                "Expected and replacement final task IDs must match",
+            ));
+        }
+        ensure_final_task_notification_matches_task(&task, &notification)?;
+        validate_final_task_runtime_durations(&task)?;
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        let owns_exact_dispatch = state.handoff_leases.get(&task_id).is_some_and(|lease| {
+            lease.generation == expected.generation()
+                && lease.dispatch_elected
+                && lease.owner_id == owner_id
+                && lease.dispatch_fence == Some(dispatch_fence)
+        });
+        if state.generations.get(&task_id) != Some(&expected.generation())
+            || !owns_exact_dispatch
+            || state.cancellation_requests.contains(&task_id) != cancellation_required
+        {
             return Ok(false);
         }
         replace_in_memory_final_task(
@@ -3165,13 +3238,97 @@ impl FinalTaskWorkDescriptor {
     }
 }
 
+/// Exact authority for one elected application handoff.
+///
+/// This is deliberately retained inside the non-cloneable handoff values
+/// below. Application code can observe it only while the task service is
+/// invoking the supervisor, and every mutation carries the store-issued
+/// generation, owner, and dispatch fence that elected that invocation.
+struct FinalTaskHandoffAuthority {
+    runtime: FinalTaskRuntime,
+    task_id: FinalTaskId,
+    generation: u64,
+    owner_id: String,
+    dispatch_fence: u64,
+}
+
+impl FinalTaskHandoffAuthority {
+    fn require_input(
+        &self,
+        input_requests: FinalTaskInputRequests,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        self.runtime.fenced_require_input(
+            &self.task_id,
+            self.generation,
+            &self.owner_id,
+            self.dispatch_fence,
+            input_requests,
+            status_message,
+        )
+    }
+
+    fn complete_task(
+        &self,
+        result: FinalTaskCallToolResult,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        self.runtime.fenced_complete_task(
+            &self.task_id,
+            self.generation,
+            &self.owner_id,
+            self.dispatch_fence,
+            result,
+            status_message,
+        )
+    }
+
+    fn fail_task(
+        &self,
+        error: FinalTaskError,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        self.runtime.fenced_fail_task(
+            &self.task_id,
+            self.generation,
+            &self.owner_id,
+            self.dispatch_fence,
+            error,
+            status_message,
+        )
+    }
+
+    fn honor_cancellation(&self, status_message: Option<String>) -> McpResult<FinalTask> {
+        self.runtime.fenced_honor_cancellation(
+            &self.task_id,
+            self.generation,
+            &self.owner_id,
+            self.dispatch_fence,
+            status_message,
+        )
+    }
+
+    fn is_cancellation_requested(&self) -> McpResult<bool> {
+        self.runtime
+            .fenced_cancellation_requested(&self.task_id, self.generation)
+    }
+}
+
 /// Initial caller-owned work recovered from a newly created final Task.
 #[must_use = "initial task work must be handed to the application supervisor"]
-#[derive(PartialEq)]
 pub struct FinalTaskInitialWork {
     task_id: FinalTaskId,
     generation: u64,
     work_descriptor: FinalTaskWorkDescriptor,
+    authority: Option<FinalTaskHandoffAuthority>,
+}
+
+impl PartialEq for FinalTaskInitialWork {
+    fn eq(&self, other: &Self) -> bool {
+        self.task_id == other.task_id
+            && self.generation == other.generation
+            && self.work_descriptor == other.work_descriptor
+    }
 }
 
 impl FinalTaskInitialWork {
@@ -3193,6 +3350,55 @@ impl FinalTaskInitialWork {
         &self.work_descriptor
     }
 
+    /// Enters `input_required` under this handoff's exact elected fence.
+    pub fn require_input(
+        &self,
+        input_requests: FinalTaskInputRequests,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        self.authority()?.require_input(input_requests, status_message)
+    }
+
+    /// Completes this task under this handoff's exact elected fence.
+    pub fn complete_task(
+        &self,
+        result: FinalTaskCallToolResult,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        self.authority()?.complete_task(result, status_message)
+    }
+
+    /// Fails this task under this handoff's exact elected fence.
+    pub fn fail_task(
+        &self,
+        error: FinalTaskError,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        self.authority()?.fail_task(error, status_message)
+    }
+
+    /// Returns whether cancellation has been requested for this exact handoff.
+    pub fn is_cancellation_requested(&self) -> McpResult<bool> {
+        self.authority()?.is_cancellation_requested()
+    }
+
+    /// Records the cooperative cancellation outcome under the elected fence.
+    pub fn honor_cancellation(&self, status_message: Option<String>) -> McpResult<FinalTask> {
+        self.authority()?.honor_cancellation(status_message)
+    }
+
+    fn authority(&self) -> McpResult<&FinalTaskHandoffAuthority> {
+        self.authority.as_ref().ok_or_else(|| {
+            McpError::internal_error(
+                "Final task application mutations require an elected service handoff",
+            )
+        })
+    }
+
+    fn attach_authority(&mut self, authority: FinalTaskHandoffAuthority) {
+        self.authority = Some(authority);
+    }
+
     fn restore_copy(&self) -> FinalTaskWorkDescriptor {
         self.work_descriptor.clone()
     }
@@ -3205,12 +3411,21 @@ impl FinalTaskInitialWork {
 /// supervisor takes this value after a task returns to `working` and uses it to
 /// resume the associated operation.
 #[must_use = "accepted task input must be handed to the resumed worker"]
-#[derive(PartialEq)]
 pub struct FinalTaskAcceptedInput {
     task_id: FinalTaskId,
     generation: u64,
     work_descriptor: FinalTaskWorkDescriptor,
     input_responses: FinalTaskInputResponses,
+    authority: Option<FinalTaskHandoffAuthority>,
+}
+
+impl PartialEq for FinalTaskAcceptedInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.task_id == other.task_id
+            && self.generation == other.generation
+            && self.work_descriptor == other.work_descriptor
+            && self.input_responses == other.input_responses
+    }
 }
 
 impl FinalTaskAcceptedInput {
@@ -3257,6 +3472,55 @@ impl FinalTaskAcceptedInput {
         )
     }
 
+    /// Enters `input_required` under this handoff's exact elected fence.
+    pub fn require_input(
+        &self,
+        input_requests: FinalTaskInputRequests,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        self.authority()?.require_input(input_requests, status_message)
+    }
+
+    /// Completes this task under this handoff's exact elected fence.
+    pub fn complete_task(
+        &self,
+        result: FinalTaskCallToolResult,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        self.authority()?.complete_task(result, status_message)
+    }
+
+    /// Fails this task under this handoff's exact elected fence.
+    pub fn fail_task(
+        &self,
+        error: FinalTaskError,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        self.authority()?.fail_task(error, status_message)
+    }
+
+    /// Returns whether cancellation has been requested for this exact handoff.
+    pub fn is_cancellation_requested(&self) -> McpResult<bool> {
+        self.authority()?.is_cancellation_requested()
+    }
+
+    /// Records the cooperative cancellation outcome under the elected fence.
+    pub fn honor_cancellation(&self, status_message: Option<String>) -> McpResult<FinalTask> {
+        self.authority()?.honor_cancellation(status_message)
+    }
+
+    fn authority(&self) -> McpResult<&FinalTaskHandoffAuthority> {
+        self.authority.as_ref().ok_or_else(|| {
+            McpError::internal_error(
+                "Final task application mutations require an elected service handoff",
+            )
+        })
+    }
+
+    fn attach_authority(&mut self, authority: FinalTaskHandoffAuthority) {
+        self.authority = Some(authority);
+    }
+
     fn restore_copy(&self) -> FinalTaskInputResponses {
         self.input_responses.clone()
     }
@@ -3269,6 +3533,15 @@ pub enum FinalTaskSupervisorHandoff {
     Initial(FinalTaskInitialWork),
     /// The task's original operation resumes with accepted client input.
     Resumed(FinalTaskAcceptedInput),
+}
+
+impl FinalTaskSupervisorHandoff {
+    fn attach_authority(&mut self, authority: FinalTaskHandoffAuthority) {
+        match self {
+            Self::Initial(initial) => initial.attach_authority(authority),
+            Self::Resumed(accepted) => accepted.attach_authority(authority),
+        }
+    }
 }
 
 /// Application-owned admission authority for Tasks with unlimited retention.
@@ -3591,6 +3864,7 @@ impl FinalTaskRuntime {
                 generation: current.generation(),
                 work_descriptor,
                 input_responses,
+                authority: None,
             }),
         )
     }
@@ -3629,6 +3903,7 @@ impl FinalTaskRuntime {
                 generation: candidate.generation(),
                 work_descriptor,
                 input_responses,
+                authority: None,
             }));
         }
         Err(McpError::internal_error(
@@ -3674,6 +3949,7 @@ impl FinalTaskRuntime {
                 generation: candidate.generation(),
                 work_descriptor,
                 input_responses,
+                authority: None,
             }));
         }
         Err(McpError::internal_error(
@@ -3705,6 +3981,7 @@ impl FinalTaskRuntime {
                 task_id,
                 generation: candidate.generation(),
                 work_descriptor,
+                authority: None,
             }));
         }
         Err(McpError::internal_error(
@@ -3744,6 +4021,7 @@ impl FinalTaskRuntime {
                 task_id: candidate.task().base().task_id.clone(),
                 generation: candidate.generation(),
                 work_descriptor,
+                authority: None,
             }));
         }
         Err(McpError::internal_error(
@@ -3767,6 +4045,7 @@ impl FinalTaskRuntime {
             task_id: task_id.clone(),
             generation: current.generation(),
             work_descriptor,
+            authority: None,
         }))
     }
 
@@ -3791,6 +4070,7 @@ impl FinalTaskRuntime {
                 generation: current.generation(),
                 work_descriptor,
                 input_responses,
+                authority: None,
             }),
         )
     }
@@ -3842,7 +4122,169 @@ impl FinalTaskRuntime {
         })
     }
 
+    fn fenced_require_input(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+        owner_id: &str,
+        dispatch_fence: u64,
+        input_requests: FinalTaskInputRequests,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        if input_requests.is_empty() {
+            return Err(McpError::invalid_params(
+                "input_required tasks require at least one input request",
+            ));
+        }
+        FinalTaskInputLedger::from_requests(&input_requests)
+            .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        let current = self.load_task_snapshot(task_id)?;
+        if current.generation() != generation {
+            return Err(stale_final_task_handoff_error());
+        }
+        let FinalTask::Working(base) = current.task() else {
+            return Err(McpError::invalid_params(
+                "only a working task can require client input",
+            ));
+        };
+        let task = FinalTask::InputRequired {
+            base: transition_final_task_base(
+                base.clone(),
+                FinalTaskStatus::InputRequired,
+                status_message,
+            )?,
+            input_requests,
+        };
+        self.persist_fenced_handoff_transition_clearing_input(
+            &current,
+            owner_id,
+            dispatch_fence,
+            false,
+            task.clone(),
+        )?;
+        Ok(task)
+    }
+
+    fn fenced_complete_task(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+        owner_id: &str,
+        dispatch_fence: u64,
+        result: FinalTaskCallToolResult,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        let current = self.load_task_snapshot(task_id)?;
+        if current.generation() != generation {
+            return Err(stale_final_task_handoff_error());
+        }
+        let FinalTask::Working(base) = current.task() else {
+            return Err(McpError::invalid_params("only a working task can complete"));
+        };
+        let task = FinalTask::Completed {
+            base: transition_terminal_final_task_base(
+                base.clone(),
+                FinalTaskStatus::Completed,
+                status_message,
+            )?,
+            result,
+        };
+        self.persist_fenced_handoff_transition_clearing_input(
+            &current,
+            owner_id,
+            dispatch_fence,
+            false,
+            task.clone(),
+        )?;
+        Ok(task)
+    }
+
+    fn fenced_fail_task(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+        owner_id: &str,
+        dispatch_fence: u64,
+        error: FinalTaskError,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        let current = self.load_task_snapshot(task_id)?;
+        if current.generation() != generation {
+            return Err(stale_final_task_handoff_error());
+        }
+        if matches!(
+            current.task(),
+            FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
+        ) {
+            return Err(McpError::invalid_params("terminal tasks cannot fail"));
+        }
+        let task = FinalTask::Failed {
+            base: transition_terminal_final_task_base(
+                current.task().base().clone(),
+                FinalTaskStatus::Failed,
+                status_message,
+            )?,
+            error,
+        };
+        self.persist_fenced_handoff_transition_clearing_input(
+            &current,
+            owner_id,
+            dispatch_fence,
+            false,
+            task.clone(),
+        )?;
+        Ok(task)
+    }
+
+    fn fenced_honor_cancellation(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+        owner_id: &str,
+        dispatch_fence: u64,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        let current = self.load_task_snapshot(task_id)?;
+        if current.generation() != generation {
+            return Err(stale_final_task_handoff_error());
+        }
+        if matches!(
+            current.task(),
+            FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
+        ) {
+            return Err(McpError::invalid_params(
+                "terminal tasks cannot be cancelled",
+            ));
+        }
+        let task = FinalTask::Cancelled(transition_terminal_final_task_base(
+            current.task().base().clone(),
+            FinalTaskStatus::Cancelled,
+            status_message,
+        )?);
+        self.persist_fenced_handoff_transition_clearing_input(
+            &current,
+            owner_id,
+            dispatch_fence,
+            true,
+            task.clone(),
+        )?;
+        Ok(task)
+    }
+
+    fn fenced_cancellation_requested(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+    ) -> McpResult<bool> {
+        let current = self.load_task_snapshot(task_id)?;
+        if current.generation() != generation {
+            return Err(stale_final_task_handoff_error());
+        }
+        self.store.is_cancellation_requested(task_id)
+    }
+
     /// Enters `input_required` with typed final embedded requests.
+    #[cfg(test)]
     pub fn require_input(
         &self,
         task_id: &FinalTaskId,
@@ -3958,6 +4400,7 @@ impl FinalTaskRuntime {
     }
 
     /// Lets a caller-owned worker record the cooperative cancellation outcome.
+    #[cfg(test)]
     pub fn honor_cancellation(
         &self,
         task_id: &FinalTaskId,
@@ -3987,6 +4430,7 @@ impl FinalTaskRuntime {
     }
 
     /// Records a typed final tools/call result for a working task.
+    #[cfg(test)]
     pub fn complete_task(
         &self,
         task_id: &FinalTaskId,
@@ -4010,6 +4454,7 @@ impl FinalTaskRuntime {
     }
 
     /// Records a typed final task failure for an active task.
+    #[cfg(test)]
     pub fn fail_task(
         &self,
         task_id: &FinalTaskId,
@@ -4143,6 +4588,32 @@ impl FinalTaskRuntime {
             return Err(McpError::invalid_params(
                 "Task state changed before the transition could be recorded",
             ));
+        }
+        self.emit(notification);
+        Ok(())
+    }
+
+    fn persist_fenced_handoff_transition_clearing_input(
+        &self,
+        expected: &FinalTaskSnapshot,
+        owner_id: &str,
+        dispatch_fence: u64,
+        cancellation_required: bool,
+        task: FinalTask,
+    ) -> McpResult<()> {
+        let notification = final_task_notification(&task);
+        if !self
+            .store
+            .replace_task_and_clear_input_for_handoff_if_current(
+                expected,
+                owner_id,
+                dispatch_fence,
+                cancellation_required,
+                task,
+                notification.clone(),
+            )?
+        {
+            return Err(stale_final_task_handoff_error());
         }
         self.emit(notification);
         Ok(())
