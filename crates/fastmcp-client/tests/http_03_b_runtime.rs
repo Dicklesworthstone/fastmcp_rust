@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
-use fastmcp_client::http_executor::{ModernHttpClient, ModernHttpClientError};
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_client::ProtocolEra;
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::http_executor::ModernHttpResponseKind;
+use fastmcp_client::http_executor::{ModernHttpClient, ModernHttpClientError};
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::sse::{SseEndOfStream, SseLimits};
 use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan, ProtocolPolicy};
-#[cfg(feature = "legacy-2024-11-05")]
-use fastmcp_client::ProtocolEra;
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, RequestId};

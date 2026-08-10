@@ -733,9 +733,13 @@ pub trait McpAppsWireHostPolicy {
     /// Observes one exact View-originated request cancellation.
     ///
     /// Returning success commits the bridge-side cancellation by releasing
-    /// that request correlation. An absent-ID cancellation remains the
-    /// protocol's explicit inert no-op and never reaches this hook.
-    async fn cancelled(
+    /// that request correlation. This is deliberately a synchronous immediate
+    /// hook: the bridge has already dropped the request-owned forwarding
+    /// future and must not suspend before committing its cancellation control.
+    /// Implementations may perform only immediate, bounded bookkeeping here.
+    /// An absent-ID cancellation remains the protocol's explicit inert no-op
+    /// and never reaches this hook.
+    fn cancelled(
         &mut self,
         _cx: &Cx,
         _request_id: &McpAppsJsonRpcRequestId,
@@ -883,7 +887,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                             // a non-cooperative embedder policy must not hold
                             // the View bridge or delay this cancellation commit.
                             drop(execution);
-                            self.commit_view_cancellation(cx, &id, &params).await?;
+                            self.commit_view_cancellation(cx, &id, &params)?;
                             return Ok(());
                         }
                         Ok(None) => {
@@ -1017,13 +1021,13 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         decode_params(params.as_ref()).map(Some)
     }
 
-    async fn commit_view_cancellation(
+    fn commit_view_cancellation(
         &mut self,
         cx: &Cx,
         request_id: &McpAppsJsonRpcRequestId,
         params: &McpAppsCancelledControlParams,
     ) -> Result<(), McpAppsHostError> {
-        self.policy.cancelled(cx, request_id, params).await?;
+        self.policy.cancelled(cx, request_id, params)?;
         self.admission
             .complete_error(McpAppsBridgeDirection::ViewToHost, request_id)
             .map_err(McpAppsHostError::Bridge)
@@ -1055,8 +1059,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     .map_err(McpAppsHostError::Bridge)?;
                 if let McpAppsControlDisposition::Bound(request_id) = disposition {
                     let params = decode_params(params.as_ref())?;
-                    self.commit_view_cancellation(cx, &request_id, &params)
-                        .await?;
+                    self.commit_view_cancellation(cx, &request_id, &params)?;
                 }
                 return Ok(());
             }
@@ -1388,16 +1391,16 @@ impl<'client> McpAppsClientWirePolicy<'client> {
 }
 
 impl McpAppsWireHostPolicy for McpAppsClientWirePolicy<'_> {
-    async fn cancelled(
+    fn cancelled(
         &mut self,
         cx: &Cx,
         _request_id: &McpAppsJsonRpcRequestId,
         _params: &McpAppsCancelledControlParams,
     ) -> Result<(), McpAppsHostError> {
         // `handle_view_request` drops the request-owned execution before this
-        // hook commits bridge cancellation. Servicing the shared executor here
-        // turns that drop into its one bounded upstream cancellation control
-        // without reading the stdio response stream again.
+        // immediate hook commits bridge cancellation. Servicing the shared
+        // executor here turns that drop into its one bounded upstream
+        // cancellation control without reading the stdio response stream again.
         self.client
             .service_multiplexed_stdio(cx)
             .map_err(McpAppsHostError::Core)
@@ -2035,11 +2038,7 @@ mod tests {
             Ok(())
         }
 
-        #[allow(
-            clippy::unused_async_trait_impl,
-            reason = "the public wire-host policy trait requires an async override"
-        )]
-        async fn cancelled(
+        fn cancelled(
             &mut self,
             _cx: &Cx,
             request_id: &McpAppsJsonRpcRequestId,
@@ -2086,11 +2085,7 @@ mod tests {
             Ok(json!({"forwarded": true}))
         }
 
-        #[allow(
-            clippy::unused_async_trait_impl,
-            reason = "the public wire-host policy trait requires an async override"
-        )]
-        async fn cancelled(
+        fn cancelled(
             &mut self,
             _cx: &Cx,
             request_id: &McpAppsJsonRpcRequestId,
@@ -2104,6 +2099,8 @@ mod tests {
         }
     }
 
+    /// Compile- and runtime-coverage policy: its request future never
+    /// completes, while cancellation observation remains an immediate hook.
     struct NeverReturnsCancellationWirePolicy {
         events: Arc<Mutex<Vec<String>>>,
     }
@@ -2123,11 +2120,7 @@ mod tests {
             std::future::pending::<Result<Value, McpAppsHostError>>().await
         }
 
-        #[allow(
-            clippy::unused_async_trait_impl,
-            reason = "the public wire-host policy trait requires an async override"
-        )]
-        async fn cancelled(
+        fn cancelled(
             &mut self,
             _cx: &Cx,
             request_id: &McpAppsJsonRpcRequestId,
@@ -2537,7 +2530,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_wire_process_next_cancels_a_never_returning_view_request_and_remains_processable() {
+    fn closed_wire_sync_cancellation_hook_releases_never_returning_view_request() {
         block_on(async {
             let cx = Cx::for_testing();
             let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);

@@ -11023,7 +11023,6 @@ mod tests {
         let message_target = format!("http://{address}/legacy-message");
         let advertised_message_target = message_target.clone();
         let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
-        let (callback_started_tx, callback_started_rx) = mpsc::sync_channel::<()>(1);
         let server = thread::spawn(move || -> Result<bool, String> {
             listener
                 .set_nonblocking(true)
@@ -11926,6 +11925,7 @@ mod tests {
         let message_target = format!("http://{address}/legacy-message");
         let advertised_message_target = message_target.clone();
         let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
+        let (callback_started_tx, callback_started_rx) = mpsc::sync_channel::<()>(1);
         let server = thread::spawn(move || -> Result<bool, String> {
             listener.set_nonblocking(true).map_err(|error| {
                 format!("make high-level legacy reverse cancellation listener nonblocking: {error}")

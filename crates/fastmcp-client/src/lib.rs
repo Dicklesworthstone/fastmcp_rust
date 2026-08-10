@@ -4156,6 +4156,45 @@ struct ReceivedJsonRpcResponse {
     raw_result: Option<String>,
 }
 
+/// Selects the cancellation election used after a final response has already
+/// been correlated to its request-local waiter.
+///
+/// Final task creation is the one exception to the ordinary cancellation-first
+/// rule: once the peer has committed a valid `tools/call` task handle, dropping
+/// it would strand an externally durable task without a client-owned handle.
+#[derive(Clone)]
+enum RequestCancellationTerminalElection {
+    CancelFirst,
+    #[cfg(feature = "tasks")]
+    FinalToolsCallTask {
+        request: CoreRequest,
+    },
+}
+
+impl RequestCancellationTerminalElection {
+    fn response_wins(self, response: &ReceivedJsonRpcResponse) -> bool {
+        match self {
+            Self::CancelFirst => false,
+            #[cfg(feature = "tasks")]
+            Self::FinalToolsCallTask { request } => {
+                response.response.error.is_none()
+                    && response.response.result.as_ref().is_some_and(|result| {
+                        response.raw_result.as_deref().is_some_and(|source| {
+                            matches!(
+                                decode_core_result_with_cache_ttl_from_source(
+                                    request,
+                                    result,
+                                    Some(source),
+                                ),
+                                Ok((CoreResult::Final(FinalCoreResult::ToolsCallTask { .. }), _))
+                            )
+                        })
+                    })
+            }
+        }
+    }
+}
+
 impl std::ops::Deref for ReceivedJsonRpcResponse {
     type Target = JsonRpcResponse;
 
@@ -7876,6 +7915,7 @@ impl Client {
             cancellation,
             method,
             params,
+            RequestCancellationTerminalElection::CancelFirst,
             |_| {},
         )?;
         let result_source = result.raw_result.as_deref().ok_or_else(|| {
@@ -8082,6 +8122,7 @@ impl Client {
             cancellation,
             method,
             params_value,
+            RequestCancellationTerminalElection::CancelFirst,
             on_committed,
         )?;
         let (result, ttl_diagnostic) = decode_core_result_with_cache_ttl_from_source(
@@ -8103,6 +8144,7 @@ impl Client {
         cancellation: &McpRequestCancellation,
         method: &str,
         params_value: serde_json::Value,
+        terminal_election: RequestCancellationTerminalElection,
         on_committed: F,
     ) -> McpResult<ReceivedPreparedResult>
     where
@@ -8143,7 +8185,13 @@ impl Client {
         let ReceivedJsonRpcResponse {
             mut response,
             raw_result,
-        } = self.recv_response_with_request_cancellation(cx, waiter, deadlines, cancellation)?;
+        } = self.recv_response_with_request_cancellation(
+            cx,
+            waiter,
+            deadlines,
+            cancellation,
+            terminal_election,
+        )?;
         let receipt = Instant::now();
         if let Some(error) = response.error.take() {
             return Err(json_rpc_error_to_mcp(error));
@@ -9104,6 +9152,7 @@ impl Client {
             waiter,
             deadlines,
             &no_request_cancellation,
+            RequestCancellationTerminalElection::CancelFirst,
         )
     }
 
@@ -9113,14 +9162,11 @@ impl Client {
         mut waiter: ResponseWaiter,
         deadlines: RequestDeadlines,
         cancellation: &McpRequestCancellation,
+        terminal_election: RequestCancellationTerminalElection,
     ) -> McpResult<ReceivedJsonRpcResponse> {
         let expected_id = waiter.id.clone();
 
         loop {
-            if cancellation.is_cancel_requested() {
-                self.cancel_request(expected_id.clone(), None)?;
-                return Err(McpError::request_cancelled());
-            }
             if let Some(executor) = &self.multiplexed_executor {
                 executor
                     .service(cx)
@@ -9133,6 +9179,15 @@ impl Client {
                         .as_ref()
                         .is_some_and(|response_id| response_id.correlates_with(&expected_id))
                 );
+                if cancellation.is_cancel_requested() && !terminal_election.response_wins(&response)
+                {
+                    // The peer has already committed its terminal response, so
+                    // there is no longer a live request on which to send a
+                    // cancellation control. Ordinary terminals remain
+                    // cancellation-first at this handoff; only a validated
+                    // durable task handle may win this election.
+                    return Err(McpError::request_cancelled());
+                }
                 return Ok(response);
             }
 
@@ -9994,6 +10049,9 @@ impl Client {
             cancellation,
             "tools/call",
             parameters,
+            RequestCancellationTerminalElection::FinalToolsCallTask {
+                request: request.clone(),
+            },
             |_| {},
         )?;
         let (result, diagnostic) = decode_core_result_with_cache_ttl_from_source(
@@ -20445,6 +20503,114 @@ mod tests {
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(!client.is_initialized());
         client.close().expect("contradictory Tasks client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn forced_stdio_valid_task_terminal_cancellation_election_retains_committed_handle() {
+        assert_forced_stdio_task_terminal_cancellation_election(
+            r#"{"jsonrpc":"2.0","id":91,"result":{"resultType":"task","taskId":"task-91","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
+            true,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn forced_stdio_complete_terminal_remains_cancellation_first() {
+        // This differs from the admitted valid task terminal only in
+        // `resultType`.
+        assert_forced_stdio_task_terminal_cancellation_election(
+            r#"{"jsonrpc":"2.0","id":91,"result":{"resultType":"complete","taskId":"task-91","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn forced_stdio_malformed_task_terminal_remains_cancellation_first() {
+        // `CreateTaskResult` alone admits this additional member, but the
+        // shipped final tools/call decoder rejects top-level serverInfo.
+        let source = r#"{"jsonrpc":"2.0","id":91,"result":{"resultType":"task","taskId":"task-91","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"serverInfo":{"name":"injected","version":"1.0.0"}}}"#;
+        let task = serde_json::from_str::<serde_json::Value>(source)
+            .expect("the malformed terminal remains JSON-RPC-shaped")["result"]
+            .clone();
+        assert!(
+            serde_json::from_value::<fastmcp_protocol::CreateTaskResult>(task).is_ok(),
+            "the old shallow task-only election would have accepted this terminal"
+        );
+        assert_forced_stdio_task_terminal_cancellation_election(source, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn forced_stdio_error_terminal_remains_cancellation_first() {
+        assert_forced_stdio_task_terminal_cancellation_election(
+            r#"{"jsonrpc":"2.0","id":91,"error":{"code":-32000,"message":"task creation failed"}}"#,
+            false,
+        );
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn assert_forced_stdio_task_terminal_cancellation_election(source: &str, response_wins: bool) {
+        let script = modern_final_tool_task_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"task","taskId":"task-73","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern Tasks discovery initializes the forced-race client");
+        let parameters = client
+            .with_final_tasks_client_capability(serde_json::json!({
+                "name": "durable-tool",
+                "arguments": {},
+            }))
+            .expect("the forced race builds the shipped final tools/call request");
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&parameters))
+            .expect("the forced race admits the shipped final tools/call request");
+        let request_id = RequestId::Number(91);
+        let waiter = client
+            .responses
+            .register(request_id.clone())
+            .expect("the forced race owns one response waiter");
+        let frame = ReceivedTransportFrame::admit(source.as_bytes().to_vec())
+            .expect("the terminal response is admitted before cancellation");
+        assert_eq!(
+            client
+                .route_received_response(frame)
+                .expect("the stdio reader routes the committed terminal response"),
+            ResponseRoute::Delivered
+        );
+        let cancellation = McpRequestCancellation::new();
+        assert!(
+            cancellation.cancel(),
+            "the forced race observes cancellation after response routing"
+        );
+        let deadlines = RequestDeadlines::start_at(client.timeout_policy, Instant::now())
+            .expect("the already-routed response does not depend on a deadline");
+        let received = client.recv_response_with_request_cancellation(
+            &Cx::for_request(),
+            waiter,
+            deadlines,
+            &cancellation,
+            RequestCancellationTerminalElection::FinalToolsCallTask { request },
+        );
+        if response_wins {
+            let response = received.expect(
+                "a committed shipped ToolsCallTask terminal wins the forced cancellation race",
+            );
+            assert_eq!(response.id, Some(request_id));
+        } else {
+            let error = received.expect_err("a non-Task terminal remains cancellation-first");
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        }
+        client.close().expect("forced-race client cleanup");
     }
 
     #[cfg(unix)]
