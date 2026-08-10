@@ -591,9 +591,9 @@ pub enum McpAppsDisplayMode {
 
 /// Closed Apps metadata attached to a final `Tool` under `_meta.ui`.
 ///
-/// The resource URI is intentionally typed as an absolute `ui:` URI. Security
-/// configuration belongs to resource metadata and is intentionally not part
-/// of this non-security protocol slice.
+/// The resource URI is intentionally typed as an exact authority-form
+/// `ui://` URI. Security configuration belongs to resource metadata and is
+/// intentionally not part of this non-security protocol slice.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpAppsToolMetadata {
     /// UI resource rendered when this tool is invoked, when declared.
@@ -610,9 +610,9 @@ impl McpAppsToolMetadata {
     ) -> Result<Self, McpAppsMetadataError> {
         if resource_uri
             .as_ref()
-            .is_some_and(|resource_uri| !resource_uri.has_scheme("ui"))
+            .is_some_and(|resource_uri| !resource_uri.as_str().starts_with("ui://"))
         {
-            return Err(McpAppsMetadataError::ResourceUriMustUseUiScheme);
+            return Err(McpAppsMetadataError::ResourceUriMustUseUiPrefix);
         }
         if visibility
             .as_ref()
@@ -934,7 +934,7 @@ impl<'de> Deserialize<'de> for McpAppsResourceMetadata {
 /// UI resource in the final catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpAppsResourceBinding {
-    /// Exact `ui:` resource URI selected by the tool.
+    /// Exact authority-form `ui://` resource URI selected by the tool.
     pub resource_uri: AbsoluteUri,
     /// The tool's effective Apps visibility.
     pub visibility: Vec<McpAppsToolVisibility>,
@@ -1196,8 +1196,8 @@ pub enum McpAppsMetadataError {
     InvalidToolMetadata,
     /// A resource `ui` object did not satisfy its closed schema.
     InvalidResourceMetadata,
-    /// A resource binding URI must use the `ui:` scheme.
-    ResourceUriMustUseUiScheme,
+    /// A resource binding URI must start with the exact `ui://` prefix.
+    ResourceUriMustUseUiPrefix,
     /// A tool visibility declaration carried more than its bounded number of entries.
     TooManyToolVisibilityEntries,
     /// One CSP directive carried more than its bounded number of origins.
@@ -1224,8 +1224,8 @@ impl fmt::Display for McpAppsMetadataError {
             }
             Self::InvalidResourceMetadata => formatter
                 .write_str("MCP Apps resource _meta.ui does not satisfy its closed schema"),
-            Self::ResourceUriMustUseUiScheme => {
-                formatter.write_str("MCP Apps resourceUri must use the ui: scheme")
+            Self::ResourceUriMustUseUiPrefix => {
+                formatter.write_str("MCP Apps resourceUri must start with ui://")
             }
             Self::TooManyToolVisibilityEntries => {
                 formatter.write_str("MCP Apps tool visibility exceeds its entry limit")
@@ -3813,6 +3813,44 @@ mod tests {
             serde_json::from_value::<McpAppsToolResult>(result_wire)
                 .expect("Apps result round-trips exactly"),
             projected
+        );
+    }
+
+    #[test]
+    fn apps_02_rejects_one_opaque_ui_uri_in_tool_metadata_construction_and_serde() {
+        let accepted_uri = AbsoluteUri::parse("ui://opaque").expect("authority-form UI URI");
+        let accepted = McpAppsToolMetadata::try_new(Some(accepted_uri), None)
+            .expect("the exact UI URI is admitted");
+        let accepted_wire = serde_json::json!({"resourceUri": "ui://opaque"});
+        assert_eq!(
+            serde_json::to_value(&accepted).expect("the admitted UI URI serializes"),
+            accepted_wire,
+        );
+
+        let opaque_uri = AbsoluteUri::parse("ui:opaque").expect("opaque UI URI is absolute");
+        assert_eq!(
+            McpAppsToolMetadata::try_new(Some(opaque_uri.clone()), None),
+            Err(McpAppsMetadataError::ResourceUriMustUseUiPrefix),
+            "removing only the authority delimiter rejects constructor input"
+        );
+        let planted = McpAppsToolMetadata {
+            resource_uri: Some(opaque_uri),
+            visibility: None,
+        };
+        assert!(
+            serde_json::to_value(&planted).is_err(),
+            "direct construction cannot serialize an opaque ui: URI"
+        );
+
+        let mut opaque_wire = accepted_wire.clone();
+        opaque_wire["resourceUri"] = serde_json::json!("ui:opaque");
+        assert!(
+            serde_json::from_value::<McpAppsToolMetadata>(opaque_wire).is_err(),
+            "removing only the authority delimiter rejects deserialization"
+        );
+        assert_eq!(
+            serde_json::to_value(&accepted).expect("rejected variants do not mutate the baseline"),
+            accepted_wire,
         );
     }
 

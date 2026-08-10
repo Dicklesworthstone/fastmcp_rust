@@ -2607,14 +2607,15 @@ pub struct CompletionValues {
 pub struct FinalCompletionValues {
     /// Completion values selected by the server.
     #[serde(
-        serialize_with = "serialize_completion_values",
-        deserialize_with = "deserialize_completion_values"
+        serialize_with = "serialize_final_completion_values",
+        deserialize_with = "deserialize_final_completion_values"
     )]
     pub values: Vec<String>,
     /// Exact total number of available values, when the peer supplied one.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_final_completion_total",
         deserialize_with = "deserialize_optional_final_completion_total"
     )]
     pub total: Option<JsonInteger>,
@@ -2634,7 +2635,31 @@ fn deserialize_optional_final_completion_total<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    JsonInteger::deserialize(deserializer).map(Some)
+    let total = JsonInteger::deserialize(deserializer)?;
+    if final_completion_total_is_negative(&total) {
+        return Err(serde::de::Error::custom(
+            "final completion total must be a nonnegative JSON integer",
+        ));
+    }
+    Ok(Some(total))
+}
+
+fn serialize_optional_final_completion_total<S>(
+    total: &Option<JsonInteger>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if total
+        .as_ref()
+        .is_some_and(final_completion_total_is_negative)
+    {
+        return Err(serde::ser::Error::custom(
+            "final completion total must be a nonnegative JSON integer",
+        ));
+    }
+    total.serialize(serializer)
 }
 
 fn deserialize_optional_final_completion_has_more<'de, D>(
@@ -2648,6 +2673,29 @@ where
 
 /// Maximum completion candidates allowed on the wire by either supported era.
 pub const MAX_COMPLETION_VALUES: usize = 100;
+/// Maximum UTF-8 bytes in one final completion candidate.
+pub const MAX_FINAL_COMPLETION_VALUE_BYTES: usize = 16 * 1024;
+/// Maximum aggregate UTF-8 bytes in final completion candidates.
+pub const MAX_FINAL_COMPLETION_VALUES_BYTES: usize = 256 * 1024;
+
+impl FinalCompletionValues {
+    /// Validates the final-only bounds and nonnegative total invariant.
+    ///
+    /// Exact MCP 2024-11-05 completion values deliberately retain their
+    /// schema's unconstrained signed `total`; this validation belongs only to
+    /// the final completion surface.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_final_completion_values(&self.values)?;
+        if self
+            .total
+            .as_ref()
+            .is_some_and(final_completion_total_is_negative)
+        {
+            return Err("final completion total must be a nonnegative JSON integer");
+        }
+        Ok(())
+    }
+}
 
 fn serialize_completion_values<S>(values: &Vec<String>, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -2672,6 +2720,56 @@ where
         ));
     }
     Ok(values)
+}
+
+fn serialize_final_completion_values<S>(
+    values: &Vec<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    validate_final_completion_values(values).map_err(serde::ser::Error::custom)?;
+    values.serialize(serializer)
+}
+
+fn deserialize_final_completion_values<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    validate_final_completion_values(&values).map_err(serde::de::Error::custom)?;
+    Ok(values)
+}
+
+fn validate_final_completion_values(values: &[String]) -> Result<(), &'static str> {
+    if values.len() > MAX_COMPLETION_VALUES {
+        return Err("completion values exceed the maximum of 100 items");
+    }
+
+    let mut total_bytes = 0_usize;
+    for value in values {
+        if value.len() > MAX_FINAL_COMPLETION_VALUE_BYTES {
+            return Err("final completion value exceeds the maximum of 16384 bytes");
+        }
+        total_bytes = total_bytes
+            .checked_add(value.len())
+            .ok_or("final completion values exceed the maximum aggregate byte limit")?;
+        if total_bytes > MAX_FINAL_COMPLETION_VALUES_BYTES {
+            return Err("final completion values exceed the maximum aggregate byte limit");
+        }
+    }
+    Ok(())
+}
+
+fn final_completion_total_is_negative(total: &JsonInteger) -> bool {
+    let Some(absolute) = total.as_str().strip_prefix('-') else {
+        return false;
+    };
+    absolute
+        .split(['e', 'E'])
+        .next()
+        .is_some_and(|mantissa| mantissa.bytes().any(|byte| matches!(byte, b'1'..=b'9')))
 }
 
 /// Exact legacy `completion/complete` result payload.
@@ -7434,6 +7532,84 @@ mod tests {
             })
             .is_err(),
             "a locally authored final result cannot emit 101 completion values"
+        );
+    }
+
+    #[test]
+    fn final_completion_values_enforce_nonnegative_totals_and_bounded_candidates() {
+        let accepted = serde_json::json!({
+            "values": ["stable"],
+            "total": 0,
+            "hasMore": false,
+        });
+        let admitted = serde_json::from_value::<FinalCompletionValues>(accepted.clone())
+            .expect("a nonnegative final completion total and bounded candidate are admitted");
+        assert_eq!(
+            serde_json::to_value(&admitted).expect("the admitted final completion re-encodes"),
+            accepted
+        );
+
+        let mut negative_total = accepted.clone();
+        negative_total["total"] = serde_json::json!(-1);
+        assert!(
+            serde_json::from_value::<FinalCompletionValues>(negative_total.clone()).is_err(),
+            "changing only total from zero to negative is refused for final completion"
+        );
+        assert!(
+            serde_json::to_value(FinalCompletionValues {
+                values: vec!["stable".to_owned()],
+                total: Some(JsonInteger::from(-1_i64)),
+                has_more: Some(false),
+            })
+            .is_err(),
+            "a locally authored final completion cannot emit a negative total"
+        );
+
+        let at_value_bound = serde_json::json!({
+            "values": ["v".repeat(MAX_FINAL_COMPLETION_VALUE_BYTES)],
+            "total": 1,
+        });
+        assert!(
+            serde_json::from_value::<FinalCompletionValues>(at_value_bound).is_ok(),
+            "a final completion candidate at the per-value byte limit is admitted"
+        );
+
+        let one_byte_over = serde_json::json!({
+            "values": ["v".repeat(MAX_FINAL_COMPLETION_VALUE_BYTES + 1)],
+            "total": 1,
+        });
+        assert!(
+            serde_json::from_value::<FinalCompletionValues>(one_byte_over).is_err(),
+            "adding one candidate byte crosses the final completion limiter"
+        );
+
+        let at_aggregate_bound = serde_json::json!({
+            "values": vec!["v".repeat(MAX_FINAL_COMPLETION_VALUE_BYTES);
+                MAX_FINAL_COMPLETION_VALUES_BYTES / MAX_FINAL_COMPLETION_VALUE_BYTES],
+            "total": MAX_FINAL_COMPLETION_VALUES_BYTES / MAX_FINAL_COMPLETION_VALUE_BYTES,
+        });
+        assert!(
+            serde_json::from_value::<FinalCompletionValues>(at_aggregate_bound.clone()).is_ok(),
+            "final completion candidates at the aggregate byte limit are admitted"
+        );
+
+        let mut aggregate_one_byte_over = at_aggregate_bound;
+        aggregate_one_byte_over["values"]
+            .as_array_mut()
+            .expect("completion values array")
+            .push(serde_json::json!("v"));
+        assert!(
+            serde_json::from_value::<FinalCompletionValues>(aggregate_one_byte_over).is_err(),
+            "adding one aggregate candidate byte crosses the final completion limiter"
+        );
+
+        let legacy_negative = serde_json::json!({
+            "values": ["stable"],
+            "total": -1,
+        });
+        assert!(
+            serde_json::from_value::<CompletionValues>(legacy_negative).is_ok(),
+            "exact MCP 2024-11-05 retains its signed completion total schema"
         );
     }
 

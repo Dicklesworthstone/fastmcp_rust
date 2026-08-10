@@ -404,8 +404,9 @@ pub fn admit_final_request(
 ///
 /// Protocol-version admission occurs first. Once that mirror selects the
 /// final protocol, `Mcp-Method` must exactly match the JSON-RPC method. The
-/// `Mcp-Name` mirror is then required only for `tools/call`, `resources/read`,
-/// and `prompts/get`; no extra header is inferred for other methods.
+/// `Mcp-Name` mirror is then required for name- or identifier-addressed
+/// methods, including official Tasks operations; no extra header is inferred
+/// for other methods.
 pub fn admit_final_http_request(
     metadata: FinalHttpRequestMetadata<'_>,
 ) -> Result<FinalRequestAdmission, RequestAdmissionError> {
@@ -467,7 +468,15 @@ fn exact_nonempty_mirror<'a>(
 }
 
 fn requires_mcp_name(method: &str) -> bool {
-    matches!(method, "tools/call" | "resources/read" | "prompts/get")
+    matches!(
+        method,
+        "tools/call"
+            | "resources/read"
+            | "prompts/get"
+            | "tasks/get"
+            | "tasks/update"
+            | "tasks/cancel"
+    )
 }
 
 #[cfg(test)]
@@ -521,6 +530,46 @@ mod tests {
         assert_eq!(error.http_status(), 400);
         assert_eq!(error.jsonrpc_error_code(), HEADER_MISMATCH_ERROR_CODE);
         assert_eq!(body_name, Some("weather"));
+    }
+
+    #[test]
+    fn official_tasks_methods_require_the_same_mcp_name_mirror() {
+        for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+            let admitted = admit_final_http_request(FinalHttpRequestMetadata {
+                version: RequestVersionMetadata {
+                    header_version: Some(FINAL_PROTOCOL_VERSION),
+                    body_version: Some(FINAL_PROTOCOL_VERSION),
+                },
+                header_method: Some(method),
+                body_method: Some(method),
+                header_name: Some("task-42"),
+                body_name: Some("task-42"),
+            });
+            assert!(
+                admitted.is_ok(),
+                "{method} accepts an exact task identifier mirror"
+            );
+        }
+
+        let body_name = Some("task-42");
+        let error = admit_final_http_request(FinalHttpRequestMetadata {
+            version: RequestVersionMetadata {
+                header_version: Some(FINAL_PROTOCOL_VERSION),
+                body_version: Some(FINAL_PROTOCOL_VERSION),
+            },
+            header_method: Some("tasks/get"),
+            body_method: Some("tasks/get"),
+            header_name: Some("other-task"),
+            body_name,
+        })
+        .expect_err("changing only a Tasks name mirror rejects final admission");
+        assert_eq!(
+            error,
+            RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
+                reason: HeaderMismatchReason::HeaderBodyNameMismatch,
+            })
+        );
+        assert_eq!(body_name, Some("task-42"));
     }
 
     #[test]
