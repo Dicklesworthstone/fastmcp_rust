@@ -22,6 +22,7 @@ use crate::handler::{
     BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
     CompletionHandler, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
 };
+use crate::proxy::ProxyFinalTaskRelay;
 #[cfg(test)]
 use asupersync::time::wall_now;
 use asupersync::types::Time;
@@ -296,6 +297,113 @@ fn decode_cursor_offset(cursor: Option<&str>) -> McpResult<usize> {
 
     usize::try_from(offset)
         .map_err(|_| McpError::invalid_params("Invalid cursor (offset too large)".to_string()))
+}
+
+/// The final catalog a continuation cursor was minted for.
+///
+/// Exact MCP 2024-11-05 cursors remain offset-only. Final cursors bind the
+/// offset to both this catalog discriminator and the router catalog revision,
+/// so a continuation cannot cross catalog routes or observe a changed catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FinalCatalogKind {
+    Tools,
+    Resources,
+    ResourceTemplates,
+    Prompts,
+}
+
+/// Canonical identity for the final list filters whose semantics affect a page.
+///
+/// Tag matching is case-insensitive and ignores duplicate/order differences,
+/// so cursors bind those normalized semantics rather than incidental input
+/// spelling. `None` and an explicitly empty tag array consequently identify
+/// the same unfiltered catalog.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinalCatalogQuery {
+    include_tags: Vec<String>,
+    exclude_tags: Vec<String>,
+}
+
+impl FinalCatalogQuery {
+    fn from_final_list_params(params: &FinalListParams) -> Self {
+        Self::from_tag_filters(
+            params.include_tags.as_deref(),
+            params.exclude_tags.as_deref(),
+        )
+    }
+
+    fn from_tag_filters(include_tags: Option<&[String]>, exclude_tags: Option<&[String]>) -> Self {
+        Self {
+            include_tags: canonical_final_catalog_tags(include_tags),
+            exclude_tags: canonical_final_catalog_tags(exclude_tags),
+        }
+    }
+}
+
+fn canonical_final_catalog_tags(tags: Option<&[String]>) -> Vec<String> {
+    let Some(tags) = tags else {
+        return Vec::new();
+    };
+    let mut canonical = tags
+        .iter()
+        .map(|tag| tag.to_lowercase())
+        .collect::<Vec<_>>();
+    canonical.sort_unstable();
+    canonical.dedup();
+    canonical
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinalCatalogCursor {
+    catalog: FinalCatalogKind,
+    revision: u64,
+    query: FinalCatalogQuery,
+    offset: u64,
+}
+
+fn decode_final_catalog_cursor_offset(
+    cursor: Option<&str>,
+    expected_catalog: FinalCatalogKind,
+    expected_revision: u64,
+    expected_query: &FinalCatalogQuery,
+    catalog_length: usize,
+) -> McpResult<usize> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+
+    let decoded = BASE64_STANDARD.decode(cursor).map_err(|_| {
+        McpError::invalid_params("Invalid final catalog cursor (base64 decode failed)")
+    })?;
+    let cursor = serde_json::from_slice::<FinalCatalogCursor>(&decoded).map_err(|_| {
+        McpError::invalid_params("Invalid final catalog cursor (JSON parse failed)")
+    })?;
+    if cursor.catalog != expected_catalog {
+        return Err(McpError::invalid_params(
+            "final catalog cursor belongs to another list method",
+        ));
+    }
+    if cursor.revision != expected_revision {
+        return Err(McpError::invalid_params(
+            "final catalog cursor references a stale catalog revision",
+        ));
+    }
+    if &cursor.query != expected_query {
+        return Err(McpError::invalid_params(
+            "final catalog cursor does not match the requested query filters",
+        ));
+    }
+    let offset = usize::try_from(cursor.offset)
+        .map_err(|_| McpError::invalid_params("Invalid final catalog cursor (offset too large)"))?;
+    if offset >= catalog_length {
+        return Err(McpError::invalid_params(
+            "final catalog cursor offset is outside the requested catalog page",
+        ));
+    }
+    Ok(offset)
 }
 
 fn parse_stateless_params<T: serde::de::DeserializeOwned>(
@@ -1281,6 +1389,23 @@ fn encode_cursor_offset(offset: usize) -> String {
     BASE64_STANDARD.encode(bytes)
 }
 
+fn encode_final_catalog_cursor(
+    catalog: FinalCatalogKind,
+    revision: u64,
+    query: &FinalCatalogQuery,
+    offset: usize,
+) -> String {
+    let offset = u64::try_from(offset).expect("usize cursor offsets always fit u64");
+    let payload = FinalCatalogCursor {
+        catalog,
+        revision,
+        query: query.clone(),
+        offset,
+    };
+    let bytes = serde_json::to_vec(&payload).expect("final catalog cursor must serialize");
+    BASE64_STANDARD.encode(bytes)
+}
+
 /// Pages an already-filtered immutable final catalog.
 ///
 /// Filtering must precede cursor arithmetic so an exact-legacy-only entry
@@ -1289,15 +1414,18 @@ fn page_final_catalog<T: Clone>(
     items: Vec<T>,
     cursor: Option<&str>,
     page_size: Option<usize>,
+    catalog: FinalCatalogKind,
+    revision: u64,
+    query: &FinalCatalogQuery,
 ) -> McpResult<(Vec<T>, Option<String>)> {
+    let offset = decode_final_catalog_cursor_offset(cursor, catalog, revision, query, items.len())?;
     let Some(page_size) = page_size else {
         return Ok((items, None));
     };
-    let offset = decode_cursor_offset(cursor)?;
     let end = offset.saturating_add(page_size).min(items.len());
     Ok((
         items.get(offset..end).unwrap_or_default().to_vec(),
-        (end < items.len()).then(|| encode_cursor_offset(end)),
+        (end < items.len()).then(|| encode_final_catalog_cursor(catalog, revision, query, end)),
     ))
 }
 
@@ -1546,8 +1674,8 @@ fn derive_handler_context(
     // request-scoped final-progress runtime. Preserve that reporter so its
     // marker, monotonic high-water mark, coalescing slot, and eventual
     // terminal finalization remain one request-owned authority.
-    let reuse_installed_final_reporter = matches!(protocol_era, ProtocolEra::Modern2026)
-        && handler_ctx.has_progress_reporter();
+    let reuse_installed_final_reporter =
+        matches!(protocol_era, ProtocolEra::Modern2026) && handler_ctx.has_progress_reporter();
 
     if let (Some(marker), Some(sender)) = (progress_marker, notification_sender)
         && !reuse_installed_final_reporter
@@ -1596,8 +1724,12 @@ pub struct Router {
     tools: HashMap<String, AdmittedToolRegistration>,
     tool_order: Vec<String>,
     completion_handler: Option<BoxedCompletionHandler>,
-    /// Whether the installed completion handler was admitted for final dispatch.
-    final_completion_enabled: bool,
+    /// Whether the server-wide completion fallback is admitted for final dispatch.
+    default_final_completion_enabled: bool,
+    /// Final completion providers selected by exact prompt name.
+    final_prompt_completion_handlers: HashMap<String, BoxedCompletionHandler>,
+    /// Final completion providers selected by exact resource-template URI.
+    final_resource_template_completion_handlers: HashMap<String, BoxedCompletionHandler>,
     resources: HashMap<String, BoxedResourceHandler>,
     /// Static resources visible to exact MCP 2024-11-05 only.
     final_only_resources: HashSet<String>,
@@ -1622,11 +1754,21 @@ pub struct Router {
     /// When `None`, list methods return all items in a single response and
     /// `nextCursor` is always omitted.
     list_page_size: Option<usize>,
+    /// Monotonic revision bound into every final catalog continuation cursor.
+    ///
+    /// This advances after each successful catalog mutation. Exact legacy
+    /// cursors intentionally do not carry this state because their wire
+    /// contract remains offset-only.
+    final_catalog_revision: u64,
     /// Cache policy emitted on exact modern catalog and resource-read results.
     final_cache_hints: FinalCacheHintPolicy,
     /// Application-owned durable final Tasks runtime used only after the
     /// request metadata has admitted the official extension.
     final_task_runtime: Option<FinalTaskRuntime>,
+    /// One route-bound upstream final Tasks relay. This is distinct from the
+    /// local runtime because upstream task IDs must never be recreated or
+    /// translated into local task state.
+    final_task_relay: Option<Arc<ProxyFinalTaskRelay>>,
     /// Bounded, process-local final request-state records for tool, resource,
     /// and prompt retries. A state is accepted only if this router issued it.
     mrtr_exchanges: Arc<MrtrExchangeRegistry>,
@@ -1640,7 +1782,9 @@ impl Router {
             tools: HashMap::new(),
             tool_order: Vec::new(),
             completion_handler: None,
-            final_completion_enabled: false,
+            default_final_completion_enabled: false,
+            final_prompt_completion_handlers: HashMap::new(),
+            final_resource_template_completion_handlers: HashMap::new(),
             resources: HashMap::new(),
             final_only_resources: HashSet::new(),
             final_resources: HashMap::new(),
@@ -1654,14 +1798,20 @@ impl Router {
             sorted_template_keys: Vec::new(),
             strict_input_validation: false,
             list_page_size: None,
+            final_catalog_revision: 0,
             final_cache_hints: FinalCacheHintPolicy::default(),
             final_task_runtime: None,
+            final_task_relay: None,
             mrtr_exchanges: Arc::new(MrtrExchangeRegistry::new()),
         }
     }
 
     pub(crate) fn set_final_task_runtime(&mut self, runtime: Option<FinalTaskRuntime>) {
         self.final_task_runtime = runtime;
+    }
+
+    pub(crate) fn set_final_task_relay(&mut self, relay: Option<Arc<ProxyFinalTaskRelay>>) {
+        self.final_task_relay = relay;
     }
 
     /// Sets the list pagination page size.
@@ -1671,6 +1821,13 @@ impl Router {
     /// opaque base64 cursors.
     pub fn set_list_page_size(&mut self, page_size: Option<usize>) {
         self.list_page_size = page_size.filter(|n| *n > 0);
+    }
+
+    fn advance_final_catalog_revision(&mut self) {
+        self.final_catalog_revision = self
+            .final_catalog_revision
+            .checked_add(1)
+            .expect("final catalog revision cannot overflow");
     }
 
     /// Sets the cache hints emitted by final catalog and resource-read
@@ -1843,29 +2000,78 @@ impl Router {
         if !existed {
             self.tool_order.push(name);
         }
+        self.advance_final_catalog_revision();
         Ok(())
     }
 
     /// Registers the handler for `completion/complete`.
     ///
-    /// Completion has one server-wide dispatch target rather than a catalog
-    /// entry. Re-registering replaces the prior target, matching the ordinary
-    /// component registration semantics.
+    /// This is the server-wide fallback for final completion dispatch and the
+    /// sole route for exact MCP 2024-11-05. A final provider registered for a
+    /// specific prompt or resource template takes precedence. Re-registering
+    /// replaces the prior fallback, matching ordinary component registration
+    /// semantics.
     pub fn add_completion_handler<H: CompletionHandler + 'static>(&mut self, handler: H) {
         self.completion_handler = Some(Box::new(handler));
-        self.final_completion_enabled = true;
+        self.default_final_completion_enabled = true;
     }
 
     /// Registers a completion handler for exact MCP 2024-11-05 dispatch only.
     pub fn add_legacy_completion_handler<H: CompletionHandler + 'static>(&mut self, handler: H) {
         self.completion_handler = Some(Box::new(handler));
-        self.final_completion_enabled = false;
+        self.default_final_completion_enabled = false;
+    }
+
+    /// Registers a final completion provider for one exact prompt name.
+    ///
+    /// The provider is selected only after final prompt and argument admission
+    /// succeeds. It never changes exact MCP 2024-11-05's server-wide route.
+    pub fn add_prompt_completion_handler<H: CompletionHandler + 'static>(
+        &mut self,
+        prompt_name: impl Into<String>,
+        handler: H,
+    ) {
+        self.final_prompt_completion_handlers
+            .insert(prompt_name.into(), Box::new(handler));
+    }
+
+    /// Registers a final completion provider for one exact resource-template URI.
+    ///
+    /// The provider is selected only after the resource template and requested
+    /// template variable have been admitted for final dispatch.
+    pub fn add_resource_template_completion_handler<H: CompletionHandler + 'static>(
+        &mut self,
+        uri_template: impl Into<String>,
+        handler: H,
+    ) {
+        self.final_resource_template_completion_handlers
+            .insert(uri_template.into(), Box::new(handler));
     }
 
     /// Returns whether a `completion/complete` handler is installed.
     #[must_use]
     pub fn has_completion_handler(&self) -> bool {
         self.completion_handler.is_some()
+            || !self.final_prompt_completion_handlers.is_empty()
+            || !self.final_resource_template_completion_handlers.is_empty()
+    }
+
+    fn has_final_completion_handler(&self) -> bool {
+        self.default_final_completion_enabled || self.has_admitted_final_completion_provider()
+    }
+
+    fn has_admitted_final_completion_provider(&self) -> bool {
+        self.final_prompt_completion_handlers
+            .keys()
+            .any(|name| self.final_prompts.contains_key(name))
+            || self
+                .final_resource_template_completion_handlers
+                .keys()
+                .any(|uri| {
+                    self.resource_templates
+                        .get(uri)
+                        .is_some_and(|entry| entry.final_definition.is_some())
+                })
     }
 
     /// Adds a resource handler.
@@ -1988,7 +2194,26 @@ impl Router {
         }
 
         if let Some(template) = template {
-            let (matcher, specificity) = admit_resource_template(&template.uri_template)?;
+            let legacy_matcher = if legacy_enabled {
+                match admit_legacy_resource_template(&template.uri_template) {
+                    Ok(matcher) => Some(matcher),
+                    Err(error) if !admit_final => return Err(error),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let (matcher, specificity) = if admit_final {
+                let (matcher, specificity) = admit_resource_template(&template.uri_template)?;
+                (Some(matcher), specificity)
+            } else {
+                let matcher = legacy_matcher.as_ref().ok_or_else(|| {
+                    McpError::internal_error(
+                        "exact-2024 resource template admission lost its matcher",
+                    )
+                })?;
+                (None, matcher.specificity())
+            };
             let uri_use_policy = if admit_final {
                 ResourceUriUsePolicy::from_client_direct_https(
                     crate::catch_extension_unwind(|| handler.final_client_direct_https()).map_err(
@@ -2020,7 +2245,8 @@ impl Router {
                 handler: Some(boxed),
                 final_definition,
                 uri_use_policy,
-                legacy_enabled,
+                legacy_enabled: legacy_matcher.is_some(),
+                legacy_matcher,
             };
             self.resource_templates
                 .insert(template.uri_template.clone(), entry);
@@ -2073,6 +2299,7 @@ impl Router {
             }
         }
 
+        self.advance_final_catalog_revision();
         Ok(())
     }
 
@@ -2168,7 +2395,20 @@ impl Router {
             }
         }
 
-        let (matcher, specificity) = admit_resource_template(&key)?;
+        let legacy_matcher = match admit_legacy_resource_template(&key) {
+            Ok(matcher) => Some(matcher),
+            Err(error) if !admit_final => return Err(error),
+            Err(_) => None,
+        };
+        let (matcher, specificity) = if admit_final {
+            let (matcher, specificity) = admit_resource_template(&key)?;
+            (Some(matcher), specificity)
+        } else {
+            let matcher = legacy_matcher.as_ref().ok_or_else(|| {
+                McpError::internal_error("exact-2024 resource template admission lost its matcher")
+            })?;
+            (None, matcher.specificity())
+        };
         let uri_use_policy = ResourceUriUsePolicy::server_mediated();
         let final_definition = admit_final
             .then(|| {
@@ -2186,7 +2426,8 @@ impl Router {
                 existing.specificity = specificity;
                 existing.final_definition = final_definition;
                 existing.uri_use_policy = uri_use_policy;
-                existing.legacy_enabled = true;
+                existing.legacy_enabled = legacy_matcher.is_some();
+                existing.legacy_matcher = legacy_matcher;
                 false // Key already exists, order unchanged
             }
             None => {
@@ -2199,7 +2440,8 @@ impl Router {
                         handler: None,
                         final_definition,
                         uri_use_policy,
-                        legacy_enabled: true,
+                        legacy_enabled: legacy_matcher.is_some(),
+                        legacy_matcher,
                     },
                 );
                 true // New key added, need to rebuild
@@ -2209,6 +2451,7 @@ impl Router {
             self.resource_template_order.push(key);
             self.rebuild_sorted_template_keys();
         }
+        self.advance_final_catalog_revision();
         Ok(())
     }
 
@@ -2358,6 +2601,7 @@ impl Router {
         if !existed {
             self.prompt_order.push(def.name);
         }
+        self.advance_final_catalog_revision();
         Ok(())
     }
 
@@ -2586,7 +2830,7 @@ impl Router {
     pub(crate) fn server_discovery_behavior_registry(&self) -> ServerBehaviorRegistry {
         let mut behaviors = Vec::with_capacity(11);
         behaviors.push(ServerBehavior::SubscriptionsListen);
-        if self.final_completion_enabled {
+        if self.has_final_completion_handler() {
             behaviors.push(ServerBehavior::CompletionComplete);
         }
         if self
@@ -2683,16 +2927,30 @@ impl Router {
             let Some(handler) = entry.handler.as_ref() else {
                 continue;
             };
-            let Some(values) = entry.matcher.match_uri(uri).ok().flatten() else {
-                continue;
+            let legacy_params = || {
+                entry
+                    .legacy_matcher
+                    .as_ref()
+                    .and_then(|matcher| matcher.matches(uri))
             };
-            let mut params = UriParams::with_capacity(values.len());
-            for (name, value) in values {
-                let TemplateValue::Scalar(value) = value else {
-                    continue 'templates;
-                };
-                params.insert(name, value);
-            }
+            let final_params = || {
+                let values = entry.matcher.as_ref()?.match_uri(uri).ok()??;
+                let mut params = UriParams::with_capacity(values.len());
+                for (name, value) in values {
+                    let TemplateValue::Scalar(value) = value else {
+                        return None;
+                    };
+                    params.insert(name, value);
+                }
+                Some(params)
+            };
+            let Some(params) = (match era {
+                Some(ProtocolEra::Legacy2024) => legacy_params(),
+                Some(ProtocolEra::Modern2026) => final_params(),
+                None => final_params().or_else(legacy_params),
+            }) else {
+                continue 'templates;
+            };
             let resolved = ResolvedResource {
                 handler,
                 params,
@@ -2846,11 +3104,11 @@ impl Router {
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
-        if !self.final_completion_enabled {
+        if !self.has_final_completion_handler() {
             return Err(McpError::method_not_found(COMPLETION_COMPLETE));
         }
 
-        match &params.reference {
+        let provider_handler = match &params.reference {
             FinalCompletionReference::Prompt { name }
             | FinalCompletionReference::PromptWithTitle { name, .. } => {
                 let prompt = self.final_prompts.get(name).ok_or_else(|| {
@@ -2868,6 +3126,7 @@ impl Router {
                         "completion argument is not declared by the referenced target",
                     ));
                 }
+                self.final_prompt_completion_handlers.get(name)
             }
             FinalCompletionReference::Resource { uri } => {
                 let template = self
@@ -2896,13 +3155,22 @@ impl Router {
                         "completion argument is not declared by the referenced target",
                     ));
                 }
+                self.final_resource_template_completion_handlers.get(uri)
             }
-        }
+        };
 
-        let handler = self
-            .completion_handler
-            .as_ref()
-            .ok_or_else(|| McpError::method_not_found(COMPLETION_COMPLETE))?;
+        let handler = match provider_handler {
+            Some(handler) => handler,
+            None if self.default_final_completion_enabled => self
+                .completion_handler
+                .as_ref()
+                .ok_or_else(|| McpError::method_not_found(COMPLETION_COMPLETE))?,
+            None => {
+                return Err(McpError::invalid_params(
+                    "no final completion provider is registered for the referenced target",
+                ));
+            }
+        };
         let handler_ctx =
             derive_handler_context(request_ctx, None, None, None, ProtocolEra::Modern2026);
         let handler_timeout =
@@ -2930,6 +3198,9 @@ impl Router {
                         "completion handler returned more than 100 values",
                     ));
                 }
+                completion
+                    .validate()
+                    .map_err(|error| McpError::internal_error(error))?;
                 completion
             }
             Outcome::Err(error) => {
@@ -3462,6 +3733,19 @@ impl Router {
                 work_descriptor,
                 status_message,
             } => {
+                if let Some(relay) = self.final_task_relay.as_ref() {
+                    // A relayed task is already durable upstream. Decode its
+                    // private carrier only after the downstream capability
+                    // gate, retain the route-bound snapshot for controls, and
+                    // emit the exact upstream handle without local creation.
+                    require_final_tasks_capability(&request_metadata)?;
+                    if let Some(result) = relay.admit_carried_task(&work_descriptor)? {
+                        return encode_final_task_result(result);
+                    }
+                    return Err(McpError::internal_error(
+                        "a proxy final Tasks relay received a non-relayed CreateTask outcome",
+                    ));
+                }
                 // A handler's declaration means it may return CreateTask; it
                 // does not turn its Complete or InputRequired outcomes into
                 // Tasks operations. Admit only the branch that can mutate the
@@ -3604,6 +3888,7 @@ impl Router {
             return Err(error);
         }
 
+        let query = FinalCatalogQuery::from_final_list_params(&params);
         let tag_filters =
             TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
@@ -3622,19 +3907,15 @@ impl Router {
         })
         .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
 
-        let result = if let Some(page_size) = self.list_page_size {
-            let offset = decode_cursor_offset(params.cursor.as_deref())?;
-            let end = offset.saturating_add(page_size).min(tools.len());
-            ListToolsResult {
-                tools: tools.get(offset..end).unwrap_or_default().to_vec(),
-                next_cursor: (end < tools.len()).then(|| encode_cursor_offset(end)),
-            }
-        } else {
-            ListToolsResult {
-                tools,
-                next_cursor: None,
-            }
-        };
+        let (tools, next_cursor) = page_final_catalog(
+            tools,
+            params.cursor.as_deref(),
+            self.list_page_size,
+            FinalCatalogKind::Tools,
+            self.final_catalog_revision,
+            &query,
+        )?;
+        let result = ListToolsResult { tools, next_cursor };
         self.project_final_tools_list(request_ctx, result, self.final_cache_hints.clone())
     }
 
@@ -3676,6 +3957,7 @@ impl Router {
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
+        let query = FinalCatalogQuery::from_final_list_params(&params);
         let filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let filters =
             (params.include_tags.is_some() || params.exclude_tags.is_some()).then_some(filters);
@@ -3697,8 +3979,14 @@ impl Router {
                 Ok(entry.definition.clone())
             })
             .collect::<McpResult<Vec<_>>>()?;
-        let (resources, next_cursor) =
-            page_final_catalog(resources, params.cursor.as_deref(), self.list_page_size)?;
+        let (resources, next_cursor) = page_final_catalog(
+            resources,
+            params.cursor.as_deref(),
+            self.list_page_size,
+            FinalCatalogKind::Resources,
+            self.final_catalog_revision,
+            &query,
+        )?;
         Ok(FinalListResourcesResult {
             resources,
             next_cursor,
@@ -3715,6 +4003,7 @@ impl Router {
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
+        let query = FinalCatalogQuery::from_final_list_params(&params);
         let filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let filters =
             (params.include_tags.is_some() || params.exclude_tags.is_some()).then_some(filters);
@@ -3738,6 +4027,9 @@ impl Router {
             resource_templates,
             params.cursor.as_deref(),
             self.list_page_size,
+            FinalCatalogKind::ResourceTemplates,
+            self.final_catalog_revision,
+            &query,
         )?;
         Ok(FinalListResourceTemplatesResult {
             resource_templates,
@@ -3755,6 +4047,7 @@ impl Router {
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
+        let query = FinalCatalogQuery::from_final_list_params(&params);
         let filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let filters =
             (params.include_tags.is_some() || params.exclude_tags.is_some()).then_some(filters);
@@ -3769,8 +4062,14 @@ impl Router {
             })
             .map(|entry| entry.definition.clone())
             .collect();
-        let (prompts, next_cursor) =
-            page_final_catalog(prompts, params.cursor.as_deref(), self.list_page_size)?;
+        let (prompts, next_cursor) = page_final_catalog(
+            prompts,
+            params.cursor.as_deref(),
+            self.list_page_size,
+            FinalCatalogKind::Prompts,
+            self.final_catalog_revision,
+            &query,
+        )?;
         Ok(FinalListPromptsResult {
             prompts,
             next_cursor,
@@ -4106,6 +4405,15 @@ impl Router {
                 .as_ref()
                 .map(|errors| errors.input_validation.clone());
             return Ok(FinalToolOutcome::Complete(result));
+        }
+
+        // A route-bound proxy asks its selected upstream to create a task
+        // during this handler call. Unlike a local handler's deferred
+        // `CreateTask`, that side effect cannot be rolled back after the
+        // proxy returns. Require the exact downstream Tasks declaration
+        // before invoking any task-capable proxy handler.
+        if declares_final_tasks && self.final_task_relay.is_some() {
+            require_final_tasks_capability(&params.meta)?;
         }
 
         let ctx = derive_handler_context(
@@ -5236,6 +5544,7 @@ impl Router {
                 prefix.is_some(),
                 safe_log_label(prefix.unwrap_or_default())
             );
+            self.advance_final_catalog_revision();
         }
 
         result
@@ -5257,7 +5566,11 @@ impl Router {
         if !preflight.is_success() {
             return preflight;
         }
-        self.mount_tools_from(other.tools, other.tool_order, prefix, behavior)
+        let result = self.mount_tools_from(other.tools, other.tool_order, prefix, behavior);
+        if result.has_components() {
+            self.advance_final_catalog_revision();
+        }
+        result
     }
 
     /// Internal: mount tools from a HashMap.
@@ -5373,6 +5686,9 @@ impl Router {
             behavior,
         );
         result.merge(template_result);
+        if result.has_components() {
+            self.advance_final_catalog_revision();
+        }
         result
     }
 
@@ -5540,20 +5856,45 @@ impl Router {
                 wrapped
             });
 
-            // Create new entry with mounted template
-            let (matcher, specificity) = match admit_resource_template(&mounted_uri_template) {
-                Ok(admitted) => admitted,
-                Err(error) => {
-                    result.errors.push(format!(
-                        "Mount rejected resource template; template_key={}; code={:?}",
-                        safe_log_label(&mounted_uri_template),
-                        error.code
-                    ));
-                    continue;
+            // Create new entry with mounted template.
+            let legacy_matcher = if entry.legacy_enabled {
+                match admit_legacy_resource_template(&mounted_uri_template) {
+                    Ok(matcher) => Some(matcher),
+                    Err(error) => {
+                        result.errors.push(format!(
+                            "Mount rejected exact-2024 resource template; template_key={}; code={:?}",
+                            safe_log_label(&mounted_uri_template),
+                            error.code
+                        ));
+                        continue;
+                    }
                 }
+            } else {
+                None
+            };
+            let final_enabled = prefix.is_none() && entry.final_definition.is_some();
+            let (matcher, specificity) = if final_enabled {
+                match admit_resource_template(&mounted_uri_template) {
+                    Ok((matcher, specificity)) => (Some(matcher), specificity),
+                    Err(error) => {
+                        result.errors.push(format!(
+                            "Mount rejected resource template; template_key={}; code={:?}",
+                            safe_log_label(&mounted_uri_template),
+                            error.code
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                let specificity = legacy_matcher.as_ref().map_or(
+                    entry.specificity,
+                    LegacyResourceTemplateMatcher::specificity,
+                );
+                (None, specificity)
             };
             let mounted_entry = ResourceTemplateEntry {
                 matcher,
+                legacy_matcher,
                 specificity,
                 template: mounted_template,
                 handler: mounted_handler,
@@ -5570,11 +5911,7 @@ impl Router {
                     None
                 },
                 uri_use_policy: entry.uri_use_policy,
-                legacy_enabled: if prefix.is_none() {
-                    entry.legacy_enabled
-                } else {
-                    true
-                },
+                legacy_enabled: entry.legacy_enabled,
             };
 
             let needs_order_push = !existed
@@ -5623,19 +5960,44 @@ impl Router {
                     wrapped
                 });
 
-                let (matcher, specificity) = match admit_resource_template(&mounted_uri_template) {
-                    Ok(admitted) => admitted,
-                    Err(error) => {
-                        result.errors.push(format!(
-                            "Mount rejected resource template; template_key={}; code={:?}",
-                            safe_log_label(&mounted_uri_template),
-                            error.code
-                        ));
-                        continue;
+                let legacy_matcher = if entry.legacy_enabled {
+                    match admit_legacy_resource_template(&mounted_uri_template) {
+                        Ok(matcher) => Some(matcher),
+                        Err(error) => {
+                            result.errors.push(format!(
+                                "Mount rejected exact-2024 resource template; template_key={}; code={:?}",
+                                safe_log_label(&mounted_uri_template),
+                                error.code
+                            ));
+                            continue;
+                        }
                     }
+                } else {
+                    None
+                };
+                let final_enabled = prefix.is_none() && entry.final_definition.is_some();
+                let (matcher, specificity) = if final_enabled {
+                    match admit_resource_template(&mounted_uri_template) {
+                        Ok((matcher, specificity)) => (Some(matcher), specificity),
+                        Err(error) => {
+                            result.errors.push(format!(
+                                "Mount rejected resource template; template_key={}; code={:?}",
+                                safe_log_label(&mounted_uri_template),
+                                error.code
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    let specificity = legacy_matcher.as_ref().map_or(
+                        entry.specificity,
+                        LegacyResourceTemplateMatcher::specificity,
+                    );
+                    (None, specificity)
                 };
                 let mounted_entry = ResourceTemplateEntry {
                     matcher,
+                    legacy_matcher,
                     specificity,
                     template: mounted_template,
                     handler: mounted_handler,
@@ -5651,11 +6013,7 @@ impl Router {
                         None
                     },
                     uri_use_policy: entry.uri_use_policy,
-                    legacy_enabled: if prefix.is_none() {
-                        entry.legacy_enabled
-                    } else {
-                        true
-                    },
+                    legacy_enabled: entry.legacy_enabled,
                 };
 
                 self.resource_templates
@@ -5697,14 +6055,18 @@ impl Router {
         if !preflight.is_success() {
             return preflight;
         }
-        self.mount_prompts_from(
+        let result = self.mount_prompts_from(
             other.prompts,
             other.final_only_prompts,
             other.final_prompts,
             other.prompt_order,
             prefix,
             behavior,
-        )
+        );
+        if result.has_components() {
+            self.advance_final_catalog_revision();
+        }
+        result
     }
 
     /// Internal: mount prompts from a HashMap.
@@ -5848,13 +6210,202 @@ impl ResolvedResource<'_> {
 
 /// Entry for a resource template with its matcher and optional handler.
 pub(crate) struct ResourceTemplateEntry {
-    pub(crate) matcher: ReversibleResourceTemplate,
+    pub(crate) matcher: Option<ReversibleResourceTemplate>,
+    legacy_matcher: Option<LegacyResourceTemplateMatcher>,
     specificity: (usize, usize, usize),
     pub(crate) template: ResourceTemplate,
     pub(crate) handler: Option<BoxedResourceHandler>,
     final_definition: Option<FinalResourceTemplate>,
     uri_use_policy: ResourceUriUsePolicy,
     legacy_enabled: bool,
+}
+
+/// The frozen, exact-2024 template matcher. Legacy registrations deliberately
+/// do not inherit new RFC 6570 operators: their parameter surface is limited
+/// to `{name}` and `{+name}`, with the historical non-empty, percent-decoded
+/// capture rules retained for existing handlers.
+#[derive(Debug, Clone)]
+struct LegacyResourceTemplateMatcher {
+    segments: Vec<LegacyResourceTemplateSegment>,
+}
+
+#[derive(Debug, Clone)]
+enum LegacyResourceTemplateSegment {
+    Literal(String),
+    Parameter(String),
+}
+
+impl LegacyResourceTemplateMatcher {
+    fn parse(pattern: &str) -> Result<Self, ()> {
+        let mut segments = Vec::new();
+        let mut literal = String::new();
+        let mut chars = pattern.chars().peekable();
+        let mut names = HashSet::new();
+
+        while let Some(character) = chars.next() {
+            match character {
+                '{' if matches!(chars.peek(), Some('{')) => {
+                    let _ = chars.next();
+                    literal.push('{');
+                }
+                '{' => {
+                    if !literal.is_empty() {
+                        segments.push(LegacyResourceTemplateSegment::Literal(std::mem::take(
+                            &mut literal,
+                        )));
+                    }
+                    let mut expression = String::new();
+                    let mut closed = false;
+                    for next in chars.by_ref() {
+                        if next == '}' {
+                            closed = true;
+                            break;
+                        }
+                        expression.push(next);
+                    }
+                    if !closed {
+                        return Err(());
+                    }
+
+                    let name = expression.strip_prefix('+').unwrap_or(&expression);
+                    if name.is_empty()
+                        || name.starts_with('+')
+                        || matches!(
+                            expression.chars().next(),
+                            Some('#' | '.' | '/' | ';' | '?' | '&')
+                        )
+                        || name
+                            .chars()
+                            .any(|character| matches!(character, '*' | ':' | ','))
+                        || !names.insert(name.to_owned())
+                    {
+                        return Err(());
+                    }
+                    segments.push(LegacyResourceTemplateSegment::Parameter(name.to_owned()));
+                }
+                '}' if matches!(chars.peek(), Some('}')) => {
+                    let _ = chars.next();
+                    literal.push('}');
+                }
+                '}' => return Err(()),
+                character => literal.push(character),
+            }
+        }
+
+        if !literal.is_empty() {
+            segments.push(LegacyResourceTemplateSegment::Literal(literal));
+        }
+        Ok(Self { segments })
+    }
+
+    fn specificity(&self) -> (usize, usize, usize) {
+        let mut literal_bytes = 0usize;
+        let mut literal_parts = 0usize;
+        for segment in &self.segments {
+            if let LegacyResourceTemplateSegment::Literal(literal) = segment {
+                literal_bytes = literal_bytes.saturating_add(literal.len());
+                literal_parts = literal_parts.saturating_add(1);
+            }
+        }
+        (literal_bytes, literal_parts, self.segments.len())
+    }
+
+    fn matches(&self, uri: &str) -> Option<UriParams> {
+        let mut params = UriParams::new();
+        let mut remainder = uri;
+        let mut segments = self.segments.iter().peekable();
+
+        while let Some(segment) = segments.next() {
+            match segment {
+                LegacyResourceTemplateSegment::Literal(literal) => {
+                    remainder = remainder.strip_prefix(literal)?;
+                }
+                LegacyResourceTemplateSegment::Parameter(name) => {
+                    let next_literal = segments.peek().and_then(|next| match next {
+                        LegacyResourceTemplateSegment::Literal(literal) => Some(literal.as_str()),
+                        LegacyResourceTemplateSegment::Parameter(_) => None,
+                    });
+                    if next_literal.is_none() && segments.peek().is_some() {
+                        return None;
+                    }
+
+                    let value = if let Some(literal) = next_literal {
+                        let index = remainder.find(literal)?;
+                        let value = &remainder[..index];
+                        remainder = &remainder[index..];
+                        value
+                    } else {
+                        if remainder.is_empty() {
+                            return None;
+                        }
+                        let parameter_count = self
+                            .segments
+                            .iter()
+                            .filter(|segment| {
+                                matches!(segment, LegacyResourceTemplateSegment::Parameter(_))
+                            })
+                            .count();
+                        let end = if parameter_count == 1 {
+                            remainder.len()
+                        } else {
+                            remainder.find('/').unwrap_or(remainder.len())
+                        };
+                        let value = &remainder[..end];
+                        remainder = &remainder[end..];
+                        value
+                    };
+                    if value.is_empty() {
+                        return None;
+                    }
+                    params.insert(name.clone(), legacy_percent_decode(value)?);
+                }
+            }
+        }
+
+        remainder.is_empty().then_some(params)
+    }
+}
+
+fn admit_legacy_resource_template(source: &str) -> McpResult<LegacyResourceTemplateMatcher> {
+    LegacyResourceTemplateMatcher::parse(source).map_err(|()| {
+        McpError::invalid_params(
+            "exact-2024 resource templates only admit unmodified {name} and {+name} parameters",
+        )
+    })
+}
+
+fn legacy_percent_decode(input: &str) -> Option<String> {
+    if !input.as_bytes().contains(&b'%') {
+        return Some(input.to_owned());
+    }
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let high = legacy_hex_value(bytes[index + 1])?;
+                let low = legacy_hex_value(bytes[index + 2])?;
+                output.push((high << 4) | low);
+                index += 3;
+            }
+            b'%' => return None,
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(output).ok()
+}
+
+const fn legacy_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Parses a resource template with the canonical RFC 6570 implementation and
@@ -6312,7 +6863,10 @@ mod safe_log_label_tests {
 
 #[cfg(test)]
 mod cursor_tests {
-    use super::{decode_cursor_offset, encode_cursor_offset};
+    use super::{
+        FinalCatalogKind, FinalCatalogQuery, decode_cursor_offset,
+        decode_final_catalog_cursor_offset, encode_cursor_offset, encode_final_catalog_cursor,
+    };
 
     #[test]
     fn roundtrip_zero() {
@@ -6354,6 +6908,77 @@ mod cursor_tests {
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
         let err = decode_cursor_offset(Some(&encoded)).unwrap_err();
         assert!(err.message.contains("offset"));
+    }
+
+    #[test]
+    fn final_catalog_cursor_binds_the_catalog_revision_and_query() {
+        let include_tags = vec!["Visible".to_owned(), "visible".to_owned()];
+        let exclude_tags = vec!["excluded".to_owned()];
+        let query = FinalCatalogQuery::from_tag_filters(Some(&include_tags), Some(&exclude_tags));
+        let cursor = encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, &query, 7);
+        let equivalent_include_tags = vec!["visible".to_owned()];
+        let equivalent_query = FinalCatalogQuery::from_tag_filters(
+            Some(&equivalent_include_tags),
+            Some(&exclude_tags),
+        );
+        assert_eq!(
+            decode_final_catalog_cursor_offset(
+                Some(&cursor),
+                FinalCatalogKind::Resources,
+                41,
+                &equivalent_query,
+                8,
+            )
+            .expect("a final cursor accepts a semantically equivalent canonical query"),
+            7
+        );
+        let stale = decode_final_catalog_cursor_offset(
+            Some(&cursor),
+            FinalCatalogKind::Resources,
+            42,
+            &query,
+            8,
+        )
+        .expect_err("changing only the catalog revision rejects a stale continuation");
+        assert!(stale.message.contains("stale catalog revision"));
+
+        let wrong_kind = decode_final_catalog_cursor_offset(
+            Some(&cursor),
+            FinalCatalogKind::Prompts,
+            41,
+            &query,
+            8,
+        )
+        .expect_err("changing only the list method rejects a cross-catalog continuation");
+        assert!(wrong_kind.message.contains("another list method"));
+
+        let other_include_tags = vec!["other".to_owned()];
+        let other_query =
+            FinalCatalogQuery::from_tag_filters(Some(&other_include_tags), Some(&exclude_tags));
+        let wrong_query = decode_final_catalog_cursor_offset(
+            Some(&cursor),
+            FinalCatalogKind::Resources,
+            41,
+            &other_query,
+            8,
+        )
+        .expect_err("changing only the request filters rejects the continuation");
+        assert!(wrong_query.message.contains("query filters"));
+
+        let out_of_range = encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, &query, 8);
+        let range_error = decode_final_catalog_cursor_offset(
+            Some(&out_of_range),
+            FinalCatalogKind::Resources,
+            41,
+            &query,
+            8,
+        )
+        .expect_err("an offset at the end of a catalog is never a router-minted continuation");
+        assert!(
+            range_error
+                .message
+                .contains("outside the requested catalog page")
+        );
     }
 }
 
@@ -7331,11 +7956,8 @@ mod router_tests {
                     .push(notification);
             },
         ));
-        let request_ctx = McpContext::with_progress(
-            cx,
-            178,
-            Arc::clone(&outer_runtime).into_reporter(),
-        );
+        let request_ctx =
+            McpContext::with_progress(cx, 178, Arc::clone(&outer_runtime).into_reporter());
         let params: FinalCallToolParams = serde_json::from_value(serde_json::json!({
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -7346,9 +7968,8 @@ mod router_tests {
             "arguments": {"total": 11999.0},
         }))
         .expect("final tool parameters are valid");
-        let notification_sender: NotificationSender = Arc::new(|_| {
-            panic!("router must not replace an installed final-progress runtime")
-        });
+        let notification_sender: NotificationSender =
+            Arc::new(|_| panic!("router must not replace an installed final-progress runtime"));
 
         let outcome = block_on(router.handle_tools_call_final_in_request(
             &request_ctx,
@@ -7363,7 +7984,9 @@ mod router_tests {
         assert!(matches!(outcome, FinalToolOutcome::Complete(_)));
         assert!(outer_runtime.flush_pending());
 
-        let sent = sent.lock().expect("notification collection is not poisoned");
+        let sent = sent
+            .lock()
+            .expect("notification collection is not poisoned");
         assert_eq!(sent.len(), 1);
         let wire = serde_json::to_string(
             sent[0]
@@ -8659,6 +9282,134 @@ mod router_tests {
         }
     }
 
+    struct ProviderCompletion {
+        value: &'static str,
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl CompletionHandler for ProviderCompletion {
+        fn complete_legacy(
+            &self,
+            _ctx: &McpContext,
+            _params: LegacyCompletionParams,
+        ) -> McpResult<CompletionValues> {
+            Ok(CompletionValues {
+                values: vec![self.value.to_owned()],
+                total: Some(1),
+                has_more: Some(false),
+            })
+        }
+
+        fn complete_final(
+            &self,
+            _ctx: &McpContext,
+            _params: FinalCompletionParams,
+        ) -> McpResult<fastmcp_protocol::FinalCompletionValues> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(fastmcp_protocol::FinalCompletionValues {
+                values: vec![self.value.to_owned()],
+                total: Some(fastmcp_protocol::JsonInteger::from(1_i64)),
+                has_more: Some(false),
+            })
+        }
+    }
+
+    struct ReversibleLevelFourTemplateResource {
+        read_calls: Arc<AtomicUsize>,
+    }
+
+    impl ResourceHandler for ReversibleLevelFourTemplateResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "mcp://resource/template".to_owned(),
+                name: "level-four-template".to_owned(),
+                description: None,
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            Some(marked_template(
+                "mcp://resource{/collection*}/manifest{?revision*}",
+                "level-four-template",
+            ))
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            unreachable!("templated reads receive their URI parameters")
+        }
+
+        fn read_with_uri(
+            &self,
+            _ctx: &McpContext,
+            uri: &str,
+            params: &UriParams,
+        ) -> McpResult<Vec<ResourceContent>> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![ResourceContent {
+                uri: uri.to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                text: Some(format!(
+                    "{}:{}",
+                    params.get("collection").expect("collection is captured"),
+                    params.get("revision").expect("revision is captured")
+                )),
+                blob: None,
+            }])
+        }
+    }
+
+    struct LegacyTemplateResource {
+        read_calls: Arc<AtomicUsize>,
+    }
+
+    impl ResourceHandler for LegacyTemplateResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "mcp://resource/legacy-template".to_owned(),
+                name: "legacy-template".to_owned(),
+                description: None,
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            Some(marked_template(
+                "mcp://resource/{collection}/manifest?revision={revision}",
+                "legacy-template",
+            ))
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            unreachable!("templated reads receive their URI parameters")
+        }
+
+        fn read_with_uri(
+            &self,
+            _ctx: &McpContext,
+            uri: &str,
+            params: &UriParams,
+        ) -> McpResult<Vec<ResourceContent>> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![ResourceContent {
+                uri: uri.to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                text: Some(format!(
+                    "{}:{}",
+                    params.get("collection").expect("collection is captured"),
+                    params.get("revision").expect("revision is captured")
+                )),
+                blob: None,
+            }])
+        }
+    }
+
     struct CompletionValueBoundary {
         final_calls: Arc<AtomicUsize>,
     }
@@ -8691,7 +9442,8 @@ mod router_tests {
                 values: (0..value_count)
                     .map(|index| format!("completion-{index}"))
                     .collect(),
-                total: None,
+                total: (params.argument.value == "negative-total")
+                    .then(|| fastmcp_protocol::JsonInteger::from(-1_i64)),
                 has_more: None,
             })
         }
@@ -11951,11 +12703,35 @@ mod router_tests {
         let cursor = first_page["nextCursor"]
             .as_str()
             .expect("the first admitted page has a continuation cursor");
+        let include_tags = vec!["visible".to_owned()];
+        let exclude_tags = vec!["excluded".to_owned()];
+        let query = FinalCatalogQuery::from_tag_filters(Some(&include_tags), Some(&exclude_tags));
         assert_eq!(
-            decode_cursor_offset(Some(cursor)).expect("cursor is router-generated"),
+            decode_final_catalog_cursor_offset(
+                Some(cursor),
+                FinalCatalogKind::Tools,
+                router.final_catalog_revision,
+                &query,
+                2,
+            )
+            .expect("cursor is router-generated for this exact final catalog revision"),
             1,
             "the cursor advances across admitted entries"
         );
+
+        let query_mismatch = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(
+                    Some(cursor),
+                    Some(vec!["other"]),
+                    Some(vec!["excluded"]),
+                    165_i64,
+                ),
+            )
+            .expect_err("changing only the final list filter rejects the continuation");
+        assert_eq!(query_mismatch.code, McpErrorCode::InvalidParams);
+        assert!(query_mismatch.message.contains("query filters"));
 
         let second_page = router
             .dispatch_stateless(
@@ -11964,7 +12740,7 @@ mod router_tests {
                     Some(cursor),
                     Some(vec!["visible"]),
                     Some(vec!["excluded"]),
-                    165_i64,
+                    166_i64,
                 ),
             )
             .expect("the continuation page keeps admitted source order");
@@ -11974,6 +12750,203 @@ mod router_tests {
             second_page.get("nextCursor").is_none(),
             "the second admitted entry terminates the filtered final sequence"
         );
+    }
+
+    #[test]
+    fn final_default_list_validates_every_supplied_catalog_cursor() {
+        let mut router = Router::new();
+        router
+            .add_tool(NamedTool::new("default-cursor-first"))
+            .expect("first final tool registers");
+        router
+            .add_tool(NamedTool::new("default-cursor-second"))
+            .expect("second final tool registers");
+        assert!(
+            router.list_page_size.is_none(),
+            "the default final list path has pagination disabled"
+        );
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 167, Budget::INFINITE, &state);
+        let full = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, None, None, 167_i64),
+            )
+            .expect("a cursor-free default final list returns the full catalog");
+        assert_eq!(full["tools"].as_array().map(Vec::len), Some(2));
+        assert!(full.get("nextCursor").is_none());
+
+        let query = FinalCatalogQuery::from_tag_filters(None, None);
+        let valid_cursor = encode_final_catalog_cursor(
+            FinalCatalogKind::Tools,
+            router.final_catalog_revision,
+            &query,
+            0,
+        );
+        let validated_full = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(Some(&valid_cursor), None, None, 168_i64),
+            )
+            .expect(
+                "a valid cursor remains admitted while default listing returns the full catalog",
+            );
+        assert_eq!(validated_full["tools"].as_array().map(Vec::len), Some(2));
+        assert!(validated_full.get("nextCursor").is_none());
+
+        let stale_revision = router
+            .final_catalog_revision
+            .checked_sub(1)
+            .expect("registered tools advance the final catalog revision");
+        let stale_cursor =
+            encode_final_catalog_cursor(FinalCatalogKind::Tools, stale_revision, &query, 0);
+        let stale = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(Some(&stale_cursor), None, None, 169_i64),
+            )
+            .expect_err("changing only the revision rejects a default-list cursor");
+        assert_eq!(stale.code, McpErrorCode::InvalidParams);
+        assert!(stale.message.contains("stale catalog revision"));
+
+        let wrong_kind_cursor = encode_final_catalog_cursor(
+            FinalCatalogKind::Prompts,
+            router.final_catalog_revision,
+            &query,
+            0,
+        );
+        let wrong_kind = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(Some(&wrong_kind_cursor), None, None, 170_i64),
+            )
+            .expect_err("changing only the kind rejects a default-list cursor");
+        assert_eq!(wrong_kind.code, McpErrorCode::InvalidParams);
+        assert!(wrong_kind.message.contains("another list method"));
+
+        let other_tags = vec!["other".to_owned()];
+        let other_query = FinalCatalogQuery::from_tag_filters(Some(&other_tags), None);
+        let wrong_query_cursor = encode_final_catalog_cursor(
+            FinalCatalogKind::Tools,
+            router.final_catalog_revision,
+            &other_query,
+            0,
+        );
+        let wrong_query = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(Some(&wrong_query_cursor), None, None, 171_i64),
+            )
+            .expect_err("changing only the filters rejects a default-list cursor");
+        assert_eq!(wrong_query.code, McpErrorCode::InvalidParams);
+        assert!(wrong_query.message.contains("query filters"));
+
+        let out_of_range_cursor = encode_final_catalog_cursor(
+            FinalCatalogKind::Tools,
+            router.final_catalog_revision,
+            &query,
+            2,
+        );
+        let out_of_range = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(Some(&out_of_range_cursor), None, None, 172_i64),
+            )
+            .expect_err("changing only the offset rejects a default-list cursor");
+        assert_eq!(out_of_range.code, McpErrorCode::InvalidParams);
+        assert!(
+            out_of_range
+                .message
+                .contains("outside the requested catalog page")
+        );
+    }
+
+    #[test]
+    fn final_resource_and_prompt_cursors_reject_stale_catalog_revisions() {
+        fn final_list_request(method: &str, cursor: Option<&str>, id: i64) -> JsonRpcRequest {
+            let mut params = serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            });
+            if let Some(cursor) = cursor {
+                params["cursor"] = serde_json::json!(cursor);
+            }
+            JsonRpcRequest::new(method, Some(params), id)
+        }
+
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        router.add_resource(NamedResource::new("file:///cursor-resource-a"));
+        router.add_resource(NamedResource::new("file:///cursor-resource-b"));
+        router.add_prompt(NamedPrompt::new("cursor-prompt-a"));
+        router.add_prompt(NamedPrompt::new("cursor-prompt-b"));
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 166, Budget::INFINITE, &state);
+
+        let resource_first = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_list_request("resources/list", None, 166_i64),
+            )
+            .expect("the first final resource page is emitted");
+        let resource_cursor = resource_first["nextCursor"]
+            .as_str()
+            .expect("the first resource page has a continuation")
+            .to_owned();
+        let resource_second = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_list_request("resources/list", Some(&resource_cursor), 167_i64),
+            )
+            .expect("an unchanged final resource catalog accepts its cursor");
+        assert_eq!(
+            resource_second["resources"][0]["uri"],
+            "file:///cursor-resource-b"
+        );
+
+        router.add_resource(NamedResource::new("file:///cursor-resource-c"));
+        let resource_stale = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_list_request("resources/list", Some(&resource_cursor), 168_i64),
+            )
+            .expect_err("adding only one catalog resource invalidates the old continuation");
+        assert_eq!(resource_stale.code, McpErrorCode::InvalidParams);
+        assert!(resource_stale.message.contains("stale catalog revision"));
+
+        let prompt_first = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_list_request("prompts/list", None, 169_i64),
+            )
+            .expect("the first final prompt page is emitted");
+        let prompt_cursor = prompt_first["nextCursor"]
+            .as_str()
+            .expect("the first prompt page has a continuation")
+            .to_owned();
+        let prompt_second = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_list_request("prompts/list", Some(&prompt_cursor), 170_i64),
+            )
+            .expect("an unchanged final prompt catalog accepts its cursor");
+        assert_eq!(prompt_second["prompts"][0]["name"], "cursor-prompt-b");
+
+        router.add_prompt(NamedPrompt::new("cursor-prompt-c"));
+        let prompt_stale = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_list_request("prompts/list", Some(&prompt_cursor), 171_i64),
+            )
+            .expect_err("adding only one catalog prompt invalidates the old continuation");
+        assert_eq!(prompt_stale.code, McpErrorCode::InvalidParams);
+        assert!(prompt_stale.message.contains("stale catalog revision"));
     }
 
     #[test]
@@ -13324,6 +14297,129 @@ mod router_tests {
     }
 
     #[test]
+    fn final_completion_routes_to_the_registered_prompt_or_resource_provider() {
+        let prompt_calls = Arc::new(AtomicUsize::new(0));
+        let resource_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_completion_handler(ProviderCompletion {
+            value: "fallback-provider",
+            final_calls: Arc::clone(&fallback_calls),
+        });
+        router.add_prompt(PromptArgumentBoundary {
+            final_calls: Arc::new(AtomicUsize::new(0)),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        router.add_resource_template(marked_template("resource://first/{id}", "first"));
+        router.add_resource_template(marked_template("resource://second/{id}", "second"));
+        router.add_prompt_completion_handler(
+            "prompt-argument-boundary",
+            ProviderCompletion {
+                value: "prompt-provider",
+                final_calls: Arc::clone(&prompt_calls),
+            },
+        );
+        router.add_resource_template_completion_handler(
+            "resource://first/{id}",
+            ProviderCompletion {
+                value: "resource-provider",
+                final_calls: Arc::clone(&resource_calls),
+            },
+        );
+
+        assert!(
+            router
+                .server_discovery_behavior_registry()
+                .contains(ServerBehavior::CompletionComplete),
+            "a registered final completion provider enables discovery"
+        );
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 187, Budget::INFINITE, &state);
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let prompt_request = JsonRpcRequest::new(
+            COMPLETION_COMPLETE,
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
+                "argument": {"name": "topic", "value": "pro"},
+            })),
+            187_i64,
+        );
+        let resource_request = JsonRpcRequest::new(
+            COMPLETION_COMPLETE,
+            Some(serde_json::json!({
+                "_meta": metadata,
+                "ref": {"type": "ref/resource", "uri": "resource://first/{id}"},
+                "argument": {"name": "id", "value": "pro"},
+            })),
+            188_i64,
+        );
+
+        let prompt = router
+            .dispatch_stateless(&request_ctx, &prompt_request)
+            .expect("the registered prompt provider handles its exact target");
+        let resource = router
+            .dispatch_stateless(&request_ctx, &resource_request)
+            .expect("the registered resource provider handles its exact target");
+        assert_eq!(
+            prompt["completion"]["values"],
+            serde_json::json!(["prompt-provider"])
+        );
+        assert_eq!(
+            resource["completion"]["values"],
+            serde_json::json!(["resource-provider"])
+        );
+        assert_eq!(prompt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            0,
+            "a target-specific provider takes precedence over the installed fallback"
+        );
+
+        let mut unregistered_provider = resource_request.clone();
+        unregistered_provider
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("ref"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion reference is an object")
+            .insert(
+                "uri".to_owned(),
+                serde_json::json!("resource://second/{id}"),
+            );
+        assert_eq!(resource_request.method, unregistered_provider.method);
+        assert_eq!(resource_request.id, unregistered_provider.id);
+        assert_eq!(
+            resource_request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("argument")),
+            unregistered_provider
+                .params
+                .as_ref()
+                .and_then(|params| params.get("argument")),
+            "the referenced resource template is the sole planted dimension"
+        );
+        let fallback = router
+            .dispatch_stateless(&request_ctx, &unregistered_provider)
+            .expect("an admitted target without a provider-specific handler reaches the fallback");
+        assert_eq!(
+            fallback["completion"]["values"],
+            serde_json::json!(["fallback-provider"])
+        );
+        assert_eq!(prompt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn explicit_legacy_completion_is_not_discovered_or_dispatched_as_final() {
         let mut router = Router::new();
         router.add_legacy_completion_handler(EchoCompletion);
@@ -13601,7 +14697,7 @@ mod router_tests {
     }
 
     #[test]
-    fn final_completion_rejects_an_over_limit_local_handler_result() {
+    fn final_completion_rejects_invalid_local_handler_results() {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::new();
         router.add_completion_handler(CompletionValueBoundary {
@@ -13666,55 +14762,29 @@ mod router_tests {
             "completion handler returned more than 100 values"
         );
         assert_eq!(final_calls.load(Ordering::SeqCst), 2);
+
+        let mut negative_total = baseline;
+        negative_total
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("argument"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion argument is an object")
+            .insert("value".to_owned(), serde_json::json!("negative-total"));
+        let error = router
+            .dispatch_stateless(&request_ctx, &negative_total)
+            .expect_err("a local handler cannot return a negative final completion total");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            error.message,
+            "final completion total must be a nonnegative JSON integer"
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
-    fn resource_template_registration_uses_the_protocol_rfc6570_matcher() {
-        struct LevelFourTemplateResource;
-
-        impl ResourceHandler for LevelFourTemplateResource {
-            fn definition(&self) -> Resource {
-                Resource {
-                    uri: "mcp://resource/template".to_owned(),
-                    name: "level-four-template".to_owned(),
-                    description: None,
-                    mime_type: Some("text/plain".to_owned()),
-                    icon: None,
-                    version: None,
-                    tags: Vec::new(),
-                }
-            }
-
-            fn template(&self) -> Option<ResourceTemplate> {
-                Some(marked_template(
-                    "mcp://resource{/collection}/manifest{?revision}",
-                    "level-four-template",
-                ))
-            }
-
-            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-                unreachable!("templated reads receive their URI parameters")
-            }
-
-            fn read_with_uri(
-                &self,
-                _ctx: &McpContext,
-                uri: &str,
-                params: &UriParams,
-            ) -> McpResult<Vec<ResourceContent>> {
-                Ok(vec![ResourceContent {
-                    uri: uri.to_owned(),
-                    mime_type: Some("text/plain".to_owned()),
-                    text: Some(format!(
-                        "{}:{}",
-                        params.get("collection").expect("collection is captured"),
-                        params.get("revision").expect("revision is captured")
-                    )),
-                    blob: None,
-                }])
-            }
-        }
-
+    fn resource_template_registration_is_final_visible_via_protocol_rfc6570_matcher() {
         struct AmbiguousTemplateResource;
 
         impl ResourceHandler for AmbiguousTemplateResource {
@@ -13743,16 +14813,23 @@ mod router_tests {
         }
 
         let mut router = Router::new();
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let completion_calls = Arc::new(AtomicUsize::new(0));
+        router.add_completion_handler(CountingCompletion {
+            final_calls: Arc::clone(&completion_calls),
+        });
         router
             .add_resource_with_behavior(
-                LevelFourTemplateResource,
+                ReversibleLevelFourTemplateResource {
+                    read_calls: Arc::clone(&read_calls),
+                },
                 crate::DuplicateBehavior::Replace,
             )
             .expect("a reversible level-four template is admitted");
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 189, Budget::INFINITE, &state);
-        let result = router
+        let legacy_error = router
             .handle_resources_read(
                 &request_ctx,
                 &fastmcp_protocol::ReadResourceParams {
@@ -13763,9 +14840,73 @@ mod router_tests {
                 None,
                 None,
             )
-            .expect("the canonical matcher reaches the registered handler");
-        let wire = serde_json::to_value(result).expect("resource result serializes");
-        assert_eq!(wire["contents"][0]["text"], "books:stable");
+            .expect_err("scalar explode remains unavailable to exact-2024 routing");
+        assert_eq!(legacy_error.code, McpErrorCode::ResourceNotFound);
+        assert_eq!(read_calls.load(Ordering::SeqCst), 0);
+
+        let final_metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let templates = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/templates/list",
+                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                    189_i64,
+                ),
+            )
+            .expect("the admitted template is final-visible");
+        assert_eq!(templates["resultType"], "complete");
+        assert_eq!(
+            templates["resourceTemplates"][0]["uriTemplate"],
+            "mcp://resource{/collection*}/manifest{?revision*}"
+        );
+
+        let final_read = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": final_metadata.clone(),
+                        "uri": "mcp://resource/books%2Ffiction/manifest?revision=stable",
+                    })),
+                    189_i64,
+                ),
+            )
+            .expect("the final route uses the same reversible matcher");
+        assert_eq!(final_read["resultType"], "complete");
+        assert_eq!(
+            final_read["contents"][0]["text"], "books/fiction:stable",
+            "the final route decodes the scalar capture exactly once"
+        );
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+
+        let completion = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    COMPLETION_COMPLETE,
+                    Some(serde_json::json!({
+                        "_meta": final_metadata,
+                        "ref": {
+                            "type": "ref/resource",
+                            "uri": "mcp://resource{/collection*}/manifest{?revision*}",
+                        },
+                        "argument": {"name": "revision", "value": "sta"},
+                    })),
+                    189_i64,
+                ),
+            )
+            .expect("the final completion target exposes protocol-derived variables");
+        assert_eq!(completion["resultType"], "complete");
+        assert_eq!(
+            completion["completion"]["values"],
+            serde_json::json!(["staging"])
+        );
+        assert_eq!(completion_calls.load(Ordering::SeqCst), 1);
 
         let template_count = router.resource_templates_count();
         let error = router
@@ -13779,6 +14920,178 @@ mod router_tests {
             router.resource_templates_count(),
             template_count,
             "rejected template admission cannot mutate the registered catalog"
+        );
+    }
+
+    #[test]
+    fn legacy_resource_template_is_inert_on_final_list_read_and_completion() {
+        let mut router = Router::new();
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let completion_calls = Arc::new(AtomicUsize::new(0));
+        router.add_completion_handler(CountingCompletion {
+            final_calls: Arc::clone(&completion_calls),
+        });
+        router
+            .add_legacy_resource_with_behavior(
+                LegacyTemplateResource {
+                    read_calls: Arc::clone(&read_calls),
+                },
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the exact-2024 template is admitted for its own route");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 190, Budget::INFINITE, &state);
+        let uri = "mcp://resource/books/manifest?revision=stable";
+        let legacy_read = router
+            .handle_resources_read(
+                &request_ctx,
+                &ReadResourceParams {
+                    uri: uri.to_owned(),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("the exact legacy route retains the registered template");
+        let legacy_wire =
+            serde_json::to_value(legacy_read).expect("legacy resource result serializes");
+        assert_eq!(legacy_wire["contents"][0]["text"], "books:stable");
+        assert!(legacy_wire.get("resultType").is_none());
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+
+        let final_metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let templates = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/templates/list",
+                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                    190_i64,
+                ),
+            )
+            .expect("final template discovery remains valid with only exact-2024 templates");
+        assert_eq!(templates["resultType"], "complete");
+        assert_eq!(templates["resourceTemplates"], serde_json::json!([]));
+
+        let final_read = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": final_metadata.clone(),
+                        "uri": uri,
+                    })),
+                    190_i64,
+                ),
+            )
+            .expect_err("changing only the dispatch era cannot invoke a legacy-only template");
+        assert_eq!(final_read.code, McpErrorCode::InvalidParams);
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+
+        let completion = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    COMPLETION_COMPLETE,
+                    Some(serde_json::json!({
+                        "_meta": final_metadata,
+                        "ref": {
+                            "type": "ref/resource",
+                            "uri": "mcp://resource/{collection}/manifest?revision={revision}",
+                        },
+                        "argument": {"name": "revision", "value": "sta"},
+                    })),
+                    190_i64,
+                ),
+            )
+            .expect_err("a legacy-only template is not a final completion target");
+        assert_eq!(completion.code, McpErrorCode::InvalidParams);
+        assert_eq!(completion_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn exact_2024_resource_template_admission_rejects_final_only_star_and_multi_variable_forms() {
+        let mut legacy_router = Router::new();
+        legacy_router
+            .add_legacy_resource_with_behavior(
+                LegacyTemplateResource {
+                    read_calls: Arc::new(AtomicUsize::new(0)),
+                },
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the frozen {name} legacy grammar remains admitted");
+        let catalog_before = serde_json::to_vec(&legacy_router.resource_templates())
+            .expect("the admitted legacy catalog serializes");
+
+        let star_error = legacy_router
+            .add_legacy_resource_with_behavior(
+                ReversibleLevelFourTemplateResource {
+                    read_calls: Arc::new(AtomicUsize::new(0)),
+                },
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect_err("changing only a legacy variable to scalar explode is final-only");
+        assert_eq!(star_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            serde_json::to_vec(&legacy_router.resource_templates())
+                .expect("rejected star admission leaves the catalog serializable"),
+            catalog_before,
+            "legacy rejection cannot mutate the existing catalog"
+        );
+
+        let multi_variable_error = legacy_router
+            .add_legacy_resource_template_with_behavior(
+                marked_template("mcp://resource{?collection*,revision*}", "final-only-multi"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect_err("changing only to a named multi-variable expression is final-only");
+        assert_eq!(multi_variable_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            serde_json::to_vec(&legacy_router.resource_templates())
+                .expect("rejected multi-variable admission leaves the catalog serializable"),
+            catalog_before,
+            "the near-identical final syntax cannot alter an exact-2024 catalog"
+        );
+
+        let mut final_router = Router::new();
+        final_router
+            .add_final_resource_with_behavior(
+                ReversibleLevelFourTemplateResource {
+                    read_calls: Arc::new(AtomicUsize::new(0)),
+                },
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the scalar-explode form remains admitted on the final route");
+        final_router
+            .add_resource_template_with_behavior(
+                marked_template("mcp://resource{?collection*,revision*}", "final-multi"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the named multi-variable form remains admitted on the final route");
+        assert_eq!(final_router.resource_templates_count(), 2);
+    }
+
+    #[test]
+    fn frozen_exact_2024_matcher_preserves_plus_capture_and_percent_decoding() {
+        let matcher = admit_legacy_resource_template("legacy://resource/{+path}")
+            .expect("the frozen legacy grammar retains {+name}");
+        let params = matcher
+            .matches("legacy://resource/books%2Ffiction")
+            .expect("legacy plus capture matches a percent-encoded path");
+        assert_eq!(
+            params.get("path").map(String::as_str),
+            Some("books/fiction")
+        );
+
+        assert!(
+            admit_legacy_resource_template("legacy://resource/{+path*}").is_err(),
+            "changing only the scalar modifier keeps the new syntax final-only"
         );
     }
 
