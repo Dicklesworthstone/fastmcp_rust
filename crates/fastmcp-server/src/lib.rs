@@ -2781,7 +2781,7 @@ impl ServerHttpRequestCancellation {
     pub fn is_cancelled(&self) -> bool {
         self.transport.is_cancelled()
             || self.terminal_delivery.is_settled()
-            || self.request.is_cancel_requested() && !self.terminal_delivery.is_enqueued()
+            || self.request.is_cancel_requested() && !self.terminal_delivery.is_committed()
     }
 
     /// Returns the exact JSON-RPC request ID owned by this response body.
@@ -2798,8 +2798,10 @@ impl ServerHttpRequestCancellation {
     /// when MCP cancellation has closed the response body.
     pub fn checkpoint(&self, cx: &Cx) -> Result<(), TransportError> {
         self.transport.checkpoint(cx)?;
+        // A committed terminal sequence keeps the cancelled request live
+        // until both the drained control and its final completion settle.
         if self.terminal_delivery.is_settled()
-            || self.request.is_cancel_requested() && !self.terminal_delivery.is_enqueued()
+            || self.request.is_cancel_requested() && !self.terminal_delivery.is_committed()
         {
             return Err(TransportError::Cancelled);
         }
@@ -2849,7 +2851,7 @@ impl ServerHttpSseResponse {
         self.inner.is_finished()
             || self.terminal_delivery.is_settled()
             || self.request_cancellation.is_cancel_requested()
-                && !self.terminal_delivery.is_enqueued()
+                && !self.terminal_delivery.is_committed()
     }
 
     /// Pops the next queued event, then reports a fully drained terminal
@@ -2874,7 +2876,7 @@ impl ServerHttpSseResponse {
                 Ok(Some(event))
             }
             None if self.request_cancellation.is_cancel_requested() => {
-                if self.terminal_delivery.is_enqueued() {
+                if self.terminal_delivery.is_committed() {
                     Ok(None)
                 } else {
                     self.terminal_delivery.mark_failed();
@@ -3442,6 +3444,11 @@ impl FinalSubscriptionRegistry {
                     .election
                     .graceful_completion
                     .store(true, Ordering::Release);
+                // The parked dispatch only observes the election through its
+                // request cancellation; the graceful_completion flag above is
+                // ordered before this wake so the dispatch converts to the
+                // terminal completion response instead of a cancelled error.
+                entry.request_cancellation.cancel();
                 (true, entry.terminal_delivery)
             }
             FinalSubscriptionPhase::PeerTerminated | FinalSubscriptionPhase::ServerTerminated => {
@@ -5476,24 +5483,28 @@ fn spawn_modern_sse_dispatch(
                 notification_sender,
             )
             .await;
-        if let Some(response) = response
-            && cancellation.begin_finalization()
-        {
+        if let Some(response) = response {
             let graceful_completion = final_subscription_completion_response(&response);
-            let sent = if graceful_completion {
-                // A server-owned shutdown may have cancelled the listener's
-                // root context. The terminal control has already won this
-                // stream, so mask only its paired final response while the
-                // peer still owns the body.
-                request_cx.masked(|| response_sender.send_response(&request_cx, response))
-            } else {
-                response_sender.send_response(&request_cx, response)
-            };
-            if graceful_completion {
-                if sent.is_ok() {
-                    terminal_delivery.mark_completion_enqueued();
+            // The server-side graceful election cancels this request as its
+            // dispatch wake, which claims the finalization race; its elected
+            // terminal completion is the sanctioned final frame and must
+            // still flush. Every other response drops once cancellation won.
+            if cancellation.begin_finalization() || graceful_completion {
+                let sent = if graceful_completion {
+                    // A server-owned shutdown may have cancelled the
+                    // listener's root context. The terminal control has
+                    // already won this stream, so mask only its paired final
+                    // response while the peer still owns the body.
+                    request_cx.masked(|| response_sender.send_response(&request_cx, response))
                 } else {
-                    terminal_delivery.mark_failed();
+                    response_sender.send_response(&request_cx, response)
+                };
+                if graceful_completion {
+                    if sent.is_ok() {
+                        terminal_delivery.mark_completion_enqueued();
+                    } else {
+                        terminal_delivery.mark_failed();
+                    }
                 }
             }
         }
@@ -5574,7 +5585,7 @@ async fn send_modern_sse_stream(
                 Ok(None) if response.is_finished() => break,
                 Ok(None)
                     if request_cancellation.is_cancel_requested()
-                        && !terminal_delivery.is_enqueued() =>
+                        && !terminal_delivery.is_committed() =>
                 {
                     break;
                 }
@@ -7062,9 +7073,23 @@ impl Server {
                 result => result,
             },
         };
+        // The server-side graceful election cancels the listen as its
+        // dispatch wake; liveness gating would convert the sanctioned
+        // terminal completion into a cancellation error, so that exact
+        // response is exempt while middleware hooks still run.
+        let raw_graceful_completion = request.method == SUBSCRIPTIONS_LISTEN
+            && result.as_ref().is_ok_and(|value| {
+                final_subscription_completion_result(value, request.id.as_ref())
+            });
         let result = match result {
             Ok(value) => self
-                .apply_middleware_response(&entered_middleware, &request_ctx, &request, value)
+                .apply_middleware_response_with_liveness(
+                    &entered_middleware,
+                    &request_ctx,
+                    &request,
+                    value,
+                    !raw_graceful_completion,
+                )
                 .and_then(|value| {
                     validate_final_core_middleware_response(
                         final_core_request.as_ref(),
@@ -7103,7 +7128,10 @@ impl Server {
             }
             return None;
         }
-        if request.method == SUBSCRIPTIONS_LISTEN && request_cancellation.is_cancel_requested() {
+        if request.method == SUBSCRIPTIONS_LISTEN
+            && request_cancellation.is_cancel_requested()
+            && !graceful_subscription_completion
+        {
             return None;
         }
         let response_id = response_id.expect("non-notification requests have an id");
@@ -7215,6 +7243,12 @@ impl Server {
 
         while !self.final_subscriptions.is_terminating() {
             if request_cancellation.is_cancel_requested() {
+                // A server-side graceful election cancels this request as its
+                // wake; the elected terminal completion outranks the plain
+                // cancellation error a peer-initiated cancel produces.
+                if lease.has_graceful_completion() {
+                    return self.final_subscription_complete_result(&subscription_id);
+                }
                 return Err(McpError::request_cancelled());
             }
             if request_ctx.ensure_live().is_err() {
@@ -7231,6 +7265,7 @@ impl Server {
                 }
                 if request_cancellation.is_cancel_requested()
                     && !self.final_subscriptions.is_terminating()
+                    && !lease.has_graceful_completion()
                 {
                     return Err(McpError::request_cancelled());
                 }
@@ -12057,7 +12092,18 @@ impl Server {
         request: &JsonRpcRequest,
         value: serde_json::Value,
     ) -> Result<serde_json::Value, McpError> {
-        if let Some(error) = Self::request_context_error(ctx) {
+        self.apply_middleware_response_with_liveness(stack, ctx, request, value, true)
+    }
+
+    fn apply_middleware_response_with_liveness(
+        &self,
+        stack: &[&dyn crate::Middleware],
+        ctx: &McpContext,
+        request: &JsonRpcRequest,
+        value: serde_json::Value,
+        enforce_liveness: bool,
+    ) -> Result<serde_json::Value, McpError> {
+        if enforce_liveness && let Some(error) = Self::request_context_error(ctx) {
             return Err(error);
         }
         let mut response = value;
@@ -12066,7 +12112,7 @@ impl Server {
             match invocation {
                 Ok(Ok(next)) => {
                     response = next;
-                    if let Some(error) = Self::request_context_error(ctx) {
+                    if enforce_liveness && let Some(error) = Self::request_context_error(ctx) {
                         return Err(error);
                     }
                 }
@@ -13174,6 +13220,13 @@ impl HandledRequest {
             .as_ref()
             .is_some_and(McpRequestCancellation::is_cancel_requested);
         if explicit_cancellation_linearized {
+            // A server-side graceful election cancels its listen as the
+            // dispatch wake; the elected terminal completion is that
+            // request's sanctioned final frame, not a response that lost a
+            // cancellation race.
+            if final_subscription_completion_response(&self.response) {
+                return false;
+            }
             self.replace_with_terminal_error(session, McpError::request_cancelled());
             return true;
         }
@@ -13191,6 +13244,9 @@ impl HandledRequest {
             .as_ref()
             .is_some_and(|cancellation| !cancellation.begin_finalization());
         if cancellation_won {
+            if final_subscription_completion_response(&self.response) {
+                return false;
+            }
             self.replace_with_terminal_error(session, McpError::request_cancelled());
             return true;
         }
