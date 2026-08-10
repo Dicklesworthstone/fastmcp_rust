@@ -103,7 +103,8 @@ pub use handler::{
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 pub use proxy::{
-    FinalProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint, ProxyClient,
+    FinalProgressCallback, ProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
+    ProxyClient,
     ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
     ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding,
     ProxyUpstreamBindingRegistry,
@@ -3962,19 +3963,19 @@ struct LiveHttpSession {
 
 type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveHttpSession>>>>;
 
-const MODERN_HTTP_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
+const MODERN_HTTP_RESPONSE_BODY_TTL: Duration = Duration::from_secs(15 * 60);
 const MODERN_HTTP_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// One response-body-owned modern HTTP session.
 ///
 /// Modern Streamable HTTP has no listener-visible session identifier. This
 /// owner exists only while an SSE response body needs its request-local
-/// connection and dispatch lifecycle.
+/// dispatch lifecycle. The endpoint, rather than this body, owns continuation
+/// state across later stateless POSTs.
 struct LiveModernHttpSession {
     server: Arc<Server>,
     session: Mutex<ServerHttpSession>,
     expires_at: Mutex<Instant>,
-    modern_connection: Arc<ModernConnection>,
     modern_dispatches: ModernHttpDispatchRegistry,
     /// Phase one starts listener shutdown and rejects new work without
     /// interrupting an already-enqueued terminal SSE control frame.
@@ -3985,13 +3986,14 @@ struct LiveModernHttpSession {
 }
 
 struct LiveModernHttpSessionRegistryState {
-    sessions: Mutex<HashMap<String, Arc<LiveModernHttpSession>>>,
+    /// Every admitted response body is keyed only by a local opaque
+    /// generation, never by a client-visible modern session identifier.
+    sessions: Mutex<HashMap<u64, Arc<LiveModernHttpSession>>>,
     /// Aborted session dispatches remain listener-owned until their task
     /// completion is observed. Dropping a task handle would detach it.
     retired_dispatches: Mutex<Vec<asupersync::runtime::TaskHandle<()>>>,
-    /// Closes admission before phase one evacuates the current map, so an
-    /// already-admitted discovery request cannot insert a fresh session into
-    /// the otherwise-empty registry during listener shutdown.
+    /// Closes response-body admission before phase one evacuates the current
+    /// map, so a concurrent SSE POST cannot escape listener-owned teardown.
     closing: AtomicBool,
 }
 
@@ -4009,6 +4011,32 @@ impl LiveModernHttpSessionRegistryState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(dispatches);
+    }
+
+    fn register_response_body(
+        &self,
+        generation: u64,
+        session: Arc<LiveModernHttpSession>,
+    ) -> Result<(), Arc<LiveModernHttpSession>> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(session);
+        }
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closing.load(Ordering::Acquire) || sessions.contains_key(&generation) {
+            return Err(session);
+        }
+        sessions.insert(generation, session);
+        Ok(())
+    }
+
+    fn take_response_body(&self, generation: u64) -> Option<Arc<LiveModernHttpSession>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&generation)
     }
 
     fn reap_retired_dispatches(&self) {
@@ -4040,13 +4068,11 @@ type LiveModernHttpSessionRegistry = Arc<LiveModernHttpSessionRegistryState>;
 
 impl LiveModernHttpSession {
     fn new(session: ServerHttpSession) -> Self {
-        let modern_connection = Arc::clone(&session.modern_connection);
         let modern_dispatches = Arc::clone(&session.modern_dispatches);
         Self {
             server: Arc::clone(&session.server),
             session: Mutex::new(session),
-            expires_at: Mutex::new(Instant::now() + MODERN_HTTP_SESSION_TTL),
-            modern_connection,
+            expires_at: Mutex::new(Instant::now() + MODERN_HTTP_RESPONSE_BODY_TTL),
             modern_dispatches,
             closing: AtomicBool::new(false),
             finalized: AtomicBool::new(false),
@@ -4065,7 +4091,8 @@ impl LiveModernHttpSession {
         *self
             .expires_at
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = now + MODERN_HTTP_SESSION_TTL;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            now + MODERN_HTTP_RESPONSE_BODY_TTL;
     }
 
     fn is_closing(&self) -> bool {
@@ -4075,9 +4102,7 @@ impl LiveModernHttpSession {
     /// Starts listener/TTL shutdown without closing the response queues that
     /// still own a server-elected terminal subscription frame.
     fn begin_shutdown_invalidation(&self) {
-        if !self.closing.swap(true, Ordering::AcqRel) {
-            self.modern_connection.disconnect();
-        }
+        self.closing.store(true, Ordering::Release);
     }
 
     fn register_modern_dispatch(
@@ -4165,7 +4190,7 @@ fn expire_live_modern_http_sessions(registry: &LiveModernHttpSessionRegistry) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let expired_ids = sessions
             .iter()
-            .filter_map(|(id, session)| session.is_expired(now).then(|| id.clone()))
+            .filter_map(|(id, session)| session.is_expired(now).then_some(*id))
             .collect::<Vec<_>>();
         expired_ids
             .into_iter()
@@ -4304,8 +4329,9 @@ async fn close_live_http_sessions(cx: &Cx, sessions: &LiveHttpSessionRegistry) {
     }
 }
 
-/// Evacuates the listener-owned modern registry and invalidates every MRTR
-/// continuation before waiting for terminal SSE control frames to flush.
+/// Evacuates the listener-owned modern response-body registry before waiting
+/// for terminal SSE control frames to flush. Endpoint shutdown has already
+/// invalidated MRTR continuations separately.
 fn detach_live_modern_http_sessions(
     sessions: &LiveModernHttpSessionRegistry,
 ) -> Vec<Arc<LiveModernHttpSession>> {
@@ -4327,9 +4353,9 @@ fn detach_live_modern_http_sessions(
 
 /// Completes modern HTTP session teardown after the terminal-control drain.
 ///
-/// Phase one already removed the sessions from admission and disconnected
-/// MRTR. This phase may now cancel live SSE dispatches without suppressing a
-/// terminal control that was granted the listener's bounded drain window.
+/// Phase one already removed the response bodies from admission. This phase
+/// may now cancel live SSE dispatches without suppressing a terminal control
+/// that was granted the listener's bounded drain window.
 async fn finish_live_modern_http_sessions(
     cx: &Cx,
     registry: &LiveModernHttpSessionRegistry,
@@ -4495,13 +4521,17 @@ impl BoundHttpServer {
         // children a bounded scheduling window to flush and close before
         // aborting any unrelated or uncooperative connection.
         let terminal_receipt = server.final_subscriptions.terminate_with_receipt();
+        // Modern continuation state belongs to the endpoint, not an
+        // individual stateless POST. Revoke it once the endpoint shuts down,
+        // before response-body ownership is evacuated and joined below.
+        self.endpoint.disconnect_modern_continuations();
         modern_session_reaper.abort();
         let _ = modern_session_reaper.join(cx).await;
         close_live_http_sessions(cx, &self.legacy_sessions).await;
-        // Phase one makes session IDs and their MRTR continuations terminal
-        // before any uninterruptible connection-child join can begin. Leave
-        // the SSE queues alive until the elected terminal control has had its
-        // bounded opportunity to flush.
+        // Phase one closes response-body admission before any uninterruptible
+        // connection-child join can begin. Leave the SSE queues alive until
+        // the elected terminal control has had its bounded opportunity to
+        // flush.
         let closing_modern_sessions = detach_live_modern_http_sessions(&self.modern_sessions);
         connection_children
             .drain_terminal_controls(&terminal_receipt)
@@ -4529,6 +4559,7 @@ impl Server {
         let endpoint = ServerHttpEndpoint {
             server: Arc::new(self),
             legacy_origin: legacy_origin.into(),
+            modern_connection: Arc::new(ModernConnection::new()),
         };
         let _ = endpoint.transport_endpoint(&endpoint.legacy_origin)?;
         Ok(endpoint)
@@ -4576,8 +4607,19 @@ impl Server {
 
 impl ServerHttpEndpoint {
     /// Opens one independently bounded live HTTP session.
+    ///
+    /// Modern request state remains owned by this endpoint, so independent
+    /// stateless POSTs can continue an earlier MRTR exchange.
     pub fn open_session(&self, cx: &Cx) -> Result<ServerHttpSession, DualEraHttpEndpointError> {
         self.open_session_with_legacy_origin(cx, &self.legacy_origin)
+    }
+
+    /// Makes every endpoint-owned modern continuation terminal.
+    ///
+    /// A response-body close deliberately does not call this: only endpoint
+    /// shutdown may revoke state that a later stateless POST can resume.
+    fn disconnect_modern_continuations(&self) {
+        self.modern_connection.disconnect();
     }
 
     fn transport_endpoint(
@@ -4656,7 +4698,7 @@ impl ServerHttpEndpoint {
             legacy_admissions: Arc::new(HttpLegacyRequestAdmissions::default()),
             legacy_pending_requests,
             legacy_runtime,
-            modern_connection: Arc::new(ModernConnection::new()),
+            modern_connection: Arc::clone(&self.modern_connection),
             modern_dispatches: Arc::new(Mutex::new(Vec::new())),
             closed: false,
         })
@@ -4672,6 +4714,12 @@ impl ServerHttpEndpoint {
             .and_then(legacy_origin_from_host)
             .unwrap_or_else(|| self.legacy_origin.clone());
         self.open_session_with_legacy_origin(cx, &legacy_origin)
+    }
+}
+
+impl Drop for ServerHttpEndpoint {
+    fn drop(&mut self) {
+        self.disconnect_modern_continuations();
     }
 }
 
@@ -19631,6 +19679,127 @@ mod lib_unit_tests {
         }
     }
 
+    async fn run_live_http_mrtr_retry(
+        cx: &Cx,
+        request_state_suffix: &str,
+    ) -> Result<(JsonRpcResponse, JsonRpcResponse, usize), String> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bound = Server::new("live-http-mrtr-retry", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .tool(LiveHttpMrtrTool {
+                calls: Arc::clone(&calls),
+            })
+            .build()
+            .bind_http(cx, "127.0.0.1:0")
+            .await
+            .map_err(|error| format!("live HTTP MRTR retry bind failed: {error}"))?;
+        let address = bound
+            .local_addr()
+            .map_err(|error| format!("live HTTP MRTR retry address failed: {error}"))?;
+        let request_state_suffix = request_state_suffix.to_owned();
+        let caller_cx = cx.clone();
+        let mut client = cx
+            .spawn(move |_client_cx| async move {
+                let result = async {
+                    let initial = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_http_mrtr",
+                            "arguments": {},
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                                "progressToken": "live-http-mrtr-sse",
+                            },
+                        })),
+                        922_i64,
+                    );
+                    let initial_body = serde_json::to_vec(&initial).map_err(|error| {
+                        format!("MRTR initial request did not serialize: {error}")
+                    })?;
+                    let initial = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/mcp",
+                            &initial_body,
+                            &[
+                                ("Accept", "text/event-stream"),
+                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                ("Mcp-Method", "tools/call"),
+                            ],
+                        ),
+                    )
+                    .await?;
+                    let initial = live_http_sse_jsonrpc_response(&initial)?;
+                    let request_state = initial
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("requestState"))
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            "MRTR input-required response omitted requestState".to_owned()
+                        })?;
+                    let roots = serde_json::to_value(
+                        bidirectional::MrtrInputResponse::roots(
+                            fastmcp_protocol::ListRootsResult::empty(),
+                        )
+                        .map_err(|error| format!("MRTR roots response failed: {error}"))?,
+                    )
+                    .map_err(|error| format!("MRTR roots response did not serialize: {error}"))?;
+                    let retry = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_http_mrtr",
+                            "arguments": {},
+                            "inputResponses": {"roots": roots},
+                            "requestState": format!("{request_state}{request_state_suffix}"),
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                                "progressToken": "live-http-mrtr-sse",
+                            },
+                        })),
+                        923_i64,
+                    );
+                    let retry_body = serde_json::to_vec(&retry)
+                        .map_err(|error| format!("MRTR retry request did not serialize: {error}"))?;
+                    let retry = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/mcp",
+                            &retry_body,
+                            &[
+                                ("Accept", "application/json"),
+                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                ("Mcp-Method", "tools/call"),
+                            ],
+                        ),
+                    )
+                    .await?;
+                    let retry = serde_json::from_slice(live_http_response_body(&retry)?)
+                        .map_err(|error| {
+                            format!("MRTR retry response was not valid JSON-RPC: {error}")
+                        })?;
+                    Ok::<_, String>((initial, retry))
+                }
+                .await;
+                caller_cx.cancel_with(
+                    CancelKind::User,
+                    Some("live HTTP cross-POST MRTR retry complete"),
+                );
+                result
+            })
+            .map_err(|error| format!("live HTTP MRTR retry client admission failed: {error}"))?;
+
+        let serve = bound.serve(cx).await;
+        let (initial, retry) = client
+            .join(cx)
+            .await
+            .map_err(|error| format!("live HTTP MRTR retry client failed: {error:?}"))??;
+        serve.map_err(|error| format!("live HTTP MRTR retry server failed: {error}"))?;
+        Ok((initial, retry, calls.load(Ordering::Acquire)))
+    }
+
     struct LiveLegacyCompletionHandler;
 
     impl CompletionHandler for LiveLegacyCompletionHandler {
@@ -22844,6 +23013,66 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn live_http_mrtr_continues_across_separate_stateless_posts() {
+        run_live_http_test(|cx| async move {
+            let (initial, retry, calls) = run_live_http_mrtr_retry(&cx, "").await?;
+            if initial.id != Some(922_i64.into())
+                || initial.error.is_some()
+                || initial
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType"))
+                    != Some(&serde_json::json!("input_required"))
+            {
+                return Err(format!(
+                    "initial stateless MRTR POST did not yield input_required: {initial:?}"
+                ));
+            }
+            if retry.id != Some(923_i64.into())
+                || retry.error.is_some()
+                || retry
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType"))
+                    != Some(&serde_json::json!("complete"))
+                || calls != 2
+            {
+                return Err(format!(
+                    "issued requestState did not resume across a separate stateless POST (retry={retry:?}, calls={calls})"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_mrtr_rejects_only_foreign_state_across_separate_stateless_posts() {
+        run_live_http_test(|cx| async move {
+            // This is the identical cross-POST retry flow above, with only
+            // the server-issued requestState changed before the retry.
+            let (initial, retry, calls) = run_live_http_mrtr_retry(&cx, "-foreign").await?;
+            if initial.id != Some(922_i64.into())
+                || initial.error.is_some()
+                || initial
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType"))
+                    != Some(&serde_json::json!("input_required"))
+            {
+                return Err(format!(
+                    "foreign-state test initial POST did not yield input_required: {initial:?}"
+                ));
+            }
+            if retry.id != Some(923_i64.into()) || retry.error.is_none() || calls != 1 {
+                return Err(format!(
+                    "changing only requestState resumed or reentered the handler (retry={retry:?}, calls={calls})"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
     fn live_http_modern_sse_rejects_only_session_id_before_handler() {
         run_live_http_test(|cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
@@ -23366,7 +23595,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_shutdown_invalidates_session_before_flushing_live_sse_terminal() {
+    fn live_http_shutdown_owns_registered_sse_body_before_flushing_terminal() {
         run_live_http_test(|cx| async move {
             let bound = Server::new("live-http-listen-half-close", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
@@ -23379,6 +23608,7 @@ mod lib_unit_tests {
                 .map_err(|error| format!("subscription half-close address failed: {error}"))?;
             let server = Arc::clone(&bound.endpoint.server);
             let remaining_modern_sessions = Arc::clone(&bound.modern_sessions);
+            let owned_modern_sessions = Arc::clone(&remaining_modern_sessions);
             let caller_cx = cx.clone();
             let controller = thread::spawn(move || -> Result<(), String> {
                 struct CancelServerOnDrop(Cx);
@@ -23453,6 +23683,18 @@ mod lib_unit_tests {
                             .to_owned(),
                     );
                 }
+                if owned_modern_sessions
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+                    != 1
+                {
+                    return Err(
+                        "live SSE response body was not registered for listener shutdown"
+                            .to_owned(),
+                    );
+                }
                 shutdown_cx.cancel_with(
                     CancelKind::User,
                     Some("subscription graceful shutdown requested"),
@@ -23488,6 +23730,14 @@ mod lib_unit_tests {
                 .is_empty()
             {
                 return Err("listener shutdown retained a live SSE session".to_owned());
+            }
+            if !remaining_modern_sessions
+                .retired_dispatches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                return Err("listener shutdown detached a live SSE dispatch".to_owned());
             }
             Ok(())
         });
