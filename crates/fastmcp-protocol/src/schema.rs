@@ -165,6 +165,51 @@ impl AdmittedSchema {
     }
 }
 
+/// A final form elicitation schema that passed both shared Draft 2020-12
+/// admission and the form surface's flat primitive-field restrictions.
+///
+/// This is intentionally distinct from [`AdmittedSchema`]: the general
+/// final-schema service permits composed and nested schemas that a client form
+/// renderer must never be asked to interpret.
+#[derive(Debug, Clone)]
+pub struct AdmittedFinalFormSchema {
+    schema: AdmittedSchema,
+}
+
+impl AdmittedFinalFormSchema {
+    /// Returns the admitted form schema without altering its wire form.
+    #[must_use]
+    pub const fn schema(&self) -> &Value {
+        self.schema.schema()
+    }
+}
+
+impl serde::Serialize for AdmittedFinalFormSchema {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde::Serialize::serialize(self.schema(), serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AdmittedFinalFormSchema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::admit(<Value as serde::Deserialize>::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl AdmittedFinalFormSchema {
+    /// Admits one final form schema from an already-decoded wire value.
+    pub fn admit(schema: Value) -> Result<Self, SchemaAdmissionError> {
+        admit_final_form_schema(schema)
+    }
+}
+
 /// A final core result discriminator admitted by this protocol surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalCoreResultType {
@@ -199,6 +244,153 @@ pub fn admit_final_schema(schema: Value) -> Result<AdmittedSchema, SchemaAdmissi
     validate_unique_local_anchors(&schema, "$", 0, &mut HashSet::new())?;
     validate_unique_local_resource_ids(&schema, "$", 0, None, &mut HashSet::new())?;
     Ok(AdmittedSchema { schema })
+}
+
+/// Admits a final form elicitation schema before a client or server interprets
+/// it as a form contract.
+///
+/// The shared service performs bounded Draft 2020-12 admission first. The
+/// form layer then requires an object root with only flat, primitive-typed
+/// fields; nested schemas and structural applicators are not renderable form
+/// controls and are refused.
+pub fn admit_final_form_schema(
+    schema: Value,
+) -> Result<AdmittedFinalFormSchema, SchemaAdmissionError> {
+    let schema = admit_final_schema(schema)?;
+    validate_final_form_schema(schema.schema())?;
+    Ok(AdmittedFinalFormSchema { schema })
+}
+
+fn validate_final_form_schema(schema: &Value) -> Result<(), SchemaAdmissionError> {
+    let root = schema
+        .as_object()
+        .ok_or_else(|| SchemaAdmissionError::new("$", "final form schema must be an object"))?;
+    if root.get("type").and_then(Value::as_str) != Some("object") {
+        return Err(SchemaAdmissionError::new(
+            "$.type",
+            "final form schema type must be object",
+        ));
+    }
+    for keyword in [
+        "$ref",
+        "$dynamicRef",
+        "$defs",
+        "items",
+        "prefixItems",
+        "contains",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "patternProperties",
+        "propertyNames",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "contentSchema",
+    ] {
+        if root.contains_key(keyword) {
+            return Err(SchemaAdmissionError::new(
+                format!("$.{keyword}"),
+                "final form schema cannot contain nested or composed schemas",
+            ));
+        }
+    }
+    let properties = root.get("properties").map_or(Ok(None), |value| {
+        value.as_object().map(Some).ok_or_else(|| {
+            SchemaAdmissionError::new("$.properties", "final form properties must be an object")
+        })
+    })?;
+    if root
+        .get("additionalProperties")
+        .is_some_and(|value| value != &Value::Bool(false))
+    {
+        return Err(SchemaAdmissionError::new(
+            "$.additionalProperties",
+            "final form additionalProperties must be false when present",
+        ));
+    }
+    if let Some(required) = root.get("required") {
+        let Some(required) = required.as_array() else {
+            return Err(SchemaAdmissionError::new(
+                "$.required",
+                "final form required must be an array",
+            ));
+        };
+        for (index, name) in required.iter().enumerate() {
+            let Some(name) = name.as_str() else {
+                return Err(SchemaAdmissionError::new(
+                    format!("$.required[{index}]"),
+                    "final form required entries must be property names",
+                ));
+            };
+            if !properties.is_some_and(|properties| properties.contains_key(name)) {
+                return Err(SchemaAdmissionError::new(
+                    format!("$.required[{index}]"),
+                    "final form required entries must name declared properties",
+                ));
+            }
+        }
+    }
+    let Some(properties) = properties else {
+        return Ok(());
+    };
+    for (name, property) in properties {
+        validate_final_form_property_schema(name, property)?;
+    }
+    Ok(())
+}
+
+fn validate_final_form_property_schema(
+    name: &str,
+    property: &Value,
+) -> Result<(), SchemaAdmissionError> {
+    let path = format!("$.properties.{name}");
+    let property = property.as_object().ok_or_else(|| {
+        SchemaAdmissionError::new(&path, "final form property schema must be an object")
+    })?;
+    match property.get("type").and_then(Value::as_str) {
+        Some("string" | "number" | "integer" | "boolean") => {}
+        _ => {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.type"),
+                "final form property type must be a primitive",
+            ));
+        }
+    }
+    for keyword in [
+        "$ref",
+        "$dynamicRef",
+        "$defs",
+        "properties",
+        "items",
+        "prefixItems",
+        "contains",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "patternProperties",
+        "propertyNames",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "contentSchema",
+    ] {
+        if property.contains_key(keyword) {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "final form property cannot contain nested or composed schemas",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validates a final core result against an admitted schema and its expected

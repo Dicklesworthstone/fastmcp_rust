@@ -1870,12 +1870,30 @@ impl FinalEmbeddedRootsListParams {
 }
 
 /// Exact final parameters for an embedded elicitation descriptor.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub enum FinalEmbeddedElicitationParams {
     /// In-band form elicitation.
     Form(FinalEmbeddedFormElicitationParams),
     /// External URL elicitation.
     Url(FinalEmbeddedUrlElicitationParams),
+}
+
+impl Serialize for FinalEmbeddedElicitationParams {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Form(params) if params.mode == ElicitMode::Form => params.serialize(serializer),
+            Self::Url(params) if params.mode == ElicitMode::Url => params.serialize(serializer),
+            Self::Form(_) => Err(serde::ser::Error::custom(
+                "form elicitation descriptor must use mode form",
+            )),
+            Self::Url(_) => Err(serde::ser::Error::custom(
+                "URL elicitation descriptor must use mode url",
+            )),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for FinalEmbeddedElicitationParams {
@@ -1911,7 +1929,7 @@ pub struct FinalEmbeddedFormElicitationParams {
     pub message: String,
     /// Requested form schema.
     #[serde(rename = "requestedSchema")]
-    pub requested_schema: ElicitRequestedSchema,
+    pub requested_schema: crate::schema::AdmittedFinalFormSchema,
 }
 
 /// URL elicitation request parameters without legacy elicitation identity.
@@ -9915,6 +9933,112 @@ mod tests {
         let url = ElicitRequestParams::url("Auth required", "https://example.com", "id-1");
         assert_eq!(url.mode(), ElicitMode::Url);
         assert_eq!(url.message(), "Auth required");
+    }
+
+    #[test]
+    fn final_embedded_form_elicitation_admits_a_flat_draft_2020_12_schema() {
+        let request: FinalEmbeddedInputRequest = serde_json::from_value(serde_json::json!({
+            "method": "elicitation/create",
+            "params": {
+                "mode": "form",
+                "message": "Choose a display name",
+                "requestedSchema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "displayName": {"type": "string", "minLength": 1}
+                    },
+                    "required": ["displayName"]
+                }
+            }
+        }))
+        .expect("a flat final form schema is admitted before descriptor interpretation");
+
+        let FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Form(form)) =
+            request
+        else {
+            panic!("fixture must decode as a final form elicitation descriptor");
+        };
+        assert_eq!(
+            form.requested_schema.schema()["properties"]["displayName"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn final_embedded_form_elicitation_rejects_only_a_nested_property_type() {
+        let mut fixture = serde_json::json!({
+            "method": "elicitation/create",
+            "params": {
+                "mode": "form",
+                "message": "Choose a display name",
+                "requestedSchema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "displayName": {"type": "string", "minLength": 1}
+                    },
+                    "required": ["displayName"]
+                }
+            }
+        });
+        fixture["params"]["requestedSchema"]["properties"]["displayName"]["type"] =
+            serde_json::json!("object");
+
+        assert!(serde_json::from_value::<FinalEmbeddedInputRequest>(fixture).is_err());
+    }
+
+    #[test]
+    fn final_embedded_elicitation_variants_round_trip_their_exact_flat_wire() {
+        for wire in [
+            r#"{"method":"elicitation/create","params":{"message":"Choose a display name","mode":"form","requestedSchema":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"displayName":{"minLength":1,"type":"string"}},"required":["displayName"],"type":"object"}}}"#,
+            r#"{"method":"elicitation/create","params":{"message":"Authorize access","mode":"url","url":"https://example.com/authorize"}}"#,
+        ] {
+            let request: FinalEmbeddedInputRequest = serde_json::from_str(wire)
+                .expect("a flat final elicitation descriptor is admitted");
+            assert_eq!(
+                serde_json::to_vec(&request).expect("admitted descriptor re-encodes"),
+                wire.as_bytes(),
+                "the final elicitation encoder must retain the flat mode-selected wire shape"
+            );
+        }
+    }
+
+    #[test]
+    fn final_embedded_url_elicitation_rejects_the_legacy_identity_field() {
+        assert!(
+            serde_json::from_value::<FinalEmbeddedInputRequest>(serde_json::json!({
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "url",
+                    "message": "Authorize access",
+                    "url": "https://example.com/authorize",
+                    "elicitationId": "exact-2024-only",
+                }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn final_embedded_elicitation_rejects_only_the_externally_tagged_shape() {
+        let mut fixture = serde_json::json!({
+            "method": "elicitation/create",
+            "params": {
+                "mode": "form",
+                "message": "Choose a display name",
+                "requestedSchema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {"displayName": {"type": "string"}},
+                    "required": ["displayName"]
+                }
+            }
+        });
+        let params = fixture["params"].take();
+        fixture["params"] = serde_json::json!({"Form": params});
+
+        assert!(serde_json::from_value::<FinalEmbeddedInputRequest>(fixture).is_err());
     }
 
     #[test]

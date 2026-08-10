@@ -116,8 +116,9 @@ pub use protocol_version::{
 };
 pub use result::*;
 pub use schema::{
-    AdmittedSchema, FinalCoreResultType, SchemaAdmissionError, ValidationError, ValidationResult,
-    admit_final_schema, validate, validate_final_core_result, validate_strict,
+    AdmittedFinalFormSchema, AdmittedSchema, FinalCoreResultType, SchemaAdmissionError,
+    ValidationError, ValidationResult, admit_final_form_schema, admit_final_schema, validate,
+    validate_final_core_result, validate_strict,
 };
 pub use server_discovery::{
     DiscoveryCacheHints, MAX_SERVER_INSTRUCTIONS_BYTES, SERVER_DISCOVER_METHOD,
