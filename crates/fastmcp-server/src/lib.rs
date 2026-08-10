@@ -144,9 +144,9 @@ use std::time::{Duration, Instant};
 use fastmcp_transport::http::{
     DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
     DualEraHttpEndpointResponse, DualEraHttpLegacySseResponse, DualEraHttpSession,
-    DualEraHttpSseResponse, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
-    HttpResponse, HttpStatus, HttpTransport, StreamableHttpRequestCancellation,
-    StreamableHttpRequestResponseSender,
+    DualEraHttpSseResponse, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest,
+    HttpRequestHandler, HttpResponse, HttpStatus, HttpTransport,
+    StreamableHttpRequestCancellation, StreamableHttpRequestResponseSender,
 };
 use fastmcp_transport::sse::SseEvent;
 
@@ -4970,6 +4970,11 @@ async fn send_modern_sse_stream(
                 Ok(None) => {
                     asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
+                Err(DualEraHttpEndpointError::Transport(TransportError::Closed))
+                    if response.is_finished() =>
+                {
+                    break;
+                }
                 Err(_) => return Err(()),
             }
         }
@@ -5047,6 +5052,58 @@ fn admit_live_http_legacy_request(
         .map_err(|()| HttpResponse::bad_request())
 }
 
+fn protocol_admission_error_response(
+    request: &HttpRequest,
+    admission: fastmcp_protocol::RequestAdmissionError,
+    max_body_size: usize,
+) -> HttpResponse {
+    // `ProtocolAdmission` is returned only after the transport's strict,
+    // bounded JSON-RPC request decode has succeeded. Re-decode with the same
+    // configured bound so the error response retains the admitted request ID
+    // without widening the listener's parsing surface.
+    let mut codec = Codec::new();
+    codec.set_max_message_size(max_body_size);
+    let id = codec
+        .decode_complete_message(&request.body)
+        .ok()
+        .and_then(|message| match message {
+            JsonRpcMessage::Request(request) => request.id,
+            JsonRpcMessage::Response(_) => None,
+        });
+    let (message, data) = match &admission {
+        fastmcp_protocol::RequestAdmissionError::HeaderMismatch(error) => (
+            "MCP request headers do not match the JSON-RPC request",
+            error.canonical_error_data(),
+        ),
+        fastmcp_protocol::RequestAdmissionError::UnsupportedProtocolVersion(error) => (
+            "Unsupported MCP protocol version",
+            Some(error.canonical_error_data()),
+        ),
+    };
+    let response = JsonRpcResponse::error(
+        id,
+        JsonRpcError {
+            code: admission.jsonrpc_error_code(),
+            message: message.to_owned(),
+            data,
+        },
+    );
+    HttpResponse::new(HttpStatus(admission.http_status())).with_json(&response)
+}
+
+fn http_endpoint_error_response(
+    request: &HttpRequest,
+    error: DualEraHttpEndpointError,
+    max_body_size: usize,
+) -> HttpResponse {
+    match error {
+        DualEraHttpEndpointError::Http(HttpError::ProtocolAdmission(admission)) => {
+            protocol_admission_error_response(request, admission, max_body_size)
+        }
+        _ => HttpResponse::bad_request(),
+    }
+}
+
 fn dispatch_http_request(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
@@ -5102,10 +5159,17 @@ fn dispatch_http_request(
         Ok(session) => session,
         Err(_) => return HttpResponse::internal_error(),
     };
+    let error_request = request.clone();
     session
         .handle(cx, request)
         .map(|response| http_endpoint_response_to_static(cx, response))
-        .unwrap_or_else(|_| HttpResponse::bad_request())
+        .unwrap_or_else(|error| {
+            http_endpoint_error_response(
+                &error_request,
+                error,
+                endpoint.server.http_config.handler_config.max_body_size,
+            )
+        })
 }
 
 async fn serve_http_connection(
@@ -5156,7 +5220,7 @@ async fn serve_http_connection(
                 return;
             }
         };
-        let response = session.begin_modern_sse(cx, request);
+        let response = session.begin_modern_sse(cx, request.clone());
         match response {
             Ok(Ok((request, response))) => {
                 let stream = framed.into_inner();
@@ -5181,8 +5245,13 @@ async fn serve_http_connection(
                 .await;
                 return;
             }
-            Err(_) => {
-                let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
+            Err(error) => {
+                let _ = send_h1_response(
+                    cx,
+                    &mut framed,
+                    http_endpoint_error_response(&request, error, http_config.max_body_size),
+                )
+                .await;
                 return;
             }
         }
@@ -21068,6 +21137,7 @@ mod lib_unit_tests {
             Some(serde_json::json!({
                 "_meta": {
                     MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                 },
             })),
             220_i64,
@@ -21138,6 +21208,7 @@ mod lib_unit_tests {
                 Some(serde_json::json!({
                     "_meta": {
                         MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                     },
                 })),
                 801_i64,
@@ -21199,6 +21270,112 @@ mod lib_unit_tests {
             {
                 return Err(format!(
                     "modern loopback discovery result was unexpected: {response:?}"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_protocol_admission_preserves_jsonrpc_when_only_version_header_differs() {
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("live-http-protocol-admission", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("protocol-admission HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("protocol-admission HTTP address failed: {error}"))?;
+            let request = JsonRpcRequest::new(
+                SERVER_DISCOVER_METHOD,
+                Some(serde_json::json!({
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                814_i64,
+            );
+            let body = serde_json::to_vec(&request)
+                .map_err(|error| format!("protocol-admission request did not serialize: {error}"))?;
+            let accepted = live_http_post(
+                "/mcp",
+                &body,
+                &[
+                    ("Accept", "application/json"),
+                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                    ("Mcp-Method", SERVER_DISCOVER_METHOD),
+                ],
+            );
+            // This has the same JSON-RPC body and all the same HTTP headers
+            // except the final protocol-version mirror.
+            let rejected = live_http_post(
+                "/mcp",
+                &body,
+                &[
+                    ("Accept", "application/json"),
+                    ("MCP-Protocol-Version", "2025-11-25"),
+                    ("Mcp-Method", SERVER_DISCOVER_METHOD),
+                ],
+            );
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let result = async {
+                        let accepted = live_http_exchange(address, accepted).await?;
+                        let rejected = live_http_exchange(address, rejected).await?;
+                        Ok::<_, String>((accepted, rejected))
+                    }
+                    .await;
+                    caller_cx.cancel_with(
+                        CancelKind::User,
+                        Some("protocol-admission loopback complete"),
+                    );
+                    result
+                })
+                .map_err(|error| format!("protocol-admission client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let (accepted, rejected) = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("protocol-admission client failed: {error:?}"))??;
+            serve.map_err(|error| format!("protocol-admission server failed: {error}"))?;
+
+            if !accepted.starts_with(b"HTTP/1.1 200") {
+                return Err(format!(
+                    "matching final protocol-version request was not accepted: {accepted:?}"
+                ));
+            }
+            let accepted: JsonRpcResponse =
+                serde_json::from_slice(live_http_response_body(&accepted)?).map_err(|error| {
+                    format!("accepted protocol-admission response was invalid: {error}")
+                })?;
+            if accepted.id != Some(814_i64.into()) || accepted.error.is_some() {
+                return Err(format!(
+                    "matching final protocol-version request did not dispatch: {accepted:?}"
+                ));
+            }
+
+            if !rejected.starts_with(b"HTTP/1.1 400") {
+                return Err(format!(
+                    "mismatched final protocol-version request did not return HTTP 400: {rejected:?}"
+                ));
+            }
+            let rejected: JsonRpcResponse =
+                serde_json::from_slice(live_http_response_body(&rejected)?).map_err(|error| {
+                    format!("rejected protocol-admission response was invalid: {error}")
+                })?;
+            if rejected.id != Some(814_i64.into())
+                || rejected.result.is_some()
+                || rejected.error.as_ref().map(|error| error.code)
+                    != Some(fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE)
+                || rejected.error.as_ref().and_then(|error| error.data.as_ref()).is_some()
+            {
+                return Err(format!(
+                    "mismatched final protocol-version request did not retain its canonical JSON-RPC error: {rejected:?}"
                 ));
             }
             Ok(())
@@ -21314,6 +21491,12 @@ mod lib_unit_tests {
             }
             if response.match_indices("data: ").count() < 3 {
                 return Err("live modern SSE response collapsed request-scoped frames".to_owned());
+            }
+            if !response.ends_with("0\r\n\r\n") {
+                return Err(
+                    "live modern SSE response omitted the terminating chunk after its final response"
+                        .to_owned(),
+                );
             }
             if calls.load(Ordering::Acquire) != 1 {
                 return Err("live modern SSE handler did not execute exactly once".to_owned());
@@ -21956,6 +22139,7 @@ mod lib_unit_tests {
                     Some(serde_json::json!({
                         "_meta": {
                             MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                         },
                     })),
                     891_i64,
