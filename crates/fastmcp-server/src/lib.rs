@@ -27891,6 +27891,151 @@ mod lib_unit_tests {
         );
     }
 
+    async fn live_http_modern_json_peer_close_probe(
+        cx: &Cx,
+        close_originating_peer: bool,
+    ) -> Result<(), String> {
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let observed_cancellation = Arc::new(AtomicBool::new(false));
+        let bound = Server::new("live-http-modern-json-peer-close", "1.0.0")
+            .tool(LiveModernHttpPeerCancellationTool {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+                observed_cancellation: Arc::clone(&observed_cancellation),
+            })
+            .build()
+            .bind_http(cx, "127.0.0.1:0")
+            .await
+            .map_err(|error| format!("modern JSON peer-close HTTP bind failed: {error}"))?;
+        let address = bound
+            .local_addr()
+            .map_err(|error| format!("modern JSON peer-close HTTP address failed: {error}"))?;
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "live_modern_http_peer_cancellation_tool",
+                "arguments": {},
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            2_401_i64,
+        );
+        let body = serde_json::to_vec(&request)
+            .map_err(|error| format!("modern JSON peer-close request did not serialize: {error}"))?;
+        let request = live_http_post(
+            "/mcp",
+            &body,
+            &[
+                ("Accept", "application/json"),
+                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                ("Mcp-Method", "tools/call"),
+                ("Mcp-Name", "live_modern_http_peer_cancellation_tool"),
+            ],
+        );
+        let caller_cx = cx.clone();
+        let started_by_client = Arc::clone(&started);
+        let release_by_client = Arc::clone(&release);
+        let observed_by_client = Arc::clone(&observed_cancellation);
+        let mut client = cx
+            .spawn(move |client_cx| async move {
+                let deadline = client_cx
+                    .now()
+                    .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                let mut stream = asupersync::time::timeout_at(
+                    deadline,
+                    AsyncTcpStream::connect(address),
+                )
+                .await
+                .map_err(|_| live_http_test_timeout("modern JSON peer-close connection"))?
+                .map_err(|error| format!("modern JSON peer-close connect failed: {error}"))?;
+                asupersync::time::timeout_at(deadline, stream.write_all(&request))
+                    .await
+                    .map_err(|_| live_http_test_timeout("modern JSON peer-close request write"))?
+                    .map_err(|error| format!("modern JSON peer-close write failed: {error}"))?;
+                asupersync::time::timeout_at(deadline, stream.flush())
+                    .await
+                    .map_err(|_| live_http_test_timeout("modern JSON peer-close request flush"))?
+                    .map_err(|error| format!("modern JSON peer-close flush failed: {error}"))?;
+                wait_for_live_http_flag(
+                    &client_cx,
+                    &started_by_client,
+                    "modern JSON peer-close handler start",
+                )
+                .await?;
+
+                if close_originating_peer {
+                    drop(stream);
+                    wait_for_live_http_flag(
+                        &client_cx,
+                        &observed_by_client,
+                        "modern JSON originating peer close cancellation",
+                    )
+                    .await?;
+                } else {
+                    release_by_client.store(true, Ordering::Release);
+                    let mut response = Vec::new();
+                    read_live_http_to_end(
+                        &mut stream,
+                        &mut response,
+                        "modern JSON peer-close positive response EOF",
+                    )
+                    .await?;
+                    if !response.starts_with(b"HTTP/1.1 200") {
+                        return Err(format!(
+                            "modern JSON peer-close positive response was unexpected: {response:?}"
+                        ));
+                    }
+                    if observed_by_client.load(Ordering::Acquire) {
+                        return Err(
+                            "a connected modern JSON peer cancelled its handler".to_owned(),
+                        );
+                    }
+                }
+
+                caller_cx.cancel_with(
+                    CancelKind::User,
+                    Some("modern JSON peer-close probe complete"),
+                );
+                Ok::<_, String>(())
+            })
+            .map_err(|error| format!("modern JSON peer-close client was not admitted: {error}"))?;
+
+        let serve = bound.serve(cx).await;
+        client
+            .join(cx)
+            .await
+            .map_err(|error| format!("modern JSON peer-close client failed: {error:?}"))??;
+        let shutdown = serve.map_err(|error| format!("modern JSON peer-close server failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "modern JSON peer-close").await?;
+        if close_originating_peer {
+            if !observed_cancellation.load(Ordering::Acquire) {
+                return Err("originating modern JSON peer close did not cancel its handler".to_owned());
+            }
+        } else if observed_cancellation.load(Ordering::Acquire) {
+            return Err("connected modern JSON peer unexpectedly cancelled its handler".to_owned());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn live_http_modern_json_connected_peer_keeps_handler_live() {
+        run_live_http_test(|cx| async move {
+            live_http_modern_json_peer_close_probe(&cx, false).await
+        });
+    }
+
+    #[test]
+    fn live_http_modern_json_originating_peer_close_cancels_handler() {
+        // This differs from the positive probe only by closing the originating
+        // socket after the handler starts.
+        run_live_http_test(|cx| async move {
+            live_http_modern_json_peer_close_probe(&cx, true).await
+        });
+    }
+
     #[test]
     fn live_http_connection_limit_hard_closes_idle_overflow_peers() {
         run_live_http_test(|cx| async move {
