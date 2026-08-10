@@ -335,7 +335,11 @@ impl TestClient {
 
         if let Some(error) = response.error {
             return Err(McpError::new(
-                fastmcp_core::McpErrorCode::from(error.code),
+                error
+                    .code
+                    .as_i32()
+                    .map(fastmcp_core::McpErrorCode::from)
+                    .unwrap_or(fastmcp_core::McpErrorCode::InternalError),
                 error.message,
             ));
         }
@@ -390,7 +394,11 @@ impl TestClient {
 
         if let Some(error) = response.error {
             return Err(McpError::new(
-                fastmcp_core::McpErrorCode::from(error.code),
+                error
+                    .code
+                    .as_i32()
+                    .map(fastmcp_core::McpErrorCode::from)
+                    .unwrap_or(fastmcp_core::McpErrorCode::InternalError),
                 error.message,
             ));
         }
@@ -437,7 +445,11 @@ impl TestClient {
 
         if let Some(error) = response.error {
             return Err(McpError::new(
-                fastmcp_core::McpErrorCode::from(error.code),
+                error
+                    .code
+                    .as_i32()
+                    .map(fastmcp_core::McpErrorCode::from)
+                    .unwrap_or(fastmcp_core::McpErrorCode::InternalError),
                 error.message,
             ));
         }

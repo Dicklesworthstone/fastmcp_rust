@@ -24,7 +24,7 @@
 use fastmcp_rust::asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
 use fastmcp_rust::serde_json::json;
 use fastmcp_rust::{
-    ApplicationTaskSupervisor, CacheScope, CompleteResult, Content, ContentBlock, Cx,
+    ApplicationTaskSupervisor, CacheScope, CacheTtl, CompleteResult, Content, ContentBlock, Cx,
     EmbeddedResourceContents, FinalAbsoluteUri, FinalCallToolResult, FinalGetPromptResult,
     FinalPromptMessage, FinalReadResourceResult, FinalTaskRuntime, FinalTaskRuntimeConfig,
     FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
@@ -1805,7 +1805,7 @@ fn final_resource_payload(text: &str) -> CompleteResult<FinalReadResourceResult>
                 meta: None,
                 additional: BTreeMap::new(),
             }],
-            ttl_ms: 0,
+            ttl_ms: CacheTtl::milliseconds(0),
             cache_scope: CacheScope::Private,
         },
         final_result_meta(),

@@ -97,9 +97,12 @@ pub fn assert_json_rpc_success(response: &JsonRpcResponse) {
 ///     Some(RequestId::Number(1)),
 ///     McpError::method_not_found("unknown").into(),
 /// );
-/// assert_json_rpc_error(&response, Some(-32601));
+/// assert_json_rpc_error(&response, Some((-32601).into()));
 /// ```
-pub fn assert_json_rpc_error(response: &JsonRpcResponse, expected_code: Option<i32>) {
+pub fn assert_json_rpc_error(
+    response: &JsonRpcResponse,
+    expected_code: Option<fastmcp_protocol::JsonInteger>,
+) {
     assert!(
         response.error.is_some(),
         "Expected error response but got success"
@@ -110,7 +113,7 @@ pub fn assert_json_rpc_error(response: &JsonRpcResponse, expected_code: Option<i
     );
 
     if let Some(expected) = expected_code {
-        let actual = response.error.as_ref().unwrap().code;
+        let actual = response.error.as_ref().unwrap().code.clone();
         assert_eq!(
             actual, expected,
             "Expected error code {expected} but got {actual}"
@@ -361,7 +364,7 @@ mod tests {
     #[test]
     fn test_valid_error_response() {
         let error = fastmcp_protocol::JsonRpcError {
-            code: -32601,
+            code: (-32601).into(),
             message: "Method not found".to_string(),
             data: None,
         };
@@ -372,7 +375,7 @@ mod tests {
             error: Some(error),
         };
         assert_json_rpc_valid(&JsonRpcMessage::Response(response.clone()));
-        assert_json_rpc_error(&response, Some(-32601));
+        assert_json_rpc_error(&response, Some((-32601).into()));
     }
 
     #[test]
@@ -460,7 +463,7 @@ mod tests {
     #[test]
     fn error_response_without_expected_code() {
         let error = fastmcp_protocol::JsonRpcError {
-            code: -32600,
+            code: (-32600).into(),
             message: "Invalid request".to_string(),
             data: None,
         };
@@ -527,7 +530,7 @@ mod tests {
     #[test]
     fn mcp_compliant_error_response_early_return() {
         let error = fastmcp_protocol::JsonRpcError {
-            code: -32601,
+            code: (-32601).into(),
             message: "Method not found".to_string(),
             data: None,
         };

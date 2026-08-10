@@ -222,9 +222,10 @@ pub use fastmcp_protocol::{
     MAX_URI_TEMPLATE_BYTES, MAX_URI_TEMPLATE_COMPOSITE_ITEMS,
     MAX_URI_TEMPLATE_EXPANSION_OUTPUT_BYTES, MAX_URI_TEMPLATE_EXPRESSIONS, MAX_URI_TEMPLATE_PARTS,
     MAX_URI_TEMPLATE_PREFIX_LENGTH, MAX_URI_TEMPLATE_VALUE_BYTES,
-    MAX_URI_TEMPLATE_VARIABLE_NAME_BYTES, MAX_URI_TEMPLATE_VARIABLES_PER_EXPRESSION, TemplateValue,
-    TemplateValues, UriTemplate, UriTemplateError, UriTemplateExpansionLimits,
-    UriTemplateExpression, UriTemplateModifier, UriTemplateOperator, UriTemplatePart,
+    MAX_URI_TEMPLATE_VARIABLE_NAME_BYTES, MAX_URI_TEMPLATE_VARIABLES_PER_EXPRESSION,
+    ReversibleResourceTemplate, TemplateValue, TemplateValues, UriTemplate, UriTemplateError,
+    UriTemplateExpansionLimits, UriTemplateExpression, UriTemplateModifier, UriTemplateOperator,
+    UriTemplatePart,
 };
 pub use fastmcp_protocol::{common_types, extensions, methods, protocol_policy};
 // Final common wire vocabulary. `FinalAbsoluteUri` avoids colliding with the
@@ -245,12 +246,13 @@ pub use fastmcp_protocol::common_types::{
 // Final typed core dispatch, result vocabulary, and bounded exact-JSON helpers.
 pub use fastmcp_protocol::methods::Final2026Peer;
 pub use fastmcp_protocol::{
-    CacheScope, CacheTtl, CacheableResult, CancellationSender, CancellationWireCodecError,
-    CancellationWireMessage, ClientNotification, CompleteResult, CompleteResultPayload,
-    CoreDispatchError, CoreRequest, CoreResult, CoreResultDiscriminatorPolicy, DecodedResult,
-    ExactJsonMember, ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
-    FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY,
-    FinalArguments, FinalCallToolParams, FinalCallToolResult, FinalCancelledNotificationParams,
+    CacheScope, CacheTtl, CacheTtlConversionError, CacheableResult, CancellationSender,
+    CancellationWireCodecError, CancellationWireMessage, ClientNotification, CompleteResult,
+    CompleteResultPayload, CoreDispatchError, CoreRequest, CoreResult,
+    CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonMember, ExactJsonObject, ExactJsonValue,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
+    FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY, FinalArguments,
+    FinalCallToolParams, FinalCallToolResult, FinalCancelledNotificationParams,
     FinalCompletionArgument, FinalCompletionContext, FinalCompletionParams,
     FinalCompletionReference, FinalCompletionResult, FinalCompletionValues, FinalCoreRequest,
     FinalCoreResult, FinalCreateMessageInputRequiredResult, FinalCreateMessageParams,
@@ -419,20 +421,20 @@ pub use fastmcp_server::{
     FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
     FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
     FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    FinalToolOutcome, HttpServerConfig, InMemoryFinalTaskStore, InboundRequestContext,
-    InboundRequestTransport, Middleware, MiddlewareDecision, MountResult, NotificationSender,
-    PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog,
-    ProxyClient, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
-    ProxyToolCatalog, ProxyTypedCatalog, RequestSender, ResourceHandler, Router, Server,
-    ServerBuilder, ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, ServerStats,
-    Session, StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
-    ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
-    TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
-    create_context_with_progress_and_senders,
+    FinalToolOutcome, FinalToolSchemaAuthority, HttpServerConfig, InMemoryFinalTaskStore,
+    InboundRequestContext, InboundRequestTransport, Middleware, MiddlewareDecision, MountResult,
+    NotificationSender, PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend,
+    ProxyCatalog, ProxyClient, ProxyPromptCatalog, ProxyResourceCatalog,
+    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, RequestSender,
+    ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint, ServerHttpEndpointResponse,
+    ServerHttpSession, ServerStats, Session, StaticTokenVerifier, StatsSnapshot, TagFilters,
+    TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
+    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    create_context_with_progress, create_context_with_progress_and_senders,
 };
 pub use fastmcp_server::{
-    DuplicateBehavior, LifespanHooks, LoggingConfig, ServerLaunchPolicyError, ShutdownHook,
-    StartupHook, ServerExtensionConfigurationError,
+    DuplicateBehavior, LifespanHooks, LoggingConfig, ServerExtensionConfigurationError,
+    ServerLaunchPolicyError, ShutdownHook, StartupHook,
 };
 pub use fastmcp_server::{
     ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
@@ -472,8 +474,8 @@ pub use fastmcp_client::{
     McpAppsHostError, McpAppsHostPolicy, McpAppsInMemoryHostTransport,
     McpAppsInMemoryViewTransport, OpaquePagination, PaginationBounds, PendingRequestRecord,
     ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
-    RequestTimeoutSource, ReverseRequestCancellation, SubscriptionFilter,
-    SubscriptionListenCollector, mcp_apps_in_memory_pair,
+    RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation, StdioRequestExecution,
+    StdioRequestExecutor, SubscriptionFilter, SubscriptionListenCollector, mcp_apps_in_memory_pair,
 };
 
 // Public client HTTP execution and configuration surfaces.
@@ -516,7 +518,8 @@ pub mod auto {
         ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
         ClientProtocolPlanError, ClientSession, FinalTask, FinalTaskInputResponses,
         FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient,
-        HttpClientError, HttpSubscriptionListener, SubscriptionFilter, SubscriptionListenCollector,
+        HttpClientError, HttpSubscriptionListener, StdioRequestExecution, StdioRequestExecutor,
+        SubscriptionFilter, SubscriptionListenCollector,
     };
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::extensions::{
@@ -534,9 +537,9 @@ pub mod auto {
     pub use fastmcp_protocol::{
         AdmittedSchema, ClientCapabilities, ClientInfo, FinalCallToolResult, FinalCancelTaskResult,
         FinalCoreResultType, FinalGetPromptResult, FinalGetTaskResult, FinalReadResourceResult,
-        FinalTaskId, RequestId, SchemaAdmissionError, TemplateValue, TemplateValues, UriTemplate,
-        UriTemplateError, UriTemplateExpansionLimits, ValidationError, ValidationResult,
-        admit_final_schema, validate_final_core_result,
+        FinalTaskId, JsonRpcResponse, RequestId, ReversibleResourceTemplate, SchemaAdmissionError,
+        TemplateValue, TemplateValues, UriTemplate, UriTemplateError, UriTemplateExpansionLimits,
+        ValidationError, ValidationResult, admit_final_schema, validate_final_core_result,
     };
     pub use fastmcp_protocol::{schema, tasks_extension};
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -717,18 +720,18 @@ pub mod modern {
     pub use fastmcp_protocol::schema::FINAL_JSON_SCHEMA_DIALECT;
     pub use fastmcp_protocol::tasks_extension::TASK_UPDATE;
     pub use fastmcp_protocol::{
-        AdmittedSchema, CacheScope, CacheTtl, CacheableResult, ClientCapabilities, ClientInfo,
-        ClientNotification, CompleteResult, CompleteResultPayload, CompleteTaskResult,
-        CreateTaskResult, DiscoveryCacheHints, EmptyTaskResult, ExactJsonMember, ExactJsonObject,
-        ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
-        FINAL_PROTOCOL_VERSION as PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY,
-        FINAL_SERVER_INFO_META_KEY, FinalArguments, FinalBaseMetadata, FinalCallToolParams,
-        FinalCallToolResult, FinalCancelTaskParams, FinalCancelTaskResult,
-        FinalCancelledNotificationParams, FinalCompletionArgument, FinalCompletionContext,
-        FinalCompletionParams, FinalCompletionReference, FinalCompletionResult,
-        FinalCompletionValues, FinalCoreRequest, FinalCoreResult, FinalCoreResultType,
-        FinalCreateMessageInputRequiredResult, FinalCreateMessageParams, FinalCreateMessageResult,
-        FinalEmbeddedCreateMessageParams, FinalEmbeddedElicitationParams,
+        AdmittedSchema, CacheScope, CacheTtl, CacheTtlConversionError, CacheableResult,
+        ClientCapabilities, ClientInfo, ClientNotification, CompleteResult, CompleteResultPayload,
+        CompleteTaskResult, CreateTaskResult, DiscoveryCacheHints, EmptyTaskResult,
+        ExactJsonMember, ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
+        FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION as PROTOCOL_VERSION,
+        FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY, FinalArguments,
+        FinalBaseMetadata, FinalCallToolParams, FinalCallToolResult, FinalCancelTaskParams,
+        FinalCancelTaskResult, FinalCancelledNotificationParams, FinalCompletionArgument,
+        FinalCompletionContext, FinalCompletionParams, FinalCompletionReference,
+        FinalCompletionResult, FinalCompletionValues, FinalCoreRequest, FinalCoreResult,
+        FinalCoreResultType, FinalCreateMessageInputRequiredResult, FinalCreateMessageParams,
+        FinalCreateMessageResult, FinalEmbeddedCreateMessageParams, FinalEmbeddedElicitationParams,
         FinalEmbeddedElicitationResult, FinalEmbeddedFormElicitationParams, FinalEmbeddedInputKind,
         FinalEmbeddedInputRequest, FinalEmbeddedInputResponse, FinalEmbeddedRootsListParams,
         FinalEmbeddedRootsListResult, FinalEmbeddedUrlElicitationParams,
@@ -760,17 +763,17 @@ pub mod modern {
         MissingRequiredClientCapabilityError, ModelHint, ModelPreferences, PaginatedResult,
         ProgressMarker, ProtocolVersionError as FinalProtocolVersionError, RELATED_TASK_META_KEY,
         RawResultEnvelope, RequestAdmissionError, RequestId, RequestVersionMetadata,
-        RequiredCapabilitiesError, SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
-        SUPPORTED_FINAL_PROTOCOL_VERSIONS, SchemaAdmissionError, ServerBehavior,
-        ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
-        ServerDiscoverResult, ServerDiscoveryError, ServerInstructionError, ServerInstructions,
-        ServerNotification, StopReason, TASK_CANCEL, TASK_GET, TASK_STATUS_NOTIFICATION,
-        TASK_SUBSCRIPTION_IDS_KEY, TASKS_EXTENSION, TaskBase as FinalTaskBase,
-        TaskDuration as FinalTaskDuration, TaskInputLedger as FinalTaskInputLedger,
-        TaskInputRequests as FinalTaskInputRequests, TaskMethodRequest as FinalTaskMethodRequest,
-        TaskRequestMeta as FinalTaskRequestMeta, TaskTimestamp as FinalTaskTimestamp,
-        TaskWireError, TemplateValue, TemplateValues, TypedCompleteMembers,
-        UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnknownResultMembers,
+        RequiredCapabilitiesError, ReversibleResourceTemplate, SERVER_DISCOVER_METHOD,
+        SERVER_DISCOVER_SUPPORTED_VERSIONS, SUPPORTED_FINAL_PROTOCOL_VERSIONS,
+        SchemaAdmissionError, ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities,
+        ServerDiscoverRequest, ServerDiscoverResult, ServerDiscoveryError, ServerInstructionError,
+        ServerInstructions, ServerNotification, StopReason, TASK_CANCEL, TASK_GET,
+        TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY, TASKS_EXTENSION,
+        TaskBase as FinalTaskBase, TaskDuration as FinalTaskDuration,
+        TaskInputLedger as FinalTaskInputLedger, TaskInputRequests as FinalTaskInputRequests,
+        TaskMethodRequest as FinalTaskMethodRequest, TaskRequestMeta as FinalTaskRequestMeta,
+        TaskTimestamp as FinalTaskTimestamp, TaskWireError, TemplateValue, TemplateValues,
+        TypedCompleteMembers, UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnknownResultMembers,
         UnsupportedProtocolVersionError, UpdateTaskParams as FinalUpdateTaskParams, UriTemplate,
         UriTemplateError, UriTemplateExpansionLimits, UriTemplateExpression, UriTemplateModifier,
         UriTemplateOperator, UriTemplatePart, ValidationError, ValidationResult,
@@ -799,10 +802,11 @@ pub mod modern {
         FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
         FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
         FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, FinalToolOutcome, InMemoryFinalTaskStore, LifespanHooks,
-        LoggingConfig, Middleware, MiddlewareDecision, MountResult, ProgressNotificationSender,
-        PromptHandler, ResourceHandler, ServerExtensionConfigurationError, ShutdownHook,
-        StartupHook, TagFilters, ToolErrorKind, ToolHandler, create_context_with_progress,
+        FinalTaskWorkDescriptor, FinalToolOutcome, FinalToolSchemaAuthority,
+        InMemoryFinalTaskStore, LifespanHooks, LoggingConfig, Middleware, MiddlewareDecision,
+        MountResult, ProgressNotificationSender, PromptHandler, ResourceHandler,
+        ServerExtensionConfigurationError, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
+        ToolHandler, create_context_with_progress,
     };
     pub use fastmcp_transport::{
         ModernHttpRequestAdmission, SendPermit, StreamableHttpRequestResponseStream,
@@ -1445,8 +1449,10 @@ pub mod modern {
 
     fn modern_http_plan(
         endpoint: CanonicalHttpUrl,
-    ) -> Result<fastmcp_client::ClientProtocolPlan, fastmcp_protocol::protocol_policy::HttpEndpointBundleError>
-    {
+    ) -> Result<
+        fastmcp_client::ClientProtocolPlan,
+        fastmcp_protocol::protocol_policy::HttpEndpointBundleError,
+    > {
         fastmcp_client::ClientProtocolPlan::http(
             fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
             Some(endpoint),
@@ -1704,17 +1710,18 @@ pub mod legacy_2024 {
         ElicitRequestParams as LegacyElicitRequestParams, ElicitResult as LegacyElicitResult,
         HttpClient, HttpClientError, ListRootsParams as LegacyListRootsParams,
         ListRootsResult as LegacyListRootsResult, Request, RequestExecution, RequestExecutor,
-        RequestTimeoutPolicy, RequestTimeoutSource,
+        RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation,
         ReverseRequestHandlers as LegacyReverseRequestHandlers,
-        ReverseRequestCancellation,
         RootsRequestHandler as LegacyRootsRequestHandler,
-        SamplingRequestHandler as LegacySamplingRequestHandler,
+        SamplingRequestHandler as LegacySamplingRequestHandler, StdioRequestExecution,
+        StdioRequestExecutor,
     };
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientRoot, Cx, McpContext, McpError, McpOutcome, McpResult,
         RootsProvider,
     };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
+    pub use fastmcp_protocol::common_types::JsonInteger;
     pub use fastmcp_protocol::methods;
     pub use fastmcp_protocol::protocol_policy::{
         HttpEndpointBundleError, LEGACY_PROTOCOL_VERSION, LegacyAdapterReceiptIssuer,
@@ -1840,7 +1847,8 @@ pub mod legacy_2024 {
     fn legacy_http_plan(
         sse_endpoint: CanonicalHttpUrl,
         message_post_endpoint: CanonicalHttpUrl,
-    ) -> Result<ClientProtocolPlan, fastmcp_protocol::protocol_policy::HttpEndpointBundleError> {
+    ) -> Result<ClientProtocolPlan, fastmcp_protocol::protocol_policy::HttpEndpointBundleError>
+    {
         ClientProtocolPlan::http(
             ProtocolPolicy::LegacyOnly,
             None,
@@ -1876,6 +1884,8 @@ pub mod prelude {
         BoundHttpServer,
         // Client
         BoundedListPage,
+        CacheTtl,
+        CacheTtlConversionError,
         CancellationSender,
         CancellationWireCodecError,
         CancellationWireMessage,
@@ -1908,6 +1918,7 @@ pub mod prelude {
         ContentBlock,
         Cx,
         DecodedResult,
+        DiscoveryCacheHints,
         DualEraHttpEndpoint,
         DualEraHttpEndpointConfig,
         DualEraHttpEndpointError,
@@ -1944,6 +1955,7 @@ pub mod prelude {
         FinalProgressNotificationParams,
         FinalProtocolVersion,
         FinalReadResourceResult,
+        FinalResource,
         FinalResourceUpdatedNotificationParams,
         FinalSubscriptionsAcknowledgedNotificationParams,
         FinalTask,
@@ -1972,6 +1984,7 @@ pub mod prelude {
         // Server
         InboundRequestContext,
         InboundRequestTransport,
+        JsonInteger,
         JsonMap,
         JsonSchema,
         JsonValue,
@@ -2012,6 +2025,8 @@ pub mod prelude {
         ModernHttpExecutor,
         ModernHttpExecutorError,
         ModernHttpRequest,
+        ModernHttpResponseKind,
+        ModernHttpResponseMetadata,
         ModernHttpResponseStream,
         ModernHttpSubscriptionListenCollector,
         ModernHttpSubscriptionListenError,
@@ -2045,6 +2060,7 @@ pub mod prelude {
         Resource,
         ResourceContent,
         ResultExt,
+        ReversibleResourceTemplate,
         Role,
         RootsProvider,
         SchemaAdmissionError,
@@ -2108,15 +2124,17 @@ pub mod prelude {
         FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
         FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
         FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, InMemoryFinalTaskStore, JsonRpcAdmissionError, JsonRpcMessage,
-        MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES, MAX_RESOURCE_READ_DEPTH,
-        MAX_TOOL_CALL_DEPTH, McpContextLeaseGuard, McpRequestCancellation, NoOpElicitationSender,
+        FinalTaskWorkDescriptor, FinalToolSchemaAuthority, InMemoryFinalTaskStore,
+        JsonRpcAdmissionError, JsonRpcMessage, JsonRpcResponse, MAX_FINAL_CACHE_CAPACITY,
+        MAX_FINAL_CACHE_MAX_BYTES, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH,
+        McpContextLeaseGuard, McpRequestCancellation, NoOpElicitationSender,
         NoOpNotificationSender, NoOpSamplingSender, PendingRequests, ProgressReporter,
         PromptHandler, RequestSender, ResourceContentItem, ResourceHandler, ResourceReadResult,
         ResourceReader, SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole,
-        SamplingSender, SamplingStopReason, ServerCapabilityInfo, ToolCallResult, ToolCaller,
-        ToolContentItem, ToolHandler, TransportElicitationSender, TransportRootsProvider,
-        TransportSamplingSender, block_on, decode_strict_jsonrpc_message,
+        SamplingSender, SamplingStopReason, ServerCapabilityInfo, StdioRequestExecution,
+        StdioRequestExecutor, ToolCallResult, ToolCaller, ToolContentItem, ToolHandler,
+        TransportElicitationSender, TransportRootsProvider, TransportSamplingSender, block_on,
+        decode_strict_jsonrpc_message,
     };
 }
 

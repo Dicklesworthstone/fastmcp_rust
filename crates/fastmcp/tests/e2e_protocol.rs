@@ -1300,6 +1300,64 @@ fn e2e_public_stdio_auto_falls_back_to_exact_legacy_on_the_shipped_facade_server
 }
 
 #[cfg(unix)]
+fn assert_public_auto_stdio_multiplexes(server_policy: &str, expected_era: ProtocolEra) {
+    let mut client = connect_auto_stdio_to_shipped_echo_server(server_policy);
+    assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+    assert_eq!(client.selected_protocol_era(), Some(expected_era));
+
+    let executor = client
+        .multiplexed_stdio_executor()
+        .expect("the selected public stdio session installs its shared executor");
+    assert_eq!(executor.selected_protocol_era(), expected_era);
+    let cx = Cx::for_request();
+    // Both sends occur before either wait. The real subprocess therefore sees
+    // two committed request owners on the selected final child, rather than a
+    // tautological sequence of one request followed by one response.
+    let mut first = client
+        .start_multiplexed_request(&cx, "ping", Some(json!({})))
+        .expect("first selected-era ping commits");
+    let mut second = client
+        .start_multiplexed_request(&cx, "ping", Some(json!({})))
+        .expect("second selected-era ping commits before the first wait");
+    assert_ne!(first.request_id(), second.request_id());
+
+    // The sequential adapter must drive this same ingress/correlation path.
+    // Its response wait sees and preserves both earlier multiplexed owners
+    // before consuming its own real subprocess response.
+    client
+        .ping()
+        .expect("the sequential adapter cannot consume either multiplexed response");
+
+    let first_response = client
+        .wait_multiplexed_request(&cx, &mut first)
+        .expect("first committed request receives its own final response");
+    let second_response = client
+        .wait_multiplexed_request(&cx, &mut second)
+        .expect("second committed request receives its own final response");
+    assert_eq!(first_response.id.as_ref(), Some(first.request_id()));
+    assert_eq!(second_response.id.as_ref(), Some(second.request_id()));
+    assert!(first_response.error.is_none());
+    assert!(second_response.error.is_none());
+    drop(executor);
+    client.close().expect("multiplexed stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_auto_modern_selection_multiplexes_two_committed_requests() {
+    assert_public_auto_stdio_multiplexes("auto", ProtocolEra::Modern2026);
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_auto_legacy_fallback_multiplexes_two_committed_requests() {
+    // The paired positive differs only in the real child's era policy. Auto
+    // must tear down its modern probe, establish a fresh exact-2024 child,
+    // then install the same shared executor on that final connection.
+    assert_public_auto_stdio_multiplexes("legacy-only", ProtocolEra::Legacy2024);
+}
+
+#[cfg(unix)]
 #[test]
 fn e2e_public_stdio_modern_only_round_trips_with_the_shipped_facade_server() {
     let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
@@ -1366,15 +1424,28 @@ fn e2e_public_legacy_stdio_roots_callback_reaches_context() {
             ]))
         }
     });
-    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
-        "legacy-only",
-        handlers,
-    )
-    .expect("the roots callback is configured before exact legacy initialization");
+    let mut client =
+        connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers("legacy-only", handlers)
+            .expect("the roots callback is configured before exact legacy initialization");
 
-    let result = client
-        .call_tool_legacy("client_root_uri", json!({}))
-        .expect("the public stdio tool call completes");
+    let cx = Cx::for_request();
+    let mut execution = client
+        .start_multiplexed_request(
+            &cx,
+            "tools/call",
+            Some(json!({"name": "client_root_uri", "arguments": {}})),
+        )
+        .expect("the public multiplexed stdio tool call commits");
+    let response = client
+        .wait_multiplexed_request(&cx, &mut execution)
+        .expect("the shared receive arbiter routes roots/list before the tool response");
+    assert_eq!(response.id.as_ref(), Some(execution.request_id()));
+    let result: legacy_2024::CallToolResult = serde_json::from_value(
+        response
+            .result
+            .expect("the successful multiplexed tools/call response has a result"),
+    )
+    .expect("the exact legacy multiplexed tools/call result remains decodable");
     assert!(!result.is_error);
     assert!(matches!(
         result.content.first(),
@@ -1399,9 +1470,24 @@ fn e2e_public_legacy_stdio_roots_without_capability_has_no_callback_authority() 
     )
     .expect("the exact legacy connection without roots capability initializes");
 
-    let result = client
-        .call_tool_legacy("client_root_uri", json!({}))
-        .expect("missing roots authority is an MCP tool result, not a transport failure");
+    let cx = Cx::for_request();
+    let mut execution = client
+        .start_multiplexed_request(
+            &cx,
+            "tools/call",
+            Some(json!({"name": "client_root_uri", "arguments": {}})),
+        )
+        .expect("the paired multiplexed stdio tool call commits");
+    let response = client
+        .wait_multiplexed_request(&cx, &mut execution)
+        .expect("missing roots authority remains a multiplexed MCP tool result");
+    assert_eq!(response.id.as_ref(), Some(execution.request_id()));
+    let result: legacy_2024::CallToolResult = serde_json::from_value(
+        response
+            .result
+            .expect("the refused multiplexed tools/call response has a result"),
+    )
+    .expect("the exact legacy refusal remains decodable");
     assert!(result.is_error);
     assert!(matches!(
         result.content.first(),

@@ -91,6 +91,119 @@ fn legacy_sampling_callback(
 fn assert_legacy_reverse_callback_cancellation_export() {
     let _: legacy_2024::LegacySamplingRequestHandler = Box::new(legacy_sampling_callback);
     let _: Option<fastmcp_rust::ReverseRequestCancellation> = None;
+    let _: legacy_2024::ProgressMarker =
+        legacy_2024::ProgressMarker::Number(legacy_2024::JsonInteger::from(7_i64));
+    let _: legacy_2024::ElicitContentValue =
+        legacy_2024::ElicitContentValue::Int(legacy_2024::JsonInteger::from(9_i64));
+    let _: for<'a, 'b> fn(
+        &'a legacy_2024::ElicitResult,
+        &'b str,
+    ) -> Option<&'a legacy_2024::JsonInteger> = legacy_2024::ElicitResult::get_int;
+}
+
+fn assert_reverse_request_exports(
+    executor: &fastmcp_rust::RequestExecutor,
+    cx: &fastmcp_rust::Cx,
+    request: &fastmcp_rust::ReverseRequest,
+) -> fastmcp_rust::McpResult<()> {
+    let _: &fastmcp_rust::JsonRpcRequest = request.request();
+    let _: &fastmcp_rust::RequestId = request.request_id();
+    let _: &fastmcp_rust::ReverseRequestCancellation = request.cancellation();
+    let _: Vec<fastmcp_rust::ReverseRequest> = executor.take_reverse_requests();
+    executor.respond_to_reverse_request(cx, request, fastmcp_rust::JsonValue::Null)
+}
+
+fn assert_legacy_reverse_request_exports(
+    executor: &legacy_2024::RequestExecutor,
+    cx: &legacy_2024::Cx,
+    request: &legacy_2024::ReverseRequest,
+) -> legacy_2024::McpResult<()> {
+    let _: &legacy_2024::JsonRpcRequest = request.request();
+    let _: &legacy_2024::RequestId = request.request_id();
+    let _: &legacy_2024::ReverseRequestCancellation = request.cancellation();
+    let _: Vec<legacy_2024::ReverseRequest> = executor.take_reverse_requests();
+    executor.respond_to_reverse_request(cx, request, legacy_2024::JsonValue::Null)
+}
+
+fn assert_root_stdio_executor_exports(
+    client: &mut fastmcp_rust::Client,
+    cx: &fastmcp_rust::Cx,
+) -> fastmcp_rust::McpResult<()> {
+    let executor: fastmcp_rust::StdioRequestExecutor = client.multiplexed_stdio_executor()?;
+    let mut execution: fastmcp_rust::StdioRequestExecution =
+        client.start_multiplexed_request(cx, "ping", None)?;
+    let _: fastmcp_rust::ProtocolEra = executor.selected_protocol_era();
+    let _: &fastmcp_rust::RequestId = execution.request_id();
+    let _: fastmcp_rust::JsonRpcResponse = client.wait_multiplexed_request(cx, &mut execution)?;
+    Ok(())
+}
+
+fn assert_auto_stdio_executor_exports(
+    client: &mut auto::Client,
+    cx: &auto::Cx,
+) -> auto::McpResult<()> {
+    let executor: auto::StdioRequestExecutor = client.multiplexed_stdio_executor()?;
+    let mut execution: auto::StdioRequestExecution =
+        client.start_multiplexed_request(cx, "ping", None)?;
+    let _: auto::ProtocolEra = executor.selected_protocol_era();
+    let _: &auto::RequestId = execution.request_id();
+    let _: auto::JsonRpcResponse = client.wait_multiplexed_request(cx, &mut execution)?;
+    Ok(())
+}
+
+fn assert_legacy_stdio_executor_exports(
+    client: &mut legacy_2024::Client,
+    cx: &legacy_2024::Cx,
+) -> legacy_2024::McpResult<()> {
+    let executor: legacy_2024::StdioRequestExecutor = client.multiplexed_stdio_executor()?;
+    let mut execution: legacy_2024::StdioRequestExecution =
+        client.start_multiplexed_request(cx, "ping", None)?;
+    let _: legacy_2024::ProtocolEra = executor.selected_protocol_era();
+    let _: &legacy_2024::RequestId = execution.request_id();
+    let _: legacy_2024::JsonRpcResponse = client.wait_multiplexed_request(cx, &mut execution)?;
+    Ok(())
+}
+
+fn assert_final_tool_schema_authority_exports<T: modern::ToolHandler>(
+    handler: &T,
+) -> modern::FinalToolSchemaAuthority {
+    let _: Option<fastmcp_rust::FinalToolSchemaAuthority> = None;
+    let _: Option<modern::FinalToolSchemaAuthority> = None;
+    handler.final_tool_schema_authority()
+}
+
+fn assert_raw_http_session_metadata_exports() {
+    let request = fastmcp_rust::ModernHttpRequest::new(
+        "https://example.test/mcp",
+        Vec::new(),
+        modern::PROTOCOL_VERSION,
+        "ping",
+        None,
+    )
+    .expect("root modern request constructor is available")
+    .with_mcp_session_id("session-1")
+    .expect("root modern request session builder is available");
+    assert_eq!(request.target(), "https://example.test/mcp");
+    let _: Option<fastmcp_rust::ModernHttpResponseKind> = None;
+    let _: for<'a> fn(&'a fastmcp_rust::ModernHttpResponseMetadata) -> Option<&'a str> =
+        fastmcp_rust::ModernHttpResponseMetadata::mcp_session_id;
+    let _: for<'a> fn(
+        &'a fastmcp_rust::ModernHttpResponseStream,
+    ) -> &'a fastmcp_rust::ModernHttpResponseMetadata =
+        fastmcp_rust::ModernHttpResponseStream::metadata;
+}
+
+fn assert_router_cache_ttl_signatures(router: &mut fastmcp_rust::Router) {
+    router.set_final_cache_hint_policy(
+        fastmcp_rust::CacheTtl::milliseconds(1),
+        fastmcp_rust::CacheTtl::milliseconds(2),
+        fastmcp_rust::CacheScope::Private,
+    );
+    let _: (
+        &fastmcp_rust::CacheTtl,
+        &fastmcp_rust::CacheTtl,
+        fastmcp_rust::CacheScope,
+    ) = router.final_cache_hint_policy();
 }
 
 mod prelude_completion_handler_reachability {
@@ -100,6 +213,36 @@ mod prelude_completion_handler_reachability {
 
     pub(super) fn assert_reachable() {
         accepts_prelude_completion_handler::<super::DownstreamCompletionHandler>();
+    }
+}
+
+mod prelude_stdio_and_http_metadata_reachability {
+    use fastmcp_rust::prelude::*;
+
+    fn final_tool_schema_authority<T: ToolHandler>(handler: &T) -> FinalToolSchemaAuthority {
+        handler.final_tool_schema_authority()
+    }
+
+    fn stdio_contract(client: &mut Client, cx: &Cx) -> McpResult<()> {
+        let executor: StdioRequestExecutor = client.multiplexed_stdio_executor()?;
+        let mut execution: StdioRequestExecution =
+            client.start_multiplexed_request(cx, "ping", None)?;
+        let _: ProtocolEra = executor.selected_protocol_era();
+        let _: &RequestId = execution.request_id();
+        let _: fastmcp_rust::JsonRpcResponse =
+            client.wait_multiplexed_request(cx, &mut execution)?;
+        Ok(())
+    }
+
+    pub(super) fn assert_reachable() {
+        let _: Option<FinalToolSchemaAuthority> = None;
+        let _: Option<ModernHttpResponseKind> = None;
+        let _: for<'a> fn(&'a ModernHttpResponseMetadata) -> Option<&'a str> =
+            ModernHttpResponseMetadata::mcp_session_id;
+        let _: for<'a> fn(&'a ModernHttpResponseStream) -> &'a ModernHttpResponseMetadata =
+            ModernHttpResponseStream::metadata;
+        let _ = final_tool_schema_authority::<super::DownstreamFinalTaskTool>;
+        let _ = stdio_contract;
     }
 }
 
@@ -637,7 +780,9 @@ fn assert_root_directional_notification_exports() {
 
     let server =
         fastmcp_rust::ServerNotification::Progress(fastmcp_rust::FinalProgressNotificationParams {
-            progress_token: fastmcp_rust::ProgressMarker::Number(41),
+            progress_token: fastmcp_rust::ProgressMarker::Number(fastmcp_rust::JsonInteger::from(
+                41_i64,
+            )),
             progress: 1.0,
             total: Some(1.0),
             message: Some("complete".to_owned()),
@@ -665,7 +810,7 @@ fn assert_modern_directional_notification_exports() {
     assert_eq!(client_wire.method, "notifications/cancelled");
 
     let server = modern::ServerNotification::Progress(modern::FinalProgressNotificationParams {
-        progress_token: modern::ProgressMarker::Number(42),
+        progress_token: modern::ProgressMarker::Number(modern::JsonInteger::from(42_i64)),
         progress: 1.0,
         total: Some(1.0),
         message: Some("complete".to_owned()),
@@ -694,7 +839,22 @@ fn assert_lossless_dual_era_product_paths() {
             .contains_key(modern::FINAL_PROTOCOL_VERSION_META_KEY)
     );
     let cache_hints = modern::DiscoveryCacheHints::private_ttl_ms(250);
-    assert_eq!(cache_hints.ttl_ms(), 250);
+    assert_eq!(
+        cache_hints
+            .ttl_ms()
+            .try_as_millis()
+            .expect("locally constructed TTL fits the runtime domain"),
+        250
+    );
+    let oversized_ttl: modern::CacheTtl = modern::CacheTtl::try_from(
+        fastmcp_rust::serde_json::from_str::<modern::JsonInteger>("18446744073709551616")
+            .expect("wide integer parses through the facade"),
+    )
+    .expect("nonnegative wide TTL is retained");
+    assert_eq!(
+        oversized_ttl.try_as_millis(),
+        Err(modern::CacheTtlConversionError::RuntimeOutOfRange)
+    );
 
     let exact_result = modern::parse_exact_json(r#"{"resultType":"complete","answer":7}"#)
         .expect("facade result codec must parse exact JSON");
@@ -769,6 +929,29 @@ fn assert_lossless_dual_era_product_paths() {
     let _: modern::Server = modern::server_builder("final-only", "1.0.0")
         .resource_template(final_template)
         .build();
+    let final_resource = modern::FinalResource {
+        uri: modern::AbsoluteUri::parse("resource://cities/london")
+            .expect("absolute resource URI parses through the facade"),
+        name: "london".to_owned(),
+        title: Some("London".to_owned()),
+        description: None,
+        icons: None,
+        mime_type: Some("application/json".to_owned()),
+        size: Some(
+            fastmcp_rust::serde_json::from_str::<modern::JsonInteger>("18446744073709551616")
+                .expect("wide resource size parses through the facade"),
+        ),
+        annotations: None,
+        meta: None,
+    };
+    assert_eq!(
+        final_resource
+            .size
+            .as_ref()
+            .expect("size is retained")
+            .as_str(),
+        "18446744073709551616"
+    );
 
     let partition = legacy_2024::LegacyAuthenticatedPeerPartition::from_authenticated_transport(
         [9_u8; legacy_2024::LegacyAuthenticatedPeerPartition::BYTE_LEN],
@@ -801,6 +984,19 @@ mod prelude_directional_notification_reachability {
     use fastmcp_rust::prelude::*;
 
     pub(super) fn assert_reachable() {
+        let _: Option<CacheTtl> = None;
+        let _: Option<CacheTtlConversionError> = None;
+        let _: Option<FinalResource> = None;
+        let _: JsonInteger = JsonInteger::from(44_i64);
+        let cache_hints = DiscoveryCacheHints::private_ttl_ms(1);
+        assert_eq!(
+            cache_hints
+                .ttl_ms()
+                .try_as_millis()
+                .expect("prelude cache TTL uses checked runtime conversion"),
+            1
+        );
+
         let client = ClientNotification::Cancelled(FinalCancelledNotificationParams {
             request_id: fastmcp_rust::RequestId::Number(43),
             reason: None,
@@ -814,7 +1010,7 @@ mod prelude_directional_notification_reachability {
         assert_eq!(client_wire.method, "notifications/cancelled");
 
         let server = ServerNotification::Progress(FinalProgressNotificationParams {
-            progress_token: ProgressMarker::Number(43),
+            progress_token: ProgressMarker::Number(JsonInteger::from(43_i64)),
             progress: 1.0,
             total: Some(1.0),
             message: Some("complete".to_owned()),
@@ -835,7 +1031,16 @@ fn main() {
     assert_completion_handler_reachability();
     assert_modern_server_builder_forwarders();
     assert_legacy_reverse_callback_cancellation_export();
+    let _ = assert_reverse_request_exports;
+    let _ = assert_legacy_reverse_request_exports;
+    let _ = assert_root_stdio_executor_exports;
+    let _ = assert_auto_stdio_executor_exports;
+    let _ = assert_legacy_stdio_executor_exports;
+    let _ = assert_final_tool_schema_authority_exports::<DownstreamFinalTaskTool>;
+    assert_raw_http_session_metadata_exports();
+    let _ = assert_router_cache_ttl_signatures;
     prelude_completion_handler_reachability::assert_reachable();
+    prelude_stdio_and_http_metadata_reachability::assert_reachable();
     assert_client_completion_input_exports();
     prelude_client_completion_input_reachability::assert_reachable();
     let _ = assert_client_http_and_subscription_exports;
