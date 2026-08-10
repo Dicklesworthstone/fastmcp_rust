@@ -1630,7 +1630,7 @@ fn workflow_public_http_state_only_mrtr_rejects_explicit_empty_without_consuming
     let mut callback_count = 0;
     let automatic = final_tasks_runtime_block_on_bounded(
         &cx,
-        client.call_tool_with_mrtr_retry_until(
+        client.call_tool_with_mrtr_retry(
             &cx,
             Instant::now() + FINAL_TASKS_E2E_BOUND,
             "public-state-only-mrtr",

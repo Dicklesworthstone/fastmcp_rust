@@ -945,6 +945,7 @@ dependencies = [
 name = "fastmcp-derive"
 version = "0.3.2"
 dependencies = [
+ "fastmcp-protocol",
  "proc-macro-crate",
  "proc-macro2",
  "quote",

@@ -4,12 +4,50 @@ use std::collections::BTreeMap;
 
 use fastmcp_rust::{
     CompletionContext, CompletionHandler, CompletionParams, CompletionReference,
-    SubscriptionFilter, auto, legacy_2024, modern, tool,
+    SubscriptionFilter, auto, legacy_2024, modern, prompt, resource, tool,
 };
 
 #[tool(tasks)]
 fn downstream_final_task_tool() -> fastmcp_rust::FinalToolOutcome {
     unreachable!("the downstream macro probe only compiles the task opt-in")
+}
+
+#[resource(uri = "facade://mrtr-resumable-resource")]
+fn facade_mrtr_resumable_resource(
+    completed_inputs: Option<&modern::MrtrCompletedInputs>,
+) -> modern::FinalMethodOutcome<modern::FinalReadResourceResult> {
+    let request_state = if completed_inputs.is_some() {
+        "facade-mrtr-resource-resumed"
+    } else {
+        "facade-mrtr-resource-initial"
+    };
+    modern::FinalMethodOutcome::InputRequired(
+        modern::InputRequiredResult::new(
+            None,
+            Some(request_state.to_owned()),
+            fastmcp_rust::ResultMeta::default(),
+        )
+        .expect("request state makes the facade MRTR resource result valid"),
+    )
+}
+
+#[prompt]
+fn facade_mrtr_resumable_prompt(
+    completed_inputs: Option<&modern::MrtrCompletedInputs>,
+) -> modern::FinalMethodOutcome<modern::FinalGetPromptResult> {
+    let request_state = if completed_inputs.is_some() {
+        "facade-mrtr-prompt-resumed"
+    } else {
+        "facade-mrtr-prompt-initial"
+    };
+    modern::FinalMethodOutcome::InputRequired(
+        modern::InputRequiredResult::new(
+            None,
+            Some(request_state.to_owned()),
+            fastmcp_rust::ResultMeta::default(),
+        )
+        .expect("request state makes the facade MRTR prompt result valid"),
+    )
 }
 
 fn assert_task_opt_in_macro_surface() {
@@ -18,9 +56,107 @@ fn assert_task_opt_in_macro_surface() {
     ));
 }
 
+fn assert_resumable_resource_and_prompt_macro_surface() {
+    fn resource_handler<T: modern::ResourceHandler>(_: T) {}
+    fn prompt_handler<T: modern::PromptHandler>(_: T) {}
+
+    resource_handler(FacadeMrtrResumableResourceResource);
+    prompt_handler(FacadeMrtrResumablePromptPrompt);
+}
+
 struct DownstreamCompletionHandler;
 
 struct DownstreamLegacyAdapterHandler;
+
+/// A downstream modern resource handler that can inspect router-admitted MRTR
+/// inputs and produce the complete-or-input-required final algebra without
+/// depending on FastMCP implementation crates.
+struct DownstreamMrtrResourceHandler;
+
+impl modern::ResourceHandler for DownstreamMrtrResourceHandler {
+    fn definition(&self) -> fastmcp_rust::Resource {
+        fastmcp_rust::Resource {
+            uri: "facade://mrtr-resource".to_owned(),
+            name: "facade-mrtr-resource".to_owned(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        _ctx: &'a modern::McpContext,
+        _request_cx: &'a modern::Cx,
+        _uri: &'a str,
+        _params: &'a std::collections::HashMap<String, String>,
+        completed_inputs: Option<&'a modern::MrtrCompletedInputs>,
+    ) -> modern::BoxFuture<
+        'a,
+        modern::McpOutcome<modern::FinalMethodOutcome<modern::FinalReadResourceResult>>,
+    > {
+        Box::pin(async move {
+            let _ = completed_inputs;
+            modern::Outcome::Err(modern::McpError::internal_error(
+                "compile-only downstream MRTR resource handler",
+            ))
+        })
+    }
+}
+
+/// A downstream modern prompt handler that uses the same opaque completed
+/// inputs and final outcome algebra as a resource handler.
+struct DownstreamMrtrPromptHandler;
+
+impl modern::PromptHandler for DownstreamMrtrPromptHandler {
+    fn definition(&self) -> fastmcp_rust::Prompt {
+        fastmcp_rust::Prompt {
+            name: "facade-mrtr-prompt".to_owned(),
+            description: None,
+            arguments: Vec::new(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn get_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        _ctx: &'a modern::McpContext,
+        _request_cx: &'a modern::Cx,
+        _arguments: std::collections::HashMap<String, String>,
+        completed_inputs: Option<&'a modern::MrtrCompletedInputs>,
+    ) -> modern::BoxFuture<
+        'a,
+        modern::McpOutcome<modern::FinalMethodOutcome<modern::FinalGetPromptResult>>,
+    > {
+        Box::pin(async move {
+            let _ = completed_inputs;
+            modern::Outcome::Err(modern::McpError::internal_error(
+                "compile-only downstream MRTR prompt handler",
+            ))
+        })
+    }
+}
+
+fn assert_modern_mrtr_resource_and_prompt_handler_exports() {
+    let _: fn(
+        modern::InputRequiredResult,
+    ) -> modern::FinalMethodOutcome<modern::FinalReadResourceResult> =
+        modern::FinalMethodOutcome::InputRequired;
+    let _: fn(
+        modern::InputRequiredResult,
+    ) -> modern::FinalMethodOutcome<modern::FinalGetPromptResult> =
+        modern::FinalMethodOutcome::InputRequired;
+
+    fn resource_handler<T: modern::ResourceHandler>() {}
+    fn prompt_handler<T: modern::PromptHandler>() {}
+
+    resource_handler::<DownstreamMrtrResourceHandler>();
+    prompt_handler::<DownstreamMrtrPromptHandler>();
+}
 
 impl legacy_2024::Legacy2024Handler for DownstreamLegacyAdapterHandler {
     fn handle_legacy_2024(
@@ -447,12 +583,17 @@ async fn use_final_only_http_resource_and_completion_apis(
     client: &mut modern::HttpClient,
     cx: &modern::Cx,
 ) -> Result<(), modern::HttpClientError> {
+    let _: modern::FinalListToolsResult = client.list_tools(cx, None).await?;
+    let _: modern::FinalListPromptsResult = client.list_prompts(cx, Some("next-page")).await?;
     let _: modern::FinalListResourcesResult = client.list_resources(cx, None).await?;
     let _: modern::FinalListResourceTemplatesResult = client
         .list_resource_templates(cx, Some("next-page"))
         .await?;
     let _: modern::FinalReadResourceResult =
         client.read_resource(cx, "resource://cities/boston").await?;
+    let _: modern::FinalGetPromptResult = client
+        .get_prompt(cx, "city", std::collections::HashMap::new())
+        .await?;
     let _: modern::FinalCompletionResult = client
         .complete(
             cx,
@@ -471,6 +612,19 @@ async fn use_final_only_http_resource_and_completion_apis(
     Ok(())
 }
 
+async fn use_final_only_http_subscription_listener(
+    client: &mut modern::HttpClient,
+    cx: &modern::Cx,
+    filter: modern::SubscriptionFilter,
+    limits: modern::SseLimits,
+) -> Result<Option<modern::ModernHttpSubscriptionListenEvent>, modern::HttpClientError> {
+    let mut listener: modern::HttpSubscriptionListener<'_> = client
+        .open_subscriptions_listener(cx, filter, limits)
+        .await?;
+    let _: &modern::RequestId = listener.request_id();
+    listener.next_event(cx).await
+}
+
 async fn use_final_only_http_mrtr_apis(
     client: &mut modern::HttpClient,
     cx: &modern::Cx,
@@ -479,7 +633,7 @@ async fn use_final_only_http_mrtr_apis(
 ) -> Result<(), modern::HttpClientError> {
     let mut tool_rounds = 0_usize;
     let _: modern::FinalCoreResult = client
-        .call_tool_with_mrtr_retry_until(
+        .call_tool_with_mrtr_retry(
             cx,
             deadline,
             "city_lookup",
@@ -494,7 +648,7 @@ async fn use_final_only_http_mrtr_apis(
         .await?;
     let mut resource_rounds = 0_usize;
     let _: modern::FinalCoreResult = client
-        .read_resource_with_mrtr_retry_until(
+        .read_resource_with_mrtr_retry(
             cx,
             deadline,
             "resource://cities/boston",
@@ -508,7 +662,7 @@ async fn use_final_only_http_mrtr_apis(
         .await?;
     let mut prompt_rounds = 0_usize;
     let _: modern::FinalCoreResult = client
-        .get_prompt_with_mrtr_retry_until(
+        .get_prompt_with_mrtr_retry(
             cx,
             deadline,
             "city",
@@ -528,18 +682,23 @@ fn assert_client_http_and_subscription_exports() {
     assert_typed_facade_http_builder_exports();
     let _ = modern::HttpClient::connect;
     let _ = modern::HttpClient::call_tool_outcome;
+    let _ = modern::HttpClient::list_tools;
+    let _ = modern::HttpClient::list_prompts;
     let _ = modern::HttpClient::list_resources;
     let _ = modern::HttpClient::list_resource_templates;
     let _ = modern::HttpClient::read_resource;
+    let _ = modern::HttpClient::get_prompt;
     let _ = modern::HttpClient::complete;
-    let _ = modern::HttpClient::call_tool_with_mrtr_retry_until;
-    let _ = modern::HttpClient::read_resource_with_mrtr_retry_until;
-    let _ = modern::HttpClient::get_prompt_with_mrtr_retry_until;
+    let _ = modern::HttpClient::call_tool_with_mrtr_retry;
+    let _ = modern::HttpClient::read_resource_with_mrtr_retry;
+    let _ = modern::HttpClient::get_prompt_with_mrtr_retry;
+    let _ = modern::HttpClient::open_subscriptions_listener;
     let _ = modern::HttpClient::listen_subscriptions;
     let _ = modern::HttpClient::get_task;
     let _ = modern::HttpClient::update_task;
     let _ = modern::HttpClient::cancel_task;
     let _ = use_final_only_http_resource_and_completion_apis;
+    let _ = use_final_only_http_subscription_listener;
     let _ = use_final_only_http_mrtr_apis;
     let _ = bind_modern_http;
     let _ = serve_modern_http;
@@ -1141,8 +1300,10 @@ mod prelude_directional_notification_reachability {
 
 fn main() {
     assert_task_opt_in_macro_surface();
+    assert_resumable_resource_and_prompt_macro_surface();
     let _ = assert_legacy_sse_method_signatures;
     assert_completion_handler_reachability();
+    assert_modern_mrtr_resource_and_prompt_handler_exports();
     assert_modern_server_builder_forwarders();
     let _ = assert_modern_server_final_task_forwarders;
     let _ = assert_mcp_apps_wire_bridge_exports::<

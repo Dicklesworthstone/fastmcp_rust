@@ -911,14 +911,16 @@ fn e2e_public_http_modern_only_selects_modern_and_refuses_legacy_only() {
     // A ModernOnly plan has no configured legacy fallback and must not create
     // a client after the LegacyOnly endpoint refuses its modern request.
     let legacy_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::LegacyOnly);
-    let refusal = runtime_block_on_bounded(
+    let refusal = match runtime_block_on_bounded(
         &cx,
         auto::client_builder()
             .client_info("e2e-modern-only-http-client", "1.0.0")
             .protocol_plan(plan(legacy_server.address(), ProtocolPolicy::ModernOnly))
             .connect_http_client_with_cx(&cx),
-    )
-    .expect_err("a ModernOnly facade plan must reject the LegacyOnly endpoint's live 400");
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a ModernOnly facade plan must reject the LegacyOnly endpoint's live 400"),
+    };
     assert!(matches!(
         refusal,
         auto::HttpClientError::Connection(auto::ClientHttpConnectionError::Modern(
@@ -970,14 +972,16 @@ fn e2e_public_http_legacy_only_selects_legacy_and_refuses_modern_only() {
     // A LegacyOnly plan has no configured modern route and must not manufacture
     // an exact-legacy session after the ModernOnly endpoint refuses its SSE GET.
     let modern_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::ModernOnly);
-    let refusal = runtime_block_on_bounded(
+    let refusal = match runtime_block_on_bounded(
         &cx,
         auto::client_builder()
             .client_info("e2e-legacy-only-http-client", "1.0.0")
             .protocol_plan(plan(modern_server.address(), ProtocolPolicy::LegacyOnly))
             .connect_http_client_with_cx(&cx),
-    )
-    .expect_err("a LegacyOnly facade plan must reject the ModernOnly endpoint's live 400");
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a LegacyOnly facade plan must reject the ModernOnly endpoint's live 400"),
+    };
     assert!(matches!(
         refusal,
         auto::HttpClientError::Connection(auto::ClientHttpConnectionError::Modern(

@@ -213,7 +213,7 @@ fn facade_only_dual_era_apps_and_subscription_surfaces_compile() {
         .expect("only the URI scheme differs from the accepted metadata baseline");
     assert_eq!(
         McpAppsToolMetadata::try_new(Some(non_ui_uri), Some(vec![McpAppsToolVisibility::Model]),),
-        Err(McpAppsMetadataError::ResourceUriMustUseUiScheme),
+        Err(McpAppsMetadataError::ResourceUriMustUseUiPrefix),
         "changing only the resource URI scheme must be rejected"
     );
 
@@ -1833,6 +1833,12 @@ fn final_complete_resource_mcp_result() -> McpResult<CompleteResult<FinalReadRes
     Ok(final_resource_payload("mcp-result"))
 }
 
+#[resource(uri = "final://resource/async-outcome")]
+async fn async_final_resource_outcome()
+-> fastmcp_rust::server::FinalMethodOutcome<FinalReadResourceResult> {
+    fastmcp_rust::server::FinalMethodOutcome::Complete(final_resource_payload("async-outcome"))
+}
+
 #[test]
 fn resource_final_complete_results_keep_final_payloads() {
     let ctx = test_ctx();
@@ -1868,6 +1874,34 @@ fn resource_final_complete_results_keep_final_payloads() {
         assert!(meta.is_none());
         assert!(additional.is_empty());
     }
+}
+
+#[test]
+fn async_macro_final_resource_outcome_reaches_public_final_resources_read() {
+    let server = Server::new("facade-final-resource-outcome", "1.0.0")
+        .resource(AsyncFinalResourceOutcomeResource)
+        .build();
+    let request = JsonRpcRequest::new(
+        "resources/read",
+        Some(json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+            "uri": "final://resource/async-outcome",
+        })),
+        65_i64,
+    );
+    let response = server
+        .dispatch_stateless(&facade_final_inbound(), &request)
+        .expect("the public final resources/read route invokes the async macro outcome hook");
+    let result = response
+        .result
+        .expect("final resources/read returns its outcome as a result");
+
+    assert!(response.error.is_none());
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["contents"][0]["text"], "async-outcome");
 }
 
 // --- Resource default trait methods ---
@@ -1922,6 +1956,29 @@ fn resource_multi_param_read_with_uri() {
         .read_with_uri(&ctx, "files://docs/readme.txt", &params)
         .unwrap();
     assert_eq!(result[0].text, Some("docs/readme.txt".to_string()));
+}
+
+/// A resource whose two Rust parameters come from one RFC 6570 expression.
+#[resource(uri = "macro://resource{?collection*,revision*}")]
+fn multi_variable_expression_resource(collection: String, revision: String) -> String {
+    format!("{collection}:{revision}")
+}
+
+#[test]
+fn resource_multi_variable_expression_flattens_every_template_parameter() {
+    let handler = MultiVariableExpressionResourceResource;
+    let ctx = test_ctx();
+    let mut params = HashMap::new();
+    params.insert("collection".to_string(), "books".to_string());
+    params.insert("revision".to_string(), "stable".to_string());
+    let result = handler
+        .read_with_uri(
+            &ctx,
+            "macro://resource?collection=books&revision=stable",
+            &params,
+        )
+        .expect("both parameters from one expression reach the resource function");
+    assert_eq!(result[0].text, Some("books:stable".to_string()));
 }
 
 // --- Resource with optional URI template parameter ---

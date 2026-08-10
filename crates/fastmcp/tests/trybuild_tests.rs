@@ -42,11 +42,8 @@ fn compile_fail_tests() {
 }
 
 /// Compile a real downstream package whose only dependency is a renamed
-/// `fastmcp-rust` facade. This is intentionally an explicit packaging gate:
-/// it launches nested Cargo with an isolated target directory and would make
-/// every ordinary workspace test run unnecessarily expensive.
+/// `fastmcp-rust` facade.
 #[test]
-#[ignore = "explicit facade-only downstream compile gate"]
 fn renamed_facade_only_consumer_compiles_every_macro_family() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target_dir = cargo_target_dir(manifest_dir);
@@ -594,6 +591,44 @@ fn facade_prompt(name: String) -> Vec<PromptMessage> {
     }]
 }
 
+#[resource(uri = "facade://mrtr-resumable-resource")]
+fn facade_mrtr_resumable_resource(
+    completed_inputs: Option<&modern::MrtrCompletedInputs>,
+) -> modern::FinalMethodOutcome<modern::FinalReadResourceResult> {
+    let request_state = if completed_inputs.is_some() {
+        "facade-mrtr-resource-resumed"
+    } else {
+        "facade-mrtr-resource-initial"
+    };
+    modern::FinalMethodOutcome::InputRequired(
+        modern::InputRequiredResult::new(
+            None,
+            Some(request_state.to_owned()),
+            mcp::ResultMeta::default(),
+        )
+        .expect("request state makes the renamed-facade MRTR resource result valid"),
+    )
+}
+
+#[prompt]
+fn facade_mrtr_resumable_prompt(
+    completed_inputs: Option<&modern::MrtrCompletedInputs>,
+) -> modern::FinalMethodOutcome<modern::FinalGetPromptResult> {
+    let request_state = if completed_inputs.is_some() {
+        "facade-mrtr-prompt-resumed"
+    } else {
+        "facade-mrtr-prompt-initial"
+    };
+    modern::FinalMethodOutcome::InputRequired(
+        modern::InputRequiredResult::new(
+            None,
+            Some(request_state.to_owned()),
+            mcp::ResultMeta::default(),
+        )
+        .expect("request state makes the renamed-facade MRTR prompt result valid"),
+    )
+}
+
 fn assert_generated_surface() -> McpResult<()> {
     fn tool_handler<T: ToolHandler>(_: T) {}
     fn resource_handler<T: ResourceHandler>(_: T) {}
@@ -601,7 +636,9 @@ fn assert_generated_surface() -> McpResult<()> {
 
     tool_handler(FacadeTool);
     resource_handler(FacadeResourceResource);
+    resource_handler(FacadeMrtrResumableResourceResource);
     prompt_handler(FacadePromptPrompt);
+    prompt_handler(FacadeMrtrResumablePromptPrompt);
     let _ = ToolInput::json_schema();
     Ok(())
 }
@@ -627,6 +664,10 @@ fn assert_dual_era_facade_surface() {
     let _: Option<FinalRequestMeta> = None;
     let _: Option<ModernHttpClient> = None;
     let _: Option<MrtrExchangeRegistry> = None;
+    let _: Option<modern::InputRequiredResult> = None;
+    let _: Option<modern::MrtrCompletedInputs> = None;
+    let _: Option<modern::FinalMethodOutcome<modern::FinalReadResourceResult>> = None;
+    let _: Option<modern::FinalMethodOutcome<modern::FinalGetPromptResult>> = None;
     let _: Option<LegacySseHttpClient> = None;
     let _: Option<modern::ContentBlock> = None;
     let _: Option<modern::ExtensionDescriptorRegistry> = None;
