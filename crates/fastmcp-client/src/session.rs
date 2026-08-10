@@ -246,6 +246,13 @@ impl ClientExtensionRuntime {
             .contains_key(&official_mcp_apps_extension_id())
     }
 
+    pub(crate) fn configures_extension(&self, extension_id: &str) -> bool {
+        self.client_discovery
+            .extensions
+            .keys()
+            .any(|configured| configured.as_str() == extension_id)
+    }
+
     pub(crate) fn mcp_apps_activation_receipt(
         &self,
         negotiated: &NegotiatedExtensionSet,
@@ -723,23 +730,14 @@ pub(crate) fn mcp_apps_activation_receipt(
     client_settings: Option<&McpAppsClientSettings>,
     discovery: &ServerDiscoverResult,
 ) -> Option<McpAppsActivationReceipt> {
-    let Some(client_settings) = client_settings else {
-        return None;
-    };
-    let Ok(capabilities) = serde_json::to_value(discovery.capabilities()) else {
-        return None;
-    };
-    let Some(server_settings) = capabilities
+    let client_settings = client_settings?;
+    let capabilities = serde_json::to_value(discovery.capabilities()).ok()?;
+    let server_settings = capabilities
         .get("extensions")
         .and_then(serde_json::Value::as_object)
         .and_then(|extensions| extensions.get(official_mcp_apps_extension_id().as_str()))
-        .cloned()
-    else {
-        return None;
-    };
-    let Ok(server_settings) = ExtensionSettings::new(server_settings) else {
-        return None;
-    };
+        .cloned()?;
+    let server_settings = ExtensionSettings::new(server_settings).ok()?;
     let mut registry = ExtensionDescriptorRegistry::new();
     let apps_extension = register_official_mcp_apps_extension(&mut registry).ok()?;
     registry.freeze().ok()?;

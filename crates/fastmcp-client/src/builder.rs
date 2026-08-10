@@ -50,6 +50,11 @@ use crate::{
     combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
 };
 
+#[cfg(feature = "legacy-2024-11-05")]
+const DEFAULT_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::Auto;
+#[cfg(not(feature = "legacy-2024-11-05"))]
+const DEFAULT_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::ModernOnly;
+
 /// The maximum number of connection attempts admitted by the client retry policy.
 const MAX_CONNECTION_ATTEMPTS: u32 = 8;
 /// The maximum delay before one connection retry.
@@ -214,7 +219,7 @@ impl ClientBuilder {
     /// - Retry delay: 1 second
     /// - Inherit environment: true
     /// - Auto-initialize: false (initialize immediately on connect)
-    /// - Protocol policy: Auto
+    /// - Protocol policy: Auto when exact-2024 support is compiled, otherwise ModernOnly
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -235,9 +240,7 @@ impl ClientBuilder {
             client_extension_runtime: None,
             auto_initialize: false,
             owned_process_group: false,
-            protocol_plan: ClientProtocolPlan::stdio(
-                fastmcp_protocol::protocol_policy::ProtocolPolicy::Auto,
-            ),
+            protocol_plan: ClientProtocolPlan::stdio(DEFAULT_PROTOCOL_POLICY),
         }
     }
 
@@ -387,6 +390,7 @@ impl ClientBuilder {
     /// Apps can activate only on a final MCP connection when the server also
     /// advertises its exact empty Apps marker. Exact legacy routes neither
     /// advertise nor activate these settings.
+    #[cfg(feature = "apps")]
     #[must_use]
     pub fn mcp_apps(mut self, settings: McpAppsClientSettings) -> Self {
         self.mcp_apps_settings = Some(settings);
@@ -504,6 +508,8 @@ impl ClientBuilder {
     /// permits at most one modern probe and binds its cache to the complete
     /// configured endpoint bundle rather than to an HTTP origin.
     pub fn http_negotiation(&self) -> Result<ClientHttpNegotiation, ClientHttpNegotiationError> {
+        self.validate_feature_configuration()
+            .map_err(|_| Self::http_policy_admission_error())?;
         ClientHttpNegotiation::from_protocol_plan(&self.protocol_plan)
     }
 
@@ -529,6 +535,9 @@ impl ClientBuilder {
     ) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
         let builder = self.selected_legacy_builder_with_reverse_handlers();
         builder
+            .validate_feature_configuration()
+            .map_err(|_| Self::http_policy_admission_error())?;
+        builder
             .validate_reverse_callback_configuration(&builder.protocol_plan)
             .map_err(|_| Self::http_policy_admission_error())?;
         let reverse_request_handlers = builder.reverse_request_handlers.clone();
@@ -546,8 +555,14 @@ impl ClientBuilder {
 
         if connection.selected_protocol_era()
             == fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024
-            && !reverse_request_handlers.is_empty()
         {
+            // This must run even for an empty handler set. A caller may not
+            // advertise exact-2024 sampling or roots authority without the
+            // matching callable handler merely because Auto selected legacy
+            // after its disposable modern probe.
+            reverse_request_handlers
+                .validate_legacy_capabilities(&legacy_capabilities)
+                .map_err(|_| Self::http_policy_admission_error())?;
             connection.set_legacy_client_capabilities(legacy_capabilities);
             connection
                 .set_legacy_reverse_request_handlers(reverse_request_handlers)
@@ -575,6 +590,9 @@ impl ClientBuilder {
     /// both completed on the admitted legacy routes.
     pub async fn connect_http_client_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
         let builder = self.selected_legacy_builder_with_reverse_handlers();
+        builder
+            .validate_feature_configuration()
+            .map_err(HttpClientError::CoreResult)?;
         builder
             .validate_reverse_callback_configuration(&builder.protocol_plan)
             .map_err(HttpClientError::CoreResult)?;
@@ -624,6 +642,7 @@ impl ClientBuilder {
         // retries, command resolution, or subprocess creation. In particular,
         // auto-initialize must never return a live client that cannot issue its
         // first protocol request.
+        self.validate_feature_configuration()?;
         self.timeout_policy.validate()?;
         let retry_policy = self.effective_connection_retry_policy()?;
         let retry_deadline = Instant::now()
@@ -817,9 +836,7 @@ impl ClientBuilder {
                 // The disposable modern child has been cleaned up before its
                 // error reaches this branch. Observe cancellation again before
                 // creating a fresh legacy child.
-                if cx.checkpoint().is_err() {
-                    return Err(McpError::request_cancelled());
-                }
+                crate::admit_auto_legacy_fallback(cx)?;
                 if Instant::now() >= retry_deadline {
                     return Err(Self::connection_retry_elapsed_error());
                 }
@@ -850,6 +867,7 @@ impl ClientBuilder {
         defer_initialization: bool,
         retry_deadline: Instant,
     ) -> McpResult<Client> {
+        self.validate_feature_configuration()?;
         self.validate_reverse_callback_configuration(&protocol_plan)?;
         // Build the command
         let executable = resolve_stdio_command(command, self.working_dir.as_deref())?;
@@ -972,6 +990,43 @@ impl ClientBuilder {
             }
             ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto => Ok(()),
         }
+    }
+
+    /// Refuses a policy or extension that this crate build did not include,
+    /// before it can resolve a command, spawn a process, or contact HTTP.
+    fn validate_feature_configuration(&self) -> McpResult<()> {
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        if !matches!(self.protocol_plan.policy(), ProtocolPolicy::ModernOnly) {
+            return Err(McpError::invalid_params(format!(
+                "FeatureUnavailable: legacy-2024-11-05 is compiled out; policy {:?} requires --features legacy-2024-11-05",
+                self.protocol_plan.policy(),
+            )));
+        }
+
+        #[cfg(not(feature = "apps"))]
+        if self.mcp_apps_settings.is_some()
+            || self
+                .client_extension_runtime
+                .as_ref()
+                .is_some_and(ClientExtensionRuntime::configures_mcp_apps)
+        {
+            return Err(McpError::invalid_params(
+                "FeatureUnavailable: apps is compiled out; MCP Apps configuration requires --features apps",
+            ));
+        }
+
+        #[cfg(not(feature = "tasks"))]
+        if self
+            .client_extension_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.configures_extension("io.modelcontextprotocol/tasks"))
+        {
+            return Err(McpError::invalid_params(
+                "FeatureUnavailable: tasks is compiled out; Tasks configuration requires --features tasks",
+            ));
+        }
+
+        Ok(())
     }
 
     fn http_policy_admission_error() -> ClientHttpConnectionError {
@@ -1202,7 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_handlers_reject_modern_or_list_changed_legacy_configuration() {
+    fn reverse_handlers_reject_modern_and_require_legacy_capability_parity() {
         let sampling_handler = || {
             ReverseRequestHandlers::new().with_sampling_create_message(|_cancellation, _params| {
                 Ok(fastmcp_protocol::CreateMessageResult::text(
@@ -1226,11 +1281,23 @@ mod tests {
             .reverse_request_handlers(ReverseRequestHandlers::new().with_roots_list(
                 |_cancellation, _params| Ok(fastmcp_protocol::ListRootsResult::new(Vec::new())),
             ));
-        let legacy_error = legacy
+        legacy
             .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(
                 ProtocolPolicy::LegacyOnly,
             ))
-            .expect_err("a callback cannot imply roots/list_changed authority");
+            .expect("roots/listChanged may accompany its callable roots/list handler");
+
+        let missing_handler = ClientBuilder::new().capabilities(ClientCapabilities {
+            roots: Some(fastmcp_protocol::RootsCapability {
+                list_changed: false,
+            }),
+            ..ClientCapabilities::default()
+        });
+        let legacy_error = missing_handler
+            .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(
+                ProtocolPolicy::LegacyOnly,
+            ))
+            .expect_err("an advertised roots capability requires a roots/list handler");
         assert_eq!(legacy_error.code, fastmcp_core::McpErrorCode::InvalidParams);
     }
 

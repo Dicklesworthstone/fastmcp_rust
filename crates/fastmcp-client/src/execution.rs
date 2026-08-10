@@ -7,7 +7,7 @@
 //! malformed peer ingress into a peer-directed JSON-RPC response.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ use asupersync::Cx;
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, sha256_bounded};
 use fastmcp_protocol::methods::{INITIALIZE, SUBSCRIPTIONS_LISTEN, TOOLS_CALL};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
+#[cfg(feature = "tasks")]
 use fastmcp_protocol::tasks_extension::{
     CancelTaskParams, CancelTaskResult, GetTaskParams, GetTaskResult, TASK_STATUS_NOTIFICATION,
     Task, TaskId, TaskInputLedger, TaskMethodRequest, TaskStatusNotification, UpdateTaskParams,
@@ -429,7 +430,7 @@ fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
     if bytes.get(start) == Some(&b'"') {
         return json_string_end(bytes, start);
     }
-    if matches!(bytes.get(start), Some(b'{') | Some(b'[')) {
+    if matches!(bytes.get(start), Some(b'{' | b'[')) {
         let mut stack = vec![*bytes.get(start)?];
         let mut cursor = start + 1;
         while let Some(byte) = bytes.get(cursor) {
@@ -459,7 +460,7 @@ fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
         return None;
     }
     let mut cursor = start;
-    while !matches!(bytes.get(cursor), None | Some(b',') | Some(b'}')) {
+    while !matches!(bytes.get(cursor), None | Some(b',' | b'}')) {
         cursor += 1;
     }
     let mut end = cursor;
@@ -486,9 +487,7 @@ fn tolerant_final_cache_ttl(
     ) {
         return None;
     }
-    let Some(members) = result.as_object_mut() else {
-        return None;
-    };
+    let members = result.as_object_mut()?;
     if members
         .get("resultType")
         .is_some_and(|result_type| result_type.as_str() != Some("complete"))
@@ -939,6 +938,7 @@ impl<T> SharedExecutorState<T> {
     }
 }
 
+#[cfg(feature = "tasks")]
 #[derive(Clone, Debug)]
 enum TaskExecutionOperation {
     ToolCall,
@@ -948,6 +948,7 @@ enum TaskExecutionOperation {
     Subscription,
 }
 
+#[cfg(feature = "tasks")]
 #[derive(Debug)]
 struct TaskSubscription {
     requested_filter: SubscriptionFilter,
@@ -957,7 +958,7 @@ struct TaskSubscription {
 
 #[derive(Debug)]
 enum ExecutionOutcome {
-    Response(DecodedFinalResponse),
+    Response(Box<DecodedFinalResponse>),
     Failure(McpError),
 }
 
@@ -974,7 +975,7 @@ struct DecodedFinalResponse {
 
 #[derive(Debug)]
 enum AdmittedFinalResult {
-    Core(DecodedResult, Option<ResultPeerDiagnostic>),
+    Core(Box<DecodedResult>, Option<ResultPeerDiagnostic>),
     Task,
 }
 
@@ -1023,7 +1024,9 @@ impl DecodedFinalResponse {
                     .map_err(|_| {
                         McpError::invalid_request("Peer final result failed protocol decoding")
                     })
-                    .map(|(result, diagnostic)| AdmittedFinalResult::Core(result, diagnostic))
+                    .map(|(result, diagnostic)| {
+                        AdmittedFinalResult::Core(Box::new(result), diagnostic)
+                    })
             })
             .transpose()?;
         Ok(Self {
@@ -1035,7 +1038,7 @@ impl DecodedFinalResponse {
 
     fn into_decoded(self) -> McpResult<(DecodedResult, Option<ResultPeerDiagnostic>)> {
         match self.decoded {
-            Some(AdmittedFinalResult::Core(decoded, diagnostic)) => Ok((decoded, diagnostic)),
+            Some(AdmittedFinalResult::Core(decoded, diagnostic)) => Ok((*decoded, diagnostic)),
             Some(AdmittedFinalResult::Task) => Err(McpError::invalid_request(
                 "Tasks result requires its typed Tasks execution surface",
             )),
@@ -1101,6 +1104,7 @@ struct ExecutorState<T> {
     terminal_expirations: HashMap<(RequestId, u64), Instant>,
     cancellation_events: VecDeque<CancellationRequested>,
     deferred_drop_cancellations: VecDeque<DeferredDropCancellation>,
+    #[cfg(feature = "tasks")]
     task_subscriptions: HashMap<(RequestId, u64), TaskSubscription>,
     next_generation: u64,
     result_peer_era: ResultPeerEra,
@@ -1208,6 +1212,7 @@ impl<T> ExecutorState<T> {
         for key in expired {
             self.release_terminal(&key);
             self.stream_notifications.remove(&key);
+            #[cfg(feature = "tasks")]
             self.task_subscriptions.remove(&key);
         }
     }
@@ -1227,6 +1232,7 @@ impl<T> ExecutorState<T> {
         self.terminal_error = Some(error.clone());
         self.tombstones.clear();
         self.cancel_reverse_requests();
+        #[cfg(feature = "tasks")]
         self.task_subscriptions.clear();
         self.deferred_drop_cancellations.clear();
         let pending = std::mem::take(&mut self.pending);
@@ -1343,6 +1349,7 @@ where
                 terminal_expirations: HashMap::new(),
                 cancellation_events: VecDeque::new(),
                 deferred_drop_cancellations: VecDeque::new(),
+                #[cfg(feature = "tasks")]
                 task_subscriptions: HashMap::new(),
                 next_generation: 0,
                 result_peer_era,
@@ -1403,6 +1410,49 @@ where
             .take(2)
             .count()
             == 1
+    }
+
+    /// Returns whether a modern server cancellation names this executor's live
+    /// `subscriptions/listen` owner.
+    ///
+    /// Final MCP limits server-originated wire cancellation to that stream.
+    /// A connection ingress arbiter uses this predicate before handing the
+    /// complete admitted frame to [`Self::drive_frame`], which performs the
+    /// terminal transition. Foreign, malformed, and metadata-conflicting
+    /// controls deliberately remain outside this executor.
+    pub(crate) fn owns_modern_subscription_cancellation(
+        &self,
+        notification: &JsonRpcRequest,
+    ) -> bool {
+        let state = self.state.borrow();
+        if state.result_peer_era != ResultPeerEra::Modern {
+            return false;
+        }
+        let Ok(CancellationWireMessage::Modern2026 { params, .. }) =
+            CancellationWireMessage::decode(
+                ProtocolEra::Modern2026,
+                CancellationSender::Server,
+                notification,
+            )
+        else {
+            return false;
+        };
+        if let Some(metadata_subscription_id) = params
+            .meta
+            .as_ref()
+            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+            && !metadata_subscription_id.correlates_with(&params.request_id)
+        {
+            return false;
+        }
+        state.pending.values().any(|pending| {
+            pending.method == SUBSCRIPTIONS_LISTEN
+                && pending
+                    .record
+                    .request_id
+                    .correlates_with(&params.request_id)
+        })
     }
 
     /// Starts one request-owned execution after its request is committed.
@@ -1523,12 +1573,14 @@ where
             state: self.state.clone(),
             method: request.method,
             params: request.params,
+            #[cfg(feature = "tasks")]
             task_operation: None,
             tombstone_retention: self.tombstone_retention,
             completed: false,
         })
     }
 
+    #[cfg(feature = "tasks")]
     pub fn execute_task_tool_call(
         &self,
         cx: &Cx,
@@ -1546,6 +1598,7 @@ where
         Ok(execution)
     }
 
+    #[cfg(feature = "tasks")]
     pub fn execute_tasks_get(&self, cx: &Cx, request: Request) -> McpResult<RequestExecution<T>> {
         self.require_modern_tasks_era()?;
         let task = self.decode_tasks_get_request(&request)?;
@@ -1554,6 +1607,7 @@ where
         Ok(execution)
     }
 
+    #[cfg(feature = "tasks")]
     pub fn execute_tasks_update(
         &self,
         cx: &Cx,
@@ -1584,6 +1638,7 @@ where
         Ok(execution)
     }
 
+    #[cfg(feature = "tasks")]
     pub fn execute_tasks_cancel(
         &self,
         cx: &Cx,
@@ -1596,6 +1651,7 @@ where
         Ok(execution)
     }
 
+    #[cfg(feature = "tasks")]
     pub fn execute_tasks_subscription(
         &self,
         cx: &Cx,
@@ -1740,13 +1796,19 @@ where
                         state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
                         return Err(error);
                     }
-                } else if self.route_task_subscription_acknowledgement_locked(state, &request)? {
-                } else if self.route_task_subscription_notification_locked(state, &request)? {
-                } else if self.route_stream_notification_locked(state, &request)? {
-                } else if !state.retain_notification(request) {
-                    let error = McpError::internal_error("Client peer-activity queue is full");
-                    state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
-                    return Err(error);
+                } else {
+                    #[cfg(feature = "tasks")]
+                    let handled = self
+                        .route_task_subscription_acknowledgement_locked(state, &request)?
+                        || self.route_task_subscription_notification_locked(state, &request)?
+                        || self.route_stream_notification_locked(state, &request)?;
+                    #[cfg(not(feature = "tasks"))]
+                    let handled = self.route_stream_notification_locked(state, &request)?;
+                    if !handled && !state.retain_notification(request) {
+                        let error = McpError::internal_error("Client peer-activity queue is full");
+                        state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -1883,7 +1945,7 @@ where
     ) -> McpResult<(DecodedResult, Option<ResultPeerDiagnostic>)> {
         let (outcome, _) = self.wait_for_terminal(cx, execution)?;
         match outcome {
-            ExecutionOutcome::Response(response) => response.into_decoded(),
+            ExecutionOutcome::Response(response) => (*response).into_decoded(),
             ExecutionOutcome::Failure(error) => Err(error),
         }
     }
@@ -1901,13 +1963,14 @@ where
         let (outcome, stream) = self.wait_for_terminal(cx, execution)?;
         match outcome {
             ExecutionOutcome::Response(response) => {
-                let (decoded, diagnostic) = response.into_decoded()?;
+                let (decoded, diagnostic) = (*response).into_decoded()?;
                 Ok((decoded, diagnostic, stream))
             }
             ExecutionOutcome::Failure(error) => Err(error),
         }
     }
 
+    #[cfg(feature = "tasks")]
     pub fn wait_task_tool_call(
         &self,
         cx: &Cx,
@@ -1918,8 +1981,11 @@ where
             matches!(operation, TaskExecutionOperation::ToolCall)
         })?;
         let core_request = self.decode_final_core_request_from_execution(execution)?;
-        let response = self.wait(cx, execution)?;
-        match core_request.decode_response(&response) {
+        let (response, result_source) = self.wait_with_raw_result(cx, execution)?;
+        let result_source = result_source.as_deref().ok_or_else(|| {
+            McpError::invalid_request("Peer tools/call Task result lost its admitted result source")
+        })?;
+        match core_request.decode_response_result(&response, result_source) {
             Ok(CoreResult::Final(FinalCoreResult::ToolsCallTask { result })) => Ok(result),
             Ok(_) | Err(_) => Err(McpError::invalid_request(
                 "Peer tools/call result is not a final Tasks creation result",
@@ -1927,6 +1993,7 @@ where
         }
     }
 
+    #[cfg(feature = "tasks")]
     pub fn wait_tasks_get(
         &self,
         cx: &Cx,
@@ -1950,6 +2017,7 @@ where
         Ok(result)
     }
 
+    #[cfg(feature = "tasks")]
     pub fn wait_tasks_update(
         &self,
         cx: &Cx,
@@ -1963,6 +2031,7 @@ where
         decode_task_response(&response, "tasks/update")
     }
 
+    #[cfg(feature = "tasks")]
     pub fn wait_tasks_cancel(
         &self,
         cx: &Cx,
@@ -1976,6 +2045,7 @@ where
         decode_task_response(&response, "tasks/cancel")
     }
 
+    #[cfg(feature = "tasks")]
     pub fn take_tasks_subscription_notifications(
         &self,
         execution: &RequestExecution<T>,
@@ -1991,6 +2061,7 @@ where
         Ok(subscription.notifications.drain(..).collect())
     }
 
+    #[cfg(feature = "tasks")]
     pub fn wait_tasks_subscription(
         &self,
         cx: &Cx,
@@ -2414,7 +2485,7 @@ where
                 waiter_release: true,
                 tombstone: true,
             },
-            ExecutionOutcome::Response(decoded),
+            ExecutionOutcome::Response(Box::new(decoded)),
         );
         Ok(())
     }
@@ -2426,9 +2497,9 @@ where
         self.flush_deferred_drop_cancellations_locked(cx, state)?;
         let abandoned = state
             .pending
-            .iter()
-            .filter(|(_, pending)| pending.owner_dropped.get())
-            .map(|(_, pending)| {
+            .values()
+            .filter(|pending| pending.owner_dropped.get())
+            .map(|pending| {
                 (
                     pending.record.request_id.clone(),
                     pending.record.execution_generation,
@@ -2523,6 +2594,7 @@ where
         pending.record.cancellation_committed = true;
         pending.record.terminal_state = ExecutionTerminalState::Cancelled;
         let generation = pending.record.execution_generation;
+        #[cfg(feature = "tasks")]
         state
             .task_subscriptions
             .remove(&(owned_request_id.clone(), generation));
@@ -2650,6 +2722,7 @@ where
         cancellation_control_message_for_era(state.result_peer_era, request_id)
     }
 
+    #[cfg(feature = "tasks")]
     fn route_task_subscription_acknowledgement_locked(
         &self,
         state: &mut ExecutorState<T>,
@@ -2709,6 +2782,7 @@ where
         Ok(true)
     }
 
+    #[cfg(feature = "tasks")]
     fn route_task_subscription_notification_locked(
         &self,
         state: &mut ExecutorState<T>,
@@ -2788,6 +2862,7 @@ where
         Ok(true)
     }
 
+    #[cfg(feature = "tasks")]
     fn require_modern_tasks_era(&self) -> McpResult<()> {
         if self.state.borrow().result_peer_era != ResultPeerEra::Modern {
             return Err(McpError::invalid_request(
@@ -2797,6 +2872,7 @@ where
         Ok(())
     }
 
+    #[cfg(feature = "tasks")]
     fn decode_final_core_request(&self, request: &Request) -> McpResult<CoreRequest> {
         CoreRequest::decode(
             ProtocolEra::Modern2026,
@@ -2806,6 +2882,7 @@ where
         .map_err(|_| McpError::invalid_params("Invalid final core request for Tasks execution"))
     }
 
+    #[cfg(feature = "tasks")]
     fn decode_final_core_request_from_execution(
         &self,
         execution: &RequestExecution<T>,
@@ -2818,6 +2895,7 @@ where
         .map_err(|_| McpError::invalid_params("Invalid final core request for Tasks execution"))
     }
 
+    #[cfg(feature = "tasks")]
     fn task_request_wire(&self, request: &Request) -> McpResult<Value> {
         let request_id = request.id.clone().ok_or_else(|| {
             McpError::invalid_params("Tasks execution requires a JSON-RPC request ID")
@@ -2830,12 +2908,14 @@ where
         }))
     }
 
+    #[cfg(feature = "tasks")]
     fn decode_tasks_get_request(&self, request: &Request) -> McpResult<GetTaskParams> {
         TaskMethodRequest::<GetTaskParams>::decode(self.task_request_wire(request)?)
             .map(|request| request.params)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/get request"))
     }
 
+    #[cfg(feature = "tasks")]
     fn decode_tasks_update_request(
         &self,
         request: &Request,
@@ -2849,12 +2929,14 @@ where
         .map_err(|_| McpError::invalid_params("Invalid final tasks/update request"))
     }
 
+    #[cfg(feature = "tasks")]
     fn decode_tasks_cancel_request(&self, request: &Request) -> McpResult<CancelTaskParams> {
         TaskMethodRequest::<CancelTaskParams>::decode_cancel(self.task_request_wire(request)?)
             .map(|request| request.params)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/cancel request"))
     }
 
+    #[cfg(feature = "tasks")]
     fn decode_tasks_subscription_request(
         &self,
         request: &Request,
@@ -2893,8 +2975,8 @@ where
     ) -> McpResult<()> {
         let expired = state
             .pending
-            .iter()
-            .filter_map(|(_, pending)| {
+            .values()
+            .filter_map(|pending| {
                 let reason = if observed_at >= pending.record.absolute_deadline {
                     Some(ExecutionTerminalReason::AbsoluteTimeout)
                 } else if observed_at >= pending.record.idle_deadline {
@@ -3010,7 +3092,7 @@ fn cancellation_control_message_for_era(
                 request_id: request_id.clone(),
                 reason: None,
                 meta: None,
-                additional: Default::default(),
+                additional: BTreeMap::new(),
             },
         },
     };
@@ -3022,6 +3104,7 @@ fn cancellation_control_message_for_era(
         })
 }
 
+#[cfg(feature = "tasks")]
 fn decode_task_response<R>(response: &JsonRpcResponse, method: &'static str) -> McpResult<R>
 where
     R: serde::de::DeserializeOwned,
@@ -3033,6 +3116,7 @@ where
         .map_err(|_| McpError::invalid_request(format!("Peer {method} result is invalid")))
 }
 
+#[cfg(feature = "tasks")]
 fn validate_task_subscription_filter(
     requested_filter: &SubscriptionFilter,
     accepted_filter: &SubscriptionFilter,
@@ -3075,6 +3159,7 @@ pub struct RequestExecution<T> {
     state: SharedExecutorState<T>,
     method: String,
     params: Option<Value>,
+    #[cfg(feature = "tasks")]
     task_operation: Option<TaskExecutionOperation>,
     tombstone_retention: Duration,
     completed: bool,
@@ -3125,6 +3210,7 @@ impl<T> RequestExecution<T> {
         Ok(())
     }
 
+    #[cfg(feature = "tasks")]
     fn ensure_task_operation(
         &self,
         accepts: impl FnOnce(&TaskExecutionOperation) -> bool,
@@ -3142,6 +3228,7 @@ impl<T> RequestExecution<T> {
         Ok(())
     }
 
+    #[cfg(feature = "tasks")]
     fn task_id_for(
         &self,
         select: impl FnOnce(&TaskExecutionOperation) -> Option<&TaskId>,
@@ -3203,6 +3290,7 @@ impl<T> Drop for RequestExecution<T> {
         if self.completed {
             if let Ok(mut state) = self.state.try_borrow_mut() {
                 state.release_terminal(&key);
+                #[cfg(feature = "tasks")]
                 state.task_subscriptions.remove(&key);
             }
             return;
@@ -3217,12 +3305,14 @@ impl<T> Drop for RequestExecution<T> {
         };
         let Some(pending) = state.pending.get(&correlation_key) else {
             state.release_terminal(&key);
+            #[cfg(feature = "tasks")]
             state.task_subscriptions.remove(&key);
             state.stream_notifications.remove(&key);
             return;
         };
         if pending.record.execution_generation != self.generation {
             state.release_terminal(&key);
+            #[cfg(feature = "tasks")]
             state.task_subscriptions.remove(&key);
             state.stream_notifications.remove(&key);
             return;
@@ -3230,6 +3320,7 @@ impl<T> Drop for RequestExecution<T> {
         let Some(pending) = state.pending.remove(&correlation_key) else {
             return;
         };
+        #[cfg(feature = "tasks")]
         state
             .task_subscriptions
             .remove(&(self.request_id.clone(), self.generation));
@@ -3374,6 +3465,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "tasks")]
     fn tasks_subscription_request(id: i64, task_id: &TaskId) -> JsonRpcRequest {
         let mut notifications = SubscriptionFilter::default();
         fastmcp_protocol::set_task_subscription_ids(&mut notifications, vec![task_id.clone()])
@@ -3388,6 +3480,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "tasks")]
     fn task_tool_call_request(id: i64) -> JsonRpcRequest {
         JsonRpcRequest::new(
             TOOLS_CALL,
@@ -3400,6 +3493,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "tasks")]
     fn tasks_subscription_acknowledgement(id: i64, task_id: &TaskId) -> JsonRpcMessage {
         JsonRpcMessage::Request(JsonRpcRequest::notification(
             "notifications/subscriptions/acknowledged",
@@ -3410,6 +3504,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "tasks")]
     fn tasks_status_notification(id: i64, task_id: &TaskId) -> JsonRpcMessage {
         JsonRpcMessage::Request(JsonRpcRequest::notification(
             TASK_STATUS_NOTIFICATION,
@@ -4864,7 +4959,7 @@ mod tests {
             assert_eq!(rejection.id, Some(RequestId::Number(700)));
             assert_eq!(
                 rejection.error.as_ref().map(|error| error.code.clone()),
-                Some(i32::from(McpErrorCode::MethodNotFound))
+                Some(McpErrorCode::MethodNotFound.into())
             );
         }
 
@@ -4963,6 +5058,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_executor_tool_call_preserves_completed_task_result_source() {
+        let cx = Cx::for_testing();
+        let raw_result = r#"{"resultType":"task","taskId":"task-escaped","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{"structuredContent":{"z":1.20e+4,"message":"line\nquoted\" value"},"content":[]}}"#;
+        let typed_result: Value =
+            serde_json::from_str(raw_result).expect("exact Task source remains valid JSON");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute_task_tool_call(&cx, task_tool_call_request(72))
+            .expect("final tools/call commits before source-aware Task ingress");
+
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(RequestId::Number(72), typed_result),
+                Some(raw_result.to_owned()),
+            )
+            .expect("the completed Task response is admitted with its exact source");
+        let created = executor
+            .wait_task_tool_call(&cx, &mut execution)
+            .expect("the public Tasks path decodes from the admitted source");
+        let Task::Completed { result, .. } = created.task else {
+            panic!("the completed Task branch must reach the public result");
+        };
+        let expected_nested_result =
+            r#"{"structuredContent":{"z":1.20e+4,"message":"line\nquoted\" value"},"content":[]}"#;
+        assert_eq!(
+            serde_json::to_string(&result).expect("completed Task result re-emits"),
+            expected_nested_result,
+            "escaped strings, member order, and numeric spelling survive the public Tasks path"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
     fn unit_task_01_executor_subscription_lifecycle_positive() {
         let cx = Cx::for_testing();
         let task_id = TaskId::parse("task-73").expect("bounded task id");
@@ -5019,6 +5152,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tasks")]
     fn unit_task_01_executor_subscription_wrong_task_negative_unchanged_state() {
         let cx = Cx::for_testing();
         let requested_task = TaskId::parse("task-73").expect("bounded requested task id");

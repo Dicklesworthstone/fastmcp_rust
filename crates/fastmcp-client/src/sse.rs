@@ -48,9 +48,9 @@ const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// integration layer, never assumed ambiently by this parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SseLimits {
-    max_line_bytes: usize,
-    max_event_bytes: usize,
-    max_keepalive_lines: usize,
+    line_bytes: usize,
+    event_bytes: usize,
+    keepalive_lines: usize,
 }
 
 impl SseLimits {
@@ -67,9 +67,9 @@ impl SseLimits {
             return None;
         }
         Some(Self {
-            max_line_bytes,
-            max_event_bytes,
-            max_keepalive_lines,
+            line_bytes: max_line_bytes,
+            event_bytes: max_event_bytes,
+            keepalive_lines: max_keepalive_lines,
         })
     }
 
@@ -77,21 +77,21 @@ impl SseLimits {
     /// on replacement-decoded text.
     #[must_use]
     pub const fn max_line_bytes(&self) -> usize {
-        self.max_line_bytes
+        self.line_bytes
     }
 
     /// Maximum bytes in one assembled event, enforced independently on the
     /// raw octets of its `data` lines and on the decoded data buffer.
     #[must_use]
     pub const fn max_event_bytes(&self) -> usize {
-        self.max_event_bytes
+        self.event_bytes
     }
 
     /// Maximum consecutive non-dispatching lines (comments, inert fields,
     /// blank no-data lines) between dispatched events.
     #[must_use]
     pub const fn max_keepalive_lines(&self) -> usize {
-        self.max_keepalive_lines
+        self.keepalive_lines
     }
 }
 
@@ -128,6 +128,20 @@ pub enum SseParseError {
     },
     /// The parser already refused earlier input and holds no state.
     Poisoned,
+}
+
+/// The result of incrementally handing one dispatched SSE payload to its
+/// caller.
+///
+/// The parser keeps parsing and allocation bounded independently from the
+/// integration's pending-event budget. A consumer refusal still poisons the
+/// parser so the owning response stream can release both sides together.
+#[derive(Debug)]
+pub(crate) enum SsePushError<E> {
+    /// The event-stream wire syntax or parser-local limits were refused.
+    Parse(SseParseError),
+    /// The caller refused one individual dispatched payload.
+    Consumer(E),
 }
 
 impl fmt::Display for SseParseError {
@@ -211,10 +225,34 @@ impl BoundedSseParser {
     /// [`SseParseError::Poisoned`]; the owning response stream must be
     /// closed.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, SseParseError> {
-        if self.poisoned {
-            return Err(SseParseError::Poisoned);
-        }
         let mut dispatched = Vec::new();
+        self.push_with(chunk, |payload| {
+            dispatched.push(payload);
+            Ok::<_, ()>(())
+        })
+        .map_err(|error| match error {
+            SsePushError::Parse(error) => error,
+            SsePushError::Consumer(()) => unreachable!("infallible SSE event collector refused"),
+        })?;
+        Ok(dispatched)
+    }
+
+    /// Consumes one response-body chunk, dispatching each completed payload
+    /// immediately to `accept` instead of first materializing a chunk-wide
+    /// collection.
+    ///
+    /// This lets an integration enforce its aggregate pending count and byte
+    /// budgets before a chunk packed with individually valid SSE events can
+    /// allocate every payload at once. On either parser or consumer refusal,
+    /// parser buffers are released and further input is poisoned.
+    pub(crate) fn push_with<E>(
+        &mut self,
+        chunk: &[u8],
+        mut accept: impl FnMut(String) -> Result<(), E>,
+    ) -> Result<(), SsePushError<E>> {
+        if self.poisoned {
+            return Err(SsePushError::Parse(SseParseError::Poisoned));
+        }
         for &byte in chunk {
             if self.pending_cr {
                 self.pending_cr = false;
@@ -224,27 +262,23 @@ impl BoundedSseParser {
             }
             match byte {
                 b'\r' => {
-                    if let Err(error) = self.complete_line(&mut dispatched) {
-                        return Err(self.poison(error));
-                    }
+                    self.complete_line_with(&mut accept)?;
                     self.pending_cr = true;
                 }
-                b'\n' => {
-                    if let Err(error) = self.complete_line(&mut dispatched) {
-                        return Err(self.poison(error));
-                    }
-                }
+                b'\n' => self.complete_line_with(&mut accept)?,
                 other => {
-                    if self.raw_line.len() >= self.limits.max_line_bytes {
-                        return Err(self.poison(SseParseError::LineTooLong {
-                            limit_bytes: self.limits.max_line_bytes,
-                        }));
+                    if self.raw_line.len() >= self.limits.line_bytes {
+                        return Err(SsePushError::Parse(self.poison(
+                            SseParseError::LineTooLong {
+                                limit_bytes: self.limits.line_bytes,
+                            },
+                        )));
                     }
                     self.raw_line.push(other);
                 }
             }
         }
-        Ok(dispatched)
+        Ok(())
     }
 
     /// Terminates the stream, reporting what pending state was discarded.
@@ -278,7 +312,10 @@ impl BoundedSseParser {
         error
     }
 
-    fn complete_line(&mut self, dispatched: &mut Vec<String>) -> Result<(), SseParseError> {
+    fn complete_line_with<E>(
+        &mut self,
+        accept: &mut impl FnMut(String) -> Result<(), E>,
+    ) -> Result<(), SsePushError<E>> {
         let mut raw = core::mem::take(&mut self.raw_line);
         if self.bom_window_open {
             self.bom_window_open = false;
@@ -293,29 +330,37 @@ impl BoundedSseParser {
         // line, and a sequence interrupted by a terminator is invalid in
         // both formulations.
         let line = String::from_utf8_lossy(&raw);
-        if line.len() > self.limits.max_line_bytes {
+        if line.len() > self.limits.line_bytes {
             // Replacement expansion (U+FFFD is three bytes) counts against
             // the same ceiling as the raw octets, independently.
-            return Err(SseParseError::LineTooLong {
-                limit_bytes: self.limits.max_line_bytes,
-            });
+            return Err(SsePushError::Parse(self.poison(
+                SseParseError::LineTooLong {
+                    limit_bytes: self.limits.line_bytes,
+                },
+            )));
         }
-        self.process_line(&line, raw_len, dispatched)
+        match self.process_line_with(&line, raw_len, accept) {
+            Ok(()) => Ok(()),
+            Err(SsePushError::Parse(error)) => Err(SsePushError::Parse(self.poison(error))),
+            Err(SsePushError::Consumer(error)) => Err(SsePushError::Consumer(error)),
+        }
     }
 
-    fn process_line(
+    fn process_line_with<E>(
         &mut self,
         line: &str,
         raw_len: usize,
-        dispatched: &mut Vec<String>,
-    ) -> Result<(), SseParseError> {
+        accept: &mut impl FnMut(String) -> Result<(), E>,
+    ) -> Result<(), SsePushError<E>> {
         if line.is_empty() {
             // Dispatch step. The empty-buffer check precedes trailing-LF
             // removal, so one empty data field ("\n" in the buffer) really
             // dispatches an empty payload while a no-data event dispatches
             // nothing.
             if self.data.is_empty() {
-                return self.count_non_dispatching_line();
+                return self
+                    .count_non_dispatching_line()
+                    .map_err(SsePushError::Parse);
             }
             let mut payload = core::mem::take(&mut self.data);
             if payload.ends_with('\n') {
@@ -323,11 +368,15 @@ impl BoundedSseParser {
             }
             self.event_raw_bytes = 0;
             self.keepalive_lines = 0;
-            dispatched.push(payload);
-            return Ok(());
+            return accept(payload).map_err(|error| {
+                self.poison(SseParseError::Poisoned);
+                SsePushError::Consumer(error)
+            });
         }
         if line.starts_with(':') {
-            return self.count_non_dispatching_line();
+            return self
+                .count_non_dispatching_line()
+                .map_err(SsePushError::Parse);
         }
         let (field, value) = match line.split_once(':') {
             Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
@@ -340,12 +389,12 @@ impl BoundedSseParser {
                 .saturating_add(value.len())
                 .saturating_add(1);
             let raw_after = self.event_raw_bytes.saturating_add(raw_len);
-            if decoded_after > self.limits.max_event_bytes
-                || raw_after > self.limits.max_event_bytes
-            {
-                return Err(SseParseError::EventTooLarge {
-                    limit_bytes: self.limits.max_event_bytes,
-                });
+            if decoded_after > self.limits.event_bytes || raw_after > self.limits.event_bytes {
+                return Err(SsePushError::Parse(self.poison(
+                    SseParseError::EventTooLarge {
+                        limit_bytes: self.limits.event_bytes,
+                    },
+                )));
             }
             self.data.push_str(value);
             self.data.push('\n');
@@ -358,13 +407,14 @@ impl BoundedSseParser {
         // delay, no decoder selection — inert fields from standard producers
         // are accepted without reviving removed modern SSE state.
         self.count_non_dispatching_line()
+            .map_err(SsePushError::Parse)
     }
 
     fn count_non_dispatching_line(&mut self) -> Result<(), SseParseError> {
         self.keepalive_lines = self.keepalive_lines.saturating_add(1);
-        if self.keepalive_lines > self.limits.max_keepalive_lines {
+        if self.keepalive_lines > self.limits.keepalive_lines {
             return Err(SseParseError::KeepaliveFlood {
-                limit_lines: self.limits.max_keepalive_lines,
+                limit_lines: self.limits.keepalive_lines,
             });
         }
         Ok(())
@@ -373,7 +423,7 @@ impl BoundedSseParser {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError};
+    use super::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError, SsePushError};
 
     fn generous_limits() -> SseLimits {
         SseLimits::new(4_096, 65_536, 64).expect("nonzero test limits")
@@ -683,6 +733,38 @@ mod tests {
         let events = parser.push(b"\n\n").expect("dispatches");
         assert_eq!(events, ["hello"]);
         assert_eq!(parser.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn chunk_packed_consumer_overflow_stops_before_materializing_the_tail() {
+        // Vary only the number of otherwise identical, individually valid
+        // events in one native chunk. The rejecting consumer observes exactly
+        // the first overflowing event; later chunk entries are never
+        // materialized into payload Strings.
+        let accepted = 3_usize;
+        let chunk = b"data: x\n\n".repeat(accepted + 2);
+        let mut parser = BoundedSseParser::new(generous_limits());
+        let mut observed = 0_usize;
+
+        let error = parser
+            .push_with(&chunk, |_| {
+                observed += 1;
+                if observed > accepted { Err(()) } else { Ok(()) }
+            })
+            .expect_err("the first event beyond the one-variable count limit refuses");
+
+        assert!(matches!(error, SsePushError::Consumer(())));
+        assert_eq!(observed, accepted + 1);
+        assert_eq!(
+            parser.buffered_bytes(),
+            0,
+            "refusal releases parser buffers"
+        );
+        assert_eq!(
+            parser.push(b"data: later\n\n"),
+            Err(SseParseError::Poisoned),
+            "a consumer-refused chunk cannot materialize a later tail"
+        );
     }
 
     #[test]

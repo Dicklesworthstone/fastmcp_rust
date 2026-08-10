@@ -164,6 +164,10 @@ pub enum FinalCacheMiss {
 
 /// Result of looking up a final complete result.
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "this public synchronous lookup preserves direct CoreResult ownership; boxing would only add an allocation and degrade the returned API"
+)]
 pub enum FinalCacheLookup {
     /// A complete validated result that remains fresh.
     Fresh(CoreResult),
@@ -183,7 +187,7 @@ pub(crate) struct FinalCachePage {
 /// Internal cache lookup including page provenance.
 #[derive(Clone, Debug)]
 pub(crate) enum FinalCachePageLookup {
-    Fresh(FinalCachePage),
+    Fresh(Box<FinalCachePage>),
     Miss(FinalCacheMiss),
 }
 
@@ -376,11 +380,11 @@ impl FinalResultCache {
         }
 
         self.stats.hits = self.stats.hits.saturating_add(1);
-        FinalCachePageLookup::Fresh(FinalCachePage {
+        FinalCachePageLookup::Fresh(Box::new(FinalCachePage {
             result,
             generation: entry_generation,
             scope,
-        })
+        }))
     }
 
     /// Looks up one complete result using the current monotonic instant.
@@ -575,12 +579,13 @@ pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(CacheTtl, CacheS
         }
         FinalCoreResult::Completion { .. }
         | FinalCoreResult::ToolsCall { .. }
-        | FinalCoreResult::ToolsCallTask { .. }
         | FinalCoreResult::ToolsCallInputRequired { .. }
         | FinalCoreResult::ResourcesReadInputRequired { .. }
         | FinalCoreResult::PromptsGet { .. }
         | FinalCoreResult::PromptsGetInputRequired { .. }
         | FinalCoreResult::SubscriptionsListen { .. } => None,
+        #[cfg(feature = "tasks")]
+        FinalCoreResult::ToolsCallTask { .. } => None,
     }
 }
 

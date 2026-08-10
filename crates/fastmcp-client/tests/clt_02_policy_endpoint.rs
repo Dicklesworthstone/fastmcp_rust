@@ -4,7 +4,7 @@ use fastmcp_client::{
     ClientProtocolPlan, ClientSession, ModernHttpClientError, ProtocolEra, ProtocolPolicy,
 };
 use fastmcp_core::McpErrorCode;
-use fastmcp_protocol::{ClientInfo, ServerCapabilities, ServerInfo};
+use fastmcp_protocol::{ClientCapabilities, ClientInfo, ServerCapabilities, ServerInfo};
 
 const ABSENT_STDIO_COMMAND: &str = "./clt-02-intentionally-absent-server";
 
@@ -71,7 +71,7 @@ fn clt_02_a_positive() {
             name: "test-client".to_owned(),
             version: "1.0.0".to_owned(),
         },
-        Default::default(),
+        ClientCapabilities::default(),
         ServerInfo {
             name: "test-server".to_owned(),
             version: "1.0.0".to_owned(),

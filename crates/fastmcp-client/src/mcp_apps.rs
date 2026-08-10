@@ -1247,6 +1247,10 @@ impl<'client> McpAppsClientWirePolicy<'client> {
 }
 
 impl McpAppsWireHostPolicy for McpAppsClientWirePolicy<'_> {
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "the public wire-policy trait requires an async forwarding hook; this stdio implementation completes synchronously while the HTTP implementation awaits I/O"
+    )]
     async fn dispatch_reused_request(
         &mut self,
         cx: &Cx,
@@ -1296,20 +1300,29 @@ mod tests {
         ExtensionSettings, ServerExtensionDiscovery, official_mcp_apps_empty_server_settings,
         official_mcp_apps_negotiation_resolver, register_official_mcp_apps_extension,
     };
+    use fastmcp_protocol::protocol_policy::ProtocolEra;
     use fastmcp_protocol::{
         CoreRequest, FINAL_PROTOCOL_VERSION, McpAppsBridgeImplementation,
         McpAppsDownloadFileParams, McpAppsHostNotification, McpAppsMessageParams,
         McpAppsMessageRole, McpAppsOpenLinkParams, McpAppsProgressNotification,
         McpAppsToolCallParams, McpAppsToolResult, McpAppsUpdateModelContextParams,
-        McpAppsViewCapabilities, ProtocolEra,
+        McpAppsViewCapabilities,
     };
     use serde_json::json;
 
     struct AcceptTeardown(bool);
     impl McpAppsHostPolicy for AcceptTeardown {
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "the public host-policy trait requires an async override"
+        )]
         async fn approve_view_teardown(&mut self) -> bool {
             self.0
         }
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "the public host-policy trait requires an async override"
+        )]
         async fn dispatch_reused_request(
             &mut self,
             _cx: &Cx,
@@ -1321,6 +1334,10 @@ mod tests {
 
     struct FailingTransport;
     impl McpAppsBridgeTransport for FailingTransport {
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "the public bridge-transport trait requires an async override"
+        )]
         async fn send_to_view(
             &mut self,
             _cx: &Cx,
@@ -1328,6 +1345,10 @@ mod tests {
         ) -> Result<(), McpAppsHostError> {
             Err(McpAppsHostError::Transport("planted send failure".into()))
         }
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "the public bridge-transport trait requires an async override"
+        )]
         async fn receive_from_view(
             &mut self,
             _cx: &Cx,
@@ -1809,6 +1830,10 @@ mod tests {
     struct WirePolicy;
 
     impl McpAppsWireHostPolicy for WirePolicy {
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "the public wire-host policy trait requires an async override"
+        )]
         async fn dispatch_reused_request(
             &mut self,
             _cx: &Cx,
@@ -1824,6 +1849,10 @@ mod tests {
     }
 
     impl McpAppsWireHostPolicy for ControlRecordingWirePolicy {
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "the public wire-host policy trait requires an async override"
+        )]
         async fn dispatch_reused_request(
             &mut self,
             _cx: &Cx,
@@ -1833,6 +1862,10 @@ mod tests {
             Ok(json!({"forwarded": true}))
         }
 
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "the public wire-host policy trait requires an async override"
+        )]
         async fn progress(
             &mut self,
             request_id: &McpAppsJsonRpcRequestId,
@@ -1845,6 +1878,10 @@ mod tests {
             Ok(())
         }
 
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "the public wire-host policy trait requires an async override"
+        )]
         async fn cancelled(
             &mut self,
             request_id: &McpAppsJsonRpcRequestId,
@@ -1883,6 +1920,10 @@ mod tests {
             Ok(json!({"forwarded": true}))
         }
 
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "the public wire-host policy trait requires an async override"
+        )]
         async fn cancelled(
             &mut self,
             request_id: &McpAppsJsonRpcRequestId,
