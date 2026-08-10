@@ -3624,8 +3624,10 @@ impl FinalTaskRuntimeConfig {
 ///
 /// The callback receives an initial opaque work descriptor or that descriptor
 /// plus validated input responses, together with the task identity and store
-/// generation. It never receives a store record, queue handle, or
-/// task-service control surface. The enclosing
+/// generation. Its handoff is the only application mutation authority: its
+/// `require_input`, `complete_task`, `fail_task`, and
+/// `honor_cancellation` methods carry the elected dispatch fence. It never
+/// receives a store record, queue handle, or task-service control surface. The enclosing
 /// [`AuthorizedTaskServiceRunner`] must be run by the embedding application in
 /// its own structured `Cx` region; FastMCP never creates a runtime or detaches
 /// a worker for it.
