@@ -5007,11 +5007,27 @@ impl ServerHttpSession {
             Ok(request) => request,
             Err(response) => return Ok(Err(ServerHttpEndpointResponse::Immediate(response))),
         };
-        let endpoint_response = self
+        let endpoint_response = match self
             .endpoint_session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .handle(cx, request)?;
+            .handle(cx, request)
+        {
+            Ok(endpoint_response) => endpoint_response,
+            // The transport refuses to construct an SSE body for a frame
+            // whose shape cannot own one (an id-less notification, or a
+            // request that already selected a JSON response) before the
+            // endpoint's own rejection arm can run; peers get the same
+            // graceful 400 the non-streaming arm produces.
+            Err(DualEraHttpEndpointError::Transport(TransportError::Io(error)))
+                if error.kind() == std::io::ErrorKind::InvalidInput =>
+            {
+                return Ok(Err(ServerHttpEndpointResponse::Immediate(
+                    HttpResponse::bad_request(),
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
             return self.handle_modern(cx, endpoint_response).map(Err);
         };
@@ -13549,7 +13565,7 @@ mod lib_unit_tests {
         ExtensionInactiveReason, ExtensionNegotiationError, McpAppsClientSettings,
         official_tasks_empty_settings, register_official_tasks_extension,
     };
-    use fastmcp_protocol::result::{
+    use fastmcp_protocol::{
         CoreResultDiscriminatorPolicy, DecodedResult, ResultPeerEra, decode_peer_result,
     };
     use fastmcp_protocol::{
@@ -14481,11 +14497,7 @@ mod lib_unit_tests {
         let error = rejected
             .error
             .expect("incompatible extension settings must fail closed");
-        assert_eq!(
-            error.code.as_i32(),
-            Some(i32::from(McpErrorCode::InvalidParams))
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(error.code, i32::from(McpErrorCode::InvalidParams).into());        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -14523,9 +14535,8 @@ mod lib_unit_tests {
             .dispatch_stateless(&inbound, &rejected)
             .expect("wrong-era extension request must have an error response");
         assert_eq!(
-            rejected.error.and_then(|error| error.code.as_i32()),
-            Some(i32::from(McpErrorCode::InvalidRequest))
-        );
+            rejected.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InvalidRequest).into())        );
         let mut public_rejected = extension_tasks_get_request(serde_json::json!({}));
         *public_rejected
             .params
@@ -14572,9 +14583,8 @@ mod lib_unit_tests {
             .dispatch_stateless(&inbound, &request)
             .expect("a malformed final request with an id receives an error response");
         assert_eq!(
-            response.error.and_then(|error| error.code.as_i32()),
-            Some(i32::from(McpErrorCode::InvalidParams))
-        );
+            response.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InvalidParams).into())        );
         assert!(response.result.is_none());
     }
 
@@ -14615,9 +14625,8 @@ mod lib_unit_tests {
             .dispatch_stateless(&inbound, &request)
             .expect("a malformed middleware result with an id receives an error response");
         assert_eq!(
-            response.error.and_then(|error| error.code.as_i32()),
-            Some(i32::from(McpErrorCode::InternalError))
-        );
+            response.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InternalError).into())        );
         assert!(response.result.is_none());
     }
 
@@ -14645,11 +14654,7 @@ mod lib_unit_tests {
         let error = response
             .error
             .expect("legacy request must not reach the extension handler");
-        assert_eq!(
-            error.code.as_i32(),
-            Some(i32::from(McpErrorCode::MethodNotFound))
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound).into());        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[derive(Default)]
@@ -16445,9 +16450,8 @@ mod lib_unit_tests {
             .error
             .expect("removing only the Tasks declaration must reject task creation");
         assert_eq!(
-            error.code.as_i32(),
-            Some(MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE)
-        );
+            error.code,
+            MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE.into()        );
         assert_eq!(
             error.data,
             Some(serde_json::json!({
@@ -16655,11 +16659,7 @@ mod lib_unit_tests {
         let error = rejected
             .error
             .expect("changing only Tasks settings must reject the request");
-        assert_eq!(
-            error.code.as_i32(),
-            Some(i32::from(McpErrorCode::InvalidParams))
-        );
-        assert_eq!(
+        assert_eq!(error.code, i32::from(McpErrorCode::InvalidParams).into());        assert_eq!(
             delivered
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -16690,9 +16690,8 @@ mod lib_unit_tests {
             )
             .expect("legacy request must respond");
         assert_eq!(
-            response.error.and_then(|error| error.code.as_i32()),
-            Some(i32::from(McpErrorCode::MethodNotFound))
-        );
+            response.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::MethodNotFound).into())        );
     }
 
     #[test]
@@ -17063,11 +17062,7 @@ mod lib_unit_tests {
                 .error
                 .as_ref()
                 .unwrap_or_else(|| panic!("{method} must fail closed"));
-            assert_eq!(
-                error.code.as_i32(),
-                Some(i32::from(McpErrorCode::MethodNotFound))
-            );
-            assert!(response.result.is_none());
+            assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound).into());            assert!(response.result.is_none());
         }
     }
 
@@ -17081,22 +17076,14 @@ mod lib_unit_tests {
             let error = response
                 .error
                 .unwrap_or_else(|| panic!("{method} with an id must be rejected"));
-            assert_eq!(
-                error.code.as_i32(),
-                Some(i32::from(McpErrorCode::InvalidRequest))
-            );
-            assert!(response.result.is_none());
+            assert_eq!(error.code, i32::from(McpErrorCode::InvalidRequest).into());            assert!(response.result.is_none());
         }
 
         let response = dispatch_test_request(&server, &mut session, "initialized");
         let error = response
             .error
             .expect("the legacy bare initialized spelling must not be routed");
-        assert_eq!(
-            error.code.as_i32(),
-            Some(i32::from(McpErrorCode::MethodNotFound))
-        );
-    }
+        assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound).into());    }
 
     #[test]
     fn log_level_is_session_local_and_does_not_mutate_process_filter() {
@@ -17562,11 +17549,7 @@ mod lib_unit_tests {
                 )
                 .expect("request must receive an authentication error");
             let error = response.error.expect("authentication must fail");
-            assert_eq!(
-                error.code.as_i32(),
-                Some(i32::from(McpErrorCode::ResourceForbidden))
-            );
-            assert_eq!(error.message, "Authentication failed");
+            assert_eq!(error.code, i32::from(McpErrorCode::ResourceForbidden).into());            assert_eq!(error.message, "Authentication failed");
             assert!(error.data.is_none());
         }
 
@@ -17764,11 +17747,7 @@ mod lib_unit_tests {
         let error = response
             .error
             .expect("response-stage cancellation must remain an error");
-        assert_eq!(
-            error.code.as_i32(),
-            Some(i32::from(McpErrorCode::RequestCancelled))
-        );
-        assert_eq!(error.message, "Request cancelled");
+        assert_eq!(error.code, i32::from(McpErrorCode::RequestCancelled).into());        assert_eq!(error.message, "Request cancelled");
         assert!(!error.message.contains("hostile"));
     }
 
@@ -24532,7 +24511,10 @@ mod lib_unit_tests {
             &serde_json::to_vec(&request)
                 .map_err(|error| format!("shutdown-fence request did not serialize: {error}"))?,
             &[
-                ("Accept", "application/json"),
+                // Streamable HTTP POSTs must accept both JSON and SSE; the
+                // server still commits this exchange as an ordinary non-SSE
+                // JSON response.
+                ("Accept", "application/json, text/event-stream"),
                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                 ("Mcp-Method", "tools/call"),
             ],
@@ -26963,7 +26945,7 @@ mod lib_unit_tests {
                 .error
                 .as_ref()
                 .and_then(|error| error.code.as_i32()),
-            Some(i32::from(McpErrorCode::InvalidRequest))
+            Some(i32::from(McpErrorCode::InvalidRequest).into())
         );
     }
 
@@ -27315,11 +27297,7 @@ mod lib_unit_tests {
         let error = rejected
             .error
             .expect("a different principal must not reuse session state");
-        assert_eq!(
-            error.code.as_i32(),
-            Some(i32::from(McpErrorCode::ResourceForbidden))
-        );
-        assert!(rejected.result.is_none());
+        assert_eq!(error.code, i32::from(McpErrorCode::ResourceForbidden).into());        assert!(rejected.result.is_none());
     }
 
     #[test]
@@ -28042,7 +28020,7 @@ mod lib_unit_tests {
                 .as_ref()
                 .expect("budget refusal must be a JSON-RPC cancellation error")
                 .code,
-            i32::from(McpErrorCode::RequestCancelled)
+            i32::from(McpErrorCode::RequestCancelled).into()
         );
         assert_eq!(
             *rejected_seen

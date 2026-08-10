@@ -6718,7 +6718,7 @@ mod tests {
         let primary_delivered = Arc::new(AtomicBool::new(false));
         let primary_delivered_by_emitter = Arc::clone(&primary_delivered);
         let runtime = FinalTaskRuntime::new(
-            Arc::clone(&store),
+            store.clone() as Arc<dyn FinalTaskStore>,
             FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
             Arc::new(move |_| {
                 primary_delivered_by_emitter.store(true, AtomicOrdering::SeqCst);
@@ -6775,7 +6775,7 @@ mod tests {
     fn task_03_final_update_panicking_emitter_preserves_committed_state_and_replay_safety() {
         let store = Arc::new(InMemoryFinalTaskStore::default());
         let runtime = FinalTaskRuntime::new(
-            Arc::clone(&store),
+            store.clone() as Arc<dyn FinalTaskStore>,
             FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
             Arc::new(|_| panic!("planted final task notification emitter panic")),
         );
