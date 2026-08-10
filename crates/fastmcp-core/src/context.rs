@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use asupersync::sync::Notify;
 use asupersync::types::{CancelReason, MAX_MASK_DEPTH};
 use asupersync::{Budget, Cx, Outcome, RegionId, TaskId, Time};
+use fastmcp_protocol::ProgressMarker;
 
 #[cfg(test)]
 use asupersync::time::wall_now;
@@ -1076,12 +1077,34 @@ impl NotificationSender for NoOpNotificationSender {
 #[derive(Clone)]
 pub struct ProgressReporter {
     sender: Arc<dyn NotificationSender>,
+    marker: Option<ProgressMarker>,
 }
 
 impl ProgressReporter {
     /// Creates a new progress reporter with the given sender.
     pub fn new(sender: Arc<dyn NotificationSender>) -> Self {
-        Self { sender }
+        Self {
+            sender,
+            marker: None,
+        }
+    }
+
+    /// Creates a reporter which retains the request marker it will emit.
+    ///
+    /// Proxy routes use this marker to correlate an upstream progress frame
+    /// before relaying it through this request's downstream reporter.
+    #[must_use]
+    pub fn with_marker(marker: ProgressMarker, sender: Arc<dyn NotificationSender>) -> Self {
+        Self {
+            sender,
+            marker: Some(marker),
+        }
+    }
+
+    /// Returns the request marker owned by this reporter, when it has one.
+    #[must_use]
+    pub fn marker(&self) -> Option<&ProgressMarker> {
+        self.marker.as_ref()
     }
 
     /// Reports progress to the client.
@@ -1716,6 +1739,17 @@ impl McpContext {
     #[must_use]
     pub fn has_progress_reporter(&self) -> bool {
         self.ensure_live().is_ok() && self.progress_reporter.is_some()
+    }
+
+    /// Returns the progress marker installed for this request, when available.
+    ///
+    /// A reporter without a marker cannot establish ownership of upstream
+    /// progress frames and therefore must not cause proxy forwarding.
+    #[must_use]
+    pub fn progress_marker(&self) -> Option<&ProgressMarker> {
+        self.ensure_live()
+            .ok()
+            .and_then(|_| self.progress_reporter.as_ref()?.marker())
     }
 
     /// Reports progress on the current operation.
