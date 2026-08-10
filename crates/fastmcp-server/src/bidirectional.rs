@@ -42,9 +42,10 @@ use asupersync::channel::oneshot;
 use asupersync::channel::oneshot::RecvError;
 use base64::Engine as _;
 use fastmcp_core::{
-    ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender,
-    McpError, McpErrorCode, McpRequestCancellation, McpResult, SamplingRequest, SamplingResponse,
-    SamplingRole, SamplingSender, SamplingStopReason, draw_security_identifier,
+    ClientRoot, ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
+    ElicitationSender, McpError, McpErrorCode, McpRequestCancellation, McpResult, RootsProvider,
+    SamplingRequest, SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
+    draw_security_identifier,
 };
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
@@ -781,7 +782,7 @@ impl SamplingSender for TransportSamplingSender {
                         content: fastmcp_protocol::SamplingContent::Text { text: m.text },
                     })
                     .collect(),
-                max_tokens: request.max_tokens,
+                max_tokens: fastmcp_protocol::JsonInteger::from(u64::from(request.max_tokens)),
                 system_prompt: request.system_prompt,
                 temperature: request.temperature,
                 stop_sequences: request.stop_sequences,
@@ -994,6 +995,28 @@ impl TransportRootsProvider {
             .send_request(cx, "roots/list", serde_json::json!({}))
             .await?;
         Ok(result.roots)
+    }
+}
+
+impl RootsProvider for TransportRootsProvider {
+    fn list_roots(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = McpResult<Vec<ClientRoot>>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let cx = Cx::current().ok_or_else(|| {
+                McpError::internal_error("No current asupersync Cx for roots request")
+            })?;
+            let roots = TransportRootsProvider::list_roots(self, &cx).await?;
+            Ok(roots
+                .into_iter()
+                .map(|root| ClientRoot {
+                    uri: root.uri,
+                    name: root.name,
+                })
+                .collect())
+        })
     }
 }
 
@@ -2201,7 +2224,7 @@ mod tests {
                 "sample".to_owned(),
                 MrtrInputRequest::sampling(fastmcp_protocol::CreateMessageParams::new(
                     Vec::new(),
-                    16,
+                    fastmcp_protocol::JsonInteger::from(16_i64),
                 ))
                 .expect("sampling request must serialize"),
             ),
@@ -2566,7 +2589,10 @@ mod tests {
             &cx,
             McpRequestCancellation::new(),
             "sample",
-            fastmcp_protocol::CreateMessageParams::new(Vec::new(), 16),
+            fastmcp_protocol::CreateMessageParams::new(
+                Vec::new(),
+                fastmcp_protocol::JsonInteger::from(16_i64),
+            ),
         ))
         .expect("legacy sampling must await a direct response");
         let DualEraServerToClientResult::Legacy(sampling) = sampling else {
@@ -2654,7 +2680,10 @@ mod tests {
             &cx,
             McpRequestCancellation::new(),
             "sample",
-            fastmcp_protocol::CreateMessageParams::new(Vec::new(), 16),
+            fastmcp_protocol::CreateMessageParams::new(
+                Vec::new(),
+                fastmcp_protocol::JsonInteger::from(16_i64),
+            ),
         ))
         .expect("legacy sampling must preserve an absent stopReason");
         let DualEraServerToClientResult::Legacy(result) = result else {
@@ -2683,7 +2712,10 @@ mod tests {
             &cx,
             McpRequestCancellation::new(),
             "sample",
-            fastmcp_protocol::CreateMessageParams::new(Vec::new(), 16),
+            fastmcp_protocol::CreateMessageParams::new(
+                Vec::new(),
+                fastmcp_protocol::JsonInteger::from(16_i64),
+            ),
         ))
         .expect("legacy sampling must preserve an open provider stopReason");
         let DualEraServerToClientResult::Legacy(result) = result else {
@@ -2710,7 +2742,10 @@ mod tests {
             &cx,
             McpRequestCancellation::new(),
             "sample",
-            fastmcp_protocol::CreateMessageParams::new(Vec::new(), 16),
+            fastmcp_protocol::CreateMessageParams::new(
+                Vec::new(),
+                fastmcp_protocol::JsonInteger::from(16_i64),
+            ),
         ))
         .expect("modern sampling must create an MRTR input result");
         let DualEraServerToClientResult::InputRequired(required) = sampling else {
@@ -4109,6 +4144,23 @@ mod tests {
     }
 
     #[test]
+    fn transport_roots_provider_maps_wire_roots_to_core_roots() {
+        let sender = make_sender_with_responder(|_| {
+            serde_json::json!({
+                "roots": [{"uri": "file:///workspace", "name": "workspace"}]
+            })
+        });
+        let roots = TransportRootsProvider::new(sender);
+
+        let result = fastmcp_core::block_on(fastmcp_core::RootsProvider::list_roots(&roots))
+            .expect("transport roots map into the core context type");
+        assert_eq!(
+            result,
+            vec![ClientRoot::with_name("file:///workspace", "workspace")]
+        );
+    }
+
+    #[test]
     fn transport_roots_provider_empty_roots() {
         let sender = make_sender_with_responder(|_| serde_json::json!({ "roots": [] }));
         let roots = TransportRootsProvider::new(sender);
@@ -4228,6 +4280,17 @@ mod tests {
         let cx = Cx::for_testing();
         let result = block_on(roots.list_roots(&cx));
         assert_eq!(result.unwrap_err().message, TRANSPORT_SEND_ERROR);
+    }
+
+    #[test]
+    fn transport_roots_provider_core_trait_preserves_transport_failure() {
+        let pending = Arc::new(PendingRequests::new());
+        let send_fn: TransportSendFn = Arc::new(|_| Err("network error".to_string()));
+        let roots = TransportRootsProvider::new(RequestSender::new(pending, send_fn));
+
+        let error = fastmcp_core::block_on(fastmcp_core::RootsProvider::list_roots(&roots))
+            .expect_err("the same transport failure must cross the core provider seam");
+        assert_eq!(error.message, TRANSPORT_SEND_ERROR);
     }
 
     // ── SamplingSender — transport failure ───────────────────────

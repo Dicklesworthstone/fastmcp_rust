@@ -292,6 +292,8 @@ pub struct BidirectionalSenders {
     pub sampling: Option<Arc<dyn fastmcp_core::SamplingSender>>,
     /// Optional elicitation sender for user input requests.
     pub elicitation: Option<Arc<dyn fastmcp_core::ElicitationSender>>,
+    /// Optional roots provider for filesystem boundaries exposed by the client.
+    pub roots: Option<Arc<dyn fastmcp_core::RootsProvider>>,
 }
 
 impl BidirectionalSenders {
@@ -314,6 +316,13 @@ impl BidirectionalSenders {
         self.elicitation = Some(sender);
         self
     }
+
+    /// Sets the roots provider.
+    #[must_use]
+    pub fn with_roots(mut self, provider: Arc<dyn fastmcp_core::RootsProvider>) -> Self {
+        self.roots = Some(provider);
+        self
+    }
 }
 
 impl std::fmt::Debug for BidirectionalSenders {
@@ -321,6 +330,7 @@ impl std::fmt::Debug for BidirectionalSenders {
         f.debug_struct("BidirectionalSenders")
             .field("sampling", &self.sampling.is_some())
             .field("elicitation", &self.elicitation.is_some())
+            .field("roots", &self.roots.is_some())
             .finish()
     }
 }
@@ -371,6 +381,9 @@ where
         }
         if let Some(ref elicitation) = senders.elicitation {
             ctx = ctx.with_elicitation(elicitation.clone());
+        }
+        if let Some(ref roots) = senders.roots {
+            ctx = ctx.with_roots_provider(roots.clone());
         }
     }
 
@@ -902,10 +915,11 @@ pub trait ToolHandler: Send + Sync {
 
     /// Declares whether this handler can return a final Tasks `CreateTask` outcome.
     ///
-    /// The router reads this declaration before invoking a final handler so it
-    /// can reject an unavailable or unnegotiated Tasks surface without letting
-    /// application code create or reserve work. Handlers that return
-    /// [`FinalToolOutcome::CreateTask`] must override this to return `true`.
+    /// The router verifies this declaration only if the handler actually
+    /// returns [`FinalToolOutcome::CreateTask`], then admits negotiated Tasks
+    /// capability and runtime readiness before mutating task state. Handlers
+    /// that return [`FinalToolOutcome::CreateTask`] must override this to
+    /// return `true`.
     fn declares_final_tasks(&self) -> bool {
         false
     }
@@ -970,7 +984,10 @@ pub trait ToolHandler: Send + Sync {
     /// `resume_inputs` exists only after the router consumed a
     /// framework-minted request state bound to the original modern operation.
     /// Handlers inspect its typed accessors rather than decoding client wire
-    /// values. Existing handlers preserve their normal final hook by default.
+    /// values. `#[tool]` exposes this as an
+    /// `Option<&MrtrCompletedInputs>` user-function parameter: initial calls
+    /// receive `None` and admitted retries receive `Some`. Existing handlers
+    /// preserve their normal final hook by default.
     fn call_final_outcome_async_resuming_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -1317,6 +1334,9 @@ pub trait ResourceHandler: Send + Sync {
     }
 
     /// Resumes a final resource read after framework-admitted MRTR input.
+    ///
+    /// `#[resource]` maps an `Option<&MrtrCompletedInputs>` user-function
+    /// parameter to this hook, keeping it out of URI-template parameters.
     fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -1528,6 +1548,9 @@ pub trait PromptHandler: Send + Sync {
     }
 
     /// Resumes a final prompt invocation after framework-admitted MRTR input.
+    ///
+    /// `#[prompt]` maps an `Option<&MrtrCompletedInputs>` user-function
+    /// parameter to this hook, keeping it out of prompt arguments.
     fn get_final_outcome_async_resuming_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -2960,6 +2983,7 @@ mod tests {
         let senders = BidirectionalSenders::new();
         assert!(senders.sampling.is_none());
         assert!(senders.elicitation.is_none());
+        assert!(senders.roots.is_none());
     }
 
     #[test]
@@ -2968,6 +2992,7 @@ mod tests {
         let debug = format!("{:?}", senders);
         assert!(debug.contains("sampling: false"));
         assert!(debug.contains("elicitation: false"));
+        assert!(debug.contains("roots: false"));
     }
 
     // ── create_context_with_progress ─────────────────────────────────
@@ -3246,7 +3271,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_handler_final_outcome_preserves_input_required_algebra() {
+    fn declared_task_capable_handler_preserves_input_required_algebra() {
         struct InputRequiredTool {
             result: InputRequiredResult,
             legacy_calls: AtomicUsize,
@@ -3255,6 +3280,10 @@ mod tests {
         impl ToolHandler for InputRequiredTool {
             fn definition(&self) -> Tool {
                 StubTool.definition()
+            }
+
+            fn declares_final_tasks(&self) -> bool {
+                true
             }
 
             fn call(
@@ -3285,7 +3314,7 @@ mod tests {
 
         let outcome = tool
             .call_final_outcome(&ctx, serde_json::json!({}))
-            .expect("final handler result");
+            .expect("task-capable final handler may select input_required");
 
         let FinalToolOutcome::InputRequired(result) = outcome else {
             panic!("final handler must preserve the input-required result branch");
@@ -3744,6 +3773,23 @@ mod tests {
         }
     }
 
+    struct DummyRootsProvider;
+    impl fastmcp_core::RootsProvider for DummyRootsProvider {
+        fn list_roots(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = McpResult<Vec<fastmcp_core::ClientRoot>>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(vec![fastmcp_core::ClientRoot::new("file:///workspace")])
+            })
+        }
+    }
+
     #[test]
     fn bidirectional_senders_with_sampling() {
         let senders =
@@ -3758,6 +3804,16 @@ mod tests {
             .with_elicitation(Arc::new(DummyElicitationSender) as Arc<_>);
         assert!(senders.sampling.is_none());
         assert!(senders.elicitation.is_some());
+        assert!(senders.roots.is_none());
+    }
+
+    #[test]
+    fn bidirectional_senders_with_roots() {
+        let senders =
+            BidirectionalSenders::new().with_roots(Arc::new(DummyRootsProvider) as Arc<_>);
+        assert!(senders.sampling.is_none());
+        assert!(senders.elicitation.is_none());
+        assert!(senders.roots.is_some());
     }
 
     #[test]
@@ -3807,6 +3863,25 @@ mod tests {
         let ctx =
             create_context_with_progress_and_senders(cx, 2, None, None, |_| {}, Some(&senders));
         assert_eq!(ctx.request_id(), 2);
+    }
+
+    #[test]
+    fn create_context_with_senders_roots_attaches_context_authority() {
+        let senders =
+            BidirectionalSenders::new().with_roots(Arc::new(DummyRootsProvider) as Arc<_>);
+        let ctx = create_context_with_progress_and_senders(
+            Cx::for_testing(),
+            7,
+            None,
+            None,
+            |_| {},
+            Some(&senders),
+        );
+
+        assert!(ctx.can_list_roots());
+        let roots = fastmcp_core::block_on(ctx.list_roots())
+            .expect("attached roots provider reaches the context");
+        assert_eq!(roots, vec![fastmcp_core::ClientRoot::new("file:///workspace")]);
     }
 
     #[test]
@@ -3869,6 +3944,7 @@ mod tests {
         let cx = Cx::for_testing();
         let ctx = create_context_with_progress_and_senders(cx, 6, None, None, |_| {}, None);
         assert_eq!(ctx.request_id(), 6);
+        assert!(!ctx.can_list_roots());
     }
 
     // ── ToolHandler with overrides ───────────────────────────────────

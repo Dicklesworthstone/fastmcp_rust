@@ -95,6 +95,8 @@ pub struct InboundRequestContext {
     cx: Cx,
     request_id: u64,
     transport: InboundRequestTransport,
+    state: Option<SessionState>,
+    mrtr_continuation_cancellation: Option<fastmcp_core::McpRequestCancellation>,
 }
 
 impl InboundRequestContext {
@@ -106,6 +108,43 @@ impl InboundRequestContext {
             cx,
             request_id,
             transport,
+            state: None,
+            mrtr_continuation_cancellation: None,
+        }
+    }
+
+    /// Creates sanitized facts for a request that belongs to one live modern
+    /// transport connection. The connection owns both the durable partition
+    /// used to bind MRTR retries and the cancellation authority that makes
+    /// retained continuations unusable after peer disconnect.
+    #[must_use]
+    pub(crate) fn with_modern_connection(
+        cx: Cx,
+        request_id: u64,
+        transport: InboundRequestTransport,
+        connection: &ModernConnection,
+    ) -> Self {
+        Self::with_modern_connection_context(
+            cx,
+            request_id,
+            transport,
+            &connection.request_context(),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn with_modern_connection_context(
+        cx: Cx,
+        request_id: u64,
+        transport: InboundRequestTransport,
+        connection: &ModernConnectionRequestContext,
+    ) -> Self {
+        Self {
+            cx,
+            request_id,
+            transport,
+            state: Some(connection.state.clone()),
+            mrtr_continuation_cancellation: Some(connection.continuation_cancellation.clone()),
         }
     }
 
@@ -122,7 +161,65 @@ impl InboundRequestContext {
     }
 
     pub(crate) fn request_context(&self) -> McpContext {
-        McpContext::new(self.cx.clone(), self.request_id)
+        self.state.clone().map_or_else(
+            || McpContext::new(self.cx.clone(), self.request_id),
+            |state| McpContext::with_state(self.cx.clone(), self.request_id, state),
+        )
+    }
+
+    pub(crate) fn mrtr_continuation_cancellation(
+        &self,
+    ) -> Option<fastmcp_core::McpRequestCancellation> {
+        self.mrtr_continuation_cancellation.clone()
+    }
+
+    pub(crate) fn with_cx(mut self, cx: Cx) -> Self {
+        self.cx = cx;
+        self
+    }
+}
+
+/// Durable state and retained-continuation ownership for one modern transport
+/// owner: a stdio connection or an HTTP endpoint process partition.
+///
+/// Dropping the owner is a terminal peer-disconnect event: it cancels every
+/// MRTR continuation minted by requests on this connection. Request contexts
+/// retain only clones of its state and cancellation capability, so a retained
+/// continuation cannot outlive the transport owner that issued it.
+pub(crate) struct ModernConnection {
+    state: SessionState,
+    continuation_cancellation: fastmcp_core::McpRequestCancellation,
+}
+
+#[derive(Clone)]
+pub(crate) struct ModernConnectionRequestContext {
+    state: SessionState,
+    continuation_cancellation: fastmcp_core::McpRequestCancellation,
+}
+
+impl ModernConnection {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: SessionState::new(),
+            continuation_cancellation: fastmcp_core::McpRequestCancellation::new(),
+        }
+    }
+
+    pub(crate) fn disconnect(&self) {
+        self.continuation_cancellation.cancel();
+    }
+
+    pub(crate) fn request_context(&self) -> ModernConnectionRequestContext {
+        ModernConnectionRequestContext {
+            state: self.state.clone(),
+            continuation_cancellation: self.continuation_cancellation.clone(),
+        }
+    }
+}
+
+impl Drop for ModernConnection {
+    fn drop(&mut self) {
+        self.disconnect();
     }
 }
 
@@ -2588,15 +2685,16 @@ impl Router {
         Ok(FinalCompletionResult { completion })
     }
 
-    /// Dispatches a request without connection or session state.
+    /// Dispatches a modern request through the transport-neutral final router.
     ///
     /// This is the modern server-side routing seam. It deliberately has no
-    /// `Session` argument: list results come from the immutable router catalog,
-    /// and handler invocations receive a fresh state bag that cannot be shared
-    /// with another request or connection. Every successful response is
-    /// re-emitted through the final complete-result contract. State-bearing
-    /// lifecycle methods and exact 2024-11-05 wire results stay on the legacy
-    /// adapter rather than acquiring accidental modern semantics.
+    /// `Session` argument: list results come from the immutable router catalog.
+    /// Transport entry points may additionally supply a durable modern
+    /// connection partition for MRTR binding and continuation ownership.
+    /// Every successful response is re-emitted through the final
+    /// complete-result contract. State-bearing lifecycle methods and exact
+    /// 2024-11-05 wire results stay on the legacy adapter rather than
+    /// acquiring accidental modern semantics.
     pub(crate) fn dispatch_stateless(
         &self,
         request_ctx: &McpContext,
@@ -2606,7 +2704,26 @@ impl Router {
         // Keep its ordered compatibility semantics here; modern runtime entry
         // points must use `dispatch_stateless_owned` below instead of sharing
         // this blocking bridge.
-        block_on(self.dispatch_stateless_in_request(request_ctx, request_ctx.cx(), request))
+        let continuation_cancellation = fastmcp_core::McpRequestCancellation::new();
+        self.dispatch_stateless_with_continuation_cancellation(
+            request_ctx,
+            request,
+            &continuation_cancellation,
+        )
+    }
+
+    pub(crate) fn dispatch_stateless_with_continuation_cancellation(
+        &self,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+        continuation_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<serde_json::Value> {
+        block_on(self.dispatch_stateless_in_request(
+            request_ctx,
+            request_ctx.cx(),
+            request,
+            continuation_cancellation,
+        ))
     }
 
     /// Dispatches one modern request in a request-owned structured child task.
@@ -2622,6 +2739,25 @@ impl Router {
         request_ctx: McpContext,
         request: JsonRpcRequest,
     ) -> McpResult<serde_json::Value> {
+        self.dispatch_stateless_owned_with_continuation_cancellation(
+            request_ctx,
+            request,
+            fastmcp_core::McpRequestCancellation::new(),
+        )
+        .await
+    }
+
+    /// Dispatches one modern request with the continuation owner selected by
+    /// its transport connection. The owner is deliberately distinct from the
+    /// request cancellation: an `input_required` response ends one JSON-RPC
+    /// request normally, while its retry remains valid until its connection
+    /// disconnects or the continuation expires.
+    pub(crate) async fn dispatch_stateless_owned_with_continuation_cancellation(
+        self: Arc<Self>,
+        request_ctx: McpContext,
+        request: JsonRpcRequest,
+        continuation_cancellation: fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<serde_json::Value> {
         if let Some(error) = budget_error(&request_ctx) {
             return Err(error);
         }
@@ -2630,9 +2766,15 @@ impl Router {
         let dispatch_ctx = request_ctx.clone();
         let spawn_self = Arc::clone(&self);
         let spawn_request = request.clone();
+        let spawn_continuation_cancellation = continuation_cancellation.clone();
         let mut task = match request_ctx.cx().spawn(move |child_cx| async move {
             spawn_self
-                .dispatch_stateless_in_request(&dispatch_ctx, &child_cx, &spawn_request)
+                .dispatch_stateless_in_request(
+                    &dispatch_ctx,
+                    &child_cx,
+                    &spawn_request,
+                    &spawn_continuation_cancellation,
+                )
                 .await
         }) {
             Ok(task) => task,
@@ -2643,7 +2785,12 @@ impl Router {
             // spawn failure (region closed, quota) stays a scheduling error.
             Err(asupersync::runtime::state::SpawnError::RuntimeUnavailable) => {
                 return self
-                    .dispatch_stateless_in_request(&request_ctx, request_ctx.cx(), &request)
+                    .dispatch_stateless_in_request(
+                        &request_ctx,
+                        request_ctx.cx(),
+                        &request,
+                        &continuation_cancellation,
+                    )
                     .await;
             }
             Err(_error) => {
@@ -2667,6 +2814,7 @@ impl Router {
         request_ctx: &McpContext,
         request_cx: &Cx,
         request: &JsonRpcRequest,
+        continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
         if request_cx.is_cancel_requested() {
             return Err(McpError::request_cancelled());
@@ -2727,7 +2875,6 @@ impl Router {
                     params.name.clone(),
                     &params.arguments,
                 )?;
-                self.admit_final_tool_retry_metadata(&params)?;
                 let resume_inputs = match self.resolve_final_mrtr_retry(
                     params.request_state.as_deref(),
                     params.input_responses.as_ref(),
@@ -2741,6 +2888,7 @@ impl Router {
                             params,
                             binding,
                             None,
+                            continuation_cancellation,
                         )
                         .await?
                     }
@@ -2751,6 +2899,7 @@ impl Router {
                             params,
                             binding,
                             Some(resume_inputs),
+                            continuation_cancellation,
                         )
                         .await?
                     }
@@ -2824,6 +2973,7 @@ impl Router {
                             params.clone(),
                             binding,
                             None,
+                            continuation_cancellation,
                         )
                         .await?
                     }
@@ -2834,6 +2984,7 @@ impl Router {
                             params.clone(),
                             binding,
                             Some(resume_inputs),
+                            continuation_cancellation,
                         )
                         .await?
                     }
@@ -2883,6 +3034,7 @@ impl Router {
                             params,
                             binding,
                             None,
+                            continuation_cancellation,
                         )
                         .await?
                     }
@@ -2893,6 +3045,7 @@ impl Router {
                             params,
                             binding,
                             Some(resume_inputs),
+                            continuation_cancellation,
                         )
                         .await?
                     }
@@ -2935,38 +3088,18 @@ impl Router {
         Ok(())
     }
 
-    /// Verifies operation-relevant normalized metadata before an MRTR retry
-    /// consumes its continuation. A task-capable tool performs capability and
-    /// runtime readiness admission after normal dispatch too, but doing that
-    /// only after state resolution would let altered retry metadata burn a
-    /// valid state.
-    fn admit_final_tool_retry_metadata(&self, params: &FinalCallToolParams) -> McpResult<()> {
-        if params.request_state.is_none() || params.input_responses.is_none() {
-            return Ok(());
-        }
-        let Some(final_registration) = self
-            .tools
-            .get(&params.name)
-            .and_then(|entry| entry.final_registration.as_ref())
-        else {
-            return Ok(());
-        };
-        if final_registration.declares_final_tasks {
-            self.admit_final_task_tool(&params.meta)?;
-        }
-        Ok(())
-    }
-
-    fn admit_final_task_tool(&self, metadata: &OpenMetadata) -> McpResult<()> {
+    fn admit_final_task_tool(&self, metadata: &OpenMetadata) -> McpResult<&FinalTaskRuntime> {
         require_final_tasks_capability(metadata)?;
         let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
             McpError::internal_error("task-capable tool requires an installed final Tasks runtime")
         })?;
-        runtime.ensure_task_service_ready()
+        runtime.ensure_task_service_ready()?;
+        Ok(runtime)
     }
 
     fn issue_final_mrtr_input_required(
         &self,
+        continuation_cancellation: fastmcp_core::McpRequestCancellation,
         binding: MrtrExchangeBinding,
         handler_result: InputRequiredResult,
     ) -> McpResult<serde_json::Value> {
@@ -2974,11 +3107,9 @@ impl Router {
         // requestState. Its former state member and open result siblings are
         // intentionally not forwarded across this framework boundary.
         let input_requests = handler_mrtr_input_requests(&handler_result)?;
-        let required = self.mrtr_exchanges.issue_bound(
-            fastmcp_core::McpRequestCancellation::new(),
-            binding,
-            input_requests,
-        )?;
+        let required =
+            self.mrtr_exchanges
+                .issue_bound(continuation_cancellation, binding, input_requests)?;
         encode_mrtr_input_required_result(required)
     }
 
@@ -3022,6 +3153,7 @@ impl Router {
         params: FinalCallToolParams,
         binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
+        continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
         let request_metadata = params.meta.clone();
         let outcome = self
@@ -3043,18 +3175,21 @@ impl Router {
                         "MRTR input_required requires session state to bind retries",
                     )
                 })?;
-                self.issue_final_mrtr_input_required(binding, result)
+                self.issue_final_mrtr_input_required(
+                    continuation_cancellation.clone(),
+                    binding,
+                    result,
+                )
             }
             FinalToolOutcome::CreateTask {
                 work_descriptor,
                 status_message,
             } => {
-                require_final_tasks_capability(&request_metadata)?;
-                let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
-                    McpError::internal_error(
-                        "task-capable tool requires an installed final Tasks runtime",
-                    )
-                })?;
+                // A handler's declaration means it may return CreateTask; it
+                // does not turn its Complete or InputRequired outcomes into
+                // Tasks operations. Admit only the branch that can mutate the
+                // Tasks store, immediately before that mutation.
+                let runtime = self.admit_final_task_tool(&request_metadata)?;
                 encode_final_task_result(
                     runtime.create_task_with_work(work_descriptor, status_message)?,
                 )
@@ -3069,6 +3204,7 @@ impl Router {
         params: FinalReadResourceParams,
         binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
+        continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
         match self
             .handle_resources_read_final_in_request(
@@ -3089,7 +3225,11 @@ impl Router {
                         "MRTR input_required requires session state to bind retries",
                     )
                 })?;
-                self.issue_final_mrtr_input_required(binding, result)
+                self.issue_final_mrtr_input_required(
+                    continuation_cancellation.clone(),
+                    binding,
+                    result,
+                )
             }
         }
     }
@@ -3101,6 +3241,7 @@ impl Router {
         params: FinalGetPromptParams,
         binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
+        continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
         match self
             .handle_prompts_get_final_in_request(
@@ -3121,7 +3262,11 @@ impl Router {
                         "MRTR input_required requires session state to bind retries",
                     )
                 })?;
-                self.issue_final_mrtr_input_required(binding, result)
+                self.issue_final_mrtr_input_required(
+                    continuation_cancellation.clone(),
+                    binding,
+                    result,
+                )
             }
         }
     }
@@ -3659,9 +3804,6 @@ impl Router {
             ));
         }
         let declares_final_tasks = final_registration.declares_final_tasks;
-        if declares_final_tasks {
-            self.admit_final_task_tool(&params.meta)?;
-        }
         let arguments = params
             .arguments
             .into_value()
@@ -6810,6 +6952,69 @@ mod router_tests {
                 }))?,
                 status_message: Some("router task created".to_owned()),
             })
+        }
+    }
+
+    /// A single declared task-capable handler whose result branch is selected
+    /// only by the `createTask` argument. It proves registration is not itself
+    /// a Tasks operation.
+    struct ConditionalTaskCapableRouterTool {
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for ConditionalTaskCapableRouterTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "conditional-task-capable-router-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {"createTask": {"type": "boolean"}},
+                    "required": ["createTask"],
+                    "unevaluatedProperties": false,
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn declares_final_tasks(&self) -> bool {
+            true
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("legacy conditional task-capable router result")])
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            if args
+                .get("createTask")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Ok(FinalToolOutcome::CreateTask {
+                    work_descriptor: FinalTaskWorkDescriptor::new(serde_json::json!({
+                        "operation": "conditional-task-capable-router-tool"
+                    }))?,
+                    status_message: None,
+                });
+            }
+            Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                FinalCallToolResult {
+                    content: vec![ContentBlock::text("ordinary final result")],
+                    is_error: false,
+                    structured_content: None,
+                },
+            )))
         }
     }
 
@@ -13506,7 +13711,60 @@ mod router_tests {
     }
 
     #[test]
-    fn final_task_capable_tool_without_runtime_rejects_before_handler_without_store_mutation() {
+    fn final_task_declaration_gates_only_the_create_task_outcome() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let mut router = Router::new();
+        router
+            .add_tool(ConditionalTaskCapableRouterTool {
+                final_calls: Arc::clone(&final_calls),
+            })
+            .expect("conditional task-capable tool registration succeeds");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 164, Budget::INFINITE, &state);
+
+        let complete = final_tools_call_request(
+            "conditional-task-capable-router-tool",
+            serde_json::json!({ "createTask": false }),
+            164_i64,
+        );
+        let task = final_tools_call_request(
+            "conditional-task-capable-router-tool",
+            serde_json::json!({ "createTask": true }),
+            165_i64,
+        );
+        assert_eq!(complete.method, task.method);
+        assert_eq!(
+            complete
+                .params
+                .as_ref()
+                .and_then(|params| params.get("_meta")),
+            task.params.as_ref().and_then(|params| params.get("_meta")),
+            "Tasks negotiation is unchanged between the paired requests"
+        );
+
+        let result = router
+            .dispatch_stateless(&request_ctx, &complete)
+            .expect("a declared task-capable handler may complete without Tasks negotiation");
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.task_count(), 0);
+
+        let error = router
+            .dispatch_stateless(&request_ctx, &task)
+            .expect_err("only the CreateTask outcome requires Tasks negotiation");
+        assert!(matches!(error.code, McpErrorCode::Custom(_)));
+        assert_eq!(final_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store.task_count(),
+            0,
+            "a rejected CreateTask outcome must not mutate the task store"
+        );
+    }
+
+    #[test]
+    fn final_task_outcome_without_runtime_rejects_after_handler_before_store_mutation() {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let store = Arc::new(InMemoryFinalTaskStore::default());
         let mut router = Router::new();
@@ -13521,22 +13779,22 @@ mod router_tests {
 
         let error = router
             .dispatch_stateless(&request_ctx, &final_task_capable_tool_request(161_i64))
-            .expect_err("a task-capable tool cannot run without a final Tasks runtime");
+            .expect_err("a CreateTask outcome cannot persist without a final Tasks runtime");
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert_eq!(
             error.message,
             "task-capable tool requires an installed final Tasks runtime"
         );
-        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             store.task_count(),
             0,
-            "pre-handler admission does not persist a task"
+            "outcome-aware runtime admission rejects before task-store mutation"
         );
     }
 
     #[test]
-    fn final_task_capable_tool_with_unready_service_rejects_before_handler_without_store_mutation()
+    fn final_task_outcome_with_unready_service_rejects_after_handler_before_store_mutation()
     {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let store = Arc::new(InMemoryFinalTaskStore::default());
@@ -13557,22 +13815,22 @@ mod router_tests {
 
         let error = router
             .dispatch_stateless(&request_ctx, &final_task_capable_tool_request(162_i64))
-            .expect_err("an installed but unready task service is refused before handler call");
+            .expect_err("an installed but unready task service is refused before task creation");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(
             error.message,
             "Final task creation requires an installed ready task service"
         );
-        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             store.task_count(),
             0,
-            "pre-handler readiness admission cannot persist a task"
+            "outcome-aware readiness admission cannot persist a task"
         );
     }
 
     #[test]
-    fn final_task_capable_tool_requires_peer_capability_before_handler() {
+    fn final_task_outcome_requires_peer_capability_before_store_mutation() {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let store = Arc::new(InMemoryFinalTaskStore::default());
         let runtime = task_runtime_for_router(Arc::clone(&store));
@@ -13606,10 +13864,14 @@ mod router_tests {
                     162_i64,
                 ),
             )
-            .expect_err("a missing peer Tasks capability is refused before the handler runs");
+            .expect_err("a missing peer Tasks capability is refused before task-store mutation");
         assert!(matches!(error.code, McpErrorCode::Custom(_)));
-        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(store.task_count(), 0);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.task_count(),
+            0,
+            "a rejected CreateTask outcome must not reach the task store"
+        );
     }
 
     #[test]
@@ -14167,35 +14429,152 @@ mod router_tests {
         assert_eq!(prompt_response["resultType"], "input_required");
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 2);
 
+        // Each retry receives the prior round's typed roots response through
+        // the handler resume hook, then emits a distinct continuation for the
+        // next JSON-RPC round. This exercises the public final dispatch path
+        // across tools, resources, and prompts rather than only the registry.
+        let mut tool_second_retry = tool_retry.clone();
+        tool_second_retry
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("tool retry parameters are an object")
+            .insert(
+                "requestState".to_owned(),
+                tool_response["requestState"].clone(),
+            );
+        let tool_second_response = router
+            .dispatch_stateless(&request_ctx, &tool_second_retry)
+            .expect("a second public tools/call round reaches the resumed handler");
+        assert_eq!(tool_second_response["resultType"], "input_required");
+
+        let mut resource_second_retry = resource_retry.clone();
+        resource_second_retry
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("resource retry parameters are an object")
+            .insert(
+                "requestState".to_owned(),
+                resource_response["requestState"].clone(),
+            );
+        let resource_second_response = router
+            .dispatch_stateless(&request_ctx, &resource_second_retry)
+            .expect("a second public resources/read round reaches the resumed handler");
+        assert_eq!(resource_second_response["resultType"], "input_required");
+
+        let mut prompt_second_retry = prompt_retry.clone();
+        prompt_second_retry
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("prompt retry parameters are an object")
+            .insert(
+                "requestState".to_owned(),
+                prompt_response["requestState"].clone(),
+            );
+        let prompt_second_response = router
+            .dispatch_stateless(&request_ctx, &prompt_second_retry)
+            .expect("a second public prompts/get round reaches the resumed handler");
+        assert_eq!(prompt_second_response["resultType"], "input_required");
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(resource_final_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 3);
+
         let replay = router
             .dispatch_stateless(&request_ctx, &tool_retry)
             .expect_err("replaying only the already consumed tool state is refused");
         assert_eq!(replay.code, McpErrorCode::InvalidParams);
         assert_eq!(
             tool_final_calls.load(Ordering::SeqCst),
-            2,
+            3,
             "replay must fail before the tool handler is invoked again"
         );
     }
 
     #[test]
-    fn task_capability_metadata_rejection_preserves_the_mrtr_continuation() {
+    fn modern_connection_disconnect_is_the_only_changed_retry_dimension_and_cancels_state() {
         let final_calls = Arc::new(AtomicUsize::new(0));
-        let store = Arc::new(InMemoryFinalTaskStore::default());
-        let runtime = task_runtime_for_router(Arc::clone(&store));
-        let service_runner = runtime
-            .install_task_service(1, Arc::new(NoopFinalTaskSupervisor))
-            .expect("a bounded application-owned task service is installed");
-        let service_cx = Cx::for_testing();
-        let mut running_service = Box::pin(service_runner.run(&service_cx));
-        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(matches!(
-            Future::poll(running_service.as_mut(), &mut task_cx),
-            Poll::Pending
-        ));
-
         let mut router = Router::new();
-        router.set_final_task_runtime(Some(runtime));
+        router
+            .add_tool(InputRequiredTool {
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::clone(&final_calls),
+            })
+            .expect("tool registration succeeds");
+
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            cx.clone(),
+            301,
+            InboundRequestTransport::Stdio,
+            &connection,
+        );
+        let request_ctx = inbound.request_context();
+        let continuation_cancellation = inbound
+            .mrtr_continuation_cancellation()
+            .expect("a modern connection supplies continuation ownership");
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let initial = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "name": "input-required-tool",
+                "arguments": {},
+            })),
+            301_i64,
+        );
+        let initial_result = router
+            .dispatch_stateless_with_continuation_cancellation(
+                &request_ctx,
+                &initial,
+                &continuation_cancellation,
+            )
+            .expect("the connected request mints a continuation");
+        let retry = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata,
+                "name": "input-required-tool",
+                "arguments": {},
+                "inputResponses": {"roots": router_roots_response_wire()},
+                "requestState": initial_result["requestState"].clone(),
+            })),
+            302_i64,
+        );
+        let retry_before_disconnect = serde_json::to_vec(&retry).expect("retry serializes");
+
+        // The request, opaque state, durable partition, and response map all
+        // remain unchanged. Peer disconnect is the sole changed dimension.
+        connection.disconnect();
+        let error = router
+            .dispatch_stateless_with_continuation_cancellation(
+                &request_ctx,
+                &retry,
+                &continuation_cancellation,
+            )
+            .expect_err("disconnect must cancel the retained continuation");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(
+            serde_json::to_vec(&retry).expect("retry serializes"),
+            retry_before_disconnect,
+            "disconnect cancellation cannot mutate client retry state"
+        );
+        assert_eq!(
+            final_calls.load(Ordering::SeqCst),
+            1,
+            "a disconnected continuation cannot reach the resumed handler"
+        );
+    }
+
+    #[test]
+    fn task_capable_input_required_retry_does_not_require_tasks_capability() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
         router
             .add_tool(TaskCapableInputRequiredTool {
                 final_calls: Arc::clone(&final_calls),
@@ -14204,17 +14583,15 @@ mod router_tests {
         let cx = Cx::for_testing();
         let session_state = SessionState::new();
         let request_ctx = request_context(&cx, 148, Budget::INFINITE, &session_state);
-        let task_metadata = serde_json::json!({
+        let metadata_without_tasks = serde_json::json!({
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-            "io.modelcontextprotocol/clientCapabilities": {
-                "extensions": {"io.modelcontextprotocol/tasks": {}}
-            },
+            "io.modelcontextprotocol/clientCapabilities": {},
         });
 
         let initial = JsonRpcRequest::new(
             "tools/call",
             Some(serde_json::json!({
-                "_meta": task_metadata.clone(),
+                "_meta": metadata_without_tasks.clone(),
                 "name": "task-capable-input-required-tool",
                 "arguments": {},
             })),
@@ -14222,7 +14599,7 @@ mod router_tests {
         );
         let initial_result = router
             .dispatch_stateless(&request_ctx, &initial)
-            .expect("task-capable tool mints an MRTR continuation after admission");
+            .expect("a task-capable tool may return input_required without Tasks negotiation");
         let request_state = initial_result["requestState"]
             .as_str()
             .expect("framework result carries opaque task-capable state")
@@ -14232,7 +14609,7 @@ mod router_tests {
         let retry = JsonRpcRequest::new(
             "tools/call",
             Some(serde_json::json!({
-                "_meta": task_metadata,
+                "_meta": metadata_without_tasks,
                 "name": "task-capable-input-required-tool",
                 "arguments": {},
                 "inputResponses": {"roots": router_roots_response_wire()},
@@ -14240,36 +14617,11 @@ mod router_tests {
             })),
             149_i64,
         );
-        let mut missing_task_capability = retry.clone();
-        missing_task_capability
-            .params
-            .as_mut()
-            .and_then(serde_json::Value::as_object_mut)
-            .expect("task-capability retry parameters are an object")
-            .insert(
-                "_meta".to_owned(),
-                serde_json::json!({
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                }),
-            );
-        let capability_error = router
-            .dispatch_stateless(&request_ctx, &missing_task_capability)
-            .expect_err("altered Tasks capability is rejected before MRTR state consumption");
-        assert!(matches!(capability_error.code, McpErrorCode::Custom(_)));
-        assert_eq!(
-            final_calls.load(Ordering::SeqCst),
-            1,
-            "the metadata rejection cannot invoke the resumed handler"
-        );
-        assert_eq!(store.task_count(), 0);
-
         let resumed = router
             .dispatch_stateless(&request_ctx, &retry)
-            .expect("the original task-capable retry remains usable after rejection");
+            .expect("a task-capable input-required retry remains an ordinary MRTR operation");
         assert_eq!(resumed["resultType"], "input_required");
         assert_eq!(final_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(store.task_count(), 0);
     }
 
     #[test]

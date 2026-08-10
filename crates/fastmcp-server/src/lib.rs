@@ -109,7 +109,7 @@ pub use router::{
     InboundRequestContext, InboundRequestTransport, MountResult, NotificationSender, Router,
     TagFilters,
 };
-use router::{RouterResourceReader, RouterToolCaller};
+use router::{ModernConnection, RouterResourceReader, RouterToolCaller};
 pub use session::Session;
 use session::{
     InitializationSnapshot, MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION, SessionPrincipalBinding,
@@ -145,8 +145,8 @@ use fastmcp_transport::http::{
     DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
     DualEraHttpEndpointResponse, DualEraHttpLegacySseResponse, DualEraHttpSession,
     DualEraHttpSseResponse, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest,
-    HttpRequestHandler, HttpResponse, HttpStatus, HttpTransport,
-    StreamableHttpRequestCancellation, StreamableHttpRequestResponseSender,
+    HttpRequestHandler, HttpResponse, HttpStatus, HttpTransport, StreamableHttpRequestCancellation,
+    StreamableHttpRequestResponseSender,
 };
 use fastmcp_transport::sse::SseEvent;
 
@@ -2530,6 +2530,7 @@ pub struct ServerHttpSession {
     server: Arc<Server>,
     endpoint_session: Arc<Mutex<DualEraHttpSession>>,
     legacy_session_id: String,
+    modern_session_id: String,
     legacy_session: Session,
     legacy_binding: LegacyPeerBinding,
     legacy_adapter: Option<Legacy2024ServerAdapter<HttpLegacy2024RuntimeHandler>>,
@@ -2538,6 +2539,9 @@ pub struct ServerHttpSession {
     legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
     legacy_pending_requests: Arc<PendingRequests>,
     legacy_runtime: LiveLegacy2024ConnectionRuntime,
+    /// The durable modern partition and retained-continuation owner for this
+    /// HTTP session. Closing the session cancels every MRTR state it minted.
+    modern_connection: ModernConnection,
     /// Owned modern listen dispatches whose SSE bodies were returned to the
     /// embedding caller. Handles are retained because dropping an asupersync
     /// task handle detaches it from the session lifecycle.
@@ -2554,9 +2558,9 @@ struct OwnedModernHttpDispatch {
 /// A server-bound modern SSE response body.
 ///
 /// The transport body owns peer-drop cancellation. This wrapper also observes
-/// the server request's MCP cancellation election so a cancellation-only
-/// `subscriptions/listen` terminal becomes a closed public body immediately
-/// after its final control notification has been consumed.
+/// the server request's graceful-completion election so a
+/// `subscriptions/listen` terminal remains readable through its correlated
+/// cancellation control and final complete response.
 pub struct ServerHttpSseResponse {
     inner: DualEraHttpSseResponse,
     request_cancellation: McpRequestCancellation,
@@ -2571,6 +2575,7 @@ const FINAL_TERMINAL_FAILED: u8 = 3;
 #[derive(Default)]
 struct FinalSubscriptionTerminalDelivery {
     state: AtomicU8,
+    completion_state: AtomicU8,
 }
 
 impl FinalSubscriptionTerminalDelivery {
@@ -2598,9 +2603,45 @@ impl FinalSubscriptionTerminalDelivery {
         }
     }
 
+    fn mark_completion_enqueued(&self) {
+        let _ = self.completion_state.compare_exchange(
+            FINAL_TERMINAL_OPEN,
+            FINAL_TERMINAL_ENQUEUED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn mark_completion_drained(&self) {
+        let mut state = self.completion_state.load(Ordering::Acquire);
+        while matches!(state, FINAL_TERMINAL_OPEN | FINAL_TERMINAL_ENQUEUED) {
+            match self.completion_state.compare_exchange_weak(
+                state,
+                FINAL_TERMINAL_DRAINED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => state = observed,
+            }
+        }
+    }
+
     fn mark_failed(&self) {
         let _ = self.state.compare_exchange(
             FINAL_TERMINAL_OPEN,
+            FINAL_TERMINAL_FAILED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = self.completion_state.compare_exchange(
+            FINAL_TERMINAL_OPEN,
+            FINAL_TERMINAL_FAILED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = self.completion_state.compare_exchange(
+            FINAL_TERMINAL_ENQUEUED,
             FINAL_TERMINAL_FAILED,
             Ordering::AcqRel,
             Ordering::Acquire,
@@ -2630,10 +2671,12 @@ impl FinalSubscriptionTerminalDelivery {
     }
 
     fn is_settled(&self) -> bool {
-        matches!(
-            self.state.load(Ordering::Acquire),
-            FINAL_TERMINAL_DRAINED | FINAL_TERMINAL_FAILED
-        )
+        let terminal_state = self.state.load(Ordering::Acquire);
+        let completion_state = self.completion_state.load(Ordering::Acquire);
+        terminal_state == FINAL_TERMINAL_FAILED
+            || completion_state == FINAL_TERMINAL_FAILED
+            || terminal_state == FINAL_TERMINAL_DRAINED
+                && completion_state == FINAL_TERMINAL_DRAINED
     }
 }
 
@@ -2713,8 +2756,8 @@ impl ServerHttpSseResponse {
         self.inner.sender()
     }
 
-    /// Returns whether either the transport body or the MCP request reached a
-    /// cancellation-only terminal state.
+    /// Returns whether either the transport body or the graceful terminal
+    /// sequence reached its completed state.
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.inner.is_finished()
@@ -2723,13 +2766,13 @@ impl ServerHttpSseResponse {
                 && !self.terminal_delivery.is_enqueued()
     }
 
-    /// Pops the next queued event, then reports terminal MCP cancellation as a
-    /// closed body rather than an indefinitely pending empty queue.
+    /// Pops the next queued event, then reports a fully drained terminal
+    /// sequence as a closed body rather than an indefinitely pending queue.
     ///
     /// # Errors
     ///
     /// Returns the underlying transport failure, or [`DualEraHttpEndpointError::Closed`]
-    /// after a cancellation-only MCP terminal has drained.
+    /// after the terminal control and final completion response have drained.
     pub fn pop_event(&self) -> Result<Option<SseEvent>, DualEraHttpEndpointError> {
         if self.terminal_delivery.is_settled() {
             return Err(DualEraHttpEndpointError::Closed);
@@ -2738,6 +2781,9 @@ impl ServerHttpSseResponse {
             Some(event) => {
                 if final_subscription_terminal_event(&event) {
                     self.terminal_delivery.mark_drained();
+                }
+                if final_subscription_completion_event(&event) {
+                    self.terminal_delivery.mark_completion_drained();
                 }
                 Ok(Some(event))
             }
@@ -2778,6 +2824,34 @@ fn final_subscription_terminal_event(event: &SseEvent) -> bool {
         return false;
     };
     final_subscription_terminal_notification(&notification)
+}
+
+fn final_subscription_completion_event(event: &SseEvent) -> bool {
+    let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&event.data) else {
+        return false;
+    };
+    final_subscription_completion_response(&response)
+}
+
+fn final_subscription_completion_response(response: &JsonRpcResponse) -> bool {
+    response.error.is_none()
+        && response.result.as_ref().is_some_and(|result| {
+            final_subscription_completion_result(result, response.id.as_ref())
+        })
+}
+
+fn final_subscription_completion_result(
+    result: &serde_json::Value,
+    response_id: Option<&RequestId>,
+) -> bool {
+    result.get("resultType") == Some(&serde_json::json!("complete"))
+        && result
+            .get("_meta")
+            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|subscription_id| {
+                serde_json::from_value::<RequestId>(subscription_id.clone()).ok()
+            })
+            .is_some_and(|subscription_id| response_id == Some(&subscription_id))
 }
 
 fn final_subscription_terminal_notification(notification: &JsonRpcRequest) -> bool {
@@ -2883,12 +2957,14 @@ enum FinalSubscriptionPhase {
 
 struct FinalSubscriptionElection {
     phase: Mutex<FinalSubscriptionPhase>,
+    graceful_completion: AtomicBool,
 }
 
 impl FinalSubscriptionElection {
     fn opening() -> Self {
         Self {
             phase: Mutex::new(FinalSubscriptionPhase::Opening),
+            graceful_completion: AtomicBool::new(false),
         }
     }
 }
@@ -2897,6 +2973,13 @@ impl FinalSubscriptionElection {
 struct FinalSubscriptionLease {
     registry: Arc<FinalSubscriptionRegistry>,
     key: usize,
+    election: Arc<FinalSubscriptionElection>,
+}
+
+impl FinalSubscriptionLease {
+    fn has_graceful_completion(&self) -> bool {
+        self.election.graceful_completion.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for FinalSubscriptionLease {
@@ -3068,6 +3151,7 @@ impl FinalSubscriptionRegistry {
         Ok(FinalSubscriptionLease {
             registry: Arc::clone(self),
             key,
+            election,
         })
     }
 
@@ -3268,7 +3352,10 @@ impl FinalSubscriptionRegistry {
                     entry.request_cancellation.cancel();
                     return (false, None);
                 }
-                entry.request_cancellation.cancel();
+                entry
+                    .election
+                    .graceful_completion
+                    .store(true, Ordering::Release);
                 (true, entry.terminal_delivery)
             }
             FinalSubscriptionPhase::PeerTerminated | FinalSubscriptionPhase::ServerTerminated => {
@@ -3742,6 +3829,76 @@ struct LiveHttpSession {
 
 type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveHttpSession>>>>;
 
+const MAX_LIVE_MODERN_HTTP_SESSIONS: usize = 1_024;
+const MODERN_HTTP_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// One listener-owned modern HTTP session. Unlike a response body, this owner
+/// spans the discovery POST and every later POST that presents its server
+/// issued `MCP-Session-Id` header.
+struct LiveModernHttpSession {
+    session: Mutex<ServerHttpSession>,
+    expires_at: Mutex<Instant>,
+}
+
+type LiveModernHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveModernHttpSession>>>>;
+
+impl LiveModernHttpSession {
+    fn new(session: ServerHttpSession) -> Self {
+        Self {
+            session: Mutex::new(session),
+            expires_at: Mutex::new(Instant::now() + MODERN_HTTP_SESSION_TTL),
+        }
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        *self
+            .expires_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            <= now
+    }
+
+    fn renew(&self, now: Instant) {
+        *self
+            .expires_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = now + MODERN_HTTP_SESSION_TTL;
+    }
+
+    fn begin_close(&self) -> Vec<asupersync::runtime::TaskHandle<()>> {
+        self.session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .begin_close()
+    }
+}
+
+fn close_detached_modern_http_session(session: Arc<LiveModernHttpSession>) {
+    for task in session.begin_close() {
+        task.abort();
+    }
+}
+
+fn expire_live_modern_http_sessions(registry: &LiveModernHttpSessionRegistry) {
+    let now = Instant::now();
+    let expired = {
+        let mut sessions = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expired_ids = sessions
+            .iter()
+            .filter_map(|(id, session)| session.is_expired(now).then(|| id.clone()))
+            .collect::<Vec<_>>();
+        expired_ids
+            .into_iter()
+            .filter_map(|id| sessions.remove(&id))
+            .collect::<Vec<_>>()
+    };
+    for session in expired {
+        close_detached_modern_http_session(session);
+    }
+}
+
 struct HttpConnectionLimiter {
     limit: usize,
     active: AtomicUsize,
@@ -3873,6 +4030,27 @@ async fn close_live_http_sessions(cx: &Cx, sessions: &LiveHttpSessionRegistry) {
     }
 }
 
+/// Revokes every retained modern HTTP session during listener shutdown.
+///
+/// Each retained [`ServerHttpSession`] owns its own MRTR continuation
+/// cancellation authority, so closing the registry makes every issued
+/// requestState invalid before the listener finishes shutting down.
+async fn close_live_modern_http_sessions(cx: &Cx, sessions: &LiveModernHttpSessionRegistry) {
+    let sessions = {
+        let mut sessions = sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *sessions)
+    };
+    let mut dispatches = Vec::new();
+    for session in sessions.into_values() {
+        dispatches.extend(session.begin_close());
+    }
+    for mut dispatch in dispatches {
+        let _ = dispatch.join(cx).await;
+    }
+}
+
 /// A bound, caller-owned HTTP server lifecycle.
 ///
 /// The listener and every accepted connection stay in the caller's [`Cx`]
@@ -3882,6 +4060,7 @@ pub struct BoundHttpServer {
     listener: AsyncTcpListener,
     endpoint: Arc<ServerHttpEndpoint>,
     legacy_sessions: LiveHttpSessionRegistry,
+    modern_sessions: LiveModernHttpSessionRegistry,
     connection_limiter: Arc<HttpConnectionLimiter>,
 }
 
@@ -3934,10 +4113,18 @@ impl BoundHttpServer {
             };
             let endpoint = Arc::clone(&self.endpoint);
             let legacy_sessions = Arc::clone(&self.legacy_sessions);
+            let modern_sessions = Arc::clone(&self.modern_sessions);
             let connection = cx
                 .spawn_in(&connection_scope, move |connection_cx| async move {
                     let _permit = permit;
-                    serve_http_connection(&connection_cx, stream, endpoint, legacy_sessions).await;
+                    serve_http_connection(
+                        &connection_cx,
+                        stream,
+                        endpoint,
+                        legacy_sessions,
+                        modern_sessions,
+                    )
+                    .await;
                 })
                 .map_err(|error| {
                     McpError::internal_error(format!(
@@ -3954,11 +4141,12 @@ impl BoundHttpServer {
         // children a bounded scheduling window to flush and close before
         // aborting any unrelated or uncooperative connection.
         let terminal_receipt = server.final_subscriptions.terminate_with_receipt();
-        server.cancel_active_requests(CancelKind::Shutdown, false);
         close_live_http_sessions(cx, &self.legacy_sessions).await;
+        close_live_modern_http_sessions(cx, &self.modern_sessions).await;
         connection_children
             .drain_terminal_controls_then_cancel_and_join(cx, &terminal_receipt)
             .await;
+        server.cancel_active_requests(CancelKind::Shutdown, false);
         server.graceful_shutdown_returning();
         result
     }
@@ -4011,6 +4199,7 @@ impl Server {
             listener,
             endpoint: Arc::new(endpoint),
             legacy_sessions: Arc::new(Mutex::new(HashMap::new())),
+            modern_sessions: Arc::new(Mutex::new(HashMap::new())),
             connection_limiter: Arc::new(HttpConnectionLimiter::new(max_connections)),
         })
     }
@@ -4059,6 +4248,7 @@ impl ServerHttpEndpoint {
             .to_owned();
         let legacy_session =
             Session::new(self.server.info.clone(), self.server.capabilities.clone());
+        let modern_session_id = format!("mcp-{}", legacy_session.id());
         let legacy_binding = runtime_legacy_binding(legacy_session.id());
         let legacy_pending_requests = Arc::new(
             PendingRequests::with_max_in_flight_for_exact_legacy(
@@ -4096,6 +4286,7 @@ impl ServerHttpEndpoint {
             server: Arc::clone(&self.server),
             endpoint_session,
             legacy_session_id,
+            modern_session_id,
             legacy_session,
             legacy_binding,
             legacy_adapter: None,
@@ -4104,6 +4295,7 @@ impl ServerHttpEndpoint {
             legacy_admissions: Arc::new(HttpLegacyRequestAdmissions::default()),
             legacy_pending_requests,
             legacy_runtime,
+            modern_connection: ModernConnection::new(),
             modern_dispatches: Vec::new(),
             closed: false,
         })
@@ -4127,6 +4319,10 @@ impl ServerHttpSession {
     #[must_use]
     pub fn legacy_session_id(&self) -> &str {
         &self.legacy_session_id
+    }
+
+    fn modern_session_id(&self) -> &str {
+        &self.modern_session_id
     }
 
     /// Routes and dispatches one modern or exact-2024 HTTP request.
@@ -4345,10 +4541,17 @@ impl ServerHttpSession {
             let request_cancellation = sender.request_cancellation();
             let owner_generation = next_modern_http_stream_generation();
             let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+            let inbound = InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                request_id_to_u64(request.id.as_ref()),
+                InboundRequestTransport::Http,
+                &self.modern_connection,
+            );
             let dispatch = spawn_modern_sse_dispatch(
                 cx,
                 Arc::clone(&self.server),
                 owner_generation,
+                inbound,
                 request,
                 sender,
                 Arc::clone(&terminal_delivery),
@@ -4363,10 +4566,11 @@ impl ServerHttpSession {
             ));
         }
 
-        let inbound = InboundRequestContext::new(
+        let inbound = InboundRequestContext::with_modern_connection(
             cx.clone(),
             request_id_to_u64(request.id.as_ref()),
             InboundRequestTransport::Http,
+            &self.modern_connection,
         );
 
         match endpoint_response {
@@ -4600,6 +4804,7 @@ impl ServerHttpSession {
             return Vec::new();
         }
         self.closed = true;
+        self.modern_connection.disconnect();
         let dispatches = std::mem::take(&mut self.modern_dispatches);
         for dispatch in &dispatches {
             self.server
@@ -4829,20 +5034,16 @@ fn spawn_modern_sse_dispatch(
     cx: &Cx,
     server: Arc<Server>,
     http_stream_generation: u64,
+    inbound: InboundRequestContext,
     request: JsonRpcRequest,
     response_sender: StreamableHttpRequestResponseSender,
     terminal_delivery: Arc<FinalSubscriptionTerminalDelivery>,
 ) -> Result<asupersync::runtime::TaskHandle<()>, DualEraHttpEndpointError> {
-    let request_id = request_id_to_u64(request.id.as_ref());
     let policy = server.protocol_policy;
     let notification_response_sender = response_sender.clone();
     let notification_terminal_delivery = Arc::clone(&terminal_delivery);
     cx.spawn(move |request_cx| async move {
-        let inbound = InboundRequestContext::new(
-            request_cx.clone(),
-            request_id,
-            InboundRequestTransport::Http,
-        );
+        let inbound = inbound.with_cx(request_cx.clone());
         let cancellation = response_sender.request_cancellation();
         let _active_request = match request.id.clone() {
             Some(id) => match ActiveRequestGuard::try_new_with_cancellation(
@@ -4908,7 +5109,23 @@ fn spawn_modern_sse_dispatch(
         if let Some(response) = response
             && cancellation.begin_finalization()
         {
-            let _ = response_sender.send_response(&request_cx, response);
+            let graceful_completion = final_subscription_completion_response(&response);
+            let sent = if graceful_completion {
+                // A server-owned shutdown may have cancelled the listener's
+                // root context. The terminal control has already won this
+                // stream, so mask only its paired final response while the
+                // peer still owns the body.
+                request_cx.masked(|| response_sender.send_response(&request_cx, response))
+            } else {
+                response_sender.send_response(&request_cx, response)
+            };
+            if graceful_completion {
+                if sent.is_ok() {
+                    terminal_delivery.mark_completion_enqueued();
+                } else {
+                    terminal_delivery.mark_failed();
+                }
+            }
         }
     })
     .map_err(|error| {
@@ -4932,11 +5149,19 @@ async fn send_modern_sse_stream(
     let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
     let (_reader, mut writer) = stream.into_split();
     let cancellation_server = Arc::clone(&server);
+    let modern_connection = ModernConnection::new();
+    let inbound = InboundRequestContext::with_modern_connection(
+        cx.clone(),
+        request_id_to_u64(request.id.as_ref()),
+        InboundRequestTransport::Http,
+        &modern_connection,
+    );
 
     let mut dispatch = spawn_modern_sse_dispatch(
         cx,
         server,
         http_stream_generation,
+        inbound,
         request,
         sender,
         Arc::clone(&terminal_delivery),
@@ -4950,6 +5175,7 @@ async fn send_modern_sse_stream(
             match response.pop_event() {
                 Ok(Some(event)) => {
                     let terminal_control = final_subscription_terminal_event(&event);
+                    let terminal_completion = final_subscription_completion_event(&event);
                     let bytes = event.to_bytes().map_err(|_| ())?;
                     let prefix = format!("{:X}\r\n", bytes.len());
                     writer.write_all(prefix.as_bytes()).await.map_err(|_| ())?;
@@ -4958,6 +5184,12 @@ async fn send_modern_sse_stream(
                     writer.flush().await.map_err(|_| ())?;
                     if terminal_control {
                         terminal_delivery.mark_drained();
+                    }
+                    if terminal_completion {
+                        terminal_delivery.mark_completion_drained();
+                    }
+                    if terminal_delivery.is_settled() {
+                        break;
                     }
                 }
                 Ok(None) if response.is_finished() => break,
@@ -5104,10 +5336,114 @@ fn http_endpoint_error_response(
     }
 }
 
+fn is_modern_http_discovery_request(endpoint: &ServerHttpEndpoint, request: &HttpRequest) -> bool {
+    if request.method != HttpMethod::Post
+        || request.path != endpoint.server.http_config.handler_config.base_path
+        || request.header("mcp-method") != Some(SERVER_DISCOVER_METHOD)
+    {
+        return false;
+    }
+    let mut codec = Codec::new();
+    codec.set_max_message_size(endpoint.server.http_config.handler_config.max_body_size);
+    matches!(
+        codec.decode_complete_message(&request.body),
+        Ok(JsonRpcMessage::Request(request)) if request.method == SERVER_DISCOVER_METHOD
+    )
+}
+
+fn dispatch_registered_modern_http_request(
+    cx: &Cx,
+    endpoint: &ServerHttpEndpoint,
+    modern_sessions: &LiveModernHttpSessionRegistry,
+    request: HttpRequest,
+) -> HttpResponse {
+    expire_live_modern_http_sessions(modern_sessions);
+    let error_request = request.clone();
+    if is_modern_http_discovery_request(endpoint, &request) {
+        if request.header("mcp-session-id").is_some() {
+            return HttpResponse::bad_request();
+        }
+        let mut session = match endpoint.open_session(cx) {
+            Ok(session) => session,
+            Err(_) => return HttpResponse::internal_error(),
+        };
+        let session_id = session.modern_session_id().to_owned();
+        let response = session
+            .handle(cx, request)
+            .map(|response| http_endpoint_response_to_static(cx, response))
+            .unwrap_or_else(|error| {
+                http_endpoint_error_response(
+                    &error_request,
+                    error,
+                    endpoint.server.http_config.handler_config.max_body_size,
+                )
+            });
+        if response.status != HttpStatus::OK {
+            return response;
+        }
+        let accepted = {
+            let mut sessions = modern_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if sessions.len() >= MAX_LIVE_MODERN_HTTP_SESSIONS {
+                false
+            } else {
+                sessions.insert(
+                    session_id.clone(),
+                    Arc::new(LiveModernHttpSession::new(session)),
+                );
+                true
+            }
+        };
+        if !accepted {
+            return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE);
+        }
+        return response.with_header("mcp-session-id", session_id);
+    }
+
+    let Some(session_id) = request.header("mcp-session-id") else {
+        return HttpResponse::bad_request();
+    };
+    let session = modern_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(session_id)
+        .cloned();
+    let Some(session) = session else {
+        return HttpResponse::new(HttpStatus::NOT_FOUND);
+    };
+    let now = Instant::now();
+    if session.is_expired(now) {
+        let removed = modern_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        if let Some(removed) = removed {
+            close_detached_modern_http_session(removed);
+        }
+        return HttpResponse::new(HttpStatus::NOT_FOUND);
+    }
+    session.renew(now);
+    session
+        .session
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .handle(cx, request)
+        .map(|response| http_endpoint_response_to_static(cx, response))
+        .unwrap_or_else(|error| {
+            http_endpoint_error_response(
+                &error_request,
+                error,
+                endpoint.server.http_config.handler_config.max_body_size,
+            )
+        })
+}
+
 fn dispatch_http_request(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
     legacy_sessions: &LiveHttpSessionRegistry,
+    modern_sessions: &LiveModernHttpSessionRegistry,
     request: HttpRequest,
     legacy_admission: Option<HttpLegacyRequestAdmissionGuard>,
 ) -> HttpResponse {
@@ -5155,6 +5491,12 @@ fn dispatch_http_request(
         );
     }
 
+    if request.method == HttpMethod::Post
+        && request.path == endpoint.server.http_config.handler_config.base_path
+    {
+        return dispatch_registered_modern_http_request(cx, endpoint, modern_sessions, request);
+    }
+
     let mut session = match endpoint.open_session(cx) {
         Ok(session) => session,
         Err(_) => return HttpResponse::internal_error(),
@@ -5177,6 +5519,7 @@ async fn serve_http_connection(
     stream: AsyncTcpStream,
     endpoint: Arc<ServerHttpEndpoint>,
     legacy_sessions: LiveHttpSessionRegistry,
+    modern_sessions: LiveModernHttpSessionRegistry,
 ) {
     let http_config = &endpoint.server.http_config.handler_config;
     let mut framed = Framed::new(
@@ -5271,11 +5614,13 @@ async fn serve_http_connection(
             };
         let request_endpoint = Arc::clone(&endpoint);
         let request_legacy_sessions = Arc::clone(&legacy_sessions);
+        let request_modern_sessions = Arc::clone(&modern_sessions);
         let mut dispatch = match cx.spawn_blocking(move |request_cx| {
             dispatch_http_request(
                 &request_cx,
                 &request_endpoint,
                 &request_legacy_sessions,
+                &request_modern_sessions,
                 request,
                 legacy_admission,
             )
@@ -5867,20 +6212,22 @@ impl Server {
         }
     }
 
-    /// Processes one modern request without connection-local session state.
+    /// Processes one modern request through the final dispatch surface.
     ///
     /// The transport owns raw headers and credentials. It must authenticate and
     /// validate those private inputs before constructing an
     /// [`InboundRequestContext`]; this public boundary receives only immutable,
     /// allowlisted request facts. Each call creates a fresh request authority,
     /// commits anonymous auth before extension middleware, and delegates only to
-    /// the router's stateless dispatch surface. It neither reads nor mutates a
-    /// [`Session`].
+    /// the router's final dispatch surface. It neither reads nor mutates a
+    /// legacy [`Session`]. A transport that supplies a connection-bound
+    /// [`InboundRequestContext`] also carries its durable MRTR partition and
+    /// retained-continuation cancellation authority.
     ///
     /// Requests that require connection-local lifecycle state remain available
-    /// exclusively through the legacy adapter. In particular, modern list
-    /// results come from the immutable router catalog and never depend on a
-    /// connection's previous requests.
+    /// exclusively through the legacy adapter. Modern list results still come
+    /// from the immutable router catalog and never depend on previous request
+    /// data.
     #[must_use]
     pub fn dispatch_stateless(
         &self,
@@ -6019,10 +6366,16 @@ impl Server {
                     .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 serde_json::to_value(self.server_discovery()?).map_err(McpError::from)
             } else {
+                let continuation_cancellation = inbound
+                    .mrtr_continuation_cancellation()
+                    .unwrap_or_else(McpRequestCancellation::new);
                 match self
                     .router
-                    .dispatch_stateless(&request_ctx, &admission_request)
-                {
+                    .dispatch_stateless_with_continuation_cancellation(
+                        &request_ctx,
+                        &admission_request,
+                        &continuation_cancellation,
+                    ) {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
                         self.dispatch_extension_fallback(&request_ctx, &admission_request)
                     }
@@ -6224,7 +6577,13 @@ impl Server {
                 .await
             }
             None => match Arc::clone(&self.router)
-                .dispatch_stateless_owned(request_ctx.clone(), request.clone())
+                .dispatch_stateless_owned_with_continuation_cancellation(
+                    request_ctx.clone(),
+                    request.clone(),
+                    inbound
+                        .mrtr_continuation_cancellation()
+                        .unwrap_or_else(McpRequestCancellation::new),
+                )
                 .await
             {
                 Err(error) if error.code == McpErrorCode::MethodNotFound => {
@@ -6250,7 +6609,15 @@ impl Server {
                 Err(self.apply_middleware_error(&entered_middleware, &request_ctx, &request, error))
             }
         };
-        let result = Self::request_context_error(&request_ctx).map_or(result, Err);
+        let graceful_subscription_completion = request.method == SUBSCRIPTIONS_LISTEN
+            && result.as_ref().is_ok_and(|value| {
+                final_subscription_completion_result(value, request.id.as_ref())
+            });
+        let result = if graceful_subscription_completion {
+            result
+        } else {
+            Self::request_context_error(&request_ctx).map_or(result, Err)
+        };
         if let Some(stats) = &self.stats {
             stats.record_request(&method, started_at.elapsed(), result.is_ok());
         }
@@ -6366,7 +6733,7 @@ impl Server {
             return Err(McpError::request_cancelled());
         }
 
-        let _lease = self.final_subscriptions.open(
+        let lease = self.final_subscriptions.open(
             subscription_id.clone(),
             params.notifications,
             tasks_requested,
@@ -6405,10 +6772,10 @@ impl Server {
             asupersync::time::sleep(request_ctx.cx().now(), Duration::from_millis(1)).await;
         }
 
-        // A server-initiated termination has already emitted its correlated
-        // cancellation control and cancelled this request authority.  Return
-        // the cancellation outcome so the outer transport suppresses a later
-        // final JSON-RPC response on this now-closed subscription stream.
+        if lease.has_graceful_completion() {
+            return self.final_subscription_complete_result(&subscription_id);
+        }
+
         Err(McpError::request_cancelled())
     }
 
@@ -7856,8 +8223,8 @@ impl Server {
     /// This is intended for embedding/testing scenarios where the server loop is
     /// running on a thread and the caller wants to `join()` it.
     fn graceful_shutdown_returning(&self) {
-        // Preserve the same cancellation-only subscription teardown semantics
-        // for embedded servers as for the process-exiting lifecycle.
+        // Preserve the same graceful subscription completion semantics for
+        // embedded servers as for the process-exiting lifecycle.
         let _ = self.terminate_subscription_streams();
         self.cancel_active_requests(CancelKind::Shutdown, true);
         self.run_shutdown_hook();
@@ -8075,6 +8442,9 @@ impl Server {
             Some(legacy_request_sender),
             server.logging.level,
         );
+        let modern_connection = ModernConnection::new();
+        let worker_modern_connection = modern_connection.request_context();
+        let dispatch_modern_connection = modern_connection.request_context();
         let (dispatch_sender, mut dispatch_receiver) =
             asupersync_mpsc::channel::<QueuedDispatchMessage>(MAX_DISPATCH_QUEUE_DEPTH);
 
@@ -8217,10 +8587,11 @@ impl Server {
 
                 let request_id = request.id.clone();
                 if matches!(era, ProtocolEra::Modern2026) {
-                    let inbound = InboundRequestContext::new(
+                    let inbound = InboundRequestContext::with_modern_connection_context(
                         worker_cx.clone(),
                         request_id_to_u64(request.id.as_ref()),
                         InboundRequestTransport::Stdio,
+                        &worker_modern_connection,
                     );
                     let request_cancellation = McpRequestCancellation::new();
                     let notification_send = Arc::clone(&worker_send);
@@ -8761,6 +9132,7 @@ impl Server {
                         let request_send = Arc::clone(&send);
                         let request_renderer = traffic_renderer.clone();
                         let task_principal_admission = Arc::clone(&principal_admission);
+                        let task_modern_connection = dispatch_modern_connection.clone();
                         let request = request;
                         let submitted = dispatch_cx.spawn_blocking(move |request_cx| {
                             let mut reservation = reservation;
@@ -8840,10 +9212,11 @@ impl Server {
                                             )
                                         }
                                         ModernDispatchStart::Ready => {
-                                            let inbound = InboundRequestContext::new(
+                                            let inbound = InboundRequestContext::with_modern_connection_context(
                                                 request_cx.clone(),
                                                 request_id_to_u64(request.id.as_ref()),
                                                 InboundRequestTransport::Stdio,
+                                                &task_modern_connection,
                                             );
                                             let started = Instant::now();
                                             let notification_send = Arc::clone(&request_send);
@@ -9261,6 +9634,7 @@ impl Server {
             None,
             self.logging.level,
         );
+        let modern_connection = ModernConnection::new();
 
         // Track connection opened
         if let Some(ref stats) = self.stats {
@@ -9432,10 +9806,11 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
-                        let inbound = InboundRequestContext::new(
+                        let inbound = InboundRequestContext::with_modern_connection(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
+                            &modern_connection,
                         );
                         self.dispatch_with_protocol_policy_and_final_logging(
                             self.protocol_policy,
@@ -9610,6 +9985,7 @@ impl Server {
             None,
             self.logging.level,
         );
+        let modern_connection = ModernConnection::new();
 
         // Track connection opened
         if let Some(ref stats) = self.stats {
@@ -9821,10 +10197,11 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
-                        let inbound = InboundRequestContext::new(
+                        let inbound = InboundRequestContext::with_modern_connection(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
+                            &modern_connection,
                         );
                         self.dispatch_with_protocol_policy_and_final_logging(
                             self.protocol_policy,
@@ -12691,6 +13068,9 @@ mod lib_unit_tests {
         ExtensionInactiveReason, ExtensionNegotiationError, McpAppsClientSettings,
         official_tasks_empty_settings, register_official_tasks_extension,
     };
+    use fastmcp_protocol::result::{
+        CoreResultDiscriminatorPolicy, DecodedResult, ResultPeerEra, decode_peer_result,
+    };
     use fastmcp_protocol::{
         CallToolResult, CompletionValues, Content, ExtensionDescriptorRegistry,
         FinalCompletionParams, LegacyCompletionParams, LegacyContent,
@@ -13222,6 +13602,27 @@ mod lib_unit_tests {
             .position(|window| window == b"\r\n\r\n")
             .map(|offset| &response[offset + 4..])
             .ok_or_else(|| "live HTTP response omitted its header terminator".to_string())
+    }
+
+    fn live_http_response_header(response: &[u8], name: &str) -> Result<String, String> {
+        let headers = std::str::from_utf8(
+            response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|offset| &response[..offset])
+                .ok_or_else(|| "live HTTP response omitted its header terminator".to_string())?,
+        )
+        .map_err(|error| format!("live HTTP response headers were not UTF-8: {error}"))?;
+        headers
+            .split("\r\n")
+            .skip(1)
+            .find_map(|header| {
+                let (header_name, value) = header.split_once(':')?;
+                header_name
+                    .eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_owned())
+            })
+            .ok_or_else(|| format!("live HTTP response omitted {name} header"))
     }
 
     async fn read_live_http_until(
@@ -18391,6 +18792,82 @@ mod lib_unit_tests {
         }
     }
 
+    fn live_http_mrtr_input_required() -> fastmcp_protocol::InputRequiredResult {
+        let encoded = serde_json::json!({
+            "resultType": "input_required",
+            "inputRequests": {"roots": {"method": "roots/list"}},
+            "requestState": "handler-forged-state",
+        })
+        .to_string();
+        let (decoded, diagnostic) = decode_peer_result(
+            &encoded,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("test input-required result must decode");
+        assert!(diagnostic.is_none());
+        let DecodedResult::InputRequired(result) = decoded else {
+            panic!("test result must be input_required");
+        };
+        result
+    }
+
+    struct LiveHttpMrtrTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for LiveHttpMrtrTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "live_http_mrtr".to_owned(),
+                description: Some(
+                    "Proves endpoint-owned MRTR state survives separate HTTP POSTs".to_owned(),
+                ),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("live HTTP MRTR resumed")])
+        }
+
+        fn call_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            arguments: serde_json::Value,
+            resume_inputs: Option<&'a bidirectional::MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, fastmcp_core::McpOutcome<FinalToolOutcome>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                match resume_inputs {
+                    None => asupersync::Outcome::Ok(FinalToolOutcome::InputRequired(
+                        live_http_mrtr_input_required(),
+                    )),
+                    Some(inputs) => match inputs.roots("roots") {
+                        Ok(Some(_)) => self
+                            .call_final(ctx, arguments)
+                            .map(FinalToolOutcome::Complete)
+                            .map_or_else(asupersync::Outcome::Err, asupersync::Outcome::Ok),
+                        Ok(None) => asupersync::Outcome::Err(McpError::internal_error(
+                            "live HTTP MRTR retry lost its roots input",
+                        )),
+                        Err(error) => asupersync::Outcome::Err(error),
+                    },
+                }
+            })
+        }
+    }
+
     struct LiveLegacyCompletionHandler;
 
     impl CompletionHandler for LiveLegacyCompletionHandler {
@@ -21022,11 +21499,13 @@ mod lib_unit_tests {
             .into_http_endpoint("http://legacy.test")
             .expect("extension server must construct the configured HTTP endpoint");
         let legacy_sessions: LiveHttpSessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let modern_sessions: LiveModernHttpSessionRegistry = Arc::new(Mutex::new(HashMap::new()));
 
         let response = dispatch_http_request(
             &cx,
             &endpoint,
             &legacy_sessions,
+            &modern_sessions,
             extension_tasks_get_http_request(LEGACY_PROTOCOL_VERSION),
             None,
         );
@@ -21277,6 +21756,312 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn live_http_mrtr_retry_uses_discovery_session_across_new_post_and_request_id() {
+        run_live_http_test(|cx| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let bound = Server::new("live-http-mrtr-session", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .tool(LiveHttpMrtrTool {
+                    calls: Arc::clone(&calls),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("live HTTP MRTR bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("live HTTP MRTR address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let discovery = JsonRpcRequest::new(
+                        SERVER_DISCOVER_METHOD,
+                        Some(serde_json::json!({
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                            },
+                        })),
+                        921_i64,
+                    );
+                    let discovery_body = serde_json::to_vec(&discovery)
+                        .map_err(|error| format!("MRTR discovery did not serialize: {error}"))?;
+                    let discovery = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/mcp",
+                            &discovery_body,
+                            &[
+                                ("Accept", "application/json"),
+                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                ("Mcp-Method", SERVER_DISCOVER_METHOD),
+                            ],
+                        ),
+                    )
+                    .await?;
+                    let session_id = live_http_response_header(&discovery, "mcp-session-id")?;
+                    let initial = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_http_mrtr",
+                            "arguments": {},
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                            },
+                        })),
+                        922_i64,
+                    );
+                    let initial_body = serde_json::to_vec(&initial)
+                        .map_err(|error| format!("MRTR initial request did not serialize: {error}"))?;
+                    let initial = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/mcp",
+                            &initial_body,
+                            &[
+                                ("Accept", "application/json"),
+                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                ("Mcp-Method", "tools/call"),
+                                ("MCP-Session-Id", session_id.as_str()),
+                            ],
+                        ),
+                    )
+                    .await?;
+                    let initial_response: JsonRpcResponse = serde_json::from_slice(
+                        live_http_response_body(&initial)?,
+                    )
+                    .map_err(|error| format!("MRTR initial response was invalid: {error}"))?;
+                    let request_state = initial_response
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("requestState"))
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "MRTR initial response omitted requestState".to_owned())?
+                        .to_owned();
+                    let roots = serde_json::to_value(
+                        bidirectional::MrtrInputResponse::roots(
+                            fastmcp_protocol::ListRootsResult::empty(),
+                        )
+                        .map_err(|error| format!("MRTR roots response failed: {error}"))?,
+                    )
+                    .map_err(|error| format!("MRTR roots response did not serialize: {error}"))?;
+                    let retry = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_http_mrtr",
+                            "arguments": {},
+                            "inputResponses": {"roots": roots},
+                            "requestState": request_state,
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                            },
+                        })),
+                        923_i64,
+                    );
+                    let retry_body = serde_json::to_vec(&retry)
+                        .map_err(|error| format!("MRTR retry request did not serialize: {error}"))?;
+                    let retry = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/mcp",
+                            &retry_body,
+                            &[
+                                ("Accept", "application/json"),
+                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                ("Mcp-Method", "tools/call"),
+                                ("MCP-Session-Id", session_id.as_str()),
+                            ],
+                        ),
+                    )
+                    .await;
+                    caller_cx.cancel_with(CancelKind::User, Some("live HTTP MRTR retry complete"));
+                    retry
+                })
+                .map_err(|error| format!("live HTTP MRTR client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let retry = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("live HTTP MRTR client failed: {error:?}"))??;
+            serve.map_err(|error| format!("live HTTP MRTR server failed: {error}"))?;
+            let retry: JsonRpcResponse = serde_json::from_slice(live_http_response_body(&retry)?)
+                .map_err(|error| format!("MRTR retry response was invalid: {error}"))?;
+            if retry.id != Some(923_i64.into())
+                || retry.error.is_some()
+                || retry
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType"))
+                    != Some(&serde_json::json!("complete"))
+            {
+                return Err(format!("MRTR retry did not complete: {retry:?}"));
+            }
+            if calls.load(Ordering::Acquire) != 2 {
+                return Err("MRTR handler did not run once per initial/retry POST".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_mrtr_shutdown_invalidates_state_without_reentering_handler() {
+        run_live_http_test(|cx| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let bound = Server::new("live-http-mrtr-shutdown", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .tool(LiveHttpMrtrTool {
+                    calls: Arc::clone(&calls),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("live HTTP MRTR shutdown bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("live HTTP MRTR shutdown address failed: {error}"))?;
+            let endpoint = Arc::clone(&bound.endpoint);
+            let modern_sessions = Arc::clone(&bound.modern_sessions);
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let discovery = JsonRpcRequest::new(
+                        SERVER_DISCOVER_METHOD,
+                        Some(serde_json::json!({
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                            },
+                        })),
+                        931_i64,
+                    );
+                    let discovery_body = serde_json::to_vec(&discovery).map_err(|error| {
+                        format!("MRTR shutdown discovery did not serialize: {error}")
+                    })?;
+                    let discovery = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/mcp",
+                            &discovery_body,
+                            &[
+                                ("Accept", "application/json"),
+                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                ("Mcp-Method", SERVER_DISCOVER_METHOD),
+                            ],
+                        ),
+                    )
+                    .await?;
+                    let session_id = live_http_response_header(&discovery, "mcp-session-id")?;
+                    let initial = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_http_mrtr",
+                            "arguments": {},
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                            },
+                        })),
+                        932_i64,
+                    );
+                    let initial_body = serde_json::to_vec(&initial).map_err(|error| {
+                        format!("MRTR shutdown initial request did not serialize: {error}")
+                    })?;
+                    let initial = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/mcp",
+                            &initial_body,
+                            &[
+                                ("Accept", "application/json"),
+                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                ("Mcp-Method", "tools/call"),
+                                ("MCP-Session-Id", session_id.as_str()),
+                            ],
+                        ),
+                    )
+                    .await?;
+                    let initial: JsonRpcResponse = serde_json::from_slice(
+                        live_http_response_body(&initial)?,
+                    )
+                    .map_err(|error| {
+                        format!("MRTR shutdown initial response was invalid: {error}")
+                    })?;
+                    let request_state = initial
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("requestState"))
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "MRTR shutdown initial response omitted requestState".to_owned())?
+                        .to_owned();
+                    caller_cx.cancel_with(
+                        CancelKind::User,
+                        Some("live HTTP MRTR shutdown after input_required"),
+                    );
+                    Ok::<_, String>((session_id, request_state))
+                })
+                .map_err(|error| format!("live HTTP MRTR shutdown client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let (session_id, request_state) = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("live HTTP MRTR shutdown client failed: {error:?}"))??;
+            serve.map_err(|error| format!("live HTTP MRTR shutdown server failed: {error}"))?;
+            if !modern_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                return Err("listener shutdown retained a modern HTTP session".to_owned());
+            }
+            let roots = serde_json::to_value(
+                bidirectional::MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
+                    .map_err(|error| format!("MRTR shutdown roots response failed: {error}"))?,
+            )
+            .map_err(|error| format!("MRTR shutdown roots response did not serialize: {error}"))?;
+            let retry = HttpRequest::new(HttpMethod::Post, "/mcp")
+                .with_header("content-type", "application/json")
+                .with_header("accept", "application/json")
+                .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                .with_header("mcp-method", "tools/call")
+                .with_header("mcp-session-id", session_id)
+                .with_body(
+                    serde_json::to_vec(&JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_http_mrtr",
+                            "arguments": {},
+                            "inputResponses": {"roots": roots},
+                            "requestState": request_state,
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                            },
+                        })),
+                        933_i64,
+                    ))
+                    .map_err(|error| format!("MRTR shutdown retry did not serialize: {error}"))?,
+                );
+            let retry = dispatch_registered_modern_http_request(
+                &Cx::for_testing(),
+                &endpoint,
+                &modern_sessions,
+                retry,
+            );
+            if retry.status != HttpStatus::NOT_FOUND || calls.load(Ordering::Acquire) != 1 {
+                return Err(
+                    "shutdown-invalidated MRTR retry reached the handler or was not refused"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
     fn live_http_protocol_admission_preserves_jsonrpc_when_only_version_header_differs() {
         run_live_http_test(|cx| async move {
             let bound = Server::new("live-http-protocol-admission", "1.0.0")
@@ -21298,8 +22083,9 @@ mod lib_unit_tests {
                 })),
                 814_i64,
             );
-            let body = serde_json::to_vec(&request)
-                .map_err(|error| format!("protocol-admission request did not serialize: {error}"))?;
+            let body = serde_json::to_vec(&request).map_err(|error| {
+                format!("protocol-admission request did not serialize: {error}")
+            })?;
             let accepted = live_http_post(
                 "/mcp",
                 &body,
@@ -21372,7 +22158,11 @@ mod lib_unit_tests {
                 || rejected.result.is_some()
                 || rejected.error.as_ref().map(|error| error.code)
                     != Some(fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE)
-                || rejected.error.as_ref().and_then(|error| error.data.as_ref()).is_some()
+                || rejected
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.data.as_ref())
+                    .is_some()
             {
                 return Err(format!(
                     "mismatched final protocol-version request did not retain its canonical JSON-RPC error: {rejected:?}"
@@ -21673,13 +22463,11 @@ mod lib_unit_tests {
                 {
                     return Err("server teardown omitted its cancellation control".to_owned());
                 }
-                if received
-                    .windows(b"\"resultType\"".len())
-                    .any(|window| window == b"\"resultType\"")
+                if !received
+                    .windows(b"\"resultType\":\"complete\"".len())
+                    .any(|window| window == b"\"resultType\":\"complete\"")
                 {
-                    return Err(
-                        "server cancellation emitted a forbidden terminal result".to_owned()
-                    );
+                    return Err("server teardown omitted its terminal complete result".to_owned());
                 }
                 Ok(())
             });
@@ -26404,7 +27192,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn final_subscription_http_teardown_emits_correlated_cancellation_without_result() {
+    fn public_stdio_listen_server_teardown_emits_correlated_completion() {
         let server = Arc::new(Server::new("final-listen-dispatch-test", "1.0.0").build());
         let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
         let sent_for_sender = Arc::clone(&sent);
@@ -26439,7 +27227,7 @@ mod lib_unit_tests {
         let inbound = InboundRequestContext::new(
             Cx::for_testing(),
             request_id_to_u64(Some(&subscription_id)),
-            InboundRequestTransport::Http,
+            InboundRequestTransport::Stdio,
         );
         let terminator = {
             let server = Arc::clone(&server);
@@ -26462,7 +27250,7 @@ mod lib_unit_tests {
             ProtocolPolicy::ModernOnly,
             &inbound,
             request,
-            Some(73),
+            None,
             McpRequestCancellation::new(),
             None,
             notification_sender,
@@ -26484,9 +27272,11 @@ mod lib_unit_tests {
             ServerNotification::decode(&acknowledgement),
             Ok(ServerNotification::SubscriptionsAcknowledged(_))
         ));
+        let response = response.expect("server-owned stdio teardown must complete the listen");
+        assert_eq!(response.id, Some(subscription_id.clone()));
         assert!(
-            response.is_none(),
-            "cancellation-only teardown must not emit a later result"
+            final_subscription_completion_response(&response),
+            "server-owned teardown must complete the exact listen request"
         );
         let terminal = sent
             .lock()
@@ -26513,7 +27303,7 @@ mod lib_unit_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
             2,
-            "acknowledgement and cancellation are the only terminal-stream frames",
+            "the acknowledgement and cancellation control precede the final response",
         );
     }
 
@@ -26862,7 +27652,9 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn final_subscription_http_peer_cancellation_removes_without_server_terminal_control() {
+    fn public_stdio_peer_close_removes_without_terminal_completion() {
+        // This mirrors the server-teardown positive above; only the terminal
+        // authority changes from server termination to peer closure.
         let server = Arc::new(Server::new("final-listen-peer-cancel-test", "1.0.0").build());
         let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
         let sent_for_sender = Arc::clone(&sent);
@@ -26897,7 +27689,7 @@ mod lib_unit_tests {
         let inbound = InboundRequestContext::new(
             Cx::for_testing(),
             request_id_to_u64(Some(&subscription_id)),
-            InboundRequestTransport::Http,
+            InboundRequestTransport::Stdio,
         );
         let request_cancellation = McpRequestCancellation::new();
         let canceller = {
@@ -26922,7 +27714,7 @@ mod lib_unit_tests {
             ProtocolPolicy::ModernOnly,
             &inbound,
             request,
-            Some(74),
+            None,
             request_cancellation,
             None,
             notification_sender,
@@ -27025,6 +27817,12 @@ mod lib_unit_tests {
         );
 
         terminal_delivery.mark_drained();
+        assert!(
+            !receipt.is_settled(),
+            "terminal control consumption must not stand in for final completion delivery"
+        );
+        terminal_delivery.mark_completion_enqueued();
+        terminal_delivery.mark_completion_drained();
         assert!(receipt.is_settled());
     }
 
@@ -27491,15 +28289,43 @@ mod lib_unit_tests {
             if terminal.method != "notifications/cancelled" {
                 return Err("server teardown emitted the wrong terminal control".to_owned());
             }
+            if second_sse.is_finished() || second_guard.checkpoint(&cx).is_err() {
+                return Err(
+                    "terminal control closed the public SSE body before its final completion"
+                        .to_owned(),
+                );
+            }
+            let completion_deadline = Instant::now() + Duration::from_secs(2);
+            let completion = loop {
+                match second_sse.pop_event() {
+                    Ok(Some(event)) => break event,
+                    Ok(None) if Instant::now() < completion_deadline => {
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                    Ok(None) => return Err("terminal completion remained pending".to_owned()),
+                    Err(error) => {
+                        return Err(format!("terminal completion was not readable: {error}"));
+                    }
+                }
+            };
+            let completion: JsonRpcResponse = serde_json::from_str(&completion.data)
+                .map_err(|error| format!("terminal completion was invalid JSON-RPC: {error}"))?;
+            if completion.id != Some(RequestId::Number(884))
+                || !final_subscription_completion_response(&completion)
+            {
+                return Err(
+                    "server teardown did not complete the exact public listen request".to_owned(),
+                );
+            }
             if !second_sse.is_finished() || second_guard.checkpoint(&cx).is_ok() {
-                return Err("terminal control did not finish the public SSE body".to_owned());
+                return Err("terminal completion did not finish the public SSE body".to_owned());
             }
             if !matches!(
                 second_sse.pop_event(),
                 Err(DualEraHttpEndpointError::Closed)
             ) {
                 return Err(
-                    "terminal control did not close the public SSE response body".to_owned(),
+                    "terminal completion did not close the public SSE response body".to_owned(),
                 );
             }
 
@@ -27524,7 +28350,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn public_http_last_session_drop_revokes_work_without_terminal_claim() {
+    fn public_http_peer_close_revokes_listen_without_terminal_completion() {
         run_live_http_test(|cx| async move {
             let endpoint = Server::new("public-http-last-session-drop", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
@@ -27588,10 +28414,13 @@ mod lib_unit_tests {
                     .entries
                     .is_empty()
             {
-                return Err("last-session Drop did not revoke its exact request".to_owned());
+                return Err("peer close did not revoke its exact request".to_owned());
             }
             if !matches!(sse.pop_event(), Err(DualEraHttpEndpointError::Closed)) {
-                return Err("cancelled Drop path was confused with a pending body".to_owned());
+                return Err(
+                    "peer-close path emitted an event instead of closing without completion"
+                        .to_owned(),
+                );
             }
             Ok(())
         });
