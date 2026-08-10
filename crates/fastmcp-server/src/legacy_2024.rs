@@ -20,8 +20,9 @@ use fastmcp_protocol::methods::{
     PROMPTS_LIST, RESOURCES_LIST, RESOURCES_READ, RESOURCES_SUBSCRIBE, RESOURCES_TEMPLATES_LIST,
     RESOURCES_UNSUBSCRIBE, ROOTS_LIST, SAMPLING_CREATE_MESSAGE, TOOLS_CALL, TOOLS_LIST,
     decode_legacy_2024_11_05_client_capabilities, decode_legacy_2024_11_05_envelope_classified,
-    translate_legacy_2024_result,
-    validate_legacy_2024_11_05_initialize_result, validate_legacy_2024_11_05_method_params,};
+    translate_legacy_2024_result, validate_legacy_2024_11_05_initialize_result,
+    validate_legacy_2024_11_05_method_params,
+};
 use serde_json::{Value, json};
 
 /// Maximum combined subscriptions and pending reverse requests retained by
