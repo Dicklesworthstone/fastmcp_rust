@@ -7,8 +7,10 @@
 //! - Prompt fetching
 //!
 //! MCP 2026-07-28 support is under implementation and remains unverified. The
-//! client still initializes with public protocol version `2024-11-05`; this
-//! source inventory is not aggregate conformance or release evidence.
+//! public stdio constructor starts with a modern `server/discover` probe and
+//! opens a fresh exact-2024 child only for a recognized `MethodNotFound`
+//! refusal; this source inventory is not aggregate conformance or release
+//! evidence.
 //!
 //! # Example
 //!
@@ -103,6 +105,7 @@ pub use negotiation::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
     ClientHttpNegotiationState,
 };
+pub(crate) use session::ClientExtensionRuntime;
 pub use session::{ClientProtocolPlan, ClientProtocolPlanError, ClientSession};
 
 use std::any::Any;
@@ -275,8 +278,8 @@ impl ReverseRequestHandlers {
     }
 }
 use fastmcp_transport::{
-    StdioRecvHalf, StdioSendHalf, StdioTransport, Transport, TransportError, TransportRecvHalf,
-    TransportSendHalf,
+    ClientTransportRecvHalf, ReceivedTransportFrame, StdioRecvHalf, StdioSendHalf, StdioTransport,
+    Transport, TransportError, TransportRecvHalf, TransportSendHalf,
 };
 
 use crate::cache::{FinalCachePageLookup, final_cache_hints};
@@ -367,7 +370,7 @@ pub enum FinalToolCallOutcome {
 
 /// Responses supplied to one final model-request tool retry (MRTR).
 ///
-/// Keys must name input requests from the immediately preceding
+/// Keys must exactly cover the input requests from the immediately preceding
 /// `input_required` result. Values remain JSON because the peer owns the
 /// individual embedded-request schemas.
 pub type MrtrInputResponses = BTreeMap<String, serde_json::Value>;
@@ -408,6 +411,13 @@ fn mrtr_retry_parameters(
             {
                 return Err(McpError::invalid_params(
                     "MRTR inputResponses contain a key not requested by the peer",
+                ));
+            }
+        }
+        for request in input_requests.members() {
+            if !input_responses.contains_key(&request.name) {
+                return Err(McpError::invalid_params(
+                    "MRTR inputResponses must include every key requested by the peer",
                 ));
             }
         }
@@ -3117,22 +3127,220 @@ fn validate_timeout_duration(
     Ok(())
 }
 
+/// Transport-neutral I/O for a connection whose protocol era is already fixed.
+///
+/// This type intentionally accepts only independently owned halves. It has no
+/// protocol policy, reconnect factory, subprocess handle, or lifecycle state,
+/// so it cannot probe or downgrade an `Auto` connection. The existing stdio
+/// client retains ownership of child lifecycle and reverse-handler control
+/// writes until those concerns receive their own transport-neutral slice.
+#[derive(Clone)]
+struct NegotiatedClientIo<R, S> {
+    receiver: R,
+    sender: S,
+}
+
+impl<R, S> NegotiatedClientIo<R, S>
+where
+    R: ClientTransportRecvHalf,
+    S: TransportSendHalf,
+{
+    fn new(receiver: R, sender: S) -> Self {
+        Self { receiver, sender }
+    }
+
+    fn recv(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+        self.receiver.recv_with_source(cx)
+    }
+
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.sender.send(cx, message)
+    }
+
+    fn into_parts(self) -> (R, S) {
+        (self.receiver, self.sender)
+    }
+}
+
+/// Shared adapter over the client-owned stdio ingress half.
+///
+/// The adapter owns only the receiver lock. Its matching writer adapter owns a
+/// distinct lock, so a blocked receive never holds child stdin away from a
+/// reverse-callback worker.
+#[derive(Clone)]
+struct SharedStdioRecv(Arc<Mutex<StdioRecvHalf<ChildStdout>>>);
+
+impl TransportRecvHalf for SharedStdioRecv {
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        self.0.lock().map_err(|_| TransportError::Closed)?.recv(cx)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.0.lock().map_err(|_| TransportError::Closed)?.close()
+    }
+}
+
+impl ClientTransportRecvHalf for SharedStdioRecv {
+    fn recv_with_source(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+        let mut receiver = self.0.lock().map_err(|_| TransportError::Closed)?;
+        receiver.recv(cx)?;
+        admitted_stdio_frame(&receiver)
+    }
+}
+
+impl SharedStdioRecv {
+    #[cfg(unix)]
+    fn recv_until_with_source(
+        &mut self,
+        cx: &Cx,
+        deadline: Option<Instant>,
+    ) -> Result<(ReceivedTransportFrame, Instant), TransportError> {
+        let mut receiver = self.0.lock().map_err(|_| TransportError::Closed)?;
+        receiver.recv_until_or_closed(cx, deadline)?;
+        let received_at = Instant::now();
+        let frame = admitted_stdio_frame(&receiver)?;
+        Ok((frame, received_at))
+    }
+
+    #[cfg(not(unix))]
+    fn recv_until_with_source(
+        &mut self,
+        cx: &Cx,
+        deadline: Option<Instant>,
+    ) -> Result<(ReceivedTransportFrame, Instant), TransportError> {
+        // std::process::ChildStdout exposes no portable safe readiness
+        // primitive. Keep the existing frame-boundary deadline behavior.
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(TransportError::ReceiveDeadlineExceeded);
+        }
+        self.recv_with_source(cx)
+            .map(|frame| (frame, Instant::now()))
+    }
+}
+
+/// Shared adapter over the client-owned stdio egress half.
+///
+/// It intentionally shares no lock with [`SharedStdioRecv`]. The selected
+/// negotiated I/O therefore preserves the existing callback writer's ability
+/// to respond while the sole reader is waiting for another inbound frame.
+#[derive(Clone)]
+struct SharedStdioSend(Arc<Mutex<StdioSendHalf<ChildStdin>>>);
+
+impl TransportSendHalf for SharedStdioSend {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.0
+            .lock()
+            .map_err(|_| TransportError::Closed)?
+            .send(cx, message)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.0.lock().map_err(|_| TransportError::Closed)?.close()
+    }
+}
+
+impl NegotiatedClientIo<SharedStdioRecv, SharedStdioSend> {
+    fn recv_until_with_source(
+        &mut self,
+        cx: &Cx,
+        deadline: Option<Instant>,
+    ) -> Result<(ReceivedTransportFrame, Instant), TransportError> {
+        self.receiver.recv_until_with_source(cx, deadline)
+    }
+}
+
+/// The selected stdio transport view held by request executors.
+///
+/// Its receive half remains shared with [`Client`], but request executors are
+/// always driven through admitted frames from the client. The `Transport`
+/// implementation exists only to give the executor its request and
+/// cancellation writer; its self-reader entry point is deliberately rejected
+/// after the Client claims external ingress with `drive_frame`.
+type SelectedStdioTransport = NegotiatedClientIo<SharedStdioRecv, SharedStdioSend>;
+
+impl Transport for SelectedStdioTransport {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.sender.send(cx, message)
+    }
+
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        self.receiver.recv(cx)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.receiver.close()?;
+        self.sender.close()
+    }
+}
+
+/// Extracts a response's exact raw result source from one admitted ingress frame.
+///
+/// The typed source-side response and raw source both originate from the same
+/// bounded [`ReceivedTransportFrame`], so no caller can attach a reordered or
+/// otherwise mismatched sidecar to a separately decoded response. The supplied
+/// response is retained only to detect a stale stdio reuse-buffer race.
+fn raw_result_from_admitted_response(
+    response: &JsonRpcResponse,
+    frame: ReceivedTransportFrame,
+    transport_name: &str,
+) -> McpResult<Option<String>> {
+    let (message, source) = frame.into_parts();
+    let JsonRpcMessage::Response(source_response) = message else {
+        return Err(McpError::internal_error(format!(
+            "Admitted {transport_name} ingress frame was not a JSON-RPC response"
+        )));
+    };
+    if &source_response != response {
+        return Err(McpError::internal_error(format!(
+            "Typed {transport_name} response differs from its admitted source frame"
+        )));
+    }
+    let admission = decode_strict_jsonrpc_response(&source, source.len()).map_err(|_| {
+        McpError::internal_error(format!(
+            "Admitted {transport_name} response could not retain its raw result"
+        ))
+    })?;
+    if admission.response() != response {
+        return Err(McpError::internal_error(format!(
+            "Typed {transport_name} response differs from its admitted source frame"
+        )));
+    }
+    Ok(admission.into_parts().1)
+}
+
+fn admitted_stdio_frame(
+    transport: &StdioRecvHalf<ChildStdout>,
+) -> Result<ReceivedTransportFrame, TransportError> {
+    let source = transport
+        .last_received_frame()
+        .ok_or_else(|| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stdio receive completed without an admitted source frame",
+            ))
+        })?
+        .to_vec()
+        .into_boxed_slice();
+    ReceivedTransportFrame::admit(source)
+}
+
 #[cfg(unix)]
 fn recv_child_transport(
     transport: &mut StdioRecvHalf<ChildStdout>,
     cx: &Cx,
     deadline: Option<Instant>,
-) -> Result<(JsonRpcMessage, Instant), TransportError> {
-    transport
-        .recv_until_or_closed(cx, deadline)
-        .map(|message| (message, Instant::now()))
+) -> Result<(ReceivedTransportFrame, Instant), TransportError> {
+    transport.recv_until_or_closed(cx, deadline)?;
+    let received_at = Instant::now();
+    let frame = admitted_stdio_frame(transport)?;
+    Ok((frame, received_at))
 }
 
 fn recv_shared_child_transport(
     transport: &Arc<Mutex<StdioRecvHalf<ChildStdout>>>,
     cx: &Cx,
     deadline: Option<Instant>,
-) -> Result<(JsonRpcMessage, Instant), TransportError> {
+) -> Result<(ReceivedTransportFrame, Instant), TransportError> {
     let mut receiver = transport.lock().map_err(|_| TransportError::Closed)?;
     recv_child_transport(&mut receiver, cx, deadline)
 }
@@ -3163,14 +3371,17 @@ fn recv_child_transport(
     transport: &mut StdioRecvHalf<ChildStdout>,
     cx: &Cx,
     deadline: Option<Instant>,
-) -> Result<(JsonRpcMessage, Instant), TransportError> {
+) -> Result<(ReceivedTransportFrame, Instant), TransportError> {
     // std::process::ChildStdout exposes no portable safe readiness primitive.
     // Keep the limitation explicit: non-Unix cancellation/deadlines are
     // observed at frame boundaries, but cannot interrupt a blocking pipe read.
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(TransportError::ReceiveDeadlineExceeded);
     }
-    transport.recv(cx).map(|message| (message, Instant::now()))
+    transport.recv(cx)?;
+    let received_at = Instant::now();
+    let frame = admitted_stdio_frame(transport)?;
+    Ok((frame, received_at))
 }
 
 #[cfg(unix)]
@@ -4452,6 +4663,19 @@ impl FinalTaskHandle {
             .await
     }
 
+    /// Requests cancellation for this exact durable task.
+    ///
+    /// A successful `tasks/cancel` result is only an empty acknowledgement;
+    /// it does not replace this handle's last admitted snapshot. Use
+    /// [`Self::poll`] or [`Self::watch`] to observe the resulting task state.
+    pub async fn cancel(
+        &self,
+        cx: &Cx,
+        client: &mut HttpClient,
+    ) -> Result<FinalCancelTaskResult, HttpClientError> {
+        client.cancel_final_task(cx, self.task_id().clone()).await
+    }
+
     /// Opens one live `notifications/tasks` stream for exactly this task.
     ///
     /// The resulting watcher is caller-driven and does not reconnect or poll
@@ -4598,12 +4822,34 @@ impl HttpClient {
         mcp_apps_settings: Option<McpAppsClientSettings>,
         reverse_request_handlers: ReverseRequestHandlers,
     ) -> Result<Self, HttpClientError> {
-        let mut connection = ClientHttpConnection::connect_with_mcp_apps(
+        Self::connect_with_extensions(
+            cx,
+            protocol_plan,
+            client_info,
+            client_capabilities,
+            mcp_apps_settings,
+            None,
+            reverse_request_handlers,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_extensions(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        mut client_capabilities: ClientCapabilities,
+        mcp_apps_settings: Option<McpAppsClientSettings>,
+        client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+        reverse_request_handlers: ReverseRequestHandlers,
+    ) -> Result<Self, HttpClientError> {
+        let mut connection = ClientHttpConnection::connect_with_extensions(
             cx,
             protocol_plan,
             client_info.clone(),
             client_capabilities.clone(),
             mcp_apps_settings.clone(),
+            client_extension_runtime,
         )
         .await
         .map_err(HttpClientError::Connection)?;
@@ -4706,9 +4952,16 @@ impl HttpClient {
     fn current_mcp_apps_activation_receipt(
         &self,
     ) -> Option<fastmcp_protocol::extensions::McpAppsActivationReceipt> {
-        self.connection.server_discovery().and_then(|discovery| {
-            mcp_apps_activation_receipt(self.mcp_apps_settings.as_ref(), &discovery)
-        })
+        self.connection.mcp_apps_activation_receipt()
+    }
+
+    /// Returns the frozen generic extension set retained from the modern
+    /// `server/discover` exchange, if a builder registry was configured.
+    #[must_use]
+    pub fn negotiated_extensions(
+        &self,
+    ) -> Option<fastmcp_protocol::extensions::NegotiatedExtensionSet> {
+        self.connection.negotiated_extensions()
     }
 
     /// Starts one browser-agnostic Apps Host for a negotiated modern connection.
@@ -5047,107 +5300,51 @@ impl HttpClient {
         Ok(result)
     }
 
-    /// Calls a tool and, only when its first final result requires input,
-    /// performs one MRTR retry with caller-supplied responses.
+    /// Sends one raw final extension request after exact bilateral admission.
     ///
-    /// This emits at most two requests. Exact MCP 2024-11-05 results and
-    /// final complete or Tasks results are returned without invoking
-    /// `respond`. A second `input_required` result is returned rather than
-    /// retried again.
-    pub async fn call_tool_with_mrtr_retry<F>(
+    /// The configured frozen registry must own `extension_id`, and the
+    /// retained final discovery exchange must admit `method` as a
+    /// client-to-server request. Those checks happen before this HTTP client
+    /// allocates an ID or starts a POST. The successful result is decoded from
+    /// the existing source-preserving correlated JSON-RPC path.
+    pub async fn request_final_extension(
         &mut self,
         cx: &Cx,
-        name: &str,
-        arguments: serde_json::Value,
-        respond: F,
-    ) -> Result<CoreResult, HttpClientError>
-    where
-        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
-    {
-        let parameters = serde_json::json!({
-            "name": name,
-            "arguments": arguments,
-        });
-        let result = self
-            .request_final_core(cx, "tools/call", parameters.clone())
-            .await?;
-        let Some(input_required) = mrtr_input_required_for_method("tools/call", &result) else {
-            return Ok(result);
-        };
-        let input_responses = respond(input_required).map_err(HttpClientError::CoreResult)?;
-        let retry = mrtr_retry_parameters(parameters, input_required, input_responses)
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> Result<serde_json::Value, HttpClientError> {
+        self.connection
+            .admit_final_extension_method(extension_id, method)
             .map_err(HttpClientError::CoreResult)?;
-        self.request_final_core(cx, "tools/call", retry).await
-    }
-
-    /// Reads a resource and, only when its first final result requires input,
-    /// performs one MRTR retry with caller-supplied responses.
-    ///
-    /// This emits at most two requests; see [`Self::call_tool_with_mrtr_retry`]
-    /// for the terminal-result behavior.
-    pub async fn read_resource_with_mrtr_retry<F>(
-        &mut self,
-        cx: &Cx,
-        uri: &str,
-        respond: F,
-    ) -> Result<CoreResult, HttpClientError>
-    where
-        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
-    {
-        let parameters = serde_json::json!({ "uri": uri });
-        let result = self
-            .request_final_core(cx, "resources/read", parameters.clone())
-            .await?;
-        let Some(input_required) = mrtr_input_required_for_method("resources/read", &result) else {
-            return Ok(result);
-        };
-        let input_responses = respond(input_required).map_err(HttpClientError::CoreResult)?;
-        let retry = mrtr_retry_parameters(parameters, input_required, input_responses)
-            .map_err(HttpClientError::CoreResult)?;
-        self.request_final_core(cx, "resources/read", retry).await
-    }
-
-    /// Gets a prompt and, only when its first final result requires input,
-    /// performs one MRTR retry with caller-supplied responses.
-    ///
-    /// This emits at most two requests; see [`Self::call_tool_with_mrtr_retry`]
-    /// for the terminal-result behavior.
-    pub async fn get_prompt_with_mrtr_retry<F>(
-        &mut self,
-        cx: &Cx,
-        name: &str,
-        arguments: std::collections::HashMap<String, String>,
-        respond: F,
-    ) -> Result<CoreResult, HttpClientError>
-    where
-        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
-    {
-        let mut parameters = serde_json::json!({ "name": name });
-        if !arguments.is_empty() {
-            let parameters = parameters.as_object_mut().ok_or_else(|| {
-                HttpClientError::CoreResult(McpError::internal_error(
-                    "MRTR prompt parameters must remain an object",
-                ))
-            })?;
-            parameters.insert(
-                "arguments".to_owned(),
-                serde_json::to_value(arguments).map_err(|error| {
-                    HttpClientError::CoreResult(McpError::internal_error(format!(
-                        "MRTR prompt arguments could not serialize: {error}"
-                    )))
-                })?,
-            );
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
-        let result = self
-            .request_final_core(cx, "prompts/get", parameters.clone())
-            .await?;
-        let Some(input_required) = mrtr_input_required_for_method("prompts/get", &result) else {
-            return Ok(result);
-        };
-        let input_responses = respond(input_required).map_err(HttpClientError::CoreResult)?;
-        let retry = mrtr_retry_parameters(parameters, input_required, input_responses)
-            .map_err(HttpClientError::CoreResult)?;
-        self.request_final_core(cx, "prompts/get", retry).await
+        let request_id = self.next_request_id()?;
+        let (mut response, result_source, _) = self
+            .connection
+            .request_json_with_result_source_at(
+                cx,
+                method,
+                parameters,
+                request_id,
+                DEFAULT_FINAL_CACHE_MAX_BYTES,
+            )
+            .await
+            .map_err(HttpClientError::Connection)?;
+        if let Some(error) = response.error.take() {
+            return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
+        }
+        let result_source = result_source.ok_or_else(|| {
+            HttpClientError::CoreResult(McpError::invalid_request(
+                "HTTP final extension response has no admitted result source",
+            ))
+        })?;
+        serde_json::from_str(&result_source).map_err(|_| {
+            HttpClientError::CoreResult(McpError::invalid_request(
+                "HTTP final extension response result is not valid JSON",
+            ))
+        })
     }
 
     /// Calls a tool through ordinary modern HTTP, following bounded MRTR
@@ -5158,7 +5355,7 @@ impl HttpClient {
     /// initial and continuation IDs from its monotonic allocator; `respond`
     /// can therefore be invoked once for each admitted `input_required`
     /// result. Tasks are neither requested nor accepted by this operation.
-    pub async fn call_tool_with_mrtr_retry_until<F>(
+    pub async fn call_tool_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
         deadline: Instant,
@@ -5193,9 +5390,9 @@ impl HttpClient {
     /// Reads a resource through ordinary modern HTTP, following bounded MRTR
     /// continuations until one terminal resource result arrives.
     ///
-    /// See [`Self::call_tool_with_mrtr_retry_until`] for deadline, request-ID,
+    /// See [`Self::call_tool_with_mrtr_retry`] for deadline, request-ID,
     /// callback, and Tasks behavior.
-    pub async fn read_resource_with_mrtr_retry_until<F>(
+    pub async fn read_resource_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
         deadline: Instant,
@@ -5228,9 +5425,9 @@ impl HttpClient {
     /// Gets a prompt through ordinary modern HTTP, following bounded MRTR
     /// continuations until one terminal prompt result arrives.
     ///
-    /// See [`Self::call_tool_with_mrtr_retry_until`] for deadline, request-ID,
+    /// See [`Self::call_tool_with_mrtr_retry`] for deadline, request-ID,
     /// callback, and Tasks behavior.
-    pub async fn get_prompt_with_mrtr_retry_until<F>(
+    pub async fn get_prompt_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
         deadline: Instant,
@@ -5314,6 +5511,27 @@ impl HttpClient {
         self.get_final_task_snapshot(cx, task_id)
             .await
             .map(FinalTaskHandle::new)
+    }
+
+    /// Requests cancellation for one exact final Tasks identifier.
+    ///
+    /// The request ID is allocated from this client's private monotonic
+    /// allocator. The acknowledgement is intentionally returned without
+    /// projecting a task snapshot; callers that own a [`FinalTaskHandle`]
+    /// retain its current snapshot until a later poll or task notification.
+    pub async fn cancel_final_task(
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
+    ) -> Result<FinalCancelTaskResult, HttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        let request_id = self.next_request_id()?;
+        self.connection
+            .cancel_task_final(cx, request_id, task_id, DEFAULT_FINAL_CACHE_MAX_BYTES)
+            .await
+            .map_err(HttpClientError::Connection)
     }
 
     async fn get_final_task_snapshot(
@@ -5519,77 +5737,20 @@ struct ReceivedPreparedResult {
     receipt: Instant,
 }
 
-/// Shared request correlation for a negotiated stdio connection.
+/// A cloneable, request-owning executor for the selected stdio connection.
 ///
-/// A cloneable request executor for the selected stdio session.
-#[derive(Debug)]
-struct StdioDropRetirement {
-    request_id: RequestId,
-    peer_era: ProtocolEra,
-    requested: AtomicBool,
-}
-
-/// Bounded, client-owned retirement records for cloned stdio executions.
-///
-/// `StdioRequestExecution::drop` only marks its own pre-registered record.
-/// The mutable client later drains that fixed set while it owns the response
-/// registry and the outbound writer; Drop itself never locks or writes.
-#[derive(Clone, Default, Debug)]
-struct SharedStdioDropRetirements(
-    Arc<Mutex<std::collections::HashMap<CorrelationKey, Arc<StdioDropRetirement>>>>,
-);
-
-impl SharedStdioDropRetirements {
-    fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-
-    fn insert(&self, retirement: Arc<StdioDropRetirement>) -> McpResult<()> {
-        let key = retirement
-            .request_id
-            .correlation_key()
-            .map_err(|_| McpError::internal_error("Invalid JSON-RPC request ID"))?;
-        self.0
-            .lock()
-            .map_err(|_| McpError::internal_error("Stdio drop retirement registry is unavailable"))?
-            .insert(key, retirement);
-        Ok(())
-    }
-
-    fn take_requested(&self) -> McpResult<Vec<Arc<StdioDropRetirement>>> {
-        let mut retirements = self.0.lock().map_err(|_| {
-            McpError::internal_error("Stdio drop retirement registry is unavailable")
-        })?;
-        let requested = retirements
-            .iter()
-            .filter(|(_, retirement)| retirement.requested.load(Ordering::Acquire))
-            .map(|(key, retirement)| (key.clone(), Arc::clone(retirement)))
-            .collect::<Vec<_>>();
-        for (key, _) in &requested {
-            retirements.remove(key);
-        }
-        Ok(requested
-            .into_iter()
-            .map(|(_, retirement)| retirement)
-            .collect())
-    }
-
-    fn remove(&self, request_id: &RequestId) {
-        let Ok(key) = request_id.correlation_key() else {
-            return;
-        };
-        if let Ok(mut retirements) = self.0.lock() {
-            retirements.remove(&key);
-        }
-    }
-}
-
+/// Clones share one ID allocator, response/tombstone registry, and writer.
+/// They never own a receive half: [`Client::drive_multiplexed_stdio`] is the
+/// sole connection ingress driver and delivers exact admitted frames to this
+/// executor. That prevents a handle wait from racing a Client convenience API
+/// for the next stdio frame.
 #[derive(Clone)]
 pub struct StdioRequestExecutor {
-    sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
-    responses: SharedResponseRegistry,
-    drop_retirements: SharedStdioDropRetirements,
+    executor: RequestExecutor<SelectedStdioTransport>,
+    next_id: Arc<AtomicU64>,
+    timeout_policy: Arc<Mutex<RequestTimeoutPolicy>>,
     peer_era: ProtocolEra,
+    client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
 }
 
 impl std::fmt::Debug for StdioRequestExecutor {
@@ -5602,50 +5763,48 @@ impl std::fmt::Debug for StdioRequestExecutor {
 }
 
 /// One request committed through [`StdioRequestExecutor`].
-#[derive(Debug)]
 pub struct StdioRequestExecution {
-    request_id: RequestId,
-    waiter: Option<ResponseWaiter>,
-    drop_retirement: Arc<StdioDropRetirement>,
-    drop_retirements: SharedStdioDropRetirements,
-    committed_at: Instant,
-    completed: bool,
+    execution: RequestExecution<SelectedStdioTransport>,
+}
+
+impl std::fmt::Debug for StdioRequestExecution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StdioRequestExecution")
+            .field("request_id", self.request_id())
+            .field("generation", &self.execution.generation())
+            .finish()
+    }
 }
 
 impl StdioRequestExecution {
     /// Returns the JSON-RPC ID committed for this request.
     #[must_use]
     pub fn request_id(&self) -> &RequestId {
-        &self.request_id
+        self.execution.request_id()
     }
-}
 
-impl Drop for StdioRequestExecution {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        // A Drop implementation must not wait for either the shared response
-        // registry or child stdin. The mutable Client drains this request on
-        // its next owned progress point and performs the sole control write.
-        self.drop_retirement
-            .requested
-            .store(true, Ordering::Release);
+    /// Drains this execution's admitted progress notifications in arrival
+    /// order without reading the connection.
+    pub fn take_stream_notifications(&mut self) -> McpResult<Vec<JsonRpcRequest>> {
+        self.execution.take_stream_notifications()
     }
 }
 
 impl StdioRequestExecutor {
     fn new(
-        sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
-        responses: SharedResponseRegistry,
-        drop_retirements: SharedStdioDropRetirements,
+        transport: SelectedStdioTransport,
+        next_id: Arc<AtomicU64>,
         peer_era: ProtocolEra,
+        timeout_policy: RequestTimeoutPolicy,
+        client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     ) -> Self {
         Self {
-            sender,
-            responses,
-            drop_retirements,
+            executor: RequestExecutor::with_protocol_era(transport, peer_era),
+            next_id,
+            timeout_policy: Arc::new(Mutex::new(timeout_policy)),
             peer_era,
+            client_extension_runtime,
         }
     }
 
@@ -5655,46 +5814,123 @@ impl StdioRequestExecutor {
         self.peer_era
     }
 
-    fn execute(&self, cx: &Cx, request: JsonRpcRequest) -> McpResult<StdioRequestExecution> {
-        if cx.checkpoint().is_err() {
-            return Err(McpError::request_cancelled());
+    /// Commits one raw JSON-RPC request and returns its request-owned handle.
+    ///
+    /// The selected connection allocates the ID itself, so executor clones and
+    /// the Client's sequential APIs stay in one monotonic correlation space.
+    /// A completed handle is observed with [`Self::try_take_response`] after
+    /// the owning [`Client`] drives ingress.
+    pub fn execute(
+        &self,
+        cx: &Cx,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<StdioRequestExecution> {
+        let method = method.into();
+        if self
+            .client_extension_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.owns_method(&method))
+        {
+            return Err(McpError::invalid_params(
+                "Registered final extension methods require Client::request_final_extension",
+            ));
         }
-        let request_id = request
-            .id
-            .clone()
-            .ok_or_else(|| McpError::invalid_params("Multiplexed stdio requests require an ID"))?;
-        // Reserve in the same registry used by the sequential adapter before
-        // the write. The sole reader can therefore route an immediate peer
-        // response to this exact owner without a split-brain response path.
-        let waiter = self.responses.register(request_id.clone())?;
-        let send_result = self
-            .sender
-            .lock()
-            .map_err(|_| McpError::internal_error("Multiplexed stdio writer is unavailable"))?
-            .send(cx, &JsonRpcMessage::Request(request))
-            .map_err(transport_error_to_mcp);
-        if let Err(error) = send_result {
-            let _ = self.responses.fail(&request_id, error.clone());
-            return Err(error);
-        }
-        let drop_retirement = Arc::new(StdioDropRetirement {
-            request_id: request_id.clone(),
-            peer_era: self.peer_era,
-            requested: AtomicBool::new(false),
-        });
-        if let Err(error) = self.drop_retirements.insert(Arc::clone(&drop_retirement)) {
-            let _ = self.responses.fail(&request_id, error.clone());
-            return Err(error);
-        }
-        Ok(StdioRequestExecution {
-            request_id,
-            waiter: Some(waiter),
-            drop_retirement,
-            drop_retirements: self.drop_retirements.clone(),
-            committed_at: Instant::now(),
-            completed: false,
-        })
+        let id = next_stdio_request_id(&self.next_id)?;
+        let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
+        self.execute_request(cx, JsonRpcRequest::new(method, params, id))
     }
+
+    fn execute_request(
+        &self,
+        cx: &Cx,
+        request: JsonRpcRequest,
+    ) -> McpResult<StdioRequestExecution> {
+        let timeout_policy = *self.timeout_policy.lock().map_err(|_| {
+            McpError::internal_error("Negotiated stdio timeout policy is unavailable")
+        })?;
+        let execution = self
+            .executor
+            .execute_with_timeout_policy(cx, request, timeout_policy)?;
+        Ok(StdioRequestExecution { execution })
+    }
+
+    /// Takes one already-routed final response without reading the transport.
+    pub fn try_take_response(
+        &self,
+        execution: &mut StdioRequestExecution,
+    ) -> McpResult<Option<JsonRpcResponse>> {
+        let Some(response) = self.executor.try_take_response(&mut execution.execution)? else {
+            return Ok(None);
+        };
+        if let Some(error) = response.error.clone() {
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        Ok(Some(response))
+    }
+
+    /// Takes one already-routed final response with its exact admitted result
+    /// source, without reading the transport.
+    pub fn try_take_response_with_raw_result(
+        &self,
+        execution: &mut StdioRequestExecution,
+    ) -> McpResult<Option<(JsonRpcResponse, Option<String>)>> {
+        let Some((response, raw_result)) = self
+            .executor
+            .try_take_response_with_raw_result(&mut execution.execution)?
+        else {
+            return Ok(None);
+        };
+        if let Some(error) = response.error.clone() {
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        Ok(Some((response, raw_result)))
+    }
+
+    fn service(&self, cx: &Cx) -> McpResult<()> {
+        self.executor.poll_timeouts_at(cx, Instant::now())
+    }
+
+    fn service_at(&self, cx: &Cx, observed_at: Instant) -> McpResult<()> {
+        self.executor.poll_timeouts_at(cx, observed_at)
+    }
+
+    fn next_pending_deadline(&self) -> Option<Instant> {
+        self.executor.next_pending_deadline()
+    }
+
+    fn owns_response_id(&self, response_id: &RequestId) -> bool {
+        self.executor.owns_response_id(response_id)
+    }
+
+    fn owns_progress_notification(&self, notification: &JsonRpcRequest) -> bool {
+        self.executor.owns_progress_notification(notification)
+    }
+
+    fn drive_frame(&self, cx: &Cx, frame: ReceivedTransportFrame) -> McpResult<()> {
+        self.executor.drive_frame(cx, frame)
+    }
+
+    fn fail_connection(&self, error: McpError) {
+        self.executor.fail_connection(error);
+    }
+
+    fn set_timeout_policy(&self, timeout_policy: RequestTimeoutPolicy) -> McpResult<()> {
+        *self.timeout_policy.lock().map_err(|_| {
+            McpError::internal_error("Negotiated stdio timeout policy is unavailable")
+        })? = timeout_policy;
+        Ok(())
+    }
+}
+
+fn next_stdio_request_id(next_id: &AtomicU64) -> McpResult<u64> {
+    next_id
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current
+                .checked_add(1)
+                .filter(|next| *next <= REQUEST_ID_EXHAUSTION_SENTINEL)
+        })
+        .map_err(|_| McpError::internal_error("Client request ID space exhausted"))
 }
 
 pub struct Client {
@@ -5721,18 +5957,19 @@ pub struct Client {
     /// Serializes every outbound frame, including callback completions the
     /// sole reader commits between bounded receive polls.
     response_sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
+    /// Transport-neutral selected I/O, installed only after the stdio
+    /// connection selects its immutable protocol era. Its shared halves retain
+    /// the existing independently locked reader and writer ownership.
+    selected_io: Option<NegotiatedClientIo<SharedStdioRecv, SharedStdioSend>>,
     /// Installed only after a final stdio handshake selected its immutable
     /// peer era. Auto's disposable modern probe never reaches this field.
     multiplexed_executor: Option<StdioRequestExecutor>,
-    /// Fixed retirement records owned by the client, whose request handles
-    /// may be dropped from arbitrary caller contexts.
-    stdio_drop_retirements: SharedStdioDropRetirements,
     /// Capability context for cancellation.
     cx: Cx,
     /// Session state after initialization.
     session: ClientSession,
     /// Request ID counter.
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     /// Strict response correlation for every in-flight request.
     responses: SharedResponseRegistry,
     /// Exact non-progress notifications received from a modern server.
@@ -5933,14 +6170,15 @@ impl Client {
 
     /// Creates a client with a provided Cx for cancellation support.
     pub fn stdio_with_cx(command: &str, args: &[&str], cx: Cx) -> McpResult<Self> {
-        // Preserve the long-standing direct convenience constructor as an
-        // explicit exact-2024 connection. Callers that need an immutable
-        // modern-only or auto-selection policy use the plan-aware entry point
-        // below, which performs policy selection before exposing a client.
+        // The public convenience constructor follows the same modern-first,
+        // bounded Auto selection as ClientBuilder. A recognized discovery
+        // MethodNotFound closes the disposable probe and opens one fresh
+        // exact-2024 child; malformed discoveries and every other failure are
+        // never replayed as legacy traffic.
         Self::stdio_with_protocol_plan_with_cx(
             command,
             args,
-            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
             cx,
         )
     }
@@ -6058,6 +6296,7 @@ impl Client {
         let client_capabilities = ClientCapabilities::default();
 
         let (transport, response_sender) = transport.into_split();
+        let transport = Arc::new(Mutex::new(transport));
         let response_sender = Arc::new(Mutex::new(response_sender));
         let reverse_callback_pool =
             ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
@@ -6070,10 +6309,10 @@ impl Client {
             child_cleanup_phase: ClientChildCleanupPhase::Active,
             cleanup_error: None,
             pending_process_cleanup_error: None,
-            transport: Arc::new(Mutex::new(transport)),
+            transport,
             response_sender,
+            selected_io: None,
             multiplexed_executor: None,
-            stdio_drop_retirements: SharedStdioDropRetirements::default(),
             cx,
             session: ClientSession::new_placeholder(
                 client_info.clone(),
@@ -6087,7 +6326,7 @@ impl Client {
             .with_protocol_plan(protocol_plan.clone()),
             // `initialize()` consumes ID 1 through the same monotonic
             // allocator, leaving ID 2 as the first ordinary request ID.
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
             responses: SharedResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
@@ -6126,6 +6365,8 @@ impl Client {
             let cleanup = client.close();
             return combine_operation_and_cleanup(Err(error), cleanup);
         }
+
+        client.activate_selected_io();
 
         // Mark as initialized
         client.initialized.store(true, Ordering::SeqCst);
@@ -6199,23 +6440,30 @@ impl Client {
         timeout_policy: RequestTimeoutPolicy,
     ) -> Self {
         let (transport, response_sender) = transport.into_split();
+        let transport = Arc::new(Mutex::new(transport));
         let response_sender = Arc::new(Mutex::new(response_sender));
         let reverse_callback_pool =
             ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
-        Self {
+        let selected_io = session.selected_era().map(|_| {
+            NegotiatedClientIo::new(
+                SharedStdioRecv(Arc::clone(&transport)),
+                SharedStdioSend(Arc::clone(&response_sender)),
+            )
+        });
+        let mut client = Self {
             child: Some(child),
             group_anchor,
             child_ownership,
             child_cleanup_phase: ClientChildCleanupPhase::Active,
             cleanup_error: None,
             pending_process_cleanup_error: None,
-            transport: Arc::new(Mutex::new(transport)),
+            transport,
             response_sender,
+            selected_io,
             multiplexed_executor: None,
-            stdio_drop_retirements: SharedStdioDropRetirements::default(),
             cx,
             session,
-            next_id: AtomicU64::new(2), // Start at 2 since initialize used 1
+            next_id: Arc::new(AtomicU64::new(2)), // Start at 2 since initialize used 1
             responses: SharedResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
@@ -6230,7 +6478,9 @@ impl Client {
             initialized: AtomicBool::new(true), // Already initialized by builder
             initialization_error: None,
             final_log_level: None,
-        }
+        };
+        client.install_multiplexed_stdio_executor();
+        client
     }
 
     /// Creates an uninitialized client for auto-initialize mode.
@@ -6264,6 +6514,7 @@ impl Client {
         timeout_policy: RequestTimeoutPolicy,
     ) -> Self {
         let (transport, response_sender) = transport.into_split();
+        let transport = Arc::new(Mutex::new(transport));
         let response_sender = Arc::new(Mutex::new(response_sender));
         let reverse_callback_pool =
             ReverseCallbackPool::new(Arc::clone(&response_sender), cx.clone());
@@ -6274,13 +6525,13 @@ impl Client {
             child_cleanup_phase: ClientChildCleanupPhase::Active,
             cleanup_error: None,
             pending_process_cleanup_error: None,
-            transport: Arc::new(Mutex::new(transport)),
+            transport,
             response_sender,
+            selected_io: None,
             multiplexed_executor: None,
-            stdio_drop_retirements: SharedStdioDropRetirements::default(),
             cx,
             session,
-            next_id: AtomicU64::new(1), // Start at 1 since initialize hasn't happened
+            next_id: Arc::new(AtomicU64::new(1)), // Start at 1 since initialize hasn't happened
             responses: SharedResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
@@ -6345,6 +6596,8 @@ impl Client {
             return Err(self.record_initialization_failure(error));
         }
 
+        self.activate_selected_io();
+
         // Mark as initialized
         self.initialized.store(true, Ordering::SeqCst);
         self.install_multiplexed_stdio_executor();
@@ -6400,6 +6653,9 @@ impl Client {
     fn terminate_connection(&mut self, error: McpError) -> McpError {
         self.initialized.store(false, Ordering::SeqCst);
         self.responses.fail_all(error.clone());
+        if let Some(executor) = &self.multiplexed_executor {
+            executor.fail_connection(error.clone());
+        }
         self.cancel_reverse_callback_pool();
         if let Err(cleanup_error) = self.join_reverse_callback_pool() {
             // Do not attempt to lock or close stdin while a retained callback
@@ -6514,6 +6770,16 @@ impl Client {
         self.session.server_discovery()
     }
 
+    /// Returns the generic final extension state frozen by the successful
+    /// `server/discover` exchange, if this client selected MCP 2026-07-28 and
+    /// was configured through [`ClientBuilder::extension_registry`].
+    #[must_use]
+    pub fn negotiated_extensions(
+        &self,
+    ) -> Option<&fastmcp_protocol::extensions::NegotiatedExtensionSet> {
+        self.session.negotiated_extensions()
+    }
+
     /// Returns the protocol version negotiated during initialization.
     #[must_use]
     pub fn protocol_version(&self) -> &str {
@@ -6617,6 +6883,9 @@ impl Client {
     pub fn set_request_timeout_policy(&mut self, policy: RequestTimeoutPolicy) -> McpResult<()> {
         policy.validate()?;
         self.timeout_policy = policy;
+        if let Some(executor) = &self.multiplexed_executor {
+            executor.set_timeout_policy(policy)?;
+        }
         Ok(())
     }
 
@@ -6737,47 +7006,56 @@ impl Client {
             .send(cx, message)
     }
 
+    fn activate_selected_io(&mut self) {
+        if self.selected_io.is_none() && self.session.selected_era().is_some() {
+            self.selected_io = Some(NegotiatedClientIo::new(
+                SharedStdioRecv(Arc::clone(&self.transport)),
+                SharedStdioSend(Arc::clone(&self.response_sender)),
+            ));
+        }
+    }
+
+    /// Receives one source-preserving frame after selection.
+    ///
+    /// The fallback is reachable only while the initialization handshake is
+    /// still provisional. Once an era is selected, every live receive loop
+    /// consumes the frame through `NegotiatedClientIo`.
+    fn recv_next_child_frame(
+        &mut self,
+        cx: &Cx,
+        deadline: Option<Instant>,
+    ) -> Result<(ReceivedTransportFrame, Instant), TransportError> {
+        if let Some(io) = self.selected_io.as_mut() {
+            io.recv_until_with_source(cx, deadline)
+        } else {
+            recv_shared_child_transport(&self.transport, cx, deadline)
+        }
+    }
+
     fn install_multiplexed_stdio_executor(&mut self) {
+        if self.multiplexed_executor.is_some() {
+            return;
+        }
         let Some(peer_era) = self.session.selected_era() else {
             return;
         };
+        let Some(transport) = self.selected_io.clone() else {
+            return;
+        };
         self.multiplexed_executor = Some(StdioRequestExecutor::new(
-            Arc::clone(&self.response_sender),
-            self.responses.clone(),
-            self.stdio_drop_retirements.clone(),
+            transport,
+            Arc::clone(&self.next_id),
             peer_era,
+            self.timeout_policy,
+            self.session.client_extension_runtime().cloned(),
         ));
-    }
-
-    /// Drains dropped multiplexed request handles at a client-owned progress
-    /// point. This is deliberately the only place a drop retirement can lock
-    /// correlation state or touch child stdin.
-    fn flush_stdio_drop_retirements(&mut self) -> McpResult<()> {
-        for retirement in self.stdio_drop_retirements.take_requested()? {
-            let retired = self
-                .responses
-                .tombstone(&retirement.request_id, McpError::request_cancelled())?;
-            if !retired
-                || !self
-                    .responses
-                    .claim_cancellation_control(&retirement.request_id)?
-            {
-                continue;
-            }
-            let control =
-                stdio_cancellation_control_message(retirement.peer_era, &retirement.request_id)?;
-            if let Err(error) = self.send_bounded_control_message(control) {
-                return Err(self.terminate_connection(error));
-            }
-        }
-        Ok(())
     }
 
     /// Returns the negotiated shared stdio executor.
     ///
     /// The ordinary `Client` convenience methods remain sequential adapters.
-    /// Callers that need several committed requests before waiting may clone
-    /// this executor and use [`Self::start_multiplexed_request`].
+    /// Callers may clone this executor and commit several request-owned
+    /// handles before the Client drives selected ingress.
     pub fn multiplexed_stdio_executor(&self) -> McpResult<StdioRequestExecutor> {
         self.multiplexed_executor.clone().ok_or_else(|| {
             McpError::invalid_request(
@@ -6794,14 +7072,9 @@ impl Client {
         method: impl Into<String>,
         params: Option<serde_json::Value>,
     ) -> McpResult<StdioRequestExecution> {
-        self.flush_stdio_drop_retirements()?;
-        let id = self.next_request_id()?;
-        let request = JsonRpcRequest::new(
-            method.into(),
-            params,
-            i64::try_from(id).expect("client request IDs are bounded to i64"),
-        );
-        self.multiplexed_stdio_executor()?.execute(cx, request)
+        let executor = self.multiplexed_stdio_executor()?;
+        executor.service(cx)?;
+        executor.execute(cx, method, params)
     }
 
     /// Waits for one multiplexed request through the same sole ingress path
@@ -6814,28 +7087,43 @@ impl Client {
         cx: &Cx,
         execution: &mut StdioRequestExecution,
     ) -> McpResult<JsonRpcResponse> {
-        if execution.completed
-            || !self
-                .stdio_drop_retirements
-                .ptr_eq(&execution.drop_retirements)
-        {
-            return Err(McpError::invalid_request(
-                "Multiplexed stdio execution belongs to a different client",
-            ));
+        let executor = self.multiplexed_stdio_executor()?;
+        loop {
+            if let Some(response) = executor.try_take_response(execution)? {
+                return Ok(response);
+            }
+            self.drive_multiplexed_stdio(cx)?;
         }
-        self.flush_stdio_drop_retirements()?;
-        let waiter = execution.waiter.take().ok_or_else(|| {
-            McpError::invalid_request("Multiplexed stdio execution was already consumed")
-        })?;
-        execution.completed = true;
-        let deadlines = RequestDeadlines::start_at(self.timeout_policy, execution.committed_at)?;
-        let response = self.recv_response_with_cx(cx, waiter, deadlines);
-        self.stdio_drop_retirements.remove(&execution.request_id);
-        let response = response?;
-        if let Some(error) = response.error.clone() {
-            return Err(json_rpc_error_to_mcp(error));
-        }
-        Ok(response.response)
+    }
+
+    /// Admits and routes one selected stdio frame for every request-owned
+    /// handle on this connection.
+    ///
+    /// This is the only public ingress driver for cloned
+    /// [`StdioRequestExecutor`] handles. It services dropped owners before a
+    /// read, routes matching final/progress frames to the executor through
+    /// `drive_frame`, and leaves reverse requests plus unrelated Client
+    /// traffic on their existing connection-owned paths.
+    pub fn drive_multiplexed_stdio(&mut self, cx: &Cx) -> McpResult<()> {
+        let executor = self.multiplexed_stdio_executor()?;
+        executor
+            .service(cx)
+            .map_err(|error| self.terminate_connection(error))?;
+        let deadline = executor.next_pending_deadline();
+        let (frame, received_at) = match self.recv_next_child_frame(cx, deadline) {
+            Ok(frame) => frame,
+            Err(TransportError::ReceiveDeadlineExceeded) if !self.transport_is_closed() => {
+                executor
+                    .service(cx)
+                    .map_err(|error| self.terminate_connection(error))?;
+                return Ok(());
+            }
+            Err(error) => return Err(self.terminate_connection(transport_error_to_mcp(error))),
+        };
+        executor
+            .service_at(cx, received_at)
+            .map_err(|error| self.terminate_connection(error))?;
+        self.process_selected_ingress_frame(cx, frame)
     }
 
     /// Verifies that the initialized server can answer an MCP ping request.
@@ -6852,13 +7140,7 @@ impl Client {
 
     /// Generates the next request ID.
     fn next_request_id(&self) -> McpResult<u64> {
-        self.next_id
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                current
-                    .checked_add(1)
-                    .filter(|next| *next <= REQUEST_ID_EXHAUSTION_SENTINEL)
-            })
-            .map_err(|_| McpError::internal_error("Client request ID space exhausted"))
+        next_stdio_request_id(&self.next_id)
     }
 
     fn with_modern_request_metadata(
@@ -6889,8 +7171,26 @@ impl Client {
             McpError::internal_error("Modern request metadata did not serialize as an object")
         })?;
         let mut final_metadata = final_metadata.clone();
-        let advertise_mcp_apps =
-            self.session.server_discovery().is_none() || self.session.mcp_apps_active();
+        if let Some(configured_extensions) = self.session.client_extension_wire_settings() {
+            let capabilities = final_metadata
+                .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| {
+                    McpError::internal_error("Modern request metadata omitted client capabilities")
+                })?;
+            let extensions = capabilities
+                .entry("extensions")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    McpError::internal_error("Modern client extensions must be an object")
+                })?;
+            for (extension_id, settings) in configured_extensions {
+                extensions.insert(extension_id, settings);
+            }
+        }
+        let advertise_mcp_apps = !self.session.generic_mcp_apps_configured()
+            && (self.session.server_discovery().is_none() || self.session.mcp_apps_active());
         if let Some(settings) = advertise_mcp_apps
             .then_some(self.session.mcp_apps_settings())
             .flatten()
@@ -6901,14 +7201,16 @@ impl Client {
                 .ok_or_else(|| {
                     McpError::internal_error("Modern request metadata omitted client capabilities")
                 })?;
-            let mut extensions = serde_json::Map::new();
+            let extensions = capabilities
+                .entry("extensions")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    McpError::internal_error("Modern client extensions must be an object")
+                })?;
             extensions.insert(
                 fastmcp_protocol::extensions::OFFICIAL_MCP_APPS_EXTENSION_ID.to_owned(),
                 settings.to_extension_settings().into_value(),
-            );
-            capabilities.insert(
-                "extensions".to_owned(),
-                serde_json::Value::Object(extensions),
             );
         }
         metadata.extend(final_metadata);
@@ -7052,6 +7354,37 @@ impl Client {
         admit_final_tasks_discovery_surface(discovery, method, direction)
     }
 
+    /// Sends one raw final extension request after exact bilateral admission.
+    ///
+    /// The builder-owned frozen descriptor registry and the extension set
+    /// retained from `server/discover` must both authorize `extension_id` and
+    /// `method` as a client-to-server request. Rejection happens before a
+    /// request ID is allocated, a response waiter is registered, or bytes are
+    /// committed to the peer. The returned [`serde_json::Value`] is decoded
+    /// from the existing source-preserving correlated result path.
+    pub fn request_final_extension(
+        &mut self,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        self.ensure_initialized()?;
+        self.session
+            .admit_final_extension_method(extension_id, method)?;
+        let parameters = self.prepare_request_parameters(parameters)?;
+        let received = self.send_prepared_request(method, parameters)?;
+        let source = received.raw_result.as_deref().ok_or_else(|| {
+            self.terminate_connection(McpError::invalid_request(
+                "Peer final extension response lost its admitted result source",
+            ))
+        })?;
+        serde_json::from_str(source).map_err(|_| {
+            self.terminate_connection(McpError::invalid_request(
+                "Peer response result is not valid JSON for the admitted final extension request",
+            ))
+        })
+    }
+
     /// Sends one already-admitted final Tasks request and decodes its exact
     /// result envelope. A malformed task response is a peer protocol
     /// contradiction and terminates this connection.
@@ -7100,8 +7433,13 @@ impl Client {
 
     fn retain_modern_server_notification(
         &mut self,
-        request: &JsonRpcRequest,
+        frame: &ReceivedTransportFrame,
     ) -> McpResult<Option<ModernServerNotification>> {
+        let JsonRpcMessage::Request(request) = frame.message() else {
+            return Err(McpError::internal_error(
+                "Client final notification retention received a response frame",
+            ));
+        };
         let modern_session = match self.session.selected_era() {
             Some(ProtocolEra::Modern2026) => true,
             Some(ProtocolEra::Legacy2024) => false,
@@ -7129,7 +7467,7 @@ impl Client {
             return Ok(Some(ModernServerNotification::Retained));
         }
 
-        let raw_params = self.last_received_raw_notification_params(request)?;
+        let raw_params = raw_notification_params_from_frame(frame.source())?;
         let notification = decode_final_server_notification(request, raw_params.as_deref())
             .map_err(|error| {
                 McpError::invalid_request(format!("Invalid final server notification: {error}"))
@@ -7170,27 +7508,6 @@ impl Client {
 
         Ok(Some(ModernServerNotification::Progress(progress)))
     }
-
-    fn last_received_raw_notification_params(
-        &self,
-        request: &JsonRpcRequest,
-    ) -> McpResult<Option<String>> {
-        if request.method != "notifications/progress" {
-            return Ok(None);
-        }
-        let transport = self
-            .transport
-            .lock()
-            .map_err(|_| McpError::internal_error("Client stdio reader is unavailable"))?;
-        let frame = transport.last_received_frame().ok_or_else(|| {
-            McpError::invalid_request("Client lost the raw final progress notification frame")
-        })?;
-        let raw_params = raw_notification_params_from_frame(frame)?.ok_or_else(|| {
-            McpError::invalid_request("Final progress notification is missing raw params")
-        })?;
-        Ok(Some(raw_params))
-    }
-
     /// Sends a request and waits for response.
     fn send_request<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &mut self,
@@ -7622,14 +7939,11 @@ impl Client {
 
         #[cfg(unix)]
         {
+            let cx = self.cx.clone();
             let deadline = Instant::now() + FINAL_CACHE_NOTIFICATION_DRAIN_WINDOW;
             loop {
                 let receive_deadline = self.reverse_callback_poll_deadline(deadline);
-                let (message, _) = match recv_shared_child_transport(
-                    &self.transport,
-                    &self.cx,
-                    Some(receive_deadline),
-                ) {
+                let (frame, _) = match self.recv_next_child_frame(&cx, Some(receive_deadline)) {
                     Ok(received) => received,
                     Err(TransportError::ReceiveDeadlineExceeded) if !self.transport_is_closed() => {
                         if receive_deadline < deadline {
@@ -7646,7 +7960,7 @@ impl Client {
                         return Err(self.terminate_connection(transport_error_to_mcp(error)));
                     }
                 };
-                self.process_idle_cache_invalidation_message(message)?;
+                self.process_selected_ingress_frame(&cx, frame)?;
             }
         }
 
@@ -7657,48 +7971,64 @@ impl Client {
         }
     }
 
-    fn process_idle_cache_invalidation_message(
+    /// Routes one frame admitted by the selected connection reader.
+    ///
+    /// Matching request-owned response and progress traffic goes to the
+    /// negotiated executor first. Every other server message retains the
+    /// Client's existing callback, notification, and sequential-wait path.
+    fn process_selected_ingress_frame(
         &mut self,
-        message: JsonRpcMessage,
+        cx: &Cx,
+        frame: ReceivedTransportFrame,
     ) -> McpResult<()> {
-        if let Err(error) = validate_inbound_typed_message(&message) {
+        if let Err(error) = validate_inbound_typed_message(frame.message()) {
             return Err(self.terminate_connection(error));
         }
-        match message {
-            JsonRpcMessage::Response(response) => {
-                let route = self
-                    .route_last_received_response(response)
+        if matches!(frame.message(), JsonRpcMessage::Response(_)) {
+            let route = self
+                .route_received_response(frame)
+                .map_err(|error| self.terminate_connection(error))?;
+            if matches!(
+                route,
+                ResponseRoute::InvalidEnvelope
+                    | ResponseRoute::MissingId
+                    | ResponseRoute::ConnectionClosed
+            ) {
+                let error = self.responses.terminal_error().unwrap_or_else(|| {
+                    McpError::internal_error("Client response correlation failed")
+                });
+                return Err(self.terminate_connection(error));
+            }
+        } else {
+            let JsonRpcMessage::Request(request) = frame.message() else {
+                unreachable!("a JSON-RPC message is either a request or response")
+            };
+            if let Some(executor) = self.multiplexed_executor.clone()
+                && executor.owns_progress_notification(request)
+            {
+                executor
+                    .drive_frame(cx, frame)
                     .map_err(|error| self.terminate_connection(error))?;
-                if matches!(
-                    route,
-                    ResponseRoute::InvalidEnvelope
-                        | ResponseRoute::MissingId
-                        | ResponseRoute::ConnectionClosed
-                ) {
-                    let error = self.responses.terminal_error().unwrap_or_else(|| {
-                        McpError::internal_error("Client response correlation failed")
-                    });
+                return Ok(());
+            }
+            if self.cancel_legacy_reverse_callback(request) {
+                return Ok(());
+            }
+            if self.retain_modern_server_notification(&frame)?.is_some() {
+                return Ok(());
+            }
+            let JsonRpcMessage::Request(request) = frame.into_message() else {
+                unreachable!("the frame was checked as a JSON-RPC request")
+            };
+            if let Some(response) = self.server_request_response(&request) {
+                if let Err(error) = self.send_server_response_during_receive(response) {
                     return Err(self.terminate_connection(error));
                 }
-            }
-            JsonRpcMessage::Request(request) => {
-                if self.cancel_legacy_reverse_callback(&request) {
-                    return Ok(());
-                }
-                if self.retain_modern_server_notification(&request)?.is_some() {
-                    return Ok(());
-                }
-                if let Some(response) = self.server_request_response(&request) {
-                    if let Err(error) = self.send_server_response_during_receive(response) {
-                        return Err(self.terminate_connection(error));
-                    }
-                } else if server_notification_kind(&request)
-                    == Some(ServerNotificationKind::LogMessage)
-                    && let Some(params) = request.params.as_ref()
-                    && let Ok(message) = serde_json::from_value::<LogMessageParams>(params.clone())
-                {
-                    self.emit_log_message(message);
-                }
+            } else if server_notification_kind(&request) == Some(ServerNotificationKind::LogMessage)
+                && let Some(params) = request.params.as_ref()
+                && let Ok(message) = serde_json::from_value::<LogMessageParams>(params.clone())
+            {
+                self.emit_log_message(message);
             }
         }
         Ok(())
@@ -7946,43 +8276,42 @@ impl Client {
         outcome
     }
 
-    fn route_last_received_response(
+    fn route_received_response(
         &mut self,
-        response: JsonRpcResponse,
+        frame: ReceivedTransportFrame,
     ) -> McpResult<ResponseRoute> {
-        // The typed JSON value cannot reconstruct exact numeric lexemes or
-        // object spelling. Copy the retained frame before the next receive
-        // invalidates the transport reuse buffer, then admit its raw result
-        // sidecar alongside the already-decoded response.
-        let frame = self
-            .transport
-            .lock()
-            .map_err(|_| McpError::internal_error("Client stdio reader is unavailable"))?
-            .last_received_frame()
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                McpError::internal_error("Stdio response frame is unavailable for raw admission")
-            })?;
-        let admission = decode_strict_jsonrpc_response(&frame, frame.len()).map_err(|_| {
-            McpError::internal_error("Admitted stdio response could not retain its raw result")
-        })?;
-        if admission.response() != &response {
+        let JsonRpcMessage::Response(response) = frame.message() else {
             return Err(McpError::internal_error(
-                "Typed stdio response differs from its admitted source frame",
+                "Client response routing received a request frame",
             ));
+        };
+        if let Some(executor) = &self.multiplexed_executor
+            && response
+                .id
+                .as_ref()
+                .is_some_and(|response_id| executor.owns_response_id(response_id))
+        {
+            // The selected Client is the one reader. Giving the full admitted
+            // frame to the matching request executor preserves result source
+            // and prevents a generic owner from entering the older sequential
+            // response registry.
+            let cx = self.cx.clone();
+            executor.drive_frame(&cx, frame)?;
+            return Ok(ResponseRoute::Delivered);
         }
-        let (_, raw_result) = admission.into_parts();
+        let response = response.clone();
+        let raw_result = raw_result_from_admitted_response(&response, frame, "stdio")?;
         Ok(self.responses.route_with_raw_result(response, raw_result))
     }
 
-    fn finish_timeout_after_complete_message(
+    fn finish_timeout_after_complete_frame(
         &mut self,
         request_id: &RequestId,
-        message: JsonRpcMessage,
+        frame: ReceivedTransportFrame,
         source: RequestTimeoutSource,
     ) -> McpError {
         let timeout = request_timeout_error(source);
-        if let Err(protocol_error) = validate_inbound_typed_message(&message) {
+        if let Err(protocol_error) = validate_inbound_typed_message(frame.message()) {
             let _ = self.responses.fail(request_id, timeout.clone());
             let _ = self.terminate_connection(protocol_error);
             return timeout;
@@ -7993,50 +8322,61 @@ impl Client {
             return timeout;
         }
 
-        match message {
-            JsonRpcMessage::Response(response) => {
-                let route = match self.route_last_received_response(response) {
-                    Ok(route) => route,
-                    Err(error) => {
-                        let _ = self.terminate_connection(error);
-                        return timeout;
-                    }
-                };
-                if matches!(
-                    route,
-                    ResponseRoute::InvalidEnvelope
-                        | ResponseRoute::MissingId
-                        | ResponseRoute::ConnectionClosed
-                ) {
-                    let terminal_error = self.responses.terminal_error().unwrap_or_else(|| {
-                        McpError::internal_error("Client response correlation failed")
-                    });
-                    let _ = self.terminate_connection(terminal_error);
-                }
-            }
-            JsonRpcMessage::Request(request) => {
-                if self.cancel_legacy_reverse_callback(&request) {
+        if matches!(frame.message(), JsonRpcMessage::Response(_)) {
+            let route = match self.route_received_response(frame) {
+                Ok(route) => route,
+                Err(error) => {
+                    let _ = self.terminate_connection(error);
                     return timeout;
                 }
-                match self.retain_modern_server_notification(&request) {
-                    Ok(Some(_)) => return timeout,
-                    Ok(None) => {}
-                    Err(error) => {
-                        let _ = self.terminate_connection(error);
-                        return timeout;
-                    }
+            };
+            if matches!(
+                route,
+                ResponseRoute::InvalidEnvelope
+                    | ResponseRoute::MissingId
+                    | ResponseRoute::ConnectionClosed
+            ) {
+                let terminal_error = self.responses.terminal_error().unwrap_or_else(|| {
+                    McpError::internal_error("Client response correlation failed")
+                });
+                let _ = self.terminate_connection(terminal_error);
+            }
+        } else {
+            let JsonRpcMessage::Request(request) = frame.message() else {
+                unreachable!("a JSON-RPC message is either a request or response")
+            };
+            if let Some(executor) = self.multiplexed_executor.clone()
+                && executor.owns_progress_notification(request)
+            {
+                let cx = self.cx.clone();
+                if let Err(error) = executor.drive_frame(&cx, frame) {
+                    let _ = self.terminate_connection(error);
                 }
-                if let Some(response) = self.server_request_response(&request) {
-                    if let Err(error) = self.send_bounded_control_message(response) {
-                        let _ = self.terminate_connection(error);
-                    }
-                } else if server_notification_kind(&request)
-                    == Some(ServerNotificationKind::LogMessage)
-                    && let Some(params) = request.params.as_ref()
-                    && let Ok(message) = serde_json::from_value::<LogMessageParams>(params.clone())
-                {
-                    self.emit_log_message(message);
+                return timeout;
+            }
+            if self.cancel_legacy_reverse_callback(request) {
+                return timeout;
+            }
+            match self.retain_modern_server_notification(&frame) {
+                Ok(Some(_)) => return timeout,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = self.terminate_connection(error);
+                    return timeout;
                 }
+            }
+            let JsonRpcMessage::Request(request) = frame.into_message() else {
+                unreachable!("the frame was checked as a JSON-RPC request")
+            };
+            if let Some(response) = self.server_request_response(&request) {
+                if let Err(error) = self.send_bounded_control_message(response) {
+                    let _ = self.terminate_connection(error);
+                }
+            } else if server_notification_kind(&request) == Some(ServerNotificationKind::LogMessage)
+                && let Some(params) = request.params.as_ref()
+                && let Ok(message) = serde_json::from_value::<LogMessageParams>(params.clone())
+            {
+                self.emit_log_message(message);
             }
         }
         timeout
@@ -8061,7 +8401,11 @@ impl Client {
         let expected_id = waiter.id.clone();
 
         loop {
-            self.flush_stdio_drop_retirements()?;
+            if let Some(executor) = &self.multiplexed_executor {
+                executor
+                    .service(cx)
+                    .map_err(|error| self.terminate_connection(error))?;
+            }
             if let Some(response) = waiter.try_response()? {
                 debug_assert!(
                     response
@@ -8077,98 +8421,100 @@ impl Client {
             }
 
             let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
-            let (message, received_at) =
-                match recv_shared_child_transport(&self.transport, cx, Some(receive_deadline)) {
-                    Ok(received) => received,
-                    Err(TransportError::ReceiveDeadlineExceeded) => {
-                        if receive_deadline < deadlines.next() && !self.transport_is_closed() {
-                            self.drain_completed_reverse_callbacks()
-                                .map_err(|error| self.terminate_connection(error))?;
-                            continue;
-                        }
-                        let kind = deadlines
-                            .expired_at(Instant::now())
-                            .unwrap_or_else(|| deadlines.next_kind());
-                        if self.transport_is_closed() {
-                            return Err(self.finish_partial_frame_timeout(&expected_id, kind));
-                        }
-                        return Err(self.timeout_committed_request(&expected_id, kind));
+            let (frame, received_at) = match self.recv_next_child_frame(cx, Some(receive_deadline))
+            {
+                Ok(received) => received,
+                Err(TransportError::ReceiveDeadlineExceeded) => {
+                    if receive_deadline < deadlines.next() && !self.transport_is_closed() {
+                        self.drain_completed_reverse_callbacks()
+                            .map_err(|error| self.terminate_connection(error))?;
+                        continue;
                     }
-                    Err(TransportError::Timeout) if !self.transport_is_closed() => {
-                        return Err(self.finish_open_context_interruption(
-                            &expected_id,
-                            McpError::internal_error("Request timed out"),
-                        ));
+                    let kind = deadlines
+                        .expired_at(Instant::now())
+                        .unwrap_or_else(|| deadlines.next_kind());
+                    if self.transport_is_closed() {
+                        return Err(self.finish_partial_frame_timeout(&expected_id, kind));
                     }
-                    Err(TransportError::Cancelled) if !self.transport_is_closed() => {
-                        return Err(self.finish_open_context_interruption(
-                            &expected_id,
-                            McpError::request_cancelled(),
-                        ));
-                    }
-                    Err(error) => {
-                        let error = transport_error_to_mcp(error);
-                        return Err(self.terminate_connection(error));
-                    }
-                };
+                    return Err(self.timeout_committed_request(&expected_id, kind));
+                }
+                Err(TransportError::Timeout) if !self.transport_is_closed() => {
+                    return Err(self.finish_open_context_interruption(
+                        &expected_id,
+                        McpError::internal_error("Request timed out"),
+                    ));
+                }
+                Err(TransportError::Cancelled) if !self.transport_is_closed() => {
+                    return Err(self.finish_open_context_interruption(
+                        &expected_id,
+                        McpError::request_cancelled(),
+                    ));
+                }
+                Err(error) => {
+                    let error = transport_error_to_mcp(error);
+                    return Err(self.terminate_connection(error));
+                }
+            };
             if let Some(kind) = deadlines.expired_at(received_at) {
-                return Err(self.finish_timeout_after_complete_message(
-                    &expected_id,
-                    message,
-                    kind,
-                ));
+                return Err(self.finish_timeout_after_complete_frame(&expected_id, frame, kind));
             }
-            if let Err(error) = validate_inbound_typed_message(&message) {
+            if let Err(error) = validate_inbound_typed_message(frame.message()) {
                 return Err(self.terminate_connection(error));
             }
 
-            match message {
-                JsonRpcMessage::Response(response) => {
-                    // The registry preserves responses for other registered
-                    // waiters and never lets an unknown/missing ID consume this
-                    // request's response slot.
-                    let route = self
-                        .route_last_received_response(response)
+            if matches!(frame.message(), JsonRpcMessage::Response(_)) {
+                // The registry preserves responses for other registered
+                // waiters and never lets an unknown/missing ID consume this
+                // request's response slot.
+                let route = self
+                    .route_received_response(frame)
+                    .map_err(|error| self.terminate_connection(error))?;
+                if matches!(
+                    route,
+                    ResponseRoute::InvalidEnvelope
+                        | ResponseRoute::MissingId
+                        | ResponseRoute::ConnectionClosed
+                ) {
+                    let error = self.responses.terminal_error().unwrap_or_else(|| {
+                        McpError::internal_error("Client response correlation failed")
+                    });
+                    return Err(self.terminate_connection(error));
+                }
+            } else {
+                let JsonRpcMessage::Request(request) = frame.message() else {
+                    unreachable!("a JSON-RPC message is either a request or response")
+                };
+                if let Some(executor) = self.multiplexed_executor.clone()
+                    && executor.owns_progress_notification(request)
+                {
+                    executor
+                        .drive_frame(cx, frame)
                         .map_err(|error| self.terminate_connection(error))?;
-                    if matches!(
-                        route,
-                        ResponseRoute::InvalidEnvelope
-                            | ResponseRoute::MissingId
-                            | ResponseRoute::ConnectionClosed
-                    ) {
-                        let error = self.responses.terminal_error().unwrap_or_else(|| {
-                            McpError::internal_error("Client response correlation failed")
-                        });
+                    continue;
+                }
+                if self.cancel_legacy_reverse_callback(request) {
+                    continue;
+                }
+                match self.retain_modern_server_notification(&frame) {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                    Err(error) => return Err(self.terminate_connection(error)),
+                }
+                let JsonRpcMessage::Request(request) = frame.into_message() else {
+                    unreachable!("the frame was checked as a JSON-RPC request")
+                };
+                if let Some(response) = self.server_request_response(&request) {
+                    if let Err(error) = self.send_server_response_during_receive(response) {
                         return Err(self.terminate_connection(error));
                     }
+                    continue;
                 }
-                JsonRpcMessage::Request(request) => {
-                    if self.cancel_legacy_reverse_callback(&request) {
-                        continue;
-                    }
-                    match self.retain_modern_server_notification(&request) {
-                        Ok(Some(_)) => continue,
-                        Ok(None) => {}
-                        Err(error) => return Err(self.terminate_connection(error)),
-                    }
-                    if let Some(response) = self.server_request_response(&request) {
-                        if let Err(error) = self.send_server_response_during_receive(response) {
-                            return Err(self.terminate_connection(error));
-                        }
-                        continue;
-                    }
 
-                    if server_notification_kind(&request)
-                        == Some(ServerNotificationKind::LogMessage)
-                    {
-                        if let Some(params) = request.params.as_ref() {
-                            if let Ok(message) =
-                                serde_json::from_value::<LogMessageParams>(params.clone())
-                            {
-                                self.emit_log_message(message);
-                            }
-                        }
-                    }
+                if server_notification_kind(&request) == Some(ServerNotificationKind::LogMessage)
+                    && let Some(params) = request.params.as_ref()
+                    && let Ok(message) = serde_json::from_value::<LogMessageParams>(params.clone())
+                {
+                    self.emit_log_message(message);
                 }
             }
         }
@@ -8177,10 +8523,10 @@ impl Client {
     /// Collects one final `subscriptions/listen` stream until its complete
     /// result. The listener owns only its acknowledgement, subscription
     /// change events, and matching cancellation. Its retained events use the
-    /// same bound as the connection-wide final notification queue; a matching
-    /// cancellation retires the waiter so one late terminal result is safely
-    /// consumed. Ordinary final log/progress notifications keep their existing
-    /// connection-wide handling.
+    /// same bound as the connection-wide final notification queue. A matching
+    /// cancellation begins teardown but leaves the waiter live until its
+    /// correlated complete result is admitted. Ordinary final log/progress
+    /// notifications keep their existing connection-wide handling.
     fn recv_subscription_listener(
         &mut self,
         mut waiter: ResponseWaiter,
@@ -8188,10 +8534,12 @@ impl Client {
         requested: &SubscriptionFilter,
         deadlines: RequestDeadlines,
     ) -> McpResult<SubscriptionListenCollector> {
+        let cx = self.cx.clone();
         let expected_id = waiter.id.clone();
         let mut accepted_filter = None;
         let mut notifications = Vec::new();
         let mut task_notifications = Vec::new();
+        let mut server_teardown_requested = false;
 
         loop {
             if let Some(response) = waiter.try_response()? {
@@ -8251,11 +8599,8 @@ impl Client {
             }
 
             let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
-            let (message, received_at) = match recv_shared_child_transport(
-                &self.transport,
-                &self.cx,
-                Some(receive_deadline),
-            ) {
+            let (frame, received_at) = match self.recv_next_child_frame(&cx, Some(receive_deadline))
+            {
                 Ok(received) => received,
                 Err(TransportError::ReceiveDeadlineExceeded) => {
                     if receive_deadline < deadlines.next() && !self.transport_is_closed() {
@@ -8284,10 +8629,13 @@ impl Client {
                     ));
                 }
                 Err(TransportError::Closed) => {
+                    let message = if server_teardown_requested {
+                        "Subscription listener reached EOF after cancellation before terminal complete result"
+                    } else {
+                        "Subscription listener reached EOF before terminal complete result"
+                    };
                     return Err(
-                        self.terminate_connection(subscription_listener_protocol_error(
-                            "Subscription listener reached EOF before terminal complete result",
-                        )),
+                        self.terminate_connection(subscription_listener_protocol_error(message))
                     );
                 }
                 Err(error) => {
@@ -8295,242 +8643,227 @@ impl Client {
                 }
             };
             if let Some(kind) = deadlines.expired_at(received_at) {
-                return Err(self.finish_timeout_after_complete_message(
-                    &expected_id,
-                    message,
-                    kind,
-                ));
+                return Err(self.finish_timeout_after_complete_frame(&expected_id, frame, kind));
             }
-            if let Err(error) = validate_inbound_typed_message(&message) {
+            if let Err(error) = validate_inbound_typed_message(frame.message()) {
                 return Err(self.terminate_connection(error));
             }
 
-            match message {
-                JsonRpcMessage::Response(response) => {
-                    let route = self
-                        .route_last_received_response(response)
-                        .map_err(|error| self.terminate_connection(error))?;
-                    if matches!(
-                        route,
-                        ResponseRoute::InvalidEnvelope
-                            | ResponseRoute::MissingId
-                            | ResponseRoute::ConnectionClosed
-                    ) {
-                        let error = self.responses.terminal_error().unwrap_or_else(|| {
-                            McpError::internal_error("Client response correlation failed")
-                        });
-                        return Err(self.terminate_connection(error));
-                    }
+            if matches!(frame.message(), JsonRpcMessage::Response(_)) {
+                let route = self
+                    .route_received_response(frame)
+                    .map_err(|error| self.terminate_connection(error))?;
+                if matches!(
+                    route,
+                    ResponseRoute::InvalidEnvelope
+                        | ResponseRoute::MissingId
+                        | ResponseRoute::ConnectionClosed
+                ) {
+                    let error = self.responses.terminal_error().unwrap_or_else(|| {
+                        McpError::internal_error("Client response correlation failed")
+                    });
+                    return Err(self.terminate_connection(error));
                 }
-                JsonRpcMessage::Request(request) => {
-                    if self.cancel_legacy_reverse_callback(&request) {
-                        continue;
-                    }
-                    if request.id.is_none() && request.method == TASK_STATUS_NOTIFICATION {
-                        let Some(accepted_filter) = accepted_filter.as_ref() else {
-                            return Err(self.terminate_connection(
+            } else {
+                let JsonRpcMessage::Request(request) = frame.message() else {
+                    unreachable!("a JSON-RPC message is either a request or response")
+                };
+                if let Some(executor) = self.multiplexed_executor.clone()
+                    && executor.owns_progress_notification(request)
+                {
+                    executor
+                        .drive_frame(&cx, frame)
+                        .map_err(|error| self.terminate_connection(error))?;
+                    continue;
+                }
+                if self.cancel_legacy_reverse_callback(request) {
+                    continue;
+                }
+                if request.id.is_none() && request.method == TASK_STATUS_NOTIFICATION {
+                    let Some(accepted_filter) = accepted_filter.as_ref() else {
+                        return Err(self.terminate_connection(
                                 subscription_listener_protocol_error(
                                     "Subscription listener received a Tasks event before acknowledgement",
                                 ),
                             ));
-                        };
-                        let accepted_task_ids = match task_subscription_ids(accepted_filter) {
-                            Ok(Some(task_ids)) => task_ids,
-                            _ => {
-                                return Err(self.terminate_connection(
+                    };
+                    let accepted_task_ids = match task_subscription_ids(accepted_filter) {
+                        Ok(Some(task_ids)) => task_ids,
+                        _ => {
+                            return Err(self.terminate_connection(
                                     subscription_listener_protocol_error(
                                         "Subscription listener received a Tasks event without an acknowledged Tasks filter",
                                     ),
                                 ));
-                            }
-                        };
-                        let notification: FinalTaskStatusNotification = match serde_json::from_value(
-                            serde_json::to_value(&request).map_err(|error| {
-                                McpError::internal_error(format!(
-                                    "Failed to inspect Tasks subscription event: {error}"
-                                ))
-                            })?,
-                        ) {
-                            Ok(notification) => notification,
-                            Err(_) => {
-                                return Err(self.terminate_connection(
-                                    subscription_listener_protocol_error(
-                                        "Subscription listener received an invalid Tasks event",
-                                    ),
-                                ));
-                            }
-                        };
-                        let subscription_id = notification
-                            .params
-                            .meta
-                            .as_ref()
-                            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
-                            .and_then(|value| {
-                                serde_json::from_value::<RequestId>(value.clone()).ok()
-                            });
-                        if !subscription_id.as_ref().is_some_and(|subscription_id| {
-                            subscription_id.correlates_with(&expected_id)
-                        }) {
+                        }
+                    };
+                    let notification: FinalTaskStatusNotification = match serde_json::from_value(
+                        serde_json::to_value(&request).map_err(|error| {
+                            McpError::internal_error(format!(
+                                "Failed to inspect Tasks subscription event: {error}"
+                            ))
+                        })?,
+                    ) {
+                        Ok(notification) => notification,
+                        Err(_) => {
                             return Err(self.terminate_connection(
                                 subscription_listener_protocol_error(
-                                    "Tasks event subscription ID does not match the listen request",
+                                    "Subscription listener received an invalid Tasks event",
                                 ),
                             ));
                         }
-                        if !accepted_task_ids
-                            .iter()
-                            .any(|task_id| task_id == &notification.params.task.base().task_id)
-                        {
-                            return Err(self.terminate_connection(
-                                subscription_listener_protocol_error(
-                                    "Tasks event taskId is outside the acknowledged filter",
-                                ),
-                            ));
-                        }
-                        if task_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
-                            return Err(self.terminate_connection(McpError::invalid_request(
-                                FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
-                            )));
-                        }
-                        task_notifications.push(notification);
+                    };
+                    let subscription_id = notification
+                        .params
+                        .meta
+                        .as_ref()
+                        .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                        .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok());
+                    if !subscription_id.as_ref().is_some_and(|subscription_id| {
+                        subscription_id.correlates_with(&expected_id)
+                    }) {
+                        return Err(self.terminate_connection(
+                            subscription_listener_protocol_error(
+                                "Tasks event subscription ID does not match the listen request",
+                            ),
+                        ));
+                    }
+                    if !accepted_task_ids
+                        .iter()
+                        .any(|task_id| task_id == &notification.params.task.base().task_id)
+                    {
+                        return Err(self.terminate_connection(
+                            subscription_listener_protocol_error(
+                                "Tasks event taskId is outside the acknowledged filter",
+                            ),
+                        ));
+                    }
+                    if task_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+                        return Err(self.terminate_connection(McpError::invalid_request(
+                            FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+                        )));
+                    }
+                    task_notifications.push(notification);
+                    continue;
+                }
+
+                if request.method == "notifications/cancelled" {
+                    let cancellation = match CancellationWireMessage::decode(
+                        ProtocolEra::Modern2026,
+                        CancellationSender::Server,
+                        request,
+                    ) {
+                        Ok(CancellationWireMessage::Modern2026 { params, .. }) => params,
+                        Ok(CancellationWireMessage::Legacy2024 { .. }) | Err(_) => continue,
+                    };
+                    if !cancellation.request_id.correlates_with(&expected_id) {
                         continue;
                     }
-
-                    if request.method == "notifications/cancelled" {
-                        let cancellation = match CancellationWireMessage::decode(
-                            ProtocolEra::Modern2026,
-                            CancellationSender::Server,
-                            &request,
-                        ) {
-                            Ok(CancellationWireMessage::Modern2026 { params, .. }) => params,
-                            Ok(CancellationWireMessage::Legacy2024 { .. }) | Err(_) => continue,
-                        };
-                        if !cancellation.request_id.correlates_with(&expected_id) {
-                            continue;
-                        }
-                        if let Some(metadata_subscription_id) = cancellation
-                            .meta
-                            .as_ref()
-                            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
-                            .and_then(|value| {
-                                serde_json::from_value::<RequestId>(value.clone()).ok()
-                            })
-                            && !metadata_subscription_id.correlates_with(&expected_id)
-                        {
-                            continue;
-                        }
-                        let error = McpError::request_cancelled();
-                        match self.responses.tombstone(&expected_id, error.clone()) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(tombstone_error) => {
-                                return Err(self.terminate_connection(tombstone_error));
-                            }
-                        }
-                        return Err(error);
+                    if let Some(metadata_subscription_id) = cancellation
+                        .meta
+                        .as_ref()
+                        .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                        .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+                        && !metadata_subscription_id.correlates_with(&expected_id)
+                    {
+                        continue;
                     }
+                    server_teardown_requested = true;
+                    continue;
+                }
 
-                    if is_final_server_notification_method(&request) {
-                        let raw_params = match self.last_received_raw_notification_params(&request)
-                        {
-                            Ok(raw_params) => raw_params,
-                            Err(_) => {
-                                return Err(self.terminate_connection(
-                                    subscription_listener_protocol_error(
-                                        "Subscription listener lost raw final notification params",
-                                    ),
-                                ));
-                            }
-                        };
-                        let notification = match decode_final_server_notification(
-                            &request,
-                            raw_params.as_deref(),
-                        ) {
+                if is_final_server_notification_method(request) {
+                    let raw_params = match raw_notification_params_from_frame(frame.source()) {
+                        Ok(raw_params) => raw_params,
+                        Err(_) => {
+                            return Err(self.terminate_connection(
+                                subscription_listener_protocol_error(
+                                    "Subscription listener lost raw final notification params",
+                                ),
+                            ));
+                        }
+                    };
+                    let notification =
+                        match decode_final_server_notification(request, raw_params.as_deref()) {
                             Ok(notification) => notification,
                             Err(_) => {
                                 return Err(self.terminate_connection(
-                                    subscription_listener_protocol_error(
-                                        "Subscription listener received an invalid final notification",
-                                    ),
-                                ));
+                                subscription_listener_protocol_error(
+                                    "Subscription listener received an invalid final notification",
+                                ),
+                            ));
                             }
                         };
-                        match notification {
-                            ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
-                                if accepted_filter.is_some() {
-                                    return Err(self.terminate_connection(
+                    match notification {
+                        ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
+                            if accepted_filter.is_some() {
+                                return Err(self.terminate_connection(
                                         subscription_listener_protocol_error(
                                             "Subscription listener received a duplicate acknowledgement",
                                         ),
                                     ));
-                                }
-                                if let Err(error) = validate_subscription_acknowledgement(
-                                    &expected_id,
-                                    requested,
-                                    &acknowledgement,
-                                ) {
-                                    return Err(self.terminate_connection(error));
-                                }
-                                accepted_filter = Some(acknowledgement.notifications);
                             }
-                            ServerNotification::Cancelled(_) => {
-                                return Err(self.terminate_connection(
+                            if let Err(error) = validate_subscription_acknowledgement(
+                                &expected_id,
+                                requested,
+                                &acknowledgement,
+                            ) {
+                                return Err(self.terminate_connection(error));
+                            }
+                            accepted_filter = Some(acknowledgement.notifications);
+                        }
+                        ServerNotification::Cancelled(_) => {
+                            return Err(self.terminate_connection(
                                     subscription_listener_protocol_error(
                                         "Subscription cancellation bypassed the final cancellation codec",
                                     ),
                                 ));
-                            }
-                            notification @ (ServerNotification::ResourcesListChanged(_)
-                            | ServerNotification::ToolsListChanged(_)
-                            | ServerNotification::PromptsListChanged(_)
-                            | ServerNotification::ResourceUpdated(_)) => {
-                                let Some(accepted_filter) = accepted_filter.as_ref() else {
-                                    return Err(self.terminate_connection(
+                        }
+                        notification @ (ServerNotification::ResourcesListChanged(_)
+                        | ServerNotification::ToolsListChanged(_)
+                        | ServerNotification::PromptsListChanged(_)
+                        | ServerNotification::ResourceUpdated(_)) => {
+                            let Some(accepted_filter) = accepted_filter.as_ref() else {
+                                return Err(self.terminate_connection(
                                         subscription_listener_protocol_error(
                                             "Subscription listener received an event before acknowledgement",
                                         ),
                                     ));
-                                };
-                                if let Err(error) = validate_subscription_notification_filter(
-                                    &notification,
-                                    accepted_filter,
-                                ) {
-                                    return Err(self.terminate_connection(error));
-                                }
-                                if notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
-                                    return Err(self.terminate_connection(
-                                        McpError::invalid_request(
-                                            FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
-                                        ),
-                                    ));
-                                }
-                                notifications.push(notification);
+                            };
+                            if let Err(error) = validate_subscription_notification_filter(
+                                &notification,
+                                accepted_filter,
+                            ) {
+                                return Err(self.terminate_connection(error));
                             }
-                            ServerNotification::Progress(_) | ServerNotification::Message(_) => {
-                                if let Err(error) = self.retain_modern_server_notification(&request)
-                                {
-                                    return Err(self.terminate_connection(error));
-                                }
+                            if notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+                                return Err(self.terminate_connection(McpError::invalid_request(
+                                    FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+                                )));
+                            }
+                            notifications.push(notification);
+                        }
+                        ServerNotification::Progress(_) | ServerNotification::Message(_) => {
+                            if let Err(error) = self.retain_modern_server_notification(&frame) {
+                                return Err(self.terminate_connection(error));
                             }
                         }
-                        continue;
                     }
+                    continue;
+                }
 
-                    if let Some(response) = self.server_request_response(&request) {
-                        if let Err(error) = self.send_server_response_during_receive(response) {
-                            return Err(self.terminate_connection(error));
-                        }
-                        continue;
+                if let Some(response) = self.server_request_response(request) {
+                    if let Err(error) = self.send_server_response_during_receive(response) {
+                        return Err(self.terminate_connection(error));
                     }
+                    continue;
+                }
 
-                    if server_notification_kind(&request)
-                        == Some(ServerNotificationKind::LogMessage)
-                        && let Some(params) = request.params.as_ref()
-                        && let Ok(message) =
-                            serde_json::from_value::<LogMessageParams>(params.clone())
-                    {
-                        self.emit_log_message(message);
-                    }
+                if server_notification_kind(request) == Some(ServerNotificationKind::LogMessage)
+                    && let Some(params) = request.params.as_ref()
+                    && let Ok(message) = serde_json::from_value::<LogMessageParams>(params.clone())
+                {
+                    self.emit_log_message(message);
                 }
             }
         }
@@ -8561,6 +8894,7 @@ impl Client {
         let client_info = self.session.client_info().clone();
         let client_capabilities = self.session.client_capabilities().clone();
         let mcp_apps_settings = self.session.mcp_apps_settings().cloned();
+        let client_extension_runtime = self.session.client_extension_runtime().cloned();
         let protocol_plan = self.session.protocol_plan().clone();
         let mut session = match initialization {
             ClientInitialization::Legacy(result) => ClientSession::try_new(
@@ -8585,9 +8919,15 @@ impl Client {
             .with_server_discovery(discovery),
         };
         session = session.with_mcp_apps_settings(mcp_apps_settings);
-        let apps_activation_receipt = session.server_discovery().and_then(|discovery| {
-            mcp_apps_activation_receipt(session.mcp_apps_settings(), discovery)
-        });
+        session = session.with_client_extension_runtime(client_extension_runtime);
+        session.negotiate_client_extensions_after_discovery()?;
+        let apps_activation_receipt = if session.generic_mcp_apps_configured() {
+            session.generic_mcp_apps_activation_receipt()
+        } else {
+            session.server_discovery().and_then(|discovery| {
+                mcp_apps_activation_receipt(session.mcp_apps_settings(), discovery)
+            })
+        };
         session.set_mcp_apps_activation_receipt(apps_activation_receipt);
         self.session = session.try_with_protocol_plan(protocol_plan).map_err(|_| {
             McpError::internal_error("Configured protocol policy rejects the negotiated era")
@@ -9183,6 +9523,7 @@ impl Client {
         timeout_policy: RequestTimeoutPolicy,
         mut deadlines: RequestDeadlines,
     ) -> McpResult<ReceivedJsonRpcResponse> {
+        let cx = self.cx.clone();
         let expected_id = waiter.id.clone();
         let mut last_progress = None;
         let mut last_final_progress = None;
@@ -9198,11 +9539,8 @@ impl Client {
             }
 
             let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
-            let (message, received_at) = match recv_shared_child_transport(
-                &self.transport,
-                &self.cx,
-                Some(receive_deadline),
-            ) {
+            let (frame, received_at) = match self.recv_next_child_frame(&cx, Some(receive_deadline))
+            {
                 Ok(received) => received,
                 Err(TransportError::ReceiveDeadlineExceeded) => {
                     if receive_deadline < deadlines.next() && !self.transport_is_closed() {
@@ -9236,121 +9574,83 @@ impl Client {
                 }
             };
             if let Some(kind) = deadlines.expired_at(received_at) {
-                return Err(self.finish_timeout_after_complete_message(
-                    &expected_id,
-                    message,
-                    kind,
-                ));
+                return Err(self.finish_timeout_after_complete_frame(&expected_id, frame, kind));
             }
-            if let Err(error) = validate_inbound_typed_message(&message) {
+            if let Err(error) = validate_inbound_typed_message(frame.message()) {
                 return Err(self.terminate_connection(error));
             }
 
-            match message {
-                JsonRpcMessage::Response(response) => {
-                    let route = self
-                        .route_last_received_response(response)
-                        .map_err(|error| self.terminate_connection(error))?;
-                    if matches!(
-                        route,
-                        ResponseRoute::InvalidEnvelope
-                            | ResponseRoute::MissingId
-                            | ResponseRoute::ConnectionClosed
-                    ) {
-                        let error = self.responses.terminal_error().unwrap_or_else(|| {
-                            McpError::internal_error("Client response correlation failed")
-                        });
-                        return Err(self.terminate_connection(error));
-                    }
+            if matches!(frame.message(), JsonRpcMessage::Response(_)) {
+                let route = self
+                    .route_received_response(frame)
+                    .map_err(|error| self.terminate_connection(error))?;
+                if matches!(
+                    route,
+                    ResponseRoute::InvalidEnvelope
+                        | ResponseRoute::MissingId
+                        | ResponseRoute::ConnectionClosed
+                ) {
+                    let error = self.responses.terminal_error().unwrap_or_else(|| {
+                        McpError::internal_error("Client response correlation failed")
+                    });
+                    return Err(self.terminate_connection(error));
                 }
-                JsonRpcMessage::Request(request) => {
-                    if self.cancel_legacy_reverse_callback(&request) {
-                        continue;
-                    }
-                    match self.retain_modern_server_notification(&request) {
-                        Ok(Some(ModernServerNotification::Progress(progress))) => {
-                            if last_final_progress
-                                .as_ref()
-                                .is_none_or(|last| progress.progress.cmp(last).is_gt())
-                                && progress.progress_token == *expected_marker
+            } else {
+                let JsonRpcMessage::Request(request) = frame.message() else {
+                    unreachable!("a JSON-RPC message is either a request or response")
+                };
+                if let Some(executor) = self.multiplexed_executor.clone()
+                    && executor.owns_progress_notification(request)
+                {
+                    executor
+                        .drive_frame(&cx, frame)
+                        .map_err(|error| self.terminate_connection(error))?;
+                    continue;
+                }
+                if self.cancel_legacy_reverse_callback(request) {
+                    continue;
+                }
+                match self.retain_modern_server_notification(&frame) {
+                    Ok(Some(ModernServerNotification::Progress(progress))) => {
+                        if last_final_progress
+                            .as_ref()
+                            .is_none_or(|last| progress.progress.cmp(last).is_gt())
+                            && progress.progress_token == *expected_marker
+                        {
+                            last_final_progress = Some(progress.progress.clone());
+                            let callback_progress = progress
+                                .progress
+                                .as_str()
+                                .parse::<f64>()
+                                .ok()
+                                .filter(|value| value.is_finite());
+                            let callback_total =
+                                progress.total.as_ref().map_or(Some(None), |total| {
+                                    total
+                                        .as_str()
+                                        .parse::<f64>()
+                                        .ok()
+                                        .filter(|value| value.is_finite())
+                                        .map(Some)
+                                });
+                            if let (Some(callback_progress), Some(callback_total)) =
+                                (callback_progress, callback_total)
                             {
-                                last_final_progress = Some(progress.progress.clone());
-                                let callback_progress = progress
-                                    .progress
-                                    .as_str()
-                                    .parse::<f64>()
-                                    .ok()
-                                    .filter(|value| value.is_finite());
-                                let callback_total =
-                                    progress.total.as_ref().map_or(Some(None), |total| {
-                                        total
-                                            .as_str()
-                                            .parse::<f64>()
-                                            .ok()
-                                            .filter(|value| value.is_finite())
-                                            .map(Some)
-                                    });
-                                if let (Some(callback_progress), Some(callback_total)) =
-                                    (callback_progress, callback_total)
+                                if invoke_tool_progress_callback(
+                                    &mut *on_progress,
+                                    callback_progress,
+                                    callback_total,
+                                    progress.message.as_deref(),
+                                )
+                                .is_err()
                                 {
-                                    if invoke_tool_progress_callback(
-                                        &mut *on_progress,
-                                        callback_progress,
-                                        callback_total,
-                                        progress.message.as_deref(),
-                                    )
-                                    .is_err()
-                                    {
-                                        let error =
-                                            McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR);
-                                        return Err(self.finish_committed_request_locally(
-                                            &expected_id,
-                                            error,
-                                        ));
-                                    }
-                                }
-                                if timeout_policy.reset_idle_on_matching_progress
-                                    && let Err(error) = deadlines.reset_idle_at(received_at)
-                                {
+                                    let error =
+                                        McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR);
                                     return Err(
                                         self.finish_committed_request_locally(&expected_id, error)
                                     );
                                 }
                             }
-                            continue;
-                        }
-                        Ok(Some(_)) => continue,
-                        Ok(None) => {}
-                        Err(error) => return Err(self.terminate_connection(error)),
-                    }
-                    if let Some(response) = self.server_request_response(&request) {
-                        if let Err(error) = self.send_server_response_during_receive(response) {
-                            return Err(self.terminate_connection(error));
-                        }
-                        continue;
-                    }
-
-                    if server_notification_kind(&request) == Some(ServerNotificationKind::Progress)
-                    {
-                        if let Some(params) = request.params.as_ref()
-                            && let Some(progress) =
-                                parse_valid_client_progress(params, last_progress)
-                            && progress.marker == *expected_marker
-                        {
-                            if invoke_tool_progress_callback(
-                                &mut *on_progress,
-                                progress.progress,
-                                progress.total,
-                                progress.message.as_deref(),
-                            )
-                            .is_err()
-                            {
-                                let error = McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR);
-                                return Err(
-                                    self.finish_committed_request_locally(&expected_id, error)
-                                );
-                            }
-                            last_progress = Some(progress.progress);
                             if timeout_policy.reset_idle_on_matching_progress
                                 && let Err(error) = deadlines.reset_idle_at(received_at)
                             {
@@ -9359,19 +9659,54 @@ impl Client {
                                 );
                             }
                         }
-                    } else if server_notification_kind(&request)
-                        == Some(ServerNotificationKind::LogMessage)
+                        continue;
+                    }
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                    Err(error) => return Err(self.terminate_connection(error)),
+                }
+                if let Some(response) = self.server_request_response(request) {
+                    if let Err(error) = self.send_server_response_during_receive(response) {
+                        return Err(self.terminate_connection(error));
+                    }
+                    continue;
+                }
+
+                if server_notification_kind(request) == Some(ServerNotificationKind::Progress) {
+                    if let Some(params) = request.params.as_ref()
+                        && let Some(progress) = parse_valid_client_progress(params, last_progress)
+                        && progress.marker == *expected_marker
                     {
-                        if let Some(params) = request.params.as_ref() {
-                            if let Ok(message) =
-                                serde_json::from_value::<LogMessageParams>(params.clone())
-                            {
-                                self.emit_log_message(message);
-                            }
+                        if invoke_tool_progress_callback(
+                            &mut *on_progress,
+                            progress.progress,
+                            progress.total,
+                            progress.message.as_deref(),
+                        )
+                        .is_err()
+                        {
+                            let error = McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR);
+                            return Err(self.finish_committed_request_locally(&expected_id, error));
+                        }
+                        last_progress = Some(progress.progress);
+                        if timeout_policy.reset_idle_on_matching_progress
+                            && let Err(error) = deadlines.reset_idle_at(received_at)
+                        {
+                            return Err(self.finish_committed_request_locally(&expected_id, error));
                         }
                     }
-                    // Continue waiting for actual response
+                } else if server_notification_kind(request)
+                    == Some(ServerNotificationKind::LogMessage)
+                {
+                    if let Some(params) = request.params.as_ref() {
+                        if let Ok(message) =
+                            serde_json::from_value::<LogMessageParams>(params.clone())
+                        {
+                            self.emit_log_message(message);
+                        }
+                    }
                 }
+                // Continue waiting for actual response
             }
         }
     }
@@ -10130,14 +10465,19 @@ impl Client {
     /// cannot be established, signalling fails, or the subprocess cannot be
     /// reaped within the cleanup deadline.
     pub fn close(&mut self) -> McpResult<()> {
-        // A dropped final multiplexed execution has no later receive or send
-        // turn to drive its retirement. Drain it before failing waiters or
-        // closing child stdin so its selected-era cancellation still receives
-        // exactly one bounded control-write attempt.
-        let deferred_retirement_result = self.flush_stdio_drop_retirements();
+        // A dropped request-owned handle has no later ingress turn to flush
+        // its cancellation. Service the shared executor before closing child
+        // stdin so the selected-era control receives one bounded attempt.
+        let deferred_retirement_result = self
+            .multiplexed_executor
+            .as_ref()
+            .map_or(Ok(()), |executor| executor.service(&self.cx));
         self.initialized.store(false, Ordering::SeqCst);
         self.responses
             .fail_all(McpError::internal_error("Client connection closed"));
+        if let Some(executor) = &self.multiplexed_executor {
+            executor.fail_connection(McpError::internal_error("Client connection closed"));
+        }
         self.cancel_reverse_callback_pool();
         self.join_reverse_callback_pool()?;
 
@@ -10183,8 +10523,15 @@ impl Drop for Client {
     fn drop(&mut self) {
         // Drop cannot report cleanup failure or create an orphan cleanup task;
         // callers requiring proof must call close() and handle its result.
+        // Cloned request-owned handles can outlive this Client value. Publish
+        // the same connection terminal outcome before closing their shared
+        // transport so a surviving handle never remains pending without an
+        // ingress driver.
         self.responses
             .fail_all(McpError::internal_error("Client connection closed"));
+        if let Some(executor) = &self.multiplexed_executor {
+            executor.fail_connection(McpError::internal_error("Client connection closed"));
+        }
         self.cancel_reverse_callback_pool();
         self.join_reverse_callback_pool_unbounded();
         let _ = self.close_transport();
@@ -10243,6 +10590,58 @@ mod tests {
                 if authorized { "" } else { "not " }
             );
         }
+    }
+
+    #[test]
+    fn negotiated_client_io_preserves_memory_source_from_one_admission() {
+        use fastmcp_transport::memory::create_memory_transport_pair;
+
+        let (client, server) = create_memory_transport_pair();
+        let (client_recv, client_send) = client.into_split();
+        let (mut server_recv, mut server_send) = server.into_split();
+        let mut io = NegotiatedClientIo::new(client_recv, client_send);
+        let cx = Cx::for_testing();
+        let response = JsonRpcResponse::success(
+            RequestId::Number(61),
+            serde_json::json!({
+                "resultType": "complete",
+                "opaque": {"origin": "memory"}
+            }),
+        );
+
+        server_send
+            .send(&cx, &JsonRpcMessage::Response(response.clone()))
+            .expect("peer commits one response");
+        let received = io
+            .recv(&cx)
+            .expect("transport-neutral ingress retains the committed source");
+        let JsonRpcMessage::Response(typed) = received.message().clone() else {
+            panic!("memory peer sent one response");
+        };
+        let raw_result = raw_result_from_admitted_response(&typed, received, "memory")
+            .expect("one admitted source derives its typed response and raw result");
+        assert_eq!(typed, response);
+        let expected_raw_result = serde_json::to_string(
+            response
+                .result
+                .as_ref()
+                .expect("success response retains its result"),
+        )
+        .expect("committed result serializes");
+        assert_eq!(raw_result.as_deref(), Some(expected_raw_result.as_str()));
+
+        io.send(
+            &cx,
+            &JsonRpcMessage::Request(JsonRpcRequest::new("after/admission", None, 62_i64)),
+        )
+        .expect("admitted source retention does not mutate the selected transport");
+        let JsonRpcMessage::Request(request) = server_recv
+            .recv(&cx)
+            .expect("peer receives the only outbound request")
+        else {
+            panic!("the transport-neutral sender preserves request direction");
+        };
+        assert_eq!(request.method, "after/admission");
     }
 
     #[test]
@@ -10492,8 +10891,292 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn legacy_raw_extension_http_plan(
+        sse_target: &str,
+        message_target: &str,
+    ) -> ClientProtocolPlan {
+        ClientProtocolPlan::http(
+            ProtocolPolicy::LegacyOnly,
+            None,
+            Some(
+                CanonicalHttpUrl::parse(sse_target)
+                    .expect("local exact legacy SSE target is canonical"),
+            ),
+            Some(
+                CanonicalHttpUrl::parse(message_target)
+                    .expect("local exact legacy message target is canonical"),
+            ),
+            "legacy-raw-extension-credential".to_owned(),
+            "legacy-raw-extension-security".to_owned(),
+            "legacy-raw-extension-transport".to_owned(),
+            1,
+            1,
+            1,
+        )
+        .expect("exact legacy raw extension HTTP plan is complete")
+    }
+
+    #[cfg(unix)]
+    fn assert_no_raw_extension_http_post(listener: &TcpListener) {
+        listener
+            .set_nonblocking(true)
+            .expect("configure raw extension no-contact assertion");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok(_) => panic!("rejected raw extension request must not start an HTTP POST"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => panic!("unexpected raw extension no-contact accept error: {error}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn public_http_mrtr_drives_tool_resource_and_prompt_to_terminal_results() {
+    fn clt_ext_raw_http_public_request_uses_the_negotiated_registry() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw extension HTTP peer");
+        let address = listener
+            .local_addr()
+            .expect("read raw extension HTTP peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = std::thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept raw extension discovery");
+            let probe_request = read_http_cache_test_request(&mut probe);
+            assert_eq!(probe_request["id"], 1);
+            assert_eq!(probe_request["method"], "server/discover");
+            assert_eq!(
+                probe_request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                    ["com.example/raw"],
+                serde_json::json!({ "mode": "raw" })
+            );
+            let discovery = modern_raw_extension_discovery_response(
+                "raw-extension-http-server",
+                Some(serde_json::json!({ "mode": "raw" })),
+            );
+            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+
+            let (mut request_stream, _) = listener.accept().expect("accept raw extension request");
+            let request = read_http_cache_test_request(&mut request_stream);
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "example/echo");
+            assert_eq!(request["params"]["input"], "ok");
+            assert_eq!(
+                request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]["com.example/raw"],
+                serde_json::json!({ "mode": "raw" })
+            );
+            write_http_cache_test_response(
+                &mut request_stream,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"echoed":{"input":"ok"},"resultType":"complete"}}"#,
+            );
+        });
+
+        let (extension_id, registry, discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&modern_target))
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .expect("raw extension registry freezes before HTTP discovery")
+                .connect_http_client_with_cx(&cx),
+        )
+        .expect("public HTTP raw extension client completes discovery");
+        assert!(client.negotiated_extensions().is_some());
+
+        let result = http_test_runtime_block_on(client.request_final_extension(
+            &cx,
+            &extension_id,
+            "example/echo",
+            serde_json::json!({ "input": "ok" }),
+        ))
+        .expect("public HTTP raw extension request uses the admitted source path");
+        assert_eq!(result["echoed"]["input"], "ok");
+        server.join().expect("raw extension HTTP peer joins");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_raw_http_unnegotiated_settings_do_not_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw extension HTTP peer");
+        let address = listener
+            .local_addr()
+            .expect("read raw extension HTTP peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = std::thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept raw extension discovery");
+            let probe_request = read_http_cache_test_request(&mut probe);
+            assert_eq!(probe_request["method"], "server/discover");
+            let discovery =
+                modern_raw_extension_discovery_response("raw-extension-http-server", None);
+            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+            assert_no_raw_extension_http_post(&listener);
+        });
+
+        // This differs from the admitted descriptor only in the one-sided
+        // inactive fallback and the absent peer settings it selects.
+        let (extension_id, registry, discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::ClientInactiveFallback,
+        );
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&modern_target))
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .expect("inactive raw extension registry freezes before HTTP discovery")
+                .connect_http_client_with_cx(&cx),
+        )
+        .expect("public HTTP client retains inactive extension negotiation");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        let error = http_test_runtime_block_on(client.request_final_extension(
+            &cx,
+            &extension_id,
+            "example/echo",
+            serde_json::json!({}),
+        ))
+        .expect_err("unnegotiated raw extension settings reject before HTTP ID allocation");
+        assert!(
+            matches!(error, HttpClientError::CoreResult(ref error) if error.code == McpErrorCode::InvalidParams)
+        );
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        server.join().expect("raw extension no-post peer joins");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_raw_http_wrong_direction_does_not_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw extension HTTP peer");
+        let address = listener
+            .local_addr()
+            .expect("read raw extension HTTP peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = std::thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept raw extension discovery");
+            let probe_request = read_http_cache_test_request(&mut probe);
+            assert_eq!(probe_request["method"], "server/discover");
+            let discovery = modern_raw_extension_discovery_response(
+                "raw-extension-http-server",
+                Some(serde_json::json!({ "mode": "raw" })),
+            );
+            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+            assert_no_raw_extension_http_post(&listener);
+        });
+
+        // This differs from the admitted descriptor only in method direction.
+        let (extension_id, registry, discovery) = raw_extension_configuration(
+            ExtensionDirection::ServerToClient,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&modern_target))
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .expect("server-owned raw descriptor freezes before HTTP discovery")
+                .connect_http_client_with_cx(&cx),
+        )
+        .expect("public HTTP client retains bilateral raw extension state");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        let error = http_test_runtime_block_on(client.request_final_extension(
+            &cx,
+            &extension_id,
+            "example/echo",
+            serde_json::json!({}),
+        ))
+        .expect_err("server-owned raw method rejects before HTTP ID allocation");
+        assert!(
+            matches!(error, HttpClientError::CoreResult(ref error) if error.code == McpErrorCode::InvalidParams)
+        );
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        server
+            .join()
+            .expect("wrong-direction raw extension no-post peer joins");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_raw_legacy_http_request_cannot_bypass_extension_admission() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind exact legacy raw peer");
+        let address = listener
+            .local_addr()
+            .expect("read exact legacy raw peer address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (verify_sender, verify_receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let mut request = [0_u8; 1_024];
+            let read = sse.read(&mut request).expect("read exact legacy SSE GET");
+            let request =
+                std::str::from_utf8(&request[..read]).expect("exact legacy SSE GET is UTF-8");
+            assert!(request.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            let endpoint = format!("event: endpoint\ndata: {advertised_message_target}\n\n");
+            write!(
+                sse,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n{:X}\r\n{}\r\n",
+                endpoint.len(),
+                endpoint,
+            )
+            .expect("write exact legacy SSE endpoint event");
+            sse.flush().expect("flush exact legacy SSE endpoint event");
+            ready_sender
+                .send(())
+                .expect("exact legacy SSE endpoint is visible to the client");
+            verify_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("client reports the local raw extension refusal");
+            assert_no_raw_extension_http_post(&listener);
+        });
+
+        let (_extension_id, registry, discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let cx = Cx::for_request();
+        let mut connection = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(legacy_raw_extension_http_plan(&sse_target, &message_target))
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .expect("raw extension registry is frozen before exact legacy selection")
+                .connect_http_with_cx(&cx),
+        )
+        .expect("exact legacy raw connection opens only its SSE lane");
+        ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("exact legacy peer exposes its message endpoint");
+
+        let error = http_test_runtime_block_on(connection.request(
+            &cx,
+            "example/echo",
+            serde_json::json!({}),
+            RequestId::Number(2),
+        ))
+        .expect_err("legacy raw request cannot bypass the registered final extension method");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::RegisteredExtensionMethodRequiresAdmission { ref method }
+                if method == "example/echo"
+        ));
+        verify_sender
+            .send(())
+            .expect("release the exact legacy no-contact assertion");
+        server
+            .join()
+            .expect("exact legacy raw extension peer joins without a message POST");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_mrtr_retry_drives_tool_resource_and_prompt_to_terminal_results() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind public MRTR listener");
         let address = listener.local_addr().expect("read public MRTR address");
         let modern_target = format!("http://{address}/mcp");
@@ -10582,7 +11265,7 @@ mod tests {
         let sse_limits = sse::SseLimits::new(1_024, 8_192, 8).expect("valid SSE limits");
 
         let mut tool_states = Vec::new();
-        let tool = http_test_runtime_block_on(client.call_tool_with_mrtr_retry_until(
+        let tool = http_test_runtime_block_on(client.call_tool_with_mrtr_retry(
             &cx,
             Instant::now() + Duration::from_secs(2),
             "public-tool",
@@ -10604,7 +11287,7 @@ mod tests {
         assert_eq!(tool_states, ["tool-one", "tool-two"]);
 
         let mut resource_states = Vec::new();
-        let resource = http_test_runtime_block_on(client.read_resource_with_mrtr_retry_until(
+        let resource = http_test_runtime_block_on(client.read_resource_with_mrtr_retry(
             &cx,
             Instant::now() + Duration::from_secs(2),
             "file:///public-mrtr.txt",
@@ -10625,7 +11308,7 @@ mod tests {
         assert_eq!(resource_states, ["resource-one", "resource-two"]);
 
         let mut prompt_states = Vec::new();
-        let prompt = http_test_runtime_block_on(client.get_prompt_with_mrtr_retry_until(
+        let prompt = http_test_runtime_block_on(client.get_prompt_with_mrtr_retry(
             &cx,
             Instant::now() + Duration::from_secs(2),
             "public-prompt",
@@ -10726,7 +11409,7 @@ mod tests {
         ))
         .expect("public HTTP bound client completes discovery");
         let mut callback_count = 0_usize;
-        let result = http_test_runtime_block_on(client.call_tool_with_mrtr_retry_until(
+        let result = http_test_runtime_block_on(client.call_tool_with_mrtr_retry(
             &cx,
             Instant::now() + Duration::from_secs(2),
             "bound-tool",
@@ -10755,14 +11438,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn public_http_mrtr_round_bound_accepts_the_terminal_fifth_response() {
+    fn public_http_mrtr_retry_round_bound_accepts_the_terminal_fifth_response() {
         assert_public_http_mrtr_round_bound(true);
     }
 
     #[cfg(unix)]
     #[test]
-    fn public_http_mrtr_round_bound_rejects_only_an_input_required_fifth_response_without_contact()
-    {
+    fn public_http_mrtr_retry_round_bound_rejects_only_an_input_required_fifth_response_without_contact()
+     {
         assert_public_http_mrtr_round_bound(false);
     }
 
@@ -11174,6 +11857,178 @@ mod tests {
         ));
         assert!(matches!(task, FinalTask::Working(_)));
         assert_eq!(task.base().last_updated_at.as_str(), "2026-07-28T12:00:00Z");
+        assert_eq!(next_id, 4);
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum PublicFinalTaskCancellationEntryPoint {
+        Direct,
+        Handle,
+    }
+
+    #[cfg(unix)]
+    fn run_public_http_final_task_cancellation(
+        cancellation_task_id: &str,
+        entry_point: PublicFinalTaskCancellationEntryPoint,
+    ) -> (FinalTask, serde_json::Value, FinalCancelTaskResult, u64) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind public final task cancellation listener");
+        let address = listener
+            .local_addr()
+            .expect("read public final task cancellation listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let cancellation_task_id = cancellation_task_id.to_owned();
+        let cancellation_task_id_for_server = cancellation_task_id.clone();
+        let server = std::thread::spawn(move || {
+            let discovery = modern_tasks_discovery_response(
+                "public-final-task-cancellation-server",
+                serde_json::json!({}),
+            );
+            let (mut probe, _) = listener
+                .accept()
+                .expect("accept final task cancellation discovery");
+            let probe_request = read_http_cache_test_request(&mut probe);
+            assert_eq!(probe_request["id"], 1);
+            assert_eq!(probe_request["method"], "server/discover");
+            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+
+            let (mut get, _) = listener
+                .accept()
+                .expect("accept final task cancellation attachment");
+            let get_request = read_http_cache_test_request(&mut get);
+            assert_eq!(get_request["id"], 2);
+            assert_eq!(get_request["method"], "tasks/get");
+            assert_eq!(get_request["params"]["taskId"], "task-73");
+            write_http_cache_test_response(
+                &mut get,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-73","status":"working","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null,"pollIntervalMs":25}}"#,
+            );
+
+            let (mut cancel, _) = listener
+                .accept()
+                .expect("accept final task cancellation request");
+            let cancel_request = read_http_cache_test_request(&mut cancel);
+            assert_eq!(cancel_request["id"], 3);
+            assert_eq!(cancel_request["method"], "tasks/cancel");
+            assert_eq!(
+                cancel_request["params"]["taskId"],
+                cancellation_task_id_for_server
+            );
+            assert_eq!(
+                cancel_request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                MODERN_PROTOCOL_VERSION
+            );
+            assert_eq!(
+                cancel_request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    ["io.modelcontextprotocol/tasks"],
+                serde_json::json!({})
+            );
+            write_http_cache_test_response(
+                &mut cancel,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete"}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(HttpClient::connect(
+            &cx,
+            http_cache_test_plan(&modern_target),
+            ClientInfo {
+                name: "public-final-task-cancellation-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("public HTTP client completes Tasks discovery");
+        let handle = http_test_runtime_block_on(client.attach_final_task(
+            &cx,
+            FinalTaskId::parse("task-73").expect("bounded public task handle ID"),
+        ))
+        .expect("public HTTP task attachment admits the first snapshot");
+        let expected_snapshot =
+            serde_json::to_value(handle.task()).expect("serialize owned task snapshot");
+        let acknowledgement = match entry_point {
+            PublicFinalTaskCancellationEntryPoint::Direct => http_test_runtime_block_on(
+                client.cancel_final_task(
+                    &cx,
+                    FinalTaskId::parse(cancellation_task_id)
+                        .expect("bounded public task cancellation ID"),
+                ),
+            )
+            .expect("direct task cancellation accepts its explicit task ID"),
+            PublicFinalTaskCancellationEntryPoint::Handle => {
+                http_test_runtime_block_on(handle.cancel(&cx, &mut client))
+                    .expect("task handle delegates cancellation for its exact owned task")
+            }
+        };
+        let task = handle.task().clone();
+        let next_id = client.next_id.load(Ordering::Relaxed);
+        server
+            .join()
+            .expect("public final task cancellation server joins");
+        (task, expected_snapshot, acknowledgement, next_id)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_final_task_cancel_exact_id_leaves_owned_snapshot_unchanged() {
+        let (task, expected_snapshot, acknowledgement, next_id) =
+            run_public_http_final_task_cancellation(
+                "task-73",
+                PublicFinalTaskCancellationEntryPoint::Direct,
+            );
+        assert!(acknowledgement.meta.is_none());
+        assert!(acknowledgement.additional.is_empty());
+        assert!(matches!(task, FinalTask::Working(_)));
+        assert_eq!(task.base().task_id.as_str(), "task-73");
+        assert_eq!(task.base().last_updated_at.as_str(), "2026-07-28T12:00:00Z");
+        assert_eq!(
+            serde_json::to_value(&task).expect("serialize retained task snapshot"),
+            expected_snapshot
+        );
+        assert_eq!(next_id, 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_final_task_cancel_foreign_id_leaves_owned_snapshot_unchanged() {
+        // This differs from the direct positive case only in the explicit cancellation task ID.
+        let (task, expected_snapshot, acknowledgement, next_id) =
+            run_public_http_final_task_cancellation(
+                "task-74",
+                PublicFinalTaskCancellationEntryPoint::Direct,
+            );
+        assert!(acknowledgement.meta.is_none());
+        assert!(acknowledgement.additional.is_empty());
+        assert!(matches!(task, FinalTask::Working(_)));
+        assert_eq!(task.base().task_id.as_str(), "task-73");
+        assert_eq!(task.base().last_updated_at.as_str(), "2026-07-28T12:00:00Z");
+        assert_eq!(
+            serde_json::to_value(&task).expect("serialize retained task snapshot"),
+            expected_snapshot
+        );
+        assert_eq!(next_id, 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_final_task_handle_cancel_delegates_without_snapshot_mutation() {
+        let (task, expected_snapshot, acknowledgement, next_id) =
+            run_public_http_final_task_cancellation(
+                "task-73",
+                PublicFinalTaskCancellationEntryPoint::Handle,
+            );
+        assert!(acknowledgement.meta.is_none());
+        assert!(acknowledgement.additional.is_empty());
+        assert!(matches!(task, FinalTask::Working(_)));
+        assert_eq!(task.base().task_id.as_str(), "task-73");
+        assert_eq!(
+            serde_json::to_value(&task).expect("serialize retained task snapshot"),
+            expected_snapshot
+        );
         assert_eq!(next_id, 4);
     }
 
@@ -12414,6 +13269,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn selected_stdio_callback_writer_completes_while_reader_waits_for_peer() {
+        // The peer withholds the original response until it has read the
+        // callback completion. After admitting the callback request, the sole
+        // client reader has no inbound frame available and waits again. The
+        // callback can therefore complete only if selected ingress and egress
+        // retain independently locked halves.
+        let script = "IFS= read -r request; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
+            IFS= read -r sampling; \
+            case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
+            case \"$sampling\" in *'\"id\":41'*'\"model\":\"selected-half\"'*) callback_ok=true;; *) callback_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"request\":%s,\"callback\":%s}}\\n' \
+            \"$request_ok\" \"$callback_ok\"; exec sleep 2";
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+            let callback_calls = Arc::clone(&callback_calls);
+            move |_cancellation, _params| {
+                callback_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(CreateMessageResult::text("handled", "selected-half"))
+            }
+        });
+        let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
+            script,
+            Duration::from_secs(2),
+            handlers,
+        );
+        assert!(
+            client.selected_io.is_some(),
+            "the live legacy client activates selected shared halves before callbacks"
+        );
+
+        let result: serde_json::Value = client
+            .send_request("test/selected-reader", serde_json::json!({}))
+            .expect("callback writer must complete before the peer releases the response");
+
+        assert_eq!(
+            result,
+            serde_json::json!({"request": true, "callback": true})
+        );
+        assert_eq!(callback_calls.load(Ordering::Relaxed), 1);
+        assert!(client.is_initialized());
+        assert!(!client.transport_is_closed());
+        client
+            .close()
+            .expect("selected shared-half callback cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clt_legacy_reverse_request_handlers_remain_unchanged() {
         let script = "IFS= read -r request; \
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
@@ -13008,7 +13912,7 @@ mod tests {
         // routing now retains each response's raw admitted source frame, so a
         // fabricated in-memory response (which no frame ever carried) is
         // correctly refused by production code.
-        let mut client = make_shell_scripted_initialized_client(
+        let client = make_shell_scripted_initialized_client(
             r#"printf '%s
 ' '{"jsonrpc":"2.0","id":21,"result":{"owner":"unrelated"}}'; exec sleep 2"#,
             Duration::from_secs(1),
@@ -13025,16 +13929,13 @@ mod tests {
             .expect("register unrelated owner");
 
         let recv_cx = Cx::for_request();
-        let unrelated_message = client
-            .transport
-            .lock()
-            .expect("client reader lock")
-            .recv(&recv_cx)
+        let (unrelated_frame, _) = client
+            .recv_next_child_frame(&recv_cx, Some(Instant::now() + Duration::from_secs(2)))
             .expect("scripted unrelated response arrives with its source frame");
 
-        let timeout = client.finish_timeout_after_complete_message(
+        let timeout = client.finish_timeout_after_complete_frame(
             &timed_out_id,
-            unrelated_message,
+            unrelated_frame,
             RequestTimeoutSource::Idle,
         );
 
@@ -13077,8 +13978,12 @@ mod tests {
             .expect("register timeout owner");
         let late_ping =
             JsonRpcMessage::Request(JsonRpcRequest::new("ping", Some(serde_json::json!({})), 88));
+        let late_ping = ReceivedTransportFrame::admit(
+            serde_json::to_vec(&late_ping).expect("serialize complete late request source"),
+        )
+        .expect("admit complete late request source");
 
-        let timeout = client.finish_timeout_after_complete_message(
+        let timeout = client.finish_timeout_after_complete_frame(
             &timed_out_id,
             late_ping,
             RequestTimeoutSource::Idle,
@@ -13095,7 +14000,7 @@ mod tests {
             Some(Instant::now() + Duration::from_secs(2)),
         )
         .expect("the peer observes both bounded control frames");
-        let JsonRpcMessage::Response(evidence) = evidence else {
+        let JsonRpcMessage::Response(evidence) = evidence.into_message() else {
             panic!("expected scripted evidence response");
         };
         assert_eq!(evidence.id, Some(RequestId::Number(99)));
@@ -13127,8 +14032,12 @@ mod tests {
             error: None,
             id: Some(request_id.clone()),
         });
+        let malformed = ReceivedTransportFrame::admit(
+            serde_json::to_vec(&malformed).expect("serialize malformed complete response source"),
+        )
+        .expect("admit malformed complete response source");
 
-        let timeout = client.finish_timeout_after_complete_message(
+        let timeout = client.finish_timeout_after_complete_frame(
             &request_id,
             malformed,
             RequestTimeoutSource::Idle,
@@ -14125,103 +15034,180 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn dropped_multiplexed_stdio_executions_retire_at_the_next_client_progress_point() {
-        let mut client = make_shell_scripted_initialized_client(
-            "while IFS= read -r _; do :; done",
-            Duration::from_secs(2),
-        );
-        client.install_multiplexed_stdio_executor();
-        let cx = Cx::for_request();
-
-        for _ in 0..1_024 {
-            drop(
-                client
-                    .start_multiplexed_request(&cx, "ping", Some(serde_json::json!({})))
-                    .expect("each silent-peer request commits before its owner is dropped"),
-            );
-        }
-
-        let final_execution = client
-            .start_multiplexed_request(&cx, "ping", Some(serde_json::json!({})))
-            .expect("dropped owners must not exhaust the live in-flight limit");
-        assert_eq!(client.responses.pending_len(), 1);
-        assert_eq!(client.responses.tombstone_len(), 1_024);
-        assert_eq!(client.responses.cancellation_control_len(), 1_024);
-        drop(final_execution);
-        assert_eq!(client.responses.pending_len(), 1);
-        client.close().expect("silent-peer stdio client cleanup");
-    }
-
-    #[test]
-    fn completed_multiplexed_stdio_execution_does_not_request_drop_retirement() {
-        let (sender, receiver) = oneshot::channel();
-        let retirement = Arc::new(StdioDropRetirement {
-            request_id: RequestId::Number(91),
-            peer_era: ProtocolEra::Modern2026,
-            requested: AtomicBool::new(false),
-        });
-        let execution = StdioRequestExecution {
-            request_id: RequestId::Number(91),
-            waiter: Some(ResponseWaiter {
-                id: RequestId::Number(91),
-                receiver,
-            }),
-            drop_retirement: Arc::clone(&retirement),
-            drop_retirements: SharedStdioDropRetirements::default(),
-            committed_at: Instant::now(),
-            completed: true,
-        };
-        drop(sender);
-        drop(execution);
-
-        assert!(!retirement.requested.load(Ordering::Acquire));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn multiplexed_stdio_reordered_responses_retain_their_inbound_raw_result_frames() {
+    fn negotiated_stdio_executor_clones_route_reordered_exact_result_sources() {
         let second_raw_result = r#"{"owner":"second","exact":1.20e+4}"#;
         let first_raw_result = r#"{"owner":"first","exact":7.30e-2}"#;
         let script = format!(
-            "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{second_raw_result}}}'; \\
+            "IFS= read -r _; IFS= read -r _; \\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{second_raw_result}}}'; \\
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{first_raw_result}}}'; \\
              exec sleep 2"
         );
         let mut client = make_shell_scripted_initialized_client(&script, Duration::from_secs(1));
-        client.install_multiplexed_stdio_executor();
         let cx = Cx::for_request();
-        let mut first = client
-            .start_multiplexed_request(&cx, "ping", Some(serde_json::json!({})))
-            .expect("first request commits");
-        let mut second = client
-            .start_multiplexed_request(&cx, "ping", Some(serde_json::json!({})))
-            .expect("second request commits");
+        let executor = client
+            .multiplexed_stdio_executor()
+            .expect("selected client exposes a cloneable request executor");
+        let mut first = executor
+            .execute(&cx, "ping", Some(serde_json::json!({})))
+            .expect("first direct executor request commits");
+        let mut second = executor
+            .clone()
+            .execute(&cx, "ping", Some(serde_json::json!({})))
+            .expect("second cloned executor request commits");
         assert_eq!(first.request_id(), &RequestId::Number(2));
         assert_eq!(second.request_id(), &RequestId::Number(3));
 
-        let first_waiter = first.waiter.take().expect("first waiter remains owned");
-        let deadlines = RequestDeadlines::start_at(client.timeout_policy, first.committed_at)
-            .expect("test timeout policy is valid");
-        let first_response = client
-            .recv_response_with_cx(&cx, first_waiter, deadlines)
-            .expect("the sole reader routes both out-of-order responses");
-        first.completed = true;
-        assert_eq!(first_response.id, Some(RequestId::Number(2)));
-        assert_eq!(first_response.raw_result.as_deref(), Some(first_raw_result));
+        client
+            .drive_multiplexed_stdio(&cx)
+            .expect("client-owned ingress admits the reordered second response first");
+        client
+            .drive_multiplexed_stdio(&cx)
+            .expect("client-owned ingress admits the retained first response second");
 
-        let second_waiter = second.waiter.take().expect("second waiter remains owned");
-        let deadlines = RequestDeadlines::start_at(client.timeout_policy, second.committed_at)
-            .expect("test timeout policy is valid");
-        let second_response = client
-            .recv_response_with_cx(&cx, second_waiter, deadlines)
-            .expect("the reordered second response remains in its exact waiter");
-        second.completed = true;
+        let (second_response, second_source) = executor
+            .try_take_response_with_raw_result(&mut second)
+            .expect("second handle remains owned by the cloneable executor")
+            .expect("second handle receives its reordered final");
         assert_eq!(second_response.id, Some(RequestId::Number(3)));
         assert_eq!(
-            second_response.raw_result.as_deref(),
-            Some(second_raw_result)
+            second_source.as_deref(),
+            Some(second_raw_result),
+            "the exact source remains with the reordered response owner"
         );
+        let (first_response, first_source) = executor
+            .try_take_response_with_raw_result(&mut first)
+            .expect("first handle remains owned by the original executor")
+            .expect("first handle receives its retained final");
+        assert_eq!(first_response.id, Some(RequestId::Number(2)));
+        assert_eq!(first_source.as_deref(), Some(first_raw_result));
         client.close().expect("reordered stdio client cleanup");
+    }
+
+    #[cfg(unix)]
+    fn assert_negotiated_stdio_drop_cancellation(drop_first: bool) {
+        // The peer emits its final pair immediately only after it observes the
+        // cancellation control. Without that third frame, its background
+        // branch emits the same IDs one second later. The two tests below
+        // differ solely in whether the first request-owned handle is dropped.
+        let script = r#"
+            IFS= read -r _
+            IFS= read -r _
+            (
+                sleep 1
+                printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"owner":"first","control":"retained"}}'
+                printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"owner":"second","control":"retained"}}'
+            ) &
+            if IFS= read -r control; then
+                case "$control" in
+                    *notifications/cancelled*)
+                        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"owner":"first","control":"dropped"}}'
+                        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"owner":"second","control":"dropped"}}'
+                        ;;
+                esac
+            fi
+        "#;
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+        let cx = Cx::for_request();
+        let executor = client
+            .multiplexed_stdio_executor()
+            .expect("selected client exposes a cloneable request executor");
+        let mut first = executor
+            .execute(&cx, "ping", Some(serde_json::json!({})))
+            .expect("first request commits");
+        let mut second = executor
+            .clone()
+            .execute(&cx, "ping", Some(serde_json::json!({})))
+            .expect("second request commits");
+
+        let expected_control = if drop_first {
+            drop(first);
+            client
+                .drive_multiplexed_stdio(&cx)
+                .expect("client services the dropped owner's cancellation before reading");
+            client
+                .drive_multiplexed_stdio(&cx)
+                .expect("late tombstoned final cannot consume the retained second handle");
+            "dropped"
+        } else {
+            let first_response = client
+                .wait_multiplexed_request(&cx, &mut first)
+                .expect("retained first handle completes without a cancellation control");
+            assert_eq!(
+                first_response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("control"))
+                    .and_then(serde_json::Value::as_str),
+                Some("retained")
+            );
+            "retained"
+        };
+
+        let second_response = if drop_first {
+            executor
+                .try_take_response(&mut second)
+                .expect("retained second handle is still owned")
+                .expect("retained second handle completes after the late tombstoned first final")
+        } else {
+            client
+                .wait_multiplexed_request(&cx, &mut second)
+                .expect("sequential adapter waits through the same client-owned ingress")
+        };
+        assert_eq!(second_response.id, Some(RequestId::Number(3)));
+        assert_eq!(
+            second_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("control"))
+                .and_then(serde_json::Value::as_str),
+            Some(expected_control),
+            "the peer observes cancellation only when the first owner is dropped"
+        );
+        assert_eq!(
+            executor.executor.take_cancellation_events().len(),
+            if drop_first { 1 } else { 0 },
+            "the retained-vs-dropped pair differs by exactly one local cancellation event"
+        );
+        client
+            .close()
+            .expect("drop-cancellation stdio client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_negotiated_stdio_handle_tombstones_its_late_final_and_cancels_once() {
+        assert_negotiated_stdio_drop_cancellation(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_negotiated_stdio_handle_does_not_emit_drop_cancellation() {
+        assert_negotiated_stdio_drop_cancellation(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_client_fails_a_surviving_negotiated_stdio_handle() {
+        let client = make_shell_scripted_initialized_client(
+            "while IFS= read -r _; do :; done",
+            Duration::from_secs(2),
+        );
+        let cx = Cx::for_request();
+        let executor = client
+            .multiplexed_stdio_executor()
+            .expect("selected client exposes its cloneable executor");
+        let mut execution = executor
+            .execute(&cx, "ping", Some(serde_json::json!({})))
+            .expect("request commits before its client owner is dropped");
+
+        drop(client);
+
+        let error = executor
+            .try_take_response(&mut execution)
+            .expect_err("a surviving handle observes the client-drop terminal outcome");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(error.message, "Client connection closed");
     }
 
     #[test]
@@ -15019,6 +16005,65 @@ mod tests {
         assert!(err.message.contains("spawn"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn clt_02_public_stdio_defaults_to_auto_and_retains_modern_selection() {
+        let script = modern_typed_call_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"public auto modern"}],"isError":false}}"#,
+        );
+        let mut client = Client::stdio("sh", &["-c", script.as_str()])
+            .expect("the public stdio constructor completes its modern Auto probe");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(ProtocolEra::Modern2026)
+        );
+        assert!(client.server_discovery().is_some());
+        assert!(matches!(
+            client
+                .call_tool_typed("echo", serde_json::json!({}))
+                .expect("the selected modern connection uses typed final-result dispatch"),
+            CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+        ));
+        client.close().expect("public modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_02_public_stdio_auto_reopens_one_fresh_exact_legacy_child() {
+        let script = auto_discovery_refusal_client_script(-32_601);
+        let mut client = Client::stdio("sh", &["-c", script.as_str()])
+            .expect("only a discovery MethodNotFound authorizes the fresh legacy child");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(ProtocolEra::Legacy2024)
+        );
+        assert!(client.server_discovery().is_none());
+        client
+            .ping()
+            .expect("the fresh exact legacy child receives the historical request shape");
+        client
+            .close()
+            .expect("public legacy fallback client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_02_public_stdio_auto_rejects_one_non_method_not_found_refusal() {
+        // Only the discovery refusal code differs from the paired fallback
+        // positive. No second process may be used as a legacy replay path.
+        let script = auto_discovery_refusal_client_script(-32_602);
+        let error = match Client::stdio("sh", &["-c", script.as_str()]) {
+            Ok(_) => panic!("InvalidParams discovery refusal cannot authorize legacy fallback"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+    }
+
     #[test]
     fn client_stdio_with_cx_fails_when_cancelled() {
         let cx = Cx::for_request();
@@ -15318,6 +16363,29 @@ mod tests {
              case \"$retry\" in *{method}*'\"inputResponses\":{{\"roots\":{{\"roots\":[]}}}}'*'\"requestState\":\"retry-1\"'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{complete_result}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_mrtr_two_input_client_script(complete_retry: bool) -> String {
+        let discovery_response =
+            modern_discovery_response("mrtr-two-input-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        let retry = if complete_retry {
+            "IFS= read -r retry || exit 1; \
+             case \"$retry\" in *tools/call*'\"inputResponses\":{\"roots\":{\"roots\":[]},\"sampling\":{\"messages\":[]}}'*'\"requestState\":\"retry-two\"'*) \
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"complete\",\"content\":[],\"isError\":false}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        } else {
+            "IFS= read -r retry && exit 1; exit 0"
+        };
+        format!(
+            "IFS= read -r discovery || exit 1; \
+             case \"$discovery\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r initial || exit 1; \
+             case \"$initial\" in *tools/call*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"input_required\",\"inputRequests\":{{\"roots\":{{\"method\":\"roots/list\"}},\"sampling\":{{\"method\":\"sampling/createMessage\"}}}},\"requestState\":\"retry-two\"}}}}' ;; *) exit 1 ;; esac; \
+             {retry}"
         )
     }
 
@@ -15627,6 +16695,214 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn raw_extension_configuration(
+        direction: ExtensionDirection,
+        fallback: fastmcp_protocol::extensions::ExtensionFallbackPolicy,
+    ) -> (
+        fastmcp_protocol::ExtensionId,
+        fastmcp_protocol::extensions::ExtensionDescriptorRegistry,
+        fastmcp_protocol::extensions::ClientExtensionDiscovery,
+    ) {
+        use fastmcp_protocol::extensions::{
+            ClientExtensionDiscovery, ExtensionDescriptor, ExtensionMethodDescriptor,
+            ExtensionNegotiationResolver, ExtensionSettings, ExtensionSettingsSchema,
+        };
+
+        let extension_id = fastmcp_protocol::ExtensionId::parse("com.example/raw")
+            .expect("test extension identifier is valid");
+        let mut registry = fastmcp_protocol::extensions::ExtensionDescriptorRegistry::new();
+        registry
+            .register(ExtensionDescriptor {
+                id: extension_id.clone(),
+                client_settings: ExtensionSettingsSchema {
+                    schema_id: "raw-client-settings-v1".to_owned(),
+                    codec_id: "raw-client-codec-v1".to_owned(),
+                },
+                server_settings: ExtensionSettingsSchema {
+                    schema_id: "raw-server-settings-v1".to_owned(),
+                    codec_id: "raw-server-codec-v1".to_owned(),
+                },
+                resolver: ExtensionNegotiationResolver {
+                    id: "raw-settings-v1".to_owned(),
+                    version: 1,
+                    fallback,
+                },
+                method: Some(ExtensionMethodDescriptor {
+                    name: "example/echo".to_owned(),
+                    direction,
+                    http_era_disposition: (direction == ExtensionDirection::ClientToServer)
+                        .then_some(
+                        fastmcp_protocol::extensions::ExtensionHttpEraDisposition::ModernExclusive,
+                    ),
+                    legacy_fallback: false,
+                }),
+                notification: None,
+                result_discriminator: None,
+                routing_headers: Vec::new(),
+                stdio_correlation: None,
+            })
+            .expect("test extension descriptor is valid");
+        let settings = ExtensionSettings::new(serde_json::json!({ "mode": "raw" }))
+            .expect("test extension settings are an object");
+        let discovery = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(extension_id.clone(), settings)]),
+        };
+        (extension_id, registry, discovery)
+    }
+
+    /// Resolver canary that succeeds exactly once per resolver instance.
+    ///
+    /// The builder runtime must construct this state for each connection and
+    /// discovery retry. Sharing it would make the second negotiation fail.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct OneShotRawExtensionResolver {
+        has_resolved: bool,
+    }
+
+    #[cfg(unix)]
+    impl fastmcp_protocol::extensions::ExtensionSettingsCompatibilityResolver
+        for OneShotRawExtensionResolver
+    {
+        fn resolve(
+            &mut self,
+            descriptor: &fastmcp_protocol::extensions::ExtensionDescriptor,
+            client: &fastmcp_protocol::extensions::ExtensionSettings,
+            _server: &fastmcp_protocol::extensions::ExtensionSettings,
+        ) -> Result<
+            fastmcp_protocol::extensions::ExtensionSettings,
+            fastmcp_protocol::extensions::ExtensionNegotiationError,
+        > {
+            if std::mem::replace(&mut self.has_resolved, true) {
+                return Err(
+                    fastmcp_protocol::extensions::ExtensionNegotiationError::SettingsCompatibilityRejected(
+                        descriptor.id.to_string(),
+                    ),
+                );
+            }
+            Ok(client.clone())
+        }
+    }
+
+    /// Deliberately shared resolver state used to prove that the explicit
+    /// factory contract cannot turn an `Arc<Mutex<_>>` clone into isolation.
+    #[cfg(unix)]
+    struct SharedArcRawExtensionResolver {
+        shared: Arc<Mutex<OneShotRawExtensionResolver>>,
+    }
+
+    #[cfg(unix)]
+    impl fastmcp_protocol::extensions::ExtensionSettingsCompatibilityResolver
+        for SharedArcRawExtensionResolver
+    {
+        fn resolve(
+            &mut self,
+            descriptor: &fastmcp_protocol::extensions::ExtensionDescriptor,
+            client: &fastmcp_protocol::extensions::ExtensionSettings,
+            server: &fastmcp_protocol::extensions::ExtensionSettings,
+        ) -> Result<
+            fastmcp_protocol::extensions::ExtensionSettings,
+            fastmcp_protocol::extensions::ExtensionNegotiationError,
+        > {
+            let mut shared = self
+                .shared
+                .lock()
+                .expect("shared resolver canary mutex is not poisoned");
+            fastmcp_protocol::extensions::ExtensionSettingsCompatibilityResolver::resolve(
+                &mut *shared,
+                descriptor,
+                client,
+                server,
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    fn accept_raw_extension_settings(
+        _descriptor: &fastmcp_protocol::extensions::ExtensionDescriptor,
+        client: &fastmcp_protocol::extensions::ExtensionSettings,
+        _server: &fastmcp_protocol::extensions::ExtensionSettings,
+    ) -> Result<
+        fastmcp_protocol::extensions::ExtensionSettings,
+        fastmcp_protocol::extensions::ExtensionNegotiationError,
+    > {
+        Ok(client.clone())
+    }
+
+    #[cfg(unix)]
+    fn modern_raw_extension_discovery_response(
+        server_name: &str,
+        server_settings: Option<serde_json::Value>,
+    ) -> String {
+        let extensions = server_settings.map_or_else(BTreeMap::new, |settings| {
+            BTreeMap::from([("com.example/raw".to_owned(), settings)])
+        });
+        let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+            &fastmcp_protocol::ServerBehaviorRegistry::default(),
+            extensions,
+        )
+        .expect("raw extension discovery settings satisfy the generic envelope");
+        let result = ServerDiscoverResult::new(
+            capabilities,
+            ServerInfo {
+                name: server_name.to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        serde_json::to_string(&serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": 1,
+            "result": result,
+        }))
+        .expect("raw extension discovery response serializes")
+    }
+
+    #[cfg(unix)]
+    fn modern_raw_extension_client_script(response: &str) -> String {
+        let discovery = modern_raw_extension_discovery_response(
+            "raw-extension-server",
+            Some(serde_json::json!({ "mode": "raw" })),
+        );
+        format!(
+            "IFS= read -r discovery || exit 1; \\
+             case \"$discovery\" in *server/discover*'\"extensions\":{{\"com.example/raw\":{{\"mode\":\"raw\"}}}}'*) \\
+             printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \\
+             IFS= read -r request || exit 1; \\
+             case \"$request\" in *'\"id\":2'*'\"method\":\"example/echo\"'*'\"input\":\"ok\"'*'\"extensions\":{{\"com.example/raw\":{{\"mode\":\"raw\"}}}}'*) \\
+             printf '%s\\n' '{response}' ;; *) exit 1 ;; esac; \\
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_raw_extension_no_contact_client_script(
+        server_settings: Option<serde_json::Value>,
+    ) -> String {
+        let discovery =
+            modern_raw_extension_discovery_response("raw-extension-server", server_settings);
+        format!(
+            "IFS= read -r discovery || exit 1; \\
+             case \"$discovery\" in *server/discover*'\"extensions\":{{\"com.example/raw\":{{\"mode\":\"raw\"}}}}'*) \\
+             printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \\
+             if IFS= read -r unexpected; then exit 1; fi; \\
+             exit 0"
+        )
+    }
+
+    #[cfg(unix)]
+    fn legacy_raw_extension_no_contact_client_script() -> &'static str {
+        "IFS= read -r initialize || exit 1; \\
+         case \"$initialize\" in *'\"method\":\"initialize\"'*) \\
+         printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-raw-extension\",\"version\":\"1.0.0\"}}}' ;; *) exit 1 ;; esac; \\
+         IFS= read -r lifecycle || exit 1; \\
+         case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \\
+         if IFS= read -r unexpected; then exit 1; fi; \\
+         exit 0"
+    }
+
+    #[cfg(unix)]
     fn modern_final_tasks_client_script(get_response: &str) -> String {
         let discovery_response =
             modern_tasks_discovery_response("tasks-modern-server", serde_json::json!({}));
@@ -15735,6 +17011,25 @@ mod tests {
          case \"$request\" in *ping*io.modelcontextprotocol/protocolVersion*|*ping*io.modelcontextprotocol/clientCapabilities*) exit 1 ;; \
          *ping*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac; \
          exec sleep 2"
+    }
+
+    #[cfg(unix)]
+    fn auto_discovery_refusal_client_script(refusal_code: i32) -> String {
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in \
+             *server/discover*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":{refusal_code},\"message\":\"discovery refusal\"}}}}' ;; \
+             *initialize*2024-11-05*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"public-auto-legacy\",\"version\":\"1.0.0\"}}}}}}'; \
+             IFS= read -r lifecycle || exit 1; \
+             case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+             IFS= read -r request || exit 1; \
+             case \"$request\" in *ping*io.modelcontextprotocol/protocolVersion*|*ping*io.modelcontextprotocol/clientCapabilities*) exit 1 ;; \
+             *ping*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac ;; \
+             *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
     }
 
     #[cfg(unix)]
@@ -16046,6 +17341,10 @@ mod tests {
             Cx::for_request(),
         )
         .expect("modern discovery initializes the exact-source client");
+        assert!(
+            client.selected_io.is_some(),
+            "a live selected stdio client installs its negotiated shared halves"
+        );
 
         let result = client
             .call_tool_typed("echo", serde_json::json!({}))
@@ -16183,6 +17482,296 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn clt_ext_raw_stdio_public_request_uses_the_negotiated_registry() {
+        let (extension_id, registry, discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let script = modern_raw_extension_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"echoed":{"input":"ok"},"resultType":"complete"}}"#,
+        );
+        let mut client = ClientBuilder::new()
+            .extension_registry(registry, discovery, || accept_raw_extension_settings)
+            .expect("frozen raw extension registry is builder-owned")
+            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
+            .expect("raw extension discovery negotiates the public stdio client");
+
+        assert!(client.negotiated_extensions().is_some());
+        let result = client
+            .request_final_extension(
+                &extension_id,
+                "example/echo",
+                serde_json::json!({ "input": "ok" }),
+            )
+            .expect("the negotiated client-to-server raw extension request succeeds");
+        assert_eq!(result["echoed"]["input"], "ok");
+        client.close().expect("raw extension stdio client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_raw_resolver_is_fresh_for_each_negotiation_retry() {
+        let (_extension_id, registry, client_discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls_for_runtime = Arc::clone(&factory_calls);
+        let runtime = ClientExtensionRuntime::new(registry, client_discovery, move || {
+            factory_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            OneShotRawExtensionResolver::default()
+        })
+        .expect("retry canary configuration freezes its immutable registry");
+        let wire: serde_json::Value =
+            serde_json::from_str(&modern_raw_extension_discovery_response(
+                "raw-extension-retry-server",
+                Some(serde_json::json!({ "mode": "raw" })),
+            ))
+            .expect("retry discovery envelope serializes");
+        let discovery = serde_json::from_value(wire["result"].clone())
+            .expect("retry discovery result remains protocol-valid");
+
+        assert!(
+            runtime.negotiate(&discovery).is_ok(),
+            "the initial discovery receives one fresh resolver"
+        );
+        assert!(
+            runtime.negotiate(&discovery).is_ok(),
+            "a retry cannot inherit mutable resolver state from the failed attempt"
+        );
+        assert_eq!(
+            factory_calls.load(Ordering::SeqCst),
+            2,
+            "each negotiation attempt invokes the factory for a distinct resolver instance"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_raw_shared_arc_factory_is_not_treated_as_resolver_isolation() {
+        let (_extension_id, registry, client_discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let shared = Arc::new(Mutex::new(OneShotRawExtensionResolver::default()));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let shared_for_factory = Arc::clone(&shared);
+        let factory_calls_for_runtime = Arc::clone(&factory_calls);
+        let runtime = ClientExtensionRuntime::new(registry, client_discovery, move || {
+            factory_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            SharedArcRawExtensionResolver {
+                shared: Arc::clone(&shared_for_factory),
+            }
+        })
+        .expect("the factory boundary accepts a resolver only when it constructs one");
+        let wire: serde_json::Value =
+            serde_json::from_str(&modern_raw_extension_discovery_response(
+                "raw-extension-shared-resolver-server",
+                Some(serde_json::json!({ "mode": "raw" })),
+            ))
+            .expect("shared resolver discovery envelope serializes");
+        let discovery = serde_json::from_value(wire["result"].clone())
+            .expect("shared resolver discovery result remains protocol-valid");
+
+        assert!(
+            runtime.negotiate(&discovery).is_ok(),
+            "the first factory-produced wrapper observes the shared resolver once"
+        );
+        let error = runtime
+            .negotiate(&discovery)
+            .expect_err("a factory returning shared Arc state cannot masquerade as isolated");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            factory_calls.load(Ordering::SeqCst),
+            2,
+            "the runtime did invoke the factory twice; the failure comes only from its shared output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_raw_cloned_builders_isolate_extension_resolvers() {
+        let (_extension_id, registry, discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let builder = ClientBuilder::new()
+            .extension_registry(registry, discovery, OneShotRawExtensionResolver::default)
+            .expect("one frozen registry is cloneable as an immutable builder plan");
+        let first_script = modern_raw_extension_no_contact_client_script(Some(serde_json::json!({
+            "mode": "raw"
+        })));
+        let mut first = builder
+            .clone()
+            .connect_stdio_with_cx("sh", &["-c", first_script.as_str()], &Cx::for_request())
+            .expect("the first cloned builder gets an isolated resolver");
+        first
+            .close()
+            .expect("the first isolated raw extension client closes");
+
+        let second_script =
+            modern_raw_extension_no_contact_client_script(Some(serde_json::json!({
+                "mode": "raw"
+            })));
+        let mut second = builder
+            .connect_stdio_with_cx("sh", &["-c", second_script.as_str()], &Cx::for_request())
+            .expect("a sibling cloned builder cannot inherit the first resolver state");
+        second
+            .close()
+            .expect("the second isolated raw extension client closes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_raw_stdio_start_and_executor_reject_registered_methods_without_contact() {
+        let (_extension_id, registry, discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let script = modern_raw_extension_no_contact_client_script(Some(serde_json::json!({
+            "mode": "raw"
+        })));
+        let mut client = ClientBuilder::new()
+            .extension_registry(registry, discovery, || accept_raw_extension_settings)
+            .expect("raw extension registry is frozen before raw API admission")
+            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
+            .expect("modern discovery negotiates the registered raw method");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        let error = client
+            .start_multiplexed_request(
+                &Cx::for_request(),
+                "example/echo",
+                Some(serde_json::json!({})),
+            )
+            .expect_err("the public raw start surface cannot bypass extension admission");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+
+        let executor = client
+            .multiplexed_stdio_executor()
+            .expect("initialized stdio client exposes the public executor");
+        let error = executor
+            .execute(
+                &Cx::for_request(),
+                "example/echo",
+                Some(serde_json::json!({})),
+            )
+            .expect_err("the public raw executor cannot bypass extension admission");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        client
+            .close()
+            .expect("raw bypass rejections leave no stdio request to clean up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_raw_stdio_unnegotiated_settings_do_not_contact_the_peer() {
+        // This differs from the admitted descriptor only in its one-sided
+        // fallback: an absent server setting now selects an inactive set.
+        let (extension_id, registry, discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::ClientInactiveFallback,
+        );
+        let script = modern_raw_extension_no_contact_client_script(None);
+        let mut client = ClientBuilder::new()
+            .extension_registry(registry, discovery, || accept_raw_extension_settings)
+            .expect("raw extension registry permits the inactive fallback")
+            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
+            .expect("modern discovery retains inactive raw extension state");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        let error = client
+            .request_final_extension(&extension_id, "example/echo", serde_json::json!({}))
+            .expect_err("unnegotiated settings cannot allocate or write a raw extension request");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        client
+            .close()
+            .expect("inactive raw extension client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_raw_stdio_wrong_direction_does_not_contact_the_peer() {
+        // This differs from the admitted descriptor only in method direction.
+        let (extension_id, registry, discovery) = raw_extension_configuration(
+            ExtensionDirection::ServerToClient,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let script = modern_raw_extension_no_contact_client_script(Some(serde_json::json!({
+            "mode": "raw"
+        })));
+        let mut client = ClientBuilder::new()
+            .extension_registry(registry, discovery, || accept_raw_extension_settings)
+            .expect("server-to-client raw descriptor freezes for discovery")
+            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
+            .expect("raw extension negotiation itself remains bilateral");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        let error = client
+            .request_final_extension(&extension_id, "example/echo", serde_json::json!({}))
+            .expect_err("a server-owned raw method cannot contact the peer through the client API");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        client
+            .close()
+            .expect("wrong-direction raw extension client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_raw_stdio_exact_2024_rejects_without_contact() {
+        let (extension_id, registry, discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let mut client = ClientBuilder::new()
+            .extension_registry(registry, discovery, || accept_raw_extension_settings)
+            .expect("raw extension registry may be configured before era selection")
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+            .connect_stdio_with_cx(
+                "sh",
+                &["-c", legacy_raw_extension_no_contact_client_script()],
+                &Cx::for_request(),
+            )
+            .expect("exact legacy lifecycle completes before raw extension rejection");
+        let next_id_before = client.next_id.load(Ordering::SeqCst);
+
+        let error = client
+            .request_final_extension(&extension_id, "example/echo", serde_json::json!({}))
+            .expect_err("exact 2024-11-05 excludes every final generic extension");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+
+        let error = client
+            .start_multiplexed_request(
+                &Cx::for_request(),
+                "example/echo",
+                Some(serde_json::json!({})),
+            )
+            .expect_err("exact 2024 raw start cannot bypass final extension exclusion");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+
+        let executor = client
+            .multiplexed_stdio_executor()
+            .expect("exact legacy initialization still exposes raw stdio executor");
+        let error = executor
+            .execute(
+                &Cx::for_request(),
+                "example/echo",
+                Some(serde_json::json!({})),
+            )
+            .expect_err("exact 2024 raw executor cannot bypass final extension exclusion");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        client.close().expect("legacy raw extension client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clt_tasks_final_wrong_task_id_terminates_the_connection() {
         // This differs from the admitted get response only in the returned
         // taskId. A response for another opaque ID must not be accepted.
@@ -16316,6 +17905,70 @@ mod tests {
             CoreResult::Final(FinalCoreResult::PromptsGet { .. })
         ));
         client.close().expect("MRTR prompt client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_mrtr_retry_continues_only_after_every_requested_input_key() {
+        let script = modern_mrtr_two_input_client_script(true);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the two-input MRTR client");
+
+        let result = client
+            .call_tool_with_mrtr_retry("retry-tool", serde_json::json!({}), |_| {
+                Ok(BTreeMap::from([
+                    ("roots".to_owned(), serde_json::json!({ "roots": [] })),
+                    ("sampling".to_owned(), serde_json::json!({ "messages": [] })),
+                ]))
+            })
+            .expect("a retry with every requested input key reaches the terminal result");
+        assert!(matches!(
+            result,
+            CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+        ));
+        client.close().expect("two-input MRTR client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_mrtr_partial_input_map_rejects_without_a_retry_or_state_change() {
+        let script = modern_mrtr_two_input_client_script(false);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes before the partial MRTR map");
+        let mut callback_count = 0_usize;
+
+        let error = client
+            .call_tool_with_mrtr_retry("retry-tool", serde_json::json!({}), |_| {
+                callback_count += 1;
+                Ok(BTreeMap::from([(
+                    "roots".to_owned(),
+                    serde_json::json!({ "roots": [] }),
+                )]))
+            })
+            .expect_err("omitting only one requested key must reject before the retry write");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            error.message,
+            "MRTR inputResponses must include every key requested by the peer"
+        );
+        assert_eq!(callback_count, 1);
+        assert!(
+            client.is_initialized(),
+            "a local partial-map rejection must leave the connection state unchanged"
+        );
+        client
+            .close()
+            .expect("partial-map rejection performs no retry contact");
     }
 
     #[cfg(unix)]
@@ -17016,7 +18669,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn clt_01_subscriptions_listen_matching_cancellation_is_request_owned() {
+    fn clt_01_subscriptions_listen_cancellation_requires_terminal_complete_result() {
         let script = modern_subscriptions_listen_client_script(
             2,
             &[
@@ -17036,13 +18689,16 @@ mod tests {
                 tools_list_changed: Some(true),
                 ..SubscriptionFilter::default()
             })
-            .expect_err("matching final cancellation terminates only the listener");
-        assert_eq!(error.code, McpErrorCode::RequestCancelled);
-        assert!(client.is_initialized());
-        assert!(client.responses.terminal_error().is_none());
-        client
-            .close()
-            .expect("cancellation leaves the client closable");
+            .expect_err(
+                "matching cancellation cannot replace the required terminal complete result",
+            );
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "Subscription listener reached EOF after cancellation before terminal complete result"
+        );
+        assert!(!client.is_initialized());
+        assert!(client.responses.terminal_error().is_some());
     }
 
     #[cfg(unix)]
@@ -17078,6 +18734,9 @@ mod tests {
             collector.notifications.as_slice(),
             [ServerNotification::ToolsListChanged(None)]
         ));
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
         assert!(client.is_initialized());
         assert!(client.responses.terminal_error().is_none());
         client.close().expect("modern client cleanup");
@@ -17085,7 +18744,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn clt_01_subscriptions_listen_cancellation_tombstones_late_terminal_response() {
+    fn clt_01_subscriptions_listen_cancellation_consumes_terminal_before_next_request() {
         let script = modern_subscription_cancellation_late_terminal_client_script();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -17095,19 +18754,24 @@ mod tests {
         )
         .expect("modern discovery initializes the subscription client");
 
-        let error = client
+        let collector = client
             .listen_subscriptions_typed(SubscriptionFilter {
                 tools_list_changed: Some(true),
                 ..SubscriptionFilter::default()
             })
-            .expect_err("matching final cancellation terminates only the listener");
-        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            .expect("matching cancellation remains live until its correlated complete result");
+        assert_eq!(collector.subscription_id, RequestId::from(2));
+        assert!(matches!(
+            collector.terminal.payload,
+            FinalSubscriptionsListenResult {}
+        ));
         assert_eq!(client.responses.pending_len(), 0);
-        assert_eq!(client.responses.tombstone_len(), 1);
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
 
-        client
-            .ping()
-            .expect("the next request consumes the listener's late terminal response");
+        client.ping().expect(
+            "the next request starts after the listener consumed its own terminal response",
+        );
         assert_eq!(client.responses.tombstone_len(), 0);
         assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
         assert!(client.is_initialized());
