@@ -1301,8 +1301,9 @@ mod tests {
         McpAppsDownloadFileParams, McpAppsHostNotification, McpAppsMessageParams,
         McpAppsMessageRole, McpAppsOpenLinkParams, McpAppsProgressNotification,
         McpAppsToolCallParams, McpAppsToolResult, McpAppsUpdateModelContextParams,
-        McpAppsViewCapabilities, ProtocolEra,
+        McpAppsViewCapabilities,
     };
+    use fastmcp_protocol::protocol_policy::ProtocolEra;
     use serde_json::json;
 
     struct AcceptTeardown(bool);

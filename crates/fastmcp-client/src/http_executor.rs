@@ -6520,8 +6520,11 @@ mod tests {
     };
     use crate::sse::SseLimits;
     use crate::{
-        CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, FinalToolCallOutcome, ProtocolEra,
-        ProtocolPolicy, ReverseRequestHandlers,
+        CanonicalHttpUrl, ClientBuilder, ClientExtensionRuntime, ClientProtocolPlan,
+        FinalToolCallOutcome, ProtocolEra, ProtocolPolicy, ReverseRequestHandlers,
+    };
+    use fastmcp_protocol::methods::{
+        PROMPTS_GET, RESOURCES_READ, SERVER_DISCOVER, SUBSCRIPTIONS_LISTEN, TOOLS_CALL,
     };
 
     #[derive(Debug)]
@@ -6723,8 +6726,8 @@ mod tests {
             "mimeTypes": [generic_mime_type]
         });
         let server = thread::spawn(move || {
-            let (mut probe, _) = listener.accept().expect("accept generic Apps discovery");
-            let probe = read_request(&mut probe);
+            let (mut stream, _) = listener.accept().expect("accept generic Apps discovery");
+            let probe = read_request(&mut stream);
             let probe = serde_json::from_slice::<serde_json::Value>(&probe.body)
                 .expect("generic Apps discovery is JSON-RPC");
             assert_eq!(probe["method"], SERVER_DISCOVER);
@@ -6735,7 +6738,7 @@ mod tests {
                 "the frozen generic registry, not dedicated Apps compatibility settings, owns discovery"
             );
             write_response(
-                &mut probe,
+                &mut stream,
                 200,
                 "application/json",
                 br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private"}}"#,
@@ -10595,7 +10598,7 @@ mod tests {
             }
         });
         let cx = Cx::for_request();
-        let error = runtime_block_on(
+        let Err(error) = runtime_block_on(
             ClientBuilder::new()
                 .protocol_plan(plan(
                     "http://127.0.0.1:9/mcp",
@@ -10605,8 +10608,9 @@ mod tests {
                 ))
                 .reverse_request_handlers(handlers)
                 .connect_http_client_with_cx(&cx),
-        )
-        .expect_err("ModernOnly HTTP must reject exact-2024 callback configuration");
+        ) else {
+            panic!("ModernOnly HTTP must reject exact-2024 callback configuration");
+        };
         assert!(matches!(
             error,
             crate::HttpClientError::CoreResult(error)

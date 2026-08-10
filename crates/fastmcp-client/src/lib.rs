@@ -11154,13 +11154,14 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("exact legacy peer exposes its message endpoint");
 
-        let error = http_test_runtime_block_on(connection.request(
+        let Err(error) = http_test_runtime_block_on(connection.request(
             &cx,
             "example/echo",
             serde_json::json!({}),
             RequestId::Number(2),
-        ))
-        .expect_err("legacy raw request cannot bypass the registered final extension method");
+        )) else {
+            panic!("legacy raw request cannot bypass the registered final extension method");
+        };
         assert!(matches!(
             error,
             ClientHttpConnectionError::RegisteredExtensionMethodRequiresAdmission { ref method }
@@ -11181,13 +11182,13 @@ mod tests {
         let address = listener.local_addr().expect("read public MRTR address");
         let modern_target = format!("http://{address}/mcp");
         let server = std::thread::spawn(move || {
-            let (mut probe, _) = listener.accept().expect("accept public MRTR discovery");
-            let probe = read_http_cache_test_request(&mut probe);
+            let (mut stream, _) = listener.accept().expect("accept public MRTR discovery");
+            let probe = read_http_cache_test_request(&mut stream);
             assert_eq!(probe["id"], 1);
             assert_eq!(probe["method"], "server/discover");
             let discovery =
                 modern_discovery_response("public-http-mrtr-server", &[MODERN_PROTOCOL_VERSION]);
-            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+            write_http_cache_test_response(&mut stream, "application/json", discovery.as_bytes());
 
             for (method, request_id, expected_state, next_state) in [
                 ("tools/call", 2, None, Some("tool-one")),
@@ -11340,16 +11341,16 @@ mod tests {
             .expect("read public MRTR bound address");
         let modern_target = format!("http://{address}/mcp");
         let server = std::thread::spawn(move || {
-            let (mut probe, _) = listener
+            let (mut stream, _) = listener
                 .accept()
                 .expect("accept public MRTR bound discovery");
-            let probe = read_http_cache_test_request(&mut probe);
+            let probe = read_http_cache_test_request(&mut stream);
             assert_eq!(probe["id"], 1);
             let discovery = modern_discovery_response(
                 "public-http-mrtr-bound-server",
                 &[MODERN_PROTOCOL_VERSION],
             );
-            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+            write_http_cache_test_response(&mut stream, "application/json", discovery.as_bytes());
 
             for request_id in 2..=(MAX_MRTR_CONTINUATION_ROUNDS as i64 + 2) {
                 let (mut stream, _) = listener.accept().expect("accept public MRTR bound round");
@@ -13338,7 +13339,7 @@ mod tests {
                 let sampling_calls = std::sync::Arc::clone(&sampling_calls);
                 move |_cancellation, params| {
                     sampling_calls.fetch_add(1, Ordering::Relaxed);
-                    assert_eq!(params.max_tokens, 9);
+                    assert_eq!(params.max_tokens, 9.into());
                     Ok(CreateMessageResult::text("handled", "handler-model"))
                 }
             })
@@ -13912,7 +13913,7 @@ mod tests {
         // routing now retains each response's raw admitted source frame, so a
         // fabricated in-memory response (which no frame ever carried) is
         // correctly refused by production code.
-        let client = make_shell_scripted_initialized_client(
+        let mut client = make_shell_scripted_initialized_client(
             r#"printf '%s
 ' '{"jsonrpc":"2.0","id":21,"result":{"owner":"unrelated"}}'; exec sleep 2"#,
             Duration::from_secs(1),

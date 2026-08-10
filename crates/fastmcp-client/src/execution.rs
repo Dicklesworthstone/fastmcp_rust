@@ -4864,7 +4864,7 @@ mod tests {
             assert_eq!(rejection.id, Some(RequestId::Number(700)));
             assert_eq!(
                 rejection.error.as_ref().map(|error| error.code.clone()),
-                Some(i32::from(McpErrorCode::MethodNotFound))
+                Some(i32::from(McpErrorCode::MethodNotFound).into())
             );
         }
 
