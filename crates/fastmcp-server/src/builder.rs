@@ -3444,6 +3444,181 @@ mod tests {
     }
 
     #[test]
+    fn builder_proxy_dual_era_preserves_final_catalog_and_routes_bound_calls() {
+        let expected_final_tool = serde_json::to_value(&final_proxy_catalog().final_tools[0])
+            .expect("the final fixture serializes");
+        let (server, legacy_calls, final_calls) = dual_era_proxy_server();
+        let mut legacy_session = initialized_legacy_proxy_session(&server);
+        let notification_sender: crate::NotificationSender = Arc::new(|_| {});
+        let request_sender = crate::RequestSender::new(
+            Arc::new(crate::PendingRequests::new()),
+            Arc::new(|message| Err(format!("unexpected outbound message in test: {message:?}"))),
+        );
+
+        let legacy_catalog = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut legacy_session,
+                JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 801_i64),
+                &notification_sender,
+                &request_sender,
+            )
+            .expect("the legacy tools/list request receives a response")
+            .result
+            .expect("the legacy tools/list response has a result payload");
+        assert_eq!(legacy_catalog["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(legacy_catalog["tools"][0]["name"], "legacy-weather");
+
+        let final_inbound = crate::InboundRequestContext::new(
+            Cx::for_testing(),
+            802,
+            crate::InboundRequestTransport::Memory,
+        );
+        let final_catalog = server
+            .dispatch_stateless(&final_inbound, &final_tools_list_request(802_i64))
+            .expect("the final tools/list request receives a response")
+            .result
+            .expect("the final tools/list response has a result payload");
+        assert_eq!(final_catalog["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(final_catalog["tools"][0]["name"], "weather");
+        assert_eq!(
+            serde_json::to_vec(&final_catalog["tools"][0])
+                .expect("the emitted final tool normalizes to JSON"),
+            serde_json::to_vec(&expected_final_tool)
+                .expect("the exact final fixture normalizes to JSON"),
+            "the final proxy path retains the full normalized FinalTool model"
+        );
+
+        let legacy_call = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut legacy_session,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "legacy-weather",
+                        "arguments": {"city": "Portland"},
+                    })),
+                    803_i64,
+                ),
+                &notification_sender,
+                &request_sender,
+            )
+            .expect("the legacy tools/call request receives a response")
+            .result
+            .expect("the legacy tools/call response has a result payload");
+        assert_eq!(legacy_call["content"][0]["text"], "bound legacy proxy");
+
+        let final_call_inbound = crate::InboundRequestContext::new(
+            Cx::for_testing(),
+            804,
+            crate::InboundRequestTransport::Memory,
+        );
+        let final_call = server
+            .dispatch_stateless(
+                &final_call_inbound,
+                &final_tools_call_request(
+                    "weather",
+                    serde_json::json!({"city": "Boston"}),
+                    804,
+                ),
+            )
+            .expect("the final tools/call request receives a response")
+            .result
+            .expect("the final tools/call response has a result payload");
+        assert_eq!(final_call["resultType"], "complete");
+        assert_eq!(final_call["content"][0]["text"], "bound final proxy");
+        assert_eq!(final_call["structuredContent"], serde_json::json!({"route": "final"}));
+
+        assert_eq!(
+            legacy_calls
+                .lock()
+                .expect("the test call log lock is not poisoned")
+                .clone(),
+            vec![(
+                "legacy-weather".to_owned(),
+                serde_json::json!({"city": "Portland"}),
+            )],
+            "the legacy request reaches only its bound legacy upstream"
+        );
+        assert_eq!(
+            final_calls
+                .lock()
+                .expect("the test call log lock is not poisoned")
+                .clone(),
+            vec![("weather".to_owned(), serde_json::json!({"city": "Boston"}))],
+            "the final request reaches only its bound final upstream"
+        );
+    }
+
+    #[test]
+    fn builder_proxy_dual_era_rejects_cross_era_names_without_upstream_calls() {
+        let (server, legacy_calls, final_calls) = dual_era_proxy_server();
+        let mut legacy_session = initialized_legacy_proxy_session(&server);
+        let notification_sender: crate::NotificationSender = Arc::new(|_| {});
+        let request_sender = crate::RequestSender::new(
+            Arc::new(crate::PendingRequests::new()),
+            Arc::new(|message| Err(format!("unexpected outbound message in test: {message:?}"))),
+        );
+
+        let legacy_rejected = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut legacy_session,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "weather",
+                        "arguments": {},
+                    })),
+                    805_i64,
+                ),
+                &notification_sender,
+                &request_sender,
+            )
+            .expect("the legacy cross-era request receives a JSON-RPC error");
+        assert!(legacy_rejected.result.is_none());
+        assert_eq!(
+            legacy_rejected.error.and_then(|error| error.code.as_i32()),
+            Some(-32601),
+            "the final-only name is absent from the legacy call route"
+        );
+
+        let final_inbound = crate::InboundRequestContext::new(
+            Cx::for_testing(),
+            806,
+            crate::InboundRequestTransport::Memory,
+        );
+        let final_rejected = server
+            .dispatch_stateless(
+                &final_inbound,
+                &final_tools_call_request("legacy-weather", serde_json::json!({}), 806),
+            )
+            .expect("the final cross-era request receives a JSON-RPC error");
+        assert!(final_rejected.result.is_none());
+        assert_eq!(
+            final_rejected.error.and_then(|error| error.code.as_i32()),
+            Some(-32602),
+            "the legacy-only name is absent from the final call route"
+        );
+
+        assert!(
+            legacy_calls
+                .lock()
+                .expect("the test call log lock is not poisoned")
+                .is_empty(),
+            "the final-only name must be rejected before the legacy upstream is called"
+        );
+        assert!(
+            final_calls
+                .lock()
+                .expect("the test call log lock is not poisoned")
+                .is_empty(),
+            "the legacy-only name must be rejected before the final upstream is called"
+        );
+    }
+
+    #[test]
     fn builder_proxy_rejects_final_tools_with_one_legacy_resource_vector() {
         let mut catalog = final_proxy_catalog();
         catalog.resources.push(Resource {
