@@ -2865,7 +2865,19 @@ impl ServerHttpSseResponse {
         if self.terminal_delivery.is_settled() {
             return Err(DualEraHttpEndpointError::Closed);
         }
-        match self.inner.pop_event()? {
+        let popped = match self.inner.pop_event() {
+            // A peer/session close cancels the transport body directly; with
+            // no committed terminal sequence that is this body's clean close,
+            // not a transport failure the reader must distinguish.
+            Err(DualEraHttpEndpointError::Transport(TransportError::Cancelled))
+                if !self.terminal_delivery.is_committed() =>
+            {
+                self.terminal_delivery.mark_failed();
+                return Err(DualEraHttpEndpointError::Closed);
+            }
+            popped => popped?,
+        };
+        match popped {
             Some(event) => {
                 if final_subscription_terminal_event(&event) {
                     self.terminal_delivery.mark_drained();
