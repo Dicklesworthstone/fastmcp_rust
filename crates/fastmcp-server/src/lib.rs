@@ -5192,7 +5192,6 @@ impl ServerHttpSession {
             return Vec::new();
         }
         self.closed = true;
-        self.modern_connection.disconnect();
         let dispatches = cancel_modern_http_dispatches(&self.server, &self.modern_dispatches, None);
         self.legacy_admissions.cancel_all();
         if let Some(adapter) = self.legacy_adapter.as_mut() {
