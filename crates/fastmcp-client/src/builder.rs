@@ -1203,6 +1203,95 @@ mod tests {
         client.close().expect("builder callback client cleanup");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn auto_with_reverse_handlers_keeps_a_modern_selected_connection_handler_free() {
+        let script = r#"IFS= read -r discover || exit 1;
+            case "$discover" in
+                *server/discover*) ;;
+                *) exit 1 ;;
+            esac;
+            case "$discover" in
+                *'"sampling"'*|*'"roots"'*) exit 1 ;;
+            esac;
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"auto-modern-callbacks","version":"1.0.0"}}}}';
+            exec sleep 2"#;
+        let handlers =
+            ReverseRequestHandlers::new().with_sampling_create_message(|_cancellation, _params| {
+                Ok(fastmcp_protocol::CreateMessageResult::text(
+                    "must stay out of modern discovery",
+                    "auto-modern-model",
+                ))
+            });
+
+        let mut client = ClientBuilder::new()
+            .reverse_request_handlers(handlers)
+            .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request())
+            .expect("Auto probes the final handshake before considering legacy callbacks");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026)
+        );
+        client.close().expect("Auto-modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_with_reverse_handlers_installs_them_only_after_method_not_found_fallback() {
+        let script = r#"IFS= read -r first || exit 1;
+            case "$first" in
+                *server/discover*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}';
+                    exec sleep 2 ;;
+                *initialize*2024-11-05*)
+                    case "$first" in *'"sampling":{}'*) capabilities_ok=true ;; *) capabilities_ok=false ;; esac;
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"auto-legacy-callbacks","version":"1.0.0"}}}';
+                    IFS= read -r lifecycle || exit 1;
+                    case "$lifecycle" in *notifications/initialized*) lifecycle_ok=true ;; *) lifecycle_ok=false ;; esac;
+                    IFS= read -r request || exit 1;
+                    printf '%s\n' '{"jsonrpc":"2.0","method":"sampling/createMessage","id":41,"params":{"messages":[],"maxTokens":9}}';
+                    IFS= read -r callback || exit 1;
+                    case "$callback" in *'"id":41'*'"model":"auto-legacy-model"'*) callback_ok=true ;; *) callback_ok=false ;; esac;
+                    case "$request" in *'"id":2'*) request_ok=true ;; *) request_ok=false ;; esac;
+                    printf '{"jsonrpc":"2.0","id":2,"result":{"capabilities":%s,"lifecycle":%s,"callback":%s,"request":%s}}\n' "$capabilities_ok" "$lifecycle_ok" "$callback_ok" "$request_ok";
+                    exec sleep 2 ;;
+                *) exit 1 ;;
+            esac"#;
+        let handlers =
+            ReverseRequestHandlers::new().with_sampling_create_message(|_cancellation, _params| {
+                Ok(fastmcp_protocol::CreateMessageResult::text(
+                    "installed after fallback",
+                    "auto-legacy-model",
+                ))
+            });
+
+        let mut client = ClientBuilder::new()
+            .reverse_request_handlers(handlers)
+            .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request())
+            .expect("MethodNotFound authorizes a fresh legacy client with its callbacks");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        );
+        let result: serde_json::Value = client
+            .send_request("test/auto-fallback-callback", serde_json::json!({}))
+            .expect("the selected legacy client dispatches its configured callback");
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "capabilities": true,
+                "lifecycle": true,
+                "callback": true,
+                "request": true
+            })
+        );
+        client.close().expect("Auto-legacy client cleanup");
+    }
+
     #[test]
     fn builder_retains_public_mcp_apps_configuration() {
         let settings = McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
