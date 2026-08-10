@@ -4038,7 +4038,7 @@ impl FinalTaskRuntime {
         // Creation has crossed the durable create-before-reply boundary. A
         // post-commit observer failure must never erase the client handle by
         // turning this accepted operation into an RPC error.
-        let _ = self.emit(notification);
+        self.emit(notification);
         self.signal_task_service(task_id);
         Ok(())
     }
@@ -4074,7 +4074,7 @@ impl FinalTaskRuntime {
         }
         // The durable commit above is the acceptance point. Observer failures
         // cannot revoke the returned task handle.
-        let _ = self.emit(notification);
+        self.emit(notification);
         self.signal_task_service(task_id);
         Ok(())
     }
@@ -4100,11 +4100,11 @@ impl FinalTaskRuntime {
                 "Task state changed before the transition could be recorded",
             ));
         }
-        let emit_result = self.emit(notification);
+        self.emit(notification);
         if let Some(task_id) = wakeup_task_id {
             self.signal_task_service(task_id);
         }
-        emit_result
+        Ok(())
     }
 
     fn persist_transition_clearing_input(
@@ -4122,31 +4122,33 @@ impl FinalTaskRuntime {
                 "Task state changed before the transition could be recorded",
             ));
         }
-        self.emit(notification)
+        self.emit(notification);
+        Ok(())
     }
 
-    /// Delivers a durable notification to every observer. A panic from one
-    /// observer is contained after the store mutation, subsequent observers
-    /// still receive the notification, and the caller receives one bounded
-    /// typed failure instead of unwinding through the task state machine.
-    fn emit(&self, notification: FinalTaskStatusNotification) -> McpResult<()> {
+    /// Delivers a durable notification to every observer after the store
+    /// mutation. A panic from one observer is contained and recorded as
+    /// delivery degradation; it cannot revoke the already-committed state or
+    /// turn the accepted transition into an RPC error.
+    fn emit(&self, notification: FinalTaskStatusNotification) {
         let emitters = self
             .notification_emitters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let mut emitter_panicked = false;
+        let mut panicked_emitter_count = 0usize;
         for emitter in emitters {
             if catch_unwind(AssertUnwindSafe(|| emitter(notification.clone()))).is_err() {
-                emitter_panicked = true;
+                panicked_emitter_count += 1;
             }
         }
-        if emitter_panicked {
-            return Err(McpError::internal_error(
-                "A final task notification emitter panicked after durable mutation",
-            ));
+        if panicked_emitter_count != 0 {
+            log::error!(
+                target: "fastmcp_rust::server",
+                "Final Task notification delivery degraded after durable mutation; panicked_emitter_count={}",
+                panicked_emitter_count
+            );
         }
-        Ok(())
     }
 
     fn restore_accepted_input(
@@ -6585,6 +6587,137 @@ mod tests {
                 .expect("read task after contained emitter panic")
                 .is_some(),
             "the durable task mutation survives the contained emitter panic"
+        );
+    }
+
+    #[test]
+    fn task_03_final_update_non_panicking_emitter_preserves_committed_state() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let primary_delivered = Arc::new(AtomicBool::new(false));
+        let primary_delivered_by_emitter = Arc::clone(&primary_delivered);
+        let runtime = FinalTaskRuntime::new(
+            Arc::clone(&store),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
+            Arc::new(move |_| {
+                primary_delivered_by_emitter.store(true, AtomicOrdering::SeqCst);
+            }),
+        );
+        let continued = Arc::new(AtomicBool::new(false));
+        let continued_by_second_emitter = Arc::clone(&continued);
+        runtime.add_notification_emitter(Arc::new(move |_| {
+            continued_by_second_emitter.store(true, AtomicOrdering::SeqCst);
+        }));
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        runtime
+            .require_input(&task_id, final_roots_request(), None)
+            .expect("task enters input_required before the update RPC");
+        primary_delivered.store(false, AtomicOrdering::SeqCst);
+        continued.store(false, AtomicOrdering::SeqCst);
+
+        let mut parameters = final_task_method_parameters(&task_id);
+        parameters["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
+        let response = dispatch_final_tasks_update(&runtime, parameters)
+            .expect("a delivered post-commit notification preserves the update RPC success");
+
+        assert_eq!(response["resultType"], "complete");
+        assert!(
+            primary_delivered.load(AtomicOrdering::SeqCst),
+            "the first emitter receives the committed update notification"
+        );
+        assert!(
+            continued.load(AtomicOrdering::SeqCst),
+            "the later emitter receives the same committed update notification"
+        );
+        assert!(matches!(
+            runtime
+                .get_task(&task_id)
+                .expect("read task after successful update RPC")
+                .task,
+            FinalTask::Working(_)
+        ));
+        assert!(matches!(
+            store
+                .latest_notification(&task_id)
+                .expect("read retained update notification")
+                .params
+                .task,
+            FinalTask::Working(_)
+        ));
+    }
+
+    #[test]
+    fn task_03_final_update_panicking_emitter_preserves_committed_state_and_replay_safety() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = FinalTaskRuntime::new(
+            Arc::clone(&store),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
+            Arc::new(|_| panic!("planted final task notification emitter panic")),
+        );
+        let continued = Arc::new(AtomicBool::new(false));
+        let continued_by_second_emitter = Arc::clone(&continued);
+        runtime.add_notification_emitter(Arc::new(move |_| {
+            continued_by_second_emitter.store(true, AtomicOrdering::SeqCst);
+        }));
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        runtime
+            .require_input(&task_id, final_roots_request(), None)
+            .expect("task enters input_required despite prior delivery degradation");
+        continued.store(false, AtomicOrdering::SeqCst);
+
+        let mut parameters = final_task_method_parameters(&task_id);
+        parameters["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_final_tasks_update(&runtime, parameters.clone())
+        }));
+        let response = result
+            .expect("a panicking emitter is contained after the durable update")
+            .expect("delivery degradation cannot turn the committed update RPC into an error");
+
+        assert_eq!(response["resultType"], "complete");
+        assert!(
+            continued.load(AtomicOrdering::SeqCst),
+            "a later emitter still receives the committed update notification"
+        );
+        assert!(matches!(
+            runtime
+                .get_task(&task_id)
+                .expect("read task after contained emitter panic")
+                .task,
+            FinalTask::Working(_)
+        ));
+        assert!(matches!(
+            store
+                .latest_notification(&task_id)
+                .expect("read retained notification after contained emitter panic")
+                .params
+                .task,
+            FinalTask::Working(_)
+        ));
+
+        let generation_after_commit = store
+            .get_task_snapshot(&task_id)
+            .expect("read durable generation after committed update")
+            .expect("committed update retains its task")
+            .generation();
+        let replay = dispatch_final_tasks_update(&runtime, parameters)
+            .expect("the retry after delivery degradation is acknowledged as a replay");
+        assert_eq!(replay["resultType"], "complete");
+        assert_eq!(
+            store
+                .get_task_snapshot(&task_id)
+                .expect("read durable generation after replay")
+                .expect("replay retains its task")
+                .generation(),
+            generation_after_commit,
+            "replaying the accepted update cannot create a second durable transition"
         );
     }
 
