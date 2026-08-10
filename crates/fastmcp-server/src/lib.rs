@@ -4332,10 +4332,10 @@ impl BoundHttpServer {
         modern_session_reaper.abort();
         let _ = modern_session_reaper.join(cx).await;
         close_live_http_sessions(cx, &self.legacy_sessions).await;
-        close_live_modern_http_sessions(cx, &self.modern_sessions).await;
         connection_children
             .drain_terminal_controls_then_cancel_and_join(cx, &terminal_receipt)
             .await;
+        close_live_modern_http_sessions(cx, &self.modern_sessions).await;
         server.cancel_active_requests(CancelKind::Shutdown, false);
         server.graceful_shutdown_returning();
         result
@@ -23247,6 +23247,76 @@ mod lib_unit_tests {
             if !response.starts_with(b"HTTP/1.1 406") || calls.load(Ordering::Acquire) != 0 {
                 return Err(
                     "changing only the SSE qvalue precision must reject before handler entry"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_sse_discovery_rejects_preissued_session_without_registry_mutation() {
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("live-http-sse-discovery-reject", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("SSE discovery rejection bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("SSE discovery rejection address failed: {error}"))?;
+            let modern_sessions = Arc::clone(&bound.modern_sessions);
+            let discovery = JsonRpcRequest::new(
+                SERVER_DISCOVER_METHOD,
+                Some(serde_json::json!({
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                RequestId::Number(869),
+            );
+            let discovery_body = serde_json::to_vec(&discovery)
+                .map_err(|error| format!("SSE discovery rejection did not serialize: {error}"))?;
+            let request = live_http_post(
+                "/mcp",
+                &discovery_body,
+                &[
+                    ("Accept", "text/event-stream"),
+                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                    ("Mcp-Method", SERVER_DISCOVER_METHOD),
+                    ("MCP-Session-Id", "preissued-session"),
+                ],
+            );
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let response = live_http_exchange(address, request).await;
+                    caller_cx.cancel_with(
+                        CancelKind::User,
+                        Some("SSE discovery preissued-session rejection complete"),
+                    );
+                    response
+                })
+                .map_err(|error| {
+                    format!("SSE discovery rejection client admission failed: {error}")
+                })?;
+
+            let serve = bound.serve(&cx).await;
+            let response = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("SSE discovery rejection client failed: {error:?}"))??;
+            serve.map_err(|error| format!("SSE discovery rejection server failed: {error}"))?;
+            if !response.starts_with(b"HTTP/1.1 400")
+                || !modern_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+            {
+                return Err(
+                    "preissued SSE discovery session header minted or retained a session"
                         .to_owned(),
                 );
             }
