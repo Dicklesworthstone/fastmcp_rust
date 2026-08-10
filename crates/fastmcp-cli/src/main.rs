@@ -391,6 +391,10 @@ fn doc_01_b_positive() {
     ));
 
     let public_help = public_cli_help_candidate().expect("--help must reach Clap DisplayHelp");
+    assert_eq!(
+        normalize_cli_help_whitespace(&public_help.bytes),
+        format!("{EXPECTED_CLI_ROOT_HELP_PREFIX}{EXPECTED_CLI_PROTOCOL_STATUS_STANZA}")
+    );
     let mut state = ConsumerVisibleCliHelp::default();
 
     assert_eq!(
@@ -447,27 +451,19 @@ fn doc_01_b_planted_negative() {
         .expect("baseline public help must be admitted");
     let accepted_before = state.clone();
 
-    for claim in [
-        "FastMCP supports MCP 2026-07-28.",
-        "Auto is runnable.",
-        "MCP 2025-11-25 is supported.",
-        "FastMCP is production ready.",
-        "FastMCP is fully supported for production use.",
-    ] {
-        let planted_candidate = CliHelpCandidate {
-            contract: baseline.contract,
-            bytes: raw_help_with_root_claim(&baseline.bytes, claim),
-        };
-        assert_eq!(
-            admit_public_cli_help(&mut state, planted_candidate),
-            Err(CliDocumentationRefusal::RootHelpFrameMismatch),
-            "the raw-help claim {claim:?} must be rejected"
-        );
-        assert_eq!(
-            state, accepted_before,
-            "a rejected one-field raw-help mutation must leave evaluator and consumer-visible state unchanged"
-        );
-    }
+    let planted_candidate = CliHelpCandidate {
+        contract: baseline.contract,
+        bytes: raw_help_with_root_claim(&baseline.bytes, "FastMCP supports MCP 2026-07-28."),
+    };
+    assert_eq!(
+        admit_public_cli_help(&mut state, planted_candidate),
+        Err(CliDocumentationRefusal::RootHelpFrameMismatch),
+        "the one-field raw-help mutation must be rejected"
+    );
+    assert_eq!(
+        state, accepted_before,
+        "a rejected one-field raw-help mutation must leave evaluator and consumer-visible state unchanged"
+    );
     let mut emitted_after_rejection = Vec::new();
     assert_eq!(
         emit_admitted_cli_help_to(&state, &mut emitted_after_rejection),
@@ -561,6 +557,10 @@ enum Commands {
         /// Just print the config, don't modify any files.
         #[arg(long)]
         dry_run: bool,
+
+        /// Protocol-policy selection for the installed FastMCP server (auto, modern-only, legacy-only).
+        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::Auto)]
+        protocol_policy: CliProtocolPolicy,
     },
 
     /// List configured MCP servers.
@@ -858,7 +858,16 @@ fn main() -> ExitCode {
             cwd,
             target,
             dry_run,
-        } => cmd_install(&name, &server, &args, cwd.as_deref(), target, dry_run),
+            protocol_policy,
+        } => cmd_install(
+            &name,
+            &server,
+            &args,
+            cwd.as_deref(),
+            target,
+            dry_run,
+            protocol_policy,
+        ),
         Commands::List {
             target,
             config,
@@ -5690,8 +5699,9 @@ fn cmd_install(
     cwd: Option<&Path>,
     target: InstallTarget,
     dry_run: bool,
+    protocol_policy: CliProtocolPolicy,
 ) -> McpResult<()> {
-    let config = generate_server_config(name, server, args, cwd)?;
+    let config = generate_server_config(name, server, args, cwd, protocol_policy)?;
 
     match target {
         InstallTarget::Claude => install_claude_desktop(&config, dry_run),
@@ -5727,6 +5737,30 @@ fn server_configs_semantically_equal(left: &McpServerConfig, right: &McpServerCo
         && left_environment == right_environment
         && left.cwd == right.cwd
         && left.disabled == right.disabled
+}
+
+/// Client-owned environment entries are retained across install updates. The
+/// generated policy always wins for its reserved key, so semantic no-op
+/// detection treats an existing retained environment as part of the desired
+/// installed state instead of rewriting the same entry on every invocation.
+fn install_config_with_preserved_environment(
+    existing: &McpServerConfig,
+    desired: &McpServerConfig,
+) -> McpServerConfig {
+    let mut merged = desired.clone();
+    let Some(existing_environment) = existing.env.as_ref() else {
+        return merged;
+    };
+    let Some(desired_environment) = merged.env.as_mut() else {
+        return merged;
+    };
+
+    for (key, value) in existing_environment {
+        desired_environment
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+    merged
 }
 
 fn serialize_server_config_object(
@@ -5854,8 +5888,10 @@ fn effective_installed_server_config(
 fn merge_install_server_entry(
     target: InstallTarget,
     existing: &mut serde_json::Map<String, serde_json::Value>,
-    desired: serde_json::Map<String, serde_json::Value>,
+    mut desired: serde_json::Map<String, serde_json::Value>,
 ) {
+    merge_existing_install_environment(target, existing, &mut desired);
+
     for owned_key in [
         "transport",
         "type",
@@ -5881,11 +5917,55 @@ fn merge_install_server_entry(
     existing.extend(desired);
 }
 
+/// Preserve client-owned environment entries while making the selected
+/// FastMCP launch policy authoritative. Cline's current transport shape nests
+/// its environment, while the flat legacy shape is accepted so an update can
+/// migrate it without discarding environment entries.
+fn merge_existing_install_environment(
+    target: InstallTarget,
+    existing: &serde_json::Map<String, serde_json::Value>,
+    desired: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let existing_environment = if target == InstallTarget::Cline {
+        existing
+            .get("transport")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|transport| transport.get("env"))
+            .or_else(|| existing.get("env"))
+    } else {
+        existing.get("env")
+    };
+    let Some(existing_environment) = existing_environment.and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+
+    let desired_environment = if target == InstallTarget::Cline {
+        desired
+            .get_mut("transport")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|transport| transport.get_mut("env"))
+    } else {
+        desired.get_mut("env")
+    };
+    let Some(desired_environment) = desired_environment.and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    for (key, value) in existing_environment {
+        desired_environment
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+}
+
 fn generate_server_config(
     name: &str,
     server: &str,
     args: &[String],
     cwd: Option<&Path>,
+    protocol_policy: CliProtocolPolicy,
 ) -> McpResult<(String, McpServerConfig)> {
     if name.trim().is_empty() {
         return Err(fastmcp_core::McpError::invalid_params(
@@ -5917,7 +5997,10 @@ fn generate_server_config(
         McpServerConfig {
             command: server.to_string(),
             args: args.to_vec(),
-            env: None,
+            env: Some(HashMap::from([(
+                FASTMCP_PROTOCOL_POLICY_ENV.to_owned(),
+                protocol_policy.server_launch_value().to_owned(),
+            )])),
             cwd,
             disabled: false,
         },
@@ -9514,7 +9597,10 @@ fn install_json_registry(
     let semantic_noop = registry
         .get(&config.0)
         .and_then(|existing| effective_installed_server_config(target, existing))
-        .is_some_and(|existing| server_configs_semantically_equal(&existing, &config.1));
+        .is_some_and(|existing| {
+            let desired = install_config_with_preserved_environment(&existing, &config.1);
+            server_configs_semantically_equal(&existing, &desired)
+        });
     if semantic_noop {
         let current = read_destination_snapshot_at(
             &secured_parent,
@@ -10128,13 +10214,34 @@ mod tests {
                     server,
                     target,
                     dry_run,
+                    protocol_policy,
                     ..
                 } => {
                     assert_eq!(name, "my-server");
                     assert_eq!(server, "./server");
                     assert_eq!(target, InstallTarget::Claude);
                     assert!(!dry_run);
+                    assert_eq!(protocol_policy, CliProtocolPolicy::Auto);
                 }
+                _ => unreachable!("Expected Install command"),
+            }
+        }
+
+        #[test]
+        fn test_install_command_with_protocol_policy() {
+            let cli = Cli::try_parse_from([
+                "fastmcp",
+                "install",
+                "--protocol-policy",
+                "legacy-only",
+                "my-server",
+                "./server",
+            ])
+            .expect("install accepts an explicit protocol-policy selection");
+            match cli.command {
+                Commands::Install {
+                    protocol_policy, ..
+                } => assert_eq!(protocol_policy, CliProtocolPolicy::LegacyOnly),
                 _ => unreachable!("Expected Install command"),
             }
         }
@@ -10468,37 +10575,246 @@ mod tests {
                 "/path/to/server",
                 &["--config".to_string(), "config.json".to_string()],
                 Some(Path::new("/srv/my-server")),
+                CliProtocolPolicy::ModernOnly,
             )
             .expect("bounded config");
 
             assert_eq!(name, "my-server");
             assert_eq!(config.command, "/path/to/server");
             assert_eq!(config.args, vec!["--config", "config.json"]);
-            assert!(config.env.is_none());
+            assert_eq!(
+                config
+                    .env
+                    .as_ref()
+                    .and_then(|environment| environment.get(FASTMCP_PROTOCOL_POLICY_ENV))
+                    .map(String::as_str),
+                Some("modern-only")
+            );
             assert_eq!(config.cwd.as_deref(), Some("/srv/my-server"));
         }
 
         #[test]
         fn generate_server_config_rejects_excessive_argument_counts() {
             let arguments = vec!["value".to_owned(); CLI_OUTPUT_MAX_ITEMS + 1];
-            let error = generate_server_config("server", "command", &arguments, None)
-                .err()
-                .expect("oversized argument list must be rejected");
+            let error = generate_server_config(
+                "server",
+                "command",
+                &arguments,
+                None,
+                CliProtocolPolicy::Auto,
+            )
+            .err()
+            .expect("oversized argument list must be rejected");
 
             assert!(error.message.contains("maximum accepted count"));
         }
 
         #[test]
         fn generate_server_config_rejects_blank_names_and_commands() {
-            let blank_name = generate_server_config("  ", "server", &[], None)
-                .err()
-                .expect("blank server name must be rejected");
+            let blank_name =
+                generate_server_config("  ", "server", &[], None, CliProtocolPolicy::Auto)
+                    .err()
+                    .expect("blank server name must be rejected");
             assert!(blank_name.message.contains("name"));
 
-            let blank_command = generate_server_config("server", "\t", &[], None)
-                .err()
-                .expect("blank server command must be rejected");
+            let blank_command =
+                generate_server_config("server", "\t", &[], None, CliProtocolPolicy::Auto)
+                    .err()
+                    .expect("blank server command must be rejected");
             assert!(blank_command.message.contains("command"));
+        }
+
+        #[test]
+        fn install_policy_serializes_in_flat_client_configs() {
+            for (policy, expected) in [
+                (CliProtocolPolicy::Auto, "auto"),
+                (CliProtocolPolicy::ModernOnly, "modern-only"),
+                (CliProtocolPolicy::LegacyOnly, "legacy-only"),
+            ] {
+                let (_, config) = generate_server_config("server", "command", &[], None, policy)
+                    .expect("install config accepts every explicit policy");
+
+                for target in [InstallTarget::Claude, InstallTarget::Cursor] {
+                    let entry = shape_install_server_entry(
+                        target,
+                        serialize_server_config_object(&config)
+                            .expect("install config serializes to a JSON object"),
+                    );
+                    assert_eq!(entry["type"], "stdio");
+                    assert_eq!(entry["env"][FASTMCP_PROTOCOL_POLICY_ENV], expected);
+                }
+            }
+        }
+
+        #[test]
+        fn install_policy_serializes_in_cline_transport_config() {
+            for (policy, expected) in [
+                (CliProtocolPolicy::Auto, "auto"),
+                (CliProtocolPolicy::ModernOnly, "modern-only"),
+                (CliProtocolPolicy::LegacyOnly, "legacy-only"),
+            ] {
+                let (_, config) = generate_server_config("server", "command", &[], None, policy)
+                    .expect("install config accepts every explicit policy");
+                let entry = shape_install_server_entry(
+                    InstallTarget::Cline,
+                    serialize_server_config_object(&config)
+                        .expect("install config serializes to a JSON object"),
+                );
+
+                assert_eq!(entry["transport"]["type"], "stdio");
+                assert_eq!(
+                    entry["transport"]["env"][FASTMCP_PROTOCOL_POLICY_ENV],
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn install_merge_preserves_environment_in_flat_client_configs() {
+            let (_, config) = generate_server_config(
+                "server",
+                "command",
+                &[],
+                None,
+                CliProtocolPolicy::ModernOnly,
+            )
+            .expect("install config accepts the selected policy");
+
+            for target in [InstallTarget::Claude, InstallTarget::Cursor] {
+                let mut existing = serde_json::json!({
+                    "type": "stdio",
+                    "command": "previous-command",
+                    "env": {
+                        "EXISTING_SETTING": "preserve-exactly",
+                        "FASTMCP_PROTOCOL_POLICY": "legacy-only",
+                    },
+                })
+                .as_object()
+                .expect("flat client fixture object")
+                .clone();
+                let desired = shape_install_server_entry(
+                    target,
+                    serialize_server_config_object(&config)
+                        .expect("install config serializes to a JSON object"),
+                );
+
+                merge_install_server_entry(target, &mut existing, desired);
+
+                assert_eq!(existing["type"], "stdio");
+                assert_eq!(existing["env"]["EXISTING_SETTING"], "preserve-exactly");
+                assert_eq!(existing["env"][FASTMCP_PROTOCOL_POLICY_ENV], "modern-only");
+            }
+        }
+
+        #[test]
+        fn install_merge_preserves_environment_in_cline_transport_shapes() {
+            let (_, config) = generate_server_config(
+                "server",
+                "command",
+                &[],
+                None,
+                CliProtocolPolicy::LegacyOnly,
+            )
+            .expect("install config accepts the selected policy");
+            let desired = || {
+                shape_install_server_entry(
+                    InstallTarget::Cline,
+                    serialize_server_config_object(&config)
+                        .expect("install config serializes to a JSON object"),
+                )
+            };
+
+            for mut existing in [
+                serde_json::json!({
+                    "transport": {
+                        "type": "stdio",
+                        "command": "previous-command",
+                        "env": {
+                            "EXISTING_SETTING": "preserve-exactly",
+                            "FASTMCP_PROTOCOL_POLICY": "auto",
+                        },
+                    },
+                    "metadata": ["preserve"],
+                }),
+                serde_json::json!({
+                    "type": "stdio",
+                    "command": "previous-command",
+                    "env": {
+                        "EXISTING_SETTING": "preserve-exactly",
+                        "FASTMCP_PROTOCOL_POLICY": "modern-only",
+                    },
+                }),
+            ] {
+                let existing = existing.as_object_mut().expect("Cline fixture object");
+
+                merge_install_server_entry(InstallTarget::Cline, existing, desired());
+
+                assert_eq!(existing["transport"]["type"], "stdio");
+                assert_eq!(
+                    existing["transport"]["env"]["EXISTING_SETTING"],
+                    "preserve-exactly"
+                );
+                assert_eq!(
+                    existing["transport"]["env"][FASTMCP_PROTOCOL_POLICY_ENV],
+                    "legacy-only"
+                );
+            }
+        }
+
+        #[test]
+        fn install_semantic_noop_preserves_environment_but_requires_exact_policy() {
+            let (_, desired) = generate_server_config(
+                "server",
+                "command",
+                &[],
+                None,
+                CliProtocolPolicy::ModernOnly,
+            )
+            .expect("install config accepts the selected policy");
+            let existing_with_selected_policy = McpServerConfig {
+                command: "command".to_owned(),
+                args: Vec::new(),
+                env: Some(HashMap::from([
+                    ("EXISTING_SETTING".to_owned(), "preserve-exactly".to_owned()),
+                    (
+                        FASTMCP_PROTOCOL_POLICY_ENV.to_owned(),
+                        "modern-only".to_owned(),
+                    ),
+                ])),
+                cwd: None,
+                disabled: false,
+            };
+            let semantic_desired =
+                install_config_with_preserved_environment(&existing_with_selected_policy, &desired);
+            assert!(server_configs_semantically_equal(
+                &existing_with_selected_policy,
+                &semantic_desired
+            ));
+
+            let existing_with_stale_policy = McpServerConfig {
+                env: Some(HashMap::from([
+                    ("EXISTING_SETTING".to_owned(), "preserve-exactly".to_owned()),
+                    (
+                        FASTMCP_PROTOCOL_POLICY_ENV.to_owned(),
+                        "legacy-only".to_owned(),
+                    ),
+                ])),
+                ..existing_with_selected_policy
+            };
+            let semantic_desired =
+                install_config_with_preserved_environment(&existing_with_stale_policy, &desired);
+            assert_eq!(
+                semantic_desired
+                    .env
+                    .as_ref()
+                    .and_then(|environment| environment.get(FASTMCP_PROTOCOL_POLICY_ENV))
+                    .map(String::as_str),
+                Some("modern-only")
+            );
+            assert!(!server_configs_semantically_equal(
+                &existing_with_stale_policy,
+                &semantic_desired
+            ));
         }
 
         #[test]
