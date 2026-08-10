@@ -410,7 +410,7 @@ pub struct Tool {
 }
 
 /// Resource definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resource {
     /// Resource URI.
     pub uri: String,

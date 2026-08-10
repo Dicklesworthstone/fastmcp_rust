@@ -63,9 +63,9 @@ pub const MAX_ICON_SIZE_BYTES: usize = 128;
 pub const MAX_CONTENT_ENCODED_BYTES: usize = 1024 * 1024;
 /// Maximum UTF-8 bytes in each W3C trace field.
 pub const MAX_TRACE_FIELD_BYTES: usize = 4 * 1024;
-/// Maximum bytes retained for one exact final progress number lexeme.
+/// Maximum bytes retained for one exact finite final progress number lexeme.
 pub const MAX_EXACT_PROGRESS_NUMBER_BYTES: usize = 256;
-/// Largest absolute decimal exponent accepted for one final progress number.
+/// Largest absolute decimal exponent accepted for one exact finite final progress number.
 pub const MAX_EXACT_PROGRESS_EXPONENT_ABS: i32 = 9_999;
 /// Maximum bytes retained for one arbitrary-width JSON integer token.
 pub const MAX_JSON_INTEGER_BYTES: usize = 4 * 1024;
@@ -548,25 +548,31 @@ impl<'de> Deserialize<'de> for JsonInteger {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = Box::<RawValue>::deserialize(deserializer)?;
-        raw.get().parse().map_err(serde::de::Error::custom)
+        // Not RawValue: raw capture cannot survive serde's buffered Content
+        // replay, so a RawValue-based decode fails inside every untagged
+        // context - most critically the JsonRpcMessage enum, where it made
+        // this crate unable to parse error responses it had itself encoded.
+        // An arbitrary-precision Number replays through buffering and keeps
+        // the parser's number spelling.
+        let number = serde_json::Number::deserialize(deserializer)?;
+        Self::try_from_number(number).map_err(serde::de::Error::custom)
     }
 }
 
-/// A bounded, exact, finite nonnegative JSON number used by final progress
-/// notifications.
+/// A bounded, exact, finite JSON number used by final progress notifications.
 ///
 /// The original JSON-number lexeme is retained for wire re-encoding. Ordering
 /// is computed from bounded decimal components, never through IEEE-754.
 #[derive(Clone, Debug)]
 pub struct ExactNonNegativeJsonNumber {
     raw: Box<RawValue>,
+    negative: bool,
     significant_digits: String,
     decimal_point: i32,
 }
 
 impl ExactNonNegativeJsonNumber {
-    /// Admits one bounded nonnegative JSON number while retaining its spelling.
+    /// Admits one bounded finite JSON number while retaining its spelling.
     pub fn try_from_number(number: serde_json::Number) -> Result<Self, CommonTypeError> {
         Self::parse(number.as_str())
     }
@@ -583,17 +589,19 @@ impl ExactNonNegativeJsonNumber {
         if lexeme.len() > MAX_EXACT_PROGRESS_NUMBER_BYTES {
             return Err(CommonTypeError::TooLong("exact progress number"));
         }
-        if lexeme.starts_with('-') {
-            return Err(CommonTypeError::Invalid("nonnegative progress number"));
-        }
-
-        let (mantissa, exponent) = match lexeme.find(|character| matches!(character, 'e' | 'E')) {
-            Some(index) => (
-                &lexeme[..index],
-                parse_bounded_progress_exponent(&lexeme[index + 1..])?,
-            ),
-            None => (lexeme, 0),
+        let (negative, unsigned_lexeme) = match lexeme.strip_prefix('-') {
+            Some(unsigned_lexeme) => (true, unsigned_lexeme),
+            None => (false, lexeme),
         };
+
+        let (mantissa, exponent) =
+            match unsigned_lexeme.find(|character| matches!(character, 'e' | 'E')) {
+                Some(index) => (
+                    &unsigned_lexeme[..index],
+                    parse_bounded_progress_exponent(&unsigned_lexeme[index + 1..])?,
+                ),
+                None => (unsigned_lexeme, 0),
+            };
         let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
         if whole.is_empty()
             || !whole.bytes().all(|byte| byte.is_ascii_digit())
@@ -622,6 +630,7 @@ impl ExactNonNegativeJsonNumber {
 
         Ok(Self {
             raw,
+            negative,
             significant_digits,
             decimal_point,
         })
@@ -636,30 +645,8 @@ impl ExactNonNegativeJsonNumber {
     fn is_zero(&self) -> bool {
         self.significant_digits == "0"
     }
-}
 
-impl PartialEq for ExactNonNegativeJsonNumber {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other).is_eq()
-    }
-}
-
-impl Eq for ExactNonNegativeJsonNumber {}
-
-impl PartialOrd for ExactNonNegativeJsonNumber {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ExactNonNegativeJsonNumber {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self.is_zero(), other.is_zero()) {
-            (true, true) => return std::cmp::Ordering::Equal,
-            (true, false) => return std::cmp::Ordering::Less,
-            (false, true) => return std::cmp::Ordering::Greater,
-            (false, false) => {}
-        }
+    fn cmp_magnitude(&self, other: &Self) -> std::cmp::Ordering {
         match self.decimal_point.cmp(&other.decimal_point) {
             std::cmp::Ordering::Equal => {}
             order => return order,
@@ -688,6 +675,37 @@ impl Ord for ExactNonNegativeJsonNumber {
             }
         }
         std::cmp::Ordering::Equal
+    }
+}
+
+impl PartialEq for ExactNonNegativeJsonNumber {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for ExactNonNegativeJsonNumber {}
+
+impl PartialOrd for ExactNonNegativeJsonNumber {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ExactNonNegativeJsonNumber {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.is_zero(), other.is_zero()) {
+            (true, true) => return std::cmp::Ordering::Equal,
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            (false, false) => {}
+        }
+        match (self.negative, other.negative) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, true) => other.cmp_magnitude(self),
+            (false, false) => self.cmp_magnitude(other),
+        }
     }
 }
 
@@ -2737,7 +2755,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_nonnegative_json_numbers_preserve_lexemes_and_compare_mathematically() {
+    fn exact_finite_json_numbers_preserve_signed_lexemes_and_compare_mathematically() {
         let large = ExactNonNegativeJsonNumber::parse("123456789012345678901234567890")
             .expect("large integer exact progress number");
         let decimal = ExactNonNegativeJsonNumber::parse("1.20e+4")
@@ -2746,20 +2764,26 @@ mod tests {
             .expect("equivalent decimal exact progress number");
         let greater =
             ExactNonNegativeJsonNumber::parse("12000.0001").expect("greater exact progress number");
+        let negative =
+            ExactNonNegativeJsonNumber::parse("-1.20e+4").expect("negative exact progress number");
+        let more_negative = ExactNonNegativeJsonNumber::parse("-12000.0001")
+            .expect("more negative exact progress number");
 
         assert_eq!(large.as_str(), "123456789012345678901234567890");
         assert_eq!(decimal.as_str(), "1.20e+4");
         assert_eq!(decimal, equivalent);
         assert!(greater > decimal);
+        assert!(more_negative < negative);
+        assert!(negative < decimal);
         assert_eq!(
             serde_json::to_string(&decimal).expect("exact progress number serializes"),
             "1.20e+4",
             "the decimal/exponent lexeme re-encodes without an IEEE-754 conversion"
         );
         assert_eq!(
-            ExactNonNegativeJsonNumber::parse("-1"),
-            Err(CommonTypeError::Invalid("nonnegative progress number")),
-            "changing only the sign rejects an otherwise valid progress number"
+            serde_json::to_string(&negative).expect("negative exact progress number serializes"),
+            "-1.20e+4",
+            "the signed decimal/exponent lexeme re-encodes without an IEEE-754 conversion"
         );
         assert_eq!(
             ExactNonNegativeJsonNumber::parse("1e10000"),

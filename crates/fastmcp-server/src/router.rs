@@ -40,7 +40,7 @@ use fastmcp_protocol::common_types::{
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID;
 use fastmcp_protocol::methods::COMPLETION_COMPLETE;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
-use fastmcp_protocol::uri_template::ReversibleResourceTemplate;
+use fastmcp_protocol::uri_template::{ReversibleResourceTemplate, UriTemplatePart};
 use fastmcp_protocol::{
     AdmittedSchema, CacheScope, CacheTtl, CallToolParams, CallToolResult, CompleteResult, Content,
     CoreRequest, CoreResult, FinalCallToolParams, FinalCallToolResult, FinalCompletionParams,
@@ -2844,24 +2844,51 @@ impl Router {
 
         match &params.reference {
             FinalCompletionReference::Prompt { name }
-            | FinalCompletionReference::PromptWithTitle { name, .. }
-                if !self.prompts.contains_key(name) =>
-            {
-                return Err(McpError::invalid_params(
-                    "completion prompt reference is not registered",
-                ));
+            | FinalCompletionReference::PromptWithTitle { name, .. } => {
+                let prompt = self.final_prompts.get(name).ok_or_else(|| {
+                    McpError::invalid_params("completion prompt reference is not registered")
+                })?;
+                if !prompt
+                    .definition
+                    .arguments
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|argument| argument.name == params.argument.name)
+                {
+                    return Err(McpError::invalid_params(
+                        "completion argument is not declared by the referenced target",
+                    ));
+                }
             }
-            FinalCompletionReference::Resource { uri }
-                if !self.resources.contains_key(uri)
-                    && !self.resource_templates.contains_key(uri) =>
-            {
-                return Err(McpError::invalid_params(
-                    "completion resource reference is not registered",
-                ));
+            FinalCompletionReference::Resource { uri } => {
+                let template = self
+                    .resource_templates
+                    .get(uri)
+                    .filter(|entry| entry.final_definition.is_some())
+                    .ok_or_else(|| {
+                        McpError::invalid_params("completion resource reference is not registered")
+                    })?;
+                let template = fastmcp_protocol::UriTemplate::parse(
+                    &template.template.uri_template,
+                )
+                .map_err(|_| {
+                    McpError::internal_error(
+                        "admitted completion resource template is no longer valid",
+                    )
+                })?;
+                if !template.parts().iter().any(|part| {
+                    matches!(part, UriTemplatePart::Expression(expression)
+                        if expression
+                            .variables()
+                            .iter()
+                            .any(|variable| variable.name() == params.argument.name))
+                }) {
+                    return Err(McpError::invalid_params(
+                        "completion argument is not declared by the referenced target",
+                    ));
+                }
             }
-            FinalCompletionReference::Prompt { .. }
-            | FinalCompletionReference::PromptWithTitle { .. }
-            | FinalCompletionReference::Resource { .. } => {}
         }
 
         let handler = self
@@ -2889,7 +2916,14 @@ impl Router {
         .await?;
 
         let completion = match outcome {
-            Outcome::Ok(completion) => completion,
+            Outcome::Ok(completion) => {
+                if completion.values.len() > fastmcp_protocol::MAX_COMPLETION_VALUES {
+                    return Err(McpError::internal_error(
+                        "completion handler returned more than 100 values",
+                    ));
+                }
+                completion
+            }
             Outcome::Err(error) => {
                 return Err(sanitize_handler_error(
                     request_ctx.cx(),
@@ -8503,6 +8537,75 @@ mod router_tests {
         }
     }
 
+    struct CountingCompletion {
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl CompletionHandler for CountingCompletion {
+        fn complete_legacy(
+            &self,
+            _ctx: &McpContext,
+            _params: LegacyCompletionParams,
+        ) -> McpResult<CompletionValues> {
+            Ok(CompletionValues {
+                values: vec!["legacy".to_owned()],
+                total: Some(1),
+                has_more: Some(false),
+            })
+        }
+
+        fn complete_final(
+            &self,
+            _ctx: &McpContext,
+            params: FinalCompletionParams,
+        ) -> McpResult<fastmcp_protocol::FinalCompletionValues> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(fastmcp_protocol::FinalCompletionValues {
+                values: vec![format!("{}ging", params.argument.value)],
+                total: Some(fastmcp_protocol::JsonInteger::from(1_i64)),
+                has_more: Some(false),
+            })
+        }
+    }
+
+    struct CompletionValueBoundary {
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl CompletionHandler for CompletionValueBoundary {
+        fn complete_legacy(
+            &self,
+            _ctx: &McpContext,
+            _params: LegacyCompletionParams,
+        ) -> McpResult<CompletionValues> {
+            Ok(CompletionValues {
+                values: Vec::new(),
+                total: None,
+                has_more: None,
+            })
+        }
+
+        fn complete_final(
+            &self,
+            _ctx: &McpContext,
+            params: FinalCompletionParams,
+        ) -> McpResult<fastmcp_protocol::FinalCompletionValues> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            let value_count = if params.argument.value == "one-over" {
+                fastmcp_protocol::MAX_COMPLETION_VALUES + 1
+            } else {
+                fastmcp_protocol::MAX_COMPLETION_VALUES
+            };
+            Ok(fastmcp_protocol::FinalCompletionValues {
+                values: (0..value_count)
+                    .map(|index| format!("completion-{index}"))
+                    .collect(),
+                total: None,
+                has_more: None,
+            })
+        }
+    }
+
     struct ConcurrentModernTool {
         started: Arc<AtomicUsize>,
         completed: Arc<Mutex<Vec<String>>>,
@@ -13066,7 +13169,10 @@ mod router_tests {
         let mut router = Router::new();
         assert!(!router.has_completion_handler());
         router.add_completion_handler(EchoCompletion);
-        router.add_prompt(NamedPrompt::new("deploy"));
+        router.add_prompt(PromptArgumentBoundary {
+            final_calls: Arc::new(AtomicUsize::new(0)),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+        });
         assert!(router.has_completion_handler());
         assert!(
             router
@@ -13081,8 +13187,8 @@ mod router_tests {
         let legacy_request = JsonRpcRequest::new(
             COMPLETION_COMPLETE,
             Some(serde_json::json!({
-                "ref": {"type": "ref/prompt", "name": "deploy"},
-                "argument": {"name": "environment", "value": "sta"},
+                "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
+                "argument": {"name": "topic", "value": "sta"},
             })),
             87_i64,
         );
@@ -13108,8 +13214,8 @@ mod router_tests {
                             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
                             "io.modelcontextprotocol/clientCapabilities": {},
                         },
-                        "ref": {"type": "ref/prompt", "name": "deploy"},
-                        "argument": {"name": "environment", "value": "sta"},
+                        "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
+                        "argument": {"name": "topic", "value": "sta"},
                     })),
                     88_i64,
                 ),
@@ -13169,11 +13275,16 @@ mod router_tests {
     }
 
     #[test]
-    fn final_completion_resource_reference_accepts_static_and_template_resources() {
+    fn final_completion_resource_template_reference_and_argument_are_validated_before_handler() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::new();
-        router.add_completion_handler(EchoCompletion);
+        router.add_completion_handler(CountingCompletion {
+            final_calls: Arc::clone(&final_calls),
+        });
         router.add_resource(NamedResource::new("resource://static"));
         router.add_resource_template(marked_template("resource://{id}", "registered"));
+        router
+            .add_legacy_resource_template(marked_template("resource://{legacy_id}", "legacy-only"));
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 188, Budget::INFINITE, &state);
@@ -13194,6 +13305,7 @@ mod router_tests {
         let template_accepted = router
             .dispatch_stateless(&request_ctx, &baseline)
             .expect("a registered final resource-template reference is accepted");
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
         let mut static_reference = baseline.clone();
         static_reference
@@ -13204,23 +13316,70 @@ mod router_tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("completion reference is an object")
             .insert("uri".to_owned(), serde_json::json!("resource://static"));
-        let static_accepted = router
+        let static_error = router
             .dispatch_stateless(&request_ctx, &static_reference)
-            .expect("a registered final static resource reference is accepted");
+            .expect_err("a static resource is not a final completion-template target");
+        assert_eq!(static_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
-        let mut planted = static_reference.clone();
-        planted
+        let mut legacy_template = baseline.clone();
+        legacy_template
             .params
             .as_mut()
             .and_then(serde_json::Value::as_object_mut)
             .and_then(|params| params.get_mut("ref"))
             .and_then(serde_json::Value::as_object_mut)
             .expect("completion reference is an object")
-            .insert("uri".to_owned(), serde_json::json!("resource://missing"));
-        let error = router
-            .dispatch_stateless(&request_ctx, &planted)
-            .expect_err("changing only the resource URI to an unregistered value is refused");
-        assert_eq!(error.code, McpErrorCode::InvalidParams);
+            .insert(
+                "uri".to_owned(),
+                serde_json::json!("resource://{legacy_id}"),
+            );
+        assert_eq!(baseline.method, legacy_template.method);
+        assert_eq!(baseline.id, legacy_template.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("argument")),
+            legacy_template
+                .params
+                .as_ref()
+                .and_then(|params| params.get("argument")),
+            "the target URI is the sole planted visibility dimension"
+        );
+        let legacy_template_error = router
+            .dispatch_stateless(&request_ctx, &legacy_template)
+            .expect_err("an exact-2024-only template is not final-visible");
+        assert_eq!(legacy_template_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+
+        let mut unknown_argument = baseline.clone();
+        unknown_argument
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("argument"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion argument is an object")
+            .insert("name".to_owned(), serde_json::json!("unknown"));
+        assert_eq!(baseline.method, unknown_argument.method);
+        assert_eq!(baseline.id, unknown_argument.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("ref")),
+            unknown_argument
+                .params
+                .as_ref()
+                .and_then(|params| params.get("ref")),
+            "the argument name is the sole planted validation dimension"
+        );
+        let unknown_argument_error = router
+            .dispatch_stateless(&request_ctx, &unknown_argument)
+            .expect_err("an undeclared template argument is rejected before the handler");
+        assert_eq!(unknown_argument_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             serde_json::to_vec(&router.resource_templates())
                 .expect("resource-template catalog serializes after refusal"),
@@ -13232,15 +13391,186 @@ mod router_tests {
                 .dispatch_stateless(&request_ctx, &baseline)
                 .expect("the registered reference remains accepted after refusal"),
             template_accepted,
-            "the planted URI is the only changed observable"
+            "rejected target or argument changes cannot alter the accepted completion"
         );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn final_completion_prompt_reference_and_argument_are_validated_before_handler() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_completion_handler(CountingCompletion {
+            final_calls: Arc::clone(&final_calls),
+        });
+        router.add_prompt(PromptArgumentBoundary {
+            final_calls: Arc::new(AtomicUsize::new(0)),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        router.add_legacy_prompt(NamedPrompt::new("legacy-completion-prompt"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 189, Budget::INFINITE, &state);
+        let baseline = JsonRpcRequest::new(
+            COMPLETION_COMPLETE,
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
+                "argument": {"name": "topic", "value": "sta"},
+            })),
+            189_i64,
+        );
+        let accepted = router
+            .dispatch_stateless(&request_ctx, &baseline)
+            .expect("a final-visible prompt and its declared argument are accepted");
+        assert_eq!(accepted["resultType"], "complete");
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+
+        let mut legacy_prompt = baseline.clone();
+        legacy_prompt
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("ref"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion reference is an object")
+            .insert(
+                "name".to_owned(),
+                serde_json::json!("legacy-completion-prompt"),
+            );
+        assert_eq!(baseline.method, legacy_prompt.method);
+        assert_eq!(baseline.id, legacy_prompt.id);
         assert_eq!(
-            router
-                .dispatch_stateless(&request_ctx, &static_reference)
-                .expect("the registered static resource remains accepted after refusal"),
-            static_accepted,
-            "the planted URI is the only changed observable"
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("argument")),
+            legacy_prompt
+                .params
+                .as_ref()
+                .and_then(|params| params.get("argument")),
+            "the prompt name is the sole planted visibility dimension"
         );
+        let legacy_prompt_error = router
+            .dispatch_stateless(&request_ctx, &legacy_prompt)
+            .expect_err("an exact-2024-only prompt is not final-visible");
+        assert_eq!(legacy_prompt_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+
+        let mut unknown_argument = baseline.clone();
+        unknown_argument
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("argument"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion argument is an object")
+            .insert("name".to_owned(), serde_json::json!("unknown"));
+        assert_eq!(baseline.method, unknown_argument.method);
+        assert_eq!(baseline.id, unknown_argument.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("ref")),
+            unknown_argument
+                .params
+                .as_ref()
+                .and_then(|params| params.get("ref")),
+            "the argument name is the sole planted validation dimension"
+        );
+        let unknown_argument_error = router
+            .dispatch_stateless(&request_ctx, &unknown_argument)
+            .expect_err("an undeclared prompt argument is rejected before the handler");
+        assert_eq!(unknown_argument_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+
+        let legacy = router
+            .dispatch_legacy_completion(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    COMPLETION_COMPLETE,
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "legacy-completion-prompt"},
+                        "argument": {"name": "unknown", "value": "sta"},
+                    })),
+                    190_i64,
+                ),
+            )
+            .expect("exact-2024 completion retains its unvalidated target argument behavior");
+        assert!(legacy.get("resultType").is_none());
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn final_completion_rejects_an_over_limit_local_handler_result() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_completion_handler(CompletionValueBoundary {
+            final_calls: Arc::clone(&final_calls),
+        });
+        router.add_prompt(PromptArgumentBoundary {
+            final_calls: Arc::new(AtomicUsize::new(0)),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 191, Budget::INFINITE, &state);
+        let baseline = JsonRpcRequest::new(
+            COMPLETION_COMPLETE,
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
+                "argument": {"name": "topic", "value": "at-bound"},
+            })),
+            191_i64,
+        );
+        let accepted = router
+            .dispatch_stateless(&request_ctx, &baseline)
+            .expect("a local handler result at the 100-value limit is accepted");
+        assert_eq!(
+            accepted["completion"]["values"].as_array().map(Vec::len),
+            Some(fastmcp_protocol::MAX_COMPLETION_VALUES)
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+
+        let mut one_over = baseline.clone();
+        one_over
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|params| params.get_mut("argument"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion argument is an object")
+            .insert("value".to_owned(), serde_json::json!("one-over"));
+        assert_eq!(baseline.method, one_over.method);
+        assert_eq!(baseline.id, one_over.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("ref")),
+            one_over
+                .params
+                .as_ref()
+                .and_then(|params| params.get("ref")),
+            "the handler result boundary is the sole planted dimension"
+        );
+        let error = router
+            .dispatch_stateless(&request_ctx, &one_over)
+            .expect_err("a local handler cannot return a 101st completion value");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            error.message,
+            "completion handler returned more than 100 values"
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -16345,7 +16675,7 @@ mod router_tests {
             ),
             (
                 FinalResourceReadCacheHintProvenance::RouterPolicy,
-                17,
+                23,
                 "public",
             ),
         ] {

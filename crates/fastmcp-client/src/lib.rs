@@ -745,23 +745,25 @@ fn final_log_level(level: LogLevel) -> LoggingLevel {
     match level {
         LogLevel::Debug => LoggingLevel::Debug,
         LogLevel::Info => LoggingLevel::Info,
+        LogLevel::Notice => LoggingLevel::Notice,
         LogLevel::Warning => LoggingLevel::Warning,
         LogLevel::Error => LoggingLevel::Error,
+        LogLevel::Critical => LoggingLevel::Critical,
+        LogLevel::Alert => LoggingLevel::Alert,
+        LogLevel::Emergency => LoggingLevel::Emergency,
     }
 }
 
-fn legacy_log_level(level: LoggingLevel) -> McpResult<LogLevel> {
+fn legacy_log_level(level: LoggingLevel) -> LogLevel {
     match level {
-        LoggingLevel::Debug => Ok(LogLevel::Debug),
-        LoggingLevel::Info => Ok(LogLevel::Info),
-        LoggingLevel::Warning => Ok(LogLevel::Warning),
-        LoggingLevel::Error => Ok(LogLevel::Error),
-        LoggingLevel::Notice
-        | LoggingLevel::Critical
-        | LoggingLevel::Alert
-        | LoggingLevel::Emergency => Err(McpError::invalid_params(
-            "MCP 2024-11-05 logging cannot represent the selected final severity",
-        )),
+        LoggingLevel::Debug => LogLevel::Debug,
+        LoggingLevel::Info => LogLevel::Info,
+        LoggingLevel::Notice => LogLevel::Notice,
+        LoggingLevel::Warning => LogLevel::Warning,
+        LoggingLevel::Error => LogLevel::Error,
+        LoggingLevel::Critical => LogLevel::Critical,
+        LoggingLevel::Alert => LogLevel::Alert,
+        LoggingLevel::Emergency => LogLevel::Emergency,
     }
 }
 
@@ -2569,22 +2571,22 @@ fn is_final_server_notification_method(request: &JsonRpcRequest) -> bool {
         .is_some_and(|method| method.admits_notification_from(Final2026Peer::Server))
 }
 
-fn final_log_message_sink_projection(message: &FinalLogMessageParams) -> Option<LogMessageParams> {
+fn final_log_message_sink_projection(message: &FinalLogMessageParams) -> LogMessageParams {
     let level = match message.level {
         LoggingLevel::Debug => LogLevel::Debug,
         LoggingLevel::Info => LogLevel::Info,
+        LoggingLevel::Notice => LogLevel::Notice,
         LoggingLevel::Warning => LogLevel::Warning,
         LoggingLevel::Error => LogLevel::Error,
-        LoggingLevel::Notice
-        | LoggingLevel::Critical
-        | LoggingLevel::Alert
-        | LoggingLevel::Emergency => return None,
+        LoggingLevel::Critical => LogLevel::Critical,
+        LoggingLevel::Alert => LogLevel::Alert,
+        LoggingLevel::Emergency => LogLevel::Emergency,
     };
-    Some(LogMessageParams {
+    LogMessageParams {
         level,
         logger: message.logger.clone(),
         data: message.data.clone(),
-    })
+    }
 }
 
 const INITIALIZE_REQUEST_ID: i64 = 1;
@@ -3769,8 +3771,12 @@ fn remote_log_metadata(message: &LogMessageParams) -> RemoteLogMetadata {
     let level = match message.level {
         LogLevel::Debug => "debug",
         LogLevel::Info => "info",
+        LogLevel::Notice => "notice",
         LogLevel::Warning => "warning",
         LogLevel::Error => "error",
+        LogLevel::Critical => "critical",
+        LogLevel::Alert => "alert",
+        LogLevel::Emergency => "emergency",
     };
     let (data_kind, data_extent) = match &message.data {
         serde_json::Value::Null => ("null", 0),
@@ -6901,7 +6907,9 @@ impl Client {
                 ));
             }
             let log_message = match &notification {
-                ServerNotification::Message(message) => final_log_message_sink_projection(message),
+                ServerNotification::Message(message) => {
+                    Some(final_log_message_sink_projection(message))
+                }
                 _ => None,
             };
             self.final_server_notifications.push_back(notification);
@@ -9130,9 +9138,11 @@ impl Client {
     fn emit_log_message(&self, message: LogMessageParams) {
         let level = match message.level {
             LogLevel::Debug => log::Level::Debug,
-            LogLevel::Info => log::Level::Info,
+            LogLevel::Info | LogLevel::Notice => log::Level::Info,
             LogLevel::Warning => log::Level::Warn,
-            LogLevel::Error => log::Level::Error,
+            LogLevel::Error | LogLevel::Critical | LogLevel::Alert | LogLevel::Emergency => {
+                log::Level::Error
+            }
         };
         let metadata = remote_log_metadata(&message);
         log::log!(target: REMOTE_LOG_TARGET, level, "{metadata}");
@@ -9314,13 +9324,11 @@ impl Client {
     /// A modern MCP 2026-07-28 session stores the complete RFC 5424 level and
     /// adds it as `io.modelcontextprotocol/logLevel` metadata to every later
     /// request. It never sends `logging/setLevel`. An exact 2024-11-05 session
-    /// sends the historical RPC and rejects final-only severities before any
-    /// bytes are committed.
+    /// sends the historical RPC with the same RFC 5424 severity.
     ///
     /// # Errors
     ///
-    /// Returns an error if an exact legacy peer cannot represent the selected
-    /// level or rejects its historical acknowledgement.
+    /// Returns an error if the peer rejects its historical acknowledgement.
     pub fn set_log_level_typed(&mut self, level: LoggingLevel) -> McpResult<()> {
         self.ensure_initialized()?;
         match self.session.selected_era() {
@@ -9329,7 +9337,7 @@ impl Client {
                 Ok(())
             }
             Some(ProtocolEra::Legacy2024) => {
-                let level = legacy_log_level(level)?;
+                let level = legacy_log_level(level);
                 let params = SetLogLevelParams { level };
                 let _: serde_json::Value = self.send_request("logging/setLevel", params)?;
                 Ok(())
@@ -9340,7 +9348,7 @@ impl Client {
         }
     }
 
-    /// Configures one of the severities shared by both protocol eras.
+    /// Configures one of the RFC 5424 severities supported by both protocol eras.
     ///
     /// Modern sessions use later request metadata; exact legacy sessions send
     /// `logging/setLevel` unchanged.
@@ -13210,7 +13218,7 @@ mod tests {
     }
 
     #[test]
-    fn final_log_message_sink_projection_preserves_only_lossless_levels() {
+    fn final_log_message_sink_projection_preserves_all_legacy_levels() {
         let message = FinalLogMessageParams {
             level: LoggingLevel::Warning,
             logger: Some("server.audit".to_string()),
@@ -13228,8 +13236,7 @@ mod tests {
             )]),
         };
 
-        let projection = final_log_message_sink_projection(&message)
-            .expect("warning is an exact legacy sink severity");
+        let projection = final_log_message_sink_projection(&message);
         assert_eq!(projection.level, LogLevel::Warning);
         assert_eq!(projection.logger.as_deref(), Some("server.audit"));
         assert_eq!(
@@ -13248,11 +13255,49 @@ mod tests {
             Some(&serde_json::json!(true))
         );
 
-        let unsupported = FinalLogMessageParams {
-            level: LoggingLevel::Notice,
-            ..message
-        };
-        assert!(final_log_message_sink_projection(&unsupported).is_none());
+        for (level, expected) in [
+            (LoggingLevel::Debug, LogLevel::Debug),
+            (LoggingLevel::Info, LogLevel::Info),
+            (LoggingLevel::Notice, LogLevel::Notice),
+            (LoggingLevel::Warning, LogLevel::Warning),
+            (LoggingLevel::Error, LogLevel::Error),
+            (LoggingLevel::Critical, LogLevel::Critical),
+            (LoggingLevel::Alert, LogLevel::Alert),
+            (LoggingLevel::Emergency, LogLevel::Emergency),
+        ] {
+            let projected = final_log_message_sink_projection(&FinalLogMessageParams {
+                level,
+                logger: Some("server.audit".to_owned()),
+                data: serde_json::json!("event"),
+                meta: None,
+                additional: std::collections::BTreeMap::new(),
+            });
+            assert_eq!(projected.level, expected);
+        }
+    }
+
+    #[test]
+    fn client_legacy_log_level_mappings_preserve_all_eight_severities() {
+        for (legacy, final_level, wire) in [
+            (LogLevel::Debug, LoggingLevel::Debug, "debug"),
+            (LogLevel::Info, LoggingLevel::Info, "info"),
+            (LogLevel::Notice, LoggingLevel::Notice, "notice"),
+            (LogLevel::Warning, LoggingLevel::Warning, "warning"),
+            (LogLevel::Error, LoggingLevel::Error, "error"),
+            (LogLevel::Critical, LoggingLevel::Critical, "critical"),
+            (LogLevel::Alert, LoggingLevel::Alert, "alert"),
+            (LogLevel::Emergency, LoggingLevel::Emergency, "emergency"),
+        ] {
+            assert_eq!(final_log_level(legacy), final_level);
+            assert_eq!(legacy_log_level(final_level), legacy);
+            let metadata = remote_log_metadata(&LogMessageParams {
+                level: legacy,
+                logger: None,
+                data: serde_json::Value::Null,
+            })
+            .to_string();
+            assert!(metadata.contains(&format!("level={wire}")));
+        }
     }
 
     #[test]

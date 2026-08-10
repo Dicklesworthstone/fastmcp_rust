@@ -1273,21 +1273,81 @@ pub struct FinalSubscriptionsAcknowledgedNotificationParams {
 /// Final clients opt into these notifications through
 /// `io.modelcontextprotocol/logLevel` in request metadata; this notification
 /// itself remains independent of the removed final `logging/setLevel` RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FinalLogMessageParams {
     /// Final RFC 5424 severity.
     pub level: LoggingLevel,
-    /// Optional logger name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional non-null logger name.
     pub logger: Option<String>,
     /// Arbitrary log data.
     pub data: Value,
     /// Optional final notification metadata.
-    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<OpenMetadata>,
     /// Schema-open extension members retained without activating behavior.
-    #[serde(flatten, default)]
     pub additional: BTreeMap<String, Value>,
+}
+
+#[derive(Serialize)]
+struct FinalLogMessageParamsRef<'a> {
+    level: LoggingLevel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logger: Option<&'a str>,
+    data: &'a Value,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    meta: Option<&'a OpenMetadata>,
+    #[serde(flatten)]
+    additional: &'a BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct FinalLogMessageParamsWire {
+    level: LoggingLevel,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null_logger")]
+    logger: Option<String>,
+    data: Value,
+    #[serde(rename = "_meta", default)]
+    meta: Option<OpenMetadata>,
+    #[serde(flatten, default)]
+    additional: BTreeMap<String, Value>,
+}
+
+impl Serialize for FinalLogMessageParams {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        FinalLogMessageParamsRef {
+            level: self.level,
+            logger: self.logger.as_deref(),
+            data: &self.data,
+            meta: self.meta.as_ref(),
+            additional: &self.additional,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FinalLogMessageParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = FinalLogMessageParamsWire::deserialize(deserializer)?;
+        Ok(Self {
+            level: wire.level,
+            logger: wire.logger,
+            data: wire.data,
+            meta: wire.meta,
+            additional: wire.additional,
+        })
+    }
+}
+
+fn deserialize_optional_non_null_logger<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 /// Exact final `notifications/cancelled` parameters.
@@ -1368,9 +1428,9 @@ pub struct FinalProgressNotificationParams {
     /// Token from the client request being progressed.
     #[serde(rename = "progressToken")]
     pub progress_token: ProgressMarker,
-    /// Progress completed so far.
+    /// Finite progress completed so far.
     pub progress: ExactNonNegativeJsonNumber,
-    /// Total work, when known.
+    /// Finite total work, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<ExactNonNegativeJsonNumber>,
     /// Optional progress message.
@@ -1405,15 +1465,6 @@ impl<'de> Deserialize<'de> for FinalProgressNotificationParams {
         D: Deserializer<'de>,
     {
         let wire = FinalProgressNotificationParamsWire::deserialize(deserializer)?;
-        if wire
-            .total
-            .as_ref()
-            .is_some_and(|total| wire.progress > *total)
-        {
-            return Err(serde::de::Error::custom(
-                "final progress must not exceed its total",
-            ));
-        }
         Ok(Self {
             progress_token: wire.progress_token,
             progress: wire.progress,
@@ -4291,10 +4342,18 @@ pub struct GetPromptResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
+    /// Emergency level.
+    Emergency,
+    /// Alert level.
+    Alert,
+    /// Critical level.
+    Critical,
     /// Debug level.
     Debug,
     /// Info level.
     Info,
+    /// Notice level.
+    Notice,
     /// Warning level.
     Warning,
     /// Error level.
@@ -5760,6 +5819,83 @@ mod tests {
     }
 
     #[test]
+    fn final_log_message_omits_an_absent_logger_and_rejects_explicit_null() {
+        let absent = JsonRpcRequest::notification(
+            NOTIFICATIONS_MESSAGE,
+            Some(serde_json::json!({
+                "level": "notice",
+                "data": {"message": "catalog refreshed"}
+            })),
+        );
+        let admitted = ServerNotification::decode(&absent)
+            .expect("a final log message without a logger is admitted");
+        let ServerNotification::Message(params) = &admitted else {
+            panic!("final log message decodes to the message variant");
+        };
+        assert_eq!(params.logger, None);
+        assert_eq!(
+            serde_json::to_value(admitted.encode().expect("admitted log message re-encodes"))
+                .expect("admitted log message remains JSON"),
+            serde_json::to_value(&absent).expect("absent-logger message remains JSON"),
+            "an absent final logger remains absent when the notification re-encodes"
+        );
+
+        let empty = JsonRpcRequest::notification(
+            NOTIFICATIONS_MESSAGE,
+            Some(serde_json::json!({
+                "level": "notice",
+                "logger": "",
+                "data": {"message": "catalog refreshed"}
+            })),
+        );
+        let empty = ServerNotification::decode(&empty)
+            .expect("an empty final logger is a valid string value");
+        let ServerNotification::Message(empty_params) = &empty else {
+            panic!("empty logger decodes to the final message variant");
+        };
+        assert_eq!(empty_params.logger.as_deref(), Some(""));
+        assert_eq!(
+            serde_json::to_value(empty.encode().expect("empty logger re-encodes"))
+                .expect("empty logger notification remains JSON")["params"]["logger"],
+            ""
+        );
+
+        let explicit_null = JsonRpcRequest::notification(
+            NOTIFICATIONS_MESSAGE,
+            Some(serde_json::json!({
+                "level": "notice",
+                "logger": null,
+                "data": {"message": "catalog refreshed"}
+            })),
+        );
+        assert!(
+            matches!(
+                ServerNotification::decode(&explicit_null),
+                Err(FinalNotificationError::InvalidParams {
+                    method: NOTIFICATIONS_MESSAGE
+                })
+            ),
+            "an explicit null final logger is invalid"
+        );
+
+        let outbound_missing_logger = FinalLogMessageParams {
+            level: LoggingLevel::Notice,
+            logger: None,
+            data: serde_json::json!({"message": "catalog refreshed"}),
+            meta: None,
+            additional: BTreeMap::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(outbound_missing_logger)
+                .expect("an absent logger serializes as an omitted member"),
+            serde_json::json!({
+                "level": "notice",
+                "data": {"message": "catalog refreshed"}
+            })
+        );
+    }
+
+    #[test]
     fn final_progress_raw_params_preserve_large_decimal_and_exponent_lexemes() {
         let large_wire = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"job-large","progress":123456789012345678901234567890}}"#;
         let large_request: JsonRpcRequest =
@@ -5818,7 +5954,7 @@ mod tests {
     }
 
     #[test]
-    fn final_progress_rejects_one_variable_invalid_and_non_monotonic_values() {
+    fn final_progress_admits_finite_negative_and_greater_than_total_values() {
         let baseline_params =
             r#"{"progressToken":"job-ordered","progress":1.20e+4,"total":12000.0}"#;
         let baseline_wire = format!(
@@ -5835,36 +5971,67 @@ mod tests {
             r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{negative_params}}}"#
         ))
         .expect("one-variable negative progress notification parses");
-        assert!(
-            matches!(
-                ServerNotification::decode_with_raw_params(&negative, negative_params),
-                Err(FinalNotificationError::InvalidParams {
-                    method: NOTIFICATIONS_PROGRESS
-                })
-            ),
-            "changing only progress to a negative number rejects final progress admission"
+        let negative = ServerNotification::decode_with_raw_params(&negative, negative_params)
+            .expect("negative finite progress is admitted");
+        let ServerNotification::Progress(negative_params) = negative else {
+            panic!("negative final progress notification decodes to the progress variant");
+        };
+        assert_eq!(negative_params.progress.as_str(), "-1");
+        assert_eq!(
+            negative_params
+                .total
+                .as_ref()
+                .map(ExactNonNegativeJsonNumber::as_str),
+            Some("12000.0")
         );
 
-        let non_monotonic_params =
-            r#"{"progressToken":"job-ordered","progress":1.20e+4,"total":11999.0}"#;
-        let non_monotonic: JsonRpcRequest = serde_json::from_str(&format!(
-            r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{non_monotonic_params}}}"#
+        let negative_total_params =
+            r#"{"progressToken":"job-ordered","progress":1.20e+4,"total":-2}"#;
+        let negative_total: JsonRpcRequest = serde_json::from_str(&format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{negative_total_params}}}"#
         ))
-        .expect("one-variable non-monotonic progress notification parses");
+        .expect("one-variable negative total progress notification parses");
+        let negative_total =
+            ServerNotification::decode_with_raw_params(&negative_total, negative_total_params)
+                .expect("negative finite total is admitted");
+        let ServerNotification::Progress(negative_total_params) = negative_total else {
+            panic!("negative-total final progress notification decodes to the progress variant");
+        };
+        assert_eq!(
+            negative_total_params
+                .total
+                .as_ref()
+                .map(ExactNonNegativeJsonNumber::as_str),
+            Some("-2")
+        );
+
+        let greater_than_total_params =
+            r#"{"progressToken":"job-ordered","progress":1.20e+4,"total":11999.0}"#;
+        let greater_than_total: JsonRpcRequest = serde_json::from_str(&format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{greater_than_total_params}}}"#
+        ))
+        .expect("one-variable greater-than-total progress notification parses");
+        let greater_than_total = ServerNotification::decode_with_raw_params(
+            &greater_than_total,
+            greater_than_total_params,
+        )
+        .expect("finite final progress greater than its total is admitted");
+        let ServerNotification::Progress(greater_than_total_params) = greater_than_total else {
+            panic!("greater-than-total notification decodes to the progress variant");
+        };
         assert!(
-            matches!(
-                ServerNotification::decode_with_raw_params(&non_monotonic, non_monotonic_params),
-                Err(FinalNotificationError::InvalidParams {
-                    method: NOTIFICATIONS_PROGRESS
-                })
-            ),
-            "changing only total below progress rejects non-monotonic final progress"
+            greater_than_total_params.progress
+                > *greater_than_total_params
+                    .total
+                    .as_ref()
+                    .expect("greater-than-total notification retains total"),
+            "the admitted final values retain their unconstrained numeric relationship"
         );
         assert_eq!(
             serde_json::to_value(admitted.encode().expect("baseline progress re-encodes"))
                 .expect("baseline progress JSON serializes"),
             baseline_wire,
-            "rejections cannot mutate the admitted exact progress baseline"
+            "admitting unconstrained finite values cannot mutate the exact progress baseline"
         );
     }
 
@@ -8929,22 +9096,43 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn log_level_serialization() {
-        assert_eq!(serde_json::to_value(LogLevel::Debug).unwrap(), "debug");
-        assert_eq!(serde_json::to_value(LogLevel::Info).unwrap(), "info");
-        assert_eq!(serde_json::to_value(LogLevel::Warning).unwrap(), "warning");
-        assert_eq!(serde_json::to_value(LogLevel::Error).unwrap(), "error");
-    }
-
-    #[test]
-    fn log_level_deserialization() {
-        assert_eq!(
-            serde_json::from_value::<LogLevel>(serde_json::json!("debug")).unwrap(),
-            LogLevel::Debug
-        );
-        assert_eq!(
-            serde_json::from_value::<LogLevel>(serde_json::json!("warning")).unwrap(),
-            LogLevel::Warning
+    fn exact_2024_log_levels_round_trip_on_logging_params() {
+        for (level, wire) in [
+            (LogLevel::Emergency, "emergency"),
+            (LogLevel::Alert, "alert"),
+            (LogLevel::Critical, "critical"),
+            (LogLevel::Error, "error"),
+            (LogLevel::Warning, "warning"),
+            (LogLevel::Notice, "notice"),
+            (LogLevel::Info, "info"),
+            (LogLevel::Debug, "debug"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(level).expect("log level serializes"),
+                wire
+            );
+            assert_eq!(
+                serde_json::from_value::<LogLevel>(serde_json::json!(wire))
+                    .expect("exact 2024 log level deserializes"),
+                level
+            );
+            assert_eq!(
+                serde_json::to_value(SetLogLevelParams { level })
+                    .expect("set-level parameters serialize"),
+                serde_json::json!({"level": wire})
+            );
+            let message = serde_json::from_value::<LogMessageParams>(serde_json::json!({
+                "level": wire,
+                "data": "event"
+            }))
+            .expect("message parameters deserialize");
+            assert_eq!(message.level, level);
+            assert_eq!(message.logger, None);
+            assert_eq!(message.data, serde_json::json!("event"));
+        }
+        assert!(
+            serde_json::from_value::<LogLevel>(serde_json::json!("trace")).is_err(),
+            "the exact 2024 wire enum rejects non-MCP severity names"
         );
     }
 

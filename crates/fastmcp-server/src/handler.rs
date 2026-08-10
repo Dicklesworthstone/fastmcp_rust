@@ -160,7 +160,7 @@ where
     /// Creates a progress sender for MCP 2026-07-28 handler dispatch.
     ///
     /// Calls made through the ordinary [`ProgressReporter`] bridge are
-    /// admitted as exact nonnegative JSON numbers and emitted with
+    /// admitted as exact finite JSON numbers and emitted with
     /// [`FinalProgressNotificationParams`]. The exact-2024 constructor
     /// [`Self::new`] deliberately retains its `f64` wire model.
     pub fn new_final(marker: ProgressMarker, send_fn: F) -> Self {
@@ -241,13 +241,6 @@ where
             );
             return;
         }
-        if total.as_ref().is_some_and(|total| progress > *total) {
-            log::warn!(
-                target: "fastmcp_rust::handler",
-                "final progress notification rejected; reason=progress_exceeds_total"
-            );
-            return;
-        }
         let params = FinalProgressNotificationParams {
             progress_token: self.marker.clone(),
             progress,
@@ -296,7 +289,7 @@ where
             Err(_) => {
                 log::warn!(
                     target: "fastmcp_rust::handler",
-                    "final progress notification rejected; reason=invalid_nonnegative_numeric_value"
+                    "final progress notification rejected; reason=invalid_finite_numeric_value"
                 );
                 return;
             }
@@ -307,7 +300,7 @@ where
                 Err(_) => {
                     log::warn!(
                         target: "fastmcp_rust::handler",
-                        "final progress notification rejected; reason=invalid_nonnegative_numeric_value"
+                        "final progress notification rejected; reason=invalid_finite_numeric_value"
                     );
                     return;
                 }
@@ -319,20 +312,20 @@ where
 
     fn send_progress(&self, progress: f64, total: Option<f64>, message: Option<&str>) {
         if self.final_protocol {
-            let Some(progress) = exact_nonnegative_progress_from_f64(progress) else {
+            let Some(progress) = exact_finite_progress_from_f64(progress) else {
                 log::warn!(
                     target: "fastmcp_rust::handler",
-                    "final progress notification rejected; reason=invalid_nonnegative_numeric_value"
+                    "final progress notification rejected; reason=invalid_finite_numeric_value"
                 );
                 return;
             };
             let total = match total {
-                Some(total) => match exact_nonnegative_progress_from_f64(total) {
+                Some(total) => match exact_finite_progress_from_f64(total) {
                     Some(total) => Some(total),
                     None => {
                         log::warn!(
                             target: "fastmcp_rust::handler",
-                            "final progress notification rejected; reason=invalid_nonnegative_numeric_value"
+                            "final progress notification rejected; reason=invalid_finite_numeric_value"
                         );
                         return;
                     }
@@ -348,7 +341,7 @@ where
     }
 }
 
-fn exact_nonnegative_progress_from_f64(value: f64) -> Option<ExactNonNegativeJsonNumber> {
+fn exact_finite_progress_from_f64(value: f64) -> Option<ExactNonNegativeJsonNumber> {
     value
         .is_finite()
         .then(|| ExactNonNegativeJsonNumber::parse(&value.to_string()).ok())
@@ -3053,11 +3046,11 @@ mod tests {
     }
 
     #[test]
-    fn public_final_context_exact_progress_rejects_one_smaller_total_without_emission() {
+    fn public_final_context_exact_progress_admits_signed_and_greater_than_total_values() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_clone = Arc::clone(&sent);
         let reporter = ProgressNotificationSender::new_final(
-            ProgressMarker::from("invalid-final-progress"),
+            ProgressMarker::from("unconstrained-final-progress"),
             move |request| {
                 sent_clone
                     .lock()
@@ -3069,23 +3062,38 @@ mod tests {
         let context = McpContext::with_progress(Cx::for_testing(), 2804, reporter);
 
         context.report_progress_exact(
-            serde_json::from_str("1e400").expect("baseline progress parses"),
-            Some(serde_json::from_str("1e400").expect("baseline total parses")),
-            Some("complete"),
-        );
-        context.report_progress_exact(
             serde_json::from_str("1e400").expect("unchanged progress parses"),
             Some(serde_json::from_str("1e399").expect("one-variable smaller total parses")),
             Some("complete"),
         );
-
-        assert_eq!(
-            sent.lock()
-                .expect("notification collection is not poisoned")
-                .len(),
-            1,
-            "changing only total below progress must not emit a second notification"
+        context.report_progress_exact(
+            serde_json::from_str("-1").expect("negative progress parses"),
+            Some(serde_json::from_str("-2").expect("negative total parses")),
+            Some("rollback"),
         );
+
+        let notifications = sent
+            .lock()
+            .expect("notification collection is not poisoned");
+        assert_eq!(notifications.len(), 2);
+        let first = serde_json::to_string(
+            notifications[0]
+                .params
+                .as_ref()
+                .expect("first notification has parameters"),
+        )
+        .expect("first final progress parameters serialize");
+        let second = serde_json::to_string(
+            notifications[1]
+                .params
+                .as_ref()
+                .expect("second notification has parameters"),
+        )
+        .expect("second final progress parameters serialize");
+        assert!(first.contains("\"progress\":1e+400"));
+        assert!(first.contains("\"total\":1e+399"));
+        assert!(second.contains("\"progress\":-1"));
+        assert!(second.contains("\"total\":-2"));
     }
 
     #[test]

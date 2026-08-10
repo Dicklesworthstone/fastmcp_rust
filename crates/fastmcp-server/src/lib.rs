@@ -686,21 +686,31 @@ struct LiveLegacy2024ConnectionRuntime {
 fn map_legacy_log_level(level: &str, ceiling: LevelFilter) -> Option<LogLevel> {
     let mapped = match level {
         "debug" => LogLevel::Debug,
-        "info" | "notice" => LogLevel::Info,
+        "info" => LogLevel::Info,
+        "notice" => LogLevel::Notice,
         "warning" => LogLevel::Warning,
-        "error" | "alert" | "critical" | "emergency" => LogLevel::Error,
+        "error" => LogLevel::Error,
+        "critical" => LogLevel::Critical,
+        "alert" => LogLevel::Alert,
+        "emergency" => LogLevel::Emergency,
         _ => return None,
     };
     let requested = match mapped {
         LogLevel::Debug => LevelFilter::Debug,
-        LogLevel::Info => LevelFilter::Info,
+        LogLevel::Info | LogLevel::Notice => LevelFilter::Info,
         LogLevel::Warning => LevelFilter::Warn,
-        LogLevel::Error => LevelFilter::Error,
+        LogLevel::Error | LogLevel::Critical | LogLevel::Alert | LogLevel::Emergency => {
+            LevelFilter::Error
+        }
     };
     if ceiling == LevelFilter::Off {
         return None;
     }
-    Some(match requested.min(ceiling) {
+    let effective = requested.min(ceiling);
+    if effective == requested {
+        return Some(mapped);
+    }
+    Some(match effective {
         LevelFilter::Debug => LogLevel::Debug,
         LevelFilter::Info => LogLevel::Info,
         LevelFilter::Warn => LogLevel::Warning,
@@ -12525,9 +12535,11 @@ impl Server {
     fn handle_set_log_level(&self, session: &mut Session, params: SetLogLevelParams) {
         let requested = match params.level {
             LogLevel::Debug => LevelFilter::Debug,
-            LogLevel::Info => LevelFilter::Info,
+            LogLevel::Info | LogLevel::Notice => LevelFilter::Info,
             LogLevel::Warning => LevelFilter::Warn,
-            LogLevel::Error => LevelFilter::Error,
+            LogLevel::Error | LogLevel::Critical | LogLevel::Alert | LogLevel::Emergency => {
+                LevelFilter::Error
+            }
         };
 
         let configured = self.logging.level;
@@ -12547,16 +12559,20 @@ impl Server {
             return;
         }
 
-        let effective_level = match effective {
-            LevelFilter::Debug => LogLevel::Debug,
-            LevelFilter::Info => LogLevel::Info,
-            LevelFilter::Warn => LogLevel::Warning,
-            LevelFilter::Error => LogLevel::Error,
-            // A client cannot request Trace through MCP; defensively clamp a
-            // future/internal Trace value to the most verbose protocol level.
-            LevelFilter::Trace => LogLevel::Debug,
-            // Handled by the early return above.
-            LevelFilter::Off => LogLevel::Error,
+        let effective_level = if effective == requested {
+            params.level
+        } else {
+            match effective {
+                LevelFilter::Debug => LogLevel::Debug,
+                LevelFilter::Info => LogLevel::Info,
+                LevelFilter::Warn => LogLevel::Warning,
+                LevelFilter::Error => LogLevel::Error,
+                // A client cannot request Trace through MCP; defensively clamp a
+                // future/internal Trace value to the most verbose protocol level.
+                LevelFilter::Trace => LogLevel::Debug,
+                // Handled by the early return above.
+                LevelFilter::Off => LogLevel::Error,
+            }
         };
         session.set_log_level(effective_level);
 
@@ -12580,8 +12596,12 @@ impl Server {
         match level {
             LogLevel::Debug => 1,
             LogLevel::Info => 2,
-            LogLevel::Warning => 3,
-            LogLevel::Error => 4,
+            LogLevel::Notice => 3,
+            LogLevel::Warning => 4,
+            LogLevel::Error => 5,
+            LogLevel::Critical => 6,
+            LogLevel::Alert => 7,
+            LogLevel::Emergency => 8,
         }
     }
 
@@ -18155,23 +18175,41 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn legacy_logging_maps_notice_and_high_severity_levels() {
-        assert_eq!(
-            map_legacy_log_level("notice", LevelFilter::Info),
-            Some(LogLevel::Info)
-        );
-        assert_eq!(
-            map_legacy_log_level("critical", LevelFilter::Error),
-            Some(LogLevel::Error)
-        );
-        assert_eq!(
-            map_legacy_log_level("alert", LevelFilter::Error),
-            Some(LogLevel::Error)
-        );
-        assert_eq!(
-            map_legacy_log_level("emergency", LevelFilter::Error),
-            Some(LogLevel::Error)
-        );
+    fn legacy_logging_maps_all_eight_levels_without_losing_severity() {
+        for (wire, ceiling, expected) in [
+            ("debug", LevelFilter::Debug, LogLevel::Debug),
+            ("info", LevelFilter::Info, LogLevel::Info),
+            ("notice", LevelFilter::Info, LogLevel::Notice),
+            ("warning", LevelFilter::Warn, LogLevel::Warning),
+            ("error", LevelFilter::Error, LogLevel::Error),
+            ("critical", LevelFilter::Error, LogLevel::Critical),
+            ("alert", LevelFilter::Error, LogLevel::Alert),
+            ("emergency", LevelFilter::Error, LogLevel::Emergency),
+        ] {
+            assert_eq!(map_legacy_log_level(wire, ceiling), Some(expected));
+        }
+    }
+
+    #[test]
+    fn legacy_set_log_level_preserves_all_eight_levels_when_unclamped() {
+        let server = Server::new("legacy-log-levels", "1.0.0")
+            .log_level(Level::Debug)
+            .build();
+        let mut session = initialized_test_session(&server);
+
+        for level in [
+            LogLevel::Debug,
+            LogLevel::Info,
+            LogLevel::Notice,
+            LogLevel::Warning,
+            LogLevel::Error,
+            LogLevel::Critical,
+            LogLevel::Alert,
+            LogLevel::Emergency,
+        ] {
+            server.handle_set_log_level(&mut session, SetLogLevelParams { level });
+            assert_eq!(session.log_level(), Some(level));
+        }
     }
 
     #[test]
@@ -18204,11 +18242,18 @@ mod lib_unit_tests {
 
     #[test]
     fn log_level_rank_ordering() {
-        assert!(Server::log_level_rank(LogLevel::Debug) < Server::log_level_rank(LogLevel::Info));
-        assert!(Server::log_level_rank(LogLevel::Info) < Server::log_level_rank(LogLevel::Warning));
-        assert!(
-            Server::log_level_rank(LogLevel::Warning) < Server::log_level_rank(LogLevel::Error)
-        );
+        for (level, expected_rank) in [
+            (LogLevel::Debug, 1),
+            (LogLevel::Info, 2),
+            (LogLevel::Notice, 3),
+            (LogLevel::Warning, 4),
+            (LogLevel::Error, 5),
+            (LogLevel::Critical, 6),
+            (LogLevel::Alert, 7),
+            (LogLevel::Emergency, 8),
+        ] {
+            assert_eq!(Server::log_level_rank(level), expected_rank);
+        }
     }
 
     // ── ActiveRequestGuard ──────────────────────────────────────────
