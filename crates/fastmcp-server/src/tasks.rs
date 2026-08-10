@@ -7013,9 +7013,11 @@ mod tests {
             serde_json::from_value(serde_json::json!({"content": []}))
                 .expect("typed terminal task result");
         match handoff {
-            FinalTaskSupervisorHandoff::Initial(initial) => initial.complete_task(result, None)?,
+            FinalTaskSupervisorHandoff::Initial(initial) => {
+                let _ = initial.complete_task(result, None)?;
+            }
             FinalTaskSupervisorHandoff::Resumed(accepted) => {
-                accepted.complete_task(result, None)?;
+                let _ = accepted.complete_task(result, None)?;
             }
         }
         Ok(())
@@ -9186,7 +9188,7 @@ mod tests {
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let delivered_for_emitter = Arc::clone(&delivered);
         let runtime = FinalTaskRuntime::new(
-            Arc::clone(&store),
+            store.clone() as Arc<dyn FinalTaskStore>,
             FinalTaskRuntimeConfig::new(60_000, Some(5_000))
                 .expect("a finite final task policy is valid"),
             Arc::new(move |notification| {

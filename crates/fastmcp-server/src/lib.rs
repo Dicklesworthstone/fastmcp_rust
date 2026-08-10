@@ -14454,7 +14454,8 @@ mod lib_unit_tests {
     #[test]
     fn builder_mcp_apps_ui_resource_binds_a_final_only_ui_catalog_entry() {
         let resource = crate::providers::McpAppsUiResource::try_new(
-            fastmcp_protocol::AbsoluteUri::parse("ui://weather/dashboard").expect("valid ui URI"),
+            fastmcp_protocol::common_types::AbsoluteUri::parse("ui://weather/dashboard")
+                .expect("valid ui URI"),
             "weather-dashboard",
             "<main>weather</main>",
         )
@@ -14520,7 +14521,8 @@ mod lib_unit_tests {
     #[test]
     fn builder_mcp_apps_ui_resource_rejects_only_missing_apps_opt_in_without_mutation() {
         let resource = crate::providers::McpAppsUiResource::try_new(
-            fastmcp_protocol::AbsoluteUri::parse("ui://weather/dashboard").expect("valid ui URI"),
+            fastmcp_protocol::common_types::AbsoluteUri::parse("ui://weather/dashboard")
+                .expect("valid ui URI"),
             "weather-dashboard",
             "<main>weather</main>",
         )
