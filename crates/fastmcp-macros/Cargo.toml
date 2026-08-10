@@ -15,6 +15,9 @@ categories = ["development-tools::procedural-macro-helpers"]
 [lib]
 proc-macro = true
 
+[features]
+tasks = []
+
 [dependencies]
 fastmcp-protocol.workspace = true
 proc-macro2 = "=1.0.107"

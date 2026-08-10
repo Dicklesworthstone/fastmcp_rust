@@ -1563,9 +1563,9 @@ fn is_canonical_final_tool_outcome(ty: &Type) -> bool {
     };
     let segments = &type_path.path.segments;
     if segments.len() < 2
-        || !segments
+        || segments
             .last()
-            .is_some_and(|segment| segment.ident == "FinalToolOutcome")
+            .is_none_or(|segment| segment.ident != "FinalToolOutcome")
     {
         return false;
     }
@@ -2602,8 +2602,10 @@ mod async_handler_expansion_tests {
         generate_final_tool_outcome_conversion, generate_final_tool_payload_projection,
         generate_final_tool_result_conversion, generate_prompt_execution_methods,
         generate_resource_execution_methods, generate_tool_execution_methods,
-        generate_tool_tasks_declaration, validate_final_handler_return, validate_tool_tasks_return,
+        validate_final_handler_return,
     };
+    #[cfg(feature = "tasks")]
+    use super::{generate_tool_tasks_declaration, validate_tool_tasks_return};
     use proc_macro_crate::FoundCrate;
     use quote::{format_ident, quote};
 
@@ -2889,6 +2891,7 @@ mod async_handler_expansion_tests {
         }
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn tool_tasks_opt_in_is_bound_to_canonical_final_tool_outcomes() {
         let attrs: ToolAttrs = syn::parse_str("tasks").expect("the bare tasks opt-in parses");
@@ -2920,6 +2923,27 @@ mod async_handler_expansion_tests {
         );
         assert!(declaration.contains("true"), "{declaration}");
         assert!(generate_tool_tasks_declaration(false).is_empty());
+    }
+
+    #[cfg(not(feature = "tasks"))]
+    #[test]
+    fn tool_tasks_forms_require_the_feature_before_expansion() {
+        const DIAGNOSTIC: &str = "#[tool(tasks)] requires the fastmcp-derive `tasks` feature; enable fastmcp-rust's `tasks` feature or fastmcp-derive's `tasks` feature";
+
+        for attributes in ["tasks", "tasks = true", "tasks()"] {
+            let error = syn::parse_str::<ToolAttrs>(attributes)
+                .expect_err("every Tasks-specific spelling must be feature-gated");
+            assert_eq!(error.to_string(), DIAGNOSTIC, "{attributes}");
+        }
+    }
+
+    #[test]
+    fn tool_rejects_unsupported_apps_ui_syntax() {
+        let error = syn::parse_str::<ToolAttrs>(
+            "ui(resource_uri = \"ui://weather/dashboard\", visibility = [\"model\", \"app\"])",
+        )
+        .expect_err("the canonical macro surface has no Apps-specific ui attribute");
+        assert_eq!(error.to_string(), "unknown attribute");
     }
 
     #[test]
@@ -3596,6 +3620,12 @@ impl Parse for ToolAttrs {
                     timeout = Some(lit.value());
                 }
                 "tasks" => {
+                    if !cfg!(feature = "tasks") {
+                        return Err(syn::Error::new(
+                            ident.span(),
+                            "#[tool(tasks)] requires the fastmcp-derive `tasks` feature; enable fastmcp-rust's `tasks` feature or fastmcp-derive's `tasks` feature",
+                        ));
+                    }
                     if input.peek(Token![=]) {
                         return Err(syn::Error::new(
                             ident.span(),
@@ -3976,8 +4006,9 @@ mod schema_bound_tool_expansion_tests {
 /// - `tags` - List of tool tags for filtering (`tags = ["api", "read"]`)
 /// - `output_schema` - An inline JSON object (legacy form), or a bare return
 ///   type path with `json_schema()` (typed result form)
-/// - `tasks` - Opt a canonical `FinalToolOutcome` return into final Tasks
-///   creation; incompatible return types are rejected at compile time
+/// - `tasks` - With the `fastmcp-derive/tasks` feature enabled, opt a
+///   canonical `FinalToolOutcome` return into final Tasks creation;
+///   incompatible return types are rejected at compile time
 ///
 /// # Parameter Defaults
 ///
