@@ -1745,9 +1745,14 @@ mod tests {
     use super::*;
     use asupersync::Cx;
     use fastmcp_core::{McpContext, McpResult};
+    use fastmcp_protocol::common_types::{ContentBlock, Implementation};
     use fastmcp_protocol::extensions::ExtensionNegotiationError;
     use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy, StdioOpeningFrame};
-    use fastmcp_protocol::{Content, JsonRpcRequest, Prompt, Resource, ResourceContent, Tool};
+    use fastmcp_protocol::{
+        CallToolResult, CompleteResult, Content, CoreResult, FinalCallToolResult,
+        FinalCoreResult, JsonRpcRequest, LegacyContent, LegacyCoreResult, Prompt, Resource,
+        ResourceContent, ResultMeta, Tool,
+    };
 
     // ── Stub handlers ────────────────────────────────────────────────
 
@@ -3112,6 +3117,25 @@ mod tests {
         )
     }
 
+    fn final_tools_call_request(
+        name: &str,
+        arguments: serde_json::Value,
+        id: i64,
+    ) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": name,
+                "arguments": arguments,
+            })),
+            id,
+        )
+    }
+
     fn final_catalog_proxy_client(era: ProtocolEra) -> ProxyClient {
         let mut bindings = ProxyClient::upstream_binding_registry();
         let policy = match era {
@@ -3141,6 +3165,182 @@ mod tests {
             &upstream_protocol_version,
         )
         .expect("the selected upstream version matches its immutable binding")
+    }
+
+    #[derive(Clone, Copy)]
+    enum DualEraProxyRoute {
+        Legacy,
+        Final,
+    }
+
+    struct RecordingDualEraProxyBackend {
+        route: DualEraProxyRoute,
+        calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    impl RecordingDualEraProxyBackend {
+        fn record(&self, name: &str, arguments: serde_json::Value) {
+            self.calls
+                .lock()
+                .expect("the test call log lock is not poisoned")
+                .push((name.to_owned(), arguments));
+        }
+    }
+
+    impl crate::proxy::ProxyBackend for RecordingDualEraProxyBackend {
+        fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
+            Ok(Vec::new())
+        }
+
+        fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
+            Ok(Vec::new())
+        }
+
+        fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
+            Ok(Vec::new())
+        }
+
+        fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
+            Ok(Vec::new())
+        }
+
+        fn call_tool(
+            &mut self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            self.record(name, arguments);
+            Ok(vec![Content::text(match self.route {
+                DualEraProxyRoute::Legacy => "bound legacy proxy",
+                DualEraProxyRoute::Final => "bound final proxy",
+            })])
+        }
+
+        fn call_tool_with_progress(
+            &mut self,
+            name: &str,
+            arguments: serde_json::Value,
+            _: crate::proxy::ProgressCallback<'_>,
+        ) -> McpResult<Vec<Content>> {
+            self.call_tool(name, arguments)
+        }
+
+        fn read_resource(&mut self, _: &str) -> McpResult<Vec<ResourceContent>> {
+            Ok(Vec::new())
+        }
+
+        fn get_prompt(
+            &mut self,
+            _: &str,
+            _: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn call_tool_result(
+            &mut self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> McpResult<CoreResult> {
+            self.record(name, arguments);
+            match self.route {
+                DualEraProxyRoute::Legacy => Ok(CoreResult::Legacy(
+                    LegacyCoreResult::ToolsCall(CallToolResult {
+                        content: vec![LegacyContent::Text {
+                            text: "bound legacy proxy".to_owned(),
+                            annotations: None,
+                            additional: std::collections::BTreeMap::new(),
+                        }],
+                        is_error: false,
+                        meta: None,
+                        additional: std::collections::BTreeMap::new(),
+                    }),
+                )),
+                DualEraProxyRoute::Final => Ok(CoreResult::Final(FinalCoreResult::ToolsCall {
+                    result: CompleteResult::new(
+                        FinalCallToolResult {
+                            content: vec![ContentBlock::text("bound final proxy")],
+                            is_error: false,
+                            structured_content: Some(serde_json::json!({"route": "final"})),
+                        },
+                        ResultMeta::server_generated(
+                            Implementation::try_new("bound-final-upstream", "1.0")
+                                .expect("the fixed test implementation is valid"),
+                        ),
+                    ),
+                    diagnostic: None,
+                })),
+            }
+        }
+    }
+
+    fn dual_era_proxy_client(
+        route: DualEraProxyRoute,
+        calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    ) -> ProxyClient {
+        let era = match route {
+            DualEraProxyRoute::Legacy => ProtocolEra::Legacy2024,
+            DualEraProxyRoute::Final => ProtocolEra::Modern2026,
+        };
+        let (route_id, upstream_identity) = match route {
+            DualEraProxyRoute::Legacy => ("dual-era-legacy-route", "stdio:dual-era-legacy"),
+            DualEraProxyRoute::Final => ("dual-era-final-route", "stdio:dual-era-final"),
+        };
+        let policy = match era {
+            ProtocolEra::Modern2026 => ProtocolPolicy::ModernOnly,
+            ProtocolEra::Legacy2024 => ProtocolPolicy::LegacyOnly,
+        };
+        let opening = match era {
+            ProtocolEra::Modern2026 => StdioOpeningFrame::ModernRequest {
+                protocol_version: era.version().as_str().to_owned(),
+            },
+            ProtocolEra::Legacy2024 => StdioOpeningFrame::LegacyInitialize,
+        };
+        let mut bindings = ProxyClient::upstream_binding_registry();
+        let binding = bindings
+            .bind_stdio(route_id, upstream_identity, "dual-era-receipt", 1, policy, opening)
+            .expect("the test route selects one immutable era");
+        let upstream_protocol_version = era.version().as_str().to_owned();
+        ProxyClient::from_backend_with_upstream_binding(
+            RecordingDualEraProxyBackend { route, calls },
+            binding,
+            &upstream_protocol_version,
+        )
+        .expect("the selected upstream version matches its immutable binding")
+    }
+
+    fn dual_era_proxy_server(
+    ) -> (
+        crate::Server,
+        Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        let legacy_calls = Arc::new(Mutex::new(Vec::new()));
+        let final_calls = Arc::new(Mutex::new(Vec::new()));
+        let server = ServerBuilder::new("srv", "1.0")
+            .proxy(
+                dual_era_proxy_client(DualEraProxyRoute::Legacy, Arc::clone(&legacy_calls)),
+                legacy_proxy_catalog(),
+            )
+            .proxy(
+                dual_era_proxy_client(DualEraProxyRoute::Final, Arc::clone(&final_calls)),
+                final_proxy_catalog(),
+            )
+            .build();
+        (server, legacy_calls, final_calls)
+    }
+
+    fn initialized_legacy_proxy_session(server: &crate::Server) -> crate::Session {
+        let mut session = crate::Session::new(server.info().clone(), server.capabilities().clone());
+        session.initialize(
+            fastmcp_protocol::ClientInfo {
+                name: "dual-era-legacy-client".to_owned(),
+                version: "1.0".to_owned(),
+            },
+            fastmcp_protocol::ClientCapabilities::default(),
+            "2024-11-05".to_owned(),
+        );
+        session
     }
 
     fn assert_rejected_proxy_catalog_preserves_local_registration(catalog: ProxyCatalog) {
