@@ -4408,7 +4408,7 @@ impl ModernHttpClient {
             return Err(ModernHttpFinalCoreListenError::InvalidRequestId);
         }
         admit_final_tasks_result_discriminator(
-            &self.server_discovery,
+            &self.server_discovery(),
             OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
         )
         .map_err(|_| {
@@ -4467,7 +4467,7 @@ impl ModernHttpClient {
             .is_some();
         let client_extensions = if tasks_requested {
             admit_final_tasks_discovery_surface(
-                &self.server_discovery,
+                &self.server_discovery(),
                 TASK_STATUS_NOTIFICATION,
                 fastmcp_protocol::ExtensionDirection::ServerToClient,
             )
@@ -4525,7 +4525,7 @@ impl ModernHttpClient {
             return Err(ModernHttpClientError::InvalidRequestId);
         }
         admit_final_tasks_result_discriminator(
-            &self.server_discovery,
+            &self.server_discovery(),
             OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
         )
         .map_err(|_| ModernHttpClientError::TasksNegotiation)?;
@@ -4772,7 +4772,7 @@ impl ModernHttpClient {
         method: &'static str,
     ) -> Result<(TaskRequestMeta, BTreeMap<String, serde_json::Value>), ModernHttpClientError> {
         if !self
-            .server_discovery
+            .server_discovery()
             .supported_versions()
             .iter()
             .any(|version| version == MODERN_PROTOCOL_VERSION)
@@ -4780,7 +4780,7 @@ impl ModernHttpClient {
             return Err(ModernHttpClientError::DiscoveryDoesNotAdvertiseModernProtocol);
         }
         admit_final_tasks_discovery_surface(
-            &self.server_discovery,
+            &self.server_discovery(),
             method,
             ExtensionDirection::ClientToServer,
         )
