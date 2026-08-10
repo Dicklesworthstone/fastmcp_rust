@@ -15,8 +15,8 @@ use crate::bidirectional::{
 };
 use crate::handler::{
     BidirectionalSenders, BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
-    FinalToolOutcome, FinalToolSchemaAuthority, ProgressNotificationSender, UriParams,
-    empty_final_result_meta, encode_final_complete_result,
+    FinalToolOutcome, ProgressNotificationSender, UriParams, empty_final_result_meta,
+    encode_final_complete_result,
 };
 use crate::handler::{
     BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
@@ -575,12 +575,12 @@ fn admit_final_tool_error_structured_content<H: ToolHandler + ?Sized>(
 }
 
 fn admit_final_tool_schemas<H: ToolHandler + ?Sized>(
-    authority: FinalToolSchemaAuthority,
+    upstream_schema_registered: bool,
     input_schema: &serde_json::Value,
     output_schema: Option<&serde_json::Value>,
     handler: &H,
 ) -> McpResult<FinalToolSchemas> {
-    if authority == FinalToolSchemaAuthority::Upstream {
+    if upstream_schema_registered {
         // The upstream selected and already admitted this exact schema. In
         // particular, a proxy must retain a valid non-object JSON Schema
         // rather than treating it as a local framework schema or inventing a
@@ -676,12 +676,12 @@ impl AdmittedToolRegistration {
         definition: Tool,
         legacy_enabled: bool,
     ) -> McpResult<Self> {
-        let (exact_final_definition, declares_final_tasks, schema_authority) =
+        let (exact_final_definition, declares_final_tasks, upstream_schema_registered) =
             crate::catch_extension_unwind(|| {
                 (
                     handler.final_definition(),
                     handler.declares_final_tasks(),
-                    handler.final_tool_schema_authority(),
+                    handler.upstream_final_tool_schema_registration().is_some(),
                 )
             })
             .map_err(|_payload| {
@@ -721,7 +721,7 @@ impl AdmittedToolRegistration {
             ));
         }
         let schemas = admit_final_tool_schemas(
-            schema_authority,
+            upstream_schema_registered,
             &final_definition.input_schema,
             final_definition.output_schema.as_ref(),
             &handler,
@@ -6109,6 +6109,7 @@ mod router_tests {
     use crate::bidirectional::MrtrInputResponse;
     use crate::handler::{
         CompletionHandler, FinalToolSchemaAuthority, PromptHandler, ResourceHandler, ToolHandler,
+        UpstreamFinalToolSchemaRegistration,
     };
     use crate::tasks::{
         ApplicationTaskSupervisor, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
@@ -6696,7 +6697,7 @@ mod router_tests {
     }
 
     struct UpstreamScalarSchemaTool {
-        authority: FinalToolSchemaAuthority,
+        registered_proxy: bool,
     }
 
     impl ToolHandler for UpstreamScalarSchemaTool {
@@ -6714,7 +6715,15 @@ mod router_tests {
         }
 
         fn final_tool_schema_authority(&self) -> FinalToolSchemaAuthority {
-            self.authority
+            // This public, forgeable label must not bypass local validation.
+            FinalToolSchemaAuthority::Upstream
+        }
+
+        fn upstream_final_tool_schema_registration(
+            &self,
+        ) -> Option<UpstreamFinalToolSchemaRegistration> {
+            self.registered_proxy
+                .then(UpstreamFinalToolSchemaRegistration::exact_proxy)
         }
 
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
@@ -13279,18 +13288,18 @@ mod router_tests {
     }
 
     #[test]
-    fn upstream_schema_authority_retains_scalar_output_schema_without_local_validation() {
+    fn only_tokenized_upstream_schema_registration_bypasses_local_validation() {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1601, Budget::INFINITE, &state);
-        let mut upstream_router = Router::new();
-        upstream_router
+        let mut registered_proxy_router = Router::new();
+        registered_proxy_router
             .add_tool(UpstreamScalarSchemaTool {
-                authority: FinalToolSchemaAuthority::Upstream,
+                registered_proxy: true,
             })
             .expect("an upstream-owned scalar schema is retained without local admission");
 
-        let response = upstream_router
+        let response = registered_proxy_router
             .dispatch_stateless(
                 &request_ctx,
                 &final_tools_call_request(
@@ -13305,15 +13314,15 @@ mod router_tests {
             serde_json::json!({"upstream": true})
         );
 
-        let mut local_router = Router::new();
-        let error = local_router
+        let mut forged_router = Router::new();
+        let error = forged_router
             .add_tool(UpstreamScalarSchemaTool {
-                authority: FinalToolSchemaAuthority::Local,
+                registered_proxy: false,
             })
-            .expect_err("changing only schema authority retains the local schema admission rule");
+            .expect_err("a forgeable authority label cannot bypass local schema admission");
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert!(
-            local_router
+            forged_router
                 .get_tool("upstream-scalar-schema-tool")
                 .is_none()
         );
