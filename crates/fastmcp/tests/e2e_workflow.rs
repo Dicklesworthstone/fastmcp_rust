@@ -1215,7 +1215,6 @@ fn workflow_final_tasks_startup_guard_resumes_planted_pre_readiness_panic() {
 }
 
 struct E2eFinalTaskSupervisor {
-    runtime: FinalTaskRuntime,
     input_required: mpsc::SyncSender<()>,
     cancelled: mpsc::SyncSender<()>,
 }
@@ -1226,7 +1225,6 @@ impl ApplicationTaskSupervisor for E2eFinalTaskSupervisor {
         cx: &'a Cx,
         handoff: FinalTaskSupervisorHandoff,
     ) -> FinalTaskSupervisorFuture<'a> {
-        let runtime = self.runtime.clone();
         let input_required = self.input_required.clone();
         let cancelled = self.cancelled.clone();
         Box::pin(async move {
@@ -1236,8 +1234,7 @@ impl ApplicationTaskSupervisor for E2eFinalTaskSupervisor {
                         "roots": {"method": "roots/list"}
                     }))
                     .expect("the public final roots input descriptor is typed");
-                    runtime.require_input(
-                        initial.task_id(),
+                    initial.require_input(
                         requests,
                         Some("awaiting roots from live supervisor".to_owned()),
                     )?;
@@ -1245,22 +1242,17 @@ impl ApplicationTaskSupervisor for E2eFinalTaskSupervisor {
                         McpError::internal_error("E2E input-required observer dropped")
                     })?;
                 }
-                FinalTaskSupervisorHandoff::Resumed(accepted) => {
-                    let task_id = accepted.task_id().clone();
-                    loop {
-                        if runtime.is_cancellation_requested(&task_id)? {
-                            runtime.honor_cancellation(
-                                &task_id,
-                                Some("cancelled by live supervisor".to_owned()),
-                            )?;
-                            cancelled.send(()).map_err(|_| {
-                                McpError::internal_error("E2E cancellation observer dropped")
-                            })?;
-                            break;
-                        }
-                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                FinalTaskSupervisorHandoff::Resumed(accepted) => loop {
+                    if accepted.is_cancellation_requested()? {
+                        accepted
+                            .honor_cancellation(Some("cancelled by live supervisor".to_owned()))?;
+                        cancelled.send(()).map_err(|_| {
+                            McpError::internal_error("E2E cancellation observer dropped")
+                        })?;
+                        break;
                     }
-                }
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                },
             }
             Ok(())
         })
@@ -1413,7 +1405,6 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
         .install_task_service(
             1,
             Arc::new(E2eFinalTaskSupervisor {
-                runtime: runtime.clone(),
                 input_required: input_required_tx,
                 cancelled: cancelled_tx,
             }),
@@ -1545,7 +1536,6 @@ fn workflow_public_http_state_only_mrtr_rejects_explicit_empty_without_consuming
         .install_task_service(
             1,
             Arc::new(E2eFinalTaskSupervisor {
-                runtime: runtime.clone(),
                 input_required,
                 cancelled,
             }),
