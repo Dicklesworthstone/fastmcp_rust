@@ -7,9 +7,9 @@
 //! malformed peer ingress into a peer-directed JSON-RPC response.
 
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::rc::Rc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
@@ -584,6 +584,111 @@ pub struct CancellationRequested {
     pub reason: ExecutionTerminalReason,
 }
 
+/// Cooperative cancellation handle owned by one exact-2024 reverse request.
+///
+/// The executor cancels this handle only after accepting an ID-free legacy
+/// `notifications/cancelled` notification that names this request's live
+/// owner. A callback must use its own checkpoints before producing effects.
+const REVERSE_CALLBACK_OPEN: u8 = 0;
+const REVERSE_CALLBACK_CANCELLED: u8 = 1;
+const REVERSE_CALLBACK_RESPONSE_SENT: u8 = 2;
+
+#[derive(Clone, Debug)]
+pub struct ReverseRequestCancellation(Arc<AtomicU8>);
+
+impl ReverseRequestCancellation {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(REVERSE_CALLBACK_OPEN)))
+    }
+
+    pub(crate) fn cancel(&self) {
+        let _ = self.0.compare_exchange(
+            REVERSE_CALLBACK_OPEN,
+            REVERSE_CALLBACK_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.0.load(Ordering::Acquire) == REVERSE_CALLBACK_OPEN
+    }
+
+    pub(crate) fn record_response_sent(&self) {
+        let previous = self.0.compare_exchange(
+            REVERSE_CALLBACK_OPEN,
+            REVERSE_CALLBACK_RESPONSE_SENT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        debug_assert!(
+            previous.is_ok(),
+            "only an elected open callback can record a response write"
+        );
+    }
+
+    pub(crate) fn belongs_to_same_request(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Returns whether the server or owning connection cancelled this request.
+    #[must_use]
+    pub fn is_cancel_requested(&self) -> bool {
+        self.0.load(Ordering::Acquire) == REVERSE_CALLBACK_CANCELLED
+    }
+
+    /// Returns `RequestCancelled` when this reverse request is no longer live.
+    pub fn checkpoint(&self) -> McpResult<()> {
+        if self.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+        Ok(())
+    }
+}
+
+/// One exact-2024 server-authored reverse request together with its response
+/// capability.
+///
+/// The capability is local to both this request incarnation and this executor
+/// connection. It cannot answer a later request that happens to reuse the
+/// same JSON-RPC ID, including after a matching cancellation.
+#[derive(Clone, Debug)]
+pub struct ReverseRequest {
+    request: JsonRpcRequest,
+    cancellation: ReverseRequestCancellation,
+    owner: Arc<()>,
+}
+
+impl ReverseRequest {
+    /// Returns the exact server-authored request frame.
+    #[must_use]
+    pub fn request(&self) -> &JsonRpcRequest {
+        &self.request
+    }
+
+    /// Returns the exact response ID carried by this request.
+    #[must_use]
+    pub fn request_id(&self) -> &RequestId {
+        self.request
+            .id
+            .as_ref()
+            .expect("reverse request owners always retain a request ID")
+    }
+
+    /// Returns the cooperative cancellation handle for this request owner.
+    #[must_use]
+    pub fn cancellation(&self) -> &ReverseRequestCancellation {
+        &self.cancellation
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ActiveReverseRequest {
+    request_id: RequestId,
+    cancellation: ReverseRequestCancellation,
+    owner: Arc<()>,
+}
+
 /// Immutable receipt for the terminal CAS of one execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionTerminalRecord {
@@ -740,10 +845,69 @@ impl OpaquePagination {
 #[derive(Debug)]
 struct PendingExecution {
     record: PendingRequestRecord,
-    owner_dropped: Rc<Cell<bool>>,
+    owner_dropped: OwnerDropped,
     timeout_policy: RequestTimeoutPolicy,
     last_progress: Option<f64>,
     method: String,
+}
+
+/// Shared dropped-owner marker. This replaces the executor's local
+/// `Rc<Cell<bool>>` ownership so cloned execution handles can cross the
+/// negotiated stdio boundary without relying on thread-local state.
+#[derive(Clone, Debug)]
+struct OwnerDropped(Arc<AtomicBool>);
+
+impl OwnerDropped {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn get(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn set(&self, value: bool) {
+        self.0.store(value, Ordering::Release);
+    }
+}
+
+/// Mutex-backed executor state ownership.
+///
+/// The transport-neutral adapter retains its historical synchronous API. The
+/// negotiated stdio client uses its own sole ingress arbiter and shared
+/// response registry; this wrapper removes the old `Rc<RefCell<_>>` ownership
+/// from public request handles.
+#[derive(Debug)]
+struct SharedExecutorState<T>(Arc<Mutex<ExecutorState<T>>>);
+
+impl<T> Clone for SharedExecutorState<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T> SharedExecutorState<T> {
+    fn new(state: ExecutorState<T>) -> Self {
+        Self(Arc::new(Mutex::new(state)))
+    }
+
+    fn borrow(&self) -> MutexGuard<'_, ExecutorState<T>> {
+        self.0
+            .lock()
+            .expect("request executor state mutex poisoned")
+    }
+
+    fn borrow_mut(&self) -> MutexGuard<'_, ExecutorState<T>> {
+        self.borrow()
+    }
+
+    fn try_borrow_mut(&self) -> Result<MutexGuard<'_, ExecutorState<T>>, ()> {
+        self.0.try_lock().map_err(|_| ())
+    }
+
+    fn ptr_eq(left: &Self, right: &Self) -> bool {
+        Arc::ptr_eq(&left.0, &right.0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -853,11 +1017,22 @@ impl DecodedFinalResponse {
                     .expect("validated JSON-RPC final responses have either result or error");
                 match error.data {
                     Some(data) => Err(McpError::with_data(
-                        McpErrorCode::from(error.code),
+                        error
+                            .code
+                            .as_i32()
+                            .map(McpErrorCode::from)
+                            .unwrap_or(McpErrorCode::InternalError),
                         error.message,
                         data,
                     )),
-                    None => Err(McpError::new(McpErrorCode::from(error.code), error.message)),
+                    None => Err(McpError::new(
+                        error
+                            .code
+                            .as_i32()
+                            .map(McpErrorCode::from)
+                            .unwrap_or(McpErrorCode::InternalError),
+                        error.message,
+                    )),
                 }
             }
         }
@@ -887,8 +1062,8 @@ struct ExecutorState<T> {
     completed: HashMap<(RequestId, u64), ExecutionOutcome>,
     tombstones: HashMap<CorrelationKey, Tombstone>,
     notifications: VecDeque<JsonRpcRequest>,
-    reverse_requests: VecDeque<JsonRpcRequest>,
-    pending_reverse_request_ids: HashSet<RequestId>,
+    reverse_requests: VecDeque<ReverseRequest>,
+    pending_reverse_requests: HashMap<CorrelationKey, ActiveReverseRequest>,
     stream_notifications: HashMap<(RequestId, u64), VecDeque<JsonRpcRequest>>,
     uncorrelated_responses: VecDeque<JsonRpcResponse>,
     terminal_records: HashMap<(RequestId, u64), ExecutionTerminalRecord>,
@@ -923,24 +1098,34 @@ impl<T> ExecutorState<T> {
         let request_id = request.id.clone().ok_or_else(|| {
             McpError::invalid_request("Client reverse request omitted a JSON-RPC request ID")
         })?;
-        if self
-            .pending_reverse_request_ids
-            .iter()
-            .any(|owned_request_id| owned_request_id.correlates_with(&request_id))
-        {
+        let key = request_id.correlation_key().map_err(|_| {
+            McpError::invalid_request("Client reverse request has an invalid JSON-RPC request ID")
+        })?;
+        if self.pending_reverse_requests.contains_key(&key) {
             return Err(McpError::invalid_request(
                 "Client reverse request ID is already active",
             ));
         }
-        self.pending_reverse_request_ids.insert(request_id.clone());
         if self.reverse_requests.len() >= MAX_RETAINED_PEER_ACTIVITY {
-            let removed = self.pending_reverse_request_ids.remove(&request_id);
-            debug_assert!(removed);
             return Err(McpError::internal_error(
                 "Client reverse-request queue is full",
             ));
         }
-        self.reverse_requests.push_back(request);
+        let cancellation = ReverseRequestCancellation::new();
+        let owner = Arc::new(());
+        self.pending_reverse_requests.insert(
+            key,
+            ActiveReverseRequest {
+                request_id: request_id.clone(),
+                cancellation: cancellation.clone(),
+                owner: Arc::clone(&owner),
+            },
+        );
+        self.reverse_requests.push_back(ReverseRequest {
+            request,
+            cancellation,
+            owner,
+        });
         Ok(())
     }
 
@@ -981,14 +1166,21 @@ impl<T> ExecutorState<T> {
         }
     }
 
+    fn cancel_reverse_requests(&mut self) {
+        for reverse_request in self.pending_reverse_requests.values() {
+            reverse_request.cancellation.cancel();
+        }
+        self.pending_reverse_requests.clear();
+        self.reverse_requests.clear();
+    }
+
     fn fail_all(&mut self, error: McpError, reason: ExecutionTerminalReason) {
         if self.terminal_error.is_some() {
             return;
         }
         self.terminal_error = Some(error.clone());
         self.tombstones.clear();
-        self.pending_reverse_request_ids.clear();
-        self.reverse_requests.clear();
+        self.cancel_reverse_requests();
         self.task_subscriptions.clear();
         self.deferred_drop_cancellations.clear();
         let pending = std::mem::take(&mut self.pending);
@@ -1022,7 +1214,7 @@ impl<T> ExecutorState<T> {
 /// consumed by the request currently driving the reader.
 #[derive(Debug)]
 pub struct RequestExecutor<T> {
-    state: Rc<RefCell<ExecutorState<T>>>,
+    state: SharedExecutorState<T>,
     tombstone_retention: Duration,
     max_in_flight: usize,
     max_correlations: usize,
@@ -1059,14 +1251,14 @@ where
     #[must_use]
     pub fn with_result_peer_era(transport: T, result_peer_era: ResultPeerEra) -> Self {
         Self {
-            state: Rc::new(RefCell::new(ExecutorState {
+            state: SharedExecutorState::new(ExecutorState {
                 transport,
                 pending: HashMap::new(),
                 completed: HashMap::new(),
                 tombstones: HashMap::new(),
                 notifications: VecDeque::new(),
                 reverse_requests: VecDeque::new(),
-                pending_reverse_request_ids: HashSet::new(),
+                pending_reverse_requests: HashMap::new(),
                 stream_notifications: HashMap::new(),
                 uncorrelated_responses: VecDeque::new(),
                 terminal_records: HashMap::new(),
@@ -1078,7 +1270,7 @@ where
                 result_peer_era,
                 terminal_error: None,
                 shutdown: false,
-            })),
+            }),
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT_EXECUTIONS,
             max_correlations: DEFAULT_MAX_RESPONSE_CORRELATIONS,
@@ -1177,7 +1369,7 @@ where
                     "Client execution absolute deadline exceeds the clock range",
                 )
             })?;
-        let owner_dropped = Rc::new(Cell::new(false));
+        let owner_dropped = OwnerDropped::new();
         state.pending.insert(
             correlation_key.clone(),
             PendingExecution {
@@ -1611,7 +1803,12 @@ where
     }
 
     /// Removes and returns exact-legacy peer requests that require a client response.
-    pub fn take_reverse_requests(&self) -> Vec<JsonRpcRequest> {
+    ///
+    /// Each returned request retains its own response capability and
+    /// cancellation handle. Pass the same value to
+    /// [`Self::respond_to_reverse_request`] so an old callback cannot respond
+    /// to a later peer request that reuses its JSON-RPC ID.
+    pub fn take_reverse_requests(&self) -> Vec<ReverseRequest> {
         self.state.borrow_mut().reverse_requests.drain(..).collect()
     }
 
@@ -1619,7 +1816,7 @@ where
     pub fn respond_to_reverse_request(
         &self,
         cx: &Cx,
-        request_id: RequestId,
+        request: &ReverseRequest,
         result: Value,
     ) -> McpResult<()> {
         let mut state = self.state.borrow_mut();
@@ -1633,16 +1830,27 @@ where
                 "Client request executor connection is no longer usable",
             ));
         }
-        let owned_request_id = state
-            .pending_reverse_request_ids
-            .iter()
-            .find(|owned_request_id| owned_request_id.correlates_with(&request_id))
-            .cloned();
-        let Some(owned_request_id) = owned_request_id else {
+        let request_id = request.request_id();
+        let key = request_id.correlation_key().map_err(|_| {
+            McpError::invalid_request("Client reverse response has an invalid JSON-RPC request ID")
+        })?;
+        let Some(active) = state.pending_reverse_requests.get(&key) else {
             return Err(McpError::invalid_request(
                 "Client reverse response does not own a live peer request ID",
             ));
         };
+        if !Arc::ptr_eq(&active.owner, &request.owner)
+            || !active
+                .cancellation
+                .belongs_to_same_request(&request.cancellation)
+            || !active.request_id.correlates_with(request_id)
+            || !request.cancellation.is_open()
+        {
+            return Err(McpError::invalid_request(
+                "Client reverse response does not own a live peer request ID",
+            ));
+        }
+        let owned_request_id = active.request_id.clone();
         state
             .transport
             .send(
@@ -1653,13 +1861,11 @@ where
                 )),
             )
             .map_err(|error| self.handle_send_error_locked(&mut state, error))?;
-        let removed = state.pending_reverse_request_ids.remove(&owned_request_id);
-        debug_assert!(removed);
+        request.cancellation.record_response_sent();
+        let removed = state.pending_reverse_requests.remove(&key);
+        debug_assert!(removed.is_some());
         state.reverse_requests.retain(|request| {
-            request
-                .id
-                .as_ref()
-                .is_none_or(|request_id| !request_id.correlates_with(&owned_request_id))
+            !request.request_id().correlates_with(&owned_request_id)
         });
         Ok(())
     }
@@ -1758,6 +1964,7 @@ where
                 cleanup_error.get_or_insert(error);
             }
         }
+        state.cancel_reverse_requests();
         if let Err(error) = state.transport.close() {
             let error = transport_error_to_mcp(error);
             state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
@@ -2122,18 +2329,14 @@ where
         };
         match cancellation {
             CancellationWireMessage::Legacy2024 { params, .. } => {
-                let owned_request_id = state
-                    .pending_reverse_request_ids
-                    .iter()
-                    .find(|request_id| request_id.correlates_with(&params.request_id))
-                    .cloned();
-                if let Some(owned_request_id) = owned_request_id {
-                    state.pending_reverse_request_ids.remove(&owned_request_id);
+                let key = params.request_id.correlation_key().ok();
+                if let Some(active) = key
+                    .as_ref()
+                    .and_then(|key| state.pending_reverse_requests.remove(key))
+                {
+                    active.cancellation.cancel();
                     state.reverse_requests.retain(|request| {
-                        request
-                            .id
-                            .as_ref()
-                            .is_none_or(|request_id| !request_id.correlates_with(&owned_request_id))
+                        !Arc::ptr_eq(&request.owner, &active.owner)
                     });
                 }
             }
@@ -2574,8 +2777,8 @@ fn validate_task_subscription_filter(
 pub struct RequestExecution<T> {
     request_id: RequestId,
     generation: u64,
-    owner_dropped: Rc<Cell<bool>>,
-    state: Rc<RefCell<ExecutorState<T>>>,
+    owner_dropped: OwnerDropped,
+    state: SharedExecutorState<T>,
     method: String,
     params: Option<Value>,
     task_operation: Option<TaskExecutionOperation>,
@@ -2614,8 +2817,8 @@ impl<T> RequestExecution<T> {
             .map_or_else(Vec::new, |events| events.into_iter().collect()))
     }
 
-    fn ensure_owner(&self, state: &Rc<RefCell<ExecutorState<T>>>) -> McpResult<()> {
-        if !Rc::ptr_eq(&self.state, state) {
+    fn ensure_owner(&self, state: &SharedExecutorState<T>) -> McpResult<()> {
+        if !SharedExecutorState::ptr_eq(&self.state, state) {
             return Err(McpError::invalid_params(
                 "Request execution belongs to a different executor",
             ));
@@ -3069,7 +3272,7 @@ mod tests {
         assert!(executor.take_reverse_requests().is_empty());
         assert_eq!(executor.pending_records(), pending_before);
         let state = executor.state.borrow();
-        assert!(state.pending_reverse_request_ids.is_empty());
+        assert!(state.pending_reverse_requests.is_empty());
         assert_eq!(state.reverse_requests.len(), 0);
         assert_eq!(state.transport.sent.len(), 2);
         let JsonRpcMessage::Response(rejection) = &state.transport.sent[1] else {
@@ -3102,19 +3305,19 @@ mod tests {
 
         let reverse_requests = executor.take_reverse_requests();
         assert_eq!(reverse_requests.len(), 1);
-        assert_eq!(reverse_requests[0].id, Some(RequestId::Number(700)));
-        assert_eq!(reverse_requests[0].method, "sampling/createMessage");
+        assert_eq!(reverse_requests[0].request_id(), &RequestId::Number(700));
+        assert_eq!(reverse_requests[0].request().method, "sampling/createMessage");
         assert_eq!(executor.pending_records(), pending_before);
         executor
             .respond_to_reverse_request(
                 &cx,
-                RequestId::Number(700),
+                &reverse_requests[0],
                 serde_json::json!({"ok": true}),
             )
             .expect("legacy handler result is sent for its exact request ID");
 
         let state = executor.state.borrow();
-        assert!(state.pending_reverse_request_ids.is_empty());
+        assert!(state.pending_reverse_requests.is_empty());
         assert!(state.reverse_requests.is_empty());
         assert_eq!(state.transport.sent.len(), 2);
         let JsonRpcMessage::Response(response) = &state.transport.sent[1] else {
@@ -3172,11 +3375,11 @@ mod tests {
         executor.drive(&cx).expect("reverse request is retained");
         let reverse = executor.take_reverse_requests();
         assert_eq!(reverse.len(), 1);
-        assert_eq!(reverse[0].id, Some(RequestId::Number(700)));
+        assert_eq!(reverse[0].request_id(), &RequestId::Number(700));
         executor
             .respond_to_reverse_request(
                 &cx,
-                RequestId::Number(700),
+                &reverse[0],
                 serde_json::json!({"ok": true}),
             )
             .expect("reverse request receives a JSON-RPC result");
@@ -4106,7 +4309,7 @@ mod tests {
             };
             assert_eq!(rejection.id, Some(RequestId::Number(700)));
             assert_eq!(
-                rejection.error.as_ref().map(|error| error.code),
+                rejection.error.as_ref().map(|error| error.code.clone()),
                 Some(i32::from(McpErrorCode::MethodNotFound))
             );
         }
@@ -4339,7 +4542,9 @@ mod tests {
         assert_eq!(missing_diagnostic, Some(FinalCacheTtlDiagnostic::Missing));
         assert!(matches!(
             missing,
-            CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) if result.payload.ttl_ms == 0
+            CoreResult::Final(FinalCoreResult::ToolsList { result, .. })
+                if result.payload.ttl_ms.try_as_millis() == Ok(0)
+                    && result.payload.ttl_ms.as_str() == "0"
         ));
 
         let (negative, negative_diagnostic) = decode_core_result_with_cache_ttl(
@@ -4355,7 +4560,9 @@ mod tests {
         assert_eq!(negative_diagnostic, Some(FinalCacheTtlDiagnostic::Negative));
         assert!(matches!(
             negative,
-            CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) if result.payload.ttl_ms == 0
+            CoreResult::Final(FinalCoreResult::ToolsList { result, .. })
+                if result.payload.ttl_ms.try_as_millis() == Ok(0)
+                    && result.payload.ttl_ms.as_str() == "0"
         ));
 
         let exact_source = r#"{"resultType":"complete","tools":[],"zeta":{"second":2,"first":1},"ttlMs":-1,"cacheScope":"private","alpha":1.20e+4}"#;
@@ -4370,6 +4577,15 @@ mod tests {
         let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = exact else {
             panic!("exact TTL source selects tools/list");
         };
+        assert_eq!(result.payload.ttl_ms.as_str(), "0");
+        assert_eq!(
+            result
+                .payload
+                .ttl_ms
+                .try_as_millis()
+                .expect("normalized TTL fits the local duration domain"),
+            0
+        );
         assert_eq!(
             result
                 .extras

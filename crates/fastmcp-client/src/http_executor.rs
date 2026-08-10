@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::Instant;
 
@@ -19,6 +20,7 @@ use asupersync::http::h1::{
     ClientError, ClientStreamingResponse, HttpClient, Method, RedirectPolicy, RetryPolicy,
 };
 use asupersync::http::{Body, Frame};
+use asupersync::sync::Mutex;
 use fastmcp_protocol::extensions::{
     ExtensionDirection, McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID,
     OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
@@ -43,9 +45,10 @@ use fastmcp_protocol::{
     CoreDispatchError, CoreRequest, CoreResult, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult,
     FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
-    InputRequiredResult, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification, SubscriptionFilter,
-    decode_strict_jsonrpc_message, decode_strict_jsonrpc_response, task_subscription_ids,
+    InputRequiredResult, JsonInteger, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification,
+    SubscriptionFilter, decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
+    task_subscription_ids,
 };
 
 use crate::execution::{MrtrDriver, MrtrDriverLimits};
@@ -157,6 +160,8 @@ pub struct ModernHttpRequest {
     method: String,
     name: Option<String>,
     authorization: Option<String>,
+    mcp_session_id: Option<String>,
+    mcp_session_epoch: Option<u64>,
 }
 
 impl fmt::Debug for ModernHttpRequest {
@@ -171,6 +176,10 @@ impl fmt::Debug for ModernHttpRequest {
             .field(
                 "authorization",
                 &self.authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "mcp_session_id",
+                &self.mcp_session_id.as_ref().map(|_| "<present>"),
             )
             .finish()
     }
@@ -205,6 +214,8 @@ impl ModernHttpRequest {
             method,
             name,
             authorization: None,
+            mcp_session_id: None,
+            mcp_session_epoch: None,
         })
     }
 
@@ -219,6 +230,25 @@ impl ModernHttpRequest {
         target: &fastmcp_core::CanonicalHttpUrl,
     ) -> Self {
         self.authorization = credential.authorization_for_target(target);
+        self
+    }
+
+    /// Attaches the opaque session identifier issued by a successful modern
+    /// `server/discover` response to this post-discovery request.
+    pub fn with_mcp_session_id(
+        mut self,
+        mcp_session_id: impl Into<String>,
+    ) -> Result<Self, ModernHttpExecutorError> {
+        let mcp_session_id = mcp_session_id.into();
+        if mcp_session_id.is_empty() || contains_header_control(&mcp_session_id) {
+            return Err(ModernHttpExecutorError::InvalidRequestMetadata);
+        }
+        self.mcp_session_id = Some(mcp_session_id);
+        Ok(self)
+    }
+
+    fn with_mcp_session_epoch(mut self, epoch: u64) -> Self {
+        self.mcp_session_epoch = Some(epoch);
         self
     }
 
@@ -263,6 +293,9 @@ impl ModernHttpRequest {
         if let Some(authorization) = &self.authorization {
             headers.push(("Authorization".to_owned(), authorization.clone()));
         }
+        if let Some(mcp_session_id) = &self.mcp_session_id {
+            headers.push(("MCP-Session-Id".to_owned(), mcp_session_id.clone()));
+        }
         headers
     }
 }
@@ -286,6 +319,7 @@ pub enum ModernHttpResponseKind {
 pub struct ModernHttpResponseMetadata {
     status: u16,
     kind: ModernHttpResponseKind,
+    mcp_session_id: Option<String>,
 }
 
 impl ModernHttpResponseMetadata {
@@ -299,6 +333,13 @@ impl ModernHttpResponseMetadata {
     #[must_use]
     pub const fn kind(&self) -> ModernHttpResponseKind {
         self.kind
+    }
+
+    /// Returns the opaque session identifier supplied by the HTTP peer, if
+    /// that response issued one.
+    #[must_use]
+    pub fn mcp_session_id(&self) -> Option<&str> {
+        self.mcp_session_id.as_deref()
     }
 }
 
@@ -980,7 +1021,7 @@ pub enum ModernHttpFinalCoreListenError {
     /// The server terminated the request with a JSON-RPC error.
     RemoteError {
         /// Server-provided JSON-RPC code.
-        code: i32,
+        code: JsonInteger,
         /// Server-provided JSON-RPC message.
         message: String,
     },
@@ -1093,7 +1134,7 @@ fn decode_final_core_terminal(
     }
     if let Some(error) = response.error.as_ref() {
         return Err(ModernHttpFinalCoreListenError::RemoteError {
-            code: error.code,
+            code: error.code.clone(),
             message: error.message.clone(),
         });
     }
@@ -1336,7 +1377,7 @@ pub enum ModernHttpSubscriptionListenError {
     /// The server terminated the listener with a JSON-RPC error.
     RemoteError {
         /// The remote JSON-RPC error code.
-        code: i32,
+        code: JsonInteger,
         /// The remote JSON-RPC error message.
         message: String,
     },
@@ -1551,7 +1592,7 @@ fn decode_final_subscriptions_terminal(
     }
     if let Some(error) = response.error.as_ref() {
         return Err(ModernHttpSubscriptionListenError::RemoteError {
-            code: error.code,
+            code: error.code.clone(),
             message: error.message.clone(),
         });
     }
@@ -1898,12 +1939,20 @@ fn native_http_client() -> HttpClient {
 pub struct ModernHttpClient {
     protocol_plan: ClientProtocolPlan,
     modern_post_target: String,
+    session_state: Arc<Mutex<ModernHttpSessionState>>,
+    session_recovery: Arc<Mutex<()>>,
     client_info: ClientInfo,
     client_capabilities: ClientCapabilities,
     mcp_apps_settings: Option<McpAppsClientSettings>,
     mcp_apps_active: bool,
     server_discovery: ServerDiscoverResult,
     executor: ModernHttpExecutor,
+}
+
+#[derive(Debug)]
+struct ModernHttpSessionState {
+    mcp_session_id: String,
+    epoch: u64,
 }
 
 /// The result of a policy-bound modern HTTP connection attempt.
@@ -1974,7 +2023,7 @@ pub enum ModernHttpMrtrError {
     /// A JSON-RPC request frame appeared where this round requires a response.
     UnexpectedResponseMessage,
     /// A peer terminated the round with a JSON-RPC error.
-    RemoteError { code: i32, message: String },
+    RemoteError { code: JsonInteger, message: String },
     /// A successful JSON response did not retain its result source.
     MissingResult,
     /// The ordinary method-specific result contradicted the selected core contract.
@@ -3164,6 +3213,15 @@ pub enum ModernHttpClientError {
     DiscoveryRejected,
     /// The recognized response was not the exact typed discovery reply.
     InvalidDiscoveryResponse,
+    /// A successful modern discovery response did not issue the session ID
+    /// required for every later modern HTTP POST.
+    MissingDiscoverySessionId,
+    /// A post-discovery response attempted to replace the opaque session ID
+    /// retained from discovery.
+    UnexpectedMcpSessionId,
+    SessionUnavailable,
+    SessionRecoveryWouldFallbackToLegacy,
+    SessionRecoveryRepeatedNotFound,
     /// The typed final discovery reply did not advertise the final version
     /// selected for this modern HTTP connection.
     DiscoveryDoesNotAdvertiseModernProtocol,
@@ -3210,7 +3268,7 @@ pub enum ModernHttpClientError {
         /// Exact official Tasks method that received the error.
         method: &'static str,
         /// Server-provided JSON-RPC code.
-        code: i32,
+        code: JsonInteger,
         /// Server-provided JSON-RPC message.
         message: String,
     },
@@ -3237,7 +3295,7 @@ pub enum ModernHttpClientError {
         actual: Option<RequestId>,
     },
     /// The server returned a JSON-RPC error for the tool call.
-    RemoteError { code: i32, message: String },
+    RemoteError { code: JsonInteger, message: String },
     /// The response contradicted the final typed core result contract.
     TypedResult(CoreDispatchError),
     /// The decoded response was not one final `tools/call` result branch.
@@ -3287,6 +3345,15 @@ impl fmt::Display for ModernHttpClientError {
             Self::InvalidDiscoveryResponse => {
                 formatter.write_str("server/discover returned an invalid final response")
             }
+            Self::MissingDiscoverySessionId => {
+                formatter.write_str("server/discover did not issue an MCP-Session-Id")
+            }
+            Self::UnexpectedMcpSessionId => {
+                formatter.write_str("a modern HTTP response replaced the discovered MCP-Session-Id")
+            }
+            Self::SessionUnavailable => formatter.write_str("the modern HTTP session is unavailable"),
+            Self::SessionRecoveryWouldFallbackToLegacy => formatter.write_str("modern session recovery refused legacy fallback"),
+            Self::SessionRecoveryRepeatedNotFound => formatter.write_str("fresh modern session replay was rejected as unknown or expired"),
             Self::DiscoveryDoesNotAdvertiseModernProtocol => {
                 formatter.write_str("server/discover did not advertise MCP 2026-07-28")
             }
@@ -3391,6 +3458,11 @@ impl std::error::Error for ModernHttpClientError {
             | Self::RequestEncodingFailed
             | Self::DiscoveryRejected
             | Self::InvalidDiscoveryResponse
+            | Self::MissingDiscoverySessionId
+            | Self::UnexpectedMcpSessionId
+            | Self::SessionUnavailable
+            | Self::SessionRecoveryWouldFallbackToLegacy
+            | Self::SessionRecoveryRepeatedNotFound
             | Self::DiscoveryDoesNotAdvertiseModernProtocol
             | Self::InvalidRequestId
             | Self::TasksNegotiation
@@ -3470,6 +3542,10 @@ impl ModernHttpClient {
             .await
             .map_err(ModernHttpClientError::Executor)?;
         let probe_status = probe_response.metadata().status();
+        let probe_session_id = probe_response
+            .metadata()
+            .mcp_session_id()
+            .map(str::to_owned);
         let probe_body = probe_response
             .read_to_end(cx, MAX_MODERN_HTTP_PROBE_BODY_BYTES)
             .await
@@ -3485,11 +3561,19 @@ impl ModernHttpClient {
         {
             ClientHttpNegotiationDecision::ModernSelected => {
                 let server_discovery = decode_modern_discovery_response(&probe_body)?;
+                let mcp_session_id = probe_session_id
+                    .filter(|session_id| !trim_http_ows(session_id).is_empty())
+                    .ok_or(ModernHttpClientError::MissingDiscoverySessionId)?;
                 let mcp_apps_active =
                     resolve_mcp_apps_activation(mcp_apps_settings.as_ref(), &server_discovery);
                 Ok(ModernHttpConnectOutcome::Modern(Self {
                     protocol_plan,
                     modern_post_target,
+                    session_state: Arc::new(Mutex::new(ModernHttpSessionState {
+                        mcp_session_id,
+                        epoch: 0,
+                    })),
+                    session_recovery: Arc::new(Mutex::new(())),
                     client_info,
                     client_capabilities,
                     mcp_apps_settings,
@@ -3537,6 +3621,129 @@ impl ModernHttpClient {
             .flatten()
     }
 
+    async fn attach_mcp_session_id(
+        &self,
+        cx: &Cx,
+        request: ModernHttpRequest,
+    ) -> Result<ModernHttpRequest, ModernHttpClientError> {
+        let state = self
+            .session_state
+            .lock(cx)
+            .await
+            .map_err(|_| ModernHttpClientError::SessionUnavailable)?;
+        let session_id = state.mcp_session_id.clone();
+        let session_epoch = state.epoch;
+        request
+            .with_mcp_session_id(session_id)
+            .map(|request| request.with_mcp_session_epoch(session_epoch))
+            .map_err(ModernHttpClientError::Executor)
+    }
+
+    async fn build_post_discovery_request(
+        &self,
+        cx: &Cx,
+        method: &str,
+        parameters: serde_json::Value,
+        request_id: Option<RequestId>,
+        client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+    ) -> Result<ModernHttpRequest, ModernHttpClientError> {
+        let request = build_modern_request_with_extensions(
+            &self.modern_post_target,
+            &self.client_info,
+            &self.client_capabilities,
+            method,
+            parameters,
+            request_id,
+            client_extensions,
+        )?;
+        self.attach_mcp_session_id(cx, request).await
+    }
+
+    async fn execute_post_discovery_request(
+        &self,
+        cx: &Cx,
+        request: &ModernHttpRequest,
+    ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
+        let response = self
+            .executor
+            .execute(cx, request)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        if is_defined_stale_session_response(&response) {
+            let observed_session_id = request
+                .mcp_session_id
+                .as_deref()
+                .ok_or(ModernHttpClientError::SessionUnavailable)?
+                .to_owned();
+            let observed_epoch = request
+                .mcp_session_epoch
+                .ok_or(ModernHttpClientError::SessionUnavailable)?;
+            drop(response);
+            self.refresh_expired_session(cx, &observed_session_id, observed_epoch).await?;
+            let replay = self.attach_mcp_session_id(cx, request.clone()).await?;
+            let response = self.executor.execute(cx, &replay).await.map_err(ModernHttpClientError::Executor)?;
+            if is_defined_stale_session_response(&response) {
+                drop(response);
+                return Err(ModernHttpClientError::SessionRecoveryRepeatedNotFound);
+            }
+            return self.validate_response_session_id(&replay, response);
+        }
+        self.validate_response_session_id(request, response)
+    }
+
+    fn validate_response_session_id(
+        &self,
+        request: &ModernHttpRequest,
+        response: ModernHttpResponseStream,
+    ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
+        if response.metadata().mcp_session_id().is_some_and(|session_id| {
+            request.mcp_session_id.as_deref() != Some(session_id)
+        }) {
+            return Err(ModernHttpClientError::UnexpectedMcpSessionId);
+        }
+        Ok(response)
+    }
+
+    async fn refresh_expired_session(
+        &self,
+        cx: &Cx,
+        observed_session_id: &str,
+        observed_epoch: u64,
+    ) -> Result<(), ModernHttpClientError> {
+        let _recovery = self.session_recovery.lock(cx).await.map_err(|_| ModernHttpClientError::SessionUnavailable)?;
+        {
+            let state = self.session_state.lock(cx).await.map_err(|_| ModernHttpClientError::SessionUnavailable)?;
+            if state.mcp_session_id != observed_session_id || state.epoch != observed_epoch {
+                return Ok(());
+            }
+        }
+        let request = build_modern_request_with_extensions(
+            &self.modern_post_target, &self.client_info, &self.client_capabilities,
+            SERVER_DISCOVER, serde_json::json!({}), Some(RequestId::Number(1)),
+            mcp_apps_client_extensions(self.mcp_apps_settings.as_ref()).as_ref(),
+        )?;
+        let response = self.executor
+            .execute(cx, &request)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        let status = response.metadata().status();
+        let session_id = response.metadata().mcp_session_id().map(str::to_owned);
+        let body = response.read_to_end(cx, MAX_MODERN_HTTP_PROBE_BODY_BYTES).await.map_err(ModernHttpClientError::Executor)?;
+        let mut negotiation = ClientHttpNegotiation::from_protocol_plan(&self.protocol_plan).map_err(ModernHttpClientError::Negotiation)?;
+        match negotiation.observe_modern_probe(HttpModernProbe { status, body: classify_modern_probe_body(&body) }).map_err(ModernHttpClientError::Negotiation)? {
+            ClientHttpNegotiationDecision::ModernSelected => {}
+            ClientHttpNegotiationDecision::LegacySseFallbackAuthorized => return Err(ModernHttpClientError::SessionRecoveryWouldFallbackToLegacy),
+        }
+        let _ = decode_modern_discovery_response(&body)?;
+        let session_id = session_id.filter(|value| !trim_http_ows(value).is_empty()).ok_or(ModernHttpClientError::MissingDiscoverySessionId)?;
+        let mut state = self.session_state.lock(cx).await.map_err(|_| ModernHttpClientError::SessionUnavailable)?;
+        if state.mcp_session_id == observed_session_id && state.epoch == observed_epoch {
+            state.mcp_session_id = session_id;
+            state.epoch = state.epoch.saturating_add(1);
+        }
+        Ok(())
+    }
+
     /// Issues one modern JSON-RPC request through the native HTTP executor.
     ///
     /// The runtime overwrites the final metadata keys in `_meta` from its
@@ -3558,19 +3765,10 @@ impl ModernHttpClient {
             });
         }
         let client_extensions = merge_client_extensions(self.active_mcp_apps_settings(), None);
-        let request = build_modern_request_with_extensions(
-            &self.modern_post_target,
-            &self.client_info,
-            &self.client_capabilities,
-            method,
-            parameters,
-            request_id,
-            client_extensions.as_ref(),
-        )?;
-        self.executor
-            .execute(cx, &request)
-            .await
-            .map_err(ModernHttpClientError::Executor)
+        let request = self
+            .build_post_discovery_request(cx, method, parameters, request_id, client_extensions.as_ref())
+            .await?;
+        self.execute_post_discovery_request(cx, &request).await
     }
 
     /// Calls one tool through ordinary modern HTTP and follows bounded MRTR
@@ -3783,16 +3981,16 @@ impl ModernHttpClient {
         maximum_response_bytes: usize,
     ) -> Result<CoreResult, ModernHttpMrtrError> {
         let client_extensions = merge_client_extensions(self.active_mcp_apps_settings(), None);
-        let request = build_modern_request_with_extensions(
-            &self.modern_post_target,
-            &self.client_info,
-            &self.client_capabilities,
-            method,
-            parameters,
-            Some(request_id.clone()),
-            client_extensions.as_ref(),
-        )
-        .map_err(ModernHttpMrtrError::Request)?;
+        let request = self
+            .build_post_discovery_request(
+                cx,
+                method,
+                parameters,
+                Some(request_id.clone()),
+                client_extensions.as_ref(),
+            )
+            .await
+            .map_err(ModernHttpMrtrError::Request)?;
         let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
             ModernHttpMrtrError::Request(ModernHttpClientError::RequestEncodingFailed)
         })?;
@@ -3802,9 +4000,10 @@ impl ModernHttpClient {
             wire_request.params.as_ref(),
         )
         .map_err(|error| ModernHttpMrtrError::Request(ModernHttpClientError::TypedResult(error)))?;
-        let response = self.executor.execute(cx, &request).await.map_err(|error| {
-            ModernHttpMrtrError::Request(ModernHttpClientError::Executor(error))
-        })?;
+        let response = self
+            .execute_post_discovery_request(cx, &request)
+            .await
+            .map_err(ModernHttpMrtrError::Request)?;
 
         let result = match response.metadata().kind() {
             ModernHttpResponseKind::Json => {
@@ -3858,16 +4057,16 @@ impl ModernHttpClient {
         }
         let method = method.as_ref();
         let client_extensions = merge_client_extensions(self.active_mcp_apps_settings(), None);
-        let request = build_modern_request_with_extensions(
-            &self.modern_post_target,
-            &self.client_info,
-            &self.client_capabilities,
-            method,
-            parameters,
-            Some(request_id.clone()),
-            client_extensions.as_ref(),
-        )
-        .map_err(ModernHttpFinalCoreListenError::Request)?;
+        let request = self
+            .build_post_discovery_request(
+                cx,
+                method,
+                parameters,
+                Some(request_id.clone()),
+                client_extensions.as_ref(),
+            )
+            .await
+            .map_err(ModernHttpFinalCoreListenError::Request)?;
         let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
             ModernHttpFinalCoreListenError::Request(ModernHttpClientError::RequestEncodingFailed)
         })?;
@@ -3878,10 +4077,9 @@ impl ModernHttpClient {
         )
         .map_err(ModernHttpFinalCoreListenError::TerminalResult)?;
         let response = self
-            .executor
-            .execute(cx, &request)
+            .execute_post_discovery_request(cx, &request)
             .await
-            .map_err(ModernHttpFinalCoreListenError::Executor)?;
+            .map_err(ModernHttpFinalCoreListenError::Request)?;
         response.into_final_core_listener(request_id, core_request, limits)
     }
 
@@ -3931,16 +4129,16 @@ impl ModernHttpClient {
         )]);
         let client_extensions =
             merge_client_extensions(self.active_mcp_apps_settings(), Some(&task_extensions));
-        let request = build_modern_request_with_extensions(
-            &self.modern_post_target,
-            &self.client_info,
-            &self.client_capabilities,
-            TOOLS_CALL,
-            serde_json::json!({ "name": name, "arguments": arguments }),
-            Some(request_id.clone()),
-            client_extensions.as_ref(),
-        )
-        .map_err(ModernHttpFinalCoreListenError::Request)?;
+        let request = self
+            .build_post_discovery_request(
+                cx,
+                TOOLS_CALL,
+                serde_json::json!({ "name": name, "arguments": arguments }),
+                Some(request_id.clone()),
+                client_extensions.as_ref(),
+            )
+            .await
+            .map_err(ModernHttpFinalCoreListenError::Request)?;
         let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
             ModernHttpFinalCoreListenError::Request(ModernHttpClientError::RequestEncodingFailed)
         })?;
@@ -3951,10 +4149,9 @@ impl ModernHttpClient {
         )
         .map_err(ModernHttpFinalCoreListenError::TerminalResult)?;
         let response = self
-            .executor
-            .execute(cx, &request)
+            .execute_post_discovery_request(cx, &request)
             .await
-            .map_err(ModernHttpFinalCoreListenError::Executor)?;
+            .map_err(ModernHttpFinalCoreListenError::Request)?;
         response.into_final_tasks_tool_call_listener(request_id, core_request, limits)
     }
 
@@ -3992,21 +4189,20 @@ impl ModernHttpClient {
         };
         let client_extensions =
             merge_client_extensions(self.active_mcp_apps_settings(), client_extensions.as_ref());
-        let request = build_modern_request_with_extensions(
-            &self.modern_post_target,
-            &self.client_info,
-            &self.client_capabilities,
-            SUBSCRIPTIONS_LISTEN,
-            serde_json::json!({ "notifications": notifications.clone() }),
-            Some(request_id.clone()),
-            client_extensions.as_ref(),
-        )
-        .map_err(ModernHttpSubscriptionListenError::Request)?;
-        let response = self
-            .executor
-            .execute(cx, &request)
+        let request = self
+            .build_post_discovery_request(
+                cx,
+                SUBSCRIPTIONS_LISTEN,
+                serde_json::json!({ "notifications": notifications.clone() }),
+                Some(request_id.clone()),
+                client_extensions.as_ref(),
+            )
             .await
-            .map_err(ModernHttpSubscriptionListenError::Executor)?;
+            .map_err(ModernHttpSubscriptionListenError::Request)?;
+        let response = self
+            .execute_post_discovery_request(cx, &request)
+            .await
+            .map_err(ModernHttpSubscriptionListenError::Request)?;
         response.into_final_subscriptions_listener(request_id, notifications, limits)
     }
 
@@ -4056,20 +4252,10 @@ impl ModernHttpClient {
         )]);
         let client_extensions =
             merge_client_extensions(self.active_mcp_apps_settings(), Some(&task_extensions));
-        let request = build_modern_request_with_extensions(
-            &self.modern_post_target,
-            &self.client_info,
-            &self.client_capabilities,
-            TOOLS_CALL,
-            parameters,
-            Some(request_id.clone()),
-            client_extensions.as_ref(),
-        )?;
-        let response = self
-            .executor
-            .execute(cx, &request)
-            .await
-            .map_err(ModernHttpClientError::Executor)?;
+        let request = self
+            .build_post_discovery_request(cx, TOOLS_CALL, parameters, Some(request_id.clone()), client_extensions.as_ref())
+            .await?;
+        let response = self.execute_post_discovery_request(cx, &request).await?;
         let body = response
             .read_to_end(cx, maximum_response_bytes)
             .await
@@ -4099,7 +4285,7 @@ impl ModernHttpClient {
         }
         if let Some(error) = response.error.as_ref() {
             return Err(ModernHttpClientError::RemoteError {
-                code: error.code,
+                code: error.code.clone(),
                 message: error.message.clone(),
             });
         }
@@ -4353,11 +4539,8 @@ impl ModernHttpClient {
             request_id.clone(),
             client_extensions,
         )?;
-        let response = self
-            .executor
-            .execute(cx, &request)
-            .await
-            .map_err(ModernHttpClientError::Executor)?;
+        let request = self.attach_mcp_session_id(cx, request).await?;
+        let response = self.execute_post_discovery_request(cx, &request).await?;
         let body = response
             .read_to_end(cx, maximum_response_bytes)
             .await
@@ -4396,7 +4579,7 @@ impl ModernHttpClient {
         if let Some(error) = response.error.as_ref() {
             return Err(ModernHttpClientError::TasksRemoteError {
                 method,
-                code: error.code,
+                code: error.code.clone(),
                 message: error.message.clone(),
             });
         }
@@ -5289,7 +5472,7 @@ fn decode_mrtr_json_response(
     }
     if let Some(error) = response.error.as_ref() {
         return Err(ModernHttpMrtrError::RemoteError {
-            code: error.code,
+            code: error.code.clone(),
             message: error.message.clone(),
         });
     }
@@ -5557,6 +5740,8 @@ pub fn validate_response_head(
     headers: &[(String, String)],
 ) -> Result<ModernHttpResponseMetadata, ModernHttpExecutorError> {
     validate_content_encoding(headers)?;
+    let mcp_session_id =
+        single_header(headers, "mcp-session-id", "MCP-Session-Id")?.map(str::to_owned);
     if (300..400).contains(&status) {
         return Err(ModernHttpExecutorError::Redirect { status });
     }
@@ -5577,7 +5762,11 @@ pub fn validate_response_head(
     } else {
         ModernHttpResponseKind::HttpFailure
     };
-    Ok(ModernHttpResponseMetadata { status, kind })
+    Ok(ModernHttpResponseMetadata {
+        status,
+        kind,
+        mcp_session_id,
+    })
 }
 
 fn validate_content_encoding(headers: &[(String, String)]) -> Result<(), ModernHttpExecutorError> {
@@ -5610,6 +5799,12 @@ fn validate_content_encoding(headers: &[(String, String)]) -> Result<(), ModernH
     } else {
         Err(ModernHttpExecutorError::UnsupportedContentEncoding)
     }
+}
+
+fn is_defined_stale_session_response(response: &ModernHttpResponseStream) -> bool {
+    response.metadata().status() == 404
+        && response.metadata().kind() == ModernHttpResponseKind::HttpFailure
+        && response.metadata().mcp_session_id().is_none()
 }
 
 fn single_header<'a>(
@@ -5687,7 +5882,7 @@ mod tests {
         MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES, MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
         MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS, ModernHttpClient, ModernHttpClientError,
         ModernHttpExecutorError, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
-        ModernHttpResponseKind, ModernHttpSubscriptionListenCollector,
+        ModernHttpMrtrError, ModernHttpResponseKind, ModernHttpSubscriptionListenCollector,
         ModernHttpSubscriptionListenError, decode_modern_discovery_response,
         merge_client_extensions, reject_body_frame_after_cancellation, validate_response_head,
     };
@@ -5982,15 +6177,34 @@ mod tests {
     }
 
     fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+        write_response_with_session_id(
+            stream,
+            status,
+            content_type,
+            body,
+            Some("test-modern-session"),
+        );
+    }
+
+    fn write_response_with_session_id(
+        stream: &mut TcpStream,
+        status: u16,
+        content_type: &str,
+        body: &[u8],
+        mcp_session_id: Option<&str>,
+    ) {
         let reason = match status {
             200 => "OK",
             202 => "Accepted",
             404 => "Not Found",
             _ => "Test Response",
         };
+        let mcp_session_header = mcp_session_id
+            .map(|session_id| format!("MCP-Session-Id: {session_id}\r\n"))
+            .unwrap_or_default();
         write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{mcp_session_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .expect("write native HTTP response head");
@@ -8271,7 +8485,13 @@ mod tests {
                     .head
                     .contains("MCP-Protocol-Version: 2026-07-28\r\n")
             );
-            write_response(&mut probe, 404, "text/plain", b"");
+            write_response_with_session_id(
+                &mut probe,
+                404,
+                "text/plain",
+                b"",
+                Some("must-not-leak-into-legacy"),
+            );
 
             let (mut sse, _) = listener.accept().expect("accept fresh legacy SSE GET");
             let sse_request = read_request(&mut sse);
@@ -8279,6 +8499,10 @@ mod tests {
             assert!(
                 !sse_request.head.contains("MCP-Protocol-Version:"),
                 "the fresh exact legacy SSE GET must not retain final headers"
+            );
+            assert!(
+                !sse_request.head.contains("MCP-Session-Id:"),
+                "Auto fallback must not leak a modern discovery session onto legacy SSE"
             );
             begin_chunked_sse(&mut sse);
             write_chunked_sse_event(
@@ -8299,6 +8523,10 @@ mod tests {
                 !initialize_request
                     .head
                     .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+            );
+            assert!(
+                !initialize_request.head.contains("MCP-Session-Id:"),
+                "Auto fallback must not leak a modern discovery session onto legacy POST"
             );
             let initialize = serde_json::from_slice::<serde_json::Value>(&initialize_request.body)
                 .expect("legacy initialize POST must be JSON-RPC");
@@ -9294,6 +9522,502 @@ mod tests {
     }
 
     #[test]
+    fn modern_http_client_rejects_duplicate_discovery_session_id_before_any_post_discovery_contact()
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind duplicate-session listener");
+        let address = listener.local_addr().expect("read duplicate-session address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept duplicate-session probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("duplicate-session probe is JSON-RPC")["method"],
+                SERVER_DISCOVER
+            );
+            let body = modern_discovery_body();
+            write!(
+                probe,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMCP-Session-Id: session-one\r\nmcp-session-id: session-two\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write duplicate-session response head");
+            probe
+                .write_all(body)
+                .expect("write duplicate-session response body");
+            probe.flush().expect("flush duplicate-session response");
+
+            listener
+                .set_nonblocking(true)
+                .expect("configure duplicate-session no-contact assertion");
+            let no_contact_deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < no_contact_deadline {
+                match listener.accept() {
+                    Ok(_) => panic!(
+                        "duplicate discovery session IDs must reject before a post-discovery POST"
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("unexpected duplicate-session accept error: {error}"),
+                }
+            }
+        });
+
+        let cx = Cx::for_request();
+        let result = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "duplicate-session-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ));
+        assert!(matches!(
+            result,
+            Err(ModernHttpClientError::Executor(
+                ModernHttpExecutorError::DuplicateResponseHeader {
+                    name: "MCP-Session-Id"
+                }
+            ))
+        ));
+        server.join().expect("duplicate-session peer joins");
+    }
+
+    #[test]
+    fn modern_http_client_rejects_rotated_response_session_id_before_mrtr_continuation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind rotated-session listener");
+        let address = listener.local_addr().expect("read rotated-session address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept rotated-session probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("rotated-session probe is JSON-RPC")["method"],
+                SERVER_DISCOVER
+            );
+            write_response_with_session_id(
+                &mut probe,
+                200,
+                "application/json",
+                modern_discovery_body(),
+                Some("session-one"),
+            );
+
+            let (mut first_round, _) = listener.accept().expect("accept rotated-session round");
+            let first_request = read_request(&mut first_round);
+            assert!(
+                first_request
+                    .head
+                    .contains("MCP-Session-Id: session-one\r\n"),
+                "the first ordinary request must use discovery's immutable ID"
+            );
+            write_response_with_session_id(
+                &mut first_round,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","requestState":"must-not-continue"}}"#,
+                Some("session-two"),
+            );
+
+            listener
+                .set_nonblocking(true)
+                .expect("configure rotated-session no-contact assertion");
+            let no_contact_deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < no_contact_deadline {
+                match listener.accept() {
+                    Ok(_) => panic!(
+                        "a substituted response session ID must reject before an MRTR continuation"
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("unexpected rotated-session accept error: {error}"),
+                }
+            }
+        });
+
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "rotated-session-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("rotated-session discovery selects modern HTTP")
+        .into_modern()
+        .expect("ModernOnly cannot select legacy HTTP");
+        let result = runtime_block_on(client.call_tool_with_mrtr_retry(
+            &cx,
+            RequestId::Number(2),
+            Instant::now() + Duration::from_secs(2),
+            "echo",
+            serde_json::json!({}),
+            SseLimits::new(1_024, 4_096, 4).expect("bounded rotated-session limits"),
+            || panic!("a rotated session ID must reject before allocating a continuation ID"),
+            |_| panic!("a rotated session ID must reject before invoking the continuation callback"),
+        ));
+        assert!(matches!(
+            result,
+            Err(ModernHttpMrtrError::Request(
+                ModernHttpClientError::UnexpectedMcpSessionId
+            ))
+        ));
+        server.join().expect("rotated-session peer joins");
+    }
+
+    #[test]
+    fn modern_http_client_replays_discovery_session_id_for_json_and_sse_posts() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind session replay listener");
+        let address = listener.local_addr().expect("read session replay address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept session discovery probe");
+            let probe_request = read_request(&mut probe);
+            assert!(
+                !probe_request.head.contains("MCP-Session-Id:"),
+                "discovery must not send an unissued session ID"
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("session discovery probe is JSON-RPC")["method"],
+                SERVER_DISCOVER
+            );
+            write_response_with_session_id(
+                &mut probe,
+                200,
+                "application/json",
+                modern_discovery_body(),
+                Some("session-replay-42"),
+            );
+
+            let (mut json, _) = listener.accept().expect("accept session JSON request");
+            let json_request = read_request(&mut json);
+            assert!(
+                json_request
+                    .head
+                    .contains("MCP-Session-Id: session-replay-42"),
+                "ordinary modern JSON POST must replay the discovered session ID"
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&json_request.body)
+                    .expect("session JSON request is JSON-RPC")["method"],
+                "tools/list"
+            );
+            write_response_with_session_id(&mut json, 404, "text/plain", b"", None);
+
+            let (mut refresh, _) = listener.accept().expect("accept fresh session discovery");
+            let refresh_request = read_request(&mut refresh);
+            assert!(
+                !refresh_request.head.contains("MCP-Session-Id:"),
+                "recovery discovery must not replay the expired session ID"
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&refresh_request.body)
+                    .expect("recovery discovery is JSON-RPC")["method"],
+                SERVER_DISCOVER
+            );
+            write_response_with_session_id(
+                &mut refresh,
+                200,
+                "application/json",
+                modern_discovery_body(),
+                Some("session-replay-43"),
+            );
+
+            let (mut json, _) = listener.accept().expect("accept recovered JSON replay");
+            let json_request = read_request(&mut json);
+            assert!(json_request.head.contains("MCP-Session-Id: session-replay-43"));
+            write_response_with_session_id(
+                &mut json,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+                None,
+            );
+
+            let (mut sse, _) = listener.accept().expect("accept session SSE request");
+            let sse_request = read_request(&mut sse);
+            assert!(
+                sse_request
+                    .head
+                    .contains("MCP-Session-Id: session-replay-43"),
+                "modern SSE-opening POST must replay the discovered session ID"
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&sse_request.body)
+                    .expect("session SSE request is JSON-RPC")["method"],
+                TOOLS_CALL
+            );
+            write_response_with_session_id(
+                &mut sse,
+                200,
+                "text/event-stream",
+                br#"event: message
+data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"type":"text","text":"done"}],"isError":false}}
+
+"#,
+                None,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "session-replay-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("session-bearing discovery selects modern HTTP")
+        .into_modern()
+        .expect("ModernOnly cannot select legacy HTTP");
+        let json_response = runtime_block_on(client.request(
+            &cx,
+            "tools/list",
+            serde_json::json!({}),
+            Some(RequestId::Number(2)),
+        ))
+        .expect("session-bearing JSON POST succeeds");
+        let _ = runtime_block_on(json_response.read_to_end(&cx, 4_096))
+            .expect("drain session-bearing JSON response");
+
+        let mut sse_listener = runtime_block_on(client.open_final_tool_call_listener(
+            &cx,
+            RequestId::Number(3),
+            "echo",
+            serde_json::json!({}),
+            SseLimits::new(1_024, 4_096, 4).expect("bounded session SSE limits"),
+        ))
+        .expect("session-bearing SSE POST opens");
+        assert!(matches!(
+            runtime_block_on(sse_listener.next_event(&cx)),
+            Ok(Some(ModernHttpFinalCoreEvent::Terminal(
+                FinalCoreResult::ToolsCall { .. }
+            )))
+        ));
+        server.join().expect("session replay peer joins");
+    }
+
+    #[test]
+    fn modern_http_session_recovery_repeated_stale_response_replays_once_then_stops() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind repeated stale peer");
+        let address = listener.local_addr().expect("read repeated stale address");
+        let target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            for (expected_method, session, status, response_session) in [
+                (SERVER_DISCOVER, None, 200, Some("old")),
+                ("tools/list", Some("old"), 404, None),
+                (SERVER_DISCOVER, None, 200, Some("new")),
+                ("tools/list", Some("new"), 404, None),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept bounded recovery request");
+                let request = read_request(&mut stream);
+                assert_eq!(serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"], expected_method);
+                match session {
+                    Some(session) => assert!(request.head.contains(&format!("MCP-Session-Id: {session}\r\n"))),
+                    None => assert!(!request.head.contains("MCP-Session-Id:")),
+                }
+                write_response_with_session_id(&mut stream, status, if status == 200 { "application/json" } else { "text/plain" }, if status == 200 { modern_discovery_body() } else { b"" }, response_session);
+            }
+            listener.set_nonblocking(true).unwrap();
+            let until = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < until {
+                match listener.accept() {
+                    Ok(_) => panic!("second stale response must not cause another recovery"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(2)),
+                    Err(error) => panic!("unexpected accept error: {error}"),
+                }
+            }
+        });
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(&cx, plan(&target, "http://127.0.0.1:9/sse", "http://127.0.0.1:9/post", ProtocolPolicy::ModernOnly), ClientInfo { name: "repeated".to_owned(), version: "1".to_owned() }, ClientCapabilities::default())).unwrap().into_modern().unwrap();
+        assert!(matches!(runtime_block_on(client.request(&cx, "tools/list", serde_json::json!({}), Some(RequestId::Number(2)))), Err(ModernHttpClientError::SessionRecoveryRepeatedNotFound)));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn modern_http_session_header_bearing_404_does_not_recover_or_replay() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().unwrap();
+            let _ = read_request(&mut discovery);
+            write_response_with_session_id(&mut discovery, 200, "application/json", modern_discovery_body(), Some("session"));
+            let (mut request, _) = listener.accept().unwrap();
+            let request = read_request(&mut request);
+            assert!(request.head.contains("MCP-Session-Id: session\r\n"));
+            write_response_with_session_id(&mut request, 404, "text/plain", b"", Some("session"));
+            listener.set_nonblocking(true).unwrap();
+            let until = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < until {
+                match listener.accept() {
+                    Ok(_) => panic!("header-bearing 404 must not recover"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(2)),
+                    Err(error) => panic!("unexpected accept error: {error}"),
+                }
+            }
+        });
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(&cx, plan(&target, "http://127.0.0.1:9/sse", "http://127.0.0.1:9/post", ProtocolPolicy::ModernOnly), ClientInfo { name: "control".to_owned(), version: "1".to_owned() }, ClientCapabilities::default())).unwrap().into_modern().unwrap();
+        let response = runtime_block_on(client.request(&cx, "tools/list", serde_json::json!({}), Some(RequestId::Number(2)))).unwrap();
+        assert_eq!(response.metadata().status(), 404);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn modern_http_same_id_stale_callers_share_one_epoch_refresh() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let steps = [
+                (SERVER_DISCOVER, None, Some("same"), None),
+                ("tools/list", Some("same"), None, None),
+                (SERVER_DISCOVER, None, Some("same"), None),
+                ("tools/list", Some("same"), None, Some(2)),
+                ("tools/list", Some("same"), None, None),
+                ("tools/list", Some("same"), None, Some(3)),
+            ];
+            for (method, session, discovery_session, result_id) in steps {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                assert_eq!(serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"], method);
+                match session {
+                    Some(session) => assert!(request.head.contains(&format!("MCP-Session-Id: {session}\r\n"))),
+                    None => assert!(!request.head.contains("MCP-Session-Id:")),
+                }
+                match (discovery_session, result_id) {
+                    (Some(session), _) => write_response_with_session_id(&mut stream, 200, "application/json", modern_discovery_body(), Some(session)),
+                    (_, Some(id)) => write_response_with_session_id(&mut stream, 200, "application/json", format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}}}"#).as_bytes(), None),
+                    _ => write_response_with_session_id(&mut stream, 404, "text/plain", b"", None),
+                }
+            }
+        });
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(&cx, plan(&target, "http://127.0.0.1:9/sse", "http://127.0.0.1:9/post", ProtocolPolicy::ModernOnly), ClientInfo { name: "epoch".to_owned(), version: "1".to_owned() }, ClientCapabilities::default())).unwrap().into_modern().unwrap();
+        let first = runtime_block_on(client.build_post_discovery_request(&cx, "tools/list", serde_json::json!({}), Some(RequestId::Number(2)), None)).unwrap();
+        let second = runtime_block_on(client.build_post_discovery_request(&cx, "tools/list", serde_json::json!({}), Some(RequestId::Number(3)), None)).unwrap();
+        let first = runtime_block_on(client.execute_post_discovery_request(&cx, &first)).unwrap();
+        runtime_block_on(first.read_to_end(&cx, 4096)).unwrap();
+        let second = runtime_block_on(client.execute_post_discovery_request(&cx, &second)).unwrap();
+        runtime_block_on(second.read_to_end(&cx, 4096)).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn modern_http_stale_sse_opener_discovers_without_header_then_reopens_with_fresh_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write_response_with_session_id(&mut stream, 200, "application/json", modern_discovery_body(), Some("old-sse"));
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream).head.contains("MCP-Session-Id: old-sse\r\n"));
+            write_response_with_session_id(&mut stream, 404, "text/plain", b"", None);
+            let (mut stream, _) = listener.accept().unwrap();
+            let refresh = read_request(&mut stream);
+            assert!(!refresh.head.contains("MCP-Session-Id:"));
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&refresh.body).unwrap()["method"], SERVER_DISCOVER);
+            write_response_with_session_id(&mut stream, 200, "application/json", modern_discovery_body(), Some("fresh-sse"));
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream).head.contains("MCP-Session-Id: fresh-sse\r\n"));
+            write_response_with_session_id(&mut stream, 200, "text/event-stream", br#"event: message
+data: {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"done"}],"isError":false}}
+
+"#, None);
+        });
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(&cx, plan(&target, "http://127.0.0.1:9/sse", "http://127.0.0.1:9/post", ProtocolPolicy::ModernOnly), ClientInfo { name: "sse".to_owned(), version: "1".to_owned() }, ClientCapabilities::default())).unwrap().into_modern().unwrap();
+        let mut listener = runtime_block_on(client.open_final_tool_call_listener(&cx, RequestId::Number(2), "echo", serde_json::json!({}), SseLimits::new(1024, 4096, 4).unwrap())).unwrap();
+        assert!(matches!(runtime_block_on(listener.next_event(&cx)), Ok(Some(ModernHttpFinalCoreEvent::Terminal(FinalCoreResult::ToolsCall { .. })))));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn modern_http_client_rejects_discovery_without_session_id_before_any_post_discovery_contact() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind missing-session listener");
+        let address = listener.local_addr().expect("read missing-session address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept missing-session probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("missing-session probe is JSON-RPC")["method"],
+                SERVER_DISCOVER
+            );
+            write_response_with_session_id(
+                &mut probe,
+                200,
+                "application/json",
+                modern_discovery_body(),
+                None,
+            );
+
+            listener
+                .set_nonblocking(true)
+                .expect("configure missing-session no-contact assertion");
+            let no_contact_deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < no_contact_deadline {
+                match listener.accept() {
+                    Ok(_) => panic!("missing session ID must reject before a post-discovery POST"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("unexpected missing-session accept error: {error}"),
+                }
+            }
+        });
+
+        let cx = Cx::for_request();
+        let result = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "missing-session-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ));
+        assert!(matches!(
+            result,
+            Err(ModernHttpClientError::MissingDiscoverySessionId)
+        ));
+        server.join().expect("missing-session peer joins");
+    }
+
+    #[test]
     fn ordinary_modern_http_mrtr_retries_tool_resource_and_prompt_state_only_without_tasks() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ordinary MRTR listener");
         let address = listener.local_addr().expect("read ordinary MRTR address");
@@ -9319,6 +10043,12 @@ mod tests {
                 let (mut stream, _) = listener.accept().expect("accept ordinary MRTR round");
                 let request = read_request(&mut stream);
                 assert!(request.head.contains(&format!("Mcp-Method: {method}\r\n")));
+                assert!(
+                    request
+                        .head
+                        .contains("MCP-Session-Id: test-modern-session\r\n"),
+                    "every ordinary MRTR round must replay discovery's session ID"
+                );
                 let body = serde_json::from_slice::<serde_json::Value>(&request.body)
                     .expect("ordinary MRTR request is JSON-RPC");
                 assert_eq!(body["id"], request_id);

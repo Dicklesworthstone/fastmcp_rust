@@ -60,8 +60,8 @@ pub use cache::{
 pub use execution::{
     CancellationRequested, ExecutionTerminalReason, ExecutionTerminalRecord,
     ExecutionTerminalState, FinalCacheTtlDiagnostic, OpaquePagination, PaginationBounds,
-    PendingRequestRecord, Request, RequestExecution, RequestExecutor, clt_01_a_manifest_digest,
-    clt_01_b_manifest_digest,
+    PendingRequestRecord, Request, RequestExecution, RequestExecutor, ReverseRequest,
+    ReverseRequestCancellation, clt_01_a_manifest_digest, clt_01_b_manifest_digest,
 };
 pub use fastmcp_core::CanonicalHttpUrl;
 pub use fastmcp_protocol::common_types::LoggingLevel;
@@ -128,10 +128,8 @@ use std::time::{Duration, Instant};
 use asupersync::{Cx, channel::oneshot};
 use execution::{MrtrDriver, MrtrDriverLimits};
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sha256_bounded};
-#[cfg(test)]
-use fastmcp_protocol::common_types::JsonInteger;
 use fastmcp_protocol::common_types::{
-    ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
+    ContentBlock, EmbeddedResourceContents, JsonInteger, OpenMetadata, RawIcon,
 };
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, OFFICIAL_TASKS_RESULT_DISCRIMINATOR, official_tasks_empty_settings,
@@ -172,70 +170,6 @@ use crate::session::mcp_apps_activation_receipt;
 ///
 /// The callback receives the progress value, optional total, and optional message.
 pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<&str>);
-
-/// Cancellation handle owned by one server-initiated reverse request.
-///
-/// The client marks this handle cancelled when an exact MCP 2024-11-05
-/// `notifications/cancelled` message names the callback's request ID. Reverse
-/// callbacks must check it at their own cancellation points and return without
-/// producing further effects when it is set.
-const REVERSE_CALLBACK_OPEN: u8 = 0;
-const REVERSE_CALLBACK_CANCELLED: u8 = 1;
-const REVERSE_CALLBACK_RESPONSE_SENT: u8 = 2;
-
-#[derive(Clone, Debug)]
-pub struct ReverseRequestCancellation(Arc<std::sync::atomic::AtomicU8>);
-
-impl ReverseRequestCancellation {
-    fn new() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicU8::new(
-            REVERSE_CALLBACK_OPEN,
-        )))
-    }
-
-    fn cancel(&self) {
-        let _ = self.0.compare_exchange(
-            REVERSE_CALLBACK_OPEN,
-            REVERSE_CALLBACK_CANCELLED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-    }
-
-    fn is_open(&self) -> bool {
-        self.0.load(Ordering::Acquire) == REVERSE_CALLBACK_OPEN
-    }
-
-    fn record_response_sent(&self) {
-        let previous = self.0.compare_exchange(
-            REVERSE_CALLBACK_OPEN,
-            REVERSE_CALLBACK_RESPONSE_SENT,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        debug_assert!(
-            previous.is_ok(),
-            "only an elected open callback can record a response write"
-        );
-    }
-
-    /// Returns whether the server cancelled this reverse request.
-    #[must_use]
-    pub fn is_cancel_requested(&self) -> bool {
-        self.0.load(Ordering::Acquire) == REVERSE_CALLBACK_CANCELLED
-    }
-
-    /// Returns `RequestCancelled` when the server cancelled this request.
-    ///
-    /// This is the usual cooperative cancellation point for synchronous
-    /// callbacks that perform work in a loop.
-    pub fn checkpoint(&self) -> McpResult<()> {
-        if self.is_cancel_requested() {
-            return Err(McpError::request_cancelled());
-        }
-        Ok(())
-    }
-}
 
 /// Handler for a server-initiated `sampling/createMessage` request.
 pub type SamplingRequestHandler = Box<
@@ -2237,7 +2171,7 @@ impl ReverseCallbackState {
         if self.closing.load(Ordering::Acquire)
             || !active.iter().any(|callback| {
                 callback.request_id.correlates_with(request_id)
-                    && Arc::ptr_eq(&callback.cancellation.0, &cancellation.0)
+                    && callback.cancellation.belongs_to_same_request(cancellation)
             })
             || !cancellation.is_open()
         {
@@ -2686,7 +2620,11 @@ fn validate_inbound_typed_message(message: &JsonRpcMessage) -> McpResult<()> {
 }
 
 fn json_rpc_error_to_mcp(error: JsonRpcError) -> McpError {
-    let code = McpErrorCode::from(error.code);
+    let code = error
+        .code
+        .as_i32()
+        .map(McpErrorCode::from)
+        .unwrap_or(McpErrorCode::InternalError);
     match error.data {
         Some(data) => McpError::with_data(code, error.message, data),
         None => McpError::new(code, error.message),
@@ -2729,10 +2667,12 @@ fn ensure_empty_final_fields(
 /// observationally equivalent to the absence of cache hints in the legacy
 /// API. Any reusable or shared cache directive would otherwise be lost.
 fn ensure_legacy_cache_projection(
-    ttl_ms: u64,
+    ttl_ms: &fastmcp_protocol::CacheTtl,
     cache_scope: fastmcp_protocol::CacheScope,
 ) -> McpResult<()> {
-    if ttl_ms == 0 && cache_scope == fastmcp_protocol::CacheScope::Private {
+    if ttl_ms.try_as_millis() == Ok(0)
+        && cache_scope == fastmcp_protocol::CacheScope::Private
+    {
         return Ok(());
     }
     Err(final_projection_error("cache fields"))
@@ -2978,7 +2918,7 @@ fn convenience_tools_page(result: CoreResult) -> McpResult<(Vec<Tool>, Option<St
                 ttl_ms,
                 cache_scope,
             } = result.payload;
-            ensure_legacy_cache_projection(ttl_ms, cache_scope)?;
+            ensure_legacy_cache_projection(&ttl_ms, cache_scope)?;
             Ok((
                 tools
                     .into_iter()
@@ -3003,7 +2943,7 @@ fn convenience_resources_page(result: CoreResult) -> McpResult<(Vec<Resource>, O
                 ttl_ms,
                 cache_scope,
             } = result.payload;
-            ensure_legacy_cache_projection(ttl_ms, cache_scope)?;
+            ensure_legacy_cache_projection(&ttl_ms, cache_scope)?;
             Ok((
                 resources
                     .into_iter()
@@ -3030,7 +2970,7 @@ fn convenience_resource_templates_page(
                 ttl_ms,
                 cache_scope,
             } = result.payload;
-            ensure_legacy_cache_projection(ttl_ms, cache_scope)?;
+            ensure_legacy_cache_projection(&ttl_ms, cache_scope)?;
             Ok((
                 resource_templates
                     .into_iter()
@@ -3055,7 +2995,7 @@ fn convenience_prompts_page(result: CoreResult) -> McpResult<(Vec<Prompt>, Optio
                 ttl_ms,
                 cache_scope,
             } = result.payload;
-            ensure_legacy_cache_projection(ttl_ms, cache_scope)?;
+            ensure_legacy_cache_projection(&ttl_ms, cache_scope)?;
             Ok((
                 prompts
                     .into_iter()
@@ -3101,7 +3041,7 @@ fn convenience_resource_read(result: CoreResult) -> McpResult<Vec<LegacyResource
                 ttl_ms,
                 cache_scope,
             } = result.payload;
-            ensure_legacy_cache_projection(ttl_ms, cache_scope)?;
+            ensure_legacy_cache_projection(&ttl_ms, cache_scope)?;
             contents
                 .into_iter()
                 .map(final_resource_content_to_legacy)
@@ -3179,6 +3119,15 @@ fn recv_child_transport(
         .map(|message| (message, Instant::now()))
 }
 
+fn recv_shared_child_transport(
+    transport: &Arc<Mutex<StdioRecvHalf<ChildStdout>>>,
+    cx: &Cx,
+    deadline: Option<Instant>,
+) -> Result<(JsonRpcMessage, Instant), TransportError> {
+    let mut receiver = transport.lock().map_err(|_| TransportError::Closed)?;
+    recv_child_transport(&mut receiver, cx, deadline)
+}
+
 #[cfg(unix)]
 fn recv_initializing_child_transport(
     transport: &mut StdioTransport<ChildStdout, ChildStdin>,
@@ -3242,6 +3191,36 @@ fn send_child_server_response_during_receive(
         .map_err(|_| McpError::internal_error("Client stdio response writer failed"))?
         .send(cx, message)
         .map_err(transport_error_to_mcp)
+}
+
+fn stdio_cancellation_control_message(
+    peer_era: ProtocolEra,
+    request_id: &RequestId,
+) -> McpResult<JsonRpcMessage> {
+    let cancellation = match peer_era {
+        ProtocolEra::Legacy2024 => CancellationWireMessage::Legacy2024 {
+            sender: CancellationSender::Client,
+            params: CancelledParams {
+                request_id: request_id.clone(),
+                reason: None,
+            },
+        },
+        ProtocolEra::Modern2026 => CancellationWireMessage::Modern2026 {
+            sender: CancellationSender::Client,
+            params: FinalCancelledNotificationParams {
+                request_id: request_id.clone(),
+                reason: None,
+                meta: None,
+                additional: Default::default(),
+            },
+        },
+    };
+    cancellation
+        .encode()
+        .map(JsonRpcMessage::Request)
+        .map_err(|error| {
+            McpError::invalid_params(format!("Invalid cancellation control parameters: {error}"))
+        })
 }
 
 #[cfg(unix)]
@@ -4103,6 +4082,108 @@ impl ResponseRegistry {
 impl Default for ResponseRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Shared ownership of the one stdio response-correlation registry.
+///
+/// Request commitment may occur through a cloneable negotiated executor, but
+/// all response delivery still belongs to the client's sole ingress arbiter.
+#[derive(Clone, Default)]
+struct SharedResponseRegistry(Arc<Mutex<ResponseRegistry>>);
+
+impl std::fmt::Debug for SharedResponseRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("SharedResponseRegistry").finish()
+    }
+}
+
+impl SharedResponseRegistry {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(ResponseRegistry::new())))
+    }
+
+    fn lock(&self) -> McpResult<std::sync::MutexGuard<'_, ResponseRegistry>> {
+        self.0
+            .lock()
+            .map_err(|_| McpError::internal_error("Client response registry is unavailable"))
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn register(&self, id: RequestId) -> McpResult<ResponseWaiter> {
+        self.lock()?.register(id)
+    }
+
+    #[cfg(test)]
+    fn route(&self, response: JsonRpcResponse) -> ResponseRoute {
+        self.lock()
+            .map_or(ResponseRoute::ConnectionClosed, |mut registry| {
+                registry.route(response)
+            })
+    }
+
+    fn route_with_raw_result(
+        &self,
+        response: JsonRpcResponse,
+        raw_result: Option<String>,
+    ) -> ResponseRoute {
+        self.lock()
+            .map_or(ResponseRoute::ConnectionClosed, |mut registry| {
+                registry.route_with_raw_result(response, raw_result)
+            })
+    }
+
+    fn fail(&self, id: &RequestId, error: McpError) -> bool {
+        self.lock()
+            .is_ok_and(|mut registry| registry.fail(id, error))
+    }
+
+    fn tombstone(&self, id: &RequestId, error: McpError) -> McpResult<bool> {
+        self.lock()?.tombstone(id, error)
+    }
+
+    fn claim_cancellation_control(&self, id: &RequestId) -> McpResult<bool> {
+        self.lock()?.claim_cancellation_control(id)
+    }
+
+    fn owns_live_request(&self, id: &RequestId) -> McpResult<bool> {
+        self.lock()?.owns_live_request(id)
+    }
+
+    fn fail_all(&self, error: McpError) -> usize {
+        self.lock()
+            .map_or(0, |mut registry| registry.fail_all(error))
+    }
+
+    fn terminal_error(&self) -> Option<McpError> {
+        self.lock()
+            .ok()
+            .and_then(|registry| registry.terminal_error())
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.lock().map_or(0, |registry| registry.pending_len())
+    }
+
+    #[cfg(test)]
+    fn tombstone_len(&self) -> usize {
+        self.lock().map_or(0, |registry| registry.tombstone_len())
+    }
+
+    #[cfg(test)]
+    fn cancellation_control_len(&self) -> usize {
+        self.lock()
+            .map_or(0, |registry| registry.cancellation_control_len())
+    }
+
+    #[cfg(test)]
+    fn uncorrelated_diagnostics(&self) -> u8 {
+        self.lock()
+            .map_or(0, |registry| registry.uncorrelated_diagnostics)
     }
 }
 
@@ -5143,6 +5224,138 @@ struct ReceivedPreparedResult {
     receipt: Instant,
 }
 
+/// Shared request correlation for a negotiated stdio connection.
+///
+/// A cloneable request executor for the selected stdio session.
+#[derive(Clone)]
+pub struct StdioRequestExecutor {
+    sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
+    responses: SharedResponseRegistry,
+    peer_era: ProtocolEra,
+}
+
+impl std::fmt::Debug for StdioRequestExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StdioRequestExecutor")
+            .field("peer_era", &self.peer_era)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One request committed through [`StdioRequestExecutor`].
+#[derive(Debug)]
+pub struct StdioRequestExecution {
+    request_id: RequestId,
+    waiter: Option<ResponseWaiter>,
+    responses: SharedResponseRegistry,
+    sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
+    peer_era: ProtocolEra,
+    committed_at: Instant,
+    completed: bool,
+}
+
+impl StdioRequestExecution {
+    /// Returns the JSON-RPC ID committed for this request.
+    #[must_use]
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+}
+
+impl Drop for StdioRequestExecution {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+
+        // Retirement is local and immediate: it removes the live owner even
+        // when no later client operation reaches the receive loop. Only the
+        // owner that won this tombstone transition may send its one selected-
+        // era cancellation control.
+        let retired = self
+            .responses
+            .tombstone(&self.request_id, McpError::request_cancelled())
+            .unwrap_or(false);
+        if !retired
+            || !self
+                .responses
+                .claim_cancellation_control(&self.request_id)
+                .unwrap_or(false)
+        {
+            return;
+        }
+
+        let control = match stdio_cancellation_control_message(self.peer_era, &self.request_id) {
+            Ok(control) => control,
+            Err(_) => return,
+        };
+        #[cfg(unix)]
+        {
+            if let Ok(mut sender) = self.sender.lock() {
+                let _ = sender.try_send_control_message(&control);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = control;
+        }
+    }
+}
+
+impl StdioRequestExecutor {
+    fn new(
+        sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
+        responses: SharedResponseRegistry,
+        peer_era: ProtocolEra,
+    ) -> Self {
+        Self {
+            sender,
+            responses,
+            peer_era,
+        }
+    }
+
+    /// Returns the immutable era selected by the completed handshake.
+    #[must_use]
+    pub const fn selected_protocol_era(&self) -> ProtocolEra {
+        self.peer_era
+    }
+
+    fn execute(&self, cx: &Cx, request: JsonRpcRequest) -> McpResult<StdioRequestExecution> {
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        let request_id = request
+            .id
+            .clone()
+            .ok_or_else(|| McpError::invalid_params("Multiplexed stdio requests require an ID"))?;
+        // Reserve in the same registry used by the sequential adapter before
+        // the write. The sole reader can therefore route an immediate peer
+        // response to this exact owner without a split-brain response path.
+        let waiter = self.responses.register(request_id.clone())?;
+        let send_result = self
+            .sender
+            .lock()
+            .map_err(|_| McpError::internal_error("Multiplexed stdio writer is unavailable"))?
+            .send(cx, &JsonRpcMessage::Request(request))
+            .map_err(transport_error_to_mcp);
+        if let Err(error) = send_result {
+            let _ = self.responses.fail(&request_id, error.clone());
+            return Err(error);
+        }
+        Ok(StdioRequestExecution {
+            request_id,
+            waiter: Some(waiter),
+            responses: self.responses.clone(),
+            sender: Arc::clone(&self.sender),
+            peer_era: self.peer_era,
+            committed_at: Instant::now(),
+            completed: false,
+        })
+    }
+}
+
 pub struct Client {
     /// The subprocess running the MCP server.
     child: Option<Child>,
@@ -5160,10 +5373,16 @@ pub struct Client {
     pending_process_cleanup_error: Option<McpError>,
     /// Independently owned stdio reader. Callback workers never borrow this
     /// half, so the sole reader can continue admitting cancellation frames.
-    transport: StdioRecvHalf<ChildStdout>,
+    /// The sequential adapter and cloned multiplexed request handles share
+    /// this sole ingress half. A reader turn, rather than this state lock,
+    /// serializes blocking reads.
+    transport: Arc<Mutex<StdioRecvHalf<ChildStdout>>>,
     /// Serializes every outbound frame, including callback completions the
     /// sole reader commits between bounded receive polls.
     response_sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
+    /// Installed only after a final stdio handshake selected its immutable
+    /// peer era. Auto's disposable modern probe never reaches this field.
+    multiplexed_executor: Option<StdioRequestExecutor>,
     /// Capability context for cancellation.
     cx: Cx,
     /// Session state after initialization.
@@ -5171,7 +5390,7 @@ pub struct Client {
     /// Request ID counter.
     next_id: AtomicU64,
     /// Strict response correlation for every in-flight request.
-    responses: ResponseRegistry,
+    responses: SharedResponseRegistry,
     /// Exact non-progress notifications received from a modern server.
     final_server_notifications: VecDeque<ServerNotification>,
     /// Exact progress notifications received from a modern server without
@@ -5507,8 +5726,9 @@ impl Client {
             child_cleanup_phase: ClientChildCleanupPhase::Active,
             cleanup_error: None,
             pending_process_cleanup_error: None,
-            transport,
+            transport: Arc::new(Mutex::new(transport)),
             response_sender,
+            multiplexed_executor: None,
             cx,
             session: ClientSession::new_placeholder(
                 client_info.clone(),
@@ -5523,7 +5743,7 @@ impl Client {
             // `initialize()` consumes ID 1 through the same monotonic
             // allocator, leaving ID 2 as the first ordinary request ID.
             next_id: AtomicU64::new(1),
-            responses: ResponseRegistry::new(),
+            responses: SharedResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
@@ -5564,6 +5784,7 @@ impl Client {
 
         // Mark as initialized
         client.initialized.store(true, Ordering::SeqCst);
+        client.install_multiplexed_stdio_executor();
 
         Ok(client)
     }
@@ -5643,12 +5864,13 @@ impl Client {
             child_cleanup_phase: ClientChildCleanupPhase::Active,
             cleanup_error: None,
             pending_process_cleanup_error: None,
-            transport,
+            transport: Arc::new(Mutex::new(transport)),
             response_sender,
+            multiplexed_executor: None,
             cx,
             session,
             next_id: AtomicU64::new(2), // Start at 2 since initialize used 1
-            responses: ResponseRegistry::new(),
+            responses: SharedResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
@@ -5706,12 +5928,13 @@ impl Client {
             child_cleanup_phase: ClientChildCleanupPhase::Active,
             cleanup_error: None,
             pending_process_cleanup_error: None,
-            transport,
+            transport: Arc::new(Mutex::new(transport)),
             response_sender,
+            multiplexed_executor: None,
             cx,
             session,
             next_id: AtomicU64::new(1), // Start at 1 since initialize hasn't happened
-            responses: ResponseRegistry::new(),
+            responses: SharedResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
@@ -5777,6 +6000,7 @@ impl Client {
 
         // Mark as initialized
         self.initialized.store(true, Ordering::SeqCst);
+        self.install_multiplexed_stdio_executor();
 
         Ok(())
     }
@@ -6132,11 +6356,17 @@ impl Client {
     }
 
     fn transport_is_closed(&self) -> bool {
-        self.transport.is_closed()
+        self.transport
+            .lock()
+            .map_or(true, |transport| transport.is_closed())
     }
 
     fn close_transport(&mut self) -> Result<(), TransportError> {
-        let receiver = self.transport.close();
+        let receiver = self
+            .transport
+            .lock()
+            .map_err(|_| TransportError::Closed)?
+            .close();
         let sender = self
             .response_sender
             .lock()
@@ -6158,6 +6388,74 @@ impl Client {
             .lock()
             .map_err(|_| TransportError::Closed)?
             .send(cx, message)
+    }
+
+    fn install_multiplexed_stdio_executor(&mut self) {
+        let Some(peer_era) = self.session.selected_era() else {
+            return;
+        };
+        self.multiplexed_executor = Some(StdioRequestExecutor::new(
+            Arc::clone(&self.response_sender),
+            self.responses.clone(),
+            peer_era,
+        ));
+    }
+
+    /// Returns the negotiated shared stdio executor.
+    ///
+    /// The ordinary `Client` convenience methods remain sequential adapters.
+    /// Callers that need several committed requests before waiting may clone
+    /// this executor and use [`Self::start_multiplexed_request`].
+    pub fn multiplexed_stdio_executor(&self) -> McpResult<StdioRequestExecutor> {
+        self.multiplexed_executor.clone().ok_or_else(|| {
+            McpError::invalid_request(
+                "Negotiated stdio multiplexing is unavailable before initialization",
+            )
+        })
+    }
+
+    /// Commits one raw JSON-RPC request through the negotiated shared stdio
+    /// executor without waiting for its response.
+    pub fn start_multiplexed_request(
+        &self,
+        cx: &Cx,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<StdioRequestExecution> {
+        let id = self.next_request_id()?;
+        let request = JsonRpcRequest::new(
+            method.into(),
+            params,
+            i64::try_from(id).expect("client request IDs are bounded to i64"),
+        );
+        self.multiplexed_stdio_executor()?.execute(cx, request)
+    }
+
+    /// Waits for one multiplexed request through the same sole ingress path
+    /// used by the sequential convenience API. Server requests, cancellation
+    /// controls, notifications, and every response ID therefore retain their
+    /// normal routing semantics instead of being discarded by a parallel
+    /// reader.
+    pub fn wait_multiplexed_request(
+        &mut self,
+        cx: &Cx,
+        execution: &mut StdioRequestExecution,
+    ) -> McpResult<JsonRpcResponse> {
+        if execution.completed || !self.responses.ptr_eq(&execution.responses) {
+            return Err(McpError::invalid_request(
+                "Multiplexed stdio execution belongs to a different client",
+            ));
+        }
+        let waiter = execution.waiter.take().ok_or_else(|| {
+            McpError::invalid_request("Multiplexed stdio execution was already consumed")
+        })?;
+        execution.completed = true;
+        let deadlines = RequestDeadlines::start_at(self.timeout_policy, execution.committed_at)?;
+        let response = self.recv_response_with_cx(cx, waiter, deadlines)?;
+        if let Some(error) = response.error.clone() {
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        Ok(response.response)
     }
 
     /// Verifies that the initialized server can answer an MCP ping request.
@@ -6498,7 +6796,11 @@ impl Client {
         if request.method != "notifications/progress" {
             return Ok(None);
         }
-        let frame = self.transport.last_received_frame().ok_or_else(|| {
+        let transport = self
+            .transport
+            .lock()
+            .map_err(|_| McpError::internal_error("Client stdio reader is unavailable"))?;
+        let frame = transport.last_received_frame().ok_or_else(|| {
             McpError::invalid_request("Client lost the raw final progress notification frame")
         })?;
         let raw_params = raw_notification_params_from_frame(frame)?.ok_or_else(|| {
@@ -6941,8 +7243,8 @@ impl Client {
             let deadline = Instant::now() + FINAL_CACHE_NOTIFICATION_DRAIN_WINDOW;
             loop {
                 let receive_deadline = self.reverse_callback_poll_deadline(deadline);
-                let (message, _) = match recv_child_transport(
-                    &mut self.transport,
+                let (message, _) = match recv_shared_child_transport(
+                    &self.transport,
                     &self.cx,
                     Some(receive_deadline),
                 ) {
@@ -7266,9 +7568,19 @@ impl Client {
         &mut self,
         response: JsonRpcResponse,
     ) -> McpResult<ResponseRoute> {
-        let frame = serde_json::to_vec(&response).map_err(|_| {
-            McpError::internal_error("Successful stdio response could not retain its result source")
-        })?;
+        // The typed JSON value cannot reconstruct exact numeric lexemes or
+        // object spelling. Copy the retained frame before the next receive
+        // invalidates the transport reuse buffer, then admit its raw result
+        // sidecar alongside the already-decoded response.
+        let frame = self
+            .transport
+            .lock()
+            .map_err(|_| McpError::internal_error("Client stdio reader is unavailable"))?
+            .last_received_frame()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                McpError::internal_error("Stdio response frame is unavailable for raw admission")
+            })?;
         let admission = decode_strict_jsonrpc_response(&frame, frame.len()).map_err(|_| {
             McpError::internal_error("Admitted stdio response could not retain its raw result")
         })?;
@@ -7383,7 +7695,7 @@ impl Client {
 
             let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
             let (message, received_at) =
-                match recv_child_transport(&mut self.transport, cx, Some(receive_deadline)) {
+                match recv_shared_child_transport(&self.transport, cx, Some(receive_deadline)) {
                     Ok(received) => received,
                     Err(TransportError::ReceiveDeadlineExceeded) => {
                         if receive_deadline < deadlines.next() && !self.transport_is_closed() {
@@ -7557,7 +7869,11 @@ impl Client {
 
             let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
             let (message, received_at) =
-                match recv_child_transport(&mut self.transport, &self.cx, Some(receive_deadline)) {
+                match recv_shared_child_transport(
+                    &self.transport,
+                    &self.cx,
+                    Some(receive_deadline),
+                ) {
                     Ok(received) => received,
                     Err(TransportError::ReceiveDeadlineExceeded) => {
                         if receive_deadline < deadlines.next() && !self.transport_is_closed() {
@@ -8288,9 +8604,9 @@ impl Client {
         timeout_policy.validate()?;
         // Generate a unique request ID and reuse it as the progress token.
         let request_id = self.next_request_id()?;
-        let progress_marker = ProgressMarker::Number(
+        let progress_marker = ProgressMarker::Number(JsonInteger::from(
             i64::try_from(request_id).expect("request ID allocator enforces the i64 bound"),
-        );
+        ));
 
         let params = CallToolParams {
             name: name.to_string(),
@@ -8501,7 +8817,11 @@ impl Client {
 
             let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
             let (message, received_at) =
-                match recv_child_transport(&mut self.transport, &self.cx, Some(receive_deadline)) {
+                match recv_shared_child_transport(
+                    &self.transport,
+                    &self.cx,
+                    Some(receive_deadline),
+                ) {
                     Ok(received) => received,
                     Err(TransportError::ReceiveDeadlineExceeded) => {
                         if receive_deadline < deadlines.next() && !self.transport_is_closed() {
@@ -10901,7 +11221,7 @@ mod tests {
         assert!(client.responses.terminal_error().is_none());
         assert!(client.is_initialized());
         assert!(client.child.is_some());
-        assert!(!client.transport.is_closed());
+        assert!(!client.transport_is_closed());
         client.close().expect("client cleanup");
     }
 
@@ -10935,7 +11255,7 @@ mod tests {
             serde_json::json!({"late": true}),
         ));
         let mut client = make_peer_silent_past_deadline_client(response);
-        let marker = ProgressMarker::Number(2);
+        let marker = ProgressMarker::Number(JsonInteger::from(2));
         let mut progress_events = Vec::new();
         let mut callback = |progress: f64, total: Option<f64>, message: Option<&str>| {
             progress_events.push((progress, total, message.map(ToOwned::to_owned)));
@@ -11167,7 +11487,7 @@ mod tests {
             .expect_err("the first request-local outcome remains cancellation");
         assert_eq!(waiter_error.code, McpErrorCode::RequestCancelled);
         assert!(!client.is_initialized());
-        assert!(client.transport.is_closed());
+        assert!(client.transport_is_closed());
         assert!(client.child.is_none());
         assert!(client.responses.terminal_error().is_some());
         client.close().expect("client cleanup");
@@ -11186,7 +11506,7 @@ mod tests {
             })),
         ));
         let mut client = make_peer_silent_past_deadline_client(progress);
-        let marker = ProgressMarker::Number(2);
+        let marker = ProgressMarker::Number(JsonInteger::from(2));
         let mut progress_events = Vec::new();
         let mut callback = |progress: f64, total: Option<f64>, message: Option<&str>| {
             progress_events.push((progress, total, message.map(ToOwned::to_owned)));
@@ -11221,7 +11541,7 @@ mod tests {
         client.timeout_policy =
             RequestTimeoutPolicy::new(Duration::from_millis(250), Duration::from_millis(800))
                 .unwrap();
-        let marker = ProgressMarker::Number(2);
+        let marker = ProgressMarker::Number(JsonInteger::from(2));
         let mut progress_events = Vec::new();
         let mut callback = |progress: f64, _total: Option<f64>, _message: Option<&str>| {
             progress_events.push(progress);
@@ -11253,7 +11573,7 @@ mod tests {
             RequestTimeoutPolicy::new(Duration::from_millis(400), Duration::from_millis(900))
                 .unwrap()
                 .reset_idle_on_matching_progress(false);
-        let marker = ProgressMarker::Number(2);
+        let marker = ProgressMarker::Number(JsonInteger::from(2));
         let mut progress_events = Vec::new();
         let mut callback = |progress: f64, _total: Option<f64>, _message: Option<&str>| {
             progress_events.push(progress);
@@ -11291,7 +11611,7 @@ mod tests {
         let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(1));
         client.timeout_policy =
             RequestTimeoutPolicy::new(Duration::from_millis(300), Duration::from_secs(1)).unwrap();
-        let marker = ProgressMarker::Number(2);
+        let marker = ProgressMarker::Number(JsonInteger::from(2));
         let mut progress_events = Vec::new();
         let mut callback = |progress: f64, _total: Option<f64>, _message: Option<&str>| {
             progress_events.push(progress);
@@ -11328,7 +11648,7 @@ mod tests {
         client.timeout_policy =
             RequestTimeoutPolicy::new(Duration::from_millis(300), Duration::from_millis(500))
                 .unwrap();
-        let marker = ProgressMarker::Number(2);
+        let marker = ProgressMarker::Number(JsonInteger::from(2));
         let mut progress_events = Vec::new();
         let mut callback = |progress: f64, _total: Option<f64>, _message: Option<&str>| {
             progress_events.push(progress);
@@ -11387,7 +11707,7 @@ mod tests {
             lines[0], lines[1]
         );
         let mut client = make_shell_scripted_initialized_client(&script, Duration::from_millis(5));
-        let first_marker = ProgressMarker::Number(2);
+        let first_marker = ProgressMarker::Number(JsonInteger::from(2));
         let mut first_progress = Vec::new();
         let mut first_callback = |progress: f64, total: Option<f64>, message: Option<&str>| {
             first_progress.push((progress, total, message.map(ToOwned::to_owned)));
@@ -11408,7 +11728,7 @@ mod tests {
 
         client.timeout_policy =
             RequestTimeoutPolicy::new(Duration::from_secs(3), Duration::from_secs(3)).unwrap();
-        let second_marker = ProgressMarker::Number(3);
+        let second_marker = ProgressMarker::Number(JsonInteger::from(3));
         let mut second_progress = Vec::new();
         let mut second_callback = |progress: f64, total: Option<f64>, message: Option<&str>| {
             second_progress.push((progress, total, message.map(ToOwned::to_owned)));
@@ -11432,7 +11752,7 @@ mod tests {
             })
         );
         assert!(second_progress.is_empty());
-        assert_eq!(client.responses.uncorrelated_diagnostics, 0);
+        assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
         assert_eq!(client.responses.pending_len(), 0);
         assert_eq!(client.responses.tombstone_len(), 0);
         assert!(client.responses.terminal_error().is_none());
@@ -11463,7 +11783,7 @@ mod tests {
             })
         );
         assert!(client.is_initialized());
-        assert!(!client.transport.is_closed());
+        assert!(!client.transport_is_closed());
         assert!(client.responses.terminal_error().is_none());
         client.close().expect("client cleanup");
     }
@@ -11524,7 +11844,7 @@ mod tests {
         assert_eq!(sampling_calls.load(Ordering::Relaxed), 1);
         assert_eq!(roots_calls.load(Ordering::Relaxed), 1);
         assert!(client.is_initialized());
-        assert!(!client.transport.is_closed());
+        assert!(!client.transport_is_closed());
         client.close().expect("client cleanup");
     }
 
@@ -11813,7 +12133,7 @@ mod tests {
             })
         );
         assert!(client.is_initialized());
-        assert!(!client.transport.is_closed());
+        assert!(!client.transport_is_closed());
         assert_eq!(client.responses.pending_len(), 0);
         assert_eq!(client.responses.tombstone_len(), 0);
         assert!(client.responses.terminal_error().is_none());
@@ -11862,7 +12182,7 @@ mod tests {
             "missing handler must leave state unchanged"
         );
         assert!(client.is_initialized());
-        assert!(!client.transport.is_closed());
+        assert!(!client.transport_is_closed());
         assert_eq!(client.responses.pending_len(), 0);
         assert_eq!(client.responses.tombstone_len(), 0);
         assert!(client.responses.terminal_error().is_none());
@@ -11911,10 +12231,10 @@ mod tests {
             })
         );
         assert_eq!(client.responses.tombstone_len(), 0);
-        assert_eq!(client.responses.uncorrelated_diagnostics, 0);
+        assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
         assert!(client.responses.terminal_error().is_none());
         assert!(client.is_initialized());
-        assert!(!client.transport.is_closed());
+        assert!(!client.transport_is_closed());
         client.close().expect("client cleanup");
     }
 
@@ -11935,7 +12255,7 @@ mod tests {
             Some(serde_json::json!({"timeoutSource": "absolute"}))
         );
         assert!(!client.is_initialized());
-        assert!(client.transport.is_closed());
+        assert!(client.transport_is_closed());
         assert!(client.child.is_none());
         let terminal = client
             .responses
@@ -11972,7 +12292,7 @@ mod tests {
 
         assert!(error.message.contains("timed out"));
         assert!(!client.is_initialized());
-        assert!(client.transport.is_closed());
+        assert!(client.transport_is_closed());
         assert!(client.child.is_none());
         assert_eq!(client.responses.tombstone_len(), 0);
         assert!(client.responses.terminal_error().is_some());
@@ -12002,7 +12322,7 @@ mod tests {
 
         assert_eq!(error.code, McpErrorCode::RequestCancelled);
         assert!(!client.is_initialized());
-        assert!(client.transport.is_closed());
+        assert!(client.transport_is_closed());
         assert!(client.child.is_none());
         assert_eq!(client.responses.pending_len(), 0);
         assert_eq!(client.responses.tombstone_len(), 0);
@@ -12036,7 +12356,7 @@ mod tests {
         let timeout_policy = client.timeout_policy;
         let deadlines = RequestDeadlines::start_at(timeout_policy, Instant::now()).unwrap();
         client.cx.set_cancel_requested(true);
-        let marker = ProgressMarker::Number(2);
+        let marker = ProgressMarker::Number(JsonInteger::from(2));
         let mut callback_invoked = false;
         let mut callback = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {
             callback_invoked = true;
@@ -12049,7 +12369,7 @@ mod tests {
         assert_eq!(error.code, McpErrorCode::RequestCancelled);
         assert!(!callback_invoked);
         assert!(!client.is_initialized());
-        assert!(client.transport.is_closed());
+        assert!(client.transport_is_closed());
         assert!(client.child.is_none());
         assert_eq!(client.responses.pending_len(), 0);
         assert_eq!(client.responses.tombstone_len(), 0);
@@ -12083,6 +12403,8 @@ mod tests {
         let recv_cx = Cx::for_request();
         let unrelated_message = client
             .transport
+            .lock()
+            .expect("client reader lock")
             .recv(&recv_cx)
             .expect("scripted unrelated response arrives with its source frame");
 
@@ -12111,7 +12433,7 @@ mod tests {
             ResponseRoute::TombstoneRetired
         );
         assert_eq!(client.responses.tombstone_len(), 0);
-        assert_eq!(client.responses.uncorrelated_diagnostics, 0);
+        assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
         client.close().expect("client cleanup");
     }
 
@@ -12143,8 +12465,8 @@ mod tests {
             .try_response()
             .expect_err("the expired owner receives its timeout");
         assert_eq!(waiter_error.message, timeout.message);
-        let (evidence, _) = recv_child_transport(
-            &mut client.transport,
+        let (evidence, _) = recv_shared_child_transport(
+            &client.transport,
             &client.cx,
             Some(Instant::now() + Duration::from_secs(2)),
         )
@@ -12160,7 +12482,7 @@ mod tests {
                 "response": true
             }))
         );
-        assert!(!client.transport.is_closed());
+        assert!(!client.transport_is_closed());
         assert_eq!(client.responses.tombstone_len(), 1);
         client.close().expect("client cleanup");
     }
@@ -12194,7 +12516,7 @@ mod tests {
             .expect_err("the expired owner receives its first local outcome");
         assert_eq!(waiter_error.message, timeout.message);
         assert!(!client.is_initialized());
-        assert!(client.transport.is_closed());
+        assert!(client.transport_is_closed());
         assert!(client.child.is_none());
         assert_eq!(client.responses.tombstone_len(), 0);
         assert!(client.responses.terminal_error().is_some());
@@ -12359,7 +12681,7 @@ mod tests {
 
         let both = JsonRpcResponse {
             error: Some(JsonRpcError {
-                code: -32_603,
+                code: (-32_603).into(),
                 message: "failure".to_string(),
                 data: None,
             }),
@@ -12433,7 +12755,7 @@ mod tests {
     #[test]
     fn json_rpc_error_conversion_preserves_code_message_and_data() {
         let error = json_rpc_error_to_mcp(JsonRpcError {
-            code: -32_002,
+            code: (-32_002).into(),
             message: "forbidden".to_string(),
             data: Some(serde_json::json!({"reason": "policy"})),
         });
@@ -12557,10 +12879,24 @@ mod tests {
             "message": "Halfway done"
         });
         let params: ClientProgressParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.marker, ProgressMarker::Number(42));
+        assert_eq!(params.marker, ProgressMarker::Number(JsonInteger::from(42)));
         assert!((params.progress - 0.5).abs() < f64::EPSILON);
         assert!((params.total.unwrap() - 1.0).abs() < f64::EPSILON);
         assert_eq!(params.message.as_deref(), Some("Halfway done"));
+    }
+
+    #[test]
+    fn client_progress_params_preserve_lossless_numeric_marker() {
+        let json = serde_json::from_str(
+            r#"{"progressToken":9007199254740993123456789,"progress":0.5}"#,
+        )
+        .expect("large mathematical-integer progress marker is valid JSON");
+        let params: ClientProgressParams =
+            serde_json::from_value(json).expect("progress marker remains typed");
+        let ProgressMarker::Number(marker) = params.marker else {
+            panic!("numeric marker remains numeric");
+        };
+        assert_eq!(marker.as_str(), "9007199254740993123456789");
     }
 
     #[test]
@@ -13078,6 +13414,83 @@ mod tests {
             Some(serde_json::json!({"owner": "first"}))
         );
         assert_eq!(registry.pending_len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_multiplexed_stdio_executions_tombstone_without_followup_operations() {
+        let mut client = make_shell_scripted_initialized_client(
+            "while IFS= read -r _; do :; done",
+            Duration::from_secs(2),
+        );
+        client.install_multiplexed_stdio_executor();
+        let cx = Cx::for_request();
+
+        for _ in 0..1_024 {
+            drop(
+                client
+                    .start_multiplexed_request(&cx, "ping", Some(serde_json::json!({})))
+                    .expect("each silent-peer request commits before its owner is dropped"),
+            );
+        }
+
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 1_024);
+        assert_eq!(client.responses.cancellation_control_len(), 1_024);
+        let final_execution = client
+            .start_multiplexed_request(&cx, "ping", Some(serde_json::json!({})))
+            .expect("dropped owners must not exhaust the live in-flight limit");
+        assert_eq!(client.responses.pending_len(), 1);
+        drop(final_execution);
+        assert_eq!(client.responses.pending_len(), 0);
+        client.close().expect("silent-peer stdio client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multiplexed_stdio_reordered_responses_retain_their_inbound_raw_result_frames() {
+        let second_raw_result = r#"{"owner":"second","exact":1.20e+4}"#;
+        let first_raw_result = r#"{"owner":"first","exact":7.30e-2}"#;
+        let script = format!(
+            "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{second_raw_result}}}'; \\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{first_raw_result}}}'; \\
+             exec sleep 2"
+        );
+        let mut client = make_shell_scripted_initialized_client(&script, Duration::from_secs(1));
+        client.install_multiplexed_stdio_executor();
+        let cx = Cx::for_request();
+        let mut first = client
+            .start_multiplexed_request(&cx, "ping", Some(serde_json::json!({})))
+            .expect("first request commits");
+        let mut second = client
+            .start_multiplexed_request(&cx, "ping", Some(serde_json::json!({})))
+            .expect("second request commits");
+        assert_eq!(first.request_id(), &RequestId::Number(2));
+        assert_eq!(second.request_id(), &RequestId::Number(3));
+
+        let first_waiter = first.waiter.take().expect("first waiter remains owned");
+        let deadlines = RequestDeadlines::start_at(client.timeout_policy, first.committed_at)
+            .expect("test timeout policy is valid");
+        let first_response = client
+            .recv_response_with_cx(&cx, first_waiter, deadlines)
+            .expect("the sole reader routes both out-of-order responses");
+        first.completed = true;
+        assert_eq!(first_response.id, Some(RequestId::Number(2)));
+        assert_eq!(first_response.raw_result.as_deref(), Some(first_raw_result));
+
+        let second_waiter = second.waiter.take().expect("second waiter remains owned");
+        let deadlines = RequestDeadlines::start_at(client.timeout_policy, second.committed_at)
+            .expect("test timeout policy is valid");
+        let second_response = client
+            .recv_response_with_cx(&cx, second_waiter, deadlines)
+            .expect("the reordered second response remains in its exact waiter");
+        second.completed = true;
+        assert_eq!(second_response.id, Some(RequestId::Number(3)));
+        assert_eq!(
+            second_response.raw_result.as_deref(),
+            Some(second_raw_result)
+        );
+        client.close().expect("reordered stdio client cleanup");
     }
 
     #[test]
@@ -15353,7 +15766,7 @@ mod tests {
 
         let script = modern_final_convenience_client_script(
             "resources/read",
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","contents":[{"uri":"file:///exact.txt","text":"exact resource","mimeType":"text/plain","_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}],"ttlMs":73,"cacheScope":"public"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","contents":[{"uri":"file:///exact.txt","text":"exact resource","mimeType":"text/plain","_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}],"ttlMs":7.3e1,"cacheScope":"public"}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -15366,7 +15779,14 @@ mod tests {
         let resource_result: FinalReadResourceResult = client
             .read_resource_final("file:///exact.txt")
             .expect("the exact final resource convenience retains cache directives");
-        assert_eq!(resource_result.ttl_ms, 73);
+        assert_eq!(resource_result.ttl_ms.as_str(), "7.3e1");
+        assert_eq!(
+            resource_result
+                .ttl_ms
+                .try_as_millis()
+                .expect("resource TTL fits the local duration domain"),
+            73
+        );
         assert_eq!(
             resource_result.cache_scope,
             fastmcp_protocol::CacheScope::Public
@@ -15958,7 +16378,7 @@ mod tests {
             .ping()
             .expect("the next request consumes the listener's late terminal response");
         assert_eq!(client.responses.tombstone_len(), 0);
-        assert_eq!(client.responses.uncorrelated_diagnostics, 0);
+        assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
         assert!(client.is_initialized());
         assert!(client.responses.terminal_error().is_none());
         client.close().expect("modern client cleanup");
@@ -17038,7 +17458,15 @@ mod tests {
                 .as_str(),
             "use the final contract"
         );
-        assert_eq!(discovery.cache_hints().ttl_ms(), 73);
+        assert_eq!(discovery.cache_hints().ttl_ms().as_str(), "73");
+        assert_eq!(
+            discovery
+                .cache_hints()
+                .ttl_ms()
+                .try_as_millis()
+                .expect("discovery TTL fits the local duration domain"),
+            73
+        );
         assert!(discovery.cache_hints().is_public());
         let retained = serde_json::to_value(discovery)
             .expect("the retained final discovery result stays serializable");
@@ -17701,7 +18129,7 @@ mod tests {
     #[test]
     fn client_progress_params_debug() {
         let params = ClientProgressParams {
-            marker: ProgressMarker::Number(1),
+            marker: ProgressMarker::Number(JsonInteger::from(1)),
             progress: 0.5,
             total: Some(1.0),
             message: Some("half".into()),

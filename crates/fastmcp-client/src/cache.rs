@@ -403,10 +403,14 @@ impl FinalResultCache {
         let Some((ttl, scope)) = final_cache_hints(&result) else {
             return FinalCacheInsert::NotCacheable;
         };
-        if ttl.as_millis() == 0 {
+        let ttl_ms = match ttl.try_as_millis() {
+            Ok(ttl_ms) => ttl_ms,
+            Err(_) => return FinalCacheInsert::ExpiryOutOfRange,
+        };
+        if ttl_ms == 0 {
             return FinalCacheInsert::ImmediatelyStale;
         }
-        let Some(expires_at) = receipt.checked_add(Duration::from_millis(ttl.as_millis())) else {
+        let Some(expires_at) = receipt.checked_add(Duration::from_millis(ttl_ms)) else {
             return FinalCacheInsert::ExpiryOutOfRange;
         };
 
@@ -546,7 +550,7 @@ pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(CacheTtl, CacheS
         FinalCoreResult::Discover(result) => {
             let hints = result.cache_hints();
             Some((
-                CacheTtl::milliseconds(hints.ttl_ms()),
+                hints.ttl_ms().clone(),
                 if hints.is_public() {
                     CacheScope::Public
                 } else {
@@ -554,26 +558,21 @@ pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(CacheTtl, CacheS
                 },
             ))
         }
-        FinalCoreResult::ToolsList { result, .. } => Some((
-            CacheTtl::milliseconds(result.payload.ttl_ms),
-            result.payload.cache_scope,
-        )),
-        FinalCoreResult::ResourcesList { result, .. } => Some((
-            CacheTtl::milliseconds(result.payload.ttl_ms),
-            result.payload.cache_scope,
-        )),
-        FinalCoreResult::ResourceTemplatesList { result, .. } => Some((
-            CacheTtl::milliseconds(result.payload.ttl_ms),
-            result.payload.cache_scope,
-        )),
-        FinalCoreResult::ResourcesRead { result, .. } => Some((
-            CacheTtl::milliseconds(result.payload.ttl_ms),
-            result.payload.cache_scope,
-        )),
-        FinalCoreResult::PromptsList { result, .. } => Some((
-            CacheTtl::milliseconds(result.payload.ttl_ms),
-            result.payload.cache_scope,
-        )),
+        FinalCoreResult::ToolsList { result, .. } => {
+            Some((result.payload.ttl_ms.clone(), result.payload.cache_scope))
+        }
+        FinalCoreResult::ResourcesList { result, .. } => {
+            Some((result.payload.ttl_ms.clone(), result.payload.cache_scope))
+        }
+        FinalCoreResult::ResourceTemplatesList { result, .. } => {
+            Some((result.payload.ttl_ms.clone(), result.payload.cache_scope))
+        }
+        FinalCoreResult::ResourcesRead { result, .. } => {
+            Some((result.payload.ttl_ms.clone(), result.payload.cache_scope))
+        }
+        FinalCoreResult::PromptsList { result, .. } => {
+            Some((result.payload.ttl_ms.clone(), result.payload.cache_scope))
+        }
         FinalCoreResult::Completion { .. }
         | FinalCoreResult::ToolsCall { .. }
         | FinalCoreResult::ToolsCallTask { .. }
@@ -623,19 +622,26 @@ mod tests {
         key_with_revisions(partition, cursor, 1, 1, 1, 1)
     }
 
-    fn tools_result(ttl_ms: u64, scope: &str, extra: Option<&str>) -> CoreResult {
-        let request = CoreRequest::Final(FinalCoreRequest::ToolsList(FinalListParams {
+    fn tools_list_request() -> CoreRequest {
+        CoreRequest::Final(FinalCoreRequest::ToolsList(FinalListParams {
             meta: OpenMetadata::default(),
             cursor: None,
             include_tags: None,
             exclude_tags: None,
-        }));
+        }))
+    }
+
+    fn tools_result_with_ttl(ttl_ms: &str, scope: &str, extra: Option<&str>) -> CoreResult {
         let suffix = extra.map_or_else(String::new, |extra| format!(",{extra}"));
-        request
+        tools_list_request()
             .decode_result(&format!(
                 r#"{{"resultType":"complete","tools":[],"ttlMs":{ttl_ms},"cacheScope":"{scope}"{suffix}}}"#
             ))
             .expect("the cache fixture is an admitted final complete result")
+    }
+
+    fn tools_result(ttl_ms: u64, scope: &str, extra: Option<&str>) -> CoreResult {
+        tools_result_with_ttl(&ttl_ms.to_string(), scope, extra)
     }
 
     #[test]
@@ -754,6 +760,53 @@ mod tests {
             cache.insert_if_current(input_key, generation, input_required),
             FinalCacheInsert::NotCacheable
         );
+    }
+
+    #[test]
+    fn huge_and_fractional_peer_ttls_leave_existing_entry_unchanged() {
+        let mut cache = FinalResultCache::default();
+        let key = key("credential-a", None);
+        let receipt = Instant::now();
+        let generation = cache.begin_fetch(key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                key.clone(),
+                generation,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+        let before = cache.stats();
+        let retained_before = cache.retained_bytes;
+
+        let huge = tools_result_with_ttl("18446744073709551616", "private", None);
+        assert_eq!(
+            final_cache_hints(&huge)
+                .expect("complete result retains cache hints")
+                .0
+                .as_str(),
+            "18446744073709551616",
+            "the peer TTL remains lossless until runtime expiry conversion"
+        );
+        assert_eq!(
+            cache.insert_if_current_at(key.clone(), generation, huge, receipt),
+            FinalCacheInsert::ExpiryOutOfRange
+        );
+        assert_eq!(cache.stats(), before);
+        assert!(cache.entries.contains_key(&key));
+        assert_eq!(cache.retained_bytes, retained_before);
+
+        let fractional = tools_list_request().decode_result(
+            r#"{"resultType":"complete","tools":[],"ttlMs":18446744073709551616.5,"cacheScope":"private"}"#,
+        );
+        assert!(
+            fractional.is_err(),
+            "changing only ttlMs to a fraction is rejected"
+        );
+        assert_eq!(cache.stats(), before);
+        assert!(cache.entries.contains_key(&key));
+        assert_eq!(cache.retained_bytes, retained_before);
     }
 
     #[test]
