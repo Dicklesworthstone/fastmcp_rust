@@ -2563,10 +2563,10 @@ fn http_request_accepts_sse(request: &HttpRequest) -> bool {
 
 /// A live server composition over the transport's bounded dual-era HTTP endpoint.
 ///
-/// A bound listener issues `MCP-Session-Id` on modern discovery and retains
-/// that session's state until TTL or listener shutdown. A final
-/// `subscriptions/listen` SSE body retains its request-owned dispatch until
-/// cancellation or session close. Exact MCP 2024-11-05 requests retain the
+/// Modern Streamable HTTP POSTs, including discovery, are independently
+/// dispatched and neither emit nor accept `MCP-Session-Id`. A final
+/// `subscriptions/listen` SSE body retains its request-owned dispatch only for
+/// that response body. Exact MCP 2024-11-05 requests retain the
 /// transport-issued session identifier, lifecycle adapter, and SSE response
 /// stream for this one session.
 pub struct ServerHttpEndpoint {
@@ -2585,7 +2585,6 @@ pub struct ServerHttpSession {
     server: Arc<Server>,
     endpoint_session: Arc<Mutex<DualEraHttpSession>>,
     legacy_session_id: String,
-    modern_session_id: String,
     legacy_session: Session,
     legacy_binding: LegacyPeerBinding,
     legacy_adapter: Option<Legacy2024ServerAdapter<HttpLegacy2024RuntimeHandler>>,
@@ -2594,8 +2593,8 @@ pub struct ServerHttpSession {
     legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
     legacy_pending_requests: Arc<PendingRequests>,
     legacy_runtime: LiveLegacy2024ConnectionRuntime,
-    /// The durable modern partition and retained-continuation owner for this
-    /// HTTP session. Closing the session cancels every MRTR state it minted.
+    /// The request-local modern partition and retained-continuation owner.
+    /// Closing the session cancels every MRTR state minted by this POST.
     modern_connection: Arc<ModernConnection>,
     /// Owned modern listen dispatches whose SSE bodies were returned to the
     /// embedding caller. Handles are retained because dropping an asupersync
@@ -3935,13 +3934,14 @@ struct LiveHttpSession {
 
 type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveHttpSession>>>>;
 
-const MAX_LIVE_MODERN_HTTP_SESSIONS: usize = 1_024;
 const MODERN_HTTP_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 const MODERN_HTTP_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// One listener-owned modern HTTP session. Unlike a response body, this owner
-/// spans the discovery POST and every later POST that presents its server
-/// issued `MCP-Session-Id` header.
+/// One response-body-owned modern HTTP session.
+///
+/// Modern Streamable HTTP has no listener-visible session identifier. This
+/// owner exists only while an SSE response body needs its request-local
+/// connection and dispatch lifecycle.
 struct LiveModernHttpSession {
     server: Arc<Server>,
     session: Mutex<ServerHttpSession>,
@@ -4583,7 +4583,6 @@ impl ServerHttpEndpoint {
             .to_owned();
         let legacy_session =
             Session::new(self.server.info.clone(), self.server.capabilities.clone());
-        let modern_session_id = format!("mcp-{}", legacy_session.id());
         let legacy_binding = runtime_legacy_binding(legacy_session.id());
         let legacy_pending_requests = Arc::new(
             PendingRequests::with_max_in_flight_for_exact_legacy(
@@ -4621,7 +4620,6 @@ impl ServerHttpEndpoint {
             server: Arc::clone(&self.server),
             endpoint_session,
             legacy_session_id,
-            modern_session_id,
             legacy_session,
             legacy_binding,
             legacy_adapter: None,
@@ -4656,10 +4654,6 @@ impl ServerHttpSession {
         &self.legacy_session_id
     }
 
-    fn modern_session_id(&self) -> &str {
-        &self.modern_session_id
-    }
-
     /// Routes and dispatches one modern or exact-2024 HTTP request.
     pub fn handle(
         &mut self,
@@ -4686,6 +4680,9 @@ impl ServerHttpSession {
             )));
         }
         if is_modern {
+            if request.header("mcp-session-id").is_some() {
+                return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::bad_request()));
+            }
             request = match self.prepare_modern_http_request(request) {
                 Ok(request) => request,
                 Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
@@ -5722,133 +5719,22 @@ fn http_endpoint_error_response(
     }
 }
 
-fn is_modern_http_discovery_request(endpoint: &ServerHttpEndpoint, request: &HttpRequest) -> bool {
-    if request.method != HttpMethod::Post
-        || request.path != endpoint.server.http_config.handler_config.base_path
-        || request.header("mcp-method") != Some(SERVER_DISCOVER_METHOD)
-    {
-        return false;
-    }
-    let mut codec = Codec::new();
-    codec.set_max_message_size(endpoint.server.http_config.handler_config.max_body_size);
-    matches!(
-        codec.decode_complete_message(&request.body),
-        Ok(JsonRpcMessage::Request(request)) if request.method == SERVER_DISCOVER_METHOD
-    )
-}
-
-/// Resolves a discovery-issued modern session for a subsequent POST.
-///
-/// Both JSON and SSE responses share this lookup so an SSE body cannot mint a
-/// transient `ModernConnection` that bypasses the session-owned MRTR store.
-fn registered_modern_http_session(
-    modern_sessions: &LiveModernHttpSessionRegistry,
-    request: &HttpRequest,
-) -> Result<Arc<LiveModernHttpSession>, HttpResponse> {
-    expire_live_modern_http_sessions(modern_sessions);
-    if modern_sessions.closing.load(Ordering::Acquire) {
-        return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
-    }
-    let Some(session_id) = request.header("mcp-session-id") else {
-        return Err(HttpResponse::bad_request());
-    };
-    let session = modern_sessions
-        .sessions
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(session_id)
-        .cloned();
-    let Some(session) = session else {
-        return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
-    };
-    // A request may retain an `Arc` across the registry evacuation. Do not
-    // renew or dispatch through that detached session during shutdown.
-    if session.is_closing() {
-        return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
-    }
-    let now = Instant::now();
-    if session.is_expired(now) {
-        let removed = modern_sessions
-            .sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id);
-        if let Some(removed) = removed {
-            close_detached_modern_http_session(modern_sessions, removed);
-        }
-        return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
-    }
-    session.renew(now);
-    if session.is_closing() {
-        return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
-    }
-    Ok(session)
-}
-
 fn dispatch_registered_modern_http_request(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
     modern_sessions: &LiveModernHttpSessionRegistry,
     request: HttpRequest,
 ) -> HttpResponse {
-    expire_live_modern_http_sessions(modern_sessions);
     let error_request = request.clone();
-    if is_modern_http_discovery_request(endpoint, &request) {
-        if modern_sessions.closing.load(Ordering::Acquire) {
-            return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE);
-        }
-        if request.header("mcp-session-id").is_some() {
-            return HttpResponse::bad_request();
-        }
-        let mut session = match endpoint.open_session(cx) {
-            Ok(session) => session,
-            Err(_) => return HttpResponse::internal_error(),
-        };
-        let session_id = session.modern_session_id().to_owned();
-        let response = session
-            .handle(cx, request)
-            .map(|response| http_endpoint_response_to_static(cx, response))
-            .unwrap_or_else(|error| {
-                http_endpoint_error_response(
-                    &error_request,
-                    error,
-                    endpoint.server.http_config.handler_config.max_body_size,
-                )
-            });
-        if response.status != HttpStatus::OK {
-            return response;
-        }
-        let accepted = {
-            let mut sessions = modern_sessions
-                .sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if modern_sessions.closing.load(Ordering::Acquire)
-                || sessions.len() >= MAX_LIVE_MODERN_HTTP_SESSIONS
-            {
-                false
-            } else {
-                sessions.insert(
-                    session_id.clone(),
-                    Arc::new(LiveModernHttpSession::new(session)),
-                );
-                true
-            }
-        };
-        if !accepted {
-            return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE);
-        }
-        return response.with_header("mcp-session-id", session_id);
+    if request.header("mcp-session-id").is_some() {
+        return HttpResponse::bad_request();
     }
-
-    let session = match registered_modern_http_session(modern_sessions, &request) {
+    modern_sessions.reap_retired_dispatches();
+    let mut session = match endpoint.open_session(cx) {
         Ok(session) => session,
-        Err(response) => return response,
+        Err(_) => return HttpResponse::internal_error(),
     };
     session
-        .session
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .handle(cx, request)
         .map(|response| http_endpoint_response_to_static(cx, response))
         .unwrap_or_else(|error| {
@@ -6005,19 +5891,14 @@ async fn serve_http_connection(
         && request.path == endpoint.server.http_config.handler_config.base_path
         && http_request_accepts_sse(&request);
     if is_modern_sse {
-        // Discovery is the only modern SSE-acceptable POST allowed to mint a
-        // session. Its normal JSON discovery response still carries the
-        // issued header; every later SSE request must present that same ID.
-        if is_modern_http_discovery_request(&endpoint, &request) {
-            let response =
-                dispatch_registered_modern_http_request(cx, &endpoint, &modern_sessions, request);
-            let _ = send_h1_response(cx, &mut framed, response).await;
+        if request.header("mcp-session-id").is_some() {
+            let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
             return;
         }
-        let live_session = match registered_modern_http_session(&modern_sessions, &request) {
-            Ok(session) => session,
-            Err(response) => {
-                let _ = send_h1_response(cx, &mut framed, response).await;
+        let live_session = match endpoint.open_session(cx) {
+            Ok(session) => Arc::new(LiveModernHttpSession::new(session)),
+            Err(_) => {
+                let _ = send_h1_response(cx, &mut framed, HttpResponse::internal_error()).await;
                 return;
             }
         };
@@ -22770,10 +22651,10 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_mrtr_sse_retry_uses_discovery_session_across_new_post_and_request_id() {
+    fn live_http_modern_sse_post_dispatches_without_discovery_or_session_id() {
         run_live_http_test(|cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
-            let bound = Server::new("live-http-mrtr-session", "1.0.0")
+            let bound = Server::new("live-http-stateless-sse", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .tool(LiveHttpMrtrTool {
                     calls: Arc::clone(&calls),
@@ -22788,32 +22669,6 @@ mod lib_unit_tests {
             let caller_cx = cx.clone();
             let mut client = cx
                 .spawn(move |_client_cx| async move {
-                    let discovery = JsonRpcRequest::new(
-                        SERVER_DISCOVER_METHOD,
-                        Some(serde_json::json!({
-                            "_meta": {
-                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                            },
-                        })),
-                        921_i64,
-                    );
-                    let discovery_body = serde_json::to_vec(&discovery)
-                        .map_err(|error| format!("MRTR discovery did not serialize: {error}"))?;
-                    let discovery = live_http_exchange(
-                        address,
-                        live_http_post(
-                            "/mcp",
-                            &discovery_body,
-                            &[
-                                ("Accept", "application/json"),
-                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
-                                ("Mcp-Method", SERVER_DISCOVER_METHOD),
-                            ],
-                        ),
-                    )
-                    .await?;
-                    let session_id = live_http_response_header(&discovery, "mcp-session-id")?;
                     let initial = JsonRpcRequest::new(
                         "tools/call",
                         Some(serde_json::json!({
@@ -22839,93 +22694,49 @@ mod lib_unit_tests {
                                 ("Accept", "text/event-stream"),
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
-                                ("MCP-Session-Id", session_id.as_str()),
                             ],
                         ),
                     )
                     .await?;
-                    let initial_response = live_http_sse_jsonrpc_response(&initial)?;
-                    let request_state = initial_response
-                        .result
-                        .as_ref()
-                        .and_then(|result| result.get("requestState"))
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| "MRTR initial response omitted requestState".to_owned())?
-                        .to_owned();
-                    let roots = serde_json::to_value(
-                        bidirectional::MrtrInputResponse::roots(
-                            fastmcp_protocol::ListRootsResult::empty(),
-                        )
-                        .map_err(|error| format!("MRTR roots response failed: {error}"))?,
-                    )
-                    .map_err(|error| format!("MRTR roots response did not serialize: {error}"))?;
-                    let retry = JsonRpcRequest::new(
-                        "tools/call",
-                        Some(serde_json::json!({
-                            "name": "live_http_mrtr",
-                            "arguments": {},
-                            "inputResponses": {"roots": roots},
-                            "requestState": request_state,
-                            "_meta": {
-                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                            },
-                        })),
-                        923_i64,
+                    caller_cx.cancel_with(
+                        CancelKind::User,
+                        Some("live HTTP stateless SSE request complete"),
                     );
-                    let retry_body = serde_json::to_vec(&retry).map_err(|error| {
-                        format!("MRTR retry request did not serialize: {error}")
-                    })?;
-                    let retry = live_http_exchange(
-                        address,
-                        live_http_post(
-                            "/mcp",
-                            &retry_body,
-                            &[
-                                ("Accept", "application/json"),
-                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
-                                ("Mcp-Method", "tools/call"),
-                                ("MCP-Session-Id", session_id.as_str()),
-                            ],
-                        ),
-                    )
-                    .await;
-                    caller_cx.cancel_with(CancelKind::User, Some("live HTTP MRTR retry complete"));
-                    retry
+                    Ok::<_, String>(initial)
                 })
                 .map_err(|error| format!("live HTTP MRTR client admission failed: {error}"))?;
 
             let serve = bound.serve(&cx).await;
-            let retry = client
+            let response = client
                 .join(&cx)
                 .await
                 .map_err(|error| format!("live HTTP MRTR client failed: {error:?}"))??;
             serve.map_err(|error| format!("live HTTP MRTR server failed: {error}"))?;
-            let retry: JsonRpcResponse =
-                serde_json::from_slice(live_http_response_body(&retry)?)
-                    .map_err(|error| format!("MRTR retry response was invalid: {error}"))?;
-            if retry.id != Some(923_i64.into())
-                || retry.error.is_some()
-                || retry
+            let response = live_http_sse_jsonrpc_response(&response)?;
+            if response.id != Some(922_i64.into())
+                || response.error.is_some()
+                || response
                     .result
                     .as_ref()
                     .and_then(|result| result.get("resultType"))
-                    != Some(&serde_json::json!("complete"))
+                    != Some(&serde_json::json!("input_required"))
             {
-                return Err(format!("MRTR retry did not complete: {retry:?}"));
+                return Err(format!(
+                    "sessionless modern SSE POST did not dispatch: {response:?}"
+                ));
             }
-            if calls.load(Ordering::Acquire) != 2 {
-                return Err("MRTR handler did not run once per initial/retry POST".to_owned());
+            if calls.load(Ordering::Acquire) != 1 {
+                return Err("sessionless modern SSE POST did not invoke the handler once".to_owned());
             }
             Ok(())
         });
     }
 
     #[test]
-    fn live_http_mrtr_sse_rejects_only_missing_discovery_session_before_handler() {
+    fn live_http_modern_sse_rejects_only_session_id_before_handler() {
         run_live_http_test(|cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
-            let bound = Server::new("live-http-mrtr-sse-session-required", "1.0.0")
+            let bound = Server::new("live-http-stateless-sse-reject", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .tool(LiveHttpMrtrTool {
                     calls: Arc::clone(&calls),
@@ -22940,33 +22751,6 @@ mod lib_unit_tests {
             let caller_cx = cx.clone();
             let mut client = cx
                 .spawn(move |_client_cx| async move {
-                    let discovery = JsonRpcRequest::new(
-                        SERVER_DISCOVER_METHOD,
-                        Some(serde_json::json!({
-                            "_meta": {
-                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                            },
-                        })),
-                        924_i64,
-                    );
-                    let discovery_body = serde_json::to_vec(&discovery).map_err(|error| {
-                        format!("MRTR SSE discovery did not serialize: {error}")
-                    })?;
-                    let discovery = live_http_exchange(
-                        address,
-                        live_http_post(
-                            "/mcp",
-                            &discovery_body,
-                            &[
-                                ("Accept", "application/json"),
-                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
-                                ("Mcp-Method", SERVER_DISCOVER_METHOD),
-                            ],
-                        ),
-                    )
-                    .await?;
-                    let _session_id = live_http_response_header(&discovery, "mcp-session-id")?;
                     let initial = JsonRpcRequest::new(
                         "tools/call",
                         Some(serde_json::json!({
@@ -22992,13 +22776,14 @@ mod lib_unit_tests {
                                 ("Accept", "text/event-stream"),
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
+                                ("MCP-Session-Id", "obsolete-modern-session"),
                             ],
                         ),
                     )
                     .await;
                     caller_cx.cancel_with(
                         CancelKind::User,
-                        Some("live HTTP MRTR SSE missing session complete"),
+                        Some("live HTTP stateless SSE session-header rejection complete"),
                     );
                     rejected
                 })
@@ -23011,7 +22796,7 @@ mod lib_unit_tests {
                 .map_err(|error| format!("live HTTP MRTR SSE client failed: {error:?}"))??;
             serve.map_err(|error| format!("live HTTP MRTR SSE server failed: {error}"))?;
             if !rejected.starts_with(b"HTTP/1.1 400") || calls.load(Ordering::Acquire) != 0 {
-                return Err("removing only MCP-Session-Id admitted an SSE MRTR handler".to_owned());
+                return Err("adding only MCP-Session-Id admitted a modern SSE handler".to_owned());
             }
             Ok(())
         });
