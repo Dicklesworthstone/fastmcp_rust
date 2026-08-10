@@ -2038,6 +2038,15 @@ mod tests {
                 r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":{raw_code},"message":"failed"}}}}"#
             ))
             .expect("integral error-code wire must parse");
+            // serde_json canonicalizes exponent spellings while parsing the
+            // wire into a Value ("-3.2603e4" arrives as "-3.2603e+4"); the
+            // envelope decoder's obligation is to admit the parsed code
+            // without further lexeme or precision loss.
+            let parsed_code = wire["error"]["code"]
+                .as_number()
+                .expect("error code parses as a JSON number")
+                .as_str()
+                .to_owned();
 
             let Legacy2024Envelope::Error { error, .. } = decode_legacy_2024_11_05_envelope(wire)
                 .expect("exact inbound error code must be admitted")
@@ -2049,7 +2058,7 @@ mod tests {
                     .as_number()
                     .expect("error code remains a JSON number")
                     .as_str(),
-                raw_code
+                parsed_code
             );
         }
     }

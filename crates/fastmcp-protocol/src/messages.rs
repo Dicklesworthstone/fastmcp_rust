@@ -5063,7 +5063,12 @@ pub enum ElicitAction {
 /// Content type for elicitation responses.
 ///
 /// Values can be strings, integers, floats, booleans, arrays of strings, or null.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Deserialize is manual: a derived untagged decode buffers the input into
+/// serde's Content, where an arbitrary-precision JSON number surfaces as a
+/// magic map that neither `JsonInteger` nor `f64` variant probing could
+/// previously classify.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum ElicitContentValue {
     /// Null value.
@@ -5078,6 +5083,96 @@ pub enum ElicitContentValue {
     String(String),
     /// Array of strings (for multi-select).
     StringArray(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for ElicitContentValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ElicitContentValueVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ElicitContentValueVisitor {
+            type Value = ElicitContentValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("null, a boolean, a JSON number, a string, or a string array")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(ElicitContentValue::Null)
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(ElicitContentValue::Null)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(ElicitContentValue::Bool(value))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(ElicitContentValue::Int(JsonInteger::from(value)))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(ElicitContentValue::Int(JsonInteger::from(value)))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(ElicitContentValue::Float(value))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(ElicitContentValue::String(value.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(ElicitContentValue::String(value))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element::<String>()? {
+                    values.push(value);
+                }
+                Ok(ElicitContentValue::StringArray(values))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                // The arbitrary-precision magic map is the only object shape
+                // an elicitation value can take; classify its number lexeme
+                // as an exact integer first, then as a float.
+                let Some(key) = map.next_key::<std::borrow::Cow<'_, str>>()? else {
+                    return Err(serde::de::Error::custom(
+                        "elicitation value cannot be an object",
+                    ));
+                };
+                if key != "$serde_json::private::Number" && key != "$serde_json::private::RawValue"
+                {
+                    return Err(serde::de::Error::custom(
+                        "elicitation value cannot be an object",
+                    ));
+                }
+                let lexeme = map.next_value::<std::borrow::Cow<'_, str>>()?;
+                if let Ok(integer) = lexeme.parse::<JsonInteger>() {
+                    return Ok(ElicitContentValue::Int(integer));
+                }
+                lexeme
+                    .parse::<f64>()
+                    .map(ElicitContentValue::Float)
+                    .map_err(|_| serde::de::Error::custom("invalid elicitation number"))
+            }
+        }
+
+        deserializer.deserialize_any(ElicitContentValueVisitor)
+    }
 }
 
 impl From<bool> for ElicitContentValue {
