@@ -11,6 +11,8 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::common_types::JsonInteger;
+
 /// The only legacy MCP wire version represented by this isolated surface.
 pub const LEGACY_2024_11_05_PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -604,12 +606,10 @@ pub struct Legacy2024ResourcesCapability {
 pub fn decode_legacy_2024_11_05_client_capabilities(
     value: Value,
 ) -> Result<Legacy2024ClientCapabilities, Legacy2024WireError> {
+    validate_legacy_2024_client_capability_members(&value)?;
     let capabilities: Legacy2024ClientCapabilities = serde_json::from_value(value)
         .map_err(|_| Legacy2024WireError("MCP 2024-11-05 client capabilities must be an object"))?;
-    validate_legacy_2024_capability_extensions(
-        &capabilities.extensions,
-        capabilities.experimental.as_ref(),
-    )?;
+    validate_legacy_2024_experimental_capabilities(capabilities.experimental.as_ref())?;
     Ok(capabilities)
 }
 
@@ -619,10 +619,7 @@ pub fn decode_legacy_2024_11_05_server_capabilities(
 ) -> Result<Legacy2024ServerCapabilities, Legacy2024WireError> {
     let capabilities: Legacy2024ServerCapabilities = serde_json::from_value(value)
         .map_err(|_| Legacy2024WireError("MCP 2024-11-05 server capabilities must be an object"))?;
-    validate_legacy_2024_capability_extensions(
-        &capabilities.extensions,
-        capabilities.experimental.as_ref(),
-    )?;
+    validate_legacy_2024_experimental_capabilities(capabilities.experimental.as_ref())?;
     Ok(capabilities)
 }
 
@@ -665,18 +662,26 @@ pub fn validate_legacy_2024_11_05_initialize_result(
     decode_legacy_2024_11_05_server_capabilities(capabilities)
 }
 
-fn validate_legacy_2024_capability_extensions(
-    extensions: &BTreeMap<String, Value>,
-    experimental: Option<&BTreeMap<String, Value>>,
+fn validate_legacy_2024_client_capability_members(
+    value: &Value,
 ) -> Result<(), Legacy2024WireError> {
-    if ["elicitation", "tasks", "apps", "extensions"]
+    let capabilities = value.as_object().ok_or(Legacy2024WireError(
+        "MCP 2024-11-05 client capabilities must be an object",
+    ))?;
+    if ["experimental", "sampling", "roots"]
         .iter()
-        .any(|name| extensions.contains_key(*name))
+        .any(|member| capabilities.get(*member).is_some_and(Value::is_null))
     {
         return Err(Legacy2024WireError(
-            "modern-only capabilities are not part of exact MCP 2024-11-05",
+            "MCP 2024-11-05 client capability members must be objects when present",
         ));
     }
+    Ok(())
+}
+
+fn validate_legacy_2024_experimental_capabilities(
+    experimental: Option<&BTreeMap<String, Value>>,
+) -> Result<(), Legacy2024WireError> {
     if experimental.is_some_and(|experimental| {
         experimental
             .values()
@@ -1039,7 +1044,7 @@ pub fn validate_legacy_2024_11_05_method_params(
             let params = required_params_object(method, params)?;
             if !params.get("requestId").is_some_and(legacy_2024_request_id) {
                 return Err(Legacy2024WireError(
-                    "notifications/cancelled requires a non-null string or signed integer requestId",
+                    "notifications/cancelled requires a non-null string or integer requestId",
                 ));
             }
             if params.get("reason").is_none_or(Value::is_string) {
@@ -1102,17 +1107,18 @@ pub fn validate_legacy_2024_11_05_method_params(
             let params = required_params_object(method, params)?;
             required_string(params, "uri", "notifications/resources/updated")
         }
-        NOTIFICATIONS_ROOTS_LIST_CHANGED
-        | NOTIFICATIONS_INITIALIZED
-        | PING
-        | ROOTS_LIST
-        | TOOLS_LIST
+        TOOLS_LIST
         | RESOURCES_LIST
         | RESOURCES_TEMPLATES_LIST
-        | PROMPTS_LIST => optional_params_object(params, method),
-        NOTIFICATIONS_PROMPTS_LIST_CHANGED
+        | PROMPTS_LIST => validate_legacy_2024_cursor_params(params, method),
+        NOTIFICATIONS_ROOTS_LIST_CHANGED
+        | NOTIFICATIONS_INITIALIZED
+        | NOTIFICATIONS_PROMPTS_LIST_CHANGED
         | NOTIFICATIONS_RESOURCES_LIST_CHANGED
-        | NOTIFICATIONS_TOOLS_LIST_CHANGED => optional_params_object(params, method),
+        | NOTIFICATIONS_TOOLS_LIST_CHANGED => {
+            validate_legacy_2024_metadata_params(params, false)
+        }
+        ROOTS_LIST | PING => validate_legacy_2024_metadata_params(params, true),
         INITIALIZE => validate_legacy_2024_initialize(method, params),
         _ => Err(Legacy2024WireError(
             "method is not part of exact MCP 2024-11-05",
@@ -1154,10 +1160,7 @@ fn validate_legacy_2024_sampling_create_message(
         .ok_or(Legacy2024WireError(
             "sampling/createMessage requires a messages array",
         ))?;
-    if !params
-        .get("maxTokens")
-        .is_some_and(|value| value.is_i64() || value.is_u64())
-    {
+    if !params.get("maxTokens").is_some_and(legacy_2024_json_integer) {
         return Err(Legacy2024WireError(
             "sampling/createMessage requires integer maxTokens",
         ));
@@ -1295,6 +1298,58 @@ fn optional_params_object(params: Option<&Value>, method: &str) -> Result<(), Le
     }
 }
 
+/// Validates optional exact-2024 parameter objects with a pagination cursor.
+fn validate_legacy_2024_cursor_params(
+    params: Option<&Value>,
+    method: &str,
+) -> Result<(), Legacy2024WireError> {
+    optional_params_object(params, method)?;
+    let Some(params) = params else {
+        return Ok(());
+    };
+    if params
+        .as_object()
+        .and_then(|params| params.get("cursor"))
+        .is_none_or(Value::is_string)
+    {
+        Ok(())
+    } else {
+        Err(Legacy2024WireError(
+            "exact MCP 2024-11-05 cursor must be a string when present",
+        ))
+    }
+}
+
+fn validate_legacy_2024_metadata_params(
+    params: Option<&Value>,
+    permits_progress_token: bool,
+) -> Result<(), Legacy2024WireError> {
+    optional_params_object(params, "metadata")?;
+    let Some(params) = params else {
+        return Ok(());
+    };
+    let params = params.as_object().ok_or(Legacy2024WireError(
+        "exact MCP 2024-11-05 params must be an object when present",
+    ))?;
+    let Some(meta) = params.get("_meta") else {
+        return Ok(());
+    };
+    let meta = meta.as_object().ok_or(Legacy2024WireError(
+        "exact MCP 2024-11-05 _meta must be an object",
+    ))?;
+    if !permits_progress_token
+        || meta
+            .get("progressToken")
+            .is_none_or(legacy_2024_request_id)
+    {
+        Ok(())
+    } else {
+        Err(Legacy2024WireError(
+            "exact MCP 2024-11-05 progressToken must be a string or integer",
+        ))
+    }
+}
+
 fn required_string(
     object: &serde_json::Map<String, Value>,
     member: &str,
@@ -1403,12 +1458,12 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
             Legacy2024EnvelopeKind::Request => {
                 let id = object.get("id").cloned().ok_or(
                     Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
-                        "MCP 2024-11-05 request envelopes require a non-null string or signed integer id",
+                        "MCP 2024-11-05 request envelopes require a non-null string or integer id",
                     )),
                 )?;
                 if !legacy_2024_request_id(&id) {
                     return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
-                        "MCP 2024-11-05 request envelopes require a non-null string or signed integer id",
+                        "MCP 2024-11-05 request envelopes require a non-null string or integer id",
                     )));
                 }
                 validate_legacy_2024_11_05_method_params(method.name, params.as_ref())
@@ -1432,11 +1487,11 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
         .get("id")
         .cloned()
         .ok_or(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
-            "MCP 2024-11-05 response envelopes require a non-null string or signed integer id",
+            "MCP 2024-11-05 response envelopes require a non-null string or integer id",
         )))?;
     if !legacy_2024_request_id(&id) {
         return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
-            "MCP 2024-11-05 response envelopes require a non-null string or signed integer id",
+            "MCP 2024-11-05 response envelopes require a non-null string or integer id",
         )));
     }
     match (object.get("result"), object.get("error")) {
@@ -1461,7 +1516,13 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
 }
 
 fn legacy_2024_request_id(value: &Value) -> bool {
-    value.is_string() || value.as_i64().is_some()
+    value.is_string() || legacy_2024_json_integer(value)
+}
+
+fn legacy_2024_json_integer(value: &Value) -> bool {
+    value.as_number().is_some_and(|number| {
+        JsonInteger::try_from_number(number.clone()).is_ok()
+    })
 }
 
 fn valid_legacy_2024_error(value: &Value) -> bool {
@@ -1483,13 +1544,9 @@ fn validate_legacy_2024_initialize(
         .ok_or(Legacy2024WireError(
             "MCP 2024-11-05 initialize requires object params",
         ))?;
-    if params.get("protocolVersion")
-        != Some(&Value::String(
-            LEGACY_2024_11_05_PROTOCOL_VERSION.to_owned(),
-        ))
-    {
+    if !params.get("protocolVersion").is_some_and(Value::is_string) {
         return Err(Legacy2024WireError(
-            "initialize protocolVersion must be exact MCP 2024-11-05",
+            "initialize protocolVersion must be a string",
         ));
     }
     let client_info =
@@ -1661,14 +1718,26 @@ mod tests {
     }
 
     #[test]
-    fn leg_01_schema_parity_planted_negative() {
+    fn leg_01_initialize_open_extensions_and_protocol_version_positive() {
         let mut wire = initialize_wire();
         wire["params"]["protocolVersion"] = json!("2025-11-25");
+        wire["params"]["capabilities"]["elicitation"] = json!({"form": {}});
+        assert!(matches!(
+            decode_legacy_2024_11_05_envelope(wire).unwrap(),
+            Legacy2024Envelope::Request { method, .. } if method.name == INITIALIZE
+        ));
+    }
+
+    #[test]
+    fn leg_01_initialize_open_extensions_and_protocol_version_planted_negative() {
+        let mut wire = initialize_wire();
+        wire["params"]["protocolVersion"] = Value::Bool(true);
+        wire["params"]["capabilities"]["elicitation"] = json!({"form": {}});
         assert_eq!(
             decode_legacy_2024_11_05_envelope(wire)
                 .unwrap_err()
                 .reason(),
-            "initialize protocolVersion must be exact MCP 2024-11-05"
+            "initialize protocolVersion must be a string"
         );
     }
 
@@ -1733,6 +1802,193 @@ mod tests {
     }
 
     #[test]
+    fn leg_01_server_to_client_ping_params_positive() {
+        let ping: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":"server-ping","method":"ping","params":{"_meta":{"progressToken":922337203685477580812345678901234567890}}}"#,
+        )
+        .expect("huge mathematical integer ping token is valid JSON");
+
+        assert!(matches!(
+            decode_legacy_2024_11_05_envelope(ping).unwrap(),
+            Legacy2024Envelope::Request { method, .. } if method.name == PING
+        ));
+    }
+
+    #[test]
+    fn leg_01_server_to_client_ping_params_planted_negative() {
+        let ping: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":"server-ping","method":"ping","params":{"_meta":{"progressToken":922337203685477580812345678901234567890.5}}}"#,
+        )
+        .expect("fractional ping token is valid JSON");
+
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(ping)
+                .unwrap_err()
+                .reason(),
+            "exact MCP 2024-11-05 progressToken must be a string or integer"
+        );
+    }
+
+    #[test]
+    fn leg_01_integer_token_params_positive() {
+        let huge: Value = serde_json::from_str("922337203685477580812345678901234567890")
+            .expect("huge mathematical integer token is valid JSON");
+        let mut cancelled = json!({
+            "jsonrpc": "2.0",
+            "method": NOTIFICATIONS_CANCELLED,
+            "params": {"requestId": 0}
+        });
+        cancelled["params"]["requestId"] = huge.clone();
+        assert!(decode_legacy_2024_11_05_envelope(cancelled).is_ok());
+
+        let mut progress = json!({
+            "jsonrpc": "2.0",
+            "method": NOTIFICATIONS_PROGRESS,
+            "params": {"progressToken": 0, "progress": 1}
+        });
+        progress["params"]["progressToken"] = huge;
+        assert!(decode_legacy_2024_11_05_envelope(progress).is_ok());
+    }
+
+    #[test]
+    fn leg_01_integer_token_params_planted_negative() {
+        let fractional: Value = serde_json::from_str("922337203685477580812345678901234567890.5")
+            .expect("fractional token is valid JSON");
+        let mut cancelled = json!({
+            "jsonrpc": "2.0",
+            "method": NOTIFICATIONS_CANCELLED,
+            "params": {"requestId": 0}
+        });
+        cancelled["params"]["requestId"] = fractional.clone();
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(cancelled)
+                .unwrap_err()
+                .reason(),
+            "notifications/cancelled requires a non-null string or integer requestId"
+        );
+
+        let mut progress = json!({
+            "jsonrpc": "2.0",
+            "method": NOTIFICATIONS_PROGRESS,
+            "params": {"progressToken": 0, "progress": 1}
+        });
+        progress["params"]["progressToken"] = fractional;
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(progress)
+                .unwrap_err()
+                .reason(),
+            "notifications/progress requires exact token, progress, and optional total members"
+        );
+    }
+
+    #[test]
+    fn leg_01_cursor_params_positive() {
+        for method in [TOOLS_LIST, RESOURCES_LIST, RESOURCES_TEMPLATES_LIST, PROMPTS_LIST] {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": "cursor-request",
+                "method": method,
+                "params": {"cursor": "opaque-cursor"}
+            });
+            assert!(decode_legacy_2024_11_05_envelope(request).is_ok(), "{method}");
+        }
+    }
+
+    #[test]
+    fn leg_01_cursor_params_planted_negative() {
+        for method in [TOOLS_LIST, RESOURCES_LIST, RESOURCES_TEMPLATES_LIST, PROMPTS_LIST] {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": "cursor-request",
+                "method": method,
+                "params": {"cursor": false}
+            });
+            assert_eq!(
+                decode_legacy_2024_11_05_envelope(request)
+                    .unwrap_err()
+                    .reason(),
+                "exact MCP 2024-11-05 cursor must be a string when present",
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn leg_01_metadata_params_positive() {
+        for method in [
+            NOTIFICATIONS_INITIALIZED,
+            NOTIFICATIONS_ROOTS_LIST_CHANGED,
+            NOTIFICATIONS_PROMPTS_LIST_CHANGED,
+            NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+            NOTIFICATIONS_TOOLS_LIST_CHANGED,
+        ] {
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": {"_meta": {"vendor": true}}
+            });
+            assert!(
+                decode_legacy_2024_11_05_envelope(notification).is_ok(),
+                "{method}"
+            );
+        }
+        let roots = json!({
+            "jsonrpc": "2.0",
+            "id": "roots-request",
+            "method": ROOTS_LIST,
+            "params": {"_meta": {"progressToken": "roots-progress"}}
+        });
+        assert!(decode_legacy_2024_11_05_envelope(roots).is_ok());
+    }
+
+    #[test]
+    fn leg_01_metadata_params_planted_negative() {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": NOTIFICATIONS_INITIALIZED,
+            "params": {"_meta": false}
+        });
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(notification)
+                .unwrap_err()
+                .reason(),
+            "exact MCP 2024-11-05 _meta must be an object"
+        );
+
+        let roots = json!({
+            "jsonrpc": "2.0",
+            "id": "roots-request",
+            "method": ROOTS_LIST,
+            "params": {"_meta": {"progressToken": false}}
+        });
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(roots).unwrap_err().reason(),
+            "exact MCP 2024-11-05 progressToken must be a string or integer"
+        );
+    }
+
+    #[test]
+    fn leg_01_sampling_max_tokens_arbitrary_width_positive() {
+        let request: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":"sampling-request","method":"sampling/createMessage","params":{"messages":[],"maxTokens":922337203685477580812345678901234567890}}"#,
+        )
+        .expect("huge mathematical integer maxTokens is valid JSON");
+        assert!(decode_legacy_2024_11_05_envelope(request).is_ok());
+    }
+
+    #[test]
+    fn leg_01_sampling_max_tokens_arbitrary_width_planted_negative() {
+        let request: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":"sampling-request","method":"sampling/createMessage","params":{"messages":[],"maxTokens":922337203685477580812345678901234567890.5}}"#,
+        )
+        .expect("fractional maxTokens is valid JSON");
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(request).unwrap_err().reason(),
+            "sampling/createMessage requires integer maxTokens"
+        );
+    }
+
+    #[test]
     fn leg_01_envelopes_positive() {
         assert!(matches!(
             decode_legacy_2024_11_05_envelope(initialize_wire()).unwrap(),
@@ -1772,15 +2028,27 @@ mod tests {
     }
 
     #[test]
-    fn leg_01_cross_era_planted_negative() {
-        let mut wire = initialize_wire();
-        wire["params"]["capabilities"]["elicitation"] = json!({"form": {}});
-        assert_eq!(
-            decode_legacy_2024_11_05_envelope(wire)
-                .unwrap_err()
-                .reason(),
-            "modern-only capabilities are not part of exact MCP 2024-11-05"
-        );
+    fn leg_01_client_capability_members_positive() {
+        for member in ["experimental", "sampling", "roots"] {
+            let mut wire = initialize_wire();
+            wire["params"]["capabilities"][member] = json!({});
+            assert!(decode_legacy_2024_11_05_envelope(wire).is_ok(), "{member}");
+        }
+    }
+
+    #[test]
+    fn leg_01_client_capability_members_planted_negative() {
+        for member in ["experimental", "sampling", "roots"] {
+            let mut wire = initialize_wire();
+            wire["params"]["capabilities"][member] = Value::Null;
+            assert_eq!(
+                decode_legacy_2024_11_05_envelope(wire)
+                    .unwrap_err()
+                    .reason(),
+                "MCP 2024-11-05 client capability members must be objects when present",
+                "{member}"
+            );
+        }
     }
 
     #[test]
@@ -1806,7 +2074,7 @@ mod tests {
             decode_legacy_2024_11_05_envelope(wire)
                 .unwrap_err()
                 .reason(),
-            "MCP 2024-11-05 request envelopes require a non-null string or signed integer id"
+            "MCP 2024-11-05 request envelopes require a non-null string or integer id"
         );
     }
 }

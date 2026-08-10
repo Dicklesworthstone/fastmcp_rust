@@ -1439,9 +1439,9 @@ pub struct FinalCreateMessageParams {
     pub meta: OpenMetadata,
     /// Sampling conversation.
     pub messages: Vec<crate::types::FinalSamplingMessage>,
-    /// Requested maximum token count.
+    /// Requested maximum token count as an arbitrary-width JSON integer.
     #[serde(rename = "maxTokens")]
-    pub max_tokens: i64,
+    pub max_tokens: JsonInteger,
     /// Optional system prompt.
     #[serde(
         rename = "systemPrompt",
@@ -1708,9 +1708,9 @@ pub enum FinalEmbeddedInputKind {
 pub struct FinalEmbeddedCreateMessageParams {
     /// Sampling conversation.
     pub messages: Vec<crate::types::FinalSamplingMessage>,
-    /// Requested maximum token count.
+    /// Requested maximum token count as an arbitrary-width JSON integer.
     #[serde(rename = "maxTokens")]
-    pub max_tokens: i64,
+    pub max_tokens: JsonInteger,
     /// Optional system prompt.
     #[serde(
         rename = "systemPrompt",
@@ -4719,10 +4719,10 @@ use crate::types::{ModelPreferences, SamplingContent, SamplingMessage};
 pub struct CreateMessageParams {
     /// Conversation messages.
     pub messages: Vec<SamplingMessage>,
-    /// Maximum tokens to generate.
+    /// Maximum tokens to generate, represented as an arbitrary-width JSON integer.
     // Avoid UBS "hardcoded secrets" heuristics while keeping the on-the-wire name.
     #[serde(rename = "maxTo\x6bens")]
-    pub max_tokens: u32,
+    pub max_tokens: JsonInteger,
     /// Optional system prompt.
     #[serde(rename = "systemPrompt", skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
@@ -4753,7 +4753,7 @@ pub struct CreateMessageParams {
 impl CreateMessageParams {
     /// Creates a new sampling request with default settings.
     #[must_use]
-    pub fn new(messages: Vec<SamplingMessage>, max_tokens: u32) -> Self {
+    pub fn new(messages: Vec<SamplingMessage>, max_tokens: JsonInteger) -> Self {
         Self {
             messages,
             max_tokens,
@@ -5469,6 +5469,98 @@ mod tests {
                 method,
             }) if method == SAMPLING_CREATE_MESSAGE
         ));
+    }
+
+    #[test]
+    fn legacy_sampling_params_preserve_huge_signed_max_tokens() {
+        for (wire, expected_max_tokens) in [
+            (
+                r#"{"messages":[{"role":"user","content":{"type":"text","text":"summarize"}}],"maxTokens":922337203685477580812345678901234567890}"#,
+                "922337203685477580812345678901234567890",
+            ),
+            (
+                r#"{"messages":[{"role":"user","content":{"type":"text","text":"summarize"}}],"maxTokens":-922337203685477580812345678901234567890}"#,
+                "-922337203685477580812345678901234567890",
+            ),
+        ] {
+            let params: CreateMessageParams =
+                serde_json::from_str(wire).expect("huge signed maxTokens is an exact JSON integer");
+            assert_eq!(params.max_tokens.as_str(), expected_max_tokens);
+            assert_eq!(
+                serde_json::to_string(&params).expect("huge signed maxTokens serializes"),
+                wire,
+                "the exact {expected_max_tokens} spelling round-trips"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_sampling_params_reject_fractional_huge_max_tokens_one_variable_mutation() {
+        let fractional = r#"{"messages":[{"role":"user","content":{"type":"text","text":"summarize"}}],"maxTokens":-922337203685477580812345678901234567890.5}"#;
+        assert!(
+            serde_json::from_str::<CreateMessageParams>(fractional).is_err(),
+            "changing only maxTokens from a huge signed integer to a fraction must reject"
+        );
+    }
+
+    #[test]
+    fn final_sampling_params_preserve_huge_signed_max_tokens() {
+        for (wire, expected_max_tokens) in [
+            (
+                r#"{"_meta":{},"messages":[{"role":"user","content":{"type":"text","text":"summarize"}}],"maxTokens":922337203685477580812345678901234567890}"#,
+                "922337203685477580812345678901234567890",
+            ),
+            (
+                r#"{"_meta":{},"messages":[{"role":"user","content":{"type":"text","text":"summarize"}}],"maxTokens":-922337203685477580812345678901234567890}"#,
+                "-922337203685477580812345678901234567890",
+            ),
+        ] {
+            let params: FinalCreateMessageParams = serde_json::from_str(wire)
+                .expect("huge signed final maxTokens is an exact JSON integer");
+            assert_eq!(params.max_tokens.as_str(), expected_max_tokens);
+            assert!(
+                serde_json::to_string(&params)
+                    .expect("huge signed final maxTokens serializes")
+                    .contains(&format!("\"maxTokens\":{expected_max_tokens}")),
+                "the exact {expected_max_tokens} spelling round-trips"
+            );
+        }
+
+        for (wire, expected_max_tokens) in [
+            (
+                r#"{"messages":[{"role":"user","content":{"type":"text","text":"summarize"}}],"maxTokens":922337203685477580812345678901234567890}"#,
+                "922337203685477580812345678901234567890",
+            ),
+            (
+                r#"{"messages":[{"role":"user","content":{"type":"text","text":"summarize"}}],"maxTokens":-922337203685477580812345678901234567890}"#,
+                "-922337203685477580812345678901234567890",
+            ),
+        ] {
+            let params: FinalEmbeddedCreateMessageParams = serde_json::from_str(wire)
+                .expect("huge signed embedded final maxTokens is an exact JSON integer");
+            assert_eq!(params.max_tokens.as_str(), expected_max_tokens);
+            assert!(
+                serde_json::to_string(&params)
+                    .expect("huge signed embedded final maxTokens serializes")
+                    .contains(&format!("\"maxTokens\":{expected_max_tokens}")),
+                "the exact embedded {expected_max_tokens} spelling round-trips"
+            );
+        }
+    }
+
+    #[test]
+    fn final_sampling_params_reject_fractional_huge_max_tokens_one_variable_mutation() {
+        let final_fractional = r#"{"_meta":{},"messages":[{"role":"user","content":{"type":"text","text":"summarize"}}],"maxTokens":922337203685477580812345678901234567890.5}"#;
+        assert!(
+            serde_json::from_str::<FinalCreateMessageParams>(final_fractional).is_err(),
+            "changing only final maxTokens from a huge integer to a fraction must reject"
+        );
+
+        let embedded_fractional = r#"{"messages":[{"role":"user","content":{"type":"text","text":"summarize"}}],"maxTokens":922337203685477580812345678901234567890.5}"#;
+        assert!(
+            serde_json::from_str::<FinalEmbeddedCreateMessageParams>(embedded_fractional).is_err(),
+            "changing only embedded final maxTokens from a huge integer to a fraction must reject"
+        );
     }
 
     #[test]
@@ -8806,7 +8898,10 @@ mod tests {
 
     #[test]
     fn create_message_params_minimal() {
-        let params = CreateMessageParams::new(vec![SamplingMessage::user("Hello")], 100);
+        let params = CreateMessageParams::new(
+            vec![SamplingMessage::user("Hello")],
+            JsonInteger::from(100_i64),
+        );
         let value = serde_json::to_value(&params).expect("serialize");
         assert_eq!(value[MAX_TOKENS_KEY], 100);
         assert!(value["messages"].is_array());
@@ -8821,7 +8916,7 @@ mod tests {
                 SamplingMessage::user("Hello"),
                 SamplingMessage::assistant("Hi there!"),
             ],
-            500,
+            JsonInteger::from(500_i64),
         )
         .with_system_prompt("You are helpful")
         .with_temperature(0.7)
