@@ -42,8 +42,8 @@ use crate::{
     ChildGuard, ChildOwnership, Client, ClientHttpConnection, ClientHttpConnectionError,
     ClientHttpNegotiation, ClientHttpNegotiationError, ClientProtocolPlan, ClientSession,
     HttpClient, HttpClientError, ModernHttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy,
-    ReverseRequestHandlers,
-    combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
+    ReverseRequestHandlers, combine_operation_with_cleanup, is_cleanup_unverified,
+    resolve_stdio_command,
 };
 
 /// The maximum number of connection attempts admitted by the client retry policy.
@@ -518,7 +518,8 @@ impl ClientBuilder {
     /// are ready only after `initialize` and `notifications/initialized` have
     /// both completed on the admitted legacy routes.
     pub async fn connect_http_client_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
-        self.admit_protocol_plan().map_err(HttpClientError::CoreResult)?;
+        self.admit_protocol_plan()
+            .map_err(HttpClientError::CoreResult)?;
         self.validate_reverse_callback_configuration(&self.protocol_plan)
             .map_err(HttpClientError::CoreResult)?;
         HttpClient::connect_with_mcp_apps(

@@ -116,7 +116,9 @@ fn clt_02_a_planted_negative() {
     let http_refusal = ClientBuilder::new().protocol_plan(auto_http_plan());
     let http_error = fastmcp_core::block_on(async {
         match http_refusal.connect_http_with_cx(&Cx::for_request()).await {
-            Ok(_) => panic!("auto HTTP policy without the legacy adapter must be refused before contact"),
+            Ok(_) => {
+                panic!("auto HTTP policy without the legacy adapter must be refused before contact")
+            }
             Err(error) => error,
         }
     });

@@ -126,8 +126,8 @@ use std::sync::{Arc, Mutex, Once, mpsc};
 use std::time::{Duration, Instant};
 
 use asupersync::{Cx, channel::oneshot};
-use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sha256_bounded};
 use execution::{MrtrDriver, MrtrDriverLimits};
+use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sha256_bounded};
 #[cfg(test)]
 use fastmcp_protocol::common_types::JsonInteger;
 use fastmcp_protocol::common_types::{
@@ -2148,15 +2148,20 @@ struct ActiveReverseCallback {
     cancellation: ReverseRequestCancellation,
 }
 
+/// Transport-neutral ownership and cancellation registry for exact-2024
+/// server-to-client callbacks.
+///
+/// Each transport owns its dispatch and response-write mechanics, but all of
+/// them must share these admission and response-vs-cancellation rules.
 #[derive(Default)]
-struct ReverseCallbackState {
+pub(crate) struct ReverseCallbackState {
     closing: AtomicBool,
     active: Mutex<Vec<ActiveReverseCallback>>,
     terminal_error: Mutex<Option<McpError>>,
 }
 
 impl ReverseCallbackState {
-    fn admit(&self, request_id: &RequestId) -> McpResult<ReverseRequestCancellation> {
+    pub(crate) fn admit(&self, request_id: &RequestId) -> McpResult<ReverseRequestCancellation> {
         if let Some(error) = self.terminal_error() {
             return Err(error);
         }
@@ -2190,7 +2195,7 @@ impl ReverseCallbackState {
         Ok(cancellation)
     }
 
-    fn cancel(&self, request_id: &RequestId) -> bool {
+    pub(crate) fn cancel(&self, request_id: &RequestId) -> bool {
         let active = self
             .active
             .lock()
@@ -2205,7 +2210,7 @@ impl ReverseCallbackState {
         cancelled
     }
 
-    fn complete(&self, request_id: &RequestId) {
+    pub(crate) fn complete(&self, request_id: &RequestId) {
         let mut active = self
             .active
             .lock()
@@ -2220,7 +2225,7 @@ impl ReverseCallbackState {
     /// and releases this registry lock before that write can block. This keeps
     /// cancellation reception independent of a full child-stdin pipe while
     /// preserving the response-vs-cancellation linearization point.
-    fn claim_response_if_open(
+    pub(crate) fn claim_response_if_open(
         &self,
         request_id: &RequestId,
         cancellation: &ReverseRequestCancellation,
@@ -2244,7 +2249,7 @@ impl ReverseCallbackState {
         true
     }
 
-    fn cancel_all(&self) {
+    pub(crate) fn cancel_all(&self) {
         let active = self
             .active
             .lock()
@@ -2255,7 +2260,7 @@ impl ReverseCallbackState {
         }
     }
 
-    fn fail_connection(&self, error: McpError) {
+    pub(crate) fn fail_connection(&self, error: McpError) {
         {
             let mut terminal_error = self
                 .terminal_error
@@ -2268,7 +2273,7 @@ impl ReverseCallbackState {
         self.cancel_all();
     }
 
-    fn terminal_error(&self) -> Option<McpError> {
+    pub(crate) fn terminal_error(&self) -> Option<McpError> {
         self.terminal_error
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4569,6 +4574,54 @@ impl HttpClient {
         Ok(RequestId::Number(id as i64))
     }
 
+    fn next_mrtr_request_id(&self) -> McpResult<RequestId> {
+        self.next_request_id().map_err(|error| match error {
+            HttpClientError::RequestIdExhausted => {
+                McpError::internal_error("HTTP client request IDs are exhausted")
+            }
+            _ => McpError::internal_error("HTTP client could not allocate an MRTR request ID"),
+        })
+    }
+
+    fn require_terminal_http_mrtr_result(
+        &self,
+        method: &'static str,
+        result: CoreResult,
+    ) -> Result<FinalCoreResult, HttpClientError> {
+        match (method, result) {
+            ("tools/call", CoreResult::Final(result @ FinalCoreResult::ToolsCall { .. }))
+            | (
+                "resources/read",
+                CoreResult::Final(result @ FinalCoreResult::ResourcesRead { .. }),
+            )
+            | ("prompts/get", CoreResult::Final(result @ FinalCoreResult::PromptsGet { .. })) => {
+                Ok(result)
+            }
+            (
+                "tools/call",
+                CoreResult::Final(
+                    FinalCoreResult::ToolsCallInputRequired { .. }
+                    | FinalCoreResult::ToolsCallTask { .. },
+                ),
+            )
+            | (
+                "resources/read",
+                CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. }),
+            )
+            | ("prompts/get", CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { .. })) => {
+                Err(HttpClientError::CoreResult(McpError::invalid_request(
+                    format!("ordinary HTTP MRTR {method} ended without a terminal result"),
+                )))
+            }
+            (_, CoreResult::Legacy(_)) => Err(HttpClientError::CoreResult(
+                McpError::invalid_request("ordinary HTTP MRTR requires a modern final result"),
+            )),
+            _ => Err(HttpClientError::CoreResult(McpError::invalid_request(
+                format!("ordinary HTTP MRTR received an unexpected terminal result for {method}"),
+            ))),
+        }
+    }
+
     /// Returns whether typed final complete-result caching is enabled for this
     /// HTTP client. The raw streaming [`Self::request`] API remains uncached.
     #[must_use]
@@ -4788,6 +4841,118 @@ impl HttpClient {
         let retry = mrtr_retry_parameters(parameters, input_required, input_responses)
             .map_err(HttpClientError::CoreResult)?;
         self.request_final_core(cx, "prompts/get", retry).await
+    }
+
+    /// Calls a tool through ordinary modern HTTP, following bounded MRTR
+    /// continuations until one terminal tool result arrives.
+    ///
+    /// The supplied absolute `deadline` owns the entire operation, including
+    /// the initial request and every continuation. This client allocates the
+    /// initial and continuation IDs from its monotonic allocator; `respond`
+    /// can therefore be invoked once for each admitted `input_required`
+    /// result. Tasks are neither requested nor accepted by this operation.
+    pub async fn call_tool_with_mrtr_retry_until<F>(
+        &mut self,
+        cx: &Cx,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        sse_limits: sse::SseLimits,
+        maximum_response_bytes: usize,
+        respond: F,
+    ) -> Result<FinalCoreResult, HttpClientError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        let initial_request_id = self.next_request_id()?;
+        let result = self
+            .connection
+            .call_tool_with_mrtr_retry(
+                cx,
+                initial_request_id,
+                deadline,
+                name,
+                arguments,
+                sse_limits,
+                maximum_response_bytes,
+                || self.next_mrtr_request_id(),
+                respond,
+            )
+            .await
+            .map_err(HttpClientError::Connection)?;
+        self.require_terminal_http_mrtr_result("tools/call", result)
+    }
+
+    /// Reads a resource through ordinary modern HTTP, following bounded MRTR
+    /// continuations until one terminal resource result arrives.
+    ///
+    /// See [`Self::call_tool_with_mrtr_retry_until`] for deadline, request-ID,
+    /// callback, and Tasks behavior.
+    pub async fn read_resource_with_mrtr_retry_until<F>(
+        &mut self,
+        cx: &Cx,
+        deadline: Instant,
+        uri: &str,
+        sse_limits: sse::SseLimits,
+        maximum_response_bytes: usize,
+        respond: F,
+    ) -> Result<FinalCoreResult, HttpClientError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        let initial_request_id = self.next_request_id()?;
+        let result = self
+            .connection
+            .read_resource_with_mrtr_retry(
+                cx,
+                initial_request_id,
+                deadline,
+                uri,
+                sse_limits,
+                maximum_response_bytes,
+                || self.next_mrtr_request_id(),
+                respond,
+            )
+            .await
+            .map_err(HttpClientError::Connection)?;
+        self.require_terminal_http_mrtr_result("resources/read", result)
+    }
+
+    /// Gets a prompt through ordinary modern HTTP, following bounded MRTR
+    /// continuations until one terminal prompt result arrives.
+    ///
+    /// See [`Self::call_tool_with_mrtr_retry_until`] for deadline, request-ID,
+    /// callback, and Tasks behavior.
+    pub async fn get_prompt_with_mrtr_retry_until<F>(
+        &mut self,
+        cx: &Cx,
+        deadline: Instant,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        sse_limits: sse::SseLimits,
+        maximum_response_bytes: usize,
+        respond: F,
+    ) -> Result<FinalCoreResult, HttpClientError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        let initial_request_id = self.next_request_id()?;
+        let result = self
+            .connection
+            .get_prompt_with_mrtr_retry(
+                cx,
+                initial_request_id,
+                deadline,
+                name,
+                arguments,
+                sse_limits,
+                maximum_response_bytes,
+                || self.next_mrtr_request_id(),
+                respond,
+            )
+            .await
+            .map_err(HttpClientError::Connection)?;
+        self.require_terminal_http_mrtr_result("prompts/get", result)
     }
 
     /// Opens a live final HTTP subscription listener.
@@ -6627,12 +6792,8 @@ impl Client {
                 )
             })?;
         self.last_core_result_receipt = None;
-        let received = self.send_prepared_request_with_cx(
-            cx,
-            Some(operation_deadline),
-            method,
-            params_value,
-        )?;
+        let received =
+            self.send_prepared_request_with_cx(cx, Some(operation_deadline), method, params_value)?;
         let (result, ttl_diagnostic) = decode_core_result_with_cache_ttl_from_source(
             &core_request,
             &received.result,
@@ -7903,10 +8064,8 @@ impl Client {
             .ok_or_else(|| {
                 McpError::internal_error("MRTR operation deadline exceeds the clock range")
             })?;
-        let limits = MrtrDriverLimits::new(
-            MAX_MRTR_CONTINUATION_ROUNDS,
-            MAX_MRTR_TOTAL_INPUT_RESPONSES,
-        )?;
+        let limits =
+            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?;
         let mut driver = MrtrDriver::new(&cx, deadline, limits)?;
         let mut parameters = original_parameters.clone();
 
@@ -9348,7 +9507,7 @@ pub(crate) fn transport_error_to_mcp(e: TransportError) -> McpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     #[cfg(all(unix, not(target_os = "linux")))]
     use std::io::Read as _;
     #[cfg(unix)]
@@ -9602,6 +9761,281 @@ mod tests {
             0,
         )
         .expect("modern-only HTTP cache plan is complete")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_mrtr_drives_tool_resource_and_prompt_to_terminal_results() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind public MRTR listener");
+        let address = listener.local_addr().expect("read public MRTR address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = std::thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept public MRTR discovery");
+            let probe = read_http_cache_test_request(&mut probe);
+            assert_eq!(probe["id"], 1);
+            assert_eq!(probe["method"], "server/discover");
+            let discovery =
+                modern_discovery_response("public-http-mrtr-server", &[MODERN_PROTOCOL_VERSION]);
+            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+
+            for (method, request_id, expected_state, next_state) in [
+                ("tools/call", 2, None, Some("tool-one")),
+                ("tools/call", 3, Some("tool-one"), Some("tool-two")),
+                ("tools/call", 4, Some("tool-two"), None),
+                ("resources/read", 5, None, Some("resource-one")),
+                (
+                    "resources/read",
+                    6,
+                    Some("resource-one"),
+                    Some("resource-two"),
+                ),
+                ("resources/read", 7, Some("resource-two"), None),
+                ("prompts/get", 8, None, Some("prompt-one")),
+                ("prompts/get", 9, Some("prompt-one"), Some("prompt-two")),
+                ("prompts/get", 10, Some("prompt-two"), None),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept public MRTR round");
+                let request = read_http_cache_test_request(&mut stream);
+                assert_eq!(request["id"], request_id);
+                assert_eq!(request["method"], method);
+                assert!(
+                    request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                        .get("extensions")
+                        .is_none(),
+                    "ordinary MRTR must not negotiate Tasks"
+                );
+                match expected_state {
+                    Some(state) => {
+                        assert_eq!(request["params"]["requestState"], state);
+                        assert!(request["params"].get("inputResponses").is_none());
+                    }
+                    None => {
+                        assert!(request["params"].get("requestState").is_none());
+                        assert!(request["params"].get("inputResponses").is_none());
+                    }
+                }
+
+                let response = match next_state {
+                    Some(state) => format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{\"resultType\":\"input_required\",\"requestState\":\"{state}\"}}}}"
+                    ),
+                    None => match method {
+                        "tools/call" => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}]}}}}"
+                        ),
+                        "resources/read" => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{\"resultType\":\"complete\",\"contents\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}"
+                        ),
+                        "prompts/get" => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{\"resultType\":\"complete\",\"messages\":[]}}}}"
+                        ),
+                        _ => unreachable!("the test covers only MRTR core methods"),
+                    },
+                };
+                write_http_cache_test_response(
+                    &mut stream,
+                    "application/json",
+                    response.as_bytes(),
+                );
+            }
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(HttpClient::connect(
+            &cx,
+            http_cache_test_plan(&modern_target),
+            ClientInfo {
+                name: "public-http-mrtr-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("public HTTP client completes discovery");
+        let sse_limits = sse::SseLimits::new(1_024, 8_192, 8).expect("valid SSE limits");
+
+        let mut tool_states = Vec::new();
+        let tool = http_test_runtime_block_on(client.call_tool_with_mrtr_retry_until(
+            &cx,
+            Instant::now() + Duration::from_secs(2),
+            "public-tool",
+            serde_json::json!({"input": "state-only"}),
+            sse_limits,
+            4_096,
+            |input_required| {
+                tool_states.push(
+                    input_required
+                        .request_state()
+                        .expect("tool continuation carries state")
+                        .to_owned(),
+                );
+                Ok(BTreeMap::new())
+            },
+        ))
+        .expect("public HTTP tool MRTR reaches a terminal result");
+        assert!(matches!(tool, FinalCoreResult::ToolsCall { .. }));
+        assert_eq!(tool_states, ["tool-one", "tool-two"]);
+
+        let mut resource_states = Vec::new();
+        let resource = http_test_runtime_block_on(client.read_resource_with_mrtr_retry_until(
+            &cx,
+            Instant::now() + Duration::from_secs(2),
+            "file:///public-mrtr.txt",
+            sse_limits,
+            4_096,
+            |input_required| {
+                resource_states.push(
+                    input_required
+                        .request_state()
+                        .expect("resource continuation carries state")
+                        .to_owned(),
+                );
+                Ok(BTreeMap::new())
+            },
+        ))
+        .expect("public HTTP resource MRTR reaches a terminal result");
+        assert!(matches!(resource, FinalCoreResult::ResourcesRead { .. }));
+        assert_eq!(resource_states, ["resource-one", "resource-two"]);
+
+        let mut prompt_states = Vec::new();
+        let prompt = http_test_runtime_block_on(client.get_prompt_with_mrtr_retry_until(
+            &cx,
+            Instant::now() + Duration::from_secs(2),
+            "public-prompt",
+            HashMap::new(),
+            sse_limits,
+            4_096,
+            |input_required| {
+                prompt_states.push(
+                    input_required
+                        .request_state()
+                        .expect("prompt continuation carries state")
+                        .to_owned(),
+                );
+                Ok(BTreeMap::new())
+            },
+        ))
+        .expect("public HTTP prompt MRTR reaches a terminal result");
+        assert!(matches!(prompt, FinalCoreResult::PromptsGet { .. }));
+        assert_eq!(prompt_states, ["prompt-one", "prompt-two"]);
+
+        server.join().expect("public HTTP MRTR peer joins");
+    }
+
+    #[cfg(unix)]
+    fn assert_public_http_mrtr_round_bound(final_round_is_terminal: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind public MRTR bound listener");
+        let address = listener
+            .local_addr()
+            .expect("read public MRTR bound address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = std::thread::spawn(move || {
+            let (mut probe, _) = listener
+                .accept()
+                .expect("accept public MRTR bound discovery");
+            let probe = read_http_cache_test_request(&mut probe);
+            assert_eq!(probe["id"], 1);
+            let discovery = modern_discovery_response(
+                "public-http-mrtr-bound-server",
+                &[MODERN_PROTOCOL_VERSION],
+            );
+            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+
+            for request_id in 2..=(MAX_MRTR_CONTINUATION_ROUNDS as i64 + 2) {
+                let (mut stream, _) = listener.accept().expect("accept public MRTR bound round");
+                let request = read_http_cache_test_request(&mut stream);
+                assert_eq!(request["id"], request_id);
+                assert_eq!(request["method"], "tools/call");
+                assert!(
+                    request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                        .get("extensions")
+                        .is_none(),
+                    "ordinary MRTR must not negotiate Tasks"
+                );
+                let response = if final_round_is_terminal
+                    && request_id == MAX_MRTR_CONTINUATION_ROUNDS as i64 + 2
+                {
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{\"resultType\":\"complete\",\"content\":[]}}}}"
+                    )
+                } else {
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{\"resultType\":\"input_required\",\"requestState\":\"round-{request_id}\"}}}}"
+                    )
+                };
+                write_http_cache_test_response(
+                    &mut stream,
+                    "application/json",
+                    response.as_bytes(),
+                );
+            }
+
+            if !final_round_is_terminal {
+                listener
+                    .set_nonblocking(true)
+                    .expect("configure public MRTR no-contact assertion");
+                let no_contact_deadline = Instant::now() + Duration::from_millis(200);
+                while Instant::now() < no_contact_deadline {
+                    match listener.accept() {
+                        Ok(_) => panic!("MRTR round bound must reject before a sixth POST"),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("unexpected public MRTR no-contact error: {error}"),
+                    }
+                }
+            }
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(HttpClient::connect(
+            &cx,
+            http_cache_test_plan(&modern_target),
+            ClientInfo {
+                name: "public-http-mrtr-bound-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("public HTTP bound client completes discovery");
+        let mut callback_count = 0_usize;
+        let result = http_test_runtime_block_on(client.call_tool_with_mrtr_retry_until(
+            &cx,
+            Instant::now() + Duration::from_secs(2),
+            "bound-tool",
+            serde_json::json!({}),
+            sse::SseLimits::new(1_024, 8_192, 8).expect("valid SSE limits"),
+            4_096,
+            |_| {
+                callback_count += 1;
+                Ok(BTreeMap::new())
+            },
+        ));
+
+        if final_round_is_terminal {
+            assert!(matches!(result, Ok(FinalCoreResult::ToolsCall { .. })));
+        } else {
+            assert!(matches!(
+                result,
+                Err(HttpClientError::Connection(ClientHttpConnectionError::Mrtr(
+                    http_executor::ModernHttpMrtrError::Driver(ref error)
+                ))) if error.message == "MRTR continuation-round limit exceeded"
+            ));
+        }
+        assert_eq!(callback_count, MAX_MRTR_CONTINUATION_ROUNDS);
+        server.join().expect("public HTTP MRTR bound peer joins");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_mrtr_round_bound_accepts_the_terminal_fifth_response() {
+        assert_public_http_mrtr_round_bound(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_mrtr_round_bound_rejects_only_an_input_required_fifth_response_without_contact()
+    {
+        assert_public_http_mrtr_round_bound(false);
     }
 
     #[cfg(unix)]
@@ -14803,17 +15237,13 @@ mod tests {
 
         let mut callback_count = 0;
         let error = client
-            .call_tool_with_mrtr_retry(
-                "retry-tool",
-                serde_json::json!({ "round": 1 }),
-                |_| {
-                    callback_count += 1;
-                    Ok(BTreeMap::from([(
-                        "roots".to_owned(),
-                        serde_json::json!({ "roots": [] }),
-                    )]))
-                },
-            )
+            .call_tool_with_mrtr_retry("retry-tool", serde_json::json!({ "round": 1 }), |_| {
+                callback_count += 1;
+                Ok(BTreeMap::from([(
+                    "roots".to_owned(),
+                    serde_json::json!({ "roots": [] }),
+                )]))
+            })
             .expect_err("one continuation beyond the round bound must fail locally");
 
         assert_eq!(error.code, McpErrorCode::InvalidParams);
@@ -14835,14 +15265,10 @@ mod tests {
 
         let mut callback_count = 0;
         let result = client
-            .call_tool_with_mrtr_retry(
-                "echo",
-                serde_json::json!({ "text": "legacy" }),
-                |_| {
-                    callback_count += 1;
-                    Ok(BTreeMap::new())
-                },
-            )
+            .call_tool_with_mrtr_retry("echo", serde_json::json!({ "text": "legacy" }), |_| {
+                callback_count += 1;
+                Ok(BTreeMap::new())
+            })
             .expect("legacy MRTR entry retains the one-request typed behavior");
 
         assert!(matches!(

@@ -152,11 +152,7 @@ pub(crate) struct MrtrDriver<'cx> {
 impl<'cx> MrtrDriver<'cx> {
     /// Starts one MRTR operation using exactly the supplied caller context and
     /// absolute deadline.
-    pub(crate) fn new(
-        cx: &'cx Cx,
-        deadline: Instant,
-        limits: MrtrDriverLimits,
-    ) -> McpResult<Self> {
+    pub(crate) fn new(cx: &'cx Cx, deadline: Instant, limits: MrtrDriverLimits) -> McpResult<Self> {
         let driver = Self {
             cx,
             deadline,
@@ -193,12 +189,9 @@ impl<'cx> MrtrDriver<'cx> {
     /// the configured round bound has been reached.
     pub(crate) fn begin_continuation(&mut self) -> McpResult<()> {
         self.before_request()?;
-        let continuation_rounds = self
-            .continuation_rounds
-            .checked_add(1)
-            .ok_or_else(|| {
-                McpError::internal_error("MRTR continuation-round counter overflowed")
-            })?;
+        let continuation_rounds = self.continuation_rounds.checked_add(1).ok_or_else(|| {
+            McpError::internal_error("MRTR continuation-round counter overflowed")
+        })?;
         if continuation_rounds > self.limits.max_continuation_rounds {
             return Err(McpError::invalid_params(
                 "MRTR continuation-round limit exceeded",
@@ -212,10 +205,7 @@ impl<'cx> MrtrDriver<'cx> {
     ///
     /// A state-only continuation supplies zero entries and is therefore
     /// admitted as long as the caller has not exceeded the round limit.
-    pub(crate) fn admit_input_responses(
-        &mut self,
-        input_response_count: usize,
-    ) -> McpResult<()> {
+    pub(crate) fn admit_input_responses(&mut self, input_response_count: usize) -> McpResult<()> {
         self.before_request()?;
         let total_input_responses = self
             .total_input_responses

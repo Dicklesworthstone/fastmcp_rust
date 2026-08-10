@@ -43,18 +43,22 @@ use fastmcp_protocol::{
     CoreDispatchError, CoreRequest, CoreResult, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult,
     FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
-    JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
-    SERVER_DISCOVER, ServerDiscoverResult, ServerNotification, SubscriptionFilter,
+    InputRequiredResult, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification, SubscriptionFilter,
     decode_strict_jsonrpc_message, decode_strict_jsonrpc_response, task_subscription_ids,
 };
 
+use crate::execution::{MrtrDriver, MrtrDriverLimits};
 use crate::session::resolve_mcp_apps_activation;
 use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError};
 use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
-    ClientProtocolPlan, FinalToolCallOutcome, ReverseRequestCancellation, ReverseRequestHandlers,
-    admit_final_tasks_discovery_surface, admit_final_tasks_result_discriminator,
+    ClientProtocolPlan, FinalToolCallOutcome, MAX_MRTR_CONTINUATION_ROUNDS,
+    MAX_MRTR_INPUT_RESPONSES, MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses,
+    ReverseRequestCancellation, ReverseRequestHandlers, admit_final_tasks_discovery_surface,
+    admit_final_tasks_result_discriminator,
 };
+use fastmcp_core::{McpError, McpResult};
 
 /// Exact request headers required for a modern MCP JSON-RPC POST.
 pub const MODERN_MCP_ACCEPT: &str = "application/json, text/event-stream";
@@ -1944,6 +1948,122 @@ impl ModernHttpConnectOutcome {
     }
 }
 
+/// Errors raised by an ordinary modern HTTP multi-round model-request tool
+/// retry (MRTR) operation.
+///
+/// These operations deliberately use only ordinary final core requests. They
+/// neither request nor accept the official Tasks result discriminator.
+#[derive(Debug)]
+pub enum ModernHttpMrtrError {
+    /// The shared cancellation, deadline, continuation, or input bound refused
+    /// the operation before another request could be committed.
+    Driver(McpError),
+    /// Constructing or issuing an ordinary modern core request failed.
+    Request(ModernHttpClientError),
+    /// A request-scoped SSE response failed final-core admission or collection.
+    Listener(ModernHttpFinalCoreListenError),
+    /// A JSON response failed strict JSON-RPC admission.
+    JsonRpcAdmission(JsonRpcAdmissionError),
+    /// A JSON response did not retain the request ID for its MRTR round.
+    ResponseIdMismatch {
+        /// The immutable ID assigned to the outgoing round.
+        expected: RequestId,
+        /// The response ID observed on the wire.
+        actual: Option<RequestId>,
+    },
+    /// A JSON-RPC request frame appeared where this round requires a response.
+    UnexpectedResponseMessage,
+    /// A peer terminated the round with a JSON-RPC error.
+    RemoteError { code: i32, message: String },
+    /// A successful JSON response did not retain its result source.
+    MissingResult,
+    /// The ordinary method-specific result contradicted the selected core contract.
+    TypedResult(CoreDispatchError),
+    /// The ordinary request unexpectedly decoded to a non-final core result.
+    UnexpectedCoreResult,
+    /// A continuation supplied an invalid JSON-RPC request ID.
+    InvalidRequestId { request_id: RequestId },
+    /// A continuation attempted to reuse an ID from an earlier round.
+    ReusedRequestId { request_id: RequestId },
+    /// An ordinary MRTR request received a body lane that cannot contain one
+    /// terminal final core result.
+    UnexpectedResponseKind { actual: ModernHttpResponseKind },
+    /// A `tools/call` response selected the Tasks-only result branch even
+    /// though this operation did not negotiate Tasks.
+    TasksResultRequiresNegotiatedOperation,
+}
+
+impl fmt::Display for ModernHttpMrtrError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Driver(error) => error.fmt(formatter),
+            Self::Request(error) => error.fmt(formatter),
+            Self::Listener(error) => error.fmt(formatter),
+            Self::JsonRpcAdmission(error) => {
+                write!(
+                    formatter,
+                    "ordinary HTTP MRTR response failed JSON-RPC admission: {error}"
+                )
+            }
+            Self::ResponseIdMismatch { expected, actual } => write!(
+                formatter,
+                "ordinary HTTP MRTR response ID {actual:?} did not match request {expected:?}"
+            ),
+            Self::UnexpectedResponseMessage => formatter
+                .write_str("ordinary HTTP MRTR received a JSON-RPC request, not a response"),
+            Self::RemoteError { code, message } => write!(
+                formatter,
+                "ordinary HTTP MRTR failed with JSON-RPC {code}: {message}"
+            ),
+            Self::MissingResult => {
+                formatter.write_str("ordinary HTTP MRTR response omitted its result")
+            }
+            Self::TypedResult(error) => {
+                write!(formatter, "ordinary HTTP MRTR result is invalid: {error}")
+            }
+            Self::UnexpectedCoreResult => {
+                formatter.write_str("ordinary HTTP MRTR decoded to a non-final core result")
+            }
+            Self::InvalidRequestId { request_id } => write!(
+                formatter,
+                "ordinary HTTP MRTR requires a valid request ID, received {request_id:?}"
+            ),
+            Self::ReusedRequestId { request_id } => write!(
+                formatter,
+                "ordinary HTTP MRTR continuation reused request ID {request_id:?}"
+            ),
+            Self::UnexpectedResponseKind { actual } => write!(
+                formatter,
+                "ordinary HTTP MRTR requires JSON or SSE, received {actual:?}"
+            ),
+            Self::TasksResultRequiresNegotiatedOperation => formatter.write_str(
+                "ordinary HTTP MRTR received a Tasks-only result without Tasks negotiation",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModernHttpMrtrError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            Self::Request(error) => Some(error),
+            Self::Listener(error) => Some(error),
+            Self::JsonRpcAdmission(error) => Some(error),
+            Self::TypedResult(error) => Some(error),
+            Self::InvalidRequestId { .. }
+            | Self::ReusedRequestId { .. }
+            | Self::UnexpectedResponseKind { .. }
+            | Self::ResponseIdMismatch { .. }
+            | Self::UnexpectedResponseMessage
+            | Self::RemoteError { .. }
+            | Self::MissingResult
+            | Self::UnexpectedCoreResult
+            | Self::TasksResultRequiresNegotiatedOperation => None,
+        }
+    }
+}
+
 /// A connected client HTTP transport selected by its immutable protocol plan.
 ///
 /// Auto performs the modern probe and, only for an authorized refusal, opens
@@ -2032,6 +2152,10 @@ pub enum ClientHttpConnectionError {
     FinalCoreListen(ModernHttpFinalCoreListenError),
     /// Ordinary final core response streams require the modern HTTP transport.
     FinalCoreListenRequiresModern,
+    /// An ordinary modern HTTP MRTR operation failed.
+    Mrtr(ModernHttpMrtrError),
+    /// Ordinary modern HTTP MRTR requires the modern HTTP transport.
+    MrtrRequiresModern,
     /// Final Tasks-backed `tools/call` requires the modern HTTP transport.
     FinalToolCallRequiresModern,
     /// Official final Tasks lifecycle methods require the modern HTTP transport.
@@ -2120,6 +2244,10 @@ impl fmt::Display for ClientHttpConnectionError {
             Self::FinalCoreListenRequiresModern => {
                 formatter.write_str("final core response streams require the modern HTTP transport")
             }
+            Self::Mrtr(error) => error.fmt(formatter),
+            Self::MrtrRequiresModern => {
+                formatter.write_str("ordinary HTTP MRTR requires the modern HTTP transport")
+            }
             Self::FinalToolCallRequiresModern => formatter
                 .write_str("final Tasks-backed tools/call requires the modern HTTP transport"),
             Self::FinalTasksRequiresModern { method } => {
@@ -2151,11 +2279,13 @@ impl std::error::Error for ClientHttpConnectionError {
             | Self::ModernClientNotificationPostUnsupported { .. }
             | Self::SubscriptionsListenRequiresModern
             | Self::FinalCoreListenRequiresModern
+            | Self::MrtrRequiresModern
             | Self::FinalToolCallRequiresModern
             | Self::FinalTasksRequiresModern { .. } => None,
             Self::ResponseAdmission(error) => Some(error),
             Self::SubscriptionsListen(error) => Some(error),
             Self::FinalCoreListen(error) => Some(error),
+            Self::Mrtr(error) => Some(error),
         }
     }
 }
@@ -2638,6 +2768,115 @@ impl ClientHttpConnection {
             limits,
         )
         .await
+    }
+
+    /// Calls one tool through ordinary modern HTTP and follows bounded MRTR
+    /// continuations without negotiating Tasks.
+    pub async fn call_tool_with_mrtr_retry<F, I>(
+        &self,
+        cx: &Cx,
+        initial_request_id: RequestId,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        next_request_id: I,
+        respond: F,
+    ) -> Result<CoreResult, ClientHttpConnectionError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        I: FnMut() -> McpResult<RequestId>,
+    {
+        match self {
+            Self::Modern(client) => client
+                .call_tool_with_mrtr_retry(
+                    cx,
+                    initial_request_id,
+                    deadline,
+                    name,
+                    arguments,
+                    sse_limits,
+                    maximum_response_bytes,
+                    next_request_id,
+                    respond,
+                )
+                .await
+                .map_err(ClientHttpConnectionError::Mrtr),
+            Self::LegacySse { .. } => Err(ClientHttpConnectionError::MrtrRequiresModern),
+        }
+    }
+
+    /// Reads one resource through ordinary modern HTTP and follows bounded
+    /// MRTR continuations without negotiating Tasks.
+    pub async fn read_resource_with_mrtr_retry<F, I>(
+        &self,
+        cx: &Cx,
+        initial_request_id: RequestId,
+        deadline: Instant,
+        uri: &str,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        next_request_id: I,
+        respond: F,
+    ) -> Result<CoreResult, ClientHttpConnectionError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        I: FnMut() -> McpResult<RequestId>,
+    {
+        match self {
+            Self::Modern(client) => client
+                .read_resource_with_mrtr_retry(
+                    cx,
+                    initial_request_id,
+                    deadline,
+                    uri,
+                    sse_limits,
+                    maximum_response_bytes,
+                    next_request_id,
+                    respond,
+                )
+                .await
+                .map_err(ClientHttpConnectionError::Mrtr),
+            Self::LegacySse { .. } => Err(ClientHttpConnectionError::MrtrRequiresModern),
+        }
+    }
+
+    /// Gets one prompt through ordinary modern HTTP and follows bounded MRTR
+    /// continuations without negotiating Tasks.
+    pub async fn get_prompt_with_mrtr_retry<F, I>(
+        &self,
+        cx: &Cx,
+        initial_request_id: RequestId,
+        deadline: Instant,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        next_request_id: I,
+        respond: F,
+    ) -> Result<CoreResult, ClientHttpConnectionError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        I: FnMut() -> McpResult<RequestId>,
+    {
+        match self {
+            Self::Modern(client) => client
+                .get_prompt_with_mrtr_retry(
+                    cx,
+                    initial_request_id,
+                    deadline,
+                    name,
+                    arguments,
+                    sse_limits,
+                    maximum_response_bytes,
+                    next_request_id,
+                    respond,
+                )
+                .await
+                .map_err(ClientHttpConnectionError::Mrtr),
+            Self::LegacySse { .. } => Err(ClientHttpConnectionError::MrtrRequiresModern),
+        }
     }
 
     /// Opens one live typed final `tools/call` response stream after bilateral
@@ -3332,6 +3571,271 @@ impl ModernHttpClient {
             .execute(cx, &request)
             .await
             .map_err(ModernHttpClientError::Executor)
+    }
+
+    /// Calls one tool through ordinary modern HTTP and follows bounded MRTR
+    /// continuations without negotiating Tasks.
+    ///
+    /// `next_request_id` is called only after a peer `input_required` result
+    /// has passed the shared continuation and input bounds. Every returned ID
+    /// is validated and must differ from every earlier round before it can be
+    /// sent. The operation uses the one supplied absolute `deadline` for its
+    /// initial request and every continuation.
+    pub async fn call_tool_with_mrtr_retry<F, I>(
+        &self,
+        cx: &Cx,
+        initial_request_id: RequestId,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        next_request_id: I,
+        respond: F,
+    ) -> Result<CoreResult, ModernHttpMrtrError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        I: FnMut() -> McpResult<RequestId>,
+    {
+        self.drive_mrtr_retry(
+            cx,
+            initial_request_id,
+            deadline,
+            TOOLS_CALL,
+            serde_json::json!({ "name": name, "arguments": arguments }),
+            sse_limits,
+            maximum_response_bytes,
+            next_request_id,
+            respond,
+        )
+        .await
+    }
+
+    /// Reads one resource through ordinary modern HTTP and follows bounded
+    /// MRTR continuations without negotiating Tasks.
+    pub async fn read_resource_with_mrtr_retry<F, I>(
+        &self,
+        cx: &Cx,
+        initial_request_id: RequestId,
+        deadline: Instant,
+        uri: &str,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        next_request_id: I,
+        respond: F,
+    ) -> Result<CoreResult, ModernHttpMrtrError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        I: FnMut() -> McpResult<RequestId>,
+    {
+        self.drive_mrtr_retry(
+            cx,
+            initial_request_id,
+            deadline,
+            RESOURCES_READ,
+            serde_json::json!({ "uri": uri }),
+            sse_limits,
+            maximum_response_bytes,
+            next_request_id,
+            respond,
+        )
+        .await
+    }
+
+    /// Gets one prompt through ordinary modern HTTP and follows bounded MRTR
+    /// continuations without negotiating Tasks.
+    pub async fn get_prompt_with_mrtr_retry<F, I>(
+        &self,
+        cx: &Cx,
+        initial_request_id: RequestId,
+        deadline: Instant,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        next_request_id: I,
+        respond: F,
+    ) -> Result<CoreResult, ModernHttpMrtrError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        I: FnMut() -> McpResult<RequestId>,
+    {
+        let mut parameters = serde_json::json!({ "name": name });
+        if !arguments.is_empty() {
+            let parameters = parameters.as_object_mut().ok_or_else(|| {
+                ModernHttpMrtrError::Driver(McpError::internal_error(
+                    "MRTR prompt parameters must remain an object",
+                ))
+            })?;
+            parameters.insert(
+                "arguments".to_owned(),
+                serde_json::to_value(arguments).map_err(|error| {
+                    ModernHttpMrtrError::Driver(McpError::internal_error(format!(
+                        "MRTR prompt arguments could not serialize: {error}"
+                    )))
+                })?,
+            );
+        }
+        self.drive_mrtr_retry(
+            cx,
+            initial_request_id,
+            deadline,
+            PROMPTS_GET,
+            parameters,
+            sse_limits,
+            maximum_response_bytes,
+            next_request_id,
+            respond,
+        )
+        .await
+    }
+
+    async fn drive_mrtr_retry<F, I>(
+        &self,
+        cx: &Cx,
+        initial_request_id: RequestId,
+        deadline: Instant,
+        method: &'static str,
+        original_parameters: serde_json::Value,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        mut next_request_id: I,
+        mut respond: F,
+    ) -> Result<CoreResult, ModernHttpMrtrError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        I: FnMut() -> McpResult<RequestId>,
+    {
+        validate_mrtr_request_id(&initial_request_id)?;
+        let limits =
+            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)
+                .map_err(ModernHttpMrtrError::Driver)?;
+        let mut driver =
+            MrtrDriver::new(cx, deadline, limits).map_err(ModernHttpMrtrError::Driver)?;
+        let mut used_request_ids = vec![initial_request_id.clone()];
+        let mut request_id = initial_request_id;
+        let mut parameters = original_parameters.clone();
+
+        loop {
+            driver
+                .before_request()
+                .map_err(ModernHttpMrtrError::Driver)?;
+            let result = await_mrtr_until(
+                cx,
+                driver.deadline(),
+                self.execute_mrtr_round(
+                    cx,
+                    method,
+                    parameters,
+                    request_id.clone(),
+                    sse_limits,
+                    maximum_response_bytes,
+                ),
+            )
+            .await?;
+            // A response body can finish after the operation deadline. Do
+            // not turn that late terminal into success or let it trigger a
+            // caller callback for another continuation.
+            driver
+                .before_request()
+                .map_err(ModernHttpMrtrError::Driver)?;
+            let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
+                return Ok(result);
+            };
+
+            // This occurs before either user callback or ID allocation, so a
+            // fifth continuation cannot create an effect or a sixth POST.
+            driver
+                .begin_continuation()
+                .map_err(ModernHttpMrtrError::Driver)?;
+            let input_responses = respond(input_required).map_err(ModernHttpMrtrError::Driver)?;
+            let input_response_count = input_responses.len();
+            let retry_parameters =
+                mrtr_retry_parameters(original_parameters.clone(), input_required, input_responses)
+                    .map_err(ModernHttpMrtrError::Driver)?;
+            driver
+                .admit_input_responses(input_response_count)
+                .map_err(ModernHttpMrtrError::Driver)?;
+
+            let next_id = next_request_id().map_err(ModernHttpMrtrError::Driver)?;
+            validate_mrtr_request_id(&next_id)?;
+            if used_request_ids
+                .iter()
+                .any(|used_id| used_id.correlates_with(&next_id))
+            {
+                return Err(ModernHttpMrtrError::ReusedRequestId {
+                    request_id: next_id,
+                });
+            }
+            used_request_ids.push(next_id.clone());
+            request_id = next_id;
+            parameters = retry_parameters;
+        }
+    }
+
+    async fn execute_mrtr_round(
+        &self,
+        cx: &Cx,
+        method: &'static str,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+    ) -> Result<CoreResult, ModernHttpMrtrError> {
+        let client_extensions = merge_client_extensions(self.active_mcp_apps_settings(), None);
+        let request = build_modern_request_with_extensions(
+            &self.modern_post_target,
+            &self.client_info,
+            &self.client_capabilities,
+            method,
+            parameters,
+            Some(request_id.clone()),
+            client_extensions.as_ref(),
+        )
+        .map_err(ModernHttpMrtrError::Request)?;
+        let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
+            ModernHttpMrtrError::Request(ModernHttpClientError::RequestEncodingFailed)
+        })?;
+        let core_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            method,
+            wire_request.params.as_ref(),
+        )
+        .map_err(|error| ModernHttpMrtrError::Request(ModernHttpClientError::TypedResult(error)))?;
+        let response = self.executor.execute(cx, &request).await.map_err(|error| {
+            ModernHttpMrtrError::Request(ModernHttpClientError::Executor(error))
+        })?;
+
+        let result = match response.metadata().kind() {
+            ModernHttpResponseKind::Json => {
+                let body = response
+                    .read_to_end(cx, maximum_response_bytes)
+                    .await
+                    .map_err(|error| {
+                        ModernHttpMrtrError::Request(ModernHttpClientError::Executor(error))
+                    })?;
+                decode_mrtr_json_response(
+                    &core_request,
+                    &request_id,
+                    &body,
+                    maximum_response_bytes,
+                )?
+            }
+            ModernHttpResponseKind::Sse => {
+                response
+                    .into_final_core_listener(request_id, core_request, sse_limits)
+                    .map_err(ModernHttpMrtrError::Listener)?
+                    .collect(cx)
+                    .await
+                    .map_err(ModernHttpMrtrError::Listener)?
+                    .terminal
+            }
+            actual => return Err(ModernHttpMrtrError::UnexpectedResponseKind { actual }),
+        };
+        if matches!(&result, FinalCoreResult::ToolsCallTask { .. }) {
+            return Err(ModernHttpMrtrError::TasksResultRequiresNegotiatedOperation);
+        }
+        Ok(CoreResult::Final(result))
     }
 
     /// Opens one typed final core response stream for an ordinary core request.
@@ -4644,6 +5148,164 @@ fn build_modern_request(
     )
 }
 
+fn validate_mrtr_request_id(request_id: &RequestId) -> Result<(), ModernHttpMrtrError> {
+    if request_id.validate().is_err() {
+        return Err(ModernHttpMrtrError::InvalidRequestId {
+            request_id: request_id.clone(),
+        });
+    }
+    Ok(())
+}
+
+async fn await_mrtr_until<T>(
+    cx: &Cx,
+    deadline: Instant,
+    future: impl Future<Output = Result<T, ModernHttpMrtrError>>,
+) -> Result<T, ModernHttpMrtrError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| {
+            ModernHttpMrtrError::Driver(McpError::internal_error(
+                "MRTR operation absolute deadline elapsed",
+            ))
+        })?;
+    if remaining.is_zero() {
+        return Err(ModernHttpMrtrError::Driver(McpError::internal_error(
+            "MRTR operation absolute deadline elapsed",
+        )));
+    }
+    asupersync::time::timeout(cx.now(), remaining, future)
+        .await
+        .map_err(|_| {
+            ModernHttpMrtrError::Driver(McpError::internal_error(
+                "MRTR operation absolute deadline elapsed",
+            ))
+        })?
+}
+
+fn mrtr_retry_parameters(
+    mut parameters: serde_json::Value,
+    input_required: &InputRequiredResult,
+    input_responses: MrtrInputResponses,
+) -> McpResult<serde_json::Value> {
+    if input_responses.len() > MAX_MRTR_INPUT_RESPONSES {
+        return Err(McpError::invalid_params(format!(
+            "MRTR inputResponses must not exceed {MAX_MRTR_INPUT_RESPONSES} entries",
+        )));
+    }
+
+    let input_requests = input_required.input_requests();
+    if input_requests.is_none() && !input_responses.is_empty() {
+        return Err(McpError::invalid_params(
+            "MRTR inputResponses require peer inputRequests",
+        ));
+    }
+    if let Some(input_requests) = input_requests {
+        for key in input_responses.keys() {
+            if !input_requests
+                .members()
+                .iter()
+                .any(|request| request.name == *key)
+            {
+                return Err(McpError::invalid_params(
+                    "MRTR inputResponses contain a key not requested by the peer",
+                ));
+            }
+        }
+    }
+    if input_responses.is_empty() && input_required.request_state().is_none() {
+        return Err(McpError::invalid_params(
+            "MRTR retry requires inputResponses or requestState",
+        ));
+    }
+
+    let parameters = parameters
+        .as_object_mut()
+        .ok_or_else(|| McpError::internal_error("MRTR retry parameters must remain an object"))?;
+    if !input_responses.is_empty() {
+        parameters.insert(
+            "inputResponses".to_owned(),
+            serde_json::to_value(input_responses).map_err(|error| {
+                McpError::internal_error(format!(
+                    "MRTR inputResponses could not serialize: {error}"
+                ))
+            })?,
+        );
+    }
+    if let Some(request_state) = input_required.request_state() {
+        parameters.insert(
+            "requestState".to_owned(),
+            serde_json::Value::String(request_state.to_owned()),
+        );
+    }
+    Ok(serde_json::Value::Object(parameters.clone()))
+}
+
+fn mrtr_input_required_for_method<'a>(
+    method: &str,
+    result: &'a CoreResult,
+) -> Option<&'a InputRequiredResult> {
+    match (method, result) {
+        (TOOLS_CALL, CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }))
+        | (
+            RESOURCES_READ,
+            CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }),
+        )
+        | (
+            PROMPTS_GET,
+            CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }),
+        ) => Some(result),
+        _ => None,
+    }
+}
+
+fn decode_mrtr_json_response(
+    core_request: &CoreRequest,
+    request_id: &RequestId,
+    body: &[u8],
+    maximum_response_bytes: usize,
+) -> Result<FinalCoreResult, ModernHttpMrtrError> {
+    let message = decode_strict_jsonrpc_message(body, maximum_response_bytes)
+        .map_err(ModernHttpMrtrError::JsonRpcAdmission)?;
+    let JsonRpcMessage::Response(response) = message else {
+        return Err(ModernHttpMrtrError::UnexpectedResponseMessage);
+    };
+    let admission = decode_strict_jsonrpc_response(body, maximum_response_bytes)
+        .map_err(|error| ModernHttpMrtrError::JsonRpcAdmission(error))?;
+    if admission.response() != &response {
+        return Err(ModernHttpMrtrError::JsonRpcAdmission(
+            JsonRpcAdmissionError::InvalidEnvelope,
+        ));
+    }
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|response_id| response_id.correlates_with(request_id))
+    {
+        return Err(ModernHttpMrtrError::ResponseIdMismatch {
+            expected: request_id.clone(),
+            actual: response.id,
+        });
+    }
+    if let Some(error) = response.error.as_ref() {
+        return Err(ModernHttpMrtrError::RemoteError {
+            code: error.code,
+            message: error.message.clone(),
+        });
+    }
+    let (_, result_source) = admission.into_parts();
+    let result_source = result_source
+        .as_deref()
+        .ok_or(ModernHttpMrtrError::MissingResult)?;
+    let CoreResult::Final(result) = core_request
+        .decode_response_result(&response, result_source)
+        .map_err(ModernHttpMrtrError::TypedResult)?
+    else {
+        return Err(ModernHttpMrtrError::UnexpectedCoreResult);
+    };
+    Ok(result)
+}
+
 fn mcp_apps_client_extensions(
     settings: Option<&McpAppsClientSettings>,
 ) -> Option<BTreeMap<String, serde_json::Value>> {
@@ -4998,7 +5660,7 @@ fn contains_header_control(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::future::Future as _;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -5015,12 +5677,13 @@ mod tests {
     use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
     use fastmcp_protocol::protocol_policy::{LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION};
     use fastmcp_protocol::{
-        ClientCapabilities, ClientInfo, RequestId, ServerNotification, SubscriptionFilter,
+        ClientCapabilities, ClientInfo, CoreResult, FinalCoreResult, RequestId, ServerNotification,
+        SubscriptionFilter,
     };
 
     use super::{
         ClientHttpConnection, ClientHttpConnectionError, LegacySseHttpClientError,
-        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS,
+        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, MAX_MRTR_CONTINUATION_ROUNDS,
         MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES, MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
         MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS, ModernHttpClient, ModernHttpClientError,
         ModernHttpExecutorError, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
@@ -8628,5 +9291,282 @@ mod tests {
         ))
         .expect("changing only final metadata leaves the legacy connection usable");
         server.join().expect("legacy notification server must join");
+    }
+
+    #[test]
+    fn ordinary_modern_http_mrtr_retries_tool_resource_and_prompt_state_only_without_tasks() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ordinary MRTR listener");
+        let address = listener.local_addr().expect("read ordinary MRTR address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept ordinary MRTR probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("ordinary MRTR probe is JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            for (method, request_id, state, terminal) in [
+                (TOOLS_CALL, 2, None, false),
+                (TOOLS_CALL, 3, Some("tool-state"), true),
+                (RESOURCES_READ, 4, None, false),
+                (RESOURCES_READ, 5, Some("resource-state"), true),
+                (PROMPTS_GET, 6, None, false),
+                (PROMPTS_GET, 7, Some("prompt-state"), true),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept ordinary MRTR round");
+                let request = read_request(&mut stream);
+                assert!(request.head.contains(&format!("Mcp-Method: {method}\r\n")));
+                let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("ordinary MRTR request is JSON-RPC");
+                assert_eq!(body["id"], request_id);
+                assert_eq!(body["method"], method);
+                assert_eq!(
+                    body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                    MODERN_PROTOCOL_VERSION
+                );
+                assert!(
+                    body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                        .get("extensions")
+                        .is_none(),
+                    "ordinary MRTR must not negotiate Tasks"
+                );
+                match state {
+                    Some(state) => {
+                        assert_eq!(body["params"]["requestState"], state);
+                        assert!(body["params"].get("inputResponses").is_none());
+                    }
+                    None => {
+                        assert!(body["params"].get("requestState").is_none());
+                        assert!(body["params"].get("inputResponses").is_none());
+                    }
+                }
+
+                let response = if terminal {
+                    match method {
+                        TOOLS_CALL => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}]}}}}"
+                        ),
+                        RESOURCES_READ => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{\"resultType\":\"complete\",\"contents\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}"
+                        ),
+                        PROMPTS_GET => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{\"resultType\":\"complete\",\"messages\":[]}}}}"
+                        ),
+                        _ => unreachable!("the test covers only MRTR core methods"),
+                    }
+                } else {
+                    let state = match method {
+                        TOOLS_CALL => "tool-state",
+                        RESOURCES_READ => "resource-state",
+                        PROMPTS_GET => "prompt-state",
+                        _ => unreachable!("the test covers only MRTR core methods"),
+                    };
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{\"resultType\":\"input_required\",\"requestState\":\"{state}\"}}}}"
+                    )
+                };
+                write_response(&mut stream, 200, "application/json", response.as_bytes());
+            }
+        });
+
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "ordinary-mrtr-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery selects ordinary HTTP MRTR")
+        .into_modern()
+        .expect("ModernOnly cannot select legacy HTTP");
+        let sse_limits = SseLimits::new(1_024, 8_192, 8).expect("bounded SSE limits");
+
+        let mut next_tool_id = [RequestId::Number(3)].into_iter();
+        let tool = runtime_block_on(client.call_tool_with_mrtr_retry(
+            &cx,
+            RequestId::Number(2),
+            Instant::now() + Duration::from_secs(2),
+            "ordinary-tool",
+            serde_json::json!({"input": "state-only"}),
+            sse_limits,
+            4_096,
+            || {
+                Ok(next_tool_id
+                    .next()
+                    .expect("exactly one tool continuation ID"))
+            },
+            |input_required| {
+                assert_eq!(input_required.request_state(), Some("tool-state"));
+                Ok(BTreeMap::new())
+            },
+        ))
+        .expect("ordinary HTTP tool MRTR completes without Tasks");
+        assert!(matches!(
+            tool,
+            CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+        ));
+
+        let mut next_resource_id = [RequestId::Number(5)].into_iter();
+        let resource = runtime_block_on(client.read_resource_with_mrtr_retry(
+            &cx,
+            RequestId::Number(4),
+            Instant::now() + Duration::from_secs(2),
+            "file:///ordinary-mrtr.txt",
+            sse_limits,
+            4_096,
+            || {
+                Ok(next_resource_id
+                    .next()
+                    .expect("exactly one resource continuation ID"))
+            },
+            |input_required| {
+                assert_eq!(input_required.request_state(), Some("resource-state"));
+                Ok(BTreeMap::new())
+            },
+        ))
+        .expect("ordinary HTTP resource MRTR completes without Tasks");
+        assert!(matches!(
+            resource,
+            CoreResult::Final(FinalCoreResult::ResourcesRead { .. })
+        ));
+
+        let mut next_prompt_id = [RequestId::Number(7)].into_iter();
+        let prompt = runtime_block_on(client.get_prompt_with_mrtr_retry(
+            &cx,
+            RequestId::Number(6),
+            Instant::now() + Duration::from_secs(2),
+            "ordinary-prompt",
+            HashMap::new(),
+            sse_limits,
+            4_096,
+            || {
+                Ok(next_prompt_id
+                    .next()
+                    .expect("exactly one prompt continuation ID"))
+            },
+            |input_required| {
+                assert_eq!(input_required.request_state(), Some("prompt-state"));
+                Ok(BTreeMap::new())
+            },
+        ))
+        .expect("ordinary HTTP prompt MRTR completes without Tasks");
+        assert!(matches!(
+            prompt,
+            CoreResult::Final(FinalCoreResult::PromptsGet { .. })
+        ));
+        server.join().expect("ordinary MRTR peer joins");
+    }
+
+    #[test]
+    fn ordinary_modern_http_mrtr_round_bound_changes_only_the_fifth_terminal_and_never_posts_again()
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind MRTR bound listener");
+        let address = listener.local_addr().expect("read MRTR bound address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept MRTR bound probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("MRTR bound probe is JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            // This matches a four-round positive exchange except that the
+            // fifth terminal is one extra input_required result.
+            for request_id in 2..=(MAX_MRTR_CONTINUATION_ROUNDS as i64 + 2) {
+                let (mut stream, _) = listener.accept().expect("accept bounded MRTR round");
+                let request = read_request(&mut stream);
+                let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("bounded MRTR request is JSON-RPC");
+                assert_eq!(body["id"], request_id);
+                assert_eq!(body["method"], TOOLS_CALL);
+                assert!(
+                    body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                        .get("extensions")
+                        .is_none(),
+                    "ordinary MRTR must not negotiate Tasks"
+                );
+                let state = format!("round-{request_id}");
+                let response = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{\"resultType\":\"input_required\",\"requestState\":\"{state}\"}}}}"
+                );
+                write_response(&mut stream, 200, "application/json", response.as_bytes());
+            }
+
+            listener
+                .set_nonblocking(true)
+                .expect("configure no-contact assertion");
+            let no_contact_deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < no_contact_deadline {
+                match listener.accept() {
+                    Ok(_) => panic!("MRTR round bound must reject before a sixth POST"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("unexpected no-contact accept error: {error}"),
+                }
+            }
+        });
+
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "ordinary-mrtr-bound-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery selects ordinary HTTP MRTR")
+        .into_modern()
+        .expect("ModernOnly cannot select legacy HTTP");
+        let mut next_id = 3_i64;
+        let mut callback_count = 0_usize;
+        let error = runtime_block_on(client.call_tool_with_mrtr_retry(
+            &cx,
+            RequestId::Number(2),
+            Instant::now() + Duration::from_secs(2),
+            "bound-tool",
+            serde_json::json!({}),
+            SseLimits::new(1_024, 8_192, 8).expect("bounded SSE limits"),
+            4_096,
+            || {
+                let request_id = RequestId::Number(next_id);
+                next_id += 1;
+                Ok(request_id)
+            },
+            |_| {
+                callback_count += 1;
+                Ok(BTreeMap::new())
+            },
+        ))
+        .expect_err("the one extra input_required result exceeds the local round bound");
+        assert!(matches!(
+            error,
+            super::ModernHttpMrtrError::Driver(ref error)
+                if error.message == "MRTR continuation-round limit exceeded"
+        ));
+        assert_eq!(callback_count, MAX_MRTR_CONTINUATION_ROUNDS);
+        assert_eq!(next_id, MAX_MRTR_CONTINUATION_ROUNDS as i64 + 3);
+        server.join().expect("MRTR no-contact peer joins");
     }
 }
