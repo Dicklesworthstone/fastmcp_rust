@@ -606,13 +606,13 @@ mod tests {
 
     use asupersync::Cx;
     use fastmcp_core::{McpContext, McpErrorCode, McpResult};
+    #[cfg(feature = "apps")]
+    use fastmcp_protocol::extensions::official_mcp_apps_empty_server_settings;
     use fastmcp_protocol::extensions::{
         ClientExtensionDiscovery, ExtensionLocalEnablement, ExtensionRegistryError,
         ExtensionSettings, ServerExtensionDiscovery, official_tasks_descriptor,
         official_tasks_empty_settings, register_official_tasks_extension,
     };
-    #[cfg(feature = "apps")]
-    use fastmcp_protocol::extensions::official_mcp_apps_empty_server_settings;
     use fastmcp_protocol::protocol_policy::ProtocolEra;
     use fastmcp_protocol::{
         ExtensionDescriptorRegistry, ExtensionDirection, ExtensionId, JsonRpcRequest,

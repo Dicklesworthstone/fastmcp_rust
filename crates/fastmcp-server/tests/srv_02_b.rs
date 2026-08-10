@@ -6,9 +6,9 @@
 use asupersync::Cx;
 use fastmcp_core::{McpContext, McpResult};
 use fastmcp_derive::tool;
-use fastmcp_protocol::protocol_policy::{MODERN_PROTOCOL_VERSION, ProtocolPolicy};
 #[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_protocol::JsonRpcMessage;
+use fastmcp_protocol::protocol_policy::{MODERN_PROTOCOL_VERSION, ProtocolPolicy};
 use fastmcp_protocol::{
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, JsonRpcRequest,
     MAX_SERVER_INSTRUCTIONS_BYTES, SERVER_DISCOVER_METHOD,
@@ -74,10 +74,7 @@ impl Transport for FeatureOffTransport {
             .lock()
             .expect("feature-off transport mutex must not be poisoned");
         state.recv_calls += 1;
-        state
-            .incoming
-            .pop_front()
-            .ok_or(TransportError::Closed)
+        state.incoming.pop_front().ok_or(TransportError::Closed)
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
@@ -328,7 +325,10 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
     let modern_transport_state = modern_transport_state
         .lock()
         .expect("feature-off transport mutex must not be poisoned");
-    assert_eq!(modern_transport_state.recv_calls, 2, "one request then clean EOF");
+    assert_eq!(
+        modern_transport_state.recv_calls, 2,
+        "one request then clean EOF"
+    );
     assert_eq!(modern_transport_state.close_calls, 1);
     let [JsonRpcMessage::Response(modern_stdio_response)] =
         modern_transport_state.outgoing.as_slice()

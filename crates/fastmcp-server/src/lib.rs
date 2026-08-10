@@ -5525,13 +5525,8 @@ impl BoundHttpServer {
                     )
                     .await;
                     #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
-                    serve_modern_http_connection(
-                        &connection_cx,
-                        stream,
-                        endpoint,
-                        modern_sessions,
-                    )
-                    .await;
+                    serve_modern_http_connection(&connection_cx, stream, endpoint, modern_sessions)
+                        .await;
                 })
                 .map_err(|error| {
                     McpError::internal_error(format!(
@@ -5895,7 +5890,7 @@ impl ServerHttpSession {
             return self.handle_modern(cx, endpoint_response, modern_request_cancellation);
         }
         #[cfg(any(feature = "legacy-2024-11-05", test))]
-        self.handle_legacy(cx, endpoint_response)
+        return self.handle_legacy(cx, endpoint_response);
         #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
         {
             let _ = endpoint_response;
@@ -6338,9 +6333,7 @@ impl ServerHttpSession {
             Err(error) => return Err(error),
         };
         let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
-            return self
-                .handle_modern(cx, endpoint_response, None)
-                .map(Err);
+            return self.handle_modern(cx, endpoint_response, None).map(Err);
         };
         let request = self
             .endpoint_session
@@ -10681,7 +10674,10 @@ impl Server {
                 break;
             }
             if enforce_runtime_era && negotiated_era.is_none() {
-                match classify_initial_stdio_envelope(&mut classifier, &JsonRpcMessage::Request(request.clone())) {
+                match classify_initial_stdio_envelope(
+                    &mut classifier,
+                    &JsonRpcMessage::Request(request.clone()),
+                ) {
                     Ok(ProtocolEra::Modern2026) => negotiated_era = Some(ProtocolEra::Modern2026),
                     Ok(ProtocolEra::Legacy2024) | Err(_) => {
                         if let Some(response) = protocol_era_refusal(&request) {
@@ -22665,7 +22661,9 @@ mod lib_unit_tests {
                     "ordinary modern JSON peer cancellation did not reach the handler",
                 ));
             }
-            Ok(vec![Content::text("ordinary modern JSON request completed")])
+            Ok(vec![Content::text(
+                "ordinary modern JSON request completed",
+            )])
         }
     }
 
@@ -24960,7 +24958,10 @@ mod lib_unit_tests {
             Err(ServerLaunchPolicyError::InvalidValue),
         );
 
-        assert!(matches!(builder, Err(ServerLaunchPolicyError::InvalidValue)));
+        assert!(matches!(
+            builder,
+            Err(ServerLaunchPolicyError::InvalidValue)
+        ));
     }
 
     #[test]
@@ -27923,8 +27924,9 @@ mod lib_unit_tests {
             })),
             2_401_i64,
         );
-        let body = serde_json::to_vec(&request)
-            .map_err(|error| format!("modern JSON peer-close request did not serialize: {error}"))?;
+        let body = serde_json::to_vec(&request).map_err(|error| {
+            format!("modern JSON peer-close request did not serialize: {error}")
+        })?;
         let request = live_http_post(
             "/mcp",
             &body,
@@ -27944,13 +27946,13 @@ mod lib_unit_tests {
                 let deadline = client_cx
                     .now()
                     .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
-                let mut stream = asupersync::time::timeout_at(
-                    deadline,
-                    AsyncTcpStream::connect(address),
-                )
-                .await
-                .map_err(|_| live_http_test_timeout("modern JSON peer-close connection"))?
-                .map_err(|error| format!("modern JSON peer-close connect failed: {error}"))?;
+                let mut stream =
+                    asupersync::time::timeout_at(deadline, AsyncTcpStream::connect(address))
+                        .await
+                        .map_err(|_| live_http_test_timeout("modern JSON peer-close connection"))?
+                        .map_err(|error| {
+                            format!("modern JSON peer-close connect failed: {error}")
+                        })?;
                 asupersync::time::timeout_at(deadline, stream.write_all(&request))
                     .await
                     .map_err(|_| live_http_test_timeout("modern JSON peer-close request write"))?
@@ -27989,9 +27991,7 @@ mod lib_unit_tests {
                         ));
                     }
                     if observed_by_client.load(Ordering::Acquire) {
-                        return Err(
-                            "a connected modern JSON peer cancelled its handler".to_owned(),
-                        );
+                        return Err("a connected modern JSON peer cancelled its handler".to_owned());
                     }
                 }
 
@@ -28008,11 +28008,14 @@ mod lib_unit_tests {
             .join(cx)
             .await
             .map_err(|error| format!("modern JSON peer-close client failed: {error:?}"))??;
-        let shutdown = serve.map_err(|error| format!("modern JSON peer-close server failed: {error}"))?;
+        let shutdown =
+            serve.map_err(|error| format!("modern JSON peer-close server failed: {error}"))?;
         require_quiescent_http_shutdown(shutdown, "modern JSON peer-close").await?;
         if close_originating_peer {
             if !observed_cancellation.load(Ordering::Acquire) {
-                return Err("originating modern JSON peer close did not cancel its handler".to_owned());
+                return Err(
+                    "originating modern JSON peer close did not cancel its handler".to_owned(),
+                );
             }
         } else if observed_cancellation.load(Ordering::Acquire) {
             return Err("connected modern JSON peer unexpectedly cancelled its handler".to_owned());
@@ -28022,18 +28025,18 @@ mod lib_unit_tests {
 
     #[test]
     fn live_http_modern_json_connected_peer_keeps_handler_live() {
-        run_live_http_test(|cx| async move {
-            live_http_modern_json_peer_close_probe(&cx, false).await
-        });
+        run_live_http_test(
+            |cx| async move { live_http_modern_json_peer_close_probe(&cx, false).await },
+        );
     }
 
     #[test]
     fn live_http_modern_json_originating_peer_close_cancels_handler() {
         // This differs from the positive probe only by closing the originating
         // socket after the handler starts.
-        run_live_http_test(|cx| async move {
-            live_http_modern_json_peer_close_probe(&cx, true).await
-        });
+        run_live_http_test(
+            |cx| async move { live_http_modern_json_peer_close_probe(&cx, true).await },
+        );
     }
 
     #[test]
