@@ -188,6 +188,60 @@ fn is_mcp_context_ref(ty: &Type) -> bool {
     false
 }
 
+/// Checks whether a parameter is the macro's optional MRTR resume input.
+///
+/// A resumable handler runs once before the peer has supplied any embedded
+/// input and again only after the router has validated a completed exchange.
+/// `Option<&MrtrCompletedInputs>` expresses both states without exposing a
+/// client-provided wire value to the user function.
+fn is_mrtr_completed_inputs_option_ref(ty: &Type) -> bool {
+    let Some(inner) = option_inner_type(ty) else {
+        return false;
+    };
+    let Type::Reference(reference) = inner else {
+        return false;
+    };
+    let Type::Path(type_path) = reference.elem.as_ref() else {
+        return false;
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "MrtrCompletedInputs")
+}
+
+/// Detects the completed-input type in a parameter even when it is not in
+/// the required optional-reference form. This lets expansion reject the
+/// near-identical non-optional form instead of treating it as an ordinary
+/// tool, resource, or prompt argument.
+fn contains_mrtr_completed_inputs(ty: &Type) -> bool {
+    match ty {
+        Type::Path(type_path) => type_path.path.segments.iter().any(|segment| {
+            segment.ident == "MrtrCompletedInputs"
+                || match &segment.arguments {
+                    syn::PathArguments::AngleBracketed(arguments) => arguments
+                        .args
+                        .iter()
+                        .filter_map(|argument| match argument {
+                            syn::GenericArgument::Type(value) => Some(value),
+                            _ => None,
+                        })
+                        .any(contains_mrtr_completed_inputs),
+                    _ => false,
+                }
+        }),
+        Type::Reference(reference) => contains_mrtr_completed_inputs(&reference.elem),
+        Type::Group(group) => contains_mrtr_completed_inputs(&group.elem),
+        Type::Paren(paren) => contains_mrtr_completed_inputs(&paren.elem),
+        _ => false,
+    }
+}
+
+fn invalid_mrtr_resume_parameter_error(ty: &Type) -> syn::Error {
+    syn::Error::new_spanned(ty, "MRTR resume input must be Option<&MrtrCompletedInputs>")
+}
+
 /// Checks if a type is `Option<T>`.
 fn is_option_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty {
@@ -430,22 +484,21 @@ mod helper_tests {
 
     #[test]
     fn template_params_none() {
-        let params = extract_template_params("static/path/no/params")
-            .expect("literal-only template parses");
+        let params =
+            extract_template_params("static/path/no/params").expect("literal-only template parses");
         assert!(params.is_empty());
     }
 
     #[test]
     fn template_params_single() {
-        let params = extract_template_params("config://{name}")
-            .expect("single parameter template parses");
+        let params =
+            extract_template_params("config://{name}").expect("single parameter template parses");
         assert_eq!(params, vec!["name"]);
     }
 
     #[test]
     fn template_params_adjacent_braces() {
-        let params =
-            extract_template_params("{a}{b}").expect("adjacent expressions parse");
+        let params = extract_template_params("{a}{b}").expect("adjacent expressions parse");
         assert_eq!(params, vec!["a", "b"]);
     }
 
@@ -562,12 +615,11 @@ fn extract_template_params(uri: &str) -> Result<Vec<String>, String> {
 }
 
 /// Parses one RFC 6570 expression body, excluding its surrounding braces.
-fn parse_template_expression(
-    expression: &str,
-    byte_offset: usize,
-) -> Result<Vec<String>, String> {
+fn parse_template_expression(expression: &str, byte_offset: usize) -> Result<Vec<String>, String> {
     if expression.is_empty() {
-        return Err(format!("empty URI-template expression at byte {byte_offset}"));
+        return Err(format!(
+            "empty URI-template expression at byte {byte_offset}"
+        ));
     }
 
     let mut variable_offset = byte_offset;
@@ -1415,6 +1467,78 @@ fn generate_tool_execution_methods(
     }
 }
 
+/// Emits the retry-only tool hook for a macro handler that opted into the
+/// typed MRTR input parameter. Ordinary generated entry points keep passing
+/// `None`; this hook is reached only after router admission supplied the
+/// completed input map.
+fn generate_tool_mrtr_resume_method(
+    is_async: bool,
+    expects_context: bool,
+    fn_name: &Ident,
+    param_names: &[&Ident],
+    param_extractions: &[TokenStream2],
+    resume_name: &Ident,
+    resume_type: &Type,
+    final_outcome_conversion: &TokenStream2,
+) -> TokenStream2 {
+    let sync_invocation = if expects_context {
+        quote! { #fn_name(ctx, #(#param_names),*) }
+    } else {
+        quote! { #fn_name(#(#param_names),*) }
+    };
+    let async_invocation = if expects_context {
+        quote! { #fn_name(ctx, #(#param_names),*).await }
+    } else {
+        quote! { #fn_name(#(#param_names),*).await }
+    };
+    let invocation = if is_async {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalToolOutcome> = async move {
+                let arguments = arguments.as_object().cloned().unwrap_or_default();
+                #(#param_extractions)*
+                let #resume_name: #resume_type = resume_inputs;
+                let result = #async_invocation;
+                #final_outcome_conversion
+            }.await;
+        }
+    } else {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalToolOutcome> = (|| {
+                let arguments = arguments.as_object().cloned().unwrap_or_default();
+                #(#param_extractions)*
+                let #resume_name: #resume_type = resume_inputs;
+                let result = #sync_invocation;
+                #final_outcome_conversion
+            })();
+        }
+    };
+
+    quote! {
+        fn call_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            request_cx: &'a fastmcp_core::Cx,
+            arguments: serde_json::Value,
+            resume_inputs: Option<&'a fastmcp_server::bidirectional::MrtrCompletedInputs>,
+        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::FinalToolOutcome>> {
+            Box::pin(async move {
+                if request_cx.checkpoint().is_err() {
+                    return fastmcp_core::cancelled();
+                }
+                #invocation
+                if request_cx.checkpoint().is_err() {
+                    fastmcp_core::cancelled()
+                } else {
+                    match result {
+                        Ok(value) => fastmcp_core::Outcome::Ok(value),
+                        Err(error) => fastmcp_core::Outcome::Err(error),
+                    }
+                }
+            })
+        }
+    }
+}
+
 // ============================================================================
 // Prompt Return Type Analysis
 // ============================================================================
@@ -1506,6 +1630,45 @@ fn final_tool_outcome_return_kind(output: &syn::ReturnType) -> Option<FinalCompl
     }
 }
 
+/// Classifies the complete-or-input-required algebra used by final resources
+/// and prompts. Unlike a bare `CompleteResult`, this return type preserves an
+/// application request for more embedded input until the router mints the
+/// retry state.
+fn final_method_outcome_return_kind(
+    output: &syn::ReturnType,
+    final_payload: &str,
+) -> Option<FinalCompleteReturnKind> {
+    let value = return_type_value(output)?;
+    let outcome_payload = |candidate: &Type| {
+        let Type::Path(type_path) = candidate else {
+            return false;
+        };
+        let Some(segment) = type_path.path.segments.last() else {
+            return false;
+        };
+        if segment.ident != "FinalMethodOutcome" {
+            return false;
+        }
+        first_type_argument(candidate)
+            .is_some_and(|payload| type_has_last_ident(payload, final_payload))
+    };
+
+    if outcome_payload(value) {
+        return Some(FinalCompleteReturnKind::Direct);
+    }
+    let success = first_type_argument(value)?;
+    if !outcome_payload(success) {
+        return None;
+    }
+    if type_has_last_ident(value, "McpResult") {
+        Some(FinalCompleteReturnKind::McpResult)
+    } else if type_has_last_ident(value, "Result") {
+        Some(FinalCompleteReturnKind::Result)
+    } else {
+        None
+    }
+}
+
 fn final_tool_outcome_result_preserves_mcp_error(output: &syn::ReturnType) -> bool {
     let Some(value) = return_type_value(output) else {
         return false;
@@ -1576,6 +1739,7 @@ fn type_contains_final_result_term(ty: &Type) -> bool {
         "PaginatedResult",
         "FinalCallToolResult",
         "FinalToolOutcome",
+        "FinalMethodOutcome",
         "FinalReadResourceResult",
         "FinalGetPromptResult",
         "ReadResourceResult",
@@ -1629,6 +1793,9 @@ fn validate_final_handler_return(
     }
     if final_complete_return_kind(output, payload).is_some()
         || (payload == "FinalCallToolResult" && final_tool_outcome_return_kind(output).is_some())
+        || final_payload.is_some_and(|final_payload| {
+            final_method_outcome_return_kind(output, final_payload).is_some()
+        })
         || final_payload
             .is_some_and(|payload| final_complete_return_kind(output, payload).is_some())
         || !type_contains_final_result_term(value)
@@ -1776,6 +1943,18 @@ fn generate_prompt_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
 /// return the final prompt result algebra.
 fn generate_final_prompt_result_conversion(output: &syn::ReturnType) -> Option<TokenStream2> {
     match final_complete_return_kind(output, "FinalGetPromptResult")? {
+        FinalCompleteReturnKind::Direct => Some(quote! { Ok(result) }),
+        FinalCompleteReturnKind::Result => Some(quote! {
+            result.map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))
+        }),
+        FinalCompleteReturnKind::McpResult => Some(quote! { result }),
+    }
+}
+
+/// Converts a prompt's complete-or-input-required final algebra without a
+/// legacy prompt-message projection.
+fn generate_final_prompt_outcome_conversion(output: &syn::ReturnType) -> Option<TokenStream2> {
+    match final_method_outcome_return_kind(output, "FinalGetPromptResult")? {
         FinalCompleteReturnKind::Direct => Some(quote! { Ok(result) }),
         FinalCompleteReturnKind::Result => Some(quote! {
             result.map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))
@@ -1963,6 +2142,104 @@ fn generate_prompt_execution_methods(
     }
 }
 
+/// Emits the final complete-or-input-required prompt hooks for a resumable
+/// macro handler. The accepted MRTR map is supplied only through the retry
+/// hook after router validation.
+fn generate_prompt_mrtr_outcome_methods(
+    is_async: bool,
+    expects_context: bool,
+    fn_name: &Ident,
+    param_names: &[Ident],
+    param_extractions: &[TokenStream2],
+    resume_name: &Ident,
+    resume_type: &Type,
+    conversion: &TokenStream2,
+) -> TokenStream2 {
+    let sync_invocation = if expects_context {
+        quote! { #fn_name(ctx, #(#param_names),*) }
+    } else {
+        quote! { #fn_name(#(#param_names),*) }
+    };
+    let async_invocation = if expects_context {
+        quote! { #fn_name(ctx, #(#param_names),*).await }
+    } else {
+        quote! { #fn_name(#(#param_names),*).await }
+    };
+    let initial_invocation = if is_async {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = async move {
+                #(#param_extractions)*
+                let result = #async_invocation;
+                #conversion
+            }.await;
+        }
+    } else {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = (|| {
+                #(#param_extractions)*
+                let result = #sync_invocation;
+                #conversion
+            })();
+        }
+    };
+    let resumed_invocation = if is_async {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = async move {
+                #(#param_extractions)*
+                let #resume_name: #resume_type = resume_inputs;
+                let result = #async_invocation;
+                #conversion
+            }.await;
+        }
+    } else {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = (|| {
+                #(#param_extractions)*
+                let #resume_name: #resume_type = resume_inputs;
+                let result = #sync_invocation;
+                #conversion
+            })();
+        }
+    };
+    let outcome = quote! {
+        match result {
+            Ok(value) => fastmcp_core::Outcome::Ok(value),
+            Err(error) => fastmcp_core::Outcome::Err(error),
+        }
+    };
+
+    quote! {
+        fn get_final_outcome_async_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            _request_cx: &'a fastmcp_core::Cx,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>>> {
+            Box::pin(async move {
+                let _ = ctx;
+                let _ = &arguments;
+                #initial_invocation
+                #outcome
+            })
+        }
+
+        fn get_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            _request_cx: &'a fastmcp_core::Cx,
+            arguments: std::collections::HashMap<String, String>,
+            resume_inputs: Option<&'a fastmcp_server::bidirectional::MrtrCompletedInputs>,
+        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>>> {
+            Box::pin(async move {
+                let _ = ctx;
+                let _ = &arguments;
+                #resumed_invocation
+                #outcome
+            })
+        }
+    }
+}
+
 // ============================================================================
 // Resource Return Type Analysis
 // ============================================================================
@@ -2143,6 +2420,18 @@ fn generate_resource_result_conversion(output: &syn::ReturnType, mime_type: &str
 /// return the final resource result algebra.
 fn generate_final_resource_result_conversion(output: &syn::ReturnType) -> Option<TokenStream2> {
     match final_complete_return_kind(output, "FinalReadResourceResult")? {
+        FinalCompleteReturnKind::Direct => Some(quote! { Ok(result) }),
+        FinalCompleteReturnKind::Result => Some(quote! {
+            result.map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))
+        }),
+        FinalCompleteReturnKind::McpResult => Some(quote! { result }),
+    }
+}
+
+/// Converts a resource's complete-or-input-required final algebra without
+/// projecting it through the legacy resource result surface.
+fn generate_final_resource_outcome_conversion(output: &syn::ReturnType) -> Option<TokenStream2> {
+    match final_method_outcome_return_kind(output, "FinalReadResourceResult")? {
         FinalCompleteReturnKind::Direct => Some(quote! { Ok(result) }),
         FinalCompleteReturnKind::Result => Some(quote! {
             result.map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))
@@ -3208,6 +3497,95 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
     }
 }
 
+/// Emits the final complete-or-input-required resource hooks for a resumable
+/// macro handler. The normal hook supplies `None`; the retry hook supplies
+/// only router-admitted completed inputs.
+fn generate_resource_mrtr_outcome_methods(
+    is_async: bool,
+    fn_name: &Ident,
+    call_args: &TokenStream2,
+    param_extractions: &[TokenStream2],
+    resume_name: &Ident,
+    resume_type: &Type,
+    conversion: &TokenStream2,
+) -> TokenStream2 {
+    let initial_invocation = if is_async {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = async move {
+                #(#param_extractions)*
+                let result = #fn_name(#call_args).await;
+                #conversion
+            }.await;
+        }
+    } else {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = (|| {
+                #(#param_extractions)*
+                let result = #fn_name(#call_args);
+                #conversion
+            })();
+        }
+    };
+    let resumed_invocation = if is_async {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = async move {
+                #(#param_extractions)*
+                let #resume_name: #resume_type = resume_inputs;
+                let result = #fn_name(#call_args).await;
+                #conversion
+            }.await;
+        }
+    } else {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = (|| {
+                #(#param_extractions)*
+                let #resume_name: #resume_type = resume_inputs;
+                let result = #fn_name(#call_args);
+                #conversion
+            })();
+        }
+    };
+    let outcome = quote! {
+        match result {
+            Ok(value) => fastmcp_core::Outcome::Ok(value),
+            Err(error) => fastmcp_core::Outcome::Err(error),
+        }
+    };
+
+    quote! {
+        fn read_final_outcome_async_with_uri_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            _request_cx: &'a fastmcp_core::Cx,
+            _uri: &'a str,
+            uri_params: &'a std::collections::HashMap<String, String>,
+        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>>> {
+            Box::pin(async move {
+                let _ = ctx;
+                let _ = uri_params;
+                #initial_invocation
+                #outcome
+            })
+        }
+
+        fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            _request_cx: &'a fastmcp_core::Cx,
+            _uri: &'a str,
+            uri_params: &'a std::collections::HashMap<String, String>,
+            resume_inputs: Option<&'a fastmcp_server::bidirectional::MrtrCompletedInputs>,
+        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>>> {
+            Box::pin(async move {
+                let _ = ctx;
+                let _ = uri_params;
+                #resumed_invocation
+                #outcome
+            })
+        }
+    }
+}
+
 // ============================================================================
 // Tool Macro
 // ============================================================================
@@ -3493,6 +3871,90 @@ fn validate_output_schema_expr(schema_expr: &syn::Expr) -> syn::Result<()> {
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
+mod mrtr_resume_expansion_tests {
+    use super::{
+        contains_mrtr_completed_inputs, generate_prompt_mrtr_outcome_methods,
+        generate_resource_mrtr_outcome_methods, generate_tool_mrtr_resume_method,
+        invalid_mrtr_resume_parameter_error, is_mrtr_completed_inputs_option_ref,
+    };
+    use quote::{format_ident, quote};
+
+    #[test]
+    fn resumable_mrtr_macros_deliver_completed_inputs_to_all_handler_kinds() {
+        let resume = format_ident!("completed_inputs");
+        let resume_type: syn::Type = syn::parse_quote!(Option<&MrtrCompletedInputs>);
+        let handler = format_ident!("resumable");
+        let extraction = quote! { let completed_inputs: Option<&MrtrCompletedInputs> = None; };
+
+        let tool = generate_tool_mrtr_resume_method(
+            true,
+            true,
+            &handler,
+            &[&resume],
+            &[extraction.clone()],
+            &resume,
+            &resume_type,
+            &quote! { Ok(result) },
+        )
+        .to_string();
+        assert!(
+            tool.contains("call_final_outcome_async_resuming_in_request"),
+            "{tool}"
+        );
+        assert!(
+            tool.contains("completed_inputs : Option < & MrtrCompletedInputs > = resume_inputs"),
+            "{tool}"
+        );
+
+        let call_args = quote! { ctx, completed_inputs };
+        let resource = generate_resource_mrtr_outcome_methods(
+            false,
+            &handler,
+            &call_args,
+            &[extraction.clone()],
+            &resume,
+            &resume_type,
+            &quote! { Ok(result) },
+        )
+        .to_string();
+        assert!(
+            resource.contains("read_final_outcome_async_with_uri_resuming_in_request"),
+            "{resource}"
+        );
+        assert!(resource.contains("= resume_inputs"), "{resource}");
+
+        let prompt = generate_prompt_mrtr_outcome_methods(
+            true,
+            true,
+            &handler,
+            &[resume.clone()],
+            &[extraction],
+            &resume,
+            &resume_type,
+            &quote! { Ok(result) },
+        )
+        .to_string();
+        assert!(
+            prompt.contains("get_final_outcome_async_resuming_in_request"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("= resume_inputs"), "{prompt}");
+    }
+
+    #[test]
+    fn resumable_mrtr_rejects_the_one_variable_non_optional_form() {
+        let invalid: syn::Type = syn::parse_quote!(&MrtrCompletedInputs);
+        assert!(contains_mrtr_completed_inputs(&invalid));
+        assert!(!is_mrtr_completed_inputs_option_ref(&invalid));
+        assert_eq!(
+            invalid_mrtr_resume_parameter_error(&invalid).to_string(),
+            "MRTR resume input must be Option<&MrtrCompletedInputs>",
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod schema_bound_tool_expansion_tests {
     use super::{
         OutputSchemaSource, generate_tool_result_conversion, output_schema_source,
@@ -3738,6 +4200,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Parse parameters (skip first if it's &McpContext)
     let mut params: Vec<(&Ident, &Type, Option<String>, Option<Lit>)> = Vec::new();
+    let mut call_param_names: Vec<&Ident> = Vec::new();
+    let mut mrtr_resume_param: Option<(&Ident, &Type)> = None;
     let mut required_params: Vec<String> = Vec::new();
     let mut expects_context = false;
 
@@ -3747,6 +4211,34 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
             if i == 0 && is_mcp_context_ref(pat_type.ty.as_ref()) {
                 expects_context = true;
                 continue;
+            }
+
+            if is_mrtr_completed_inputs_option_ref(pat_type.ty.as_ref()) {
+                let Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                    return syn::Error::new_spanned(
+                        &pat_type.pat,
+                        "MRTR resume input must use an identifier pattern",
+                    )
+                    .to_compile_error()
+                    .into();
+                };
+                if mrtr_resume_param.is_some() {
+                    return syn::Error::new_spanned(
+                        &pat_type.ty,
+                        "a handler may have only one MRTR resume input",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                let param_name = &pat_ident.ident;
+                mrtr_resume_param = Some((param_name, pat_type.ty.as_ref()));
+                call_param_names.push(param_name);
+                continue;
+            }
+            if contains_mrtr_completed_inputs(pat_type.ty.as_ref()) {
+                return invalid_mrtr_resume_parameter_error(pat_type.ty.as_ref())
+                    .to_compile_error()
+                    .into();
             }
 
             if let Pat::Ident(pat_ident) = pat_type.pat.as_ref() {
@@ -3763,6 +4255,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
 
                 params.push((param_name, param_type, param_doc, param_default));
+                call_param_names.push(param_name);
             }
         }
     }
@@ -3868,8 +4361,15 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    let mrtr_param_extractions = param_extractions.clone();
+    if let Some((name, ty)) = mrtr_resume_param {
+        param_extractions.push(quote! {
+            let #name: #ty = None;
+        });
+    }
+
     // Generate parameter names for function call
-    let param_names: Vec<&Ident> = params.iter().map(|(name, _, _, _)| *name).collect();
+    let param_names = call_param_names;
 
     // Check if function is async
     let is_async = input_fn.sig.asyncness.is_some();
@@ -3879,6 +4379,14 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     let result_conversion = generate_tool_result_conversion(return_type, typed_output_schema);
     let final_result_conversion = generate_final_tool_result_conversion(return_type);
     let final_outcome_conversion = generate_final_tool_outcome_conversion(return_type);
+    if mrtr_resume_param.is_some() && final_outcome_conversion.is_none() {
+        return syn::Error::new_spanned(
+            &input_fn.sig.output,
+            "MRTR resume input requires a canonical FinalToolOutcome return type",
+        )
+        .to_compile_error()
+        .into();
+    }
     let tasks_declaration = generate_tool_tasks_declaration(attrs.tasks);
 
     let execution_methods = generate_tool_execution_methods(
@@ -3891,6 +4399,20 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         final_result_conversion.as_ref(),
         final_outcome_conversion.as_ref(),
     );
+    let mrtr_resume_method = match (mrtr_resume_param, final_outcome_conversion.as_ref()) {
+        (Some((name, ty)), Some(conversion)) => generate_tool_mrtr_resume_method(
+            is_async,
+            expects_context,
+            fn_name,
+            &param_names,
+            &mrtr_param_extractions,
+            name,
+            ty,
+            conversion,
+        ),
+        (None, _) => TokenStream2::new(),
+        (Some(_), None) => unreachable!("MRTR return validation above rejects this form"),
+    };
 
     // Generate the handler implementation
     let expanded = quote! {
@@ -3941,6 +4463,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #tasks_declaration
 
                 #execution_methods
+
+                #mrtr_resume_method
             }
         }
     };
@@ -4155,6 +4679,8 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Parse parameters (skip first if it's &McpContext)
     let mut params: Vec<(&Ident, &Type)> = Vec::new();
+    let mut call_param_names: Vec<&Ident> = Vec::new();
+    let mut mrtr_resume_param: Option<(&Ident, &Type)> = None;
     let mut expects_context = false;
 
     for (i, arg) in input_fn.sig.inputs.iter().enumerate() {
@@ -4164,10 +4690,39 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
                 continue;
             }
 
+            if is_mrtr_completed_inputs_option_ref(pat_type.ty.as_ref()) {
+                let Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                    return syn::Error::new_spanned(
+                        &pat_type.pat,
+                        "MRTR resume input must use an identifier pattern",
+                    )
+                    .to_compile_error()
+                    .into();
+                };
+                if mrtr_resume_param.is_some() {
+                    return syn::Error::new_spanned(
+                        &pat_type.ty,
+                        "a handler may have only one MRTR resume input",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                let param_name = &pat_ident.ident;
+                mrtr_resume_param = Some((param_name, pat_type.ty.as_ref()));
+                call_param_names.push(param_name);
+                continue;
+            }
+            if contains_mrtr_completed_inputs(pat_type.ty.as_ref()) {
+                return invalid_mrtr_resume_parameter_error(pat_type.ty.as_ref())
+                    .to_compile_error()
+                    .into();
+            }
+
             if let Pat::Ident(pat_ident) = pat_type.pat.as_ref() {
                 let param_name = &pat_ident.ident;
                 let param_type = pat_type.ty.as_ref();
                 params.push((param_name, param_type));
+                call_param_names.push(param_name);
             }
         }
     }
@@ -4201,7 +4756,7 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let is_template = !template_params.is_empty();
 
-    let param_extractions: Vec<TokenStream2> = params
+    let mut param_extractions: Vec<TokenStream2> = params
         .iter()
         .map(|(name, ty)| {
             let name_str = name.to_string();
@@ -4247,7 +4802,14 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    let param_names: Vec<&Ident> = params.iter().map(|(name, _)| *name).collect();
+    let mrtr_param_extractions = param_extractions.clone();
+    if let Some((name, ty)) = mrtr_resume_param {
+        param_extractions.push(quote! {
+            let #name: #ty = None;
+        });
+    }
+
+    let param_names = call_param_names;
     let call_args = if expects_context {
         quote! { ctx, #(#param_names),* }
     } else {
@@ -4275,10 +4837,21 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Generate result conversion based on return type (supports Result<String, E>)
     let return_type = &input_fn.sig.output;
     let final_result_conversion = generate_final_resource_result_conversion(return_type);
-    let resource_result_conversion = final_result_conversion.as_ref().map_or_else(
-        || generate_resource_result_conversion(return_type, &mime_type),
-        |_| generate_final_legacy_rejection("resource", "ResourceHandler::read_final"),
-    );
+    let final_outcome_conversion = generate_final_resource_outcome_conversion(return_type);
+    if mrtr_resume_param.is_some() && final_outcome_conversion.is_none() {
+        return syn::Error::new_spanned(
+            &input_fn.sig.output,
+            "MRTR resume input requires FinalMethodOutcome<FinalReadResourceResult>",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let resource_result_conversion =
+        if final_result_conversion.is_some() || final_outcome_conversion.is_some() {
+            generate_final_legacy_rejection("resource", "ResourceHandler::read_final")
+        } else {
+            generate_resource_result_conversion(return_type, &mime_type)
+        };
     let execution_methods = generate_resource_execution_methods(
         is_async,
         fn_name,
@@ -4288,6 +4861,19 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         &resource_result_conversion,
         final_result_conversion.as_ref(),
     );
+    let mrtr_outcome_methods = match (mrtr_resume_param, final_outcome_conversion.as_ref()) {
+        (Some((name, ty)), Some(conversion)) => generate_resource_mrtr_outcome_methods(
+            is_async,
+            fn_name,
+            &call_args,
+            &mrtr_param_extractions,
+            name,
+            ty,
+            conversion,
+        ),
+        (None, _) => TokenStream2::new(),
+        (Some(_), None) => unreachable!("MRTR return validation above rejects this form"),
+    };
 
     let expanded = quote! {
         // Keep the original function
@@ -4324,6 +4910,8 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #timeout_tokens
 
                 #execution_methods
+
+                #mrtr_outcome_methods
             }
         }
     };
@@ -4518,6 +5106,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse parameters for prompt arguments (skip first if it's &McpContext)
     let mut prompt_args: Vec<TokenStream2> = Vec::new();
     let mut expects_context = false;
+    let mut mrtr_resume_param: Option<(&Ident, &Type)> = None;
 
     for (i, arg) in input_fn.sig.inputs.iter().enumerate() {
         if let FnArg::Typed(pat_type) = arg {
@@ -4525,6 +5114,32 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
             if i == 0 && is_mcp_context_ref(pat_type.ty.as_ref()) {
                 expects_context = true;
                 continue;
+            }
+
+            if is_mrtr_completed_inputs_option_ref(pat_type.ty.as_ref()) {
+                let Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                    return syn::Error::new_spanned(
+                        &pat_type.pat,
+                        "MRTR resume input must use an identifier pattern",
+                    )
+                    .to_compile_error()
+                    .into();
+                };
+                if mrtr_resume_param.is_some() {
+                    return syn::Error::new_spanned(
+                        &pat_type.ty,
+                        "a handler may have only one MRTR resume input",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                mrtr_resume_param = Some((&pat_ident.ident, pat_type.ty.as_ref()));
+                continue;
+            }
+            if contains_mrtr_completed_inputs(pat_type.ty.as_ref()) {
+                return invalid_mrtr_resume_parameter_error(pat_type.ty.as_ref())
+                    .to_compile_error()
+                    .into();
             }
 
             if let Pat::Ident(pat_ident) = pat_type.pat.as_ref() {
@@ -4557,6 +5172,14 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
         if let FnArg::Typed(pat_type) = arg {
             // Skip context
             if i == 0 && is_mcp_context_ref(pat_type.ty.as_ref()) {
+                continue;
+            }
+
+            if is_mrtr_completed_inputs_option_ref(pat_type.ty.as_ref()) {
+                let Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                    unreachable!("the first prompt parameter pass validated the pattern")
+                };
+                param_names.push(pat_ident.ident.clone());
                 continue;
             }
 
@@ -4616,15 +5239,33 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    let mrtr_param_extractions = param_extractions.clone();
+    if let Some((name, ty)) = mrtr_resume_param {
+        param_extractions.push(quote! {
+            let #name: #ty = None;
+        });
+    }
+
     let is_async = input_fn.sig.asyncness.is_some();
 
     // Generate result conversion based on return type (supports Result<Vec<PromptMessage>, E>)
     let return_type = &input_fn.sig.output;
     let final_result_conversion = generate_final_prompt_result_conversion(return_type);
-    let prompt_result_conversion = final_result_conversion.as_ref().map_or_else(
-        || generate_prompt_result_conversion(return_type),
-        |_| generate_final_legacy_rejection("prompt", "PromptHandler::get_final"),
-    );
+    let final_outcome_conversion = generate_final_prompt_outcome_conversion(return_type);
+    if mrtr_resume_param.is_some() && final_outcome_conversion.is_none() {
+        return syn::Error::new_spanned(
+            &input_fn.sig.output,
+            "MRTR resume input requires FinalMethodOutcome<FinalGetPromptResult>",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let prompt_result_conversion =
+        if final_result_conversion.is_some() || final_outcome_conversion.is_some() {
+            generate_final_legacy_rejection("prompt", "PromptHandler::get_final")
+        } else {
+            generate_prompt_result_conversion(return_type)
+        };
     let execution_methods = generate_prompt_execution_methods(
         is_async,
         expects_context,
@@ -4634,6 +5275,20 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
         &prompt_result_conversion,
         final_result_conversion.as_ref(),
     );
+    let mrtr_outcome_methods = match (mrtr_resume_param, final_outcome_conversion.as_ref()) {
+        (Some((name, ty)), Some(conversion)) => generate_prompt_mrtr_outcome_methods(
+            is_async,
+            expects_context,
+            fn_name,
+            &param_names,
+            &mrtr_param_extractions,
+            name,
+            ty,
+            conversion,
+        ),
+        (None, _) => TokenStream2::new(),
+        (Some(_), None) => unreachable!("MRTR return validation above rejects this form"),
+    };
 
     // Generate version token
     let version_tokens = attrs
@@ -4678,6 +5333,8 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #timeout_tokens
 
                 #execution_methods
+
+                #mrtr_outcome_methods
             }
         }
     };
