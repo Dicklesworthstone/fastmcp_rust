@@ -548,8 +548,14 @@ impl<'de> Deserialize<'de> for JsonInteger {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = Box::<RawValue>::deserialize(deserializer)?;
-        raw.get().parse().map_err(serde::de::Error::custom)
+        // Not RawValue: raw capture cannot survive serde's buffered Content
+        // replay, so a RawValue-based decode fails inside every untagged
+        // context - most critically the JsonRpcMessage enum, where it made
+        // this crate unable to parse error responses it had itself encoded.
+        // An arbitrary-precision Number replays through buffering and keeps
+        // the parser's number spelling.
+        let number = serde_json::Number::deserialize(deserializer)?;
+        Self::try_from_number(number).map_err(serde::de::Error::custom)
     }
 }
 

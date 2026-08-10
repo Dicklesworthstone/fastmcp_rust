@@ -16345,7 +16345,7 @@ mod router_tests {
             ),
             (
                 FinalResourceReadCacheHintProvenance::RouterPolicy,
-                17,
+                23,
                 "public",
             ),
         ] {
