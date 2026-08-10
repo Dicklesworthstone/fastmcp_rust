@@ -829,8 +829,11 @@ impl ServerBuilder {
             }
         };
 
+        // Legacy catalog entries register exact-2024-only: dual-era proxy
+        // composition must not promote a legacy upstream's components into
+        // the final catalog beside a modern upstream's own registrations.
         for tool in catalog.tools {
-            if let Err(error) = self.router.add_tool_with_behavior(
+            if let Err(error) = self.router.add_legacy_tool_with_behavior(
                 ProxyToolHandler::new(tool, client.clone()),
                 self.on_duplicate,
             ) {
@@ -859,7 +862,7 @@ impl ServerBuilder {
         }
 
         for resource in catalog.resources {
-            if let Err(error) = self.router.add_resource_with_behavior(
+            if let Err(error) = self.router.add_legacy_resource_with_behavior(
                 ProxyResourceHandler::new(resource, client.clone()),
                 self.on_duplicate,
             ) {
@@ -872,7 +875,7 @@ impl ServerBuilder {
         }
 
         for template in catalog.resource_templates {
-            if let Err(error) = self.router.add_resource_with_behavior(
+            if let Err(error) = self.router.add_legacy_resource_with_behavior(
                 ProxyResourceHandler::from_template(template, client.clone()),
                 self.on_duplicate,
             ) {
@@ -885,7 +888,7 @@ impl ServerBuilder {
         }
 
         for prompt in catalog.prompts {
-            if let Err(error) = self.router.add_prompt_with_behavior(
+            if let Err(error) = self.router.add_legacy_prompt_with_behavior(
                 ProxyPromptHandler::new(prompt, client.clone()),
                 self.on_duplicate,
             ) {
@@ -1188,26 +1191,29 @@ impl ServerBuilder {
                 let has_tools = !tools.is_empty();
                 let has_resources = !resources.is_empty() || !resource_templates.is_empty();
                 let has_prompts = !prompts.is_empty();
+                // A legacy upstream catalog registers exact-2024-only: dual-era
+                // proxy composition must not promote its entries into the
+                // final catalog beside a modern upstream's own registrations.
                 for tool in tools {
-                    self.router.add_tool_with_behavior(
+                    self.router.add_legacy_tool_with_behavior(
                         ProxyToolHandler::new(tool, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
                 }
                 for resource in resources {
-                    self.router.add_resource_with_behavior(
+                    self.router.add_legacy_resource_with_behavior(
                         ProxyResourceHandler::new(resource, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
                 }
                 for template in resource_templates {
-                    self.router.add_resource_with_behavior(
+                    self.router.add_legacy_resource_with_behavior(
                         ProxyResourceHandler::from_template(template, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
                 }
                 for prompt in prompts {
-                    self.router.add_prompt_with_behavior(
+                    self.router.add_legacy_prompt_with_behavior(
                         ProxyPromptHandler::new(prompt, proxy_client.clone()),
                         self.on_duplicate,
                     )?;

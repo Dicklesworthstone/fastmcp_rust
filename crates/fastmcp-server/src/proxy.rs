@@ -6025,12 +6025,12 @@ exec sleep 2
         stream.flush().expect("flush native HTTP response");
     }
 
-    /// Writes a scripted modern discovery response carrying the session the
-    /// modern HTTP client requires from server/discover.
+    /// Writes a scripted modern discovery response for the sessionless
+    /// modern HTTP client (a session header would be rejected).
     fn write_http_discovery_response(stream: &mut TcpStream, body: &[u8]) {
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMCP-Session-Id: proxy-test-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .expect("write native HTTP discovery response head");

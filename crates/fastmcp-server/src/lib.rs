@@ -20834,6 +20834,7 @@ mod lib_unit_tests {
                                 ("Accept", "text/event-stream"),
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
+                                ("Mcp-Name", "live_http_mrtr"),
                             ],
                         ),
                     )
@@ -20854,6 +20855,9 @@ mod lib_unit_tests {
                         .map_err(|error| format!("MRTR roots response failed: {error}"))?,
                     )
                     .map_err(|error| format!("MRTR roots response did not serialize: {error}"))?;
+                    // The retry leg reads its result from an ordinary JSON
+                    // response; a progress token would demand an owned SSE
+                    // body and turn this Accept into a 406.
                     let retry = JsonRpcRequest::new(
                         "tools/call",
                         Some(serde_json::json!({
@@ -20864,7 +20868,6 @@ mod lib_unit_tests {
                             "_meta": {
                                 MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
                                 FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                                "progressToken": "live-http-mrtr-sse",
                             },
                         })),
                         923_i64,
@@ -20881,6 +20884,7 @@ mod lib_unit_tests {
                                 ("Accept", "application/json"),
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
+                                ("Mcp-Name", "live_http_mrtr"),
                             ],
                         ),
                     )
@@ -21565,18 +21569,12 @@ mod lib_unit_tests {
                             };
                         }
                     }
-                    // A waker-immediate yield keeps this cooperative without
-                    // depending on the contended global block_on timer slot.
-                    let mut yielded = false;
-                    std::future::poll_fn(|task_cx| {
-                        if std::mem::replace(&mut yielded, true) {
-                            std::task::Poll::Ready(())
-                        } else {
-                            task_cx.waker().wake_by_ref();
-                            std::task::Poll::Pending
-                        }
-                    })
-                    .await;
+                    // A fair yield keeps this cooperative: spawned task
+                    // timers do not fire while the harness main thread owns
+                    // block_on (a timer park would freeze the tool forever),
+                    // and a hand-rolled immediate self-wake can starve
+                    // sibling tasks of the runtime.
+                    asupersync::runtime::yield_now().await;
                 }
             })
         }
@@ -24134,6 +24132,7 @@ mod lib_unit_tests {
                                 ("Accept", "text/event-stream"),
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
+                                ("Mcp-Name", "live_http_mrtr"),
                             ],
                         ),
                     )
@@ -24615,6 +24614,7 @@ mod lib_unit_tests {
                                 ("Accept", "text/event-stream"),
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
+                                ("Mcp-Name", "live_http_mrtr"),
                                 ("MCP-Session-Id", "obsolete-modern-session"),
                             ],
                         ),
@@ -25449,6 +25449,7 @@ mod lib_unit_tests {
                         ("Accept", "application/json"),
                         ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                         ("Mcp-Method", "tools/call"),
+                        ("Mcp-Name", "http_overlap_tool"),
                     ],
                 )
             };
@@ -26197,6 +26198,7 @@ mod lib_unit_tests {
                 ("Accept", "application/json, text/event-stream"),
                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                 ("Mcp-Method", "tools/call"),
+                ("Mcp-Name", "live_modern_controlled_tool"),
             ],
         );
         let cancellation = cx.clone();
@@ -26219,6 +26221,9 @@ mod lib_unit_tests {
                     CancelKind::Shutdown,
                     Some("shutdown-fence cancellation before H1 response"),
                 );
+                // The parked accept only wakes on I/O; poke the listener so
+                // the serve loop observes the shutdown cancellation.
+                let _ = std::net::TcpStream::connect(address);
             } else {
                 controller.release(REQUEST_ID as u64);
             }
