@@ -24,31 +24,10 @@ homepage = "https://github.com/Dicklesworthstone/fastmcp_rust"
 readme = "README.md"
 
 [workspace.dependencies]
-# Runtime (our own)
-#
-# `test-internals` STOPGAP (tracked follow-up): asupersync 0.3.4 moved the
-# standalone capability-context constructors (`Cx::for_request`,
-# `Cx::for_request_with_budget`, `Cx::for_testing*`) and the `Cx::set_current`
-# /`RegionId::new_for_test`/`TaskId::new_for_test` helpers behind
-# `#[cfg(any(test, feature = "test-internals"))]` to stop production code from
-# minting fully-capable contexts out of band (asupersync br-asupersync-2x6hbi /
-# -ovztin). FastMCP's current synchronous, thread-per-connection design mints
-# such root/request contexts directly in its `run_*` entry points, request
-# dispatch, the synchronous `Transport::close` path, the client config helpers,
-# and the shipped `fastmcp_rust::testing` helpers — none of which run inside a
-# `Runtime::block_on`, so `Cx::current()` is unavailable there. asupersync
-# exposes NO public production replacement that synchronously yields a
-# standalone, capability-bearing `Cx` (the blessed path,
-# `Runtime::request_cx_with_budget`, is `pub(crate)`). The genuine fix is an
-# architectural migration to runtime-managed contexts (wrap entry points in a
-# runtime, obtain a genuinely owned child region once asupersync exposes that
-# public primitive, and plumb `&Cx` into `Transport::close`). The current
-# `Cx::scope()` and `Cx::scope_with_budget()` APIs remain in the same region and
-# are not request-isolation substitutes. Until the upstream prerequisite is
-# resolved, we opt into `test-internals` to keep the constructors visible.
-# NOTE: `fastmcp-core::block_on` does NOT rely on this feature; it uses the
-# ambient `Cx` installed by `Runtime::block_on`.
-asupersync = { version = "=0.3.9", features = ["test-internals"] }
+# Runtime (our own).  Production surfaces use runtime-installed ambient
+# contexts; test-only constructors remain opt-in at the test or facade-lab
+# boundary and must not leak into the workspace production graph.
+asupersync = { version = "=0.3.9" }
 rich_rust = { version = "=0.2.2" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
 # signal-free process-group existence probes after a managed leader is reaped.

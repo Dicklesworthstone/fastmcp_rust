@@ -606,7 +606,7 @@ fn commit_revision(
 |------------|---------|
 | **Pinned Nightly Required** | The project contract pins `nightly-2026-07-11`; do not substitute a different toolchain merely because it supports Edition 2024 |
 | **Protocol Modernization** | The root compatibility `PROTOCOL_VERSION` remains `2024-11-05`; the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`. MCP 2026-07-28 implementation and verification are incomplete |
-| **Runtime-context migration** | The workspace still enables asupersync `test-internals` as a stopgap while synchronous entry points are migrated to runtime-managed contexts |
+| **Runtime-context migration** | Production entry points obtain an ambient `Cx` from the runtime; `test-internals` is confined to test-only dependencies and the facade's opt-in `testing-lab` feature |
 | **Network Transports** | The turnkey `run_http*` entry points provide a caller-owned dual-era HTTP listener and dispatch lifecycle. This is not aggregate conformance or full lifecycle qualification; SSE and WebSocket server entry points require caller-provided I/O integration |
 | **Client Transport Coverage** | `fastmcp-client::Client` is subprocess-stdio only; public `ClientHttpConnection` and `HttpClient` provide modern HTTP and exact legacy SSE integration. Raw WebSocket types remain outside those client surfaces |
 | **No Built-in TLS** | Transport encryption must be handled externally |
