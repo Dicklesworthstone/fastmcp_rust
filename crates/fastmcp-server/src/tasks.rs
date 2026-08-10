@@ -2127,6 +2127,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         let task_id = task.base().task_id.clone();
         ensure_final_task_notification_matches_task(&task, &notification)?;
         let now = (self.clock)();
+        validate_final_task_runtime_durations(&task)?;
+        let expires_at = in_memory_final_task_expiry(&task, now)?;
         let mut state = self
             .state
             .lock()
@@ -2140,7 +2142,6 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 "In-memory final task store capacity reached",
             ));
         }
-        let expires_at = in_memory_final_task_expiry(&task, now)?;
         let generation = next_in_memory_final_task_generation(&mut state)?;
         state
             .latest_notifications
@@ -2167,6 +2168,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             ));
         }
         let now = (self.clock)();
+        validate_final_task_runtime_durations(&task)?;
+        let expires_at = in_memory_final_task_expiry(&task, now)?;
         let mut state = self
             .state
             .lock()
@@ -2180,7 +2183,6 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 "In-memory final task store capacity reached",
             ));
         }
-        let expires_at = in_memory_final_task_expiry(&task, now)?;
         let generation = next_in_memory_final_task_generation(&mut state)?;
         state
             .latest_notifications
@@ -2230,6 +2232,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     ) -> McpResult<()> {
         let task_id = task.base().task_id.clone();
         ensure_final_task_notification_matches_task(&task, &notification)?;
+        validate_final_task_runtime_durations(&task)?;
         let now = (self.clock)();
         let mut state = self
             .state
@@ -2262,6 +2265,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             ));
         }
         ensure_final_task_notification_matches_task(&task, &notification)?;
+        validate_final_task_runtime_durations(&task)?;
         let now = (self.clock)();
         let mut state = self
             .state
@@ -2295,6 +2299,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             ));
         }
         ensure_final_task_notification_matches_task(&task, &notification)?;
+        validate_final_task_runtime_durations(&task)?;
         let now = (self.clock)();
         let mut state = self
             .state
@@ -2327,6 +2332,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             ));
         }
         ensure_final_task_notification_matches_task(&task, &notification)?;
+        validate_final_task_runtime_durations(&task)?;
         let now = (self.clock)();
         let mut state = self
             .state
@@ -2881,15 +2887,31 @@ fn ensure_final_task_notification_matches_task(
     Ok(())
 }
 
+fn validate_final_task_runtime_durations(task: &FinalTask) -> McpResult<()> {
+    for (field, duration) in [
+        ("ttlMs", task.base().ttl_ms.as_ref()),
+        ("pollIntervalMs", task.base().poll_interval_ms.as_ref()),
+    ] {
+        if let Some(duration) = duration {
+            duration.try_as_millis().map_err(|error| {
+                McpError::invalid_params(format!(
+                    "Task {field} cannot be represented by the local millisecond runtime: {error}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn in_memory_final_task_expiry(task: &FinalTask, now: Instant) -> McpResult<Option<Instant>> {
-    let Some(ttl_ms) = task
-        .base()
-        .ttl_ms
-        .as_ref()
-        .map(FinalTaskDuration::as_millis)
-    else {
+    let Some(ttl_ms) = task.base().ttl_ms.as_ref() else {
         return Ok(None);
     };
+    let ttl_ms = ttl_ms.try_as_millis().map_err(|error| {
+        McpError::invalid_params(format!(
+            "Task ttlMs cannot be represented by the local millisecond runtime: {error}"
+        ))
+    })?;
     now.checked_add(StdDuration::from_millis(ttl_ms))
         .map(Some)
         .ok_or_else(|| McpError::internal_error("Task TTL exceeds process-local clock range"))
@@ -5858,6 +5880,24 @@ mod tests {
         FinalTask::Working(base)
     }
 
+    fn final_working_task_with_wire_durations(
+        task_id: &str,
+        ttl_ms: Option<&str>,
+        poll_interval_ms: Option<&str>,
+    ) -> FinalTask {
+        let FinalTask::Working(mut base) = final_working_task_without_ttl(task_id) else {
+            unreachable!("the helper always constructs a working task");
+        };
+        base.ttl_ms = ttl_ms.map(|duration| {
+            serde_json::from_str(duration).expect("fixed test task TTL wire value is valid")
+        });
+        base.poll_interval_ms = poll_interval_ms.map(|duration| {
+            serde_json::from_str(duration)
+                .expect("fixed test task poll interval wire value is valid")
+        });
+        FinalTask::Working(base)
+    }
+
     fn in_memory_store_with_test_clock(
         max_tasks: usize,
     ) -> (Arc<InMemoryFinalTaskStore>, Arc<Mutex<Instant>>) {
@@ -5983,6 +6023,44 @@ mod tests {
                 .expect("replacement task lookup is readable")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn task_03_in_memory_store_rejects_unrepresentable_durations_before_state_mutation() {
+        const ONE_OVER_U64: &str = "18446744073709551616";
+        let (store, _) = in_memory_store_with_test_clock(2);
+
+        for (task_id, ttl_ms, poll_interval_ms, field) in [
+            (
+                "task-unrepresentable-ttl",
+                Some(ONE_OVER_U64),
+                None,
+                "ttlMs",
+            ),
+            (
+                "task-unrepresentable-poll",
+                None,
+                Some(ONE_OVER_U64),
+                "pollIntervalMs",
+            ),
+        ] {
+            let task = final_working_task_with_wire_durations(task_id, ttl_ms, poll_interval_ms);
+            let task_id = task.base().task_id.clone();
+            let error = store
+                .create_task(task.clone(), final_task_notification(&task))
+                .expect_err("unbounded wire duration cannot enter the bounded in-memory runtime");
+
+            assert!(error.message.contains(field));
+            assert!(
+                store
+                    .get_task(&task_id)
+                    .expect("rejected task lookup remains readable")
+                    .is_none(),
+                "the rejected {field} duration leaves no retained task"
+            );
+            assert!(store.latest_notification(&task_id).is_none());
+            assert_eq!(store.task_count(), 0);
+        }
     }
 
     #[test]

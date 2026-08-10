@@ -57,7 +57,8 @@ use std::time::{Duration, Instant};
 use fastmcp_core::{McpContext, McpError, McpResult, Sha256Digest, sha256_bounded};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
-    FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY, JsonRpcRequest, SERVER_DISCOVER_METHOD,
+    CacheTtl, FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY, JsonRpcRequest,
+    SERVER_DISCOVER_METHOD,
 };
 
 use crate::{Middleware, MiddlewareDecision};
@@ -516,6 +517,16 @@ enum FinalDiscoveryCachePolicy {
     Public,
 }
 
+/// Local cache-admission decision for a complete final method result.
+///
+/// This is deliberately separate from the wire cache hints: a valid final
+/// `ttlMs` may exceed the bounded local duration domain and must then remain
+/// deliverable without creating a local cache entry.
+enum FinalCompleteCachePolicy {
+    Private(Duration),
+    Public,
+}
+
 /// Returns whether a result carries the exact final discovery shape relevant
 /// to caching. Full discovery validation remains owned by the protocol/server
 /// boundary; this narrower check prevents legacy lookalikes from selecting a
@@ -541,14 +552,47 @@ fn final_discovery_cache_policy(response: &serde_json::Value) -> Option<FinalDis
         return None;
     }
     let response = response.as_object()?;
-    let ttl_ms = response.get("ttlMs")?.as_u64()?;
+    let ttl_ms = serde_json::from_value::<CacheTtl>(response.get("ttlMs")?.clone()).ok()?;
     match response.get("cacheScope")?.as_str()? {
         "private" => Some(FinalDiscoveryCachePolicy::Private(Duration::from_millis(
-            ttl_ms,
+            ttl_ms.try_as_millis().ok()?,
         ))),
         "public" => Some(FinalDiscoveryCachePolicy::Public),
         _ => None,
     }
+}
+
+fn final_complete_cache_policy(response: &serde_json::Value) -> Option<FinalCompleteCachePolicy> {
+    let response = response.as_object()?;
+    let ttl_ms = serde_json::from_value::<CacheTtl>(response.get("ttlMs")?.clone()).ok()?;
+    match response.get("cacheScope")?.as_str()? {
+        "private" => Some(FinalCompleteCachePolicy::Private(Duration::from_millis(
+            ttl_ms.try_as_millis().ok()?,
+        ))),
+        "public" => Some(FinalCompleteCachePolicy::Public),
+        _ => None,
+    }
+}
+
+/// Returns whether a final discovery result has schema-valid cache hints.
+///
+/// A wire-valid TTL can exceed the local runtime duration domain. That is not
+/// a reason to rewrite the peer response: callers must still observe its exact
+/// JSON-integer spelling, while this process simply declines to cache it.
+fn final_discovery_cache_hints_are_wire_valid(response: &serde_json::Value) -> bool {
+    let Some(response) = response.as_object() else {
+        return false;
+    };
+    let Some(ttl_ms) = response.get("ttlMs") else {
+        return false;
+    };
+    serde_json::from_value::<CacheTtl>(ttl_ms.clone()).is_ok()
+        && matches!(
+            response
+                .get("cacheScope")
+                .and_then(serde_json::Value::as_str),
+            Some("private" | "public")
+        )
 }
 
 /// Selects the request era used by the discovery cache.
@@ -1258,22 +1302,20 @@ impl ResponseCachingMiddleware {
         }
     }
 
-    fn protocol_cache_ttl_ms(&self, method: &str) -> u64 {
-        u64::try_from(self.get_ttl(method).as_millis()).unwrap_or(u64::MAX)
+    fn protocol_cache_ttl(&self, method: &str) -> CacheTtl {
+        CacheTtl::milliseconds(u64::try_from(self.get_ttl(method).as_millis()).unwrap_or(u64::MAX))
     }
 
     /// Normalizes modern protocol cache hints at the server boundary.
     ///
-    /// A handler can reduce the configured TTL, including to immediate
-    /// staleness (`0`), but it cannot increase it. Exact final discovery
-    /// carries its own required policy, so its `ttlMs` and `cacheScope` are
-    /// retained unchanged and interpreted when admitting the cache entry.
-    /// This middleware holds no sealed public-cache proof, so a final public
-    /// scope is delivered unchanged but is never cache authority.
+    /// A wire-valid final cache policy is an upstream result field, not a
+    /// bounded local expiry. Preserve it byte-for-byte through serialization;
+    /// the cache admission path can independently decline a value outside its
+    /// runtime duration domain.
     fn apply_protocol_cache_hints(&self, method: &str, response: &mut serde_json::Value) {
         if method == SERVER_DISCOVER_METHOD {
             if is_final_discovery_result(response) {
-                if final_discovery_cache_policy(response).is_none()
+                if !final_discovery_cache_hints_are_wire_valid(response)
                     && let Some(response) = response.as_object_mut()
                 {
                     response.remove("ttlMs");
@@ -1300,12 +1342,26 @@ impl ResponseCachingMiddleware {
             return;
         }
 
-        let configured_ttl = self.protocol_cache_ttl_ms(method);
-        let ttl_ms = response
+        let has_wire_valid_cache_hints = response
             .get("ttlMs")
-            .and_then(serde_json::Value::as_u64)
-            .map_or(configured_ttl, |requested| requested.min(configured_ttl));
-        response.insert("ttlMs".to_owned(), serde_json::Value::from(ttl_ms));
+            .cloned()
+            .and_then(|ttl| serde_json::from_value::<CacheTtl>(ttl).ok())
+            .is_some()
+            && matches!(
+                response
+                    .get("cacheScope")
+                    .and_then(serde_json::Value::as_str),
+                Some("private" | "public")
+            );
+        if has_wire_valid_cache_hints {
+            return;
+        }
+
+        let ttl = self.protocol_cache_ttl(method);
+        response.insert(
+            "ttlMs".to_owned(),
+            serde_json::to_value(ttl).expect("cache TTL serializes to JSON"),
+        );
         response.insert(
             "cacheScope".to_owned(),
             serde_json::Value::String("private".to_owned()),
@@ -1424,6 +1480,21 @@ impl Middleware for ResponseCachingMiddleware {
         {
             return Ok(response);
         }
+        let is_final_complete = method_requires_protocol_cache_hints(&request.method)
+            && response
+                .get("resultType")
+                .and_then(serde_json::Value::as_str)
+                == Some("complete");
+        let final_complete_policy = is_final_complete
+            .then(|| final_complete_cache_policy(&response))
+            .flatten();
+        // A wire-valid arbitrary-width TTL is still delivered, but cannot be
+        // represented by this process's bounded expiry clock. Never fall back
+        // to a configured local TTL: that would create a cache entry whose
+        // expiry has no relationship to the final result's wire policy.
+        if is_final_complete && final_complete_policy.is_none() {
+            return Ok(response);
+        }
         // Only cache if this method is cacheable
         if !self.should_cache_method(&request.method, request.params.as_ref()) {
             return Ok(response);
@@ -1457,7 +1528,11 @@ impl Middleware for ResponseCachingMiddleware {
         let ttl = match final_discovery_policy {
             Some(FinalDiscoveryCachePolicy::Private(ttl)) => ttl,
             Some(FinalDiscoveryCachePolicy::Public) => return Ok(response),
-            None => self.get_ttl(&request.method),
+            None => match final_complete_policy {
+                Some(FinalCompleteCachePolicy::Private(ttl)) => ttl,
+                Some(FinalCompleteCachePolicy::Public) => return Ok(response),
+                None => self.get_ttl(&request.method),
+            },
         };
 
         let admission_limit = {
@@ -3217,6 +3292,47 @@ mod tests {
     }
 
     #[test]
+    fn cache_01_final_wire_valid_hints_remain_lossless_outside_runtime_expiry() {
+        let middleware = ResponseCachingMiddleware::new().list_ttl_secs(120);
+        let ctx = test_context();
+        let request = test_request("tools/list", None);
+        let huge_ttl: serde_json::Value =
+            serde_json::from_str("922337203685477580812345678901234567890")
+                .expect("arbitrary-width JSON integer fixture");
+        let response = serde_json::json!({
+            "resultType": "complete",
+            "tools": [],
+            "ttlMs": huge_ttl,
+            "cacheScope": "public",
+        });
+
+        let delivered = middleware
+            .on_response(&ctx, &request, response.clone())
+            .expect("a wire-valid but uncacheable final TTL remains deliverable");
+
+        assert_eq!(
+            delivered, response,
+            "runtime expiry bounds must not rewrite upstream final cache hints"
+        );
+        assert_eq!(
+            delivered["ttlMs"].to_string(),
+            "922337203685477580812345678901234567890"
+        );
+
+        let fractional = serde_json::json!({
+            "resultType": "complete",
+            "tools": [],
+            "ttlMs": 120_000.5,
+            "cacheScope": "public",
+        });
+        let normalized = middleware
+            .on_response(&ctx, &request, fractional)
+            .expect("invalid cache hints are replaced by the local policy");
+        assert_eq!(normalized["ttlMs"], serde_json::json!(120_000));
+        assert_eq!(normalized["cacheScope"], serde_json::json!("private"));
+    }
+
+    #[test]
     fn cache_01_a_planted_negative() {
         let middleware = ResponseCachingMiddleware::new().list_ttl_secs(120);
         let ctx = test_context();
@@ -3406,6 +3522,63 @@ mod tests {
         let after_lookup = middleware.stats();
         assert_eq!(after_lookup.entries, before_lookup.entries);
         assert_eq!(after_lookup.size_bytes, before_lookup.size_bytes);
+    }
+
+    #[test]
+    fn cache_discovery_huge_and_fractional_ttls_leave_existing_entry_unchanged() {
+        let middleware = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let request = final_discovery_request(FINAL_PROTOCOL_VERSION);
+        let cached = final_discovery_response(30_000, "private");
+
+        middleware
+            .on_response(&ctx, &request, cached.clone())
+            .expect("baseline final discovery response is cacheable");
+        let before = middleware.stats();
+        assert_eq!(before.entries, 1);
+
+        let mut huge = cached.clone();
+        huge["ttlMs"] =
+            serde_json::from_str("18446744073709551616").expect("unbounded JSON integer fixture");
+        let delivered = middleware
+            .on_response(&ctx, &request, huge.clone())
+            .expect("huge final discovery TTL remains deliverable");
+
+        assert_eq!(
+            delivered, huge,
+            "a wire-valid TTL outside the local runtime domain stays lossless"
+        );
+        assert_eq!(
+            delivered["ttlMs"].to_string(),
+            "18446744073709551616",
+            "the huge TTL retains its exact peer spelling"
+        );
+        assert_eq!(
+            middleware.stats(),
+            before,
+            "an uncacheable huge TTL does not replace the cached response"
+        );
+
+        let mut fractional = huge;
+        fractional["ttlMs"] = serde_json::from_str("18446744073709551616.5")
+            .expect("fractional paired-negative fixture");
+        let delivered = middleware
+            .on_response(&ctx, &request, fractional)
+            .expect("invalid final discovery hints remain deliverable");
+
+        assert!(delivered.get("ttlMs").is_none());
+        assert!(delivered.get("cacheScope").is_none());
+        assert_eq!(
+            middleware.stats(),
+            before,
+            "changing only the TTL to a fractional value leaves cached state unchanged"
+        );
+        assert!(matches!(
+            middleware
+                .on_request(&ctx, &request)
+                .expect("baseline cache lookup is safe"),
+            MiddlewareDecision::Respond(value) if value == cached
+        ));
     }
 
     #[test]

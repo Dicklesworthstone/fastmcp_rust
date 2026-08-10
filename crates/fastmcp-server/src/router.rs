@@ -14,8 +14,9 @@ use crate::bidirectional::{
     MrtrInputRequests, MrtrInputRequired, MrtrRetry,
 };
 use crate::handler::{
-    BidirectionalSenders, BoxFuture, FinalMethodOutcome, FinalToolOutcome,
-    ProgressNotificationSender, UriParams, empty_final_result_meta, encode_final_complete_result,
+    BidirectionalSenders, BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
+    FinalToolOutcome, FinalToolSchemaAuthority, ProgressNotificationSender, UriParams,
+    empty_final_result_meta, encode_final_complete_result,
 };
 use crate::handler::{
     BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
@@ -40,7 +41,7 @@ use fastmcp_protocol::methods::COMPLETION_COMPLETE;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::uri_template::ReversibleResourceTemplate;
 use fastmcp_protocol::{
-    AdmittedSchema, CacheScope, CallToolParams, CallToolResult, CompleteResult, Content,
+    AdmittedSchema, CacheScope, CacheTtl, CallToolParams, CallToolResult, CompleteResult, Content,
     CoreRequest, CoreResult, FinalCallToolParams, FinalCallToolResult, FinalCompletionParams,
     FinalCompletionReference, FinalCompletionResult, FinalCoreRequest, FinalCoreResult,
     FinalGetPromptParams, FinalGetPromptResult, FinalListParams, FinalListPromptsResult,
@@ -179,13 +180,13 @@ impl InboundRequestContext {
     }
 }
 
-/// Durable state and retained-continuation ownership for one modern transport
-/// owner: a stdio connection or an HTTP endpoint process partition.
+/// Durable state and retained-continuation ownership for one modern stdio
+/// connection or retained modern HTTP session.
 ///
 /// Dropping the owner is a terminal peer-disconnect event: it cancels every
-/// MRTR continuation minted by requests on this connection. Request contexts
-/// retain only clones of its state and cancellation capability, so a retained
-/// continuation cannot outlive the transport owner that issued it.
+/// MRTR continuation minted by requests on this connection or session.
+/// Request contexts retain only clones of its state and cancellation capability, so a retained
+/// continuation cannot outlive the connection or session that issued it.
 pub(crate) struct ModernConnection {
     state: SessionState,
     continuation_cancellation: fastmcp_core::McpRequestCancellation,
@@ -528,7 +529,7 @@ fn require_final_tasks_capability(metadata: &OpenMetadata) -> McpResult<()> {
 /// compatibility validators.
 #[derive(Clone)]
 struct FinalToolSchemas {
-    input: AdmittedSchema,
+    input: Option<AdmittedSchema>,
     output: Option<AdmittedSchema>,
     errors: Option<FinalToolErrorStructuredContent>,
 }
@@ -574,10 +575,22 @@ fn admit_final_tool_error_structured_content<H: ToolHandler + ?Sized>(
 }
 
 fn admit_final_tool_schemas<H: ToolHandler + ?Sized>(
+    authority: FinalToolSchemaAuthority,
     input_schema: &serde_json::Value,
     output_schema: Option<&serde_json::Value>,
     handler: &H,
 ) -> McpResult<FinalToolSchemas> {
+    if authority == FinalToolSchemaAuthority::Upstream {
+        // The upstream selected and already admitted this exact schema. In
+        // particular, a proxy must retain a valid non-object JSON Schema
+        // rather than treating it as a local framework schema or inventing a
+        // `{}` error payload to satisfy it.
+        return Ok(FinalToolSchemas {
+            input: None,
+            output: None,
+            errors: None,
+        });
+    }
     if !input_schema.is_object() {
         return Err(McpError::internal_error(
             "tool declares a final input schema that is not an object",
@@ -622,7 +635,7 @@ fn admit_final_tool_schemas<H: ToolHandler + ?Sized>(
         })
         .transpose()?;
     Ok(FinalToolSchemas {
-        input,
+        input: Some(input),
         output,
         errors,
     })
@@ -663,12 +676,17 @@ impl AdmittedToolRegistration {
         definition: Tool,
         legacy_enabled: bool,
     ) -> McpResult<Self> {
-        let (exact_final_definition, declares_final_tasks) = crate::catch_extension_unwind(|| {
-            (handler.final_definition(), handler.declares_final_tasks())
-        })
-        .map_err(|_payload| {
-            McpError::internal_error("tool metadata hook panicked during admission")
-        })?;
+        let (exact_final_definition, declares_final_tasks, schema_authority) =
+            crate::catch_extension_unwind(|| {
+                (
+                    handler.final_definition(),
+                    handler.declares_final_tasks(),
+                    handler.final_tool_schema_authority(),
+                )
+            })
+            .map_err(|_payload| {
+                McpError::internal_error("tool metadata hook panicked during admission")
+            })?;
         let final_definition = match exact_final_definition {
             Some(definition) => definition,
             None => {
@@ -703,6 +721,7 @@ impl AdmittedToolRegistration {
             ));
         }
         let schemas = admit_final_tool_schemas(
+            schema_authority,
             &final_definition.input_schema,
             final_definition.output_schema.as_ref(),
             &handler,
@@ -786,18 +805,18 @@ fn encode_final_prompts_get_result(
     serde_json::from_str(&encoded).map_err(McpError::from)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FinalCacheHintPolicy {
-    list_ttl_ms: u64,
-    resource_read_ttl_ms: u64,
+    list_ttl_ms: CacheTtl,
+    resource_read_ttl_ms: CacheTtl,
     scope: CacheScope,
 }
 
 impl Default for FinalCacheHintPolicy {
     fn default() -> Self {
         Self {
-            list_ttl_ms: 5 * 60 * 1_000,
-            resource_read_ttl_ms: 60 * 60 * 1_000,
+            list_ttl_ms: CacheTtl::milliseconds(5 * 60 * 1_000),
+            resource_read_ttl_ms: CacheTtl::milliseconds(60 * 60 * 1_000),
             scope: CacheScope::Private,
         }
     }
@@ -1531,8 +1550,8 @@ impl Router {
     /// one-hour private resource-read TTL.
     pub fn set_final_cache_hint_policy(
         &mut self,
-        list_ttl_ms: u64,
-        resource_read_ttl_ms: u64,
+        list_ttl_ms: CacheTtl,
+        resource_read_ttl_ms: CacheTtl,
         scope: CacheScope,
     ) {
         self.final_cache_hints = FinalCacheHintPolicy {
@@ -1543,12 +1562,12 @@ impl Router {
     }
 
     /// Returns the active final cache-hint policy as
-    /// `(list_ttl_ms, resource_read_ttl_ms, scope)`.
+    /// `(&list_ttl_ms, &resource_read_ttl_ms, scope)`.
     #[must_use]
-    pub const fn final_cache_hint_policy(&self) -> (u64, u64, CacheScope) {
+    pub fn final_cache_hint_policy(&self) -> (&CacheTtl, &CacheTtl, CacheScope) {
         (
-            self.final_cache_hints.list_ttl_ms,
-            self.final_cache_hints.resource_read_ttl_ms,
+            &self.final_cache_hints.list_ttl_ms,
+            &self.final_cache_hints.resource_read_ttl_ms,
             self.final_cache_hints.scope,
         )
     }
@@ -3358,7 +3377,7 @@ impl Router {
                 next_cursor: None,
             }
         };
-        self.project_final_tools_list(request_ctx, result, self.final_cache_hints)
+        self.project_final_tools_list(request_ctx, result, self.final_cache_hints.clone())
     }
 
     fn project_final_tools_list(
@@ -3418,7 +3437,7 @@ impl Router {
         Ok(FinalListResourcesResult {
             resources,
             next_cursor,
-            ttl_ms: self.final_cache_hints.list_ttl_ms,
+            ttl_ms: self.final_cache_hints.list_ttl_ms.clone(),
             cache_scope: self.final_cache_hints.scope,
         })
     }
@@ -3455,7 +3474,7 @@ impl Router {
         Ok(FinalListResourceTemplatesResult {
             resource_templates,
             next_cursor,
-            ttl_ms: self.final_cache_hints.list_ttl_ms,
+            ttl_ms: self.final_cache_hints.list_ttl_ms.clone(),
             cache_scope: self.final_cache_hints.scope,
         })
     }
@@ -3487,7 +3506,7 @@ impl Router {
         Ok(FinalListPromptsResult {
             prompts,
             next_cursor,
-            ttl_ms: self.final_cache_hints.list_ttl_ms,
+            ttl_ms: self.final_cache_hints.list_ttl_ms.clone(),
             cache_scope: self.final_cache_hints.scope,
         })
     }
@@ -3796,7 +3815,7 @@ impl Router {
             .as_ref()
             .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {}", params.name)))?;
         let handler = &entry.handler;
-        let input_schema = &final_registration.schemas.input;
+        let input_schema = final_registration.schemas.input.as_ref();
         let output_schema = final_registration.schemas.output.as_ref();
         if params.arguments.is_explicit_null() {
             return Err(McpError::invalid_params(
@@ -3808,7 +3827,7 @@ impl Router {
             .arguments
             .into_value()
             .unwrap_or_else(|| serde_json::json!({}));
-        if input_schema.validate(&arguments).is_err() {
+        if input_schema.is_some_and(|schema| schema.validate(&arguments).is_err()) {
             let mut result = crate::handler::promote_legacy_tool_content(vec![Content::text(
                 "Tool arguments do not match the declared input schema.",
             )])?;
@@ -4217,6 +4236,12 @@ impl Router {
                 "resource is registered only for exact MCP 2024-11-05 dispatch",
             ));
         }
+        let cache_hint_provenance = crate::catch_extension_unwind(|| {
+            resolved.handler.final_resource_read_cache_hint_provenance()
+        })
+        .map_err(|_payload| {
+            McpError::internal_error("resource cache-hint provenance hook panicked during dispatch")
+        })?;
         let ctx = derive_handler_context(
             request_ctx,
             progress_marker,
@@ -4261,14 +4286,14 @@ impl Router {
 
         match outcome {
             Outcome::Ok(mut result) => {
-                // The legacy read bridge stamps fixed default cache hints; the
-                // router's configured policy replaces exactly those defaults,
-                // while direct final handlers keep their own explicit hints.
+                // Provenance, not equality with a wire value, determines
+                // whether router policy owns these hints. An explicit final
+                // handler may intentionally choose the same values as the
+                // legacy bridge and must still retain them unchanged.
                 if let FinalMethodOutcome::Complete(complete) = &mut result
-                    && complete.payload.ttl_ms == crate::handler::DEFAULT_FINAL_RESOURCE_TTL_MS
-                    && matches!(complete.payload.cache_scope, CacheScope::Private)
+                    && cache_hint_provenance == FinalResourceReadCacheHintProvenance::RouterPolicy
                 {
-                    complete.payload.ttl_ms = self.final_cache_hints.resource_read_ttl_ms;
+                    complete.payload.ttl_ms = self.final_cache_hints.resource_read_ttl_ms.clone();
                     complete.payload.cache_scope = self.final_cache_hints.scope;
                 }
                 Ok(result)
@@ -6082,7 +6107,9 @@ mod tag_filter_tests {
 mod router_tests {
     use super::*;
     use crate::bidirectional::MrtrInputResponse;
-    use crate::handler::{CompletionHandler, PromptHandler, ResourceHandler, ToolHandler};
+    use crate::handler::{
+        CompletionHandler, FinalToolSchemaAuthority, PromptHandler, ResourceHandler, ToolHandler,
+    };
     use crate::tasks::{
         ApplicationTaskSupervisor, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
         FinalTaskWorkDescriptor,
@@ -6668,6 +6695,47 @@ mod router_tests {
         }
     }
 
+    struct UpstreamScalarSchemaTool {
+        authority: FinalToolSchemaAuthority,
+    }
+
+    impl ToolHandler for UpstreamScalarSchemaTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "upstream-scalar-schema-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: Some(serde_json::json!(false)),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn final_tool_schema_authority(&self) -> FinalToolSchemaAuthority {
+            self.authority
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("legacy")])
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                FinalCallToolResult {
+                    content: vec![ContentBlock::text("upstream")],
+                    is_error: false,
+                    structured_content: Some(serde_json::json!({"upstream": true})),
+                },
+            )))
+        }
+    }
+
     /// A dual-era tool whose admitted output schema and handlers deliberately
     /// differ across registrations. It proves a successful replacement commits
     /// both the handler and final schema together.
@@ -6987,7 +7055,9 @@ mod router_tests {
         }
 
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
-            Ok(vec![Content::text("legacy conditional task-capable router result")])
+            Ok(vec![Content::text(
+                "legacy conditional task-capable router result",
+            )])
         }
 
         fn call_final_outcome(
@@ -7810,7 +7880,7 @@ mod router_tests {
                             serde_json::json!(true),
                         )]),
                     }],
-                    ttl_ms: 321,
+                    ttl_ms: CacheTtl::milliseconds(321),
                     cache_scope: CacheScope::Public,
                 },
                 empty_final_result_meta()?,
@@ -13209,6 +13279,47 @@ mod router_tests {
     }
 
     #[test]
+    fn upstream_schema_authority_retains_scalar_output_schema_without_local_validation() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1601, Budget::INFINITE, &state);
+        let mut upstream_router = Router::new();
+        upstream_router
+            .add_tool(UpstreamScalarSchemaTool {
+                authority: FinalToolSchemaAuthority::Upstream,
+            })
+            .expect("an upstream-owned scalar schema is retained without local admission");
+
+        let response = upstream_router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "upstream-scalar-schema-tool",
+                    serde_json::json!({}),
+                    1601_i64,
+                ),
+            )
+            .expect("upstream-owned structured content is not locally revalidated");
+        assert_eq!(
+            response["structuredContent"],
+            serde_json::json!({"upstream": true})
+        );
+
+        let mut local_router = Router::new();
+        let error = local_router
+            .add_tool(UpstreamScalarSchemaTool {
+                authority: FinalToolSchemaAuthority::Local,
+            })
+            .expect_err("changing only schema authority retains the local schema admission rule");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert!(
+            local_router
+                .get_tool("upstream-scalar-schema-tool")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn normal_registration_rejects_missing_input_schema_type_without_catalog_mutation() {
         let mut router = Router::new();
         router
@@ -13794,8 +13905,7 @@ mod router_tests {
     }
 
     #[test]
-    fn final_task_outcome_with_unready_service_rejects_after_handler_before_store_mutation()
-    {
+    fn final_task_outcome_with_unready_service_rejects_after_handler_before_store_mutation() {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let store = Arc::new(InMemoryFinalTaskStore::default());
         let runtime = task_runtime_for_router(Arc::clone(&store));
@@ -15086,7 +15196,7 @@ mod router_tests {
         else {
             panic!("resources/read selects the exact final result");
         };
-        assert_eq!(result.payload.ttl_ms, 321);
+        assert_eq!(result.payload.ttl_ms.as_str(), "321");
         assert_eq!(result.payload.cache_scope, CacheScope::Public);
         assert!(matches!(
             result.payload.contents.as_slice(),
@@ -15507,7 +15617,16 @@ mod router_tests {
         )
         .expect("valid alternate final icon");
         let mut router = Router::new();
-        router.set_final_cache_hint_policy(123, 456, CacheScope::Private);
+        let list_ttl: CacheTtl = serde_json::from_str("922337203685477580812345678901234567890")
+            .expect("an arbitrary-width final list TTL is valid");
+        let resource_read_ttl: CacheTtl =
+            serde_json::from_str("184467440737095516160000000000000000000")
+                .expect("an arbitrary-width final resource-read TTL is valid");
+        router.set_final_cache_hint_policy(
+            list_ttl.clone(),
+            resource_read_ttl.clone(),
+            CacheScope::Private,
+        );
         router
             .add_tool(FinalCatalogTool {
                 metadata,
@@ -15548,7 +15667,7 @@ mod router_tests {
             )
             .expect("final catalog is projected through the exact model");
         assert_eq!(modern_list["resultType"], "complete");
-        assert_eq!(modern_list["ttlMs"], 123);
+        assert_eq!(modern_list["ttlMs"].to_string(), list_ttl.as_str());
         assert_eq!(modern_list["cacheScope"], "private");
         assert_eq!(modern_list["tools"][0]["title"], "Exact Final Catalog Tool");
         assert_eq!(
@@ -15579,7 +15698,7 @@ mod router_tests {
         else {
             panic!("tools/list selects the exact final catalog result");
         };
-        assert_eq!(result.payload.ttl_ms, 123);
+        assert_eq!(result.payload.ttl_ms.as_str(), list_ttl.as_str());
         assert_eq!(result.payload.cache_scope, CacheScope::Private);
         let final_tool = result
             .payload
@@ -15643,7 +15762,7 @@ mod router_tests {
                 &JsonRpcRequest::new("resources/read", Some(final_read_params), 94_i64),
             )
             .expect("final resource content is projected through the final model");
-        assert_eq!(modern_read["ttlMs"], 456);
+        assert_eq!(modern_read["ttlMs"].to_string(), resource_read_ttl.as_str());
         assert_eq!(modern_read["cacheScope"], "private");
         assert_eq!(
             modern_read["contents"][0]["uri"],
@@ -15658,7 +15777,7 @@ mod router_tests {
         else {
             panic!("resources/read selects the exact final read result");
         };
-        assert_eq!(result.payload.ttl_ms, 456);
+        assert_eq!(result.payload.ttl_ms.as_str(), resource_read_ttl.as_str());
         assert_eq!(result.payload.cache_scope, CacheScope::Private);
         assert!(matches!(
             result.payload.contents.as_slice(),

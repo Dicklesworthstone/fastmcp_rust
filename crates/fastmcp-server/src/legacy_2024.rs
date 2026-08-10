@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 
+use fastmcp_protocol::JsonInteger;
 use fastmcp_protocol::methods::Legacy2024EnvelopeError;
 use fastmcp_protocol::methods::{
     COMPLETION_COMPLETE, INITIALIZE, LEGACY_2024_11_05_PROTOCOL_VERSION, LOGGING_SET_LEVEL,
@@ -203,7 +204,7 @@ pub trait Legacy2024Handler {
 /// A non-wire handler failure mapped to an exact JSON-RPC internal-error response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Legacy2024HandlerError {
-    code: i64,
+    code: JsonInteger,
     message: String,
 }
 
@@ -212,7 +213,7 @@ impl Legacy2024HandlerError {
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
-            code: -32603,
+            code: JsonInteger::from(-32603),
             message: message.into(),
         }
     }
@@ -220,17 +221,17 @@ impl Legacy2024HandlerError {
     /// Creates a handler failure with a JSON-RPC error code already selected
     /// by the live request owner.
     #[must_use]
-    pub fn with_code(code: i64, message: impl Into<String>) -> Self {
+    pub fn with_code(code: impl Into<JsonInteger>, message: impl Into<String>) -> Self {
         Self {
-            code,
+            code: code.into(),
             message: message.into(),
         }
     }
 
     /// Returns the JSON-RPC error code selected by the handler.
     #[must_use]
-    pub const fn code(&self) -> i64 {
-        self.code
+    pub fn code(&self) -> &JsonInteger {
+        &self.code
     }
 
     /// Returns the handler-provided diagnostic before the adapter maps it to
@@ -257,36 +258,36 @@ pub enum Legacy2024Outbound {
 /// Exact lifecycle and admission failure which cannot safely emit a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Legacy2024AdapterError {
-    code: i64,
+    code: JsonInteger,
     message: &'static str,
 }
 
 impl Legacy2024AdapterError {
-    const fn invalid_request(message: &'static str) -> Self {
+    fn invalid_request(message: &'static str) -> Self {
         Self {
-            code: -32600,
+            code: JsonInteger::from(-32600),
             message,
         }
     }
 
-    const fn invalid_params(message: &'static str) -> Self {
+    fn invalid_params(message: &'static str) -> Self {
         Self {
-            code: -32602,
+            code: JsonInteger::from(-32602),
             message,
         }
     }
 
-    const fn method_not_found(message: &'static str) -> Self {
+    fn method_not_found(message: &'static str) -> Self {
         Self {
-            code: -32601,
+            code: JsonInteger::from(-32601),
             message,
         }
     }
 
     /// Exact JSON-RPC error code.
     #[must_use]
-    pub const fn code(&self) -> i64 {
-        self.code
+    pub fn code(&self) -> &JsonInteger {
+        &self.code
     }
 
     /// Stable exact-2024 refusal message.
@@ -999,7 +1000,7 @@ where
                     .handler
                     .handle_legacy_2024_with_request_id(request_id, method, params)
                     .map_err(|error| Legacy2024AdapterError {
-                        code: error.code(),
+                        code: error.code().clone(),
                         message: "legacy handler failed",
                     })?;
                 match method {
@@ -1228,7 +1229,11 @@ fn error_response(id: Value, error: Legacy2024AdapterError) -> Value {
 
 fn response_id_from_wire(wire: &Value) -> Option<Value> {
     let id = wire.as_object()?.get("id")?;
-    if id.is_string() || id.as_i64().is_some() {
+    if id.is_string()
+        || id
+            .as_number()
+            .is_some_and(|number| JsonInteger::try_from_number(number.clone()).is_ok())
+    {
         Some(id.clone())
     } else {
         None
@@ -1348,6 +1353,20 @@ mod tests {
         }
     }
 
+    struct FailingHandler {
+        error: Legacy2024HandlerError,
+    }
+
+    impl Legacy2024Handler for FailingHandler {
+        fn handle_legacy_2024(
+            &mut self,
+            _method: &'static str,
+            _params: Option<&Value>,
+        ) -> Result<Value, Legacy2024HandlerError> {
+            Err(self.error.clone())
+        }
+    }
+
     struct LiveRecordingHandler {
         binding: LegacyPeerBinding,
         calls: Arc<Mutex<Vec<(LegacyPeerBinding, &'static str)>>>,
@@ -1409,6 +1428,11 @@ mod tests {
             .expect("exact test configuration must install")
     }
 
+    fn failing_adapter(error: Legacy2024HandlerError) -> Legacy2024ServerAdapter<FailingHandler> {
+        Legacy2024ServerAdapter::install(binding(), server_config(), FailingHandler { error })
+            .expect("exact test configuration must install")
+    }
+
     fn initialize() -> Value {
         json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -1422,6 +1446,84 @@ mod tests {
                 "clientInfo": {"name": "legacy-client", "version": "1.0.0"}
             }
         })
+    }
+
+    fn initialize_operating<H: Legacy2024Handler>(adapter: &mut Legacy2024ServerAdapter<H>) {
+        adapter
+            .receive(binding(), initialize())
+            .expect("initialize must be admitted");
+        adapter
+            .receive(
+                binding(),
+                json!({"jsonrpc": "2.0", "method": NOTIFICATIONS_INITIALIZED}),
+            )
+            .expect("initialized notification must be admitted");
+    }
+
+    #[test]
+    fn handler_error_preserves_arbitrary_width_code_lexeme() {
+        let raw_code = "340282366920938463463374607431768211457";
+        let code = raw_code
+            .parse::<JsonInteger>()
+            .expect("huge integer error code must be admitted");
+        let mut adapter = failing_adapter(Legacy2024HandlerError::with_code(code, "failed"));
+        initialize_operating(&mut adapter);
+
+        let response = adapter
+            .receive(
+                binding(),
+                json!({"jsonrpc": "2.0", "id": 2, "method": TOOLS_LIST}),
+            )
+            .expect("handler failure must become a response");
+        let Legacy2024Outbound::Response(response) = response else {
+            panic!("handler failure must become a JSON-RPC error response");
+        };
+
+        assert_eq!(
+            response["error"]["code"]
+                .as_number()
+                .expect("error code must remain a JSON number")
+                .as_str(),
+            raw_code
+        );
+    }
+
+    #[test]
+    fn handler_error_code_classifies_standard_values_mathematically() {
+        let code = "-3.2603e4"
+            .parse::<JsonInteger>()
+            .expect("mathematically integral standard code must be admitted");
+        let mut adapter = failing_adapter(Legacy2024HandlerError::with_code(code, "failed"));
+        initialize_operating(&mut adapter);
+
+        let response = adapter
+            .receive(
+                binding(),
+                json!({"jsonrpc": "2.0", "id": 2, "method": TOOLS_LIST}),
+            )
+            .expect("handler failure must become a response");
+        let Legacy2024Outbound::Response(response) = response else {
+            panic!("handler failure must become a JSON-RPC error response");
+        };
+        let code = JsonInteger::try_from_number(
+            response["error"]["code"]
+                .as_number()
+                .expect("error code must remain a JSON number")
+                .clone(),
+        )
+        .expect("emitted error code must remain mathematically integral");
+
+        assert_eq!(code.as_i32(), Some(-32603));
+        assert_eq!(code.as_str(), "-3.2603e4");
+    }
+
+    #[test]
+    fn handler_error_rejects_fractional_negative_code() {
+        assert!(
+            "-340282366920938463463374607431768211457.5"
+                .parse::<JsonInteger>()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1585,6 +1687,52 @@ mod tests {
     }
 
     #[test]
+    fn preadmission_error_responses_preserve_integral_request_id_lexemes() {
+        let binding = binding();
+        let mut adapter = adapter();
+
+        for raw_id in ["7e2", "340282366920938463463374607431768211457"] {
+            let wire: Value = serde_json::from_str(&format!(
+                r#"{{"jsonrpc":"2.0","id":{raw_id},"method":"tools/list","params":false}}"#
+            ))
+            .expect("integral request-id wire must parse");
+            let response = adapter
+                .receive(binding, wire)
+                .expect("a valid request ID must receive the pre-admission error response");
+            let Legacy2024Outbound::Response(response) = response else {
+                panic!("pre-admission request failure must have a JSON-RPC response");
+            };
+
+            assert_eq!(
+                response["id"]
+                    .as_number()
+                    .expect("response ID remains a JSON number")
+                    .as_str(),
+                raw_id
+            );
+            assert_eq!(response["error"]["code"], -32600);
+        }
+    }
+
+    #[test]
+    fn preadmission_error_responses_reject_fractional_request_ids() {
+        let binding = binding();
+        let mut adapter = adapter();
+        let before = adapter.snapshot();
+        let wire: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":340282366920938463463374607431768211457.5,"method":"tools/list","params":{}}"#,
+        )
+        .expect("fractional request-id wire must parse");
+
+        let error = adapter
+            .receive(binding, wire)
+            .expect_err("fractional request IDs must not receive a pre-admission response");
+        assert_eq!(error.code().as_i32(), Some(-32600));
+        assert_eq!(adapter.snapshot(), before);
+        assert!(adapter.handler.methods.is_empty());
+    }
+
+    #[test]
     fn leg_02_i_positive() {
         let left = binding_for(
             LegacyAuthenticatedPeerPartition::from_authenticated_transport([0x11; 32]),
@@ -1735,7 +1883,7 @@ mod tests {
         let error = lifecycle
             .receive(wrong_owner, initialize())
             .expect_err("changing only the authenticated owner must not select a live lifecycle");
-        assert_eq!(error.code(), -32600);
+        assert_eq!(error.code().as_i32(), Some(-32600));
         assert_eq!(
             error.message(),
             "legacy peer binding has no live adapter lifecycle"

@@ -24,8 +24,9 @@ use crate::handler::{
     FinalProxyResourceTemplateHandler,
 };
 use crate::proxy::{
-    ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog, ProxyResourceHandler,
-    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler, ProxyTypedCatalog,
+    ProxyFinalCatalog, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
+    ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler,
+    ProxyTypedCatalog,
 };
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
@@ -3323,7 +3324,10 @@ mod tests {
         let rejected = server
             .dispatch_stateless(&inbound, &final_ping)
             .expect("the final public dispatch path returns a JSON-RPC error");
-        assert_eq!(rejected.error.map(|error| error.code), Some(-32601));
+        assert_eq!(
+            rejected.error.and_then(|error| error.code.as_i32()),
+            Some(-32601)
+        );
         assert!(rejected.result.is_none());
         assert_eq!(
             legacy_session.state().len(),
@@ -3351,18 +3355,18 @@ mod tests {
             "_meta": {"com.example/prompt": {"retained": true}}
         });
         let typed = ProxyTypedCatalog {
-            tools: ProxyToolCatalog::Final(Vec::new()),
-            resources: ProxyResourceCatalog::Final(vec![
+            tools: ProxyToolCatalog::Final(ProxyFinalCatalog::new(Vec::new())),
+            resources: ProxyResourceCatalog::Final(ProxyFinalCatalog::new(vec![
                 serde_json::from_value(resource.clone())
                     .expect("the final resource fixture is valid"),
-            ]),
-            resource_templates: ProxyResourceTemplateCatalog::Final(vec![
+            ])),
+            resource_templates: ProxyResourceTemplateCatalog::Final(ProxyFinalCatalog::new(vec![
                 serde_json::from_value(template.clone())
                     .expect("the final resource-template fixture is valid"),
-            ]),
-            prompts: ProxyPromptCatalog::Final(vec![
+            ])),
+            prompts: ProxyPromptCatalog::Final(ProxyFinalCatalog::new(vec![
                 serde_json::from_value(prompt.clone()).expect("the final prompt fixture is valid"),
-            ]),
+            ])),
         };
         let server = ServerBuilder::new("srv", "1.0")
             .proxy_typed(
@@ -3454,7 +3458,7 @@ mod tests {
     fn typed_proxy_registration_rejects_one_mixed_era_component_vector() {
         let typed = ProxyTypedCatalog {
             tools: ProxyToolCatalog::Legacy(Vec::new()),
-            resources: ProxyResourceCatalog::Final(Vec::new()),
+            resources: ProxyResourceCatalog::Final(ProxyFinalCatalog::new(Vec::new())),
             resource_templates: ProxyResourceTemplateCatalog::Legacy(Vec::new()),
             prompts: ProxyPromptCatalog::Legacy(Vec::new()),
         };

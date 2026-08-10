@@ -238,7 +238,7 @@ fn assert_reservation_limit(binding: LegacyPeerBinding) {
     let error = adapter
         .make_reverse_request(binding, PING, json!({}))
         .expect_err("the adapter must reject the next reservation at its fixed bound");
-    assert_eq!(error.code(), -32600);
+    assert_eq!(error.code().as_i32(), Some(-32600));
     assert_eq!(error.message(), "legacy adapter reservation limit reached");
     assert_eq!(adapter.snapshot(), full_state);
     assert_eq!(
@@ -493,7 +493,7 @@ fn leg_02_b_planted_negative() {
     let error = left
         .close(wrong_owner)
         .expect_err("changed owner must be rejected before closed-state selection");
-    assert_eq!(error.code(), -32600);
+    assert_eq!(error.code().as_i32(), Some(-32600));
     assert_eq!(
         error.message(),
         "legacy peer binding does not own this adapter lifecycle"

@@ -43,9 +43,9 @@ use asupersync::channel::oneshot::RecvError;
 use base64::Engine as _;
 use fastmcp_core::{
     ClientRoot, ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
-    ElicitationSender, McpError, McpErrorCode, McpRequestCancellation, McpResult, RootsProvider,
-    SamplingRequest, SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
-    draw_security_identifier,
+    ElicitationSender, McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult,
+    RootsProvider, SamplingRequest, SamplingResponse, SamplingRole, SamplingSender,
+    SamplingStopReason, draw_security_identifier,
 };
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
@@ -511,7 +511,11 @@ impl<'a> ValidatedResponse<'a> {
         match self {
             Self::Success(result) => Ok(result.clone()),
             Self::Error(error) => Err(McpError::new(
-                McpErrorCode::from(error.code),
+                error
+                    .code
+                    .as_i32()
+                    .map(McpErrorCode::from)
+                    .unwrap_or(McpErrorCode::InternalError),
                 REMOTE_RESPONSE_ERROR,
             )),
             Self::Invalid => Err(McpError::internal_error(INVALID_RESPONSE_ERROR)),
@@ -945,9 +949,8 @@ impl ElicitationSender for TransportElicitationSender {
                     let json_value = match value {
                         fastmcp_protocol::ElicitContentValue::Null => serde_json::Value::Null,
                         fastmcp_protocol::ElicitContentValue::Bool(b) => serde_json::Value::Bool(b),
-                        fastmcp_protocol::ElicitContentValue::Int(i) => {
-                            serde_json::Value::Number(i.into())
-                        }
+                        fastmcp_protocol::ElicitContentValue::Int(i) => serde_json::to_value(i)
+                            .map_err(|_| McpError::internal_error(RESPONSE_PAYLOAD_ERROR))?,
                         fastmcp_protocol::ElicitContentValue::Float(f) => {
                             serde_json::Number::from_f64(f)
                                 .map(serde_json::Value::Number)
@@ -980,20 +983,42 @@ impl ElicitationSender for TransportElicitationSender {
 #[derive(Clone)]
 pub struct TransportRootsProvider {
     sender: RequestSender,
+    request_context: McpContext,
 }
 
 impl TransportRootsProvider {
-    /// Creates a new transport-backed roots provider.
-    pub fn new(sender: RequestSender) -> Self {
-        Self { sender }
+    /// Creates a roots provider bound to the originating handler request.
+    ///
+    /// The provider retains the full framework context, rather than its raw
+    /// `Cx`, so its reverse `roots/list` request observes the originating
+    /// request lease, framework budget ceiling, and cancellation domain.
+    pub fn new(sender: RequestSender, request_context: McpContext) -> Self {
+        Self {
+            sender,
+            request_context,
+        }
     }
 
     /// Lists the filesystem roots from the client.
-    pub async fn list_roots(&self, cx: &Cx) -> McpResult<Vec<fastmcp_protocol::Root>> {
-        let result: fastmcp_protocol::ListRootsResult = self
-            .sender
-            .send_request(cx, "roots/list", serde_json::json!({}))
-            .await?;
+    pub async fn list_roots(&self) -> McpResult<Vec<fastmcp_protocol::Root>> {
+        self.request_context
+            .checkpoint()
+            .map_err(|_| McpError::request_cancelled())?;
+        let request = self.sender.send_request(
+            self.request_context.cx(),
+            "roots/list",
+            serde_json::json!({}),
+        );
+        let result: fastmcp_protocol::ListRootsResult = match self.request_context.budget().deadline
+        {
+            Some(deadline) => asupersync::time::timeout_at(deadline, request)
+                .await
+                .map_err(|_| McpError::request_cancelled())??,
+            None => request.await?,
+        };
+        self.request_context
+            .ensure_live()
+            .map_err(|_| McpError::request_cancelled())?;
         Ok(result.roots)
     }
 }
@@ -1001,14 +1026,10 @@ impl TransportRootsProvider {
 impl RootsProvider for TransportRootsProvider {
     fn list_roots(
         &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = McpResult<Vec<ClientRoot>>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<Vec<ClientRoot>>> + Send + '_>>
+    {
         Box::pin(async move {
-            let cx = Cx::current().ok_or_else(|| {
-                McpError::internal_error("No current asupersync Cx for roots request")
-            })?;
-            let roots = TransportRootsProvider::list_roots(self, &cx).await?;
+            let roots = TransportRootsProvider::list_roots(self).await?;
             Ok(roots
                 .into_iter()
                 .map(|root| ClientRoot {
@@ -2851,7 +2872,7 @@ mod tests {
         let response = JsonRpcResponse::error(
             Some(id),
             JsonRpcError {
-                code: -32600,
+                code: (-32600).into(),
                 message: "Invalid request".to_string(),
                 data: None,
             },
@@ -3333,7 +3354,7 @@ mod tests {
             (
                 Some(serde_json::Value::Null),
                 Some(JsonRpcError {
-                    code: -32_603,
+                    code: (-32_603).into(),
                     message: "secret both-member detail".to_string(),
                     data: Some(serde_json::json!({"secret": true})),
                 }),
@@ -3615,7 +3636,7 @@ mod tests {
                 let response = JsonRpcResponse::error(
                     Some(id),
                     JsonRpcError {
-                        code: -32600,
+                        code: (-32600).into(),
                         message: "bad request".to_string(),
                         data: None,
                     },
@@ -3699,7 +3720,7 @@ mod tests {
         let response = JsonRpcResponse::error(
             Some(id),
             JsonRpcError {
-                code: -32001,
+                code: (-32001).into(),
                 message: "custom error".to_string(),
                 data: Some(serde_json::json!({"detail": "extra info"})),
             },
@@ -3783,7 +3804,7 @@ mod tests {
         let pending = Arc::new(PendingRequests::new());
         let send_fn: TransportSendFn = Arc::new(|_| Ok(()));
         let sender = RequestSender::new(pending, send_fn);
-        let roots = TransportRootsProvider::new(sender);
+        let roots = TransportRootsProvider::new(sender, McpContext::new(Cx::for_testing(), 0));
         let _cloned = roots.clone();
     }
 
@@ -4133,9 +4154,8 @@ mod tests {
                 ]
             })
         });
-        let roots = TransportRootsProvider::new(sender);
-        let cx = Cx::for_testing();
-        let result = block_on(roots.list_roots(&cx)).unwrap();
+        let roots = TransportRootsProvider::new(sender, McpContext::new(Cx::for_testing(), 0));
+        let result = block_on(roots.list_roots()).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].uri, "file:///home/user/project");
         assert_eq!(result[0].name, Some("Project".to_string()));
@@ -4150,7 +4170,7 @@ mod tests {
                 "roots": [{"uri": "file:///workspace", "name": "workspace"}]
             })
         });
-        let roots = TransportRootsProvider::new(sender);
+        let roots = TransportRootsProvider::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let result = fastmcp_core::block_on(fastmcp_core::RootsProvider::list_roots(&roots))
             .expect("transport roots map into the core context type");
@@ -4163,10 +4183,67 @@ mod tests {
     #[test]
     fn transport_roots_provider_empty_roots() {
         let sender = make_sender_with_responder(|_| serde_json::json!({ "roots": [] }));
-        let roots = TransportRootsProvider::new(sender);
-        let cx = Cx::for_testing();
-        let result = block_on(roots.list_roots(&cx)).unwrap();
+        let roots = TransportRootsProvider::new(sender, McpContext::new(Cx::for_testing(), 0));
+        let result = block_on(roots.list_roots()).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn transport_roots_provider_trait_preserves_originating_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sent = Arc::new(AtomicBool::new(false));
+        let sent_for_transport = Arc::clone(&sent);
+        let sender = RequestSender::new(
+            Arc::new(PendingRequests::new()),
+            Arc::new(move |_| {
+                sent_for_transport.store(true, Ordering::Release);
+                Ok(())
+            }),
+        );
+        let roots = TransportRootsProvider::new(
+            sender,
+            McpContext::new(Cx::for_testing(), 0).with_budget_ceiling(
+                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+            ),
+        );
+
+        let error = block_on(fastmcp_core::RootsProvider::list_roots(&roots))
+            .expect_err("an expired originating request must not issue roots/list");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert!(
+            !sent.load(Ordering::Acquire),
+            "the raw Cx must not relax the originating framework deadline ceiling"
+        );
+    }
+
+    #[test]
+    fn transport_roots_provider_trait_preserves_originating_cancellation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sent = Arc::new(AtomicBool::new(false));
+        let sent_for_transport = Arc::clone(&sent);
+        let sender = RequestSender::new(
+            Arc::new(PendingRequests::new()),
+            Arc::new(move |_| {
+                sent_for_transport.store(true, Ordering::Release);
+                Ok(())
+            }),
+        );
+        let cancellation = McpRequestCancellation::new();
+        cancellation.cancel();
+        let roots = TransportRootsProvider::new(
+            sender,
+            McpContext::new(Cx::for_testing(), 0).with_request_cancellation(cancellation),
+        );
+
+        let error = block_on(fastmcp_core::RootsProvider::list_roots(&roots))
+            .expect_err("a cancelled originating request must not issue roots/list");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert!(
+            !sent.load(Ordering::Acquire),
+            "the raw Cx must not relax the originating framework cancellation"
+        );
     }
 
     // ── RequestSender ID cleanup after success ───────────────────────
@@ -4275,10 +4352,8 @@ mod tests {
         let pending = Arc::new(PendingRequests::new());
         let send_fn: TransportSendFn = Arc::new(|_| Err("network error".to_string()));
         let sender = RequestSender::new(pending, send_fn);
-        let roots = TransportRootsProvider::new(sender);
-
-        let cx = Cx::for_testing();
-        let result = block_on(roots.list_roots(&cx));
+        let roots = TransportRootsProvider::new(sender, McpContext::new(Cx::for_testing(), 0));
+        let result = block_on(roots.list_roots());
         assert_eq!(result.unwrap_err().message, TRANSPORT_SEND_ERROR);
     }
 
@@ -4286,7 +4361,10 @@ mod tests {
     fn transport_roots_provider_core_trait_preserves_transport_failure() {
         let pending = Arc::new(PendingRequests::new());
         let send_fn: TransportSendFn = Arc::new(|_| Err("network error".to_string()));
-        let roots = TransportRootsProvider::new(RequestSender::new(pending, send_fn));
+        let roots = TransportRootsProvider::new(
+            RequestSender::new(pending, send_fn),
+            McpContext::new(Cx::for_testing(), 0),
+        );
 
         let error = fastmcp_core::block_on(fastmcp_core::RootsProvider::list_roots(&roots))
             .expect_err("the same transport failure must cross the core provider seam");

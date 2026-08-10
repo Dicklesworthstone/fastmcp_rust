@@ -25,7 +25,7 @@ use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
 use fastmcp_protocol::{
-    CacheScope, CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy,
+    CacheScope, CacheTtl, CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy,
     DecodedResult, FinalCallToolResult, FinalCompletionParams, FinalCompletionValues,
     FinalGetPromptResult, FinalProgressNotificationParams, FinalPrompt, FinalPromptMessage,
     FinalReadResourceResult, FinalResource, FinalResourceTemplate, FinalTool, Icon,
@@ -414,6 +414,19 @@ impl<T> From<CompleteResult<T>> for FinalMethodOutcome<T> {
     }
 }
 
+/// Identifies who selected a complete final resource-read cache policy.
+///
+/// The legacy-to-final bridge asks the router to install its configured
+/// policy. A direct final handler or exact proxy result owns its wire cache
+/// hints, even if those values happen to equal a router default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalResourceReadCacheHintProvenance {
+    /// The result came from the legacy bridge and needs the router policy.
+    RouterPolicy,
+    /// The handler or upstream peer supplied explicit final cache hints.
+    Explicit,
+}
+
 /// One application-authored outcome of a final `tools/call` handler.
 ///
 /// `CreateTask` is deliberately a request for the router to create durable
@@ -649,7 +662,7 @@ fn promote_legacy_resource_contents(
     Ok(CompleteResult::new(
         FinalReadResourceResult {
             contents,
-            ttl_ms: DEFAULT_FINAL_RESOURCE_TTL_MS,
+            ttl_ms: CacheTtl::milliseconds(DEFAULT_FINAL_RESOURCE_TTL_MS),
             cache_scope: CacheScope::Private,
         },
         empty_final_result_meta()?,
@@ -692,6 +705,38 @@ pub enum ToolErrorKind {
     InputValidation,
     /// The admitted handler returned a non-terminal tool-execution error.
     Handler,
+}
+
+/// Legacy diagnostic label for an exact-final tool's schema ownership.
+///
+/// This value no longer grants admission authority. A normal handler can
+/// report `Upstream`, so the router accepts bypasses only through the sealed
+/// [`UpstreamFinalToolSchemaRegistration`] token issued to exact proxy
+/// registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalToolSchemaAuthority {
+    /// The local router owns final schema admission and framework error mapping.
+    Local,
+    /// The exact-final upstream owns final schema admission and result shaping.
+    Upstream,
+}
+
+/// Unforgeable registration proving that an exact proxy owns final schemas.
+///
+/// The constructor is crate-private and only proxy registration can mint this
+/// value. Public handlers may observe the type in [`ToolHandler`], but cannot
+/// manufacture one to bypass local schema admission.
+#[derive(Debug)]
+pub struct UpstreamFinalToolSchemaRegistration {
+    _proxy_registration: (),
+}
+
+impl UpstreamFinalToolSchemaRegistration {
+    pub(crate) const fn exact_proxy() -> Self {
+        Self {
+            _proxy_registration: (),
+        }
+    }
 }
 
 /// Handler for a tool.
@@ -788,6 +833,27 @@ pub trait ToolHandler: Send + Sync {
     /// icon collection, and open metadata are never projected through the
     /// narrower legacy [`Tool`] model.
     fn final_definition(&self) -> Option<FinalTool> {
+        None
+    }
+
+    /// Returns the legacy diagnostic label for this handler's exact-final schemas.
+    ///
+    /// Ordinary and legacy-backed handlers keep local schema admission. An
+    /// The router does not use this forgeable label for admission; exact proxy
+    /// registration supplies a sealed token through
+    /// [`Self::upstream_final_tool_schema_registration`] instead.
+    fn final_tool_schema_authority(&self) -> FinalToolSchemaAuthority {
+        FinalToolSchemaAuthority::Local
+    }
+
+    /// Returns a sealed upstream-schema registration for an exact proxy.
+    ///
+    /// Ordinary handlers must use the default. The token has no public
+    /// constructor, so only server-owned proxy registration can opt out of
+    /// local input/output validation and framework-error synthesis.
+    fn upstream_final_tool_schema_registration(
+        &self,
+    ) -> Option<UpstreamFinalToolSchemaRegistration> {
         None
     }
 
@@ -1187,6 +1253,16 @@ pub trait ResourceHandler: Send + Sync {
     /// should override this method (or its async counterpart).
     fn read_final(&self, ctx: &McpContext) -> McpResult<CompleteResult<FinalReadResourceResult>> {
         promote_legacy_resource_contents(self.read(ctx)?)
+    }
+
+    /// Returns the provenance of complete final resource-read cache hints.
+    ///
+    /// The default is the legacy bridge, whose fixed wire values are only a
+    /// temporary projection until the router applies its configured policy.
+    /// Handlers that override [`Self::read_final`] to author a final result,
+    /// including exact proxies, must return [`FinalResourceReadCacheHintProvenance::Explicit`].
+    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
+        FinalResourceReadCacheHintProvenance::RouterPolicy
     }
 
     /// Reads the resource through the final result surface with URI parameters.
@@ -1692,6 +1768,10 @@ impl ResourceHandler for FinalProxyResourceHandler {
         Some(self.final_definition.clone())
     }
 
+    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
+        FinalResourceReadCacheHintProvenance::Explicit
+    }
+
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
         self.client.read_resource(ctx, &self.external_uri)
     }
@@ -1749,6 +1829,10 @@ impl ResourceHandler for FinalProxyResourceTemplateHandler {
 
     fn final_template_definition(&self) -> Option<FinalResourceTemplate> {
         Some(self.final_definition.clone())
+    }
+
+    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
+        FinalResourceReadCacheHintProvenance::Explicit
     }
 
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
@@ -1929,6 +2013,16 @@ impl ToolHandler for MountedToolHandler {
         Some(definition)
     }
 
+    fn final_tool_schema_authority(&self) -> FinalToolSchemaAuthority {
+        self.inner.final_tool_schema_authority()
+    }
+
+    fn upstream_final_tool_schema_registration(
+        &self,
+    ) -> Option<UpstreamFinalToolSchemaRegistration> {
+        self.inner.upstream_final_tool_schema_registration()
+    }
+
     fn final_tool_error_structured_content(
         &self,
         kind: ToolErrorKind,
@@ -1942,6 +2036,10 @@ impl ToolHandler for MountedToolHandler {
 
     fn timeout(&self) -> Option<Duration> {
         self.inner.timeout()
+    }
+
+    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
+        self.inner.final_resource_read_cache_hint_provenance()
     }
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
@@ -3062,6 +3160,10 @@ mod tests {
         assert!(tool.tags().is_empty());
         assert!(tool.annotations().is_none());
         assert!(tool.output_schema().is_none());
+        assert_eq!(
+            tool.final_tool_schema_authority(),
+            FinalToolSchemaAuthority::Local
+        );
         assert!(tool.timeout().is_none());
     }
 
@@ -3514,7 +3616,10 @@ mod tests {
             [EmbeddedResourceContents::Text { uri, text, .. }]
                 if uri.as_str() == "file:///stub" && text == "hello"
         ));
-        assert_eq!(final_result.payload.ttl_ms, DEFAULT_FINAL_RESOURCE_TTL_MS);
+        assert_eq!(
+            final_result.payload.ttl_ms.as_str(),
+            DEFAULT_FINAL_RESOURCE_TTL_MS.to_string()
+        );
         assert_eq!(final_result.payload.cache_scope, CacheScope::Private);
     }
 
@@ -3632,7 +3737,72 @@ mod tests {
         assert!(mounted.tags().is_empty());
         assert!(mounted.annotations().is_none());
         assert!(mounted.output_schema().is_none());
+        assert_eq!(
+            mounted.final_tool_schema_authority(),
+            FinalToolSchemaAuthority::Local
+        );
         assert!(mounted.timeout().is_none());
+    }
+
+    #[test]
+    fn mounted_tool_handler_preserves_upstream_schema_authority() {
+        struct UpstreamSchemaTool;
+
+        impl ToolHandler for UpstreamSchemaTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "upstream-schema".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: Some(serde_json::json!({"type": "string"})),
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn final_definition(&self) -> Option<FinalTool> {
+                Some(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "upstream-schema",
+                        "inputSchema": {"type": "object"},
+                        "outputSchema": {"type": "string"},
+                        "_meta": {"com.example/proxy": {"retained": true}}
+                    }))
+                    .expect("the exact-final mounted fixture is valid"),
+                )
+            }
+
+            fn final_tool_schema_authority(&self) -> FinalToolSchemaAuthority {
+                FinalToolSchemaAuthority::Upstream
+            }
+
+            fn call(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let mounted = MountedToolHandler::new(
+            Box::new(UpstreamSchemaTool) as BoxedToolHandler,
+            "m_upstream".to_string(),
+        );
+        assert_eq!(
+            mounted.final_tool_schema_authority(),
+            FinalToolSchemaAuthority::Upstream,
+            "mounting must not turn an exact-final proxy into a locally validated handler"
+        );
+        assert_eq!(
+            mounted
+                .final_definition()
+                .expect("mounted handler retains the exact final definition")
+                .output_schema,
+            Some(serde_json::json!({"type": "string"}))
+        );
     }
 
     #[test]
@@ -3784,9 +3954,7 @@ mod tests {
                     + '_,
             >,
         > {
-            Box::pin(async {
-                Ok(vec![fastmcp_core::ClientRoot::new("file:///workspace")])
-            })
+            Box::pin(async { Ok(vec![fastmcp_core::ClientRoot::new("file:///workspace")]) })
         }
     }
 
@@ -3881,7 +4049,10 @@ mod tests {
         assert!(ctx.can_list_roots());
         let roots = fastmcp_core::block_on(ctx.list_roots())
             .expect("attached roots provider reaches the context");
-        assert_eq!(roots, vec![fastmcp_core::ClientRoot::new("file:///workspace")]);
+        assert_eq!(
+            roots,
+            vec![fastmcp_core::ClientRoot::new("file:///workspace")]
+        );
     }
 
     #[test]

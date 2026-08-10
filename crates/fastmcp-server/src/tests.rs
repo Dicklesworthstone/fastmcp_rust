@@ -5957,7 +5957,7 @@ mod handler_direct_tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sent_clone = sent.clone();
         let sender = ProgressNotificationSender::new(
-            fastmcp_protocol::ProgressMarker::Number(99),
+            fastmcp_protocol::ProgressMarker::Number(fastmcp_protocol::JsonInteger::from(99_i64)),
             move |req: fastmcp_protocol::JsonRpcRequest| {
                 sent_clone.lock().unwrap().push(req);
             },
@@ -7497,7 +7497,10 @@ mod helper_function_tests {
             .dispatch_stateless(&inbound, &planted)
             .expect("planted request with an id must receive a response");
         assert_eq!(
-            planted_response.error.as_ref().map(|error| error.code),
+            planted_response
+                .error
+                .as_ref()
+                .map(|error| error.code.clone()),
             Some(McpErrorCode::MethodNotFound.into())
         );
         assert_eq!(
@@ -7639,7 +7642,10 @@ mod helper_function_tests {
         // An unknown tool name is an invalid `name` parameter (-32602) per the
         // MCP unknown-tool mapping; the method itself exists.
         assert_eq!(
-            planted_response.error.as_ref().map(|error| error.code),
+            planted_response
+                .error
+                .as_ref()
+                .map(|error| error.code.clone()),
             Some(McpErrorCode::InvalidParams.into())
         );
         assert_eq!(

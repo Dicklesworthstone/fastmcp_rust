@@ -6072,7 +6072,7 @@ X-Checksum: abc123\r\n\
         let response = JsonRpcResponse::error(
             None,
             fastmcp_protocol::JsonRpcError {
-                code: -32700,
+                code: (-32700).into(),
                 message: "Parse error".to_string(),
                 data: None,
             },

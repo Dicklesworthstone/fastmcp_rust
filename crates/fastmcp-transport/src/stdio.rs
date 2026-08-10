@@ -3004,7 +3004,7 @@ mod tests {
         assert!(resp.result.is_none());
         assert!(resp.error.is_some());
         let error = resp.error.unwrap();
-        assert_eq!(error.code, -32601);
+        assert_eq!(error.code.as_i32(), Some(-32601));
         assert_eq!(error.message, "Method not found");
     }
 

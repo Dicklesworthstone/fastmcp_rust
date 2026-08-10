@@ -96,7 +96,7 @@ pub use extensions::{
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
 pub use handler::{
-    BidirectionalSenders, BoxFuture, CompletionHandler, FinalToolOutcome,
+    BidirectionalSenders, BoxFuture, CompletionHandler, FinalToolOutcome, FinalToolSchemaAuthority,
     ProgressNotificationSender, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
     create_context_with_progress, create_context_with_progress_and_senders,
 };
@@ -730,13 +730,16 @@ impl LiveLegacy2024ConnectionRuntime {
         &self,
         server: &Server,
         request_cancellation: &McpRequestCancellation,
+        request_context: &McpContext,
     ) -> Option<BidirectionalSenders> {
         let request_sender = self.request_sender.as_ref()?;
         server.create_bidirectional_senders_from_capabilities(
             self.supports_sampling.load(Ordering::Acquire),
             false,
+            self.supports_roots.load(Ordering::Acquire),
             request_sender,
             request_cancellation,
+            request_context,
         )
     }
 
@@ -2378,6 +2381,7 @@ struct SessionView {
     state: SessionState,
     supports_sampling: bool,
     supports_elicitation: bool,
+    supports_roots: bool,
     log_level: Option<LogLevel>,
     principal_binding: SessionPrincipalBinding,
 }
@@ -2390,6 +2394,7 @@ impl SessionView {
             state: session.state().snapshot(),
             supports_sampling: session.supports_sampling(),
             supports_elicitation: session.supports_elicitation(),
+            supports_roots: session.supports_roots(),
             log_level: session.log_level(),
             principal_binding: session.principal_binding(),
         }
@@ -2547,7 +2552,8 @@ fn http_request_accepts_sse(request: &HttpRequest) -> bool {
 
 /// A live server composition over the transport's bounded dual-era HTTP endpoint.
 ///
-/// Modern finite requests are dispatched immediately; a final
+/// A bound listener issues `MCP-Session-Id` on modern discovery and retains
+/// that session's state until TTL or listener shutdown. A final
 /// `subscriptions/listen` SSE body retains its request-owned dispatch until
 /// cancellation or session close. Exact MCP 2024-11-05 requests retain the
 /// transport-issued session identifier, lifecycle adapter, and SSE response
@@ -2579,11 +2585,11 @@ pub struct ServerHttpSession {
     legacy_runtime: LiveLegacy2024ConnectionRuntime,
     /// The durable modern partition and retained-continuation owner for this
     /// HTTP session. Closing the session cancels every MRTR state it minted.
-    modern_connection: ModernConnection,
+    modern_connection: Arc<ModernConnection>,
     /// Owned modern listen dispatches whose SSE bodies were returned to the
     /// embedding caller. Handles are retained because dropping an asupersync
     /// task handle detaches it from the session lifecycle.
-    modern_dispatches: Vec<OwnedModernHttpDispatch>,
+    modern_dispatches: Arc<Mutex<Vec<OwnedModernHttpDispatch>>>,
     closed: bool,
 }
 
@@ -2591,6 +2597,47 @@ struct OwnedModernHttpDispatch {
     owner_generation: u64,
     request_cancellation: McpRequestCancellation,
     task: asupersync::runtime::TaskHandle<()>,
+}
+
+type ModernHttpDispatchRegistry = Arc<Mutex<Vec<OwnedModernHttpDispatch>>>;
+
+fn take_modern_http_dispatches(
+    registry: &ModernHttpDispatchRegistry,
+    owner_generation: Option<u64>,
+) -> Vec<OwnedModernHttpDispatch> {
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut retained = Vec::with_capacity(registry.len());
+    let mut removed = Vec::new();
+    for dispatch in std::mem::take(&mut *registry) {
+        if owner_generation.is_none_or(|owner| dispatch.owner_generation == owner) {
+            removed.push(dispatch);
+        } else {
+            retained.push(dispatch);
+        }
+    }
+    *registry = retained;
+    removed
+}
+
+fn cancel_modern_http_dispatches(
+    server: &Server,
+    registry: &ModernHttpDispatchRegistry,
+    owner_generation: Option<u64>,
+) -> Vec<asupersync::runtime::TaskHandle<()>> {
+    let dispatches = take_modern_http_dispatches(registry, owner_generation);
+    for dispatch in &dispatches {
+        server
+            .final_subscriptions
+            .cancel_modern_http_owner(dispatch.owner_generation);
+        dispatch.request_cancellation.cancel();
+        dispatch.task.abort();
+    }
+    dispatches
+        .into_iter()
+        .map(|dispatch| dispatch.task)
+        .collect()
 }
 
 /// A server-bound modern SSE response body.
@@ -3869,22 +3916,33 @@ type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveHttpSession>>>>
 
 const MAX_LIVE_MODERN_HTTP_SESSIONS: usize = 1_024;
 const MODERN_HTTP_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
+const MODERN_HTTP_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// One listener-owned modern HTTP session. Unlike a response body, this owner
 /// spans the discovery POST and every later POST that presents its server
 /// issued `MCP-Session-Id` header.
 struct LiveModernHttpSession {
+    server: Arc<Server>,
     session: Mutex<ServerHttpSession>,
     expires_at: Mutex<Instant>,
+    modern_connection: Arc<ModernConnection>,
+    modern_dispatches: ModernHttpDispatchRegistry,
+    closing: AtomicBool,
 }
 
 type LiveModernHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveModernHttpSession>>>>;
 
 impl LiveModernHttpSession {
     fn new(session: ServerHttpSession) -> Self {
+        let modern_connection = Arc::clone(&session.modern_connection);
+        let modern_dispatches = Arc::clone(&session.modern_dispatches);
         Self {
+            server: Arc::clone(&session.server),
             session: Mutex::new(session),
             expires_at: Mutex::new(Instant::now() + MODERN_HTTP_SESSION_TTL),
+            modern_connection,
+            modern_dispatches,
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -3903,11 +3961,68 @@ impl LiveModernHttpSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = now + MODERN_HTTP_SESSION_TTL;
     }
 
-    fn begin_close(&self) -> Vec<asupersync::runtime::TaskHandle<()>> {
-        self.session
+    fn register_modern_dispatch(&self, dispatch: OwnedModernHttpDispatch) -> bool {
+        if self.closing.load(Ordering::Acquire) {
+            dispatch.request_cancellation.cancel();
+            dispatch.task.abort();
+            return false;
+        }
+        let mut dispatches = self
+            .modern_dispatches
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .begin_close()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closing.load(Ordering::Acquire) {
+            drop(dispatches);
+            dispatch.request_cancellation.cancel();
+            dispatch.task.abort();
+            return false;
+        }
+        dispatches.push(dispatch);
+        true
+    }
+
+    fn cancel_modern_dispatch(&self, owner_generation: u64) {
+        let _ = cancel_modern_http_dispatches(
+            &self.server,
+            &self.modern_dispatches,
+            Some(owner_generation),
+        );
+    }
+
+    fn reap_modern_dispatches(&self) {
+        let mut dispatches = self
+            .modern_dispatches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut active = Vec::with_capacity(dispatches.len());
+        for mut dispatch in std::mem::take(&mut *dispatches) {
+            match dispatch.task.try_join() {
+                Ok(None) => active.push(dispatch),
+                Ok(Some(())) | Err(_) => {}
+            }
+        }
+        *dispatches = active;
+    }
+
+    fn begin_close(&self) -> Vec<asupersync::runtime::TaskHandle<()>> {
+        if self.closing.swap(true, Ordering::AcqRel) {
+            return Vec::new();
+        }
+        self.modern_connection.disconnect();
+        let dispatches = cancel_modern_http_dispatches(&self.server, &self.modern_dispatches, None);
+        match self.session.try_lock() {
+            Ok(mut session) => {
+                let _ = session.begin_close();
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let _ = poisoned.into_inner().begin_close();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // The detached request still owns this `Arc`; it will finish
+                // its synchronous section and fail closed on session drop.
+            }
+        }
+        dispatches
     }
 }
 
@@ -4073,7 +4188,7 @@ async fn close_live_http_sessions(cx: &Cx, sessions: &LiveHttpSessionRegistry) {
 /// Each retained [`ServerHttpSession`] owns its own MRTR continuation
 /// cancellation authority, so closing the registry makes every issued
 /// requestState invalid before the listener finishes shutting down.
-async fn close_live_modern_http_sessions(cx: &Cx, sessions: &LiveModernHttpSessionRegistry) {
+async fn close_live_modern_http_sessions(_cx: &Cx, sessions: &LiveModernHttpSessionRegistry) {
     let sessions = {
         let mut sessions = sessions
             .lock()
@@ -4084,8 +4199,26 @@ async fn close_live_modern_http_sessions(cx: &Cx, sessions: &LiveModernHttpSessi
     for session in sessions.into_values() {
         dispatches.extend(session.begin_close());
     }
-    for mut dispatch in dispatches {
-        let _ = dispatch.join(cx).await;
+    let deadline = Instant::now() + HTTP_TERMINAL_DRAIN_TIMEOUT;
+    let mut pending = dispatches;
+    while !pending.is_empty() && Instant::now() < deadline {
+        let mut active = Vec::with_capacity(pending.len());
+        for mut dispatch in pending {
+            match dispatch.try_join() {
+                Ok(None) => active.push(dispatch),
+                Ok(Some(())) | Err(_) => {}
+            }
+        }
+        pending = active;
+        if !pending.is_empty() {
+            asupersync::runtime::yield_now().await;
+        }
+    }
+    for dispatch in pending {
+        // Cancellation was requested before this bounded drain. Do not let an
+        // uncooperative handler hold listener shutdown by retaining its
+        // session mutex or an unbounded join.
+        dispatch.abort();
     }
 }
 
@@ -4124,6 +4257,23 @@ impl BoundHttpServer {
         }
 
         let connection_scope = cx.scope();
+        let reaper_sessions = Arc::clone(&self.modern_sessions);
+        let mut modern_session_reaper = cx
+            .spawn_in(&connection_scope, move |reaper_cx| async move {
+                loop {
+                    asupersync::time::sleep(reaper_cx.now(), MODERN_HTTP_SESSION_REAP_INTERVAL)
+                        .await;
+                    if reaper_cx.checkpoint().is_err() {
+                        break;
+                    }
+                    expire_live_modern_http_sessions(&reaper_sessions);
+                }
+            })
+            .map_err(|error| {
+                McpError::internal_error(format!(
+                    "HTTP modern-session reaper admission failed: {error}"
+                ))
+            })?;
         let mut connection_children = HttpConnectionChildren::default();
         let result = loop {
             connection_children.reap_finished();
@@ -4179,6 +4329,8 @@ impl BoundHttpServer {
         // children a bounded scheduling window to flush and close before
         // aborting any unrelated or uncooperative connection.
         let terminal_receipt = server.final_subscriptions.terminate_with_receipt();
+        modern_session_reaper.abort();
+        let _ = modern_session_reaper.join(cx).await;
         close_live_http_sessions(cx, &self.legacy_sessions).await;
         close_live_modern_http_sessions(cx, &self.modern_sessions).await;
         connection_children
@@ -4333,8 +4485,8 @@ impl ServerHttpEndpoint {
             legacy_admissions: Arc::new(HttpLegacyRequestAdmissions::default()),
             legacy_pending_requests,
             legacy_runtime,
-            modern_connection: ModernConnection::new(),
-            modern_dispatches: Vec::new(),
+            modern_connection: Arc::new(ModernConnection::new()),
+            modern_dispatches: Arc::new(Mutex::new(Vec::new())),
             closed: false,
         })
     }
@@ -4454,7 +4606,18 @@ impl ServerHttpSession {
             .load(Ordering::Acquire)
             .then(|| self.legacy_runtime.request_sender.clone())
             .flatten()
-            .map(TransportRootsProvider::new)
+            .map(|sender| {
+                TransportRootsProvider::new(
+                    sender,
+                    McpContext::new(
+                        self.legacy_request_cx
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone(),
+                        0,
+                    ),
+                )
+            })
     }
 
     /// Delivers an exact `notifications/resources/updated` message to this
@@ -4594,11 +4757,14 @@ impl ServerHttpSession {
                 sender,
                 Arc::clone(&terminal_delivery),
             )?;
-            self.modern_dispatches.push(OwnedModernHttpDispatch {
-                owner_generation,
-                request_cancellation: request_cancellation.clone(),
-                task: dispatch,
-            });
+            self.modern_dispatches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(OwnedModernHttpDispatch {
+                    owner_generation,
+                    request_cancellation: request_cancellation.clone(),
+                    task: dispatch,
+                });
             return Ok(ServerHttpEndpointResponse::ModernSse(
                 ServerHttpSseResponse::new(sse, request_cancellation, terminal_delivery),
             ));
@@ -4843,14 +5009,7 @@ impl ServerHttpSession {
         }
         self.closed = true;
         self.modern_connection.disconnect();
-        let dispatches = std::mem::take(&mut self.modern_dispatches);
-        for dispatch in &dispatches {
-            self.server
-                .final_subscriptions
-                .cancel_modern_http_owner(dispatch.owner_generation);
-            dispatch.request_cancellation.cancel();
-            dispatch.task.abort();
-        }
+        let dispatches = cancel_modern_http_dispatches(&self.server, &self.modern_dispatches, None);
         self.legacy_admissions.cancel_all();
         if let Some(adapter) = self.legacy_adapter.as_mut() {
             let _ = adapter.close(self.legacy_binding);
@@ -4860,20 +5019,30 @@ impl ServerHttpSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .close();
         dispatches
-            .into_iter()
-            .map(|dispatch| dispatch.task)
-            .collect()
     }
 
     fn reap_modern_dispatches(&mut self) {
-        let mut active = Vec::with_capacity(self.modern_dispatches.len());
-        for mut dispatch in std::mem::take(&mut self.modern_dispatches) {
+        let mut dispatches = self
+            .modern_dispatches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut active = Vec::with_capacity(dispatches.len());
+        for mut dispatch in std::mem::take(&mut *dispatches) {
             match dispatch.task.try_join() {
                 Ok(None) => active.push(dispatch),
                 Ok(Some(())) | Err(_) => {}
             }
         }
-        self.modern_dispatches = active;
+        *dispatches = active;
+    }
+
+    #[cfg(test)]
+    fn has_modern_dispatches(&self) -> bool {
+        !self
+            .modern_dispatches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 
     fn cancellation_control(&self) -> HttpLegacyCancellationControl {
@@ -5177,7 +5346,9 @@ async fn send_modern_sse_stream(
     cx: &Cx,
     stream: AsyncTcpStream,
     server: Arc<Server>,
+    live_session: &LiveModernHttpSession,
     http_stream_generation: u64,
+    inbound: InboundRequestContext,
     request: JsonRpcRequest,
     response: DualEraHttpSseResponse,
 ) -> Result<(), ()> {
@@ -5186,16 +5357,8 @@ async fn send_modern_sse_stream(
     let request_cancellation = sender.request_cancellation();
     let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
     let (_reader, mut writer) = stream.into_split();
-    let cancellation_server = Arc::clone(&server);
-    let modern_connection = ModernConnection::new();
-    let inbound = InboundRequestContext::with_modern_connection(
-        cx.clone(),
-        request_id_to_u64(request.id.as_ref()),
-        InboundRequestTransport::Http,
-        &modern_connection,
-    );
 
-    let mut dispatch = spawn_modern_sse_dispatch(
+    let dispatch = spawn_modern_sse_dispatch(
         cx,
         server,
         http_stream_generation,
@@ -5205,6 +5368,13 @@ async fn send_modern_sse_stream(
         Arc::clone(&terminal_delivery),
     )
     .map_err(|_| ())?;
+    if !live_session.register_modern_dispatch(OwnedModernHttpDispatch {
+        owner_generation: http_stream_generation,
+        request_cancellation: request_cancellation.clone(),
+        task: dispatch,
+    }) {
+        return Err(());
+    }
 
     let result = async {
         writer.write_all(&response_head).await.map_err(|_| ())?;
@@ -5255,13 +5425,9 @@ async fn send_modern_sse_stream(
 
     if result.is_err() {
         terminal_delivery.mark_failed();
-        cancellation_server
-            .final_subscriptions
-            .cancel_modern_http_owner(http_stream_generation);
-        request_cancellation.cancel();
-        dispatch.abort();
+        live_session.cancel_modern_dispatch(http_stream_generation);
     }
-    let _ = dispatch.join(cx).await;
+    live_session.reap_modern_dispatches();
     result
 }
 
@@ -5353,7 +5519,7 @@ fn protocol_admission_error_response(
     let response = JsonRpcResponse::error(
         id,
         JsonRpcError {
-            code: admission.jsonrpc_error_code(),
+            code: admission.jsonrpc_error_code().into(),
             message: message.to_owned(),
             data,
         },
@@ -5387,6 +5553,41 @@ fn is_modern_http_discovery_request(endpoint: &ServerHttpEndpoint, request: &Htt
         codec.decode_complete_message(&request.body),
         Ok(JsonRpcMessage::Request(request)) if request.method == SERVER_DISCOVER_METHOD
     )
+}
+
+/// Resolves a discovery-issued modern session for a subsequent POST.
+///
+/// Both JSON and SSE responses share this lookup so an SSE body cannot mint a
+/// transient `ModernConnection` that bypasses the session-owned MRTR store.
+fn registered_modern_http_session(
+    modern_sessions: &LiveModernHttpSessionRegistry,
+    request: &HttpRequest,
+) -> Result<Arc<LiveModernHttpSession>, HttpResponse> {
+    expire_live_modern_http_sessions(modern_sessions);
+    let Some(session_id) = request.header("mcp-session-id") else {
+        return Err(HttpResponse::bad_request());
+    };
+    let session = modern_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(session_id)
+        .cloned();
+    let Some(session) = session else {
+        return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
+    };
+    let now = Instant::now();
+    if session.is_expired(now) {
+        let removed = modern_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        if let Some(removed) = removed {
+            close_detached_modern_http_session(removed);
+        }
+        return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
+    }
+    session.renew(now);
+    Ok(session)
 }
 
 fn dispatch_registered_modern_http_request(
@@ -5439,29 +5640,10 @@ fn dispatch_registered_modern_http_request(
         return response.with_header("mcp-session-id", session_id);
     }
 
-    let Some(session_id) = request.header("mcp-session-id") else {
-        return HttpResponse::bad_request();
+    let session = match registered_modern_http_session(modern_sessions, &request) {
+        Ok(session) => session,
+        Err(response) => return response,
     };
-    let session = modern_sessions
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(session_id)
-        .cloned();
-    let Some(session) = session else {
-        return HttpResponse::new(HttpStatus::NOT_FOUND);
-    };
-    let now = Instant::now();
-    if session.is_expired(now) {
-        let removed = modern_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id);
-        if let Some(removed) = removed {
-            close_detached_modern_http_session(removed);
-        }
-        return HttpResponse::new(HttpStatus::NOT_FOUND);
-    }
-    session.renew(now);
     session
         .session
         .lock()
@@ -5594,27 +5776,56 @@ async fn serve_http_connection(
         && request.path == endpoint.server.http_config.handler_config.base_path
         && http_request_accepts_sse(&request);
     if is_modern_sse {
-        let mut session = match endpoint.open_session(cx) {
+        // Discovery is the only modern SSE-acceptable POST allowed to mint a
+        // session. Its normal JSON discovery response still carries the
+        // issued header; every later SSE request must present that same ID.
+        if is_modern_http_discovery_request(&endpoint, &request) {
+            let response =
+                dispatch_registered_modern_http_request(cx, &endpoint, &modern_sessions, request);
+            let _ = send_h1_response(cx, &mut framed, response).await;
+            return;
+        }
+        let live_session = match registered_modern_http_session(&modern_sessions, &request) {
             Ok(session) => session,
-            Err(_) => {
-                let _ = send_h1_response(cx, &mut framed, HttpResponse::internal_error()).await;
+            Err(response) => {
+                let _ = send_h1_response(cx, &mut framed, response).await;
                 return;
             }
         };
-        let response = session.begin_modern_sse(cx, request.clone());
+        let response = {
+            let mut session = live_session
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match session.begin_modern_sse(cx, request.clone()) {
+                Ok(Ok((request, response))) => Ok(Ok((
+                    InboundRequestContext::with_modern_connection(
+                        cx.clone(),
+                        request_id_to_u64(request.id.as_ref()),
+                        InboundRequestTransport::Http,
+                        &session.modern_connection,
+                    ),
+                    request,
+                    response,
+                ))),
+                Ok(Err(response)) => Ok(Err(response)),
+                Err(error) => Err(error),
+            }
+        };
         match response {
-            Ok(Ok((request, response))) => {
+            Ok(Ok((inbound, request, response))) => {
                 let stream = framed.into_inner();
                 let _ = send_modern_sse_stream(
                     cx,
                     stream,
                     Arc::clone(&endpoint.server),
+                    &live_session,
                     next_modern_http_stream_generation(),
+                    inbound,
                     request,
                     response,
                 )
                 .await;
-                session.close(cx).await;
                 return;
             }
             Ok(Err(response)) => {
@@ -6934,8 +7145,6 @@ impl Server {
         let result = (|| {
             let session_state =
                 runtime.map_or_else(SessionState::new, |runtime| runtime.session_state.clone());
-            let bidirectional_senders = runtime
-                .and_then(|runtime| runtime.bidirectional_senders(self, &request_cancellation));
             let (mut request_ctx, _request_lease_guard) = self.request_context(
                 cx,
                 request_id_to_u64(request.id.as_ref()),
@@ -6953,6 +7162,9 @@ impl Server {
                     .into_reporter(),
                 );
             }
+            let bidirectional_senders = runtime.and_then(|runtime| {
+                runtime.bidirectional_senders(self, &request_cancellation, &request_ctx)
+            });
             Self::enforce_request_context(&request_ctx)?;
             if !request_ctx.commit_anonymous_auth() {
                 return Err(McpError::internal_error(
@@ -8708,7 +8920,9 @@ impl Server {
                     }),
                     // Peer-fault rejections of id-less frames are dropped
                     // rather than terminating the dispatch worker.
-                    Err(error) if matches!(error.code(), -32600 | -32601 | -32602) => {
+                    Err(error)
+                        if matches!(error.code().as_i32(), Some(-32600 | -32601 | -32602)) =>
+                    {
                         debug!(
                             target: targets::SESSION,
                             "Dropped invalid exact-2024 notification; code={}",
@@ -9100,7 +9314,7 @@ impl Server {
                             let overloaded = JsonRpcResponse::error(
                                 Some(id),
                                 JsonRpcError {
-                                    code: RESOURCE_EXHAUSTED_ERROR_CODE,
+                                    code: RESOURCE_EXHAUSTED_ERROR_CODE.into(),
                                     message: DISPATCH_QUEUE_CAPACITY_MESSAGE.to_string(),
                                     data: None,
                                 },
@@ -9131,7 +9345,7 @@ impl Server {
                             let overloaded = JsonRpcResponse::error(
                                 Some(id),
                                 JsonRpcError {
-                                    code: RESOURCE_EXHAUSTED_ERROR_CODE,
+                                    code: RESOURCE_EXHAUSTED_ERROR_CODE.into(),
                                     message: DISPATCH_QUEUE_CAPACITY_MESSAGE.to_string(),
                                     data: None,
                                 },
@@ -9409,7 +9623,7 @@ impl Server {
                                 let overloaded = JsonRpcResponse::error(
                                     Some(id),
                                     JsonRpcError {
-                                        code: RESOURCE_EXHAUSTED_ERROR_CODE,
+                                        code: RESOURCE_EXHAUSTED_ERROR_CODE.into(),
                                         message: DISPATCH_QUEUE_CAPACITY_MESSAGE.to_string(),
                                         data: None,
                                     },
@@ -9496,7 +9710,7 @@ impl Server {
                                 let overloaded = JsonRpcResponse::error(
                                     Some(id),
                                     JsonRpcError {
-                                        code: RESOURCE_EXHAUSTED_ERROR_CODE,
+                                        code: RESOURCE_EXHAUSTED_ERROR_CODE.into(),
                                         message: DISPATCH_QUEUE_CAPACITY_MESSAGE.to_string(),
                                         data: None,
                                     },
@@ -9894,7 +10108,12 @@ impl Server {
                             }),
                             // Peer-fault rejections of id-less frames are
                             // dropped rather than terminating the connection.
-                            Err(error) if matches!(error.code(), -32600 | -32601 | -32602) => {
+                            Err(error)
+                                if matches!(
+                                    error.code().as_i32(),
+                                    Some(-32600 | -32601 | -32602)
+                                ) =>
+                            {
                                 debug!(
                                     target: targets::SESSION,
                                     "Dropped invalid exact-2024 notification; code={}",
@@ -10292,7 +10511,12 @@ impl Server {
                             // response channel; JSON-RPC drops it without
                             // advancing lifecycle, and one malformed peer
                             // notification must not terminate the connection.
-                            Err(error) if matches!(error.code(), -32600 | -32601 | -32602) => {
+                            Err(error)
+                                if matches!(
+                                    error.code().as_i32(),
+                                    Some(-32600 | -32601 | -32602)
+                                ) =>
+                            {
                                 debug!(
                                     target: targets::SESSION,
                                     "Dropped invalid exact-2024 notification; code={}",
@@ -11176,8 +11400,12 @@ impl Server {
             let params = request.params.clone();
 
             // Create bidirectional senders based on client capabilities
-            let bidirectional_senders =
-                self.create_bidirectional_senders(session, request_sender, request_cancellation);
+            let bidirectional_senders = self.create_bidirectional_senders(
+                session,
+                request_sender,
+                request_cancellation,
+                &mw_ctx,
+            );
 
             match method.as_str() {
                 "initialize" => {
@@ -11542,6 +11770,7 @@ impl Server {
                 session,
                 request_sender,
                 request_cancellation,
+                &mw_ctx,
             );
 
             match method.as_str() {
@@ -11735,19 +11964,23 @@ impl Server {
 
     /// Creates bidirectional senders based on client capabilities.
     ///
-    /// Returns `Some(BidirectionalSenders)` if the client supports any bidirectional
-    /// features (sampling, elicitation), or `None` if no features are supported.
+    /// Returns `Some(BidirectionalSenders)` if the client supports any
+    /// bidirectional feature (sampling, elicitation, roots), or `None` if it
+    /// supports none.
     fn create_bidirectional_senders(
         &self,
         session: &Session,
         request_sender: &bidirectional::RequestSender,
         request_cancellation: &McpRequestCancellation,
+        request_context: &McpContext,
     ) -> Option<handler::BidirectionalSenders> {
         self.create_bidirectional_senders_from_capabilities(
             session.supports_sampling(),
             session.supports_elicitation(),
+            session.supports_roots(),
             request_sender,
             request_cancellation,
+            request_context,
         )
     }
 
@@ -11756,12 +11989,15 @@ impl Server {
         session: &SessionView,
         request_sender: &bidirectional::RequestSender,
         request_cancellation: &McpRequestCancellation,
+        request_context: &McpContext,
     ) -> Option<handler::BidirectionalSenders> {
         self.create_bidirectional_senders_from_capabilities(
             session.supports_sampling,
             session.supports_elicitation,
+            session.supports_roots,
             request_sender,
             request_cancellation,
+            request_context,
         )
     }
 
@@ -11769,10 +12005,12 @@ impl Server {
         &self,
         supports_sampling: bool,
         supports_elicitation: bool,
+        supports_roots: bool,
         request_sender: &bidirectional::RequestSender,
         request_cancellation: &McpRequestCancellation,
+        request_context: &McpContext,
     ) -> Option<handler::BidirectionalSenders> {
-        if !supports_sampling && !supports_elicitation {
+        if !supports_sampling && !supports_elicitation && !supports_roots {
             return None;
         }
 
@@ -11791,6 +12029,13 @@ impl Server {
                 bidirectional::TransportElicitationSender::new(request_sender.clone()),
             );
             senders = senders.with_elicitation(elicitation_sender);
+        }
+
+        if supports_roots {
+            let roots_provider: Arc<dyn fastmcp_core::RootsProvider> = Arc::new(
+                bidirectional::TransportRootsProvider::new(request_sender, request_context.clone()),
+            );
+            senders = senders.with_roots(roots_provider);
         }
 
         Some(senders)
@@ -13645,6 +13890,18 @@ mod lib_unit_tests {
             .ok_or_else(|| "live HTTP response omitted its header terminator".to_string())
     }
 
+    fn live_http_sse_jsonrpc_response(response: &[u8]) -> Result<JsonRpcResponse, String> {
+        let body = std::str::from_utf8(live_http_response_body(response)?)
+            .map_err(|error| format!("live SSE body was not UTF-8: {error}"))?;
+        let data = body
+            .rsplit_once("data: ")
+            .map(|(_, data)| data)
+            .and_then(|data| data.split_once("\n\n").map(|(data, _)| data))
+            .ok_or_else(|| "live SSE body omitted a JSON-RPC event".to_owned())?;
+        serde_json::from_str(data)
+            .map_err(|error| format!("live SSE JSON-RPC event was invalid: {error}"))
+    }
+
     fn live_http_response_header(response: &[u8], name: &str) -> Result<String, String> {
         let headers = std::str::from_utf8(
             response
@@ -14283,16 +14540,38 @@ mod lib_unit_tests {
             })
     }
 
-    fn server_final_task_expiry(
+    /// Validates every unbounded wire duration before a store operation may
+    /// reclaim, replace, or otherwise mutate retained state. The returned TTL
+    /// is the one bounded duration that the store needs for its expiry index.
+    fn validate_server_final_task_durations(
         task: &fastmcp_protocol::Task,
-        now: Instant,
-    ) -> McpResult<Option<Instant>> {
-        let Some(ttl_ms) = task
+    ) -> McpResult<Option<u64>> {
+        let ttl_ms = task
             .base()
             .ttl_ms
             .as_ref()
-            .map(fastmcp_protocol::TaskDuration::as_millis)
-        else {
+            .map(fastmcp_protocol::TaskDuration::try_as_millis)
+            .transpose()
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "Server final task test-store ttlMs is outside milliseconds",
+                )
+            })?;
+        task.base()
+            .poll_interval_ms
+            .as_ref()
+            .map(fastmcp_protocol::TaskDuration::try_as_millis)
+            .transpose()
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "Server final task test-store pollIntervalMs is outside milliseconds",
+                )
+            })?;
+        Ok(ttl_ms)
+    }
+
+    fn server_final_task_expiry(ttl_ms: Option<u64>, now: Instant) -> McpResult<Option<Instant>> {
+        let Some(ttl_ms) = ttl_ms else {
             return Ok(None);
         };
         now.checked_add(Duration::from_millis(ttl_ms))
@@ -14457,8 +14736,10 @@ mod lib_unit_tests {
             notification: fastmcp_protocol::TaskStatusNotification,
         ) -> McpResult<()> {
             let task_id = task.base().task_id.clone();
+            let ttl_ms = validate_server_final_task_durations(&task)?;
             ensure_server_final_task_notification_matches_task(&task, &notification)?;
             let now = self.now();
+            let expires_at = server_final_task_expiry(ttl_ms, now)?;
             let mut state = self
                 .state
                 .lock()
@@ -14467,7 +14748,6 @@ mod lib_unit_tests {
             if state.tasks.contains_key(&task_id) {
                 return Err(McpError::invalid_params("Task already exists"));
             }
-            let expires_at = server_final_task_expiry(&task, now)?;
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
@@ -14485,6 +14765,7 @@ mod lib_unit_tests {
             work_descriptor: FinalTaskWorkDescriptor,
         ) -> McpResult<()> {
             let task_id = task.base().task_id.clone();
+            let ttl_ms = validate_server_final_task_durations(&task)?;
             ensure_server_final_task_notification_matches_task(&task, &notification)?;
             if !matches!(task, fastmcp_protocol::Task::Working(_)) {
                 return Err(McpError::invalid_params(
@@ -14496,11 +14777,11 @@ mod lib_unit_tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let now = self.now();
+            let expires_at = server_final_task_expiry(ttl_ms, now)?;
             reclaim_expired_server_final_task_handoffs(&mut state, now);
             if state.tasks.contains_key(&task_id) {
                 return Err(McpError::invalid_params("Task already exists"));
             }
-            let expires_at = server_final_task_expiry(&task, now)?;
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
@@ -14551,6 +14832,7 @@ mod lib_unit_tests {
             notification: fastmcp_protocol::TaskStatusNotification,
         ) -> McpResult<()> {
             let task_id = task.base().task_id.clone();
+            validate_server_final_task_durations(&task)?;
             ensure_server_final_task_notification_matches_task(&task, &notification)?;
             let mut state = self
                 .state
@@ -14591,6 +14873,7 @@ mod lib_unit_tests {
                     "Expected and replacement final task IDs must match",
                 ));
             }
+            validate_server_final_task_durations(&task)?;
             ensure_server_final_task_notification_matches_task(&task, &notification)?;
             let mut state = self
                 .state
@@ -14632,6 +14915,7 @@ mod lib_unit_tests {
                     "Expected and replacement final task IDs must match",
                 ));
             }
+            validate_server_final_task_durations(&task)?;
             ensure_server_final_task_notification_matches_task(&task, &notification)?;
             let mut state = self
                 .state
@@ -14669,6 +14953,7 @@ mod lib_unit_tests {
                     "Expected and replacement final task IDs must match",
                 ));
             }
+            validate_server_final_task_durations(&task)?;
             ensure_server_final_task_notification_matches_task(&task, &notification)?;
             let mut state = self
                 .state
@@ -15377,6 +15662,138 @@ mod lib_unit_tests {
                 && !state.expires_at.contains_key(&task_id),
             "post-expiry reclamation clears only the expired task's private work and expiry state"
         );
+    }
+
+    #[test]
+    fn server_final_task_store_rejects_out_of_range_ttl_before_mutation() {
+        let store = ServerFinalTaskStore::default();
+        let task_id = fastmcp_protocol::FinalTaskId::parse("server-store-oversized-ttl")
+            .expect("fixed final task ID must be valid");
+        let timestamp = fastmcp_protocol::TaskTimestamp::parse("2026-07-28T12:00:00.000Z")
+            .expect("fixed final task timestamp must be valid");
+        let task = fastmcp_protocol::Task::Working(fastmcp_protocol::TaskBase {
+            task_id: task_id.clone(),
+            status: fastmcp_protocol::FinalTaskStatus::Working,
+            status_message: None,
+            created_at: timestamp.clone(),
+            last_updated_at: timestamp,
+            ttl_ms: Some(
+                serde_json::from_str("18446744073709551616")
+                    .expect("unbounded positive final task TTL must decode"),
+            ),
+            poll_interval_ms: None,
+        });
+        let notification = fastmcp_protocol::TaskStatusNotification::new(
+            fastmcp_protocol::tasks_extension::TaskStatusNotificationParams {
+                task,
+                meta: None,
+                additional: BTreeMap::new(),
+            },
+        );
+
+        let error = store
+            .create_task(notification.params.task.clone(), notification)
+            .expect_err("out-of-range task TTL must be rejected");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            state.tasks.is_empty()
+                && state.generations.is_empty()
+                && state.notifications.is_empty()
+                && state.expires_at.is_empty(),
+            "checked TTL conversion fails before task-store mutation"
+        );
+        assert_eq!(state.next_generation, 0);
+        assert!(!state.tasks.contains_key(&task_id));
+    }
+
+    #[test]
+    fn server_final_task_store_rejects_out_of_range_poll_before_reclaiming_expired_state() {
+        let start = Instant::now();
+        let clock_now = Arc::new(Mutex::new(start));
+        let clock = {
+            let clock_now = Arc::clone(&clock_now);
+            Arc::new(move || {
+                *clock_now
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+        };
+        let store = ServerFinalTaskStore::with_clock(clock);
+        let timestamp = fastmcp_protocol::TaskTimestamp::parse("2026-07-28T12:00:00.000Z")
+            .expect("fixed final task timestamp must be valid");
+        let expired_id = fastmcp_protocol::FinalTaskId::parse("server-store-expired-before-poll")
+            .expect("fixed expired task ID must be valid");
+        let expired_task = fastmcp_protocol::Task::Working(fastmcp_protocol::TaskBase {
+            task_id: expired_id.clone(),
+            status: fastmcp_protocol::FinalTaskStatus::Working,
+            status_message: None,
+            created_at: timestamp.clone(),
+            last_updated_at: timestamp.clone(),
+            ttl_ms: Some(
+                serde_json::from_value(serde_json::json!(1_u64))
+                    .expect("finite expiry TTL must be valid"),
+            ),
+            poll_interval_ms: None,
+        });
+        let expired_notification = fastmcp_protocol::TaskStatusNotification::new(
+            fastmcp_protocol::tasks_extension::TaskStatusNotificationParams {
+                task: expired_task.clone(),
+                meta: None,
+                additional: BTreeMap::new(),
+            },
+        );
+        store
+            .create_task(expired_task, expired_notification)
+            .expect("baseline expired task must enter the store");
+        *clock_now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = start
+            .checked_add(Duration::from_millis(1))
+            .expect("test monotonic clock must represent expiry");
+
+        let rejected_id = fastmcp_protocol::FinalTaskId::parse("server-store-oversized-poll")
+            .expect("fixed rejected task ID must be valid");
+        let rejected_task = fastmcp_protocol::Task::Working(fastmcp_protocol::TaskBase {
+            task_id: rejected_id.clone(),
+            status: fastmcp_protocol::FinalTaskStatus::Working,
+            status_message: None,
+            created_at: timestamp.clone(),
+            last_updated_at: timestamp,
+            ttl_ms: None,
+            poll_interval_ms: Some(
+                serde_json::from_str("18446744073709551616")
+                    .expect("unbounded positive final task poll interval must decode"),
+            ),
+        });
+        let rejected_notification = fastmcp_protocol::TaskStatusNotification::new(
+            fastmcp_protocol::tasks_extension::TaskStatusNotificationParams {
+                task: rejected_task.clone(),
+                meta: None,
+                additional: BTreeMap::new(),
+            },
+        );
+
+        let error = store
+            .create_task(rejected_task, rejected_notification)
+            .expect_err("out-of-range task poll interval must be rejected");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            state.tasks.contains_key(&expired_id)
+                && state.expires_at.contains_key(&expired_id)
+                && state.generations.contains_key(&expired_id)
+                && !state.tasks.contains_key(&rejected_id),
+            "checked poll conversion rejects before reclaiming unrelated expired state"
+        );
+        assert_eq!(state.notifications.len(), 1);
+        assert_eq!(state.next_generation, 1);
     }
 
     #[test]
@@ -17951,7 +18368,10 @@ mod lib_unit_tests {
         let response = handled.finalize_for_return(&mut session);
 
         assert_eq!(
-            response.error.as_ref().map(|error| error.code),
+            response
+                .error
+                .as_ref()
+                .and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::RequestCancelled))
         );
         assert!(!session.is_initialized());
@@ -18084,7 +18504,10 @@ mod lib_unit_tests {
 
         assert_eq!(response.id, Some(request_id.clone()));
         assert_eq!(
-            response.error.as_ref().map(|error| error.code),
+            response
+                .error
+                .as_ref()
+                .and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::RequestCancelled))
         );
         assert!(!server.request_id_is_active(session.id(), &request_id));
@@ -18121,7 +18544,10 @@ mod lib_unit_tests {
         let response = handled.finalize_for_return(&mut session);
 
         assert_eq!(
-            response.error.as_ref().map(|error| error.code),
+            response
+                .error
+                .as_ref()
+                .and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::RequestCancelled))
         );
         assert_eq!(session.log_level(), Some(LogLevel::Warning));
@@ -18156,7 +18582,10 @@ mod lib_unit_tests {
         let response = handled.finalize_for_return(&mut session);
 
         assert_eq!(
-            response.error.as_ref().map(|error| error.code),
+            response
+                .error
+                .as_ref()
+                .and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::RequestCancelled))
         );
         assert_eq!(
@@ -18801,6 +19230,38 @@ mod lib_unit_tests {
                 format!("legacy-runtime-{counter}-{}", response.text)
             } else {
                 format!("legacy-runtime-{counter}-without-sampling")
+            };
+            Ok(vec![Content::text(text)])
+        }
+    }
+
+    struct LegacyRootsContextTool;
+
+    impl ToolHandler for LegacyRootsContextTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "legacy_roots_context_tool".to_owned(),
+                description: Some(
+                    "Proves exact-2024 handlers receive only negotiated roots authority".to_owned(),
+                ),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            let text = if ctx.can_list_roots() {
+                let roots = block_on(ctx.list_roots())?;
+                format!(
+                    "negotiated roots: {}",
+                    roots.first().map_or("<none>", |root| root.uri.as_str())
+                )
+            } else {
+                "roots authority unavailable".to_owned()
             };
             Ok(vec![Content::text(text)])
         }
@@ -19549,9 +20010,9 @@ mod lib_unit_tests {
                             return match crate::handler::promote_legacy_tool_content(vec![
                                 Content::text(format!("modern request {request_id}")),
                             ]) {
-                                Ok(result) => fastmcp_core::Outcome::Ok(
-                                    FinalToolOutcome::Complete(result),
-                                ),
+                                Ok(result) => {
+                                    fastmcp_core::Outcome::Ok(FinalToolOutcome::Complete(result))
+                                }
                                 Err(error) => fastmcp_core::Outcome::Err(error),
                             };
                         }
@@ -19922,6 +20383,92 @@ mod lib_unit_tests {
         }
     }
 
+    struct LegacyRootsContextSplitRecv {
+        phase: u8,
+        supports_roots: bool,
+        outbound: Receiver<JsonRpcMessage>,
+    }
+
+    impl LegacyRootsContextSplitRecv {
+        fn wait_for_response(&self, id: i64) -> Result<(), TransportError> {
+            loop {
+                match self.outbound.recv_timeout(Duration::from_secs(2)) {
+                    Ok(JsonRpcMessage::Response(response)) if response.id == Some(id.into()) => {
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(_) => return Err(TransportError::Timeout),
+                }
+            }
+        }
+
+        fn roots_response(&self) -> Result<JsonRpcMessage, TransportError> {
+            loop {
+                match self.outbound.recv_timeout(Duration::from_secs(2)) {
+                    Ok(JsonRpcMessage::Request(request)) if request.method == "roots/list" => {
+                        let id = request.id.expect("roots request must carry an id");
+                        return Ok(JsonRpcMessage::Response(JsonRpcResponse::success(
+                            id,
+                            serde_json::json!({
+                                "roots": [{"uri": "file:///workspace", "name": "workspace"}],
+                            }),
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(_) => return Err(TransportError::Timeout),
+                }
+            }
+        }
+    }
+
+    impl TransportRecvHalf for LegacyRootsContextSplitRecv {
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            let phase = self.phase;
+            self.phase = self.phase.saturating_add(1);
+            match phase {
+                0 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "initialize",
+                    Some(serde_json::json!({
+                        "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                        "capabilities": if self.supports_roots {
+                            serde_json::json!({"roots": {}})
+                        } else {
+                            serde_json::json!({})
+                        },
+                        "clientInfo": {"name": "legacy-roots-context", "version": "1.0.0"},
+                    })),
+                    731_i64,
+                ))),
+                1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/initialized",
+                    None,
+                ))),
+                2 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "legacy_roots_context_tool",
+                        "arguments": {},
+                    })),
+                    732_i64,
+                ))),
+                3 if self.supports_roots => self.roots_response(),
+                3 => {
+                    self.wait_for_response(732)?;
+                    Err(TransportError::Closed)
+                }
+                4 if self.supports_roots => {
+                    self.wait_for_response(732)?;
+                    Err(TransportError::Closed)
+                }
+                _ => Err(TransportError::Closed),
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
     struct LegacyCancelLateRecv {
         phase: u8,
         outbound: Receiver<JsonRpcMessage>,
@@ -20055,6 +20602,30 @@ mod lib_unit_tests {
         .expect("public split transport must complete the legacy runtime script");
         sent.lock()
             .expect("legacy runtime sent-message mutex must not be poisoned")
+            .clone()
+    }
+
+    fn legacy_roots_context_transcript(supports_roots: bool) -> Vec<JsonRpcMessage> {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (outbound, inbound) = sync_channel(16);
+        run_live_split_transport(
+            Server::new("legacy-roots-context", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .tool(LegacyRootsContextTool)
+                .build(),
+            LegacyRootsContextSplitRecv {
+                phase: 0,
+                supports_roots,
+                outbound: inbound,
+            },
+            LiveLegacyRuntimeSplitSend {
+                sent: Arc::clone(&sent),
+                outbound,
+            },
+        )
+        .expect("public split transport must complete the legacy roots context script");
+        sent.lock()
+            .expect("legacy roots context sent-message mutex must not be poisoned")
             .clone()
     }
 
@@ -20593,7 +21164,7 @@ mod lib_unit_tests {
                         response
                             .error
                             .as_ref()
-                            .map(|response_error| response_error.code),
+                            .and_then(|response_error| response_error.code.as_i32()),
                         Some(-32700)
                     );
                     failure_from_send.store(true, Ordering::Release);
@@ -20796,7 +21367,7 @@ mod lib_unit_tests {
             response
                 .error
                 .as_ref()
-                .map(|response_error| response_error.code),
+                .and_then(|response_error| response_error.code.as_i32()),
             Some(-32600)
         );
     }
@@ -21105,6 +21676,54 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn public_split_transport_legacy_context_installs_roots_provider_after_negotiation() {
+        let sent = legacy_roots_context_transcript(true);
+        assert!(
+            sent.iter().any(|message| {
+                matches!(message, JsonRpcMessage::Request(request) if request.method == "roots/list")
+            }),
+            "a negotiated roots capability must install a request-scoped roots provider"
+        );
+        let response = sent.iter().find_map(|message| match message {
+            JsonRpcMessage::Response(response) if response.id == Some(732_i64.into()) => {
+                response.result.as_ref()
+            }
+            _ => None,
+        });
+        assert_eq!(
+            response
+                .and_then(|result| result["content"].as_array())
+                .and_then(|content| content.first())
+                .and_then(|content| content["text"].as_str()),
+            Some("negotiated roots: file:///workspace")
+        );
+    }
+
+    #[test]
+    fn public_split_transport_legacy_context_withholds_roots_provider_without_capability() {
+        let sent = legacy_roots_context_transcript(false);
+        assert!(
+            !sent.iter().any(|message| {
+                matches!(message, JsonRpcMessage::Request(request) if request.method == "roots/list")
+            }),
+            "changing only the negotiated roots capability must not emit a roots request"
+        );
+        let response = sent.iter().find_map(|message| match message {
+            JsonRpcMessage::Response(response) if response.id == Some(732_i64.into()) => {
+                response.result.as_ref()
+            }
+            _ => None,
+        });
+        assert_eq!(
+            response
+                .and_then(|result| result["content"].as_array())
+                .and_then(|content| content.first())
+                .and_then(|content| content["text"].as_str()),
+            Some("roots authority unavailable")
+        );
+    }
+
+    #[test]
     fn public_stdio_legacy_progress_token_installs_f64_notification_sender() {
         let sent = legacy_stdio_progress_transcript(true);
         let progress = sent.iter().find_map(|message| match message {
@@ -21384,7 +22003,10 @@ mod lib_unit_tests {
         );
         assert_eq!(rejected.id, Some(52_i64.into()));
         assert_eq!(
-            rejected.error.as_ref().map(|error| error.code),
+            rejected
+                .error
+                .as_ref()
+                .and_then(|error| error.code.as_i32()),
             Some(-32602)
         );
         assert_eq!(call.id, Some(53_i64.into()));
@@ -21781,7 +22403,10 @@ mod lib_unit_tests {
         assert_eq!(response.id, Some(220_i64.into()));
         assert!(response.result.is_none());
         assert_eq!(
-            response.error.as_ref().map(|error| error.code),
+            response
+                .error
+                .as_ref()
+                .and_then(|error| error.code.as_i32()),
             Some(McpErrorCode::InvalidRequest.into())
         );
     }
@@ -21872,7 +22497,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_mrtr_retry_uses_discovery_session_across_new_post_and_request_id() {
+    fn live_http_mrtr_sse_retry_uses_discovery_session_across_new_post_and_request_id() {
         run_live_http_test(|cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
             let bound = Server::new("live-http-mrtr-session", "1.0.0")
@@ -21924,19 +22549,21 @@ mod lib_unit_tests {
                             "_meta": {
                                 MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
                                 FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                                "progressToken": "live-http-mrtr-sse",
                             },
                         })),
                         922_i64,
                     );
-                    let initial_body = serde_json::to_vec(&initial)
-                        .map_err(|error| format!("MRTR initial request did not serialize: {error}"))?;
+                    let initial_body = serde_json::to_vec(&initial).map_err(|error| {
+                        format!("MRTR initial request did not serialize: {error}")
+                    })?;
                     let initial = live_http_exchange(
                         address,
                         live_http_post(
                             "/mcp",
                             &initial_body,
                             &[
-                                ("Accept", "application/json"),
+                                ("Accept", "text/event-stream"),
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
                                 ("MCP-Session-Id", session_id.as_str()),
@@ -21944,10 +22571,7 @@ mod lib_unit_tests {
                         ),
                     )
                     .await?;
-                    let initial_response: JsonRpcResponse = serde_json::from_slice(
-                        live_http_response_body(&initial)?,
-                    )
-                    .map_err(|error| format!("MRTR initial response was invalid: {error}"))?;
+                    let initial_response = live_http_sse_jsonrpc_response(&initial)?;
                     let request_state = initial_response
                         .result
                         .as_ref()
@@ -21976,8 +22600,9 @@ mod lib_unit_tests {
                         })),
                         923_i64,
                     );
-                    let retry_body = serde_json::to_vec(&retry)
-                        .map_err(|error| format!("MRTR retry request did not serialize: {error}"))?;
+                    let retry_body = serde_json::to_vec(&retry).map_err(|error| {
+                        format!("MRTR retry request did not serialize: {error}")
+                    })?;
                     let retry = live_http_exchange(
                         address,
                         live_http_post(
@@ -22003,8 +22628,9 @@ mod lib_unit_tests {
                 .await
                 .map_err(|error| format!("live HTTP MRTR client failed: {error:?}"))??;
             serve.map_err(|error| format!("live HTTP MRTR server failed: {error}"))?;
-            let retry: JsonRpcResponse = serde_json::from_slice(live_http_response_body(&retry)?)
-                .map_err(|error| format!("MRTR retry response was invalid: {error}"))?;
+            let retry: JsonRpcResponse =
+                serde_json::from_slice(live_http_response_body(&retry)?)
+                    .map_err(|error| format!("MRTR retry response was invalid: {error}"))?;
             if retry.id != Some(923_i64.into())
                 || retry.error.is_some()
                 || retry
@@ -22017,6 +22643,102 @@ mod lib_unit_tests {
             }
             if calls.load(Ordering::Acquire) != 2 {
                 return Err("MRTR handler did not run once per initial/retry POST".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_mrtr_sse_rejects_only_missing_discovery_session_before_handler() {
+        run_live_http_test(|cx| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let bound = Server::new("live-http-mrtr-sse-session-required", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .tool(LiveHttpMrtrTool {
+                    calls: Arc::clone(&calls),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("live HTTP MRTR SSE bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("live HTTP MRTR SSE address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let discovery = JsonRpcRequest::new(
+                        SERVER_DISCOVER_METHOD,
+                        Some(serde_json::json!({
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                            },
+                        })),
+                        924_i64,
+                    );
+                    let discovery_body = serde_json::to_vec(&discovery).map_err(|error| {
+                        format!("MRTR SSE discovery did not serialize: {error}")
+                    })?;
+                    let discovery = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/mcp",
+                            &discovery_body,
+                            &[
+                                ("Accept", "application/json"),
+                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                ("Mcp-Method", SERVER_DISCOVER_METHOD),
+                            ],
+                        ),
+                    )
+                    .await?;
+                    let _session_id = live_http_response_header(&discovery, "mcp-session-id")?;
+                    let initial = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_http_mrtr",
+                            "arguments": {},
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                                "progressToken": "live-http-mrtr-sse",
+                            },
+                        })),
+                        925_i64,
+                    );
+                    let initial_body = serde_json::to_vec(&initial).map_err(|error| {
+                        format!("MRTR SSE initial request did not serialize: {error}")
+                    })?;
+                    let rejected = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/mcp",
+                            &initial_body,
+                            &[
+                                ("Accept", "text/event-stream"),
+                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                ("Mcp-Method", "tools/call"),
+                            ],
+                        ),
+                    )
+                    .await;
+                    caller_cx.cancel_with(
+                        CancelKind::User,
+                        Some("live HTTP MRTR SSE missing session complete"),
+                    );
+                    rejected
+                })
+                .map_err(|error| format!("live HTTP MRTR SSE client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let rejected = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("live HTTP MRTR SSE client failed: {error:?}"))??;
+            serve.map_err(|error| format!("live HTTP MRTR SSE server failed: {error}"))?;
+            if !rejected.starts_with(b"HTTP/1.1 400") || calls.load(Ordering::Acquire) != 0 {
+                return Err("removing only MCP-Session-Id admitted an SSE MRTR handler".to_owned());
             }
             Ok(())
         });
@@ -22099,18 +22821,18 @@ mod lib_unit_tests {
                         ),
                     )
                     .await?;
-                    let initial: JsonRpcResponse = serde_json::from_slice(
-                        live_http_response_body(&initial)?,
-                    )
-                    .map_err(|error| {
-                        format!("MRTR shutdown initial response was invalid: {error}")
-                    })?;
+                    let initial: JsonRpcResponse =
+                        serde_json::from_slice(live_http_response_body(&initial)?).map_err(
+                            |error| format!("MRTR shutdown initial response was invalid: {error}"),
+                        )?;
                     let request_state = initial
                         .result
                         .as_ref()
                         .and_then(|result| result.get("requestState"))
                         .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| "MRTR shutdown initial response omitted requestState".to_owned())?
+                        .ok_or_else(|| {
+                            "MRTR shutdown initial response omitted requestState".to_owned()
+                        })?
                         .to_owned();
                     caller_cx.cancel_with(
                         CancelKind::User,
@@ -22118,7 +22840,9 @@ mod lib_unit_tests {
                     );
                     Ok::<_, String>((session_id, request_state))
                 })
-                .map_err(|error| format!("live HTTP MRTR shutdown client admission failed: {error}"))?;
+                .map_err(|error| {
+                    format!("live HTTP MRTR shutdown client admission failed: {error}")
+                })?;
 
             let serve = bound.serve(&cx).await;
             let (session_id, request_state) = client
@@ -22272,7 +22996,10 @@ mod lib_unit_tests {
                 })?;
             if rejected.id != Some(814_i64.into())
                 || rejected.result.is_some()
-                || rejected.error.as_ref().map(|error| error.code)
+                || rejected
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.code.as_i32())
                     != Some(fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE)
                 || rejected
                     .error
@@ -22321,19 +23048,43 @@ mod lib_unit_tests {
             );
             let body = serde_json::to_vec(&request)
                 .map_err(|error| format!("live SSE request did not serialize: {error}"))?;
-            let request = live_http_post(
+            let discovery = JsonRpcRequest::new(
+                SERVER_DISCOVER_METHOD,
+                Some(serde_json::json!({
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                812_i64,
+            );
+            let discovery_body = serde_json::to_vec(&discovery)
+                .map_err(|error| format!("live SSE discovery did not serialize: {error}"))?;
+            let discovery = live_http_post(
                 "/mcp",
-                &body,
+                &discovery_body,
                 &[
-                    ("Accept", "application/json, text/event-stream; Q=1."),
+                    ("Accept", "application/json"),
                     ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
-                    ("Mcp-Method", "tools/call"),
-                    ("Mcp-Name", "http_request_scoped_progress"),
+                    ("Mcp-Method", SERVER_DISCOVER_METHOD),
                 ],
             );
             let caller_cx = cx.clone();
             let mut client = cx
                 .spawn(move |_client_cx| async move {
+                    let discovery = live_http_exchange(address, discovery).await?;
+                    let session_id = live_http_response_header(&discovery, "mcp-session-id")?;
+                    let request = live_http_post(
+                        "/mcp",
+                        &body,
+                        &[
+                            ("Accept", "application/json, text/event-stream; Q=1."),
+                            ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                            ("Mcp-Method", "tools/call"),
+                            ("Mcp-Name", "http_request_scoped_progress"),
+                            ("MCP-Session-Id", session_id.as_str()),
+                        ],
+                    );
                     let deadline = caller_cx
                         .now()
                         .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
@@ -22444,19 +23195,44 @@ mod lib_unit_tests {
             );
             let body = serde_json::to_vec(&request)
                 .map_err(|error| format!("live malformed request did not serialize: {error}"))?;
-            let request = live_http_post(
+            let discovery = JsonRpcRequest::new(
+                SERVER_DISCOVER_METHOD,
+                Some(serde_json::json!({
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                812_i64,
+            );
+            let discovery_body = serde_json::to_vec(&discovery).map_err(|error| {
+                format!("live malformed SSE discovery did not serialize: {error}")
+            })?;
+            let discovery = live_http_post(
                 "/mcp",
-                &body,
+                &discovery_body,
                 &[
-                    ("Accept", "application/json, text/event-stream; Q=1.0000"),
+                    ("Accept", "application/json"),
                     ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
-                    ("Mcp-Method", "tools/call"),
-                    ("Mcp-Name", "http_request_scoped_progress"),
+                    ("Mcp-Method", SERVER_DISCOVER_METHOD),
                 ],
             );
             let caller_cx = cx.clone();
             let mut client = cx
                 .spawn(move |_client_cx| async move {
+                    let discovery = live_http_exchange(address, discovery).await?;
+                    let session_id = live_http_response_header(&discovery, "mcp-session-id")?;
+                    let request = live_http_post(
+                        "/mcp",
+                        &body,
+                        &[
+                            ("Accept", "application/json, text/event-stream; Q=1.0000"),
+                            ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                            ("Mcp-Method", "tools/call"),
+                            ("Mcp-Name", "http_request_scoped_progress"),
+                            ("MCP-Session-Id", session_id.as_str()),
+                        ],
+                    );
                     let response = live_http_exchange(address, request).await;
                     caller_cx.cancel_with(CancelKind::User, Some("malformed SSE request complete"));
                     response
@@ -22479,7 +23255,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_listen_survives_request_write_eof_until_server_teardown() {
+    fn live_http_sse_discovery_mints_session_and_shutdown_cancels_registered_listen() {
         run_live_http_test(|cx| async move {
             let bound = Server::new("live-http-listen-half-close", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
@@ -22491,6 +23267,8 @@ mod lib_unit_tests {
                 .local_addr()
                 .map_err(|error| format!("subscription half-close address failed: {error}"))?;
             let server = Arc::clone(&bound.endpoint.server);
+            let modern_sessions = Arc::clone(&bound.modern_sessions);
+            let remaining_modern_sessions = Arc::clone(&bound.modern_sessions);
             let caller_cx = cx.clone();
             let controller = thread::spawn(move || -> Result<(), String> {
                 struct CancelServerOnDrop(Cx);
@@ -22504,6 +23282,37 @@ mod lib_unit_tests {
                 }
                 let shutdown_cx = caller_cx.clone();
                 let _server_cancellation = CancelServerOnDrop(caller_cx);
+                let discovery = JsonRpcRequest::new(
+                    SERVER_DISCOVER_METHOD,
+                    Some(serde_json::json!({
+                        "_meta": {
+                            MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                        },
+                    })),
+                    RequestId::Number(870),
+                );
+                let discovery_body = serde_json::to_vec(&discovery)
+                    .map_err(|error| format!("listen discovery did not serialize: {error}"))?;
+                let discovery_request = live_http_post(
+                    "/mcp",
+                    &discovery_body,
+                    &[
+                        ("Accept", "text/event-stream"),
+                        ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                        ("Mcp-Method", SERVER_DISCOVER_METHOD),
+                    ],
+                );
+                let mut discovery_stream = std::net::TcpStream::connect(address)
+                    .map_err(|error| format!("listen discovery connect failed: {error}"))?;
+                std::io::Write::write_all(&mut discovery_stream, &discovery_request)
+                    .map_err(|error| format!("listen discovery write failed: {error}"))?;
+                std::io::Write::flush(&mut discovery_stream)
+                    .map_err(|error| format!("listen discovery flush failed: {error}"))?;
+                let mut discovery_response = Vec::new();
+                std::io::Read::read_to_end(&mut discovery_stream, &mut discovery_response)
+                    .map_err(|error| format!("listen discovery read failed: {error}"))?;
+                let session_id = live_http_response_header(&discovery_response, "mcp-session-id")?;
                 let listen = JsonRpcRequest::new(
                     SUBSCRIPTIONS_LISTEN,
                     Some(serde_json::json!({
@@ -22524,6 +23333,7 @@ mod lib_unit_tests {
                         ("Accept", "text/event-stream"),
                         ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                         ("Mcp-Method", SUBSCRIPTIONS_LISTEN),
+                        ("MCP-Session-Id", session_id.as_str()),
                     ],
                 );
                 let mut stream = std::net::TcpStream::connect(address)
@@ -22565,6 +23375,23 @@ mod lib_unit_tests {
                             .to_owned(),
                     );
                 }
+                let registered_dispatch = modern_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&session_id)
+                    .cloned()
+                    .is_some_and(|session| {
+                        !session
+                            .modern_dispatches
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_empty()
+                    });
+                if !registered_dispatch {
+                    return Err(
+                        "live SSE listen was not registered with its discovery session".to_owned(),
+                    );
+                }
                 shutdown_cx.cancel_with(
                     CancelKind::User,
                     Some("subscription graceful shutdown requested"),
@@ -22593,6 +23420,13 @@ mod lib_unit_tests {
                 .join()
                 .map_err(|_| "subscription half-close controller panicked".to_owned())??;
             serve.map_err(|error| format!("subscription half-close server failed: {error}"))?;
+            if !remaining_modern_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                return Err("listener shutdown retained a live SSE session".to_owned());
+            }
             Ok(())
         });
     }
@@ -24320,8 +25154,7 @@ mod lib_unit_tests {
         let provider = session
             .legacy_roots_provider()
             .expect("roots capability must expose the shipped provider");
-        let roots_task =
-            std::thread::spawn(move || block_on(provider.list_roots(&Cx::for_testing())));
+        let roots_task = std::thread::spawn(move || block_on(provider.list_roots()));
         let request = stream
             .recv_event(&cx)
             .expect("roots provider must emit a reverse request");
@@ -25094,7 +25927,7 @@ mod lib_unit_tests {
             responses
                 .response(200)
                 .and_then(|response| response.error)
-                .map(|error| error.code),
+                .and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::RequestCancelled))
         );
         assert!(
@@ -25143,7 +25976,7 @@ mod lib_unit_tests {
         assert_eq!(
             websocket_response(&output, 1400)
                 .and_then(|response| response.error)
-                .map(|error| error.code),
+                .and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::RequestCancelled))
         );
         assert!(websocket_response(&output, 1401).is_some_and(|response| response.error.is_none()));
@@ -25191,7 +26024,7 @@ mod lib_unit_tests {
         assert_eq!(
             websocket_response(&output, 1401)
                 .and_then(|response| response.error)
-                .map(|error| error.code),
+                .and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::RequestCancelled))
         );
         run_result.expect("changing the cancellation id must preserve the other WebSocket request");
@@ -25290,7 +26123,7 @@ mod lib_unit_tests {
             responses
                 .response(1065)
                 .and_then(|response| response.error)
-                .map(|error| error.code),
+                .and_then(|error| error.code.as_i32()),
             Some(RESOURCE_EXHAUSTED_ERROR_CODE)
         );
         for id in 1001..=1064 {
@@ -25435,7 +26268,10 @@ mod lib_unit_tests {
         // Auto, so the recoverable-parse-error contract is probed on an
         // already negotiated connection.
         let steps = Arc::new(Mutex::new(VecDeque::from([
-            Ok(exact_legacy_initialize_request(32, serde_json::json!("1.0.0"))),
+            Ok(exact_legacy_initialize_request(
+                32,
+                serde_json::json!("1.0.0"),
+            )),
             Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
                 "notifications/initialized",
                 None,
@@ -25494,7 +26330,10 @@ mod lib_unit_tests {
             panic!("expected exactly one uncorrelated parse-error response");
         };
         assert_eq!(
-            response.error.as_ref().map(|error| error.code),
+            response
+                .error
+                .as_ref()
+                .and_then(|error| error.code.as_i32()),
             Some(-32700)
         );
         let wire = serde_json::to_value(response).expect("parse error response must serialize");
@@ -25512,7 +26351,10 @@ mod lib_unit_tests {
         // Auto, so the correlation contract is probed on an already
         // negotiated connection.
         let steps = Arc::new(Mutex::new(VecDeque::from([
-            Ok(exact_legacy_initialize_request(31, serde_json::json!("1.0.0"))),
+            Ok(exact_legacy_initialize_request(
+                31,
+                serde_json::json!("1.0.0"),
+            )),
             Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
                 "notifications/initialized",
                 None,
@@ -25568,7 +26410,10 @@ mod lib_unit_tests {
             panic!("expected exactly one response correlated to the proven unique id");
         };
         assert_eq!(
-            response.error.as_ref().map(|error| error.code),
+            response
+                .error
+                .as_ref()
+                .and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::InvalidRequest))
         );
     }
@@ -27535,7 +28380,7 @@ mod lib_unit_tests {
         };
         assert_eq!(
             progress.progress_token,
-            ProgressMarker::from("final-http-progress")
+            ProgressMarker::String("final-http-progress".to_owned())
         );
 
         let log = sse
@@ -28494,7 +29339,7 @@ mod lib_unit_tests {
                     .entries
                     .is_empty()
                 || second_sse.pop_event().is_ok()
-                || !second_session.modern_dispatches.is_empty()
+                || second_session.has_modern_dispatches()
             {
                 return Err("session close remained indistinguishable from pending".to_owned());
             }

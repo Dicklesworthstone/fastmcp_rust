@@ -215,7 +215,10 @@ fn srv_01_a_planted_negative() {
         panic!("the planted runtime result is a JSON-RPC response");
     };
     assert_eq!(
-        planted_response.error.as_ref().map(|error| error.code),
+        planted_response
+            .error
+            .as_ref()
+            .map(|error| error.code.clone()),
         Some(McpErrorCode::InvalidRequest.into())
     );
     assert_eq!(
@@ -340,7 +343,10 @@ fn srv_01_b_planted_negative() {
         .dispatch_stateless(&inbound, &planted)
         .expect("planted handler request with an id must receive a response");
     assert_eq!(
-        planted_response.error.as_ref().map(|error| error.code),
+        planted_response
+            .error
+            .as_ref()
+            .map(|error| error.code.clone()),
         Some(McpErrorCode::MethodNotFound.into())
     );
     assert_eq!(

@@ -21,19 +21,23 @@ use fastmcp_protocol::protocol_policy::{
     StdioEraDecision, StdioOpeningFrame,
 };
 use fastmcp_protocol::{
-    CallToolResult, CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo,
-    CompleteResult, Content, CoreRequest, CoreResult, CreateMessageParams, FinalCallToolResult,
-    FinalCoreResult, FinalGetPromptResult, FinalProgressNotificationParams,
-    FinalReadResourceResult, FinalRequestMeta, GetPromptResult, InitializeParams, InitializeResult,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyCoreResult,
-    LegacyPromptMessage, LegacyResourceContent, ListRootsParams, ListRootsResult, Prompt,
-    PromptMessage, ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate,
-    ServerNotification, Tool, ToolAnnotations, decode_strict_jsonrpc_message,
+    CacheScope, CacheTtl, CallToolResult, CancellationSender, CancellationWireMessage,
+    ClientCapabilities, ClientInfo, CompleteResult, Content, CoreRequest, CoreResult,
+    CreateMessageParams, FinalCallToolResult, FinalCoreResult, FinalGetPromptResult,
+    FinalProgressNotificationParams, FinalReadResourceResult, FinalRequestMeta, GetPromptResult,
+    InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    LegacyContent, LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent, ListRootsParams,
+    ListRootsResult, Prompt, PromptMessage, ReadResourceResult, RequestId, Resource,
+    ResourceContent, ResourceTemplate, ServerNotification, Tool, ToolAnnotations,
+    decode_strict_jsonrpc_message,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
+use crate::handler::{
+    FinalResourceReadCacheHintProvenance, FinalToolSchemaAuthority, PromptHandler, ResourceHandler,
+    ToolHandler, UpstreamFinalToolSchemaRegistration, UriParams,
+};
 
 /// Progress callback signature used by proxy backends.
 pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<String>);
@@ -46,6 +50,91 @@ pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<Strin
 /// parameters, including their raw decimal/exponent lexemes.
 pub type FinalProgressCallback<'a> = &'a mut dyn FnMut(FinalProgressNotificationParams);
 
+/// One exact final cache policy returned with a catalog page.
+///
+/// A proxy materializes catalog pages into one local snapshot, but cache hints
+/// belong to their individual upstream responses. Retaining one record per
+/// page keeps both the arbitrary-width TTL token and the selected sharing
+/// scope available to callers without inventing a synthetic aggregate policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyCatalogCacheHint {
+    /// Exact upstream final cache lifetime.
+    pub ttl_ms: CacheTtl,
+    /// Exact upstream final cache sharing scope.
+    pub cache_scope: CacheScope,
+}
+
+impl ProxyCatalogCacheHint {
+    fn new(ttl_ms: CacheTtl, cache_scope: CacheScope) -> Self {
+        Self {
+            ttl_ms,
+            cache_scope,
+        }
+    }
+}
+
+/// Materialized final catalog entries plus each upstream page's cache policy.
+#[derive(Debug, Clone)]
+pub struct ProxyFinalCatalog<T> {
+    /// Entries in upstream page order.
+    pub entries: Vec<T>,
+    /// Cache hints in the matching upstream page order.
+    pub cache_hints: Vec<ProxyCatalogCacheHint>,
+}
+
+impl<T> ProxyFinalCatalog<T> {
+    /// Constructs a locally supplied final catalog without an upstream page.
+    #[must_use]
+    pub fn new(entries: Vec<T>) -> Self {
+        Self {
+            entries,
+            cache_hints: Vec::new(),
+        }
+    }
+
+    fn single_page(entries: Vec<T>, ttl_ms: CacheTtl, cache_scope: CacheScope) -> Self {
+        Self {
+            entries,
+            cache_hints: vec![ProxyCatalogCacheHint::new(ttl_ms, cache_scope)],
+        }
+    }
+
+    /// Returns the number of materialized entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether the materialized catalog has no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns entries in upstream page order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        &self.entries
+    }
+}
+
+impl<T> IntoIterator for ProxyFinalCatalog<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<T> std::ops::Deref for ProxyFinalCatalog<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
 /// Tool definitions returned by a proxy backend's selected protocol era.
 ///
 /// The two variants deliberately remain disjoint: converting a final tool to
@@ -56,7 +145,7 @@ pub enum ProxyToolCatalog {
     /// Exact MCP 2024-11-05 tool definitions.
     Legacy(Vec<Tool>),
     /// Exact MCP 2026-07-28 tool definitions.
-    Final(Vec<fastmcp_protocol::FinalTool>),
+    Final(ProxyFinalCatalog<fastmcp_protocol::FinalTool>),
 }
 
 /// Resource definitions returned by a proxy backend's selected protocol era.
@@ -68,7 +157,7 @@ pub enum ProxyResourceCatalog {
     /// Exact MCP 2024-11-05 resource definitions.
     Legacy(Vec<Resource>),
     /// Exact MCP 2026-07-28 resource definitions.
-    Final(Vec<fastmcp_protocol::FinalResource>),
+    Final(ProxyFinalCatalog<fastmcp_protocol::FinalResource>),
 }
 
 /// Resource-template definitions returned by a proxy backend's selected era.
@@ -77,7 +166,7 @@ pub enum ProxyResourceTemplateCatalog {
     /// Exact MCP 2024-11-05 resource template definitions.
     Legacy(Vec<ResourceTemplate>),
     /// Exact MCP 2026-07-28 resource template definitions.
-    Final(Vec<fastmcp_protocol::FinalResourceTemplate>),
+    Final(ProxyFinalCatalog<fastmcp_protocol::FinalResourceTemplate>),
 }
 
 /// Prompt definitions returned by a proxy backend's selected protocol era.
@@ -86,7 +175,7 @@ pub enum ProxyPromptCatalog {
     /// Exact MCP 2024-11-05 prompt definitions.
     Legacy(Vec<Prompt>),
     /// Exact MCP 2026-07-28 prompt definitions.
-    Final(Vec<fastmcp_protocol::FinalPrompt>),
+    Final(ProxyFinalCatalog<fastmcp_protocol::FinalPrompt>),
 }
 
 /// Complete proxy catalog without projecting its selected upstream era.
@@ -113,7 +202,7 @@ impl ProxyTypedCatalog {
     pub fn final_tools(&self) -> Option<&[fastmcp_protocol::FinalTool]> {
         match &self.tools {
             ProxyToolCatalog::Legacy(_) => None,
-            ProxyToolCatalog::Final(tools) => Some(tools),
+            ProxyToolCatalog::Final(tools) => Some(tools.as_slice()),
         }
     }
 
@@ -122,7 +211,7 @@ impl ProxyTypedCatalog {
     pub fn final_resources(&self) -> Option<&[fastmcp_protocol::FinalResource]> {
         match &self.resources {
             ProxyResourceCatalog::Legacy(_) => None,
-            ProxyResourceCatalog::Final(resources) => Some(resources),
+            ProxyResourceCatalog::Final(resources) => Some(resources.as_slice()),
         }
     }
 
@@ -131,7 +220,7 @@ impl ProxyTypedCatalog {
     pub fn final_resource_templates(&self) -> Option<&[fastmcp_protocol::FinalResourceTemplate]> {
         match &self.resource_templates {
             ProxyResourceTemplateCatalog::Legacy(_) => None,
-            ProxyResourceTemplateCatalog::Final(templates) => Some(templates),
+            ProxyResourceTemplateCatalog::Final(templates) => Some(templates.as_slice()),
         }
     }
 
@@ -140,7 +229,7 @@ impl ProxyTypedCatalog {
     pub fn final_prompts(&self) -> Option<&[fastmcp_protocol::FinalPrompt]> {
         match &self.prompts {
             ProxyPromptCatalog::Legacy(_) => None,
-            ProxyPromptCatalog::Final(prompts) => Some(prompts),
+            ProxyPromptCatalog::Final(prompts) => Some(prompts.as_slice()),
         }
     }
 
@@ -583,18 +672,25 @@ const MAX_MODERN_PROXY_CATALOG_PAGES: usize = 64;
 /// partial proxy catalog after an invalid cursor sequence.
 fn collect_modern_proxy_catalog_pages<T>(
     method: &str,
-    mut fetch_page: impl FnMut(Option<&str>) -> McpResult<(Vec<T>, Option<String>)>,
-) -> McpResult<Vec<T>> {
+    mut fetch_page: impl FnMut(
+        Option<&str>,
+    ) -> McpResult<(Vec<T>, Option<String>, ProxyCatalogCacheHint)>,
+) -> McpResult<ProxyFinalCatalog<T>> {
     let mut entries = Vec::new();
+    let mut cache_hints = Vec::new();
     let mut cursor = None;
     let mut observed_cursors = HashSet::new();
 
     for _ in 0..MAX_MODERN_PROXY_CATALOG_PAGES {
-        let (page, next_cursor) = fetch_page(cursor.as_deref())?;
+        let (page, next_cursor, cache_hint) = fetch_page(cursor.as_deref())?;
         entries.extend(page);
+        cache_hints.push(cache_hint);
 
         let Some(next_cursor) = next_cursor else {
-            return Ok(entries);
+            return Ok(ProxyFinalCatalog {
+                entries,
+                cache_hints,
+            });
         };
         if cursor.as_deref() == Some(next_cursor.as_str()) {
             return Err(McpError::invalid_request(format!(
@@ -640,7 +736,12 @@ impl ProxyBackend for Client {
                 fastmcp_protocol::methods::TOOLS_LIST,
                 |cursor| match Client::list_tools_typed(self, cursor)? {
                     CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
-                        Ok((result.payload.tools, result.payload.next_cursor))
+                        let payload = result.payload;
+                        Ok((
+                            payload.tools,
+                            payload.next_cursor,
+                            ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
+                        ))
                     }
                     CoreResult::Legacy(LegacyCoreResult::ToolsList(_)) => {
                         Err(McpError::invalid_request(
@@ -679,7 +780,12 @@ impl ProxyBackend for Client {
                         Ok(ProxyResourceCatalog::Legacy(result.resources))
                     }
                     CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
-                        Ok(ProxyResourceCatalog::Final(result.payload.resources))
+                        let payload = result.payload;
+                        Ok(ProxyResourceCatalog::Final(ProxyFinalCatalog::single_page(
+                            payload.resources,
+                            payload.ttl_ms,
+                            payload.cache_scope,
+                        )))
                     }
                     _ => Err(unexpected_proxy_result("resources/list")),
                 }
@@ -688,7 +794,12 @@ impl ProxyBackend for Client {
                 fastmcp_protocol::methods::RESOURCES_LIST,
                 |cursor| match Client::list_resources_typed(self, cursor)? {
                     CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
-                        Ok((result.payload.resources, result.payload.next_cursor))
+                        let payload = result.payload;
+                        Ok((
+                            payload.resources,
+                            payload.next_cursor,
+                            ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
+                        ))
                     }
                     CoreResult::Legacy(LegacyCoreResult::ResourcesList(_)) => {
                         Err(McpError::invalid_request(
@@ -728,9 +839,16 @@ impl ProxyBackend for Client {
                     ),
                     CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
                         result, ..
-                    }) => Ok(ProxyResourceTemplateCatalog::Final(
-                        result.payload.resource_templates,
-                    )),
+                    }) => {
+                        let payload = result.payload;
+                        Ok(ProxyResourceTemplateCatalog::Final(
+                            ProxyFinalCatalog::single_page(
+                                payload.resource_templates,
+                                payload.ttl_ms,
+                                payload.cache_scope,
+                            ),
+                        ))
+                    }
                     _ => Err(unexpected_proxy_result("resources/templates/list")),
                 }
             }
@@ -739,10 +857,14 @@ impl ProxyBackend for Client {
                 |cursor| match Client::list_resource_templates_typed(self, cursor)? {
                     CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
                         result, ..
-                    }) => Ok((
-                        result.payload.resource_templates,
-                        result.payload.next_cursor,
-                    )),
+                    }) => {
+                        let payload = result.payload;
+                        Ok((
+                            payload.resource_templates,
+                            payload.next_cursor,
+                            ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
+                        ))
+                    }
                     CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(_)) => {
                         Err(McpError::invalid_request(
                             "Modern proxy client received a legacy resources/templates/list result",
@@ -778,7 +900,12 @@ impl ProxyBackend for Client {
                         Ok(ProxyPromptCatalog::Legacy(result.prompts))
                     }
                     CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
-                        Ok(ProxyPromptCatalog::Final(result.payload.prompts))
+                        let payload = result.payload;
+                        Ok(ProxyPromptCatalog::Final(ProxyFinalCatalog::single_page(
+                            payload.prompts,
+                            payload.ttl_ms,
+                            payload.cache_scope,
+                        )))
                     }
                     _ => Err(unexpected_proxy_result("prompts/list")),
                 }
@@ -787,7 +914,12 @@ impl ProxyBackend for Client {
                 fastmcp_protocol::methods::PROMPTS_LIST,
                 |cursor| match Client::list_prompts_typed(self, cursor)? {
                     CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
-                        Ok((result.payload.prompts, result.payload.next_cursor))
+                        let payload = result.payload;
+                        Ok((
+                            payload.prompts,
+                            payload.next_cursor,
+                            ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
+                        ))
                     }
                     CoreResult::Legacy(LegacyCoreResult::PromptsList(_)) => {
                         Err(McpError::invalid_request(
@@ -886,54 +1018,82 @@ pub struct ProxyCatalog {
     /// every serializable `FinalTool` member rather than being downgraded to
     /// the legacy component model.
     pub final_tools: Vec<fastmcp_protocol::FinalTool>,
+    /// Exact final `tools/list` policy for every materialized upstream page.
+    pub final_tool_cache_hints: Vec<ProxyCatalogCacheHint>,
     /// Exact legacy remote resource definitions.
     pub resources: Vec<Resource>,
     /// Exact final remote resource definitions.
     pub final_resources: Vec<fastmcp_protocol::FinalResource>,
+    /// Exact final `resources/list` policy for every materialized upstream page.
+    pub final_resource_cache_hints: Vec<ProxyCatalogCacheHint>,
     /// Exact legacy remote resource-template definitions.
     pub resource_templates: Vec<ResourceTemplate>,
     /// Exact final remote resource-template definitions.
     pub final_resource_templates: Vec<fastmcp_protocol::FinalResourceTemplate>,
+    /// Exact final `resources/templates/list` policy for every materialized upstream page.
+    pub final_resource_template_cache_hints: Vec<ProxyCatalogCacheHint>,
     /// Exact legacy remote prompt definitions.
     pub prompts: Vec<Prompt>,
     /// Exact final remote prompt definitions.
     pub final_prompts: Vec<fastmcp_protocol::FinalPrompt>,
+    /// Exact final `prompts/list` policy for every materialized upstream page.
+    pub final_prompt_cache_hints: Vec<ProxyCatalogCacheHint>,
 }
 
 impl ProxyCatalog {
     /// Builds a catalog by querying a proxy backend.
     pub fn from_backend<B: ProxyBackend + ?Sized>(backend: &mut B) -> McpResult<Self> {
-        let (tool_catalog_era, tools, final_tools) = match backend.list_tool_catalog()? {
-            ProxyToolCatalog::Legacy(tools) => (Some(ProtocolEra::Legacy2024), tools, Vec::new()),
-            ProxyToolCatalog::Final(tools) => (Some(ProtocolEra::Modern2026), Vec::new(), tools),
-        };
-        let (resources, final_resources) = match backend.list_resource_catalog()? {
-            ProxyResourceCatalog::Legacy(resources) => (resources, Vec::new()),
-            ProxyResourceCatalog::Final(resources) => (Vec::new(), resources),
-        };
-        let (resource_templates, final_resource_templates) =
-            match backend.list_resource_template_catalog()? {
-                ProxyResourceTemplateCatalog::Legacy(resource_templates) => {
-                    (resource_templates, Vec::new())
+        let (tool_catalog_era, tools, final_tools, final_tool_cache_hints) =
+            match backend.list_tool_catalog()? {
+                ProxyToolCatalog::Legacy(tools) => {
+                    (Some(ProtocolEra::Legacy2024), tools, Vec::new(), Vec::new())
                 }
-                ProxyResourceTemplateCatalog::Final(resource_templates) => {
-                    (Vec::new(), resource_templates)
+                ProxyToolCatalog::Final(tools) => (
+                    Some(ProtocolEra::Modern2026),
+                    Vec::new(),
+                    tools.entries,
+                    tools.cache_hints,
+                ),
+            };
+        let (resources, final_resources, final_resource_cache_hints) =
+            match backend.list_resource_catalog()? {
+                ProxyResourceCatalog::Legacy(resources) => (resources, Vec::new(), Vec::new()),
+                ProxyResourceCatalog::Final(resources) => {
+                    (Vec::new(), resources.entries, resources.cache_hints)
                 }
             };
-        let (prompts, final_prompts) = match backend.list_prompt_catalog()? {
-            ProxyPromptCatalog::Legacy(prompts) => (prompts, Vec::new()),
-            ProxyPromptCatalog::Final(prompts) => (Vec::new(), prompts),
-        };
+        let (resource_templates, final_resource_templates, final_resource_template_cache_hints) =
+            match backend.list_resource_template_catalog()? {
+                ProxyResourceTemplateCatalog::Legacy(resource_templates) => {
+                    (resource_templates, Vec::new(), Vec::new())
+                }
+                ProxyResourceTemplateCatalog::Final(resource_templates) => (
+                    Vec::new(),
+                    resource_templates.entries,
+                    resource_templates.cache_hints,
+                ),
+            };
+        let (prompts, final_prompts, final_prompt_cache_hints) =
+            match backend.list_prompt_catalog()? {
+                ProxyPromptCatalog::Legacy(prompts) => (prompts, Vec::new(), Vec::new()),
+                ProxyPromptCatalog::Final(prompts) => {
+                    (Vec::new(), prompts.entries, prompts.cache_hints)
+                }
+            };
         let catalog = Self {
             tool_catalog_era,
             tools,
             final_tools,
+            final_tool_cache_hints,
             resources,
             final_resources,
+            final_resource_cache_hints,
             resource_templates,
             final_resource_templates,
+            final_resource_template_cache_hints,
             prompts,
             final_prompts,
+            final_prompt_cache_hints,
         };
         catalog.admit_catalog_shape()?;
         Ok(catalog)
@@ -1441,7 +1601,12 @@ impl ProxyBackend for ProxyHttpClient {
                         Ok(ProxyToolCatalog::Legacy(result.tools))
                     }
                     CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
-                        Ok(ProxyToolCatalog::Final(result.payload.tools))
+                        let payload = result.payload;
+                        Ok(ProxyToolCatalog::Final(ProxyFinalCatalog::single_page(
+                            payload.tools,
+                            payload.ttl_ms,
+                            payload.cache_scope,
+                        )))
                     }
                     _ => Err(unexpected_proxy_result("tools/list")),
                 }
@@ -1453,7 +1618,12 @@ impl ProxyBackend for ProxyHttpClient {
                     Self::modern_catalog_parameters(cursor),
                 )? {
                     CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
-                        Ok((result.payload.tools, result.payload.next_cursor))
+                        let payload = result.payload;
+                        Ok((
+                            payload.tools,
+                            payload.next_cursor,
+                            ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
+                        ))
                     }
                     CoreResult::Legacy(LegacyCoreResult::ToolsList(_)) => {
                         Err(McpError::invalid_request(
@@ -1486,7 +1656,12 @@ impl ProxyBackend for ProxyHttpClient {
                     Ok(ProxyResourceCatalog::Legacy(result.resources))
                 }
                 CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
-                    Ok(ProxyResourceCatalog::Final(result.payload.resources))
+                    let payload = result.payload;
+                    Ok(ProxyResourceCatalog::Final(ProxyFinalCatalog::single_page(
+                        payload.resources,
+                        payload.ttl_ms,
+                        payload.cache_scope,
+                    )))
                 }
                 _ => Err(unexpected_proxy_result("resources/list")),
             },
@@ -1497,7 +1672,12 @@ impl ProxyBackend for ProxyHttpClient {
                     Self::modern_catalog_parameters(cursor),
                 )? {
                     CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
-                        Ok((result.payload.resources, result.payload.next_cursor))
+                        let payload = result.payload;
+                        Ok((
+                            payload.resources,
+                            payload.next_cursor,
+                            ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
+                        ))
                     }
                     CoreResult::Legacy(LegacyCoreResult::ResourcesList(_)) => {
                         Err(McpError::invalid_request(
@@ -1529,9 +1709,16 @@ impl ProxyBackend for ProxyHttpClient {
                 CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => Ok(
                     ProxyResourceTemplateCatalog::Legacy(result.resource_templates),
                 ),
-                CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) => Ok(
-                    ProxyResourceTemplateCatalog::Final(result.payload.resource_templates),
-                ),
+                CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) => {
+                    let payload = result.payload;
+                    Ok(ProxyResourceTemplateCatalog::Final(
+                        ProxyFinalCatalog::single_page(
+                            payload.resource_templates,
+                            payload.ttl_ms,
+                            payload.cache_scope,
+                        ),
+                    ))
+                }
                 _ => Err(unexpected_proxy_result("resources/templates/list")),
             },
             ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
@@ -1542,10 +1729,14 @@ impl ProxyBackend for ProxyHttpClient {
                 )? {
                     CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
                         result, ..
-                    }) => Ok((
-                        result.payload.resource_templates,
-                        result.payload.next_cursor,
-                    )),
+                    }) => {
+                        let payload = result.payload;
+                        Ok((
+                            payload.resource_templates,
+                            payload.next_cursor,
+                            ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
+                        ))
+                    }
                     CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(_)) => {
                         Err(McpError::invalid_request(
                             "Modern HTTP proxy received a legacy resources/templates/list result",
@@ -1577,7 +1768,12 @@ impl ProxyBackend for ProxyHttpClient {
                     Ok(ProxyPromptCatalog::Legacy(result.prompts))
                 }
                 CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
-                    Ok(ProxyPromptCatalog::Final(result.payload.prompts))
+                    let payload = result.payload;
+                    Ok(ProxyPromptCatalog::Final(ProxyFinalCatalog::single_page(
+                        payload.prompts,
+                        payload.ttl_ms,
+                        payload.cache_scope,
+                    )))
                 }
                 _ => Err(unexpected_proxy_result("prompts/list")),
             },
@@ -1588,7 +1784,12 @@ impl ProxyBackend for ProxyHttpClient {
                     Self::modern_catalog_parameters(cursor),
                 )? {
                     CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
-                        Ok((result.payload.prompts, result.payload.next_cursor))
+                        let payload = result.payload;
+                        Ok((
+                            payload.prompts,
+                            payload.next_cursor,
+                            ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
+                        ))
                     }
                     CoreResult::Legacy(LegacyCoreResult::PromptsList(_)) => {
                         Err(McpError::invalid_request(
@@ -2868,6 +3069,22 @@ impl ToolHandler for ProxyToolHandler {
         self.final_tool.clone()
     }
 
+    fn final_tool_schema_authority(&self) -> FinalToolSchemaAuthority {
+        if self.final_tool.is_some() {
+            FinalToolSchemaAuthority::Upstream
+        } else {
+            FinalToolSchemaAuthority::Local
+        }
+    }
+
+    fn upstream_final_tool_schema_registration(
+        &self,
+    ) -> Option<UpstreamFinalToolSchemaRegistration> {
+        self.final_tool
+            .as_ref()
+            .map(|_tool| UpstreamFinalToolSchemaRegistration::exact_proxy())
+    }
+
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         // Forward using the original external name
         self.client.call_tool(ctx, &self.external_name, arguments)
@@ -2886,6 +3103,14 @@ impl ToolHandler for ProxyToolHandler {
         &self,
         _kind: crate::handler::ToolErrorKind,
     ) -> Option<serde_json::Value> {
+        if self.final_tool.is_some() {
+            // Exact-final proxy handlers declare upstream schema authority.
+            // They must never synthesize a local `{}` merely to satisfy an
+            // upstream scalar outputSchema.
+            return None;
+        }
+
+        // Legacy proxy handlers use the ordinary local schema path.
         // A proxy cannot consult the upstream for framework-authored error
         // shapes. The empty object is offered for both closed kinds and
         // registration still validates it against the tool's declared
@@ -2969,6 +3194,10 @@ impl ResourceHandler for ProxyResourceHandler {
 
     fn template(&self) -> Option<ResourceTemplate> {
         self.template.clone()
+    }
+
+    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
+        FinalResourceReadCacheHintProvenance::Explicit
     }
 
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
@@ -3097,22 +3326,22 @@ mod tests {
         HttpModernProbe, HttpProbeBody, ProtocolEra, ProtocolPolicy,
     };
     use fastmcp_protocol::{
-        CallToolResult, ClientCapabilities, ClientInfo, CompleteResult, Content, CoreResult,
-        FinalCallToolResult, FinalCoreResult, FinalProgressNotificationParams, JsonRpcMessage,
-        LegacyContent, LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent, Prompt,
-        PromptMessage, Resource, ResourceContent, ServerNotification, Tool,
-        decode_strict_jsonrpc_message,
+        CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
+        Content, CoreResult, FinalCallToolResult, FinalCoreResult, FinalProgressNotificationParams,
+        JsonRpcMessage, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
+        LegacyResourceContent, Prompt, PromptMessage, Resource, ResourceContent,
+        ServerNotification, Tool, decode_strict_jsonrpc_message,
     };
 
     use super::{
-        MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES, ProxyBackend, ProxyCatalog, ProxyClient,
-        ProxyHttpClient, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
+        MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
+        ProxyClient, ProxyHttpClient, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
         ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler, ProxyUpstreamAdapter,
         ProxyUpstreamBinding, ProxyUpstreamBindingRegistry, admit_legacy_interleaved_control_frame,
         decode_modern_server_notification, forward_modern_progress_notification,
         legacy_contents_to_handler, legacy_prompt_messages_to_handler, legacy_resource_to_handler,
     };
-    use crate::handler::{PromptHandler, ToolHandler};
+    use crate::handler::{FinalToolSchemaAuthority, PromptHandler, ToolHandler};
 
     #[test]
     fn proxy_modern_sse_progress_callback_preserves_raw_progress_lexemes() {
@@ -3524,8 +3753,14 @@ mod tests {
             "2026-07-28",
         )
         .expect("matching final upstream binding");
-        let modern_handler = ProxyToolHandler::new(proxy_test_tool(), modern_proxy);
+        let modern_handler = ProxyToolHandler::from_final(final_catalog_tool(), modern_proxy)
+            .expect("an exact final catalog entry creates a forwarding handler");
         let context = McpContext::new(Cx::for_testing(), 501);
+
+        assert_eq!(
+            modern_handler.final_tool_schema_authority(),
+            FinalToolSchemaAuthority::Upstream
+        );
 
         let final_result = modern_handler
             .call_final(&context, serde_json::json!({}))
@@ -3709,7 +3944,9 @@ mod tests {
                     "final catalog is unavailable",
                 ));
             }
-            Ok(ProxyToolCatalog::Final(vec![self.tool.clone()]))
+            Ok(ProxyToolCatalog::Final(ProxyFinalCatalog::new(vec![
+                self.tool.clone(),
+            ])))
         }
 
         fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> {
@@ -3771,7 +4008,13 @@ mod tests {
         }
 
         fn list_tool_catalog(&mut self) -> fastmcp_core::McpResult<ProxyToolCatalog> {
-            Ok(ProxyToolCatalog::Final(vec![self.tool.clone()]))
+            let ttl_ms = serde_json::from_str("922337203685477580812345678901234567890")
+                .expect("arbitrary-width final TTL is valid");
+            Ok(ProxyToolCatalog::Final(ProxyFinalCatalog::single_page(
+                vec![self.tool.clone()],
+                ttl_ms,
+                CacheScope::Public,
+            )))
         }
 
         fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> {
@@ -3781,7 +4024,11 @@ mod tests {
         }
 
         fn list_resource_catalog(&mut self) -> fastmcp_core::McpResult<ProxyResourceCatalog> {
-            Ok(ProxyResourceCatalog::Final(vec![self.resource.clone()]))
+            Ok(ProxyResourceCatalog::Final(ProxyFinalCatalog::single_page(
+                vec![self.resource.clone()],
+                CacheTtl::milliseconds(0),
+                CacheScope::Private,
+            )))
         }
 
         fn list_resource_templates(
@@ -3795,9 +4042,13 @@ mod tests {
         fn list_resource_template_catalog(
             &mut self,
         ) -> fastmcp_core::McpResult<ProxyResourceTemplateCatalog> {
-            Ok(ProxyResourceTemplateCatalog::Final(vec![
-                self.template.clone(),
-            ]))
+            Ok(ProxyResourceTemplateCatalog::Final(
+                ProxyFinalCatalog::single_page(
+                    vec![self.template.clone()],
+                    CacheTtl::milliseconds(0),
+                    CacheScope::Private,
+                ),
+            ))
         }
 
         fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> {
@@ -3807,7 +4058,11 @@ mod tests {
         }
 
         fn list_prompt_catalog(&mut self) -> fastmcp_core::McpResult<ProxyPromptCatalog> {
-            Ok(ProxyPromptCatalog::Final(vec![self.prompt.clone()]))
+            Ok(ProxyPromptCatalog::Final(ProxyFinalCatalog::single_page(
+                vec![self.prompt.clone()],
+                CacheTtl::milliseconds(0),
+                CacheScope::Private,
+            )))
         }
 
         fn call_tool(
@@ -3870,23 +4125,25 @@ mod tests {
     }
 
     fn final_catalog_resource() -> fastmcp_protocol::FinalResource {
-        serde_json::from_value(serde_json::json!({
-            "uri": "https://example.test/forecast/today",
-            "name": "today-forecast",
-            "title": "Today's Forecast",
-            "description": "The current forecast.",
-            "icons": [{
-                "src": "https://example.test/icons/forecast.svg",
-                "mimeType": "image/svg+xml",
-                "sizes": ["16x16", "32x32"],
-                "theme": "dark",
-                "com.example/icon": {"retained": true}
-            }],
-            "mimeType": "application/json",
-            "size": 256,
-            "annotations": {"audience": ["assistant"], "priority": 0.75},
-            "_meta": {"com.example/resource": {"retained": true}}
-        }))
+        serde_json::from_str(
+            r#"{
+                "uri": "https://example.test/forecast/today",
+                "name": "today-forecast",
+                "title": "Today's Forecast",
+                "description": "The current forecast.",
+                "icons": [{
+                    "src": "https://example.test/icons/forecast.svg",
+                    "mimeType": "image/svg+xml",
+                    "sizes": ["16x16", "32x32"],
+                    "theme": "dark",
+                    "com.example/icon": {"retained": true}
+                }],
+                "mimeType": "application/json",
+                "size": 922337203685477580812345678901234567890,
+                "annotations": {"audience": ["assistant"], "priority": 0.75},
+                "_meta": {"com.example/resource": {"retained": true}}
+            }"#,
+        )
         .expect("the final resource fixture is exact-schema valid")
     }
 
@@ -3988,6 +4245,11 @@ mod tests {
             expected_resource
         );
         assert_eq!(
+            resources[0].size.as_ref().map(|size| size.as_str()),
+            Some("922337203685477580812345678901234567890"),
+            "the proxy catalog retains the exact arbitrary-width final resource size"
+        );
+        assert_eq!(
             serde_json::to_vec(&templates[0]).expect("template serializes"),
             expected_template
         );
@@ -4025,6 +4287,22 @@ mod tests {
         assert!(catalog.resources.is_empty());
         assert!(catalog.resource_templates.is_empty());
         assert!(catalog.prompts.is_empty());
+        assert_eq!(catalog.final_tool_cache_hints.len(), 1);
+        assert_eq!(
+            catalog.final_tool_cache_hints[0].ttl_ms.as_str(),
+            "922337203685477580812345678901234567890"
+        );
+        assert_eq!(
+            catalog.final_tool_cache_hints[0].cache_scope,
+            CacheScope::Public
+        );
+        assert_eq!(catalog.final_resource_cache_hints[0].ttl_ms.as_str(), "0");
+        assert_eq!(
+            catalog.final_resource_cache_hints[0].cache_scope,
+            CacheScope::Private
+        );
+        assert_eq!(catalog.final_resource_template_cache_hints.len(), 1);
+        assert_eq!(catalog.final_prompt_cache_hints.len(), 1);
         assert_eq!(
             serde_json::to_vec(&catalog.final_tools[0]).expect("tool serializes"),
             expected_tool
@@ -4097,17 +4375,27 @@ mod tests {
         let mut second_page = final_catalog_tool();
         second_page.name = "weather-page-two".to_owned();
         let first_page = final_catalog_tool();
+        let page_hint =
+            || ProxyCatalogCacheHint::new(CacheTtl::milliseconds(0), CacheScope::Private);
         let mut page_requests = 0;
         let replacement = super::collect_modern_proxy_catalog_pages(
             fastmcp_protocol::methods::TOOLS_LIST,
             |cursor| {
                 page_requests += 1;
                 match cursor {
-                    None => Ok((vec![first_page.clone()], Some("tools-page-2".to_owned()))),
+                    None => Ok((
+                        vec![first_page.clone()],
+                        Some("tools-page-2".to_owned()),
+                        page_hint(),
+                    )),
                     Some("tools-page-2") => {
                         // The one forbidden difference from the terminal
                         // positive page is retaining this same cursor.
-                        Ok((vec![second_page.clone()], Some("tools-page-2".to_owned())))
+                        Ok((
+                            vec![second_page.clone()],
+                            Some("tools-page-2".to_owned()),
+                            page_hint(),
+                        ))
                     }
                     Some(cursor) => Err(fastmcp_core::McpError::invalid_request(format!(
                         "unexpected test cursor {cursor}"
@@ -4117,7 +4405,8 @@ mod tests {
         )
         .map(|final_tools| ProxyCatalog {
             tool_catalog_era: Some(ProtocolEra::Modern2026),
-            final_tools,
+            final_tools: final_tools.entries,
+            final_tool_cache_hints: final_tools.cache_hints,
             ..ProxyCatalog::default()
         });
         let error = replacement.expect_err(
@@ -4136,6 +4425,38 @@ mod tests {
             retained_tool_wire,
             "the failed replacement cannot expose the first partial modern page"
         );
+    }
+
+    #[test]
+    fn proxy_catalog_retains_each_final_page_cache_hint_losslessly() {
+        let huge_ttl: CacheTtl = serde_json::from_str("922337203685477580812345678901234567890")
+            .expect("arbitrary-width final TTL is valid");
+        let catalog = super::collect_modern_proxy_catalog_pages(
+            fastmcp_protocol::methods::TOOLS_LIST,
+            |cursor| match cursor {
+                None => Ok((
+                    vec![final_catalog_tool()],
+                    Some("tools-page-2".to_owned()),
+                    ProxyCatalogCacheHint::new(huge_ttl.clone(), CacheScope::Public),
+                )),
+                Some("tools-page-2") => Ok((
+                    vec![final_catalog_tool()],
+                    None,
+                    ProxyCatalogCacheHint::new(CacheTtl::milliseconds(0), CacheScope::Private),
+                )),
+                Some(cursor) => Err(fastmcp_core::McpError::invalid_request(format!(
+                    "unexpected test cursor {cursor}"
+                ))),
+            },
+        )
+        .expect("a two-page final catalog is materialized");
+
+        assert_eq!(catalog.entries.len(), 2);
+        assert_eq!(catalog.cache_hints.len(), 2);
+        assert_eq!(catalog.cache_hints[0].ttl_ms.as_str(), huge_ttl.as_str());
+        assert_eq!(catalog.cache_hints[0].cache_scope, CacheScope::Public);
+        assert_eq!(catalog.cache_hints[1].ttl_ms.as_str(), "0");
+        assert_eq!(catalog.cache_hints[1].cache_scope, CacheScope::Private);
     }
 
     #[test]
@@ -4175,7 +4496,11 @@ mod tests {
 
     #[test]
     fn final_catalog_creates_lossless_proxy_tool_handlers_for_a_modern_binding() {
-        let expected_tool = final_catalog_tool();
+        let mut expected_tool = final_catalog_tool();
+        expected_tool.output_schema = Some(serde_json::json!({
+            "type": "string",
+            "com.example/schema": {"retained": true}
+        }));
         let expected_wire = serde_json::to_vec(&expected_tool).expect("final tool serializes");
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalCatalogBackend {
@@ -4195,6 +4520,11 @@ mod tests {
         assert!(catalog.tools.is_empty());
         assert_eq!(handlers.len(), 1);
         assert_eq!(
+            handlers[0].final_tool_schema_authority(),
+            FinalToolSchemaAuthority::Upstream,
+            "an exact-final catalog entry must delegate its scalar output schema upstream"
+        );
+        assert_eq!(
             serde_json::to_vec(
                 &handlers[0]
                     .final_definition()
@@ -4203,6 +4533,27 @@ mod tests {
             .expect("handler final definition serializes"),
             expected_wire,
             "the handler must expose the upstream final definition without a legacy projection"
+        );
+    }
+
+    #[test]
+    fn legacy_proxy_tool_handler_keeps_local_schema_authority() {
+        let handler = ProxyToolHandler::new(
+            final_tool_legacy_fallback(&final_catalog_tool()),
+            ProxyClient::from_backend(FinalCatalogBackend {
+                tool: final_catalog_tool(),
+                reject_exact_catalog: false,
+            }),
+        );
+
+        assert_eq!(
+            handler.final_tool_schema_authority(),
+            FinalToolSchemaAuthority::Local,
+            "changing only the handler construction to legacy must not bypass local validation"
+        );
+        assert!(
+            handler.final_definition().is_none(),
+            "a legacy handler cannot claim to retain exact-final schema or metadata bytes"
         );
     }
 
@@ -4467,7 +4818,7 @@ mod tests {
             fastmcp_protocol::JsonRpcMessage::Response(fastmcp_protocol::JsonRpcResponse::error(
                 Some(fastmcp_protocol::RequestId::Number(1)),
                 fastmcp_protocol::JsonRpcError {
-                    code: -32601,
+                    code: (-32601).into(),
                     message: "Method not found".to_owned(),
                     data: None,
                 },
