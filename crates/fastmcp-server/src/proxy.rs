@@ -5016,6 +5016,23 @@ exec sleep 2
         stream.flush().expect("flush native HTTP response");
     }
 
+    /// Writes a scripted modern discovery response carrying the session the
+    /// modern HTTP client requires from server/discover.
+    fn write_http_discovery_response(stream: &mut TcpStream, body: &[u8]) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMCP-Session-Id: proxy-test-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write native HTTP discovery response head");
+        stream
+            .write_all(body)
+            .expect("write native HTTP discovery response body");
+        stream
+            .flush()
+            .expect("flush native HTTP discovery response");
+    }
+
     fn http_proxy_plan(
         modern_target: &str,
         legacy_sse_target: &str,
@@ -5143,10 +5160,8 @@ exec sleep 2
         let server = thread::spawn(move || {
             let (mut probe, _) = listener.accept().expect("accept modern probe");
             let probe_request = read_http_request(&mut probe);
-            write_http_response(
+            write_http_discovery_response(
                 &mut probe,
-                200,
-                "application/json",
                 br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
             );
 
@@ -5869,10 +5884,8 @@ exec sleep 2
             for _ in 0..2 {
                 let (mut probe, _) = listener.accept().expect("accept modern probe");
                 let request = read_http_request(&mut probe);
-                write_http_response(
+                write_http_discovery_response(
                     &mut probe,
-                    200,
-                    "application/json",
                     br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
                 );
                 probes.push(request);
@@ -5937,10 +5950,8 @@ exec sleep 2
             for _ in 0..2 {
                 let (mut probe, _) = listener.accept().expect("accept modern probe");
                 let request = read_http_request(&mut probe);
-                write_http_response(
+                write_http_discovery_response(
                     &mut probe,
-                    200,
-                    "application/json",
                     br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
                 );
                 probes.push(request);
@@ -6001,10 +6012,8 @@ exec sleep 2
         let server = thread::spawn(move || {
             let (mut probe, _) = listener.accept().expect("accept modern probe");
             let probe_request = read_http_request(&mut probe);
-            write_http_response(
+            write_http_discovery_response(
                 &mut probe,
-                200,
-                "application/json",
                 br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
             );
 
@@ -6085,10 +6094,8 @@ exec sleep 2
             let server = thread::spawn(move || {
                 let (mut probe, _) = listener.accept().expect("accept modern probe");
                 let probe_request = read_http_request(&mut probe);
-                write_http_response(
+                write_http_discovery_response(
                     &mut probe,
-                    200,
-                    "application/json",
                     br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
                 );
 

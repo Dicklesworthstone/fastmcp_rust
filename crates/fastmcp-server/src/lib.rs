@@ -4388,13 +4388,23 @@ impl BoundHttpServer {
         let reaper_sessions = Arc::clone(&self.modern_sessions);
         let mut modern_session_reaper = cx
             .spawn_in(&connection_scope, move |reaper_cx| async move {
+                // Shutdown aborts this task and then joins it, but an abort
+                // cannot preempt a timer park: a task sleeping the full reap
+                // interval holds the joined shutdown hostage for up to the
+                // whole interval. Park in short chunks so cancellation is
+                // observed promptly while reaping keeps its coarse cadence.
+                const REAP_PARK_CHUNK: Duration = Duration::from_millis(100);
+                let mut parked = Duration::ZERO;
                 loop {
-                    asupersync::time::sleep(reaper_cx.now(), MODERN_HTTP_SESSION_REAP_INTERVAL)
-                        .await;
+                    asupersync::time::sleep(reaper_cx.now(), REAP_PARK_CHUNK).await;
                     if reaper_cx.checkpoint().is_err() {
                         break;
                     }
-                    expire_live_modern_http_sessions(&reaper_sessions);
+                    parked += REAP_PARK_CHUNK;
+                    if parked >= MODERN_HTTP_SESSION_REAP_INTERVAL {
+                        parked = Duration::ZERO;
+                        expire_live_modern_http_sessions(&reaper_sessions);
+                    }
                 }
             })
             .map_err(|error| {
