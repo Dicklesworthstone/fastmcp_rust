@@ -103,8 +103,9 @@ pub use handler::{
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 pub use proxy::{
-    FinalProgressCallback, ProxyBackend, ProxyCatalog, ProxyClient, ProxyPromptCatalog,
-    ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
+    FinalProgressCallback, ProxyBackend, ProxyCatalog, ProxyClient, ProxyFinalCatalog,
+    ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
+    ProxyTypedCatalog,
 };
 pub use router::{
     InboundRequestContext, InboundRequestTransport, MountResult, NotificationSender, Router,
